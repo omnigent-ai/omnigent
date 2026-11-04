@@ -4520,10 +4520,12 @@ def create_app(
             RECOVERY_STORE_CONCURRENCY,
             _interrupted,
             _restorable,
+            clear_skipped_resume,
             is_parent_owned_subagent,
             note_skipped_resume,
             reconnect_recovery_deferred,
             restore_active_children,
+            skipped_resume_runner,
         )
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
@@ -4599,14 +4601,20 @@ def create_app(
                 eager_root_ids.add(root_id)
         # A wake-only retry initializes its tree itself, without resuming work.
         wake_only_root_ids: set[str] = set()
+        skipped_resume_ids_by_root: dict[str, set[str]] = {}
         for conv in convs:
-            if not reconnect_recovery_deferred(conv.id):
+            deferred = reconnect_recovery_deferred(conv.id)
+            if not deferred and skipped_resume_runner(conv.id) is None:
                 continue
             root_id = independent_root_id(conv)
-            if root_id is not None:
+            if root_id is None:
+                continue
+            skipped_resume_ids_by_root.setdefault(root_id, set()).update((conv.id, root_id))
+            if deferred:
                 wake_only_root_ids.add(root_id)
-                # Leave the deferred resume for the session's next plain retry.
+                # Leave the tree's deferred resume for its next plain retry.
                 note_skipped_resume(conv.id, runner_id)
+                note_skipped_resume(root_id, runner_id)
 
         # Attach independent roots first; their recovery restores dependent sessions.
         convs.sort(key=lambda conv: not is_independent(conv))
@@ -4810,6 +4818,9 @@ def create_app(
                         if is_session_agent_removed(response):
                             return
                         response.raise_for_status()
+                        # This recovery runs the resumes an earlier wake skipped.
+                        for session_id in skipped_resume_ids_by_root.get(conv.id, ()):
+                            clear_skipped_resume(session_id)
                     prefetch_session_routing_catalogs(conv.id, conv, client)
                     # Clear only a root's disconnect failure, after successful init.
                     # Children retain interruption evidence until continuation runs.

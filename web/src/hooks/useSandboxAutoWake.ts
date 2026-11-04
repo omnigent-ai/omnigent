@@ -99,14 +99,8 @@ export function resetSandboxWakesForTesting(): void {
 }
 
 /**
- * Wake a session's asleep managed sandbox when a view that needs it opens.
- *
- * Uses the same server recovery as **Reconnect host** (`retry_session`) in
- * wake-only mode, so the sandbox resumes and its runner starts without a chat
- * message, a resumed turn, or a retried startup input. Each opening (`active`
- * turning true) wakes at most once, and not at all if it first finds the
- * sandbox awake: a sandbox that goes to sleep while the view stays open waits
- * for `wake()` or a reopen, so an open panel never keeps a sandbox awake.
+ * Wake a session's asleep sandbox once per visible opening, sharing attempts
+ * across remounts. The wake-only `retry_session` it sends resumes no agent work.
  *
  * @param conversationId Session whose sandbox to wake.
  * @param asleep Whether the session's managed sandbox is asleep (`host_asleep`).
@@ -162,11 +156,11 @@ export function useSandboxAutoWake({
 
   const step = attempt?.step;
   useEffect(() => {
-    // Back online, by this wake or any other: forget the attempt's outcome.
-    if (conversationId && !asleep && (step === "settling" || step === "failed")) {
+    // Runner online, by this wake or any other: forget the attempt's outcome.
+    if (conversationId && awake && (step === "settling" || step === "failed")) {
       setAttempt(conversationId, undefined);
     }
-  }, [asleep, conversationId, step]);
+  }, [awake, conversationId, step]);
 
   return {
     phase: attempt ? PHASE_BY_STEP[attempt.step] : "idle",

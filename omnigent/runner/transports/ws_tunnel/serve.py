@@ -1506,6 +1506,7 @@ async def _send_hello(
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
         CAP_FILESYSTEM_ATTACHMENTS,
     )
+    from omnigent.runner.session_init_protocol import CAP_HOLD_SUBAGENT_WAKES
 
     await send_text(
         encode_frame(
@@ -1517,6 +1518,7 @@ async def _send_hello(
                     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,
                     CAP_SIDE_CHAT_SETTINGS,
+                    CAP_HOLD_SUBAGENT_WAKES,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,

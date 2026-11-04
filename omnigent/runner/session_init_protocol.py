@@ -12,6 +12,8 @@ from omnigent.entities import Conversation
 SessionInitProtocolVersion: TypeAlias = Literal[2]
 SESSION_INIT_PROTOCOL_VERSION: SessionInitProtocolVersion = 2
 SESSION_INIT_PAYLOAD_KEY = "session_init"
+# Runner hello capability: its session init honors ``hold_subagent_wakes``.
+CAP_HOLD_SUBAGENT_WAKES = "session_init_hold_subagent_wakes"
 
 
 class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any

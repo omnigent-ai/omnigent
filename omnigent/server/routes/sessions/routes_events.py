@@ -68,11 +68,13 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_provider_auth_failure,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runner.session_init_protocol import CAP_HOLD_SUBAGENT_WAKES
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
     EventBatchFrame,
     encode_frame,
 )
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     inflight_text,
     pending_elicitations,
@@ -670,6 +672,12 @@ def _host_offline_hold_message() -> str:
     return "The host for this session is offline. Your message will be sent when it reconnects."
 
 
+def _runner_holds_subagent_wakes(tunnel_registry: TunnelRegistry | None, runner_id: str) -> bool:
+    """Whether the runner's init can hold sub-agent wakes; an in-process runner can."""
+    connection = tunnel_registry.get(runner_id) if tunnel_registry is not None else None
+    return connection is None or CAP_HOLD_SUBAGENT_WAKES in connection.hello.capabilities
+
+
 async def _recover_retry_session(
     *,
     request: Request,
@@ -719,6 +727,7 @@ async def _recover_retry_session_once(
     """Run one recovery attempt for :func:`_recover_retry_session`."""
     from omnigent.server.child_session_recovery import (
         clear_skipped_resume,
+        hold_reconnect_recovery,
         note_skipped_resume,
         skipped_resume_runner,
     )
@@ -734,6 +743,9 @@ async def _recover_retry_session_once(
     terminal_ready_from_init = False
     if runner_client is None:
         await _raise_if_runner_on_another_replica(conv, request.app.state, conversation_store)
+        if wake_only:
+            # The runner this launches can connect after the wake gives up waiting.
+            hold_reconnect_recovery(session_id)
         runner_client, conv = await ensure_runner_connected(
             session_id=session_id,
             conv=conv,
@@ -764,21 +776,35 @@ async def _recover_retry_session_once(
         if startup
         else []
     )
-    resumes_wake = (
+    owes_resume = (
         not wake_only
-        and not saved_inputs
         and conv.runner_id is not None
         and skipped_resume_runner(session_id) == conv.runner_id
-        # Native harnesses never resume from history, so only these runners owe a resume.
+    )
+    resumes_wake = (
+        owes_resume
+        and not saved_inputs
+        # Native harnesses never resume a turn from history.
         and not _is_native_terminal_session(conv)
     )
     initializer = getattr(request.app.state, "runner_session_initializer", None)
-    if resumes_wake and initializer is not None and conv.runner_id is not None:
-        # Repeat the handshake the wake suppressed rather than reuse its response.
+    if owes_resume and initializer is not None and conv.runner_id is not None:
+        # Repeat the handshake the wake held, which also releases its held sub-agent results.
         initializer.forget_completed_handshake(session_id, runner_id=conv.runner_id)
     if wake_only and not was_connected and conv.runner_id is not None:
         # Record it before the handshake so a failed wake still leaves the turn for Resume.
         note_skipped_resume(session_id, conv.runner_id)
+    if (
+        wake_only
+        and conv.runner_id is not None
+        and not _runner_holds_subagent_wakes(
+            getattr(request.app.state, "tunnel_registry", None), conv.runner_id
+        )
+    ):
+        # Its init would wake parents for recovered results; Resume initializes it instead.
+        if runner_relaunched:
+            return {"queued": False, "recovered": True, "recovery": "runner_relaunched"}
+        return {"queued": False, "recovered": False, "recovery": "already_connected"}
     terminal_ready_from_init = await _ensure_runner_session_initialized(
         session_id,
         conv,

@@ -924,9 +924,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/files/test_asleep_sandbox_auto_wake.py` uses the same patch,
   with workspace reads failing until the wake succeeds. It checks that opening
   Files in the desktop rail sends only a wake-only `retry_session` and then
-  lists the files, and that a failed wake offers Try again, not a live sandbox
-  resume. The mobile drawer and the older-server fallback are covered by
-  `web/src/shell/FilesPanel.test.tsx`.
+  lists the files. A failed wake's Try again, the mobile drawer, and the
+  older-server fallback are covered by `web/src/shell/FilesPanel.test.tsx`.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It

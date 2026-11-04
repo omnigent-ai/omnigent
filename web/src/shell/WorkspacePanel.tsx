@@ -1189,10 +1189,12 @@ function WorkspacePanelImpl({
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
+  // A phone hides the rail with CSS and shows its own drawer instead.
+  const railShown = !pending && open && !isMobile && (maximized || width > 0);
   // Mirrors the tab strip's own `active` rules, so Close Tab closes exactly
   // the tab drawn as selected.
   const closeSelectedTab = (): boolean => {
-    if (pending || !open || (!contained && isMobile) || (!maximized && width <= 0)) return false;
+    if (!railShown) return false;
     if (selectedFilePath !== null) {
       closeFileTabRef.current?.();
       return true;
@@ -1850,8 +1852,7 @@ function WorkspacePanelImpl({
               <FilesPanel
                 conversationId={contained ? conversationId : undefined}
                 frameless
-                // A phone hides the rail with CSS; its Files drawer has its own panel.
-                active={open && !inert && filesPanelActive && !isMobile && (maximized || width > 0)}
+                active={railShown && !inert && filesPanelActive}
                 onFileSelect={openFileViewer}
                 flatView={rightRailTab === "changes"}
                 showHidden={filesPanelShowHidden}

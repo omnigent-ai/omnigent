@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
-import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import ParamSpec, TypeVar
@@ -36,13 +34,10 @@ _restoration_tasks: WorkspaceScopedCache[tuple[str, str, int], asyncio.Task[None
 )
 
 
-# The runner-connect hook can run after the wake-only retry that launched it returns.
-_WAKE_ONLY_RECONNECT_GRACE_S = 60.0
 _wake_only_retries: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
-_recent_wake_only_retries: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache(
-    lambda: cachetools.TTLCache(
-        maxsize=math.inf, ttl=_WAKE_ONLY_RECONNECT_GRACE_S, timer=lambda: time.monotonic()
-    )
+# A runner a wake-only retry launched can connect after that retry gives up.
+_held_reconnect_recoveries: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=4096)
 )
 # Session -> runner a wake brought up without resuming its interrupted turn.
 _skipped_resumes: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
@@ -52,10 +47,7 @@ _skipped_resumes: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
 
 @contextmanager
 def defer_reconnect_recovery(session_id: str) -> Iterator[None]:
-    """Keep runner-connect recovery of *session_id*'s tree off during a wake-only retry.
-
-    The tree's interrupted turns then resume on its next message instead.
-    """
+    """Keep runner-connect recovery of *session_id*'s tree off during a wake-only retry."""
     _wake_only_retries[session_id] = _wake_only_retries.get(session_id, 0) + 1
     try:
         yield
@@ -65,17 +57,21 @@ def defer_reconnect_recovery(session_id: str) -> Iterator[None]:
             _wake_only_retries[session_id] = remaining
         else:
             _wake_only_retries.pop(session_id, None)
-        _recent_wake_only_retries[session_id] = True
+
+
+def hold_reconnect_recovery(session_id: str) -> None:
+    """Keep runner-connect recovery of *session_id*'s tree off until requested work starts."""
+    _held_reconnect_recoveries[session_id] = True
 
 
 def end_reconnect_deferral(session_id: str) -> None:
     """Let runner-connect recovery resume *session_id*'s tree once requested work starts."""
-    _recent_wake_only_retries.pop(session_id, None)
+    _held_reconnect_recoveries.pop(session_id, None)
 
 
 def reconnect_recovery_deferred(session_id: str) -> bool:
-    """Whether a wake-only retry of *session_id* is running or just finished."""
-    return session_id in _wake_only_retries or session_id in _recent_wake_only_retries
+    """Whether a wake-only retry of *session_id* is running or launched a runner."""
+    return session_id in _wake_only_retries or session_id in _held_reconnect_recoveries
 
 
 def note_skipped_resume(session_id: str, runner_id: str) -> None:
@@ -89,7 +85,7 @@ def skipped_resume_runner(session_id: str) -> str | None:
 
 
 def clear_skipped_resume(session_id: str) -> None:
-    """Forget *session_id*'s skipped resume once a plain retry has run it."""
+    """Forget *session_id*'s skipped resume once a plain retry or reconnect recovery runs it."""
     _skipped_resumes.pop(session_id, None)
 
 
@@ -240,6 +236,9 @@ async def restore_active_children(
     if initializer.generation_for(runner_id, client) != generation:
         _logger.info("Stopped restoring children of %s: runner tunnel changed", parent.id)
         return
+    # A woken child no longer holds back recovery of the tree restored here.
+    for session_id in tree:
+        end_reconnect_deferral(session_id)
     active = {row.id for row in tree.values() if row.id != parent.id and _interrupted(row)}
     needed = set(active)
     for row in reversed(list(tree.values())):

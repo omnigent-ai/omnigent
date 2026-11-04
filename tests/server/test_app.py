@@ -2763,7 +2763,9 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
     from omnigent.entities import Conversation
     from omnigent.runner.routing import RoutedRunner
     from omnigent.server.child_session_recovery import (
-        defer_reconnect_recovery,
+        hold_reconnect_recovery,
+        note_skipped_resume,
+        reconnect_recovery_deferred,
         skipped_resume_runner,
     )
     from omnigent.server.routes import sessions as sessions_routes
@@ -2772,21 +2774,28 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
     runner_id = "runner_wake_only_reconnect_test"
     store = SqlAlchemyConversationStore(db_uri)
     children: dict[str, str] = {}
-    for root_id in _bind_sessions(db_uri, runner_id, count=2):
+    root_ids = _bind_sessions(db_uri, runner_id, count=3)
+    for root_id, child_runner_id in zip(
+        root_ids, ["offline_runner", "offline_runner", runner_id], strict=True
+    ):
         root = store.get_conversation(root_id)
         assert root is not None
         store.set_session_live_status(root.id, "idle")
         child = store.create_conversation(
             agent_id=root.agent_id,
-            runner_id="offline_runner",
+            runner_id=child_runner_id,
             kind="sub_agent",
             parent_conversation_id=root.id,
         )
         store.set_session_live_status(child.id, "running")
         children[root.id] = child.id
-    woken_id, other_id = children
-    with defer_reconnect_recovery(woken_id):
-        pass  # the retry has returned; its runner's connect hook runs next
+    woken_id, other_id, woken_child_root_id = root_ids
+    woken_child_id = children[woken_child_root_id]
+    # The wakes that launched this runner have returned; its connect hook runs next.
+    hold_reconnect_recovery(woken_id)
+    hold_reconnect_recovery(woken_child_id)
+    # An earlier wake skipped this tree's resume; this connect's recovery runs it.
+    note_skipped_resume(other_id, "earlier_runner")
     connection = _attach_live_connection(app, monkeypatch, runner_id)
     monkeypatch.setattr(
         app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
@@ -2812,7 +2821,12 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
     assert sorted(initialized) == sorted([other_id, children[other_id]])
     assert store.get_conversation(children[woken_id]).runner_id == "offline_runner"  # type: ignore[union-attr]
     assert skipped_resume_runner(woken_id) == runner_id
+    assert skipped_resume_runner(woken_child_id) == runner_id
+    assert skipped_resume_runner(woken_child_root_id) == runner_id
     assert skipped_resume_runner(other_id) is None
+    # Only requested work ends the holds, so a later reconnect leaves the trees too.
+    assert reconnect_recovery_deferred(woken_id)
+    assert reconnect_recovery_deferred(woken_child_id)
 
 
 @pytest.mark.asyncio

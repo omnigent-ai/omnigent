@@ -16,6 +16,7 @@ import {
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 import { retrySession } from "@/lib/sessionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
@@ -30,7 +31,12 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   retrySession: vi.fn(),
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+  ...(await importOriginal<typeof RunnerHealthModule>()),
+  useSessionRunnerOnline: vi.fn(),
+}));
 
+import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useSession } from "@/hooks/useSession";
 import { resetSandboxWakesForTesting } from "@/hooks/useSandboxAutoWake";
 import { FilesPanel, revealFolderInFilesPanel } from "./FilesPanel";
@@ -86,6 +92,7 @@ vi.mock("@/hooks/useSession", () => ({
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
 const retrySessionMock = vi.mocked(retrySession);
 const useAsleepMock = vi.mocked(useWorkspaceAsleep);
+const useRunnerOnlineMock = vi.mocked(useSessionRunnerOnline);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
 const useDirectoriesMock = vi.mocked(useWorkspaceDirectories);
@@ -285,6 +292,7 @@ beforeEach(() => {
   serverInfo = WAKE_CAPABLE_INFO;
   useAllFilesMock.mockReset();
   useAsleepMock.mockReturnValue(false);
+  useRunnerOnlineMock.mockReturnValue(undefined);
   retrySessionMock.mockReset();
   retrySessionMock.mockResolvedValue({ queued: false, recovered: true });
   useChangedFilesMock.mockReset();
@@ -461,25 +469,6 @@ describe("FilesPanel on an asleep sandbox", () => {
     },
   );
 
-  it("loads the files once the sandbox is back", async () => {
-    useAsleepMock.mockReturnValue(true);
-    const { rerender } = renderPanel({
-      conversationId: "conv_asleep",
-      files: [],
-      listsLoaded: false,
-    });
-    await act(async () => {});
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-
-    useAsleepMock.mockReturnValue(false);
-    useAllFilesMock.mockReturnValue(allFilesResult([file("README.md")]));
-    rerender(panelAt("conv_asleep"));
-
-    expect(screen.getByText("README.md")).toBeInTheDocument();
-    expect(screen.queryByText("Starting sandbox…")).not.toBeInTheDocument();
-    expect(retrySessionMock).toHaveBeenCalledTimes(1);
-  });
-
   it("keeps starting the sandbox while a cached tab shows and it still sleeps", async () => {
     useAsleepMock.mockReturnValue(true);
     const { rerender } = renderPanel({
@@ -577,7 +566,7 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
   });
 
-  it("offers Start sandbox, not another automatic wake, when it sleeps again while open", async () => {
+  it("loads the files once the sandbox is back, and only offers to start it once it sleeps again", async () => {
     useAsleepMock.mockReturnValue(true);
     const { rerender } = renderPanel({
       conversationId: "conv_asleep",
@@ -585,14 +574,18 @@ describe("FilesPanel on an asleep sandbox", () => {
       listsLoaded: false,
     });
     await act(async () => {});
+    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
     expect(retrySessionMock).toHaveBeenCalledTimes(1);
 
     useAsleepMock.mockReturnValue(false);
+    useRunnerOnlineMock.mockReturnValue(true);
     useAllFilesMock.mockReturnValue(allFilesResult([file("README.md")]));
     rerender(panelAt("conv_asleep"));
     expect(screen.getByText("README.md")).toBeInTheDocument();
+    expect(screen.queryByText("Starting sandbox…")).not.toBeInTheDocument();
 
     useAsleepMock.mockReturnValue(true);
+    useRunnerOnlineMock.mockReturnValue(false);
     useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
     await act(async () => rerender(panelAt("conv_asleep")));
     expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();

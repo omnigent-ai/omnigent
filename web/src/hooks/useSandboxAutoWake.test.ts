@@ -263,15 +263,21 @@ describe("useSandboxAutoWake", () => {
     expect(result.current.phase).toBe("waking");
   });
 
-  it("fails when the sandbox stays asleep after the server reports the wake", async () => {
+  it.each<[string, Partial<Props>]>([
+    ["stays asleep", {}],
+    ["leaves sleep but its runner never comes online", { asleep: false }],
+  ])("fails when the sandbox %s after the server reports the wake", async (_label, liveness) => {
     vi.useFakeTimers();
-    const { result } = renderWake(asleepAndOpen);
+    const { result, rerender } = renderWake(asleepAndOpen);
     await act(async () => {});
+    rerender({ ...asleepAndOpen, ...liveness });
     expect(result.current.phase).toBe("waking");
 
     act(() => vi.advanceTimersByTime(SANDBOX_WAKE_SETTLE_MS));
+    rerender(asleepAndOpen);
     expect(result.current.phase).toBe("failed");
     expect(result.current.error).toBe("The sandbox didn't come back online.");
+    expect(retryMock).toHaveBeenCalledTimes(1);
   });
 
   it("starts fresh for another session in the same view", async () => {

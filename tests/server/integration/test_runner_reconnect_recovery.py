@@ -681,6 +681,7 @@ async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the
     app: FastAPI, agent: Agent, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A runner reconnecting after its wake failed leaves the interrupted turn for Resume."""
+    from omnigent.server.child_session_recovery import reconnect_recovery_deferred
     from omnigent.server.routes._sessions import orchestration
     from omnigent.server.routes.sessions import routes_events
 
@@ -692,6 +693,8 @@ async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the
         retry_url, json={"type": "retry_session", "data": {"wake_only": True}}
     )
     assert wake.status_code == 503, wake.text
+    # Nothing expires the hold, so however late the runner connects it finds the turn left.
+    assert reconnect_recovery_deferred(interrupted.id)
     inits: list[dict[str, Any]] = []
 
     async def respond(request: httpx.Request) -> httpx.Response:
@@ -706,3 +709,4 @@ async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the
         assert resume.status_code == 202, resume.text
 
     assert [init["suppress_recovery_turn"] for init in inits] == [False]
+    assert not reconnect_recovery_deferred(interrupted.id)
