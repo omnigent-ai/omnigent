@@ -7,6 +7,7 @@ import {
   QUERY_RETRY_BASE_MS,
   QUERY_RETRY_MAX_MS,
   queryRetryDelay,
+  RETRY_AFTER_JITTER,
 } from "./queryRetry";
 
 afterEach(() => {
@@ -50,10 +51,19 @@ describe("queryRetryDelay", () => {
     expect(queryRetryDelay(20, new Error("x"))).toBe(QUERY_RETRY_MAX_MS * 1.5);
   });
 
-  it("waits the server's Retry-After, bounded", () => {
+  it("waits the server's Retry-After, bounded, stretched by up to a quarter", () => {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
     expect(queryRetryDelay(0, new ApiError("slow down", 429, null, 12_000))).toBe(12_000);
     expect(queryRetryDelay(0, new ApiError("slow down", 429, null, 10 * 60_000))).toBe(
       QUERY_RETRY_AFTER_MAX_MS,
     );
+    random.mockReturnValue(1);
+    expect(queryRetryDelay(0, new ApiError("slow down", 429, null, 12_000))).toBe(
+      12_000 * (1 + RETRY_AFTER_JITTER),
+    );
+    // A zero hint means "now"; an absent one falls back to the jittered backoff.
+    expect(queryRetryDelay(0, new ApiError("now", 503, null, 0))).toBe(0);
+    random.mockReturnValue(0);
+    expect(queryRetryDelay(0, new ApiError("plain", 503, null))).toBe(QUERY_RETRY_BASE_MS / 2);
   });
 });

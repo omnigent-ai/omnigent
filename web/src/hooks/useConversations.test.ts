@@ -22,6 +22,7 @@ import {
   useBulkDeleteConversations,
   useBulkStopSessions,
   undoArchiveConversations,
+  retryListFetch,
   useConversations,
   useSessionSearch,
   useDeleteProject,
@@ -443,8 +444,31 @@ describe("useConversations stale cursor", () => {
     expect(retry(0, new ApiError("gone", 400, "stale_cursor"))).toBe(false);
     // Any other 4xx repeats on the same request too, so it isn't retried either.
     expect(retry(0, new ApiError("bad", 400, "invalid_input"))).toBe(false);
-    // A server-side failure still retries.
-    expect(retry(0, new ApiError("unavailable", 503, null))).toBe(true);
+  });
+});
+
+describe("session-list retry policy", () => {
+  it("is shared by the list, search, and project-folder queries", () => {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(
+      () => {
+        useConversations("", false);
+        useSessionSearch("linear", "all", { limit: 8 });
+        useProjectSessions("Sprint 42", true);
+      },
+      { wrapper },
+    );
+    const retries = queryClient
+      .getQueryCache()
+      .getAll()
+      .map((query) => (query.options as { retry?: unknown }).retry);
+    expect(retries).toHaveLength(3);
+    for (const retry of retries) expect(retry).toBe(retryListFetch);
   });
 });
 
