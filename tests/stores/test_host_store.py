@@ -2183,6 +2183,8 @@ def test_recovery_fences_expired_attempts_and_connected_hosts(host_store: HostSt
         sandbox_id="old",
         token_expires_at=now_epoch() + 1000,
     )
+    with pytest.raises(ValueError, match="no longer available"):
+        host_store.managed_recovery_result(host.host_id)
     assert host_store.claim_managed_recovery(host, "first")
     assert not host_store.claim_managed_recovery(host, "second")
     host_store.update_managed_recovery(host.host_id, "first", finished=True)

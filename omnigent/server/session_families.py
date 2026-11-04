@@ -12,12 +12,10 @@ from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.schemas import SessionFamily
 from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores.conversation_store import (
-    FAMILY_PIN_LABEL_PREFIX,
-    PINNED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationStore,
-    pinned_label_key,
+    family_pinned_label_key,
 )
 from omnigent.stores.permission_store import PermissionStore
 
@@ -113,9 +111,7 @@ def project_families(
     result = {item.id: item for item in sessions}
     families: dict[str, SessionFamily] = {}
     seen: set[str] = set()
-    pin_key = FAMILY_PIN_LABEL_PREFIX + pinned_label_key(user_id).removeprefix(
-        PINNED_LABEL_KEY + "."
-    )
+    pin_key = family_pinned_label_key(user_id)
     for item in candidates:
         family_id = item.family_id
         assert family_id is not None

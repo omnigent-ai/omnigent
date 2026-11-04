@@ -144,14 +144,12 @@ SIDE_CHAT_COPY_ID_PREFIX_LEN = 12
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"
 
-# ``conversation_labels.key`` is ``String(128)``. The prefix ``omnigent.pinned.``
-# is 16 chars, so a raw ``user_id`` suffix must stay ≤ 112 chars to fit. User ids
-# are ``String(128)`` elsewhere (SSO subject ids can be long), so a raw suffix
-# could overflow the key column — Postgres errors, MySQL silently truncates (and
-# two long ids could then collide on the truncated key). To stay safe while
-# keeping the common case (emails) human-readable in the DB, ids that don't fit
-# are replaced with a fixed-width hash suffix.
-_PINNED_LABEL_MAX_SUFFIX_LEN = 128 - len(PINNED_LABEL_KEY) - 1  # minus the "." joiner
+
+def _scoped_pin_key(prefix: str, user_id: str | None) -> str:
+    suffix = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
+    if len(suffix) > 128 - len(prefix):
+        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    return prefix + suffix
 
 
 def pinned_label_key(user_id: str | None) -> str:
@@ -169,11 +167,7 @@ def pinned_label_key(user_id: str | None) -> str:
     :returns: ``"omnigent.pinned.<suffix>"`` (suffix = the id, or its hash when
         the id is too long).
     """
-    suffix = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
-    if len(suffix) > _PINNED_LABEL_MAX_SUFFIX_LEN:
-        # 64 hex chars — well within the budget and collision-safe.
-        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
-    return f"{PINNED_LABEL_KEY}.{suffix}"
+    return _scoped_pin_key(PINNED_LABEL_KEY + ".", user_id)
 
 
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
@@ -191,6 +185,11 @@ SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_sou
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
 FAMILY_PIN_LABEL_PREFIX = "omnigent.family_pinned."
 MAX_SESSION_FAMILY_MEMBERS = 100
+
+
+def family_pinned_label_key(user_id: str | None) -> str:
+    """Derive the caller's family pin key within the label column's length limit."""
+    return _scoped_pin_key(FAMILY_PIN_LABEL_PREFIX, user_id)
 
 
 # Labels that must NOT cross into a new session context — deliberately

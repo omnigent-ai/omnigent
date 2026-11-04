@@ -119,6 +119,7 @@ from omnigent.stores.conversation_store import (
     ProfileHostBinding,
     SessionActivity,
     SessionConnectivity,
+    family_pinned_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -1783,6 +1784,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def _lock_session_family(self, session: Session, family_id: str) -> None:
         """Keep the family lock after its original session is deleted."""
+        # ponytail: one retained lock per moved/grouped source; reclaim only with
+        # coordinated deletion and admission across split databases.
         from sqlalchemy.dialects.mysql import insert as mysql_insert
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -1868,7 +1871,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise ConversationNotFoundError(source_id)
         family_id = source.family_id or source.id
         pin_key = pinned_label_key(user_id)
-        family_pin_key = FAMILY_PIN_LABEL_PREFIX + pin_key.removeprefix(PINNED_LABEL_KEY + ".")
+        family_pin_key = family_pinned_label_key(user_id)
 
         def write(session: Session) -> None:
             self._lock_session_family(session, family_id)
@@ -1931,9 +1934,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if source is None or source.family_id is None:
             raise OmnigentError("Session has no family", code=ErrorCode.INVALID_INPUT)
         family_id = source.family_id
-        key = FAMILY_PIN_LABEL_PREFIX + pinned_label_key(user_id).removeprefix(
-            PINNED_LABEL_KEY + "."
-        )
+        key = family_pinned_label_key(user_id)
 
         def write(session: Session) -> None:
             self._lock_session_family(session, family_id)
@@ -3717,10 +3718,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlConversationLabel.key.in_(
                                 [
                                     pinned_label_key(pinned_owner),
-                                    FAMILY_PIN_LABEL_PREFIX
-                                    + pinned_label_key(pinned_owner).removeprefix(
-                                        PINNED_LABEL_KEY + "."
-                                    ),
+                                    family_pinned_label_key(pinned_owner),
                                 ]
                             ),
                         )

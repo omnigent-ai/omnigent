@@ -7748,8 +7748,10 @@ def test_list_conversations_filters_by_project_name_dual_read(
     assert labelled.id not in unfiled_ids
 
 
+@pytest.mark.parametrize("user_id", ["alice", "a" * 112])
 def test_list_conversations_filters_by_pinned_label(
     conversation_store: SqlAlchemyConversationStore,
+    user_id: str,
 ) -> None:
     """``list_conversations(pinned=True, pinned_owner=<user>)`` returns only the
     sessions THAT user has pinned — matched by their per-user
@@ -7762,12 +7764,12 @@ def test_list_conversations_filters_by_pinned_label(
     other = conversation_store.create_conversation(title="other")
     also_pinned_by_bob = conversation_store.create_conversation(title="bob's pin")
     # Alice pins one; Bob pins a different one — each under their own key.
-    conversation_store.set_labels(pinned.id, {pinned_label_key("alice"): "1721760000000"})
+    conversation_store.set_labels(pinned.id, {pinned_label_key(user_id): "1721760000000"})
     conversation_store.set_labels(
         also_pinned_by_bob.id, {pinned_label_key("bob"): "1721760000000"}
     )
 
-    alice_page = conversation_store.list_conversations(pinned=True, pinned_owner="alice")
+    alice_page = conversation_store.list_conversations(pinned=True, pinned_owner=user_id)
     alice_ids = {c.id for c in alice_page.data}
     assert alice_ids == {pinned.id}
     # Bob's pin and the never-pinned row must not surface for Alice.
@@ -7775,27 +7777,30 @@ def test_list_conversations_filters_by_pinned_label(
     assert other.id not in alice_ids
 
     # Unpin (Alice's key deleted) removes it from her pinned filter.
-    conversation_store.delete_label(pinned.id, pinned_label_key("alice"))
-    assert conversation_store.list_conversations(pinned=True, pinned_owner="alice").data == []
+    conversation_store.delete_label(pinned.id, pinned_label_key(user_id))
+    assert conversation_store.list_conversations(pinned=True, pinned_owner=user_id).data == []
+
+    conversation_store.add_new_sibling(pinned.id, other.id, user_id=user_id)
+    conversation_store.set_family_pin(pinned.id, "1721760000001", user_id=user_id)
+    assert {
+        row.id
+        for row in conversation_store.list_conversations(pinned=True, pinned_owner=user_id).data
+    } == {pinned.id, other.id}
+    conversation_store.set_family_pin(pinned.id, "", user_id=user_id)
+    assert conversation_store.list_conversations(pinned=True, pinned_owner=user_id).data == []
 
 
-def test_pinned_label_key_fits_column_for_long_user_ids() -> None:
-    """The per-user pin key must never overflow the ``String(128)`` label-key
-    column. Short ids stay verbatim (DB-readable); an over-long id (e.g. a long
-    SSO subject) falls back to a fixed-width hash suffix, deterministic in the
-    id so writes and the pinned filter still agree."""
-    from omnigent.stores.conversation_store import PINNED_LABEL_KEY, pinned_label_key
+@pytest.mark.parametrize("length", [105, 106, 112, 113, 128, 200])
+@pytest.mark.parametrize("family", [False, True])
+def test_pinned_label_key_fits_column_for_long_user_ids(length, family) -> None:
+    from omnigent.stores.conversation_store import family_pinned_label_key, pinned_label_key
 
-    # A normal email is used verbatim.
-    assert pinned_label_key("alice@example.com") == f"{PINNED_LABEL_KEY}.alice@example.com"
-
-    # A 200-char id can't fit raw; the key must still be ≤ 128 and deterministic.
-    long_id = "u" * 200
-    key = pinned_label_key(long_id)
+    key_for = family_pinned_label_key if family else pinned_label_key
+    assert key_for("alice@example.com").endswith(".alice@example.com")
+    key = key_for("u" * length)
     assert len(key) <= 128
-    assert key == pinned_label_key(long_id)  # deterministic
-    # Distinct long ids don't collide.
-    assert pinned_label_key("u" * 200) != pinned_label_key("v" * 200)
+    assert key == key_for("u" * length)
+    assert key != key_for("v" * length)
 
 
 def test_list_projects_owned_by_excludes_shared_only_projects(
@@ -9754,13 +9759,15 @@ def test_spawn_tree_read_examines_rows_through_the_root_index(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("split_database", [False, True])
-async def test_sibling_family_lifecycle(tmp_path, split_database):
+@pytest.mark.parametrize("user_id", ["alice", "a" * 112])
+async def test_sibling_family_lifecycle(tmp_path, split_database, user_id):
     from concurrent.futures import ThreadPoolExecutor
 
     from omnigent.db.db_models import workspace_scope
     from omnigent.errors import OmnigentError
     from omnigent.stores.conversation_store import (
         FAMILY_PIN_LABEL_PREFIX,
+        family_pinned_label_key,
         pinned_label_key,
     )
 
@@ -9771,10 +9778,10 @@ async def test_sibling_family_lifecycle(tmp_path, split_database):
     source = store.create_conversation(conversation_id="1" * 32, title="Coordinator")
     first = store.create_conversation(conversation_id="2" * 32, title="Research")
     second = store.create_conversation(conversation_id="3" * 32, title="Implementation")
-    store.set_labels(source.id, {pinned_label_key("alice"): "123"})
+    store.set_labels(source.id, {pinned_label_key(user_id): "123"})
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
-            executor.submit(store.add_new_sibling, source.id, member.id, user_id="alice")
+            executor.submit(store.add_new_sibling, source.id, member.id, user_id=user_id)
             for member in (first, second)
         ]
         for future in futures:
@@ -9782,11 +9789,18 @@ async def test_sibling_family_lifecycle(tmp_path, split_database):
     family = store.get_session_family(first.id)
     assert [member.id for member in family] == [source.id, first.id, second.id]
     assert all(member.family_id == source.id for member in family)
+    assert {
+        row.id for row in store.list_conversations(pinned=True, pinned_owner=user_id).data
+    } == {
+        source.id,
+        first.id,
+        second.id,
+    }
     assert all("omnigent.session_family_id" not in member.labels for member in family)
     with workspace_scope(424242):
         other_source = store.create_conversation(conversation_id=source.id)
         other_sibling = store.create_conversation(conversation_id="6" * 32)
-        store.add_new_sibling(other_source.id, other_sibling.id, user_id="alice")
+        store.add_new_sibling(other_source.id, other_sibling.id, user_id=user_id)
         assert {member.id for member in store.get_session_family(other_source.id)} == {
             other_source.id,
             other_sibling.id,
@@ -9800,33 +9814,33 @@ async def test_sibling_family_lifecycle(tmp_path, split_database):
         member.parent_conversation_id is None and member.root_conversation_id == member.id
         for member in family
     )
-    assert all(FAMILY_PIN_LABEL_PREFIX + "alice" in member.labels for member in family)
-    assert pinned_label_key("alice") not in family[0].labels
+    assert all(family_pinned_label_key(user_id) in member.labels for member in family)
+    assert pinned_label_key(user_id) not in family[0].labels
     fork = store.fork_conversation(source.id)
     assert fork.family_id is None
     assert [member.id for member in store.get_session_family(fork.id)] == [fork.id]
     assert not any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in fork.labels)
     for parent in (source, fork):
         with pytest.raises(OmnigentError, match="no longer available"):
-            store.add_new_sibling(parent.id, first.id, user_id="alice")
-    store.set_labels(first.id, {pinned_label_key("alice"): "234"})
-    store.set_family_pin(source.id, "", user_id="alice")
-    assert store.get_conversation(first.id).labels[pinned_label_key("alice")] == "234"
+            store.add_new_sibling(parent.id, first.id, user_id=user_id)
+    store.set_labels(first.id, {pinned_label_key(user_id): "234"})
+    store.set_family_pin(source.id, "", user_id=user_id)
+    assert store.get_conversation(first.id).labels[pinned_label_key(user_id)] == "234"
     project_id = "4" * 32
     with pytest.raises(OmnigentError, match="representative"):
         store.set_conversation_project(first.id, project_id)
     store.set_conversation_project(source.id, project_id)
     assert all(member.project_id == project_id for member in store.get_session_family(second.id))
     store.update_conversation(source.id, archived=True)
-    store.set_family_pin(first.id, "345", user_id="alice")
+    store.set_family_pin(first.id, "345", user_id=user_id)
     assert await store.delete_conversation(source.id)
     assert [member.id for member in store.get_session_family(second.id)] == [first.id, second.id]
-    assert store.get_conversation(second.id).labels[FAMILY_PIN_LABEL_PREFIX + "alice"] == "345"
+    assert store.get_conversation(second.id).labels[family_pinned_label_key(user_id)] == "345"
     later = store.create_conversation(conversation_id="5" * 32, title="Follow-up")
-    store.add_new_sibling(second.id, later.id, user_id="alice")
+    store.add_new_sibling(second.id, later.id, user_id=user_id)
     assert store.get_conversation(later.id).family_id == source.id
     assert store.get_conversation(later.id).project_id == project_id
-    assert store.get_conversation(later.id).labels[FAMILY_PIN_LABEL_PREFIX + "alice"] == "345"
+    assert store.get_conversation(later.id).labels[family_pinned_label_key(user_id)] == "345"
     reopened = SqlAlchemyConversationStore(
         f"sqlite:///{tmp_path / 'metadata.db'}",
         f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
@@ -9839,7 +9853,7 @@ async def test_sibling_family_lifecycle(tmp_path, split_database):
 
     another = store.create_conversation()
     another_sibling = store.create_conversation()
-    store.add_new_sibling(another.id, another_sibling.id, user_id="alice")
+    store.add_new_sibling(another.id, another_sibling.id, user_id=user_id)
     families = store.get_session_families([source.id, another.id])
     assert [member.id for member in families[source.id]] == [first.id, second.id, later.id]
     assert [member.id for member in families[another.id]] == [another.id, another_sibling.id]

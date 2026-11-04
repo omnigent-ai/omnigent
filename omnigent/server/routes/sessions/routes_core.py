@@ -3240,7 +3240,7 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         if PINNED_LABEL_KEY in labels_to_set:
-            from omnigent.stores.conversation_store import FAMILY_PIN_LABEL_PREFIX
+            from omnigent.stores.conversation_store import family_pinned_label_key
 
             pin_source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             owner_grant = (
@@ -3264,9 +3264,7 @@ def register_core_routes(
                     conversation_store.get_session_family, session_id
                 )
                 active = [member for member in members if not member.archived]
-                family_pin_key = FAMILY_PIN_LABEL_PREFIX + pinned_label_key(user_id).removeprefix(
-                    PINNED_LABEL_KEY + "."
-                )
+                family_pin_key = family_pinned_label_key(user_id)
                 if (
                     active
                     and active[0].id == session_id
@@ -3682,20 +3680,14 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        # File into a first-class project (owner-only, gated above). ``""``
-        # unfiles; a non-empty id must name a project the caller owns. Filing
-        # into another owner's (or a missing) project is rejected as NOT_FOUND
-        # — the same 404 the projects API returns, so we don't leak existence.
+        # Unknown and foreign projects both return 404 to avoid leaking existence.
         if set_project:
             members = await asyncio.to_thread(conversation_store.get_session_family, session_id)
             for member in members:
                 await _require_access(
                     user_id, member.id, LEVEL_OWNER, permission_store, conversation_store
                 )
-            # ``""`` unfiles; a non-empty id files. Explicit JSON ``null`` is
-            # not a valid value here (omitting the field is how you leave
-            # membership unchanged), so reject it rather than treating it as a
-            # destructive unfile.
+            # Reject explicit null; omitting the field leaves membership unchanged.
             if body.project_id is None:
                 raise OmnigentError(
                     'project_id must be a project id or "" to unfile; '

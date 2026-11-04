@@ -262,6 +262,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 # boot), so a healthy launch registers in seconds; the budget covers a
 # cold registry pull of the image on first use.
 MANAGED_HOST_ONLINE_TIMEOUT_S = 120
+_MANAGED_RECOVERY_HEARTBEAT_S = 20
 _ONLINE_POLL_INTERVAL_S = 1.0
 
 # Provider defaults; sandbox.token_ttl_s can override these windows.
@@ -3979,7 +3980,7 @@ async def relaunch_managed_host(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not claimed:
-        for _ in range(MANAGED_HOST_ONLINE_TIMEOUT_S * 2):
+        while True:
             try:
                 result = await asyncio.to_thread(host_store.managed_recovery_result, host.host_id)
             except ValueError as exc:
@@ -3992,18 +3993,17 @@ async def relaunch_managed_host(
                     sandbox_provider=host.sandbox_provider,
                 )
             await asyncio.sleep(0.5)
-        raise HTTPException(
-            status_code=409,
-            detail="Another session is recovering this sandbox; retry once it is ready",
-        )
 
     async def renew() -> None:
         while True:
-            await asyncio.sleep(20)
-            if not await asyncio.to_thread(
-                host_store.update_managed_recovery, host.host_id, token
-            ):
-                return
+            await asyncio.sleep(_MANAGED_RECOVERY_HEARTBEAT_S)
+            try:
+                if not await asyncio.to_thread(
+                    host_store.update_managed_recovery, host.host_id, token
+                ):
+                    return
+            except Exception:
+                _logger.warning("Failed to renew sandbox recovery lease", exc_info=True)
 
     heartbeat = asyncio.create_task(renew())
     result = None
@@ -4024,14 +4024,17 @@ async def relaunch_managed_host(
         heartbeat.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat
-        await asyncio.to_thread(
-            host_store.update_managed_recovery,
-            host.host_id,
-            token,
-            finished=True,
-            workspace=result.workspace if result else None,
-            sandbox_id=result.sandbox_id if result else None,
-        )
+        try:
+            await asyncio.to_thread(
+                host_store.update_managed_recovery,
+                host.host_id,
+                token,
+                finished=True,
+                workspace=result.workspace if result else None,
+                sandbox_id=result.sandbox_id if result else None,
+            )
+        except Exception:
+            _logger.warning("Failed to finish sandbox recovery lease", exc_info=True)
 
 
 async def _relaunch_managed_host(

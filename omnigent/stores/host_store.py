@@ -1241,7 +1241,7 @@ class HostStore:
                 (current_workspace_id(), "__host_lifecycle__", "recovery:" + host_id),
             )
             if host is None or host.deleted_at is not None or lease is None:
-                return None
+                raise ValueError("Sandbox recovery is no longer available; retry the request")
             value = json.loads(lease.value)
             if value.get("workspace") and value.get("sandbox_id") == host.sandbox_id:
                 return value["workspace"], value["sandbox_id"]

@@ -6227,7 +6227,8 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
     assert fake.host_starts == []
 
 
-async def test_siblings_share_one_recovery_across_host_stores(db_uri: str) -> None:
+async def test_siblings_share_one_recovery_across_host_stores(db_uri, monkeypatch) -> None:
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 1)
     store = HostStore(db_uri)
     host = store.register_managed_host(
         host_id=uuid.uuid4().hex,
@@ -6265,7 +6266,8 @@ async def test_siblings_share_one_recovery_across_host_stores(db_uri: str) -> No
         loop.call_soon_threadsafe(joined.set)
         return result
 
-    second_store.claim_managed_recovery = claim
+    monkeypatch.setattr(second_store, "claim_managed_recovery", claim)
+    second = None
     try:
         async with asyncio.timeout(10):
             while not fake.prepared:
@@ -6278,6 +6280,8 @@ async def test_siblings_share_one_recovery_across_host_stores(db_uri: str) -> No
                 )
             )
             await joined.wait()
+            await asyncio.sleep(1.1)
+            assert not second.done()
             gate.set()
             results = await asyncio.gather(first, second)
         assert results[0] == results[1]
@@ -6285,4 +6289,57 @@ async def test_siblings_share_one_recovery_across_host_stores(db_uri: str) -> No
         assert fake.terminated == ["old-sandbox"]
     finally:
         gate.set()
-        await first
+        if second is not None and not second.done():
+            second.cancel()
+        await asyncio.gather(
+            first, *([second] if second is not None else []), return_exceptions=True
+        )
+
+
+@pytest.mark.parametrize("launch_fails", [False, True])
+async def test_recovery_bookkeeping_errors_preserve_launch_outcome(
+    db_uri, monkeypatch, launch_fails
+):
+    from omnigent.server import managed_hosts
+
+    store = HostStore(db_uri)
+    host = store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="recovery-errors",
+        user_id=_OWNER,
+        token="initial",
+        provider="modal",
+        sandbox_id="old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    heartbeat_seen = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    updates = []
+
+    def unavailable(*args, **kwargs):
+        updates.append(kwargs.get("finished", False))
+        loop.call_soon_threadsafe(heartbeat_seen.set)
+        raise RuntimeError("transient lease database failure")
+
+    expected = ManagedHostLaunch(
+        host_id=host.host_id, workspace="/work", sandbox_id="new", sandbox_provider="modal"
+    )
+
+    async def launch(**kwargs):
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=2)
+        if launch_fails:
+            raise ValueError("original provision failure")
+        return expected
+
+    monkeypatch.setattr(store, "update_managed_recovery", unavailable)
+    monkeypatch.setattr(managed_hosts, "_MANAGED_RECOVERY_HEARTBEAT_S", 0.001)
+    monkeypatch.setattr(managed_hosts, "_relaunch_managed_host", launch)
+    request = relaunch_managed_host(
+        config=_injected_config(FakeSandboxLauncher()), host=host, host_store=store
+    )
+    if launch_fails:
+        with pytest.raises(ValueError, match="original provision failure"):
+            await request
+    else:
+        assert await request == expected
+    assert updates[0] is False and updates[-1] is True
