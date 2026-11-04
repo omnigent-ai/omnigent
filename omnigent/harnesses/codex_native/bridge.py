@@ -194,6 +194,12 @@ class CodexNativeBridgeState:
     :param pending_shell_command_id: Submission awaiting authoritative turn reconciliation.
     :param pending_shell_parent_turn_id: Turn that was active before that submission.
     :param active_shell_turn_id: Standalone shell turn that cannot process prompts.
+    :param interrupt_generation: Stop requests fenced against this bridge owner.
+    :param interrupted_turn_id: Turn, or automatic-input source, targeted by the latest Stop.
+    :param automatic_input_source_turn_id: Completed turn that authorized automatic input.
+    :param automatic_input_client_message_id: Native delivery id allocated before submission.
+    :param automatic_input_turn_id: Native turn proven by the matching delivery receipt.
+    :param automatic_input_owner_scope: Session, thread, transport, and credential owner.
     """
 
     session_id: str
@@ -205,6 +211,12 @@ class CodexNativeBridgeState:
     pending_shell_command_id: str | None = None
     pending_shell_parent_turn_id: str | None = None
     active_shell_turn_id: str | None = None
+    interrupt_generation: int = 0
+    interrupted_turn_id: str | None = None
+    automatic_input_source_turn_id: str | None = None
+    automatic_input_client_message_id: str | None = None
+    automatic_input_turn_id: str | None = None
+    automatic_input_owner_scope: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1073,6 +1085,12 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "pending_shell_command_id": state.pending_shell_command_id,
                     "pending_shell_parent_turn_id": state.pending_shell_parent_turn_id,
                     "active_shell_turn_id": state.active_shell_turn_id,
+                    "interrupt_generation": state.interrupt_generation,
+                    "interrupted_turn_id": state.interrupted_turn_id,
+                    "automatic_input_source_turn_id": state.automatic_input_source_turn_id,
+                    "automatic_input_client_message_id": state.automatic_input_client_message_id,
+                    "automatic_input_turn_id": state.automatic_input_turn_id,
+                    "automatic_input_owner_scope": state.automatic_input_owner_scope,
                 },
                 handle,
                 sort_keys=True,
@@ -1093,6 +1111,25 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if _bridge_owner_matches(current, state) and current is not None:
+            current_interrupt_wins = current.interrupt_generation >= state.interrupt_generation
+            automatic_input = _automatic_input_fields(state)
+            if automatic_input[0] is None:
+                automatic_input = _automatic_input_fields(current)
+            state = replace(
+                state,
+                interrupt_generation=max(state.interrupt_generation, current.interrupt_generation),
+                interrupted_turn_id=(
+                    current.interrupted_turn_id
+                    if current_interrupt_wins
+                    else state.interrupted_turn_id
+                ),
+                automatic_input_source_turn_id=automatic_input[0],
+                automatic_input_client_message_id=automatic_input[1],
+                automatic_input_turn_id=automatic_input[2],
+                automatic_input_owner_scope=automatic_input[3],
+            )
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
@@ -1616,6 +1653,40 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     return read_bridge_state_result(bridge_dir).state
 
 
+def _optional_nonempty_string(value: object) -> str | None:
+    """Return an optional non-empty string after its separate shape check."""
+    return value if isinstance(value, str) and value else None
+
+
+def _optional_string_is_valid(value: object) -> bool:
+    """Accept a missing optional string or a non-empty string, never a blank value."""
+    return value is None or (isinstance(value, str) and bool(value))
+
+
+def _bridge_owner_scope(state: CodexNativeBridgeState) -> tuple[str, str, str, str]:
+    """Return the native session, thread, transport, and credential owner."""
+    return state.session_id, state.thread_id, state.socket_path, state.codex_home
+
+
+def _bridge_owner_matches(
+    current: CodexNativeBridgeState | None, expected: CodexNativeBridgeState
+) -> bool:
+    """Match all fields that can transfer control to another Codex runtime."""
+    return current is not None and _bridge_owner_scope(current) == _bridge_owner_scope(expected)
+
+
+def _automatic_input_fields(
+    state: CodexNativeBridgeState,
+) -> tuple[str | None, str | None, str | None, tuple[str, ...]]:
+    """Return one automatic input's durable claim and receipt as an atomic group."""
+    return (
+        state.automatic_input_source_turn_id,
+        state.automatic_input_client_message_id,
+        state.automatic_input_turn_id,
+        state.automatic_input_owner_scope,
+    )
+
+
 def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     """Read state once so failure diagnostics describe the delivery decision."""
     path = bridge_dir / _STATE_FILE
@@ -1653,6 +1724,29 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     parsed_active_turn_id = (
         active_turn_id if isinstance(active_turn_id, str) and active_turn_id else None
     )
+    interrupt_generation = raw.get("interrupt_generation", 0)
+    interrupted_turn_id = _optional_nonempty_string(raw.get("interrupted_turn_id"))
+    automatic_source = _optional_nonempty_string(raw.get("automatic_input_source_turn_id"))
+    automatic_client_id = _optional_nonempty_string(raw.get("automatic_input_client_message_id"))
+    automatic_turn_id = _optional_nonempty_string(raw.get("automatic_input_turn_id"))
+    automatic_owner = raw.get("automatic_input_owner_scope", [])
+    if (
+        type(interrupt_generation) is not int
+        or interrupt_generation < 0
+        or not _optional_string_is_valid(raw.get("interrupted_turn_id"))
+        or (interrupted_turn_id is not None and interrupt_generation == 0)
+        or not _optional_string_is_valid(raw.get("automatic_input_source_turn_id"))
+        or not _optional_string_is_valid(raw.get("automatic_input_client_message_id"))
+        or not _optional_string_is_valid(raw.get("automatic_input_turn_id"))
+        or not isinstance(automatic_owner, list)
+        or len(automatic_owner) not in {0, 4}
+        or any(not isinstance(value, str) or not value for value in automatic_owner)
+        or ((automatic_source is None) != (automatic_client_id is None))
+        or (automatic_source is None and (automatic_turn_id is not None or automatic_owner))
+        or (automatic_source is not None and len(automatic_owner) != 4)
+        or (automatic_source is not None and automatic_source == automatic_turn_id)
+    ):
+        return CodexNativeBridgeStateRead(None, "invalid_state")
     return CodexNativeBridgeStateRead(
         CodexNativeBridgeState(
             session_id=session_id,
@@ -1672,6 +1766,12 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             active_shell_turn_id=(
                 value if isinstance(value := raw.get("active_shell_turn_id"), str) else None
             ),
+            interrupt_generation=interrupt_generation,
+            interrupted_turn_id=interrupted_turn_id,
+            automatic_input_source_turn_id=automatic_source,
+            automatic_input_client_message_id=automatic_client_id,
+            automatic_input_turn_id=automatic_turn_id,
+            automatic_input_owner_scope=tuple(automatic_owner),
         ),
         "ready",
     )
@@ -1724,6 +1824,125 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
                 ),
             ),
         )
+
+
+def record_codex_interrupt(
+    bridge_dir: Path, *, expected: CodexNativeBridgeState
+) -> CodexNativeBridgeState | None:
+    """Fence Stop under the bridge lock and return the native turn it owns.
+
+    A control request resolves bridge state before it opens the app-server
+    connection. The thread, transport, account, or turn can change during that
+    gap. Record the Stop only while those fields still belong to the observation.
+    A claimed automatic input is the one exception: it can replace its completed
+    source while Stop is resolving, and an exact native receipt proves the turn
+    Stop should target. A request still awaiting that receipt records its source
+    so the eventual receipt remains recognizably interrupted.
+    """
+    with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if not _bridge_owner_matches(current, expected) or current is None:
+            return None
+        owns_automatic_input = (
+            current.automatic_input_source_turn_id == expected.active_turn_id
+            and current.automatic_input_owner_scope == _bridge_owner_scope(current)
+            and current.active_turn_id in {None, current.automatic_input_turn_id}
+        )
+        if current.active_turn_id != expected.active_turn_id and not owns_automatic_input:
+            return None
+        target_turn_id = current.active_turn_id or current.automatic_input_turn_id
+        interrupted_turn_id = (
+            target_turn_id or current.automatic_input_source_turn_id or expected.active_turn_id
+        )
+        updated = replace(
+            current,
+            interrupt_generation=current.interrupt_generation + 1,
+            interrupted_turn_id=interrupted_turn_id,
+        )
+        _write_bridge_state_unlocked(bridge_dir, updated)
+        # An accepted automatic turn can be known from its receipt before a
+        # delayed turn/started edge makes it the bridge's active turn.
+        return replace(updated, active_turn_id=target_turn_id)
+
+
+def claim_codex_automatic_input(
+    bridge_dir: Path,
+    completed: CodexNativeBridgeState,
+    *,
+    client_message_id: str,
+) -> CodexNativeBridgeState | None:
+    """Persist one automatic request before submission, or fail closed.
+
+    The caller must have observed the source as active and then proven it
+    completed. The claim consumes no input and grants no retry; it only records
+    the exact owner, Stop generation, source turn, and native delivery id that a
+    later receipt must echo.
+    """
+    source_turn_id = completed.active_turn_id
+    if source_turn_id is None or not client_message_id:
+        return None
+    with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if (
+            not _bridge_owner_matches(current, completed)
+            or current is None
+            or current.interrupt_generation != completed.interrupt_generation
+            or current.active_turn_id is not None
+            or current.pending_shell_command_id is not None
+            or current.active_shell_turn_id is not None
+            or current.interrupted_turn_id == source_turn_id
+            or current.automatic_input_source_turn_id is not None
+        ):
+            return None
+        updated = replace(
+            current,
+            automatic_input_source_turn_id=source_turn_id,
+            automatic_input_client_message_id=client_message_id,
+            automatic_input_owner_scope=_bridge_owner_scope(current),
+        )
+        _write_bridge_state_unlocked(bridge_dir, updated)
+        return updated
+
+
+def record_codex_automatic_input_receipt(
+    bridge_dir: Path,
+    *,
+    session_id: str,
+    thread_id: str,
+    turn_id: str,
+    client_message_id: str,
+) -> CodexNativeBridgeState | None:
+    """Bind an automatic request only to its exact native ``clientId`` echo."""
+    if not all((session_id, thread_id, turn_id, client_message_id)):
+        return None
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if (
+            state is None
+            or state.session_id != session_id
+            or state.thread_id != thread_id
+            or state.automatic_input_client_message_id != client_message_id
+            or state.automatic_input_source_turn_id is None
+            or state.automatic_input_source_turn_id == turn_id
+            or state.automatic_input_owner_scope != _bridge_owner_scope(state)
+            or state.automatic_input_turn_id not in {None, turn_id}
+        ):
+            return None
+        if state.automatic_input_turn_id == turn_id:
+            return state
+        updated = replace(state, automatic_input_turn_id=turn_id)
+        _write_bridge_state_unlocked(bridge_dir, updated)
+        return updated
+
+
+def codex_automatic_input_was_interrupted(state: CodexNativeBridgeState | None) -> bool:
+    """Return whether Stop targeted a claimed request before or after its receipt."""
+    return bool(
+        state is not None
+        and state.automatic_input_source_turn_id is not None
+        and state.interrupted_turn_id
+        in {state.automatic_input_source_turn_id, state.automatic_input_turn_id}
+    )
 
 
 def mark_shell_command_pending(
@@ -1841,6 +2060,7 @@ def clear_active_turn_id_if_matches(
     completed_turn_id: str | None,
     *,
     on_cleared: Callable[[], None] | None = None,
+    expected_owner: CodexNativeBridgeState | None = None,
 ) -> bool:
     """
     Clear the active Codex turn id if a terminal event matches it.
@@ -1871,6 +2091,9 @@ def clear_active_turn_id_if_matches(
         must not call any bridge-state function (doing so self-deadlocks). If it
         raises, the exception is caught and logged: the clear is already
         written, so a retry would not re-run the callback.
+    :param expected_owner: Optional full bridge owner observed before a delayed
+        operation. A transferred session, thread, transport, or credential home
+        is never cleared even when it reused the same turn id.
     :returns: ``True`` when bridge state was cleared or did not exist,
         ``False`` when a stale or ambiguous terminal event was ignored.
     """
@@ -1880,13 +2103,15 @@ def clear_active_turn_id_if_matches(
             return
         try:
             on_cleared()
-        except Exception:  # the clear is written; a retry cannot re-run it.
+        except Exception:  # noqa: BLE001 — the clear is written; any callback may fail.
             _logger.warning(
                 "Codex-native cleared-turn callback raised for %s", bridge_dir, exc_info=True
             )
 
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
+        if expected_owner is not None and not _bridge_owner_matches(state, expected_owner):
+            return False
         if state is None:
             _run_on_cleared()
             return True
