@@ -25,6 +25,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
+- `initial-folder-selection`: the new-session folder picker opens from a saved
+  workspace while the host list loads, or as soon as its host is known. Home
+  discovery and model loading do not block choosing a folder. Live availability
+  still gates Start, and late defaults preserve an explicit folder choice.
 - `pill-tooltip`: hovering the pill shows one tooltip with Harness, Model, and
   Connection rows (plus effort when the harness has it).
 - `pill-tooltip-suppressed`: the tooltip stays hidden while the model picker is
@@ -285,6 +289,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **New-session composer** (landing page, or New session):
 
+- Open the working-directory menu immediately after loading the page. On a
+  returning visit, select a recent repo before the host list finishes loading;
+  with a known host, Open folder is available while its home is still loading.
+  Confirm a folder or cancel browsing and check the chosen path stays correct
+  as the remaining configuration arrives.
 - Select **Codex → + → Plan** and confirm the **Plan mode** badge before sending.
 - Write a prompt or attach a file before choosing a working directory. Hover
   or focus disabled Start to see what is missing; click, tap, or press Enter to
@@ -418,6 +427,13 @@ picker is hidden or the catalog is empty. Host and sandbox runners must support
 managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
+
+- **`initial-folder-selection`, new-session composer:**
+  `tests/e2e_ui/start_session/test_picker_loading.py` holds host, model, and
+  worktree responses across fresh loads, reloads, and new tabs on desktop and
+  mobile. Cached repo selection must work before the host response and survive
+  the handoff to live data. Home discovery and provisional project browsing
+  are covered by `web/src/shell/NewChatDialog.test.tsx`.
 
 - **`touch-targets`, new-session and in-session composers:**
   `tests/browser_ui/chat/test_composer_geometry_contract.py::test_landing_and_live_cards_share_the_geometry_contract`

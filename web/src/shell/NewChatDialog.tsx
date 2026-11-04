@@ -333,7 +333,7 @@ import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
-import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
+import { readRecentWorkspaces, useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
@@ -2607,9 +2607,10 @@ export function NewChatLandingScreen() {
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
-  const [workspacePickerInitialPath, setWorkspacePickerInitialPath] = useState<string | undefined>(
-    undefined,
-  );
+  const [workspacePickerTarget, setWorkspacePickerTarget] = useState<{
+    hostId: string;
+    initialPath?: string;
+  } | null>(null);
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -2805,6 +2806,8 @@ export function NewChatLandingScreen() {
       seededConfigSigRef.current !== null &&
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
+    setWorkspacePickerOpen(false);
+    setWorkspacePopoverOpen(false);
     setSandboxSelected(false);
     setSandboxProfile(null);
     setSelectedHostId(null);
@@ -2912,7 +2915,8 @@ export function NewChatLandingScreen() {
   // the working-directory field is pre-filled and the user can send in one
   // click. Derived from the same home listing the picker uses (entries carry
   // absolute paths); only fetched when there's no recent to fall back to.
-  const needsHomeFallback = selectedHostId !== null && recent.length === 0;
+  const needsHomeFallback =
+    selectedHostId !== null && recent.length === 0 && workspace.trim() === "";
   const {
     data: homeListing,
     isLoading: homeListingLoading,
@@ -5069,8 +5073,15 @@ export function NewChatLandingScreen() {
     (branchName.trim() !== ""
       ? !workspaceIsGit
       : (prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true);
+  // Preview a settled default during the render before its seeding effect runs.
+  // A pending project or fork-fresh redirect must still choose its own path.
+  const workspaceDisplayPath =
+    workspaceTrimmed ||
+    (prefillSettled && forkFreshMainPath !== undefined
+      ? (forkFreshMainPath ?? autoSeedCandidate ?? "")
+      : "");
   const worktreeHeader = composerWorktreeHeaderState({
-    workspace: workspaceTrimmed,
+    workspace: workspaceDisplayPath,
     worktrees: hostWorktrees ?? [],
     worktreesResolved: !hostWorktreesArePlaceholder && hostWorktrees !== undefined,
     branchName,
@@ -5113,8 +5124,45 @@ export function NewChatLandingScreen() {
     (workspaceTrimmed === "" || workspaceTrimmed === storedWorkspacePreview.workspace)
       ? storedWorkspacePreview
       : null;
-  const visibleWorkspace = cachedWorkspace?.workspace ?? workspaceTrimmed;
+  const visibleWorkspace = cachedWorkspace?.workspace ?? workspaceDisplayPath;
   const visibleWorktreeHeader = cachedWorkspace ?? worktreeHeader;
+  // A saved folder can be chosen while its host is being revalidated. Live host
+  // availability still gates Send; a resolved list must contain the cached host.
+  const workspaceBrowseHostId =
+    selectedHostId ??
+    (cachedWorkspace &&
+    (hostsLoading || allHosts.some((host) => host.host_id === cachedWorkspace.hostId))
+      ? cachedWorkspace.hostId
+      : null);
+  const workspaceSelectionLoading = workspaceLoading && workspaceBrowseHostId === null;
+  const noWorkspaceHostSelected = noExecutionTargetSelected && workspaceBrowseHostId === null;
+  // Opening a cached folder is provisional. Keep its host pinned while late
+  // project defaults settle, and commit that host only when a folder is chosen.
+  const activeWorkspaceBrowseHostId = workspacePickerOpen
+    ? (workspacePickerTarget?.hostId ?? null)
+    : workspaceBrowseHostId;
+  const pickerRecent =
+    workspaceBrowseHostId === selectedHostId ? recent : readRecentWorkspaces(workspaceBrowseHostId);
+  const { addRecent: addBrowsedRecent } = useRecentWorkspaces(activeWorkspaceBrowseHostId);
+
+  function selectWorkspace(path: string) {
+    if (activeWorkspaceBrowseHostId === null) return;
+    if (selectedHostId !== activeWorkspaceBrowseHostId) selectHost(activeWorkspaceBrowseHostId);
+    workspaceFromConfigRef.current = false;
+    setWorkspace(path);
+    if (selectedHostId === activeWorkspaceBrowseHostId) addRecent(path);
+    else addBrowsedRecent(path);
+  }
+
+  function openWorkspacePicker(path: string) {
+    if (workspaceBrowseHostId === null) return;
+    setWorkspacePopoverOpen(false);
+    setWorkspacePickerTarget({
+      hostId: workspaceBrowseHostId,
+      initialPath: isNavigablePath(path) ? path : undefined,
+    });
+    setWorkspacePickerOpen(true);
+  }
 
   const pickerSelectionError =
     sandboxDefaultModelsEnabled &&
@@ -6312,8 +6360,8 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <ComposerWorkspaceTrigger
       kind="directory"
-      label={noExecutionTargetSelected ? "No host selected" : visibleWorktreeHeader.repositoryLabel}
-      iconOnly={noExecutionTargetSelected}
+      label={noWorkspaceHostSelected ? "No host selected" : visibleWorktreeHeader.repositoryLabel}
+      iconOnly={noWorkspaceHostSelected}
       icon={
         workspaceIsGit ? (
           <FolderGit2Icon
@@ -6328,20 +6376,20 @@ export function NewChatLandingScreen() {
         )
       }
       aria-label={
-        noExecutionTargetSelected
+        noWorkspaceHostSelected
           ? "Working directory: No host selected"
           : `Working directory: ${visibleWorkspace || "Not selected"}`
       }
       title={
         workspacePopoverOpen
           ? undefined
-          : noExecutionTargetSelected
+          : noWorkspaceHostSelected
             ? "No host selected"
             : visibleWorkspace || "Working directory not selected"
       }
-      disabled={noExecutionTargetSelected || workspaceLoading}
-      aria-busy={workspaceLoading || undefined}
-      className={noExecutionTargetSelected || workspaceLoading ? "disabled:opacity-100" : undefined}
+      disabled={workspaceBrowseHostId === null}
+      aria-busy={workspaceSelectionLoading || undefined}
+      className={workspaceBrowseHostId === null ? "disabled:opacity-100" : undefined}
       data-testid="new-chat-landing-workspace-chip"
     />
   );
@@ -6500,7 +6548,7 @@ export function NewChatLandingScreen() {
               data-testid="new-chat-landing-workspace-controls"
               trailingContent={mcpRegistryPicker}
             >
-              {workspaceLoading && cachedWorkspace === null && (
+              {workspaceSelectionLoading && cachedWorkspace === null && (
                 <NewChatPickerLoading
                   label="Loading working directory"
                   testId="new-chat-landing-workspace-loading"
@@ -6508,7 +6556,7 @@ export function NewChatLandingScreen() {
                 />
               )}
               <Popover open={workspacePopoverOpen} onOpenChange={setWorkspacePopoverOpen}>
-                {(!workspaceLoading || cachedWorkspace !== null) && (
+                {(!workspaceSelectionLoading || cachedWorkspace !== null) && (
                   <PopoverTrigger asChild>{workspaceChip}</PopoverTrigger>
                 )}
                 <PopoverContent
@@ -6516,26 +6564,20 @@ export function NewChatLandingScreen() {
                   sideOffset={4}
                   className="w-[31rem] max-w-[calc(100vw-2rem)] gap-1 p-1.5"
                 >
-                  {recent.length > 0 && (
+                  {pickerRecent.length > 0 && (
                     <>
                       <div className="px-2 py-0.5 text-xs font-medium text-muted-foreground">
                         Recents
                       </div>
                       <RecentWorkspaceList
-                        hostId={selectedHostId}
-                        paths={recent}
-                        selectedPath={workspaceTrimmed}
+                        hostId={workspaceBrowseHostId}
+                        paths={pickerRecent}
+                        selectedPath={visibleWorkspace}
                         onSelect={(path) => {
-                          workspaceFromConfigRef.current = false;
-                          setWorkspace(path);
-                          addRecent(path);
+                          selectWorkspace(path);
                           setWorkspacePopoverOpen(false);
                         }}
-                        onBrowse={(path) => {
-                          setWorkspacePopoverOpen(false);
-                          setWorkspacePickerInitialPath(isNavigablePath(path) ? path : undefined);
-                          setWorkspacePickerOpen(true);
-                        }}
+                        onBrowse={openWorkspacePicker}
                       />
                       <div className="my-1 h-px bg-border" />
                     </>
@@ -6544,13 +6586,7 @@ export function NewChatLandingScreen() {
                     <button
                       type="button"
                       className="w-full text-left"
-                      onClick={() => {
-                        setWorkspacePopoverOpen(false);
-                        setWorkspacePickerInitialPath(
-                          isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined,
-                        );
-                        setWorkspacePickerOpen(true);
-                      }}
+                      onClick={() => openWorkspacePicker(visibleWorkspace)}
                       data-testid="new-chat-landing-workspace-open-folder"
                     >
                       <FolderOpenIcon
@@ -7392,16 +7428,12 @@ export function NewChatLandingScreen() {
           <WorkspacePickerDialog
             open={workspacePickerOpen}
             onOpenChange={setWorkspacePickerOpen}
-            hostId={selectedHostId}
-            initialPath={workspacePickerInitialPath}
+            hostId={workspacePickerTarget?.hostId ?? null}
+            initialPath={workspacePickerTarget?.initialPath}
             description="Choose a folder for the new session."
-            onConfirm={(path) => {
-              workspaceFromConfigRef.current = false;
-              setWorkspace(path);
-              addRecent(path);
-            }}
+            onConfirm={selectWorkspace}
             occupancyForPath={
-              !shouldCreateWorktree
+              !shouldCreateWorktree && workspacePickerTarget?.hostId === selectedHostId
                 ? (absolutePath) =>
                     occupancyByDir.get(normalizeWorkspacePath(absolutePath) ?? "") ?? 0
                 : undefined

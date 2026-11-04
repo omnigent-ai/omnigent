@@ -1,10 +1,11 @@
-"""Cold loads spin; cached pickers accept edits before live configuration arrives."""
+"""Cached repo choices are usable before live configuration arrives."""
 
 from __future__ import annotations
 
 import asyncio
 import re
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from playwright.async_api import Page, Route, async_playwright, expect
@@ -41,6 +42,7 @@ async def _expect_pending(
     effort: str = "Max",
     permission: str = "Plan",
     workspace_pending: bool = True,
+    workspace_path: str = "/work/repo",
 ) -> None:
     loading = page.get_by_role("status", name="Loading session configuration")
     picker = page.get_by_test_id("new-chat-landing-agent-select")
@@ -69,14 +71,10 @@ async def _expect_pending(
         await expect(workspace_loading).to_be_visible()
         await expect(workspace).to_have_count(0)
     else:
-        await expect(workspace).to_have_text("repo")
-        await expect(workspace).to_have_attribute("title", "/work/repo")
+        await expect(workspace).to_have_text(workspace_path.rsplit("/", 1)[-1])
+        await expect(workspace).to_have_attribute("title", workspace_path)
         await expect(workspace_loading).to_have_count(0)
-        if workspace_pending:
-            await expect(workspace).to_be_disabled()
-            await expect(workspace).to_have_attribute("aria-busy", "true")
-        else:
-            await expect(workspace).to_be_enabled()
+        await expect(workspace).to_be_enabled()
 
 
 async def _drive(
@@ -93,6 +91,7 @@ async def _drive(
         cached_label: str | None = None
         cached_effort = "Max"
         cached_permission = "Plan"
+        cached_workspace = "/work/repo"
         creates = []
         try:
 
@@ -127,11 +126,12 @@ async def _drive(
 
             async def worktrees(route: Route) -> None:
                 await gates["worktrees"].wait()
+                workspace_path = parse_qs(urlsplit(route.request.url).query)["path"][0]
                 await route.fulfill(
                     json={
                         "data": [
                             {
-                                "path": "/work/repo",
+                                "path": workspace_path,
                                 "branch": "main",
                                 "is_main": True,
                                 "detached": False,
@@ -165,8 +165,10 @@ async def _drive(
             await context.add_init_script(
                 f"""localStorage.setItem('omnigent:last-agent-id', 'ag_claude_e2e');
                 localStorage.setItem('omnigent:last-host-choice', '{_HOST_ID}');
-                localStorage.setItem('omnigent:recent-workspaces',
-                    JSON.stringify({{{_HOST_ID}: ['/work/repo']}}));
+                if (!localStorage.getItem('omnigent:recent-workspaces')) {{
+                    localStorage.setItem('omnigent:recent-workspaces',
+                        JSON.stringify({{{_HOST_ID}: ['/work/repo', '/work/other']}}));
+                }}
                 if (!localStorage.getItem('omnigent:last-mode-by-harness')) {{
                     localStorage.setItem('omnigent:last-mode-by-harness', JSON.stringify({{
                         'claude-native': {{
@@ -228,14 +230,31 @@ async def _drive(
                 expected_model = live_label
                 expected_effort = cached_effort
                 expected_permission = cached_permission
+                expected_workspace = cached_workspace
 
                 await _expect_pending(
-                    page, cached_label, effort=cached_effort, permission=cached_permission
+                    page,
+                    cached_label,
+                    effort=cached_effort,
+                    permission=cached_permission,
+                    workspace_path=cached_workspace,
                 )
                 await expect(composer).to_be_enabled()
                 await composer.fill("I can type while configuration loads")
                 await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
                 if cached_label is not None:
+                    expected_workspace = "/work/other" if visit == "reload" else "/work/repo"
+                    workspace = page.get_by_test_id("new-chat-landing-workspace-chip")
+                    await workspace.click()
+                    await page.screenshot(
+                        path=output / f"{visit}-cached-repo-menu.png", animations="disabled"
+                    )
+                    await page.get_by_role("button", name=expected_workspace, exact=True).click()
+                    await expect(workspace).to_be_enabled()
+                    await expect(workspace).to_have_attribute("title", expected_workspace)
+                    await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
+                    await page.get_by_test_id("new-chat-landing-composer").dispatch_event("submit")
+                    assert not creates
                     chosen_model = "sonnet" if visit == "reload" else "opus"
                     expected_model = "Sonnet 4.6" if visit == "reload" else live_label
                     expected_effort = "High" if visit == "reload" else "Max"
@@ -279,14 +298,24 @@ async def _drive(
                 await asyncio.wait_for(served[first_response].wait(), timeout=10)
                 await _paint_frames(page)
                 await _expect_pending(
-                    page, pending_label, effort=expected_effort, permission=expected_permission
+                    page,
+                    pending_label,
+                    effort=expected_effort,
+                    permission=expected_permission,
+                    workspace_pending=first_response != "hosts",
+                    workspace_path=expected_workspace,
                 )
 
                 gates["hosts" if first_response == "agents" else "agents"].set()
                 await asyncio.wait_for(models_requested.wait(), timeout=10)
                 await _paint_frames(page)
                 await _expect_pending(
-                    page, pending_label, effort=expected_effort, permission=expected_permission
+                    page,
+                    pending_label,
+                    effort=expected_effort,
+                    permission=expected_permission,
+                    workspace_pending=False,
+                    workspace_path=expected_workspace,
                 )
                 await page.get_by_test_id("new-chat-landing").screenshot(
                     path=output / f"{visit}-loading.png", animations="disabled"
@@ -302,6 +331,7 @@ async def _drive(
                     effort=expected_effort,
                     permission=expected_permission,
                     workspace_pending=False,
+                    workspace_path=expected_workspace,
                 )
 
                 gates["models"].set()
@@ -318,6 +348,9 @@ async def _drive(
                 await expect(loading).to_have_count(0)
                 await expect(composer).to_have_value("I can type while configuration loads")
                 await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
+                await expect(
+                    page.get_by_test_id("new-chat-landing-workspace-chip")
+                ).to_have_attribute("title", expected_workspace)
                 await expect(
                     page.get_by_test_id("new-chat-landing-permission-chip")
                 ).to_be_enabled()
@@ -346,7 +379,13 @@ async def _drive(
                         for label in cached_samples
                     ), samples
                 for samples_name, allowed_labels in (
-                    ("directoryLoadingSamples", {"repo"}),
+                    (
+                        "directoryLoadingSamples",
+                        {
+                            cached_workspace.rsplit("/", 1)[-1],
+                            expected_workspace.rsplit("/", 1)[-1],
+                        },
+                    ),
                     ("permissionLoadingSamples", {cached_permission, expected_permission}),
                 ):
                     control_samples = await page.evaluate(f"window.{samples_name}")
@@ -359,9 +398,11 @@ async def _drive(
                 cached_label = expected_model
                 cached_effort = expected_effort
                 cached_permission = expected_permission
+                cached_workspace = expected_workspace
                 assert not creates
         finally:
             for gate in gates.values():
                 gate.set()
             await context.unroute_all(behavior="wait")
+            await context.close()
             await browser.close()
