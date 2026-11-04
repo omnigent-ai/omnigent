@@ -243,13 +243,22 @@ describe("HtmlCommentViewer scroll position", () => {
     rewrite("<body><p>v2</p></body>");
     expect(requestedScrollRestore()).toMatchObject({ top: 512 });
 
+    // A frame whose restore ran out of budget connects but reports nothing, so 512 stays.
+    const spent = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    spent.send({ type: BRIDGE_MSG.ready });
+    rewrite("<body><p>v3</p></body>");
+    expect(getSavedScrollTop(key)).toBe(512);
+    expect(requestedScrollRestore()).toMatchObject({ top: 512 });
+
     // The rewritten frame reports its own offset, which the next rewrite restores.
     const { send } = await connectHtmlPreviewBridge(
       screen.getByTitle<HTMLIFrameElement>("HTML preview"),
     );
     send({ type: BRIDGE_MSG.scroll, top: 140 });
     await waitFor(() => expect(getSavedScrollTop(key)).toBe(140));
-    rewrite("<body><p>v3</p></body>");
+    rewrite("<body><p>v4</p></body>");
     expect(requestedScrollRestore()).toMatchObject({ top: 140 });
   });
 
