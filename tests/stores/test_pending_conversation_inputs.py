@@ -239,3 +239,21 @@ def test_pending_input_id_pages_carry_submission_positions(db_uri):
     assert [item for item, _position in by_position] == saved
     exact, end = store.list_pending_inputs_by_id(session.id, limit=5)
     assert len(exact) == 5 and end is None
+    if not db_uri.startswith("sqlite"):
+        return  # The plan check below uses SQLite's EXPLAIN syntax.
+    with store._conv_session("test_pending_id_page_plan") as db:
+        plan = db.execute(
+            text(
+                "EXPLAIN QUERY PLAN SELECT * FROM conversation_items WHERE workspace_id=0 "
+                "AND conversation_id=:id AND response_id=:response AND id>:after "
+                "ORDER BY id LIMIT 3"
+            ),
+            {
+                "id": bytes.fromhex(session.id),
+                "response": PENDING_INPUT_RESPONSE_ID,
+                "after": bytes(16),
+            },
+        ).all()
+    # Each page seeks past its cursor in index order rather than sorting the session's inputs.
+    assert "ix_conversation_items_response_id" in str(plan) and "id>?" in str(plan)
+    assert "TEMP B-TREE" not in str(plan)

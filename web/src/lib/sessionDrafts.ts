@@ -33,7 +33,8 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
   }
 }
 
-function readStartupInputIds(entry: unknown): string[] | undefined {
+/** A stored record's `startupInputIds`, or `undefined` when missing or malformed. */
+export function readStartupInputIds(entry: unknown): string[] | undefined {
   if (typeof entry !== "object" || entry === null || !("startupInputIds" in entry))
     return undefined;
   const ids = entry.startupInputIds;

@@ -2849,6 +2849,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           text,
           authorId: senderId,
           ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          ...(replacesFailedInputs.replaces_failed_inputs
+            ? { startupInputIds: replacesFailedInputs.replaces_failed_inputs }
+            : {}),
         });
       }
       if (initialDraft && !(await waitForInitialDispatch(sessionId, tempId))) return;
@@ -3247,6 +3250,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
+      // A resend of handed-back startup inputs goes back to the composer, as a message does.
+      const replaced = replacesFailedInputs.replaces_failed_inputs;
+      if (replaced && failTarget !== null)
+        failSet({
+          failedSendDraft: {
+            conversationId: failTarget,
+            text: commandText,
+            files: [],
+            serverRefused: err instanceof ApiError && err.code !== null,
+            startupInputIds: replaced,
+          },
+        });
       if (!alreadyStreaming) {
         finalizeActive(failSet, "failed", message, null);
         failSet({ status: "idle" });
@@ -7699,6 +7714,7 @@ function unsentSendToRestore(
     .map((send) => restoreReplyDraft(send.text, send.replyDraft))
     .reduce(appendReplyDraft);
   const replyDraft = snapshotReplyDraft(joined);
+  const startupInputIds = [...new Set(sends.flatMap((send) => send.startupInputIds ?? []))];
   return {
     conversationId,
     text: serializeReplyDraft(joined),
@@ -7706,6 +7722,7 @@ function unsentSendToRestore(
     // A resend of one message reuses its id, which the server dedupes; joined text is a new message.
     ...(sends.length === 1 ? { stableId: first.stableId } : {}),
     ...(replyDraft ? { replyDraft } : {}),
+    ...(startupInputIds.length > 0 ? { startupInputIds } : {}),
     serverRefused: false,
     recovered: true,
   };
@@ -7779,11 +7796,15 @@ function returnFailedStartupInputs(
   failedInputs: PendingInput[],
   unacknowledged: ReadonlySet<string>,
 ): Partial<ConversationState> {
-  const held = new Set(getSessionDraft(conversationId)?.startupInputIds);
+  const held = new Set([
+    ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
+    ...(state.failedSendDraft?.startupInputIds ?? []),
+  ]);
   const unreturned = failedInputs.filter(
     (input) => !state.returnedStartupInputs.includes(input.pendingId),
   );
-  // Inputs a reloaded draft holds count as returned; clearing it won't bring them back in this tab.
+  // Inputs a reloaded draft or resend holds count as returned; clearing it can't bring them back
+  // in this tab.
   const inputs = unreturned.filter((input) => !held.has(input.pendingId));
   const blocks = state.blocks.filter((block) => !isStartupLookupNotice(block));
   const patch: Partial<ConversationState> = {

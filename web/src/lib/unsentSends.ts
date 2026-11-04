@@ -2,6 +2,7 @@
 // The server can hold a POST for minutes (a sandbox launch or wake) without persisting
 // it, and the queue lives in memory, so a reload would otherwise lose the text.
 import { readComposerDraft, type StoredReplyDraft } from "./replyDraft";
+import { readStartupInputIds } from "./sessionDrafts";
 
 export interface UnsentSend {
   stableId: string;
@@ -9,6 +10,8 @@ export interface UnsentSend {
   replyDraft?: StoredReplyDraft;
   /** The sender (`getCurrentUserId`), so another account in this tab can't recover it. */
   authorId: string;
+  /** Failed startup inputs the send replaces, so a reload doesn't hand them back as well. */
+  startupInputIds?: string[];
 }
 
 const UNSENT_SENDS_KEY = "omnigent.unsentSends";
@@ -32,7 +35,8 @@ function parseSend(entry: unknown): UnsentSend | null {
   const { stableId, authorId } = entry as { stableId?: unknown; authorId?: unknown };
   // A record with no sender can't be matched to the viewer.
   if (typeof stableId !== "string" || typeof authorId !== "string") return null;
-  return { ...draft, stableId, authorId };
+  const startupInputIds = readStartupInputIds(entry);
+  return { ...draft, stableId, authorId, ...(startupInputIds ? { startupInputIds } : {}) };
 }
 
 function parseQueue(entry: unknown): UnsentSend[] | null {
