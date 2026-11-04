@@ -3742,7 +3742,8 @@ async def test_mcp_servers_signed_in_mid_session_reconnect_before_the_next_turn(
     status_file = tmp_path / "mcp-auth-status.json"
     monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(status_file))
     reported = dict.fromkeys(
-        ("notes", "wiki", "docs", "figjam", "stuck", "slow", "late"), "sign_in_required"
+        ("notes", "wiki", "docs", "figjam", "drive", "calendar", "slow", "late"),
+        "sign_in_required",
     )
     reported["jira"] = "connected"
 
@@ -3758,7 +3759,8 @@ async def test_mcp_servers_signed_in_mid_session_reconnect_before_the_next_turn(
         "docs": "pending",
         # The CLI names plugin servers ``plugin:<plugin>:<server>``; the host reports ``<server>``.
         "plugin:figma:figjam": "failed",
-        "stuck": "failed",
+        "drive": "failed",
+        "calendar": "failed",
         "slow": "failed",
         "late": "failed",
         "linear": "connected",
@@ -3787,10 +3789,10 @@ async def test_mcp_servers_signed_in_mid_session_reconnect_before_the_next_turn(
             reconnects.append(server_name)
             in_flight.add(server_name)
             try:
-                if server_name in ("stuck", "late"):
+                if server_name == "late":
                     reconnect_hung.set()
                     await asyncio.Event().wait()
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.3 if server_name in ("drive", "calendar") else 0)
             finally:
                 in_flight.discard(server_name)
             if server_name in fail_once:
@@ -3839,29 +3841,30 @@ async def test_mcp_servers_signed_in_mid_session_reconnect_before_the_next_turn(
         assert await turn("q5") is first
         assert len(reconnects) == 5
 
-        report(stuck="connected")
+        report(drive="connected", calendar="connected")
         assert await turn("/compact") is first
         assert len(reconnects) == 5
 
-        # A CLI still busy with a timed-out reconnect would hold the prompt, so a new one runs it.
+        # Reconnects share one budget. A CLI still busy when it runs out would hold the prompt,
+        # so a new one runs it.
         monkeypatch.setattr(
-            "omnigent.inner.claude_sdk_executor._MCP_RECONNECT_TIMEOUT_SECONDS", 0.05
+            "omnigent.inner.claude_sdk_executor._MCP_RECONNECT_TIMEOUT_SECONDS", 0.5
         )
         second = await turn("q6")
         assert second is not first
-        assert reconnects[5:] == ["stuck"]
+        assert reconnects[5:] == ["drive", "calendar"]
         close.assert_awaited_once_with(first)
         assert "answer to q5" in second.prompts[-1]
         # The new CLI connects every server as it starts.
         assert await turn("q7") is second
-        assert len(reconnects) == 6
+        assert len(reconnects) == 7
 
         report(slow="connected")
         status_reply = "hang"
         monkeypatch.setattr("omnigent.inner.claude_sdk_executor._MCP_STATUS_TIMEOUT_SECONDS", 0.05)
         third = await turn("q8")
         assert third is not second
-        assert len(reconnects) == 6
+        assert len(reconnects) == 7
         assert "answer to q7" in third.prompts[-1]
 
         # A turn cancelled mid-reconnect does not leave the busy CLI for the next turn.

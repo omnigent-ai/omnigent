@@ -168,6 +168,7 @@ class _SignInGate:
 
     def __init__(self) -> None:
         self.signed_in = False
+        self.rejected = 0
         self.port = 0
         self._cleanup = contextlib.ExitStack()
 
@@ -189,6 +190,7 @@ class _SignInGate:
 
         async def app(scope, receive, send):
             if scope["type"] == "http" and not self.signed_in:
+                self.rejected += 1
                 await send(
                     {
                         "type": "http.response.start",
@@ -310,6 +312,8 @@ def test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session(
             _send(page, f"Say ack. {first}")
             _wait_reply(page, "ack one")
 
+            # The CLI connects on its own if sign-in completes before its first request.
+            poll_until(lambda: gate.rejected, timeout_s=30)
             gate.signed_in = True
             _write_auth_status(home, _USER_SERVER, "connected")
             _send(page, f"Read the note. {second}")
