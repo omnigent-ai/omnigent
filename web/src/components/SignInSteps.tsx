@@ -14,7 +14,7 @@ export function StepNumber({ children }: { children: ReactNode }) {
   );
 }
 
-/** Copies a sign-in link or code, falling back to a toast when the clipboard is blocked. */
+/** "Copy link" button for a sign-in link; use `iconOnly` to copy a code. Toasts if the clipboard is blocked. */
 export function CopyButton({
   text,
   label,
