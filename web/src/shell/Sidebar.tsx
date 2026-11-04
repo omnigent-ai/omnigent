@@ -313,7 +313,6 @@ import {
 } from "./sidebarStyles";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
-import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 import {
   CompactShortcutKeys,
@@ -5710,10 +5709,7 @@ function ConversationRowImpl({
               (archive outranks pin), so there's no pin action even on hover. */}
               {!isArchived && (
                 <Tooltip disableHoverableContent>
-                  <TooltipContent>
-                    <TooltipArrow />
-                    {pinTooltip}
-                  </TooltipContent>
+                  <TooltipContent>{pinTooltip}</TooltipContent>
                   <TooltipTrigger asChild>
                     <Button
                       type="button"
@@ -5763,10 +5759,7 @@ function ConversationRowImpl({
               with an explanation. */}
               {isOwner && (
                 <Tooltip disableHoverableContent>
-                  <TooltipContent>
-                    <TooltipArrow />
-                    {isArchived ? "Unarchive" : "Archive"}
-                  </TooltipContent>
+                  <TooltipContent>{isArchived ? "Unarchive" : "Archive"}</TooltipContent>
                   <TooltipTrigger asChild>
                     <Button
                       type="button"
