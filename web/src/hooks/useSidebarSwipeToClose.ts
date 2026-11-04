@@ -18,6 +18,12 @@ export const FLICK_MAX_IDLE_MS = 100;
 // or coalesced touchmove can't read as a flick on its own.
 const VELOCITY_WINDOW_MS = 100;
 
+/**
+ * Marks drawer content that owns its own leftward swipe (a session row with a
+ * swipe-left action); a touch that starts inside it never closes the drawer.
+ */
+export const OWNS_LEFT_SWIPE_ATTRIBUTE = "data-owns-left-swipe";
+
 /** Append a touch sample, keeping the newest one at or before the velocity window start. */
 export function recordTouchSample(samples: TouchSample[], x: number, time: number): void {
   samples.push({ x, time });
@@ -127,6 +133,8 @@ export function useSidebarSwipeToClose({
       const onDrawer = drawer.contains(target);
       if (!onDrawer && !scrimRef.current?.contains(target)) return;
       if (onDrawer && startsInHorizontalScroller(target, drawer)) return;
+      const element = target instanceof Element ? target : target.parentElement;
+      if (onDrawer && element?.closest(`[${OWNS_LEFT_SWIPE_ATTRIBUTE}]`)) return;
       const touch = event.touches[0];
       tracking = true;
       startX = touch.clientX;

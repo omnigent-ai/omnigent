@@ -242,6 +242,7 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
 import {
   finishActiveRowGesture,
+  ROW_GESTURE_HOLD_MS,
   ROW_MENU_SYNTHETIC,
   ROW_SWIPE_COMMIT_PX,
   RowGesturePointerSensor,
@@ -253,7 +254,7 @@ import {
   useIsSideBySideSidebarViewport,
 } from "@/hooks/useIsSideBySideSidebarViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
-import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
+import { OWNS_LEFT_SWIPE_ATTRIBUTE, useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
@@ -1037,9 +1038,9 @@ function SidebarImpl({
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, resizing, handleProps: resizeHandleProps } = useResizableSidebar();
 
-  // On the mobile layout, a leftward swipe on the open drawer slides it shut and
-  // a rightward swipe across the chat slides the closed one open, both under
-  // the finger, reusing the iOS edge swipe's progress rendering below.
+  // On the mobile layout a leftward swipe slides the open drawer shut and a
+  // rightward swipe across the chat slides the closed one open. Android closes
+  // with the system back gesture instead.
   const drawerRef = useRef<HTMLElement>(null);
   const scrimRef = useRef<HTMLButtonElement>(null);
   const [closeSwipeProgress, setCloseSwipeProgress] = useState<number | null>(null);
@@ -1048,13 +1049,15 @@ function SidebarImpl({
   // A wide phone (unfolded foldable, landscape) docks the open sidebar beside
   // the chat instead of over it. Settings keeps its full-bleed drawer.
   const sideBySide = useIsSideBySideSidebarViewport() && !inSettings;
-  const closeSwipeEnabled = open && mobileLayout && !inSettings && dragProgress == null;
+  const closeSwipeEnabled =
+    open && mobileLayout && !inSettings && dragProgress == null && !isAndroidShell();
   const openSwipeEnabled = !open && !peek && mobileLayout && !inSettings && dragProgress == null;
+  // A touch held past this before moving is a long-press, not an open swipe.
   useSidebarSwipeToOpen({
     enabled: openSwipeEnabled,
     drawerRef,
     surfaceSelector: ".app-shell",
-    holdMs: TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
+    holdMs: 250,
     onDragProgress: setOpenSwipeProgress,
     onSettle: (shouldOpen) => {
       if (shouldOpen) onOpen?.();
@@ -1064,7 +1067,7 @@ function SidebarImpl({
     enabled: closeSwipeEnabled,
     drawerRef,
     scrimRef,
-    holdMs: TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
+    holdMs: ROW_GESTURE_HOLD_MS,
     onDragProgress: setCloseSwipeProgress,
     onSettle: (close) => {
       if (close) onClose();
@@ -2131,7 +2134,6 @@ const KEYBOARD_SENSOR_OPTIONS: KeyboardSensorOptions = {
   keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
 };
 const MOUSE_SENSOR_OPTIONS: MouseSensorOptions = { activationConstraint: { distance: 5 } };
-const TOUCH_SENSOR_OPTIONS = { activationConstraint: { delay: 250, tolerance: 8 } };
 // Always-measure so the transient "remove from project" zone (mounted at drag
 // start) is registered as a drop target without a stale layout cache.
 const DND_MEASURING: MeasuringConfiguration = {
@@ -6401,6 +6403,8 @@ function ConversationRowImpl({
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
       data-testid="conversation-swipe-frame"
+      // A leftward swipe here runs the row's action, not the drawer's swipe-to-close.
+      {...{ [OWNS_LEFT_SWIPE_ATTRIBUTE]: swipeEnabled && hasSwipeLeft ? "" : undefined }}
       {...rowGestureListeners}
       onContextMenuCapture={(e) => {
         if (!(ROW_MENU_SYNTHETIC in e.nativeEvent)) touchContextMenuRef.current = false;
