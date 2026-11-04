@@ -135,9 +135,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `mcp-sign-in`: a needs-auth Claude Code MCP server (standalone or plugin) or
   Codex MCP server offers Sign in, which runs the harness CLI's `mcp login` on
   the host and finishes through its loopback listener or a pasted redirect
-  address. CLIs without `mcp login --no-browser` (Codex 0.142) are supported:
-  the host suppresses their browser and forwards a pasted redirect to their
-  listener.
+  address. CLIs without `mcp login --no-browser` (Codex 0.142), or whose flag
+  check fails, are supported: the host suppresses their browser and forwards a
+  pasted redirect to their listener. A plugin installed from two marketplaces
+  under one name offers no Sign in, since the CLI can't tell the installs apart.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
 - `harness-settings-navigation`: Harnesses is always available in Settings and

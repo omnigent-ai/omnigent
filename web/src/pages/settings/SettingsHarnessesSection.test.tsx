@@ -1344,31 +1344,31 @@ it("signs in to the installed plugin MCP the user chose", () => {
     ...INVENTORY,
     context: {
       ...INVENTORY.context,
-      plugins: ["first", "second"].map((marketplace) => ({
-        id: marketplace,
-        name: "toolkit",
+      plugins: ["notes", "toolkit"].map((name) => ({
+        id: name,
+        name,
         harness: "claude",
-        marketplace,
+        marketplace: "market",
         enabled: true,
         skills: [],
         mcp_servers: ["docs"],
-        mcp_entries: [{ id: `${marketplace}-mcp`, name: "docs" }],
+        mcp_entries: [{ id: `${name}-mcp`, name: "docs" }],
       })),
     },
   };
   const queryClient = renderHarnesses("claude-native");
   const invalidate = vi.spyOn(queryClient, "invalidateQueries");
   selectTab("Plugins · 2");
-  fireEvent.click(screen.getAllByTestId("catalog-row-toolkit")[1]);
+  fireEvent.click(screen.getByTestId("catalog-row-toolkit"));
   selectTab("MCPs · 1");
   fireEvent.click(screen.getByTestId("catalog-row-docs"));
   fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
   expect(signInDialogProps).toHaveBeenLastCalledWith(
-    expect.objectContaining({ server: "docs", plugin: "toolkit", sourceId: "second-mcp" }),
+    expect.objectContaining({ server: "docs", plugin: "toolkit", sourceId: "toolkit-mcp" }),
   );
   fireEvent.click(screen.getByRole("button", { name: "Finish MCP sign-in" }));
   expect(invalidate).toHaveBeenCalledWith({
-    queryKey: ["mcp-tools", ONLINE.host_id, "claude", "docs", "toolkit", "second-mcp"],
+    queryKey: ["mcp-tools", ONLINE.host_id, "claude", "docs", "toolkit", "toolkit-mcp"],
   });
 });
 

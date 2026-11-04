@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import sys
 from collections.abc import Callable
@@ -36,7 +37,7 @@ _AUTH_URL = f"https://auth.example.test/authorize?client_id=c&redirect_uri={_RED
 
 # Stands in for ``claude``/``codex``: logs its argv, prints the URL the way Claude Code
 # does (OSC 8 hyperlink), then waits for a pasted redirect on its terminal. With
-# FAKE_OLD_CLI it lacks ``--no-browser``; FAKE_MODE=listen waits on a loopback listener.
+# FAKE_OLD_CLI it rejects ``--no-browser``; FAKE_MODE=listen waits on a loopback listener.
 FAKE_CLI = f"""#!{sys.executable}
 import json, os, sys, time
 from pathlib import Path
@@ -47,7 +48,10 @@ if "--help" in sys.argv:
     if os.environ.get("FAKE_HELP_HANG"):
         time.sleep(60)
     print("Usage: mcp login <NAME>" + ("" if os.environ.get("FAKE_OLD_CLI") else " --no-browser"))
-    sys.exit(0)
+    sys.exit(int(os.environ.get("FAKE_HELP_EXIT", "0")))
+if os.environ.get("FAKE_OLD_CLI") and "--no-browser" in sys.argv:
+    print("error: unexpected argument '--no-browser' found")
+    sys.exit(2)
 log.write_text(json.dumps({{"argv": sys.argv[1:], "tty": sys.stdin.isatty(),
     "env": sorted(k for k in os.environ if k.startswith("OMNIGENT_")), "pid": os.getpid(),
     "browser": os.environ.get("BROWSER")}}))
@@ -302,7 +306,7 @@ async def test_sign_in_that_ends_during_delivery_gets_no_redirect(
         terminal = -1
         raise httpx.ConnectError("no listener")
 
-    monkeypatch.setattr(httpx.AsyncClient, "get", sign_in_ends_meanwhile)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", sign_in_ends_meanwhile)
     try:
         with pytest.raises(LoginError) as ended:
             await mcp_login._deliver_callback(lambda: terminal, _CALLBACK)
@@ -315,8 +319,16 @@ async def test_sign_in_that_ends_during_delivery_gets_no_redirect(
 
 @pytest.mark.parametrize("slow_listener", [False, True])
 async def test_older_cli_gets_the_redirect_on_its_listener(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, slow_listener: bool
+    fake_cli: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    slow_listener: bool,
 ) -> None:
+    for name in ("httpx", "httpcore"):
+        caplog.set_level(logging.DEBUG, logger=name)
+        # These loggers may not propagate to the root, where caplog listens.
+        logger = logging.getLogger(name)
+        monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
     monkeypatch.setenv("FAKE_OLD_CLI", "1")
     monkeypatch.setenv("FAKE_MODE", "listen")
     # The redirect goes straight to the CLI's listener, never through a proxy.
@@ -358,6 +370,24 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
     received = fake_cli.with_suffix(".received").read_text().splitlines()
     assert received == ["/callback?code=abc&state=s"]
     assert typed == []
+    # The host's logs never hold the one-time code.
+    assert "code=abc" not in caplog.text
+    await logins.close()
+
+
+@pytest.mark.parametrize("help_failure", ["FAKE_HELP_HANG", "FAKE_HELP_EXIT"])
+async def test_an_unanswered_flag_check_leaves_the_flag_out(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, help_failure: str
+) -> None:
+    monkeypatch.setenv("FAKE_OLD_CLI", "1")
+    monkeypatch.setenv("FAKE_MODE", "listen")
+    monkeypatch.setenv(help_failure, "1")
+    monkeypatch.setattr(mcp_login, "STATUS_TIMEOUT_SECONDS", 0.5)
+    logins = HostMcpLogins()
+    started = await logins.start(_server())
+    assert started["state"] == "pending", started
+    recorded = json.loads(fake_cli.read_text())
+    assert (recorded["argv"], recorded["browser"]) == (["mcp", "login", "demo"], "true")
     await logins.close()
 
 

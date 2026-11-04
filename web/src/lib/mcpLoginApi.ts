@@ -79,5 +79,7 @@ export function isSafeSignInUrl(value: string): boolean {
   }
   if (url.username || url.password) return false;
   if (url.protocol === "https:") return true;
-  return url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "http:") return false;
+  // The host accepts the same names: localhost or any loopback address.
+  return ["localhost", "[::1]"].includes(url.hostname) || /^127(\.\d{1,3}){3}$/.test(url.hostname);
 }

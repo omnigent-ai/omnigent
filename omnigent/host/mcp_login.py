@@ -259,10 +259,14 @@ async def _deliver_callback(terminal: Callable[[], int], callback_url: str) -> N
     """Send a pasted redirect to the CLI, as a browser on the host would have."""
     import httpx
 
+    # The address is the CLI's own loopback listener, checked by ``valid_callback``. A bare
+    # transport skips proxies, redirects and the client's request log, which would keep the code.
+    timeout = httpx.Timeout(CALLBACK_TIMEOUT_SECONDS).as_dict()
+    request = httpx.Request("GET", callback_url, extensions={"timeout": timeout})
     try:
-        # The address is the CLI's own loopback listener, checked by ``valid_callback``.
-        async with httpx.AsyncClient(trust_env=False, timeout=CALLBACK_TIMEOUT_SECONDS) as client:
-            await client.get(callback_url)
+        async with httpx.AsyncHTTPTransport() as transport:
+            response = await transport.handle_async_request(request)
+            await response.aclose()
         return
     except (httpx.ConnectError, httpx.ConnectTimeout):
         pass
@@ -402,17 +406,18 @@ class HostMcpLogins:
         return login.status()
 
     async def _supports_no_browser(self, executable: str, harness: str, timeout: float) -> bool:
+        # Without an answer, leave the flag out: every CLI version accepts the plain command.
         try:
             stat = os.stat(executable)
         except OSError:
-            return True
+            return False
         build = (executable, stat.st_mtime_ns, stat.st_size)
         if build not in self._no_browser_support:
             ran = await _run_status_command(
                 [executable, "mcp", "login", "--help"], harness, timeout
             )
             if ran is None or ran[0] != 0:
-                return True
+                return False
             self._no_browser_support[build] = "--no-browser" in ran[1]
         return self._no_browser_support[build]
 

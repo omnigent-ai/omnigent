@@ -227,8 +227,10 @@ def test_codex_mcp_sign_in_by_pasting_the_redirect(
                     route.continue_()
                     return
                 response = route.fetch(max_redirects=0)
-                assert response.status == 302, response.text()
-                redirects.append(response.headers["location"])
+                # Raising here would leave the route hanging; the test body checks this.
+                redirects.append(
+                    response.headers.get("location") or f"{response.status}: {response.text()}"
+                )
                 route.abort("connectionrefused")
 
             consent = server.url.removesuffix("/mcp") + "/approve*"
