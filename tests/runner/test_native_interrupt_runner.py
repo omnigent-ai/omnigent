@@ -683,11 +683,29 @@ def _patch_antigravity_bridge_id(monkeypatch: pytest.MonkeyPatch, interrupt_mod:
     )
 
 
+def _agy_waiting_permission_step(
+    *, trajectory_id: str = "traj-1", step_index: int = 3
+) -> dict[str, Any]:
+    """A trajectory step snapshot entry WAITING on an agy permission prompt."""
+    return {
+        "status": "CORTEX_STEP_STATUS_WAITING",
+        "requestedInteraction": {
+            "permission": {
+                "resource": {"action": "run_command", "target": "rm -rf /tmp/x"},
+                "actionDescription": "Run `rm -rf /tmp/x`",
+            }
+        },
+        "metadata": {
+            "sourceTrajectoryStepInfo": {"trajectoryId": trajectory_id, "stepIndex": step_index}
+        },
+    }
+
+
 @pytest.mark.asyncio
-async def test_antigravity_interrupt_prefers_rpc_cancel(
+async def test_antigravity_interrupt_running_cascade_uses_rpc_cancel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A resolvable cascade is cancelled over connect-RPC; no TUI Escape is sent."""
+    """A RUNNING cascade (no WAITING step) is cancelled over connect-RPC; no Escape."""
     import omnigent.harnesses.antigravity_native.bridge as agy_bridge
     import omnigent.harnesses.antigravity_native.rpc as agy_rpc
     from omnigent.runner.native import interrupt as interrupt_mod
@@ -711,11 +729,17 @@ async def test_antigravity_interrupt_prefers_rpc_cancel(
 
     rpc_calls: list[tuple[int, str]] = []
     monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cascade_id: 52548)
+    monkeypatch.setattr(agy_rpc, "get_trajectory_steps", lambda port, cascade_id: [])
     monkeypatch.setattr(
         agy_rpc,
         "cancel_cascade_steps",
         lambda port, cascade_id: (rpc_calls.append((port, cascade_id)), True)[1],
     )
+
+    def _fail_deliver(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("must not deliver an interaction answer; no step is WAITING")
+
+    monkeypatch.setattr(agy_rpc, "handle_user_interaction", _fail_deliver)
 
     runner, captured = _make_runner()
     resp = await runner.interrupt("antigravity-native", "conv_agy")
@@ -724,6 +748,193 @@ async def test_antigravity_interrupt_prefers_rpc_cancel(
     assert rpc_calls == [(52548, "cascade-1")]
     assert tui_calls == []  # RPC cancel succeeded; no TUI fallback needed.
     # No optimistic 'cancelled': the outcome is unknown until an edge lands.
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_agy")[0] is True
+
+
+@pytest.mark.asyncio
+async def test_antigravity_interrupt_waiting_step_denies_via_interaction_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A WAITING permission prompt is denied through the interaction bridge RPC.
+
+    ``CancelCascadeSteps`` is a no-op on a WAITING step despite returning HTTP
+    < 400, so it must never be trusted alone here: delivering the DENY via
+    ``HandleCascadeUserInteraction`` is the only action that can report success.
+    """
+    import omnigent.harnesses.antigravity_native.bridge as agy_bridge
+    import omnigent.harnesses.antigravity_native.rpc as agy_rpc
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_antigravity_bridge_id(monkeypatch, interrupt_mod)
+    monkeypatch.setattr(agy_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(
+        agy_bridge,
+        "read_bridge_state",
+        lambda bridge_dir: SimpleNamespace(
+            session_id="conv_agy", conversation_id="cascade-1", active_turn_id=None
+        ),
+    )
+
+    escape_calls: list[Any] = []
+    monkeypatch.setattr(
+        agy_bridge,
+        "send_interaction_keys_via_tui",
+        lambda bridge_dir, *keys: escape_calls.append((bridge_dir, keys)),
+    )
+    monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cascade_id: 52548)
+    monkeypatch.setattr(
+        agy_rpc,
+        "get_trajectory_steps",
+        lambda port, cascade_id: [_agy_waiting_permission_step()],
+    )
+
+    deliver_calls: list[dict[str, Any]] = []
+
+    def _deliver(
+        port: int,
+        cascade_id: str,
+        *,
+        trajectory_id: str,
+        step_index: int,
+        payload: dict[str, Any],
+    ) -> None:
+        deliver_calls.append(
+            {
+                "port": port,
+                "cascade_id": cascade_id,
+                "trajectory_id": trajectory_id,
+                "step_index": step_index,
+                "payload": payload,
+            }
+        )
+
+    monkeypatch.setattr(agy_rpc, "handle_user_interaction", _deliver)
+
+    cancel_calls: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        agy_rpc,
+        "cancel_cascade_steps",
+        lambda port, cascade_id: (cancel_calls.append((port, cascade_id)), False)[1],
+    )
+
+    runner, captured = _make_runner()
+    resp = await runner.interrupt("antigravity-native", "conv_agy")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert deliver_calls == [
+        {
+            "port": 52548,
+            "cascade_id": "cascade-1",
+            "trajectory_id": "traj-1",
+            "step_index": 3,
+            "payload": {"permission": {"allow": False}},
+        }
+    ]
+    # The denial may resume the cascade into a running turn; best-effort
+    # cancel that too, but only AFTER the denial, never in place of it.
+    assert cancel_calls == [(52548, "cascade-1")]
+    assert escape_calls == []  # never the primary action on a WAITING prompt
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_agy")[0] is True
+
+
+@pytest.mark.asyncio
+async def test_antigravity_interrupt_waiting_step_deny_failure_returns_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed interaction-bridge denial is a 503, not a false success."""
+    import omnigent.harnesses.antigravity_native.bridge as agy_bridge
+    import omnigent.harnesses.antigravity_native.rpc as agy_rpc
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_antigravity_bridge_id(monkeypatch, interrupt_mod)
+    monkeypatch.setattr(agy_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(
+        agy_bridge,
+        "read_bridge_state",
+        lambda bridge_dir: SimpleNamespace(
+            session_id="conv_agy", conversation_id="cascade-1", active_turn_id=None
+        ),
+    )
+    monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cascade_id: 52548)
+    monkeypatch.setattr(
+        agy_rpc,
+        "get_trajectory_steps",
+        lambda port, cascade_id: [_agy_waiting_permission_step()],
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise agy_rpc.AntigravityRpcError("input not registered for step 3")
+
+    monkeypatch.setattr(agy_rpc, "handle_user_interaction", _boom)
+
+    def _fail_cancel(*_a: Any, **_k: Any) -> bool:
+        raise AssertionError("must not fall through to cascade-cancel on a failed denial")
+
+    monkeypatch.setattr(agy_rpc, "cancel_cascade_steps", _fail_cancel)
+
+    escape_calls: list[Any] = []
+    monkeypatch.setattr(
+        agy_bridge,
+        "send_interaction_keys_via_tui",
+        lambda bridge_dir, *keys: escape_calls.append((bridge_dir, keys)),
+    )
+
+    runner, captured = _make_runner()
+    resp = await runner.interrupt("antigravity-native", "conv_agy")
+
+    assert resp is not None and resp.status_code == 503
+    assert json.loads(bytes(resp.body))["error"] == "antigravity_native_interrupt_failed"
+    assert escape_calls == []  # no silent fallback that would mask the failure
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_agy")[0] is False
+
+
+@pytest.mark.asyncio
+async def test_antigravity_interrupt_steps_read_failure_falls_back_to_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the step snapshot can't be read, fall back to Escape rather than guess."""
+    import httpx
+
+    import omnigent.harnesses.antigravity_native.bridge as agy_bridge
+    import omnigent.harnesses.antigravity_native.rpc as agy_rpc
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_antigravity_bridge_id(monkeypatch, interrupt_mod)
+    monkeypatch.setattr(agy_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(
+        agy_bridge,
+        "read_bridge_state",
+        lambda bridge_dir: SimpleNamespace(
+            session_id="conv_agy", conversation_id="cascade-1", active_turn_id=None
+        ),
+    )
+    monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cascade_id: 52548)
+
+    def _boom(port: int, cascade_id: str) -> list[dict[str, Any]]:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(agy_rpc, "get_trajectory_steps", _boom)
+
+    def _fail_cancel(*_a: Any, **_k: Any) -> bool:
+        raise AssertionError("must not guess at cancel when the step snapshot is unreadable")
+
+    monkeypatch.setattr(agy_rpc, "cancel_cascade_steps", _fail_cancel)
+
+    escape_calls: list[Any] = []
+    monkeypatch.setattr(
+        agy_bridge,
+        "send_interaction_keys_via_tui",
+        lambda bridge_dir, *keys: escape_calls.append((bridge_dir, keys)),
+    )
+
+    runner, captured = _make_runner()
+    resp = await runner.interrupt("antigravity-native", "conv_agy")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert escape_calls == [("dir/bid-agy", ("Escape",))]
     assert captured["wakes"] == []
     assert runner.take_pending_interrupt("conv_agy")[0] is True
 
