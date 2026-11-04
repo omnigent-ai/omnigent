@@ -474,6 +474,43 @@ def without_tool_history(messages: list[Message]) -> list[Message]:
     return [msg for msg in messages if msg.get("role") not in ("tool_call", "tool_result")]
 
 
+# The user message the runner appends to history after an interrupted turn.
+INTERRUPTION_MARKER_TEXT = (
+    "[System: interrupted]\n"
+    "The user interrupted and abandoned their previous request (the user "
+    "message immediately before this one). Do not resume or act on that "
+    "interrupted request unless the user asks for it again; treat the next "
+    "user message as the current instruction. The preceding assistant "
+    "message may be incomplete."
+)
+
+
+def is_interruption_marker(message: Message) -> bool:
+    """Whether *message* is the runner's :data:`INTERRUPTION_MARKER_TEXT` message."""
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict):
+        content = content[0].get("text")
+    return content == INTERRUPTION_MARKER_TEXT
+
+
+def pending_interruption_marker(messages: list[Message]) -> str | None:
+    """Return the interruption marker when a trailing user message before the latest is one.
+
+    A native session kept across an interrupt has not received the marker, so a
+    resumed turn must send it ahead of the latest user input.
+    """
+    if not messages or messages[-1].get("role") != "user":
+        return None
+    for message in reversed(messages[:-1]):
+        if message.get("role") != "user":
+            return None
+        if is_interruption_marker(message):
+            return INTERRUPTION_MARKER_TEXT
+    return None
+
+
 def split_transient_tail(
     messages: list[Message],
 ) -> MessageSplit:
@@ -715,6 +752,14 @@ class Executor:
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support interruption
         """Ask the executor to interrupt a currently running turn, if supported."""
+        return False
+
+    def resumes_after_interrupt(self) -> bool:
+        """Whether ``interrupt_session()`` keeps the native session for the next turn.
+
+        The interrupted ``run_turn`` keeps yielding until the harness ends that turn,
+        and the next turn sends the runner's interruption marker with its input.
+        """
         return False
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing

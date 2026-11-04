@@ -8,10 +8,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.executor import (
+    INTERRUPTION_MARKER_TEXT,
     MockExecutor,
     TextChunk,
     ToolCallRequest,
     TurnComplete,
+    pending_interruption_marker,
     split_transient_tail,
 )
 
@@ -146,6 +148,32 @@ class TestSplitTransientTail(unittest.TestCase):
         split = split_transient_tail(msgs)
         self.assertEqual(split.persisted, msgs)
         self.assertEqual(split.transient, [])
+
+
+class TestPendingInterruptionMarker(unittest.TestCase):
+    def test_marker_block_before_latest_user_input_is_pending(self):
+        marker = {
+            "role": "user",
+            "content": [{"type": "input_text", "text": INTERRUPTION_MARKER_TEXT}],
+        }
+        messages = [
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "assistant", "content": "The essay"},
+            marker,
+            {"role": "user", "content": "Summarize instead."},
+        ]
+        self.assertEqual(pending_interruption_marker(messages), INTERRUPTION_MARKER_TEXT)
+
+    def test_marker_is_not_pending_without_newer_user_input(self):
+        marker = {"role": "user", "content": INTERRUPTION_MARKER_TEXT}
+        self.assertIsNone(pending_interruption_marker([{"role": "user", "content": "hi"}, marker]))
+        self.assertIsNone(
+            pending_interruption_marker(
+                [marker, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "hi"}]
+            )
+        )
+        quoted = {"role": "user", "content": f"Why did you print {INTERRUPTION_MARKER_TEXT}?"}
+        self.assertIsNone(pending_interruption_marker([quoted, {"role": "user", "content": "hi"}]))
 
 
 if __name__ == "__main__":
