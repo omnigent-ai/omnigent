@@ -232,15 +232,12 @@ async def test_presession_catalog_matches_filtered_invocations(
         _to_agent_object as session_agent_object,
     )
 
-    assert [s.name for s in builtin_agent_object(agent, app.state.agent_cache).skills] == [
-        "bundled"
-    ]
-    assert [
-        s.name
-        for s in session_agent_object(
-            agent, app.state.agent_cache, mcp_servers_editable=True
-        ).skills
-    ] == ["bundled"]
+    builtin = builtin_agent_object(agent, app.state.agent_cache)
+    session = session_agent_object(agent, app.state.agent_cache, mcp_servers_editable=True)
+    assert [s.name for s in builtin.skills] == ["bundled"]
+    assert [s.name for s in session.skills] == ["bundled"]
+    # `skills: none` runs claude-sdk with no setting sources, so /mcp hides user servers.
+    assert builtin.loads_user_settings is session.loads_user_settings is (skill_filter != "none")
     discovery = HostSkillDiscovery(
         lambda _: pytest.fail("Pre-session discovery needs no bundle fetch")
     )
