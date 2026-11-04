@@ -214,11 +214,11 @@
   }
 
   // Restore the saved offset after a remount, re-asserting it each frame because
-  // late content can clamp it. Only input that scrolls ends it early, not a click
-  // or the zoom shortcut; reports stay off so clamps can't overwrite the offset.
+  // late content can clamp it. Only input that scrolls ends it early, not a click, a pinch
+  // or input the page handles itself; reports stay off so clamps can't overwrite the offset.
   const USER_SCROLL_EVENTS = ["wheel", "touchmove", "keydown"];
   const SCROLL_KEYS = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "];
-  let scrollRestore = null; // { top, deadline, y, layout, anchoring } while restoring
+  let scrollRestore = null; // { top, deadline, y, layout, anchoring, inputs } while restoring
   let scrollRestoreFrame = 0;
   let restoreHide = null; // the injected style hiding the page until the restore ends
 
@@ -257,10 +257,19 @@
     return e.key === " " && !!e.target && /^(BUTTON|SUMMARY)$/.test(e.target.tagName);
   }
 
+  // Capture runs before the page's own handlers, so the next frame judges whether they
+  // consumed the input; a Ctrl+wheel is a pinch or zoom gesture, not a scroll.
   function onRestoreInput(e) {
     const scrollKey =
       SCROLL_KEYS.indexOf(e.key) !== -1 && !isEditableTarget(e.target) && !spaceActivates(e);
-    if (e.type !== "keydown" || scrollKey) settleScrollRestore();
+    const pinch = e.type === "wheel" && e.ctrlKey;
+    if (e.type === "keydown" ? scrollKey : !pinch) scrollRestore.inputs.push(e);
+  }
+
+  function inputScrolledDuringRestore() {
+    return scrollRestore.inputs.some(function (e) {
+      return !e.defaultPrevented;
+    });
   }
 
   // The document and viewport sizes, which bound the offset the page can reach.
@@ -277,7 +286,7 @@
 
   function applyScrollRestore() {
     if (!scrollRestore) return;
-    const readerMoved = readerMovedDuringRestore();
+    const readerMoved = readerMovedDuringRestore() || inputScrolledDuringRestore();
     // "instant" overrides an artifact's `scroll-behavior: smooth`. A frame throttled past the
     // deadline still re-asserts once, since the page may have grown in the meantime.
     if (!readerMoved) {
@@ -287,6 +296,7 @@
       settleScrollRestore();
       return;
     }
+    scrollRestore.inputs = [];
     scrollRestore.y = window.scrollY;
     if (Math.abs(scrollRestore.y - scrollRestore.top) <= 1) revealPage();
     scrollRestore.layout = layoutSize();
@@ -320,6 +330,7 @@
       deadline: performance.now() + saved.budgetMs,
       y: window.scrollY,
       layout: layoutSize(),
+      inputs: [],
       anchoring: {
         value: rootStyle.getPropertyValue("overflow-anchor"),
         priority: rootStyle.getPropertyPriority("overflow-anchor"),

@@ -537,6 +537,17 @@ describe("bridge runtime scroll position", () => {
     focused.remove();
   }
 
+  const cancelable = { bubbles: true, cancelable: true };
+
+  /** Dispatch `event` to a widget that consumes it, as a slide deck does with its keys. */
+  function handledByPage(event: Event) {
+    const widget = document.createElement("div");
+    widget.addEventListener(event.type, (e) => e.preventDefault());
+    document.body.append(widget);
+    widget.dispatchEvent(event);
+    widget.remove();
+  }
+
   function editableText() {
     const text = document.createElement("div");
     // jsdom doesn't implement isContentEditable.
@@ -558,9 +569,10 @@ describe("bridge runtime scroll position", () => {
     const hide = addRestoreHide();
     const port = startRuntime({ restoreScroll: restoreTo(640) });
     takeOver(userScrollTo);
-    expect(hide.isConnected).toBe(false);
     vi.advanceTimersToNextFrame();
+    expect(hide.isConnected).toBe(false);
     expect(scrollTo).toHaveBeenCalledTimes(1);
+    vi.advanceTimersToNextFrame();
     // The offset the page shows is saved even when the input didn't move it.
     expect(sentScrollOffsets(port)).toEqual([window.scrollY]);
 
@@ -586,6 +598,12 @@ describe("bridge runtime scroll position", () => {
     ["an arrow key in editable text", () => pressIn(editableText(), "ArrowDown")],
     ["a space on a focused button", () => pressIn(document.createElement("button"), " ")],
     ["a space on a <summary>", () => pressIn(document.createElement("summary"), " ")],
+    ["a pinch", () => dispatchToPage(new WheelEvent("wheel", { ctrlKey: true, bubbles: true }))],
+    [
+      "a scroll key the page handles",
+      () => handledByPage(new KeyboardEvent("keydown", { key: "PageDown", ...cancelable })),
+    ],
+    ["a wheel the page handles", () => handledByPage(new WheelEvent("wheel", cancelable))],
   ])("keeps restoring through %s", (_label, interact) => {
     const { scrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
     const hide = addRestoreHide();
