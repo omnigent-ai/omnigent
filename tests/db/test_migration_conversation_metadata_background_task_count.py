@@ -2,7 +2,7 @@
 
 The migration and the ORM model both add a nullable Integer column with no
 database default; existing rows keep their values and read ``NULL``, and
-downgrading drops the column.
+downgrading drops the column while keeping the rows.
 """
 
 from __future__ import annotations
@@ -48,7 +48,9 @@ def test_model_declares_a_nullable_integer_column() -> None:
     assert column.server_default is None
 
 
-def test_upgrade_adds_the_column_and_keeps_rows(database: tuple[str, sa.Engine]) -> None:
+def test_upgrade_adds_the_column_and_downgrade_drops_it_keeping_rows(
+    database: tuple[str, sa.Engine],
+) -> None:
     uri, engine = database
     _migrate(uri, engine, "upgrade", _PREVIOUS)
     with engine.begin() as conn:
@@ -72,13 +74,13 @@ def test_upgrade_adds_the_column_and_keeps_rows(database: tuple[str, sa.Engine])
         ).one()
     assert tuple(row) == (2, None)
 
-
-def test_downgrade_drops_the_column(database: tuple[str, sa.Engine]) -> None:
-    uri, engine = database
-    _migrate(uri, engine, "upgrade", _REVISION)
-
     _migrate(uri, engine, "downgrade", _PREVIOUS)
 
     assert "background_task_count" not in {
         column["name"] for column in sa.inspect(engine).get_columns(_TABLE)
     }
+    with engine.connect() as conn:
+        assert (
+            conn.execute(sa.text(f"SELECT pending_elicitation_count FROM {_TABLE}")).scalar_one()
+            == 2
+        )
