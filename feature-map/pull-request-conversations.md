@@ -26,6 +26,14 @@ together in Comments.
   The plus hides while the composer is open; its top-right X closes it.
 - `history`: On-demand pages, incomplete/error states, resolved collapse,
   unresolved navigation and original context for unplaceable conversations.
+  Conversations on files hidden by the path filter are hidden with their file.
+  Navigating to one clears the filter and shows **Filter cleared to show <file>**.
+- `file-controls`: The sidebar **Filter changed files** input (on narrow screens a
+  toolbar button opens it above the list; hiding it clears the filter). Escape
+  clears it, and **Clear filter** restores the list. Each file header has a
+  **Copy path** button on desktop and an overflow menu with **Copy previous path**
+  (renamed files) and **Open in** the provider, which is disabled with a reason when
+  the head repository or revision is unknown.
 - `thread-refresh`: Threads fetch separately and poll while Changes is open;
   other subtabs, the PR list and the collapsed rail stop requesting them.
   A compact **Loading review threads** spinner beside the layout toggle indicates
