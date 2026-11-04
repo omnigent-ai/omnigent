@@ -2407,6 +2407,23 @@ def build_native_controls(
                 _ingest_now_serving[conv_id] = _seq + 1
                 _cond.notify_all()
 
+    def _retire_ingest_ticket(conv_id: str, seq: int, cond: asyncio.Condition) -> None:
+        """Advance the ingest gate past an abandoned ticket once its turn comes."""
+
+        async def retire() -> None:
+            async with cond:
+                while _ingest_now_serving.get(conv_id, 0) < seq:
+                    if _ingest_cond.get(conv_id) is not cond:
+                        return  # The session's gate was torn down meanwhile.
+                    await cond.wait()
+                if _ingest_now_serving.get(conv_id, 0) == seq:
+                    _ingest_now_serving[conv_id] = seq + 1
+                    cond.notify_all()
+
+        task = asyncio.create_task(retire(), name=f"retire-ingest-{conv_id}")
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
     async def _handle_claude_sdk_clear(conv_id: str) -> Response:
         """Drop a claude-sdk session's live client and history before ``/clear``.
 
@@ -2419,9 +2436,15 @@ def build_native_controls(
         _seq = _ingest_next_seq.get(conv_id, 0)
         _ingest_next_seq[conv_id] = _seq + 1
         _cond = _ingest_cond.setdefault(conv_id, asyncio.Condition())
-        async with _cond:
-            while _ingest_now_serving.get(conv_id, 0) != _seq:
-                await _cond.wait()
+        try:
+            async with _cond:
+                while _ingest_now_serving.get(conv_id, 0) != _seq:
+                    await _cond.wait()
+        except asyncio.CancelledError:
+            # Give up the place in line without jumping the input ahead of it,
+            # or later input for the session would wait on it forever.
+            _retire_ingest_ticket(conv_id, _seq, _cond)
+            raise
         try:
             if conv_id in _active_turns or _session_message_buffers.get(conv_id):
                 return JSONResponse(

@@ -4005,6 +4005,71 @@ async def test_events_clear_on_claude_sdk_releases_the_idle_client(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear cancelled while queued behind an ingest leaves the gate usable.
+
+    Tunnel teardown cancels in-flight requests. The cancelled clear's place in
+    the ingest gate is given up once the message ahead of it finishes, so the
+    next input for the session still runs.
+    """
+    from omnigent.runner import app as runner_app
+
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    sid = "f5b4cad6e7f38d9e1f2a3b4c53647566"
+    ingest_held, release_ingest = asyncio.Event(), asyncio.Event()
+    resolve_content = runner_app._resolve_forwarded_message_content
+
+    async def held_ingest(*args: Any, **kwargs: Any) -> Any:
+        if not ingest_held.is_set():
+            ingest_held.set()
+            await release_ingest.wait()
+        return await resolve_content(*args, **kwargs)
+
+    monkeypatch.setattr(runner_app, "_resolve_forwarded_message_content", held_ingest)
+    message = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "next"}],
+    }
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        ahead = asyncio.create_task(client.post(f"/v1/sessions/{sid}/events", json=message))
+        await asyncio.wait_for(ingest_held.wait(), timeout=5)
+        clear = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "clear", "continue_in_new_session": True},
+            )
+        )
+        await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- queue it
+        clear.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await clear
+        release_ingest.set()
+        assert (await asyncio.wait_for(ahead, timeout=5)).status_code < 300
+        turn = app.state.active_turns.get(sid)
+        if turn is not None:
+            await asyncio.wait_for(asyncio.shield(turn), timeout=5)
+
+        later = await asyncio.wait_for(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "clear", "continue_in_new_session": True},
+            ),
+            timeout=5,
+        )
+
+    assert later.status_code == 200, later.text
+    assert sid in pm.released
+
+
+@pytest.mark.asyncio
 async def test_events_legacy_clear_on_claude_sdk_stays_unsupported() -> None:
     """
     An unmarked ``clear`` (an older server's) keeps claude-sdk's unsupported 204.
