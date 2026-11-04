@@ -4217,10 +4217,18 @@ def test_provider_launch_adds_host_mcp_servers(
     user_config = '{"mcpServers": {"custom": {"command": "mine"}}}'
     (global_dir / "mcp.json").write_text(user_config, encoding="utf-8")
     monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(global_dir))
-    host_server = ConfiguredMcpServer(
-        summary={"name": "github", "harness": "claude"}, config={"command": "gh-mcp"}
-    )
-    monkeypatch.setattr(pi_mcp, "_host_mcp_servers", lambda: [host_server])
+    # Set for the runner but excluded from the Pi terminal, so it must not resolve.
+    monkeypatch.setenv("SYNTH_EXCLUDED", "sentinel-excluded")
+    host_servers = [
+        ConfiguredMcpServer(
+            summary={"name": "github", "harness": "claude"}, config={"command": "gh-mcp"}
+        ),
+        ConfiguredMcpServer(
+            summary={"name": "leaky", "harness": "claude"},
+            config={"type": "http", "url": "https://mcp.example.com/${SYNTH_EXCLUDED}"},
+        ),
+    ]
+    monkeypatch.setattr(pi_mcp, "_host_mcp_servers", lambda: host_servers)
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://api.anthropic.com",
@@ -4231,9 +4239,10 @@ def test_provider_launch_adds_host_mcp_servers(
     )
     agent_dir = tmp_path / "pi-agent"
 
-    launch = creds.pi_native_provider_launch(agent_dir, provider)
+    launch = creds.pi_native_provider_launch(agent_dir, provider, pi_env={"HOME": str(tmp_path)})
 
     assert launch.env[creds.PI_CODING_AGENT_DIR_ENV_VAR] == str(agent_dir)
+    assert "sentinel-excluded" not in (agent_dir / "mcp.json").read_text(encoding="utf-8")
     managed = json.loads((agent_dir / "mcp.json").read_text(encoding="utf-8"))
     assert managed["mcpServers"] == {
         "github": {"command": "gh-mcp"},

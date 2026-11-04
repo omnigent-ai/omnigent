@@ -122,6 +122,9 @@ def _from_json_config(
         oauth = raw.get("oauth")
         if isinstance(oauth, Mapping):
             settings = {key: oauth[key] for key in _PI_OAUTH_KEYS if key in oauth}
+            # Claude Code spells Pi's space-separated ``scope`` as ``scopes``.
+            if "scope" not in settings and isinstance(oauth.get("scopes"), str):
+                settings["scope"] = oauth["scopes"]
             if settings:
                 entry["oauth"] = settings
         return entry

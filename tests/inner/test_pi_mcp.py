@@ -155,7 +155,12 @@ def test_claude_http_resolves_url_and_templates_headers(monkeypatch: pytest.Monk
                     "type": "http",
                     "url": "https://${MCP_HOST}/mcp",
                     "headers": {"Authorization": "Bearer ${REMOTE_TOKEN}"},
-                    "oauth": {"clientId": "abc", "callbackPort": 8123, "unknown": "dropped"},
+                    "oauth": {
+                        "clientId": "abc",
+                        "callbackPort": 8123,
+                        "scopes": "read write",
+                        "unknown": "dropped",
+                    },
                 },
             )
         ]
@@ -164,7 +169,7 @@ def test_claude_http_resolves_url_and_templates_headers(monkeypatch: pytest.Monk
         "remote": {
             "url": "https://mcp.example.com/mcp",
             "headers": {"Authorization": "Bearer ${REMOTE_TOKEN}"},
-            "oauth": {"clientId": "abc", "callbackPort": 8123},
+            "oauth": {"clientId": "abc", "callbackPort": 8123, "scope": "read write"},
         }
     }
 
