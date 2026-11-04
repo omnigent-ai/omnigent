@@ -4484,7 +4484,7 @@ async def test_random_worktree_is_created_per_new_session(
     monkeypatch.setattr(_host_worktree, "create_worktree_on_host", create)
     for i in range(2):
         conv = await fire_mod._create_session(
-            deps, task, labels=fire_mod._session_labels(task), workflow=None
+            deps, task, labels=fire_mod._session_labels(task), workflow=None, scheduled_at=0
         )
         saved = deps.conversation_store.created[-1]
         assert saved["workspace"] == (f"/repo-worktrees/run-{i}/src" if enabled else source)
@@ -4554,6 +4554,7 @@ async def test_random_worktree_rolls_back_when_session_creation_fails(
             _task(base_branch="HEAD", model_override="custom" if failure == "update" else None),
             labels=fire_mod._session_labels(_task()),
             workflow=None,
+            scheduled_at=0,
         )
     assert deps.conversation_store.deleted == ([] if failure == "create" else ["conv_1"])
     assert remove.await_count == 1
@@ -4672,7 +4673,9 @@ async def test_cancelled_session_creation_waits_for_writes_before_cleanup(
     )
     task = _task(base_branch="HEAD")
     pending = asyncio.create_task(
-        fire_mod._create_session(deps, task, labels=fire_mod._session_labels(task), workflow=None)
+        fire_mod._create_session(
+            deps, task, labels=fire_mod._session_labels(task), workflow=None, scheduled_at=0
+        )
     )
     try:
         await asyncio.wait_for(entered.wait(), 5)
