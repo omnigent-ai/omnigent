@@ -4237,6 +4237,40 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
+  it("leaves a queued resend's startup inputs to it when Send all sends an earlier message first", async () => {
+    onTestFinished(clearSessionDrafts);
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    expect(takeFailedSendDraft("conv_real", false, true)?.text).toBe("saved on server");
+    setSessionDraft("conv_real", { text: "", files: [] });
+    const posts: unknown[] = [];
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_real/events") && init?.method === "POST")
+        posts.push(JSON.parse(String(init.body)));
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_other", text: "something else", conversationId: "conv_real" },
+        {
+          queueId: "q_resend",
+          text: "saved on server",
+          conversationId: "conv_real",
+          startupInputIds: ["pending_first"],
+        },
+      ],
+    });
+
+    useChatStore.getState().steerAllQueuedMessages("conv_real");
+    await settle();
+
+    expect(posts).toHaveLength(2);
+    expect(posts[0]).not.toHaveProperty("replaces_failed_inputs");
+    expect(posts[1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+  });
+
   it("names a reloaded draft's startup inputs before they can be read, but not in a send queued behind it", async () => {
     onTestFinished(clearSessionDrafts);
     seedSession("conv_real");

@@ -2389,11 +2389,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     setActive({
       queuedMessages: s.queuedMessages.filter((m) => !batchOrder.has(m.queueId)),
     });
-    for (const m of batch) {
+    // Off the queue, later messages' startup inputs stay theirs while earlier sends pick.
+    const batchOut = Symbol("steer_all");
+    batch.forEach((m, index) => {
+      const later = batch.slice(index + 1).flatMap((next) => next.startupInputIds ?? []);
+      nameStartupInputsOut(conversationId, batchOut, later);
       const agentId = m.agentId ?? s.boundAgentId;
-      if (agentId === null) continue;
+      if (agentId === null) return;
       void s.send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder));
-    }
+    });
+    nameStartupInputsOut(conversationId, batchOut);
   },
 
   clearQueuedMessages: (conversationId) => {

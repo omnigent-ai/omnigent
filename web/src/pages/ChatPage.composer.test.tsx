@@ -6241,6 +6241,35 @@ describe("Composer failed-send attachment restore", () => {
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
+  it("adds a refused startup resend's files after the user's newer input", () => {
+    const props = composerProps();
+    render(<Composer {...props} />);
+    const mine = new File(["mine"], "mine.txt", { type: "text/plain" });
+    fireEvent.change(textarea(), { target: { value: "newer" } });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [mine] },
+    });
+    const notes = new File(["hello"], "notes.txt", { type: "text/plain" });
+
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend",
+          files: [notes],
+          startupInputIds: ["pending_first"],
+        },
+      }),
+    );
+
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("newer\n\nresend", [mine, notes], undefined, [
+      "pending_first",
+    ]);
+  });
+
   it("clears the failed-send rejection notice once the user types", () => {
     render(<Composer {...composerProps()} />);
     act(() =>

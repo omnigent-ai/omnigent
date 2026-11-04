@@ -2815,8 +2815,8 @@ function ComposerImpl(
   // The restore effects below key off conversation state and reach the
   // attachment actions through a ref rather than widening their dependency
   // lists.
-  const attachmentsRef = useRef({ restoreFiles, replaceFiles });
-  attachmentsRef.current = { restoreFiles, replaceFiles };
+  const attachmentsRef = useRef({ addFiles, restoreFiles, replaceFiles });
+  attachmentsRef.current = { addFiles, restoreFiles, replaceFiles };
 
   useEffect(() => {
     const previousConversationId = draftConversationIdRef.current;
@@ -3117,6 +3117,7 @@ function ComposerImpl(
     if (hasNewerInput) {
       const joined = appendReplyDraft(draft, restoreReplyDraft(failed.text, failed.replyDraft));
       replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));
+      if (failed.files.length > 0) attachmentsRef.current.addFiles(failed.files);
       dirtyRef.current = true;
       return;
     }
@@ -3820,7 +3821,8 @@ function ComposerImpl(
     submit({ resetNativeInputSession: true });
   };
 
-  // A queued message pulled back into the composer brings the failed startup inputs it took.
+  // The draft keeps the recalled message's failed startup inputs, so its resend replaces them
+  // and a reload doesn't offer them again.
   const takeBackQueued = (message: {
     queueId: string;
     text: string;
