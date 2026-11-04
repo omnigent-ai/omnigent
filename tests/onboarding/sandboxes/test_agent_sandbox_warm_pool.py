@@ -324,10 +324,10 @@ def test_template_preserves_storage_mount_separation_and_agent_profile(
         ),
         (
             {
-                "requests": {"cpu": "0.02", "memory": "100M"},
+                "requests": {"cpu": ".02", "memory": "100M"},
                 "limits": {"cpu": "1", "memory": "1G"},
             },
-            {"cpu": "0.02", "memory": "100M"},
+            {"cpu": ".02", "memory": "100M"},
         ),
         (
             {"requests": {"cpu": "0.5", "memory": "1e9"}, "limits": {"cpu": "1", "memory": "2e9"}},
@@ -348,9 +348,10 @@ def test_bootstrap_requests_do_not_exceed_smaller_configured_resources(
     }
 
 
-def test_template_rejects_resource_quantities_kubernetes_cannot_parse() -> None:
-    resources = {"requests": {"memory": "1Gb"}, "limits": {"memory": "2Gi"}}
-    with pytest.raises(click.ClickException, match="'1Gb' is not a valid Kubernetes"):
+@pytest.mark.parametrize("memory", ["1Gb", "1e3Mi"])
+def test_template_rejects_resource_quantities_kubernetes_cannot_parse(memory: str) -> None:
+    resources = {"requests": {"memory": memory}, "limits": {"memory": "2Gi"}}
+    with pytest.raises(click.ClickException, match=f"'{memory}' is not a valid Kubernetes"):
         _launcher(resources=resources).template_spec()
 
 

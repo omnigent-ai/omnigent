@@ -132,11 +132,12 @@ def _shared_profile(spec: dict[str, Any]) -> bool:
 
 
 def _quantity(value: str) -> Decimal:
-    """Parse a Kubernetes quantity without the optional Kubernetes SDK."""
-    match = re.fullmatch(r"(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)([a-zA-Z]*)", value)
-    if match is None or match[2] not in _QUANTITY_SCALE:
+    """Parse an unsigned Kubernetes quantity without the optional Kubernetes SDK."""
+    # Kubernetes accepts either a decimal exponent or an SI suffix, not both.
+    match = re.fullmatch(r"(\d+\.?\d*|\.\d+)(?:([eE][-+]?\d+)|([a-zA-Z]*))", value)
+    if match is None or (match[3] or "") not in _QUANTITY_SCALE:
         raise click.ClickException(f"{value!r} is not a valid Kubernetes resource quantity.")
-    return Decimal(match[1]) * _QUANTITY_SCALE[match[2]]
+    return Decimal(match[1] + (match[2] or "")) * _QUANTITY_SCALE[match[3] or ""]
 
 
 def _contains(expected: Any, actual: Any, *, field: str = "") -> bool:
