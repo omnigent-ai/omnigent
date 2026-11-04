@@ -7,9 +7,11 @@ import json
 import sys
 from contextlib import contextmanager, suppress
 from dataclasses import asdict
+from functools import partial
 
 import psutil
 import pytest
+from cachetools import TTLCache
 
 from omnigent.host import mcp_tools
 from omnigent.host.mcp_inventory import ConfiguredMcpServer
@@ -490,7 +492,7 @@ async def test_sign_in_state_is_cached_until_a_sign_in(monkeypatch):
     async def needs_auth(payload):
         return mcp_tools._result("needs_auth")
 
-    states = iter(["available", "available", "signed_in", "signed_in"])
+    states = iter(["available", "available", *["signed_in"] * 4])
     checks = 0
     checking = asyncio.Event()
     release = asyncio.Event()
@@ -544,3 +546,15 @@ async def test_sign_in_state_is_cached_until_a_sign_in(monkeypatch):
     refuse.set()
     await before
     assert not discovery._cache
+
+    # A sign-in made outside Omnigent shows once the cached state expires.
+    now = 0.0
+    monkeypatch.setattr(mcp_tools, "TTLCache", partial(TTLCache, timer=lambda: now))
+    expiring = HostMcpTools()
+    await expiring.probe("claude", "docs")
+    now = mcp_tools.SIGN_IN_CACHE_SECONDS - 1
+    await expiring.probe("claude", "docs")
+    assert checks == 5
+    now = mcp_tools.SIGN_IN_CACHE_SECONDS
+    await expiring.probe("claude", "docs")
+    assert checks == 6

@@ -54,7 +54,7 @@ if os.environ.get("FAKE_OLD_CLI") and "--no-browser" in sys.argv:
     sys.exit(2)
 log.write_text(json.dumps({{"argv": sys.argv[1:], "tty": sys.stdin.isatty(),
     "env": sorted(k for k in os.environ if k.startswith("OMNIGENT_")), "pid": os.getpid(),
-    "browser": os.environ.get("BROWSER")}}))
+    "browser": os.environ.get("BROWSER"), "codex_home": os.environ.get("CODEX_HOME")}}))
 mode = os.environ.get("FAKE_MODE", "paste")
 if mode == "listen":
     import http.server
@@ -434,6 +434,21 @@ async def test_failed_and_expired_sign_in(
     finished = await _settled(logins, started["login_id"])
     assert (finished["state"], finished["error"]) == (state, error)
     await _assert_gone(json.loads(fake_cli.read_text())["pid"])
+    await logins.close()
+
+
+async def test_codex_signs_in_to_the_home_that_lists_its_servers(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    # A nested launch inherits its parent session's private home.
+    private_home = home / ".omnigent" / "codex-native" / "abc" / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(private_home))
+    logins = HostMcpLogins()
+    await logins.start(_server(harness="codex"))
+    assert json.loads(fake_cli.read_text())["codex_home"] == str(home / ".codex")
     await logins.close()
 
 
