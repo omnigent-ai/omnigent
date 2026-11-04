@@ -308,7 +308,7 @@ def test_html_preview_scroll_survives_tab_switch(
     offset = _open_html_artifact(page, base_url, session_a)
     assert offset > 1000
 
-    # Back to the Files tab, then open a second file in its own tab.
+    # Opening another file unmounts the preview, so returning to plan.html remounts it.
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="Files").click()
     rail.get_by_role("button", name=re.compile(r"notes\.md")).first.click()
