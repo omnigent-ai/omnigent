@@ -10,6 +10,7 @@ import {
 import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { COMPOSER_POPOVER_MAX_H, COMPOSER_POPOVER_Z } from "@/pages/chatLayout";
 
 /**
  * Built-in slash commands the web UI recognises directly. Each entry
@@ -385,16 +386,20 @@ function McpServerMenu({
     <div
       data-testid="mcp-server-menu"
       onMouseDown={(event) => event.preventDefault()}
-      className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+      className={cn(
+        "absolute bottom-full left-0 mb-2 flex w-[28rem] max-w-[calc(100vw-24px)] flex-col overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150",
+        COMPOSER_POPOVER_Z,
+        COMPOSER_POPOVER_MAX_H,
+      )}
     >
-      <div className="px-2 py-1">
+      <div className="shrink-0 px-2 py-1">
         <div className="font-medium text-ui text-foreground">MCP servers</div>
         <div className="text-xs leading-4 text-muted-foreground">Enabled for this session</div>
       </div>
-      <div className="max-h-64 overflow-y-auto">
+      <div className="max-h-64 min-h-0 overflow-y-auto">
         <McpServerRows {...rowProps} />
       </div>
-      <div className="mt-1 border-border border-t px-2 pt-2 text-xs text-muted-foreground">
+      <div className="mt-1 shrink-0 border-border border-t px-2 pt-2 text-xs text-muted-foreground">
         <Link className="underline hover:text-foreground" to={settingsHref}>
           Go to Settings
         </Link>{" "}
@@ -554,9 +559,13 @@ export function SlashCommandMenu({
   return (
     <div
       data-testid="slash-command-menu"
-      className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
+      className={cn(
+        "menu-surface absolute right-0 bottom-full left-0 mb-2 flex w-full flex-col overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu",
+        COMPOSER_POPOVER_Z,
+        COMPOSER_POPOVER_MAX_H,
+      )}
     >
-      <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
+      <div ref={listRef} className="max-h-[22rem] min-h-0 overflow-y-auto">
         {builtinRows.length > 0 && sectionHeader("Commands")}
         {builtinRows.map((row) => (
           <MenuRowButton
