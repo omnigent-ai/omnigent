@@ -59,11 +59,16 @@ be able to write resources without a separate Omnigent account.
   with the user's config, runs `omnigent login` there with the sign-in callback
   port forwarded to the laptop, then starts `omnigent host --background`.
   States: consent, trusting a new host key, a key passphrase or password,
-  installing omnigent when it is missing, finishing in the browser, connected
-  (the new host selected), already connected, closing the window mid sign-in
-  (nothing left running on the machine), and failures, shown only in the app's
-  own window. Hidden where **Run on Arca** is offered (the Databricks-internal
-  flag on a Databricks-managed server).
+  installing omnigent when it is missing, finishing in the browser (with a
+  confirmation code on OIDC servers), connected (the new host selected),
+  already connected, connected but the new host unconfirmed (the dialog stays
+  open to pick it from the host list), closing the window mid sign-in (nothing
+  left running on the machine), a sign-in link the machine shouldn't print
+  (refused, no browser), a window connected to a server on this computer
+  (`localhost`; refused in the dialog before connecting), and failures, shown
+  only in the app's own window.
+  Hidden where **Run on Arca** is offered (the Databricks-internal flag on a
+  Databricks-managed server).
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.
@@ -208,6 +213,14 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/host/test_service.py::test_service_entry_waits_while_another_daemon_serves_the_workspace`.
   A real check needs two URLs that reach one workspace, so run it only in a
   private-network sandbox against a disposable server.
+- **Foreground terminal hangup (own environment, Linux):**
+  `tests/e2e/test_host_terminal_hangup_mid_turn_e2e.py::test_terminal_hangup_lets_in_flight_turn_finish`
+  closes a real PTY while a mock reply is held. Direct and zygote runners finish
+  the same turn after the host dies by SIGHUP, without replay, then exit. SIGTERM
+  and Ctrl-C controls stop the busy runner before the reply is released. Run
+  with plain `uv run --no-sync pytest`; no live credentials are needed. This
+  proves the foreground terminal path; a generic SIGHUP report does not identify
+  its initiator. Installed system services and native browser journeys are separate.
 - **Background harness credentials (own environment, installed Codex/Claude SDK):**
   `tests/e2e/test_background_host_harness_credentials.py` compares real foreground
   and background hosts. Saved provider env references and named passthrough keep

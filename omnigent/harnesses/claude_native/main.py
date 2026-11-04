@@ -224,6 +224,9 @@ _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
 _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
+#: Kill-switch for Claude Code's server-side advisor tool, which runs only when the
+#: user sets an advisor model in their own Claude settings.
+_CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"
 #: Kill-switch Claude Code treats as covering nonessential startup traffic;
 #: the probe strips it so speed knobs never mask harness output.
 _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
@@ -266,6 +269,9 @@ _CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBAC
 # tool's `tmux kill-session` or `kill-server` ends Claude itself.
 _CLAUDE_CODE_ENV_FILE_ENV = "CLAUDE_ENV_FILE"
 _CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
+# Claude Code waits 10 minutes by default for response headers, so a request
+# whose connection died silently (e.g. across host sleep) stalls the turn.
+_CLAUDE_CODE_API_TIMEOUT_ENV = "API_TIMEOUT_MS"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -453,6 +459,8 @@ class ClaudeNativeUcodeConfig:
         Claude Code's ``modelOverrides`` setting. Consumers treat both sides
         as opaque ids; an empty map means the provider supplied no reliable
         equivalence information.
+    :param subscription_auth: Use the selected claude.ai login without inherited
+        API keys or bearer tokens. Claude still owns its model configuration.
     """
 
     env: dict[str, str]
@@ -460,6 +468,7 @@ class ClaudeNativeUcodeConfig:
     model: str | None = None
     routable_models: tuple[str, ...] = ()
     model_overrides: dict[str, str] = field(default_factory=dict)
+    subscription_auth: bool = False
 
 
 def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
@@ -750,7 +759,12 @@ def claude_config_with_launch_model_pinned(
         normalized_model_id,
     )
 
-    if claude_config is None or not launch_model or not launch_model.strip():
+    if (
+        claude_config is None
+        or claude_config.subscription_auth
+        or not launch_model
+        or not launch_model.strip()
+    ):
         return claude_config
     model = launch_model.strip()
     if model in _UCODE_CLAUDE_TIER_TO_ENV or model == _UCODE_CLAUDE_CUSTOM_TIER:
@@ -839,6 +853,74 @@ def managed_claude_gateway_signal() -> tuple[str | None, bool]:
     return claude_managed_gateway(_managed_settings_paths())
 
 
+# Env flags that switch Claude Code to a gateway or cloud transport.
+_CLAUDE_TRANSPORT_FLAGS = (
+    "CLAUDE_CODE_USE_GATEWAY",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
+@dataclass(frozen=True)
+class ClaudeAmbientTransport:
+    """Settings that can move an unconfigured Claude Code launch off its own login.
+
+    :param env: The effective ``ANTHROPIC_BASE_URL`` and transport flags,
+        each from managed settings, else user settings, else the process env,
+        e.g. ``(("ANTHROPIC_BASE_URL", "https://gateway.example"),)``.
+    :param user_api_key_helper: Whether user settings name an ``apiKeyHelper``.
+    """
+
+    env: tuple[tuple[str, str], ...]
+    user_api_key_helper: bool
+
+    def leaves_login(self) -> bool:
+        """Whether Claude Code would use a gateway, helper, or cloud transport.
+
+        :returns: ``True`` when the effective base URL is not Anthropic's, a gateway
+            or cloud transport is enabled, or user settings name an ``apiKeyHelper``.
+        """
+        env = dict(self.env)
+        if self.user_api_key_helper or any(
+            env.get(name, "").lower() in ("1", "true", "yes", "on")
+            for name in _CLAUDE_TRANSPORT_FLAGS
+        ):
+            return True
+        base_url = env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+        if not base_url:
+            return False
+        host = (urlparse(base_url).hostname or "").lower()
+        return host != "anthropic.com" and not host.endswith(".anthropic.com")
+
+
+def claude_ambient_transport() -> ClaudeAmbientTransport:
+    """Read the transport settings an unconfigured Claude Code launch applies.
+
+    Project settings depend on the session workspace and are not read here.
+
+    :returns: The effective transport settings across managed settings, user
+        settings, and the process env.
+    """
+    from omnigent.onboarding.ambient import read_claude_managed_settings, read_claude_user_settings
+
+    user_settings = read_claude_user_settings() or {}
+    layers: list[Mapping[str, object]] = []
+    for settings in (read_claude_managed_settings(_managed_settings_paths()), user_settings):
+        env = settings.get("env") if settings is not None else None
+        layers.append(env if isinstance(env, dict) else {})
+    layers.append(os.environ)
+    effective: list[tuple[str, str]] = []
+    for name in (_UCODE_CLAUDE_BASE_URL_ENV, *_CLAUDE_TRANSPORT_FLAGS):
+        values = (str(layer.get(name) or "").strip() for layer in layers)
+        value = next((value for value in values if value), None)
+        if value is not None:
+            effective.append((name, value))
+    return ClaudeAmbientTransport(
+        env=tuple(effective), user_api_key_helper=bool(user_settings.get("apiKeyHelper"))
+    )
+
+
 def claude_native_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]]:
@@ -852,7 +934,9 @@ def claude_native_model_options(
     :returns: Wire-ready model option objects.
     """
     options: list[dict[str, object]] = []
-    effective_config = claude_config or _managed_claude_model_config()
+    effective_config = claude_config
+    if effective_config is None or effective_config.subscription_auth:
+        effective_config = _managed_claude_model_config()
     if effective_config is not None:
         default_model = (effective_config.model or "").removesuffix("[1m]")
         for tier, env_var in _UCODE_CLAUDE_TIER_TO_ENV.items():
@@ -955,26 +1039,20 @@ def _claude_model_probe_launch(
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.config import load_effective_config
     from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     args = ["-p"]
     if stream_input:
         args.extend(("--input-format", "stream-json"))
     else:
         args.append("/model")
-    args.extend(
-        [
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            # The probe asks one client-side question; the MCP fleet, session
-            # persistence, and background chatter are irrelevant startup weight.
-            "--strict-mcp-config",
-            "--mcp-config",
-            '{"mcpServers":{}}',
-            "--no-session-persistence",
-            *extra_args,
-        ]
-    )
+    args.extend(["--output-format", "stream-json", "--verbose"])
+    # The probe asks one client-side question; the MCP fleet, session
+    # persistence, and background chatter are irrelevant startup weight.
+    # Claude Code refuses both MCP flags while an enterprise MCP config exists.
+    if not claude_code_managed_mcp_present():
+        args.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+    args.extend(["--no-session-persistence", *extra_args])
     if claude_config is not None and claude_config.api_key_helper:
         args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
     cfg = load_effective_config()
@@ -1353,10 +1431,10 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, launch_args = _claude_model_probe_launch(claude_config, stream_input=True)
-    ambient_gateway = None
-    if claude_config is None:
-        managed_base_url, _ = managed_claude_gateway_signal()
-        ambient_gateway = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV)
+    # Keying on every transport setting means a catalog probed under a gateway or
+    # cloud transport is never read again once that setting is removed.
+    uses_cli_settings = claude_config is None or claude_config.subscription_auth
+    ambient_transport = claude_ambient_transport() if uses_cli_settings else None
     return fingerprint_of(
         "claude-native",
         "control-picker-v3",
@@ -1364,12 +1442,13 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
         sorted(claude_config.routable_models) if claude_config is not None else None,
+        claude_config.subscription_auth if claude_config is not None else False,
         command,
         launch_args,
         binary_identity(command),
         binary_identity("claude"),
-        ambient_gateway,
-        claude_managed_model_picker() if claude_config is None else None,
+        ambient_transport,
+        claude_managed_model_picker() if uses_cli_settings else None,
     )
 
 
@@ -1563,8 +1642,10 @@ def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None
 def native_claude_auth_env_unset(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> tuple[str, ...]:
-    """Credentials that would override the explicitly configured auth helper."""
-    if claude_config is not None and claude_config.api_key_helper:
+    """Inherited credentials that would override the selected authentication."""
+    if claude_config is not None and (
+        claude_config.api_key_helper or claude_config.subscription_auth
+    ):
         return (_ANTHROPIC_API_KEY_ENV, "ANTHROPIC_AUTH_TOKEN")
     return ()
 
@@ -1583,6 +1664,8 @@ def claude_tool_env_file() -> str:
 
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    client_surface: str | None = None,
 ) -> dict[str, str]:
     """
     Build env overrides for a native Claude Code terminal process.
@@ -1595,7 +1678,9 @@ def build_native_claude_terminal_env(
     which a web-driven session cannot see or answer (see
     :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`). Custom Anthropic
     endpoints keep the selected model when it refuses, since their catalogs
-    may not serve Claude Code's canonical refusal-fallback target.
+    may not serve Claude Code's canonical refusal-fallback target. Model
+    requests default to :class:`RetryPolicy`'s per-request timeout so an
+    unanswered request is retried (see :data:`_CLAUDE_CODE_API_TIMEOUT_ENV`).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -1604,18 +1689,29 @@ def build_native_claude_terminal_env(
         ``{"ENABLE_TOOL_SEARCH": "true"}``.
     """
     terminal_env = {
+        "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV: "true",
         _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
         _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV: "1",
     }
     if claude_config is not None:
         terminal_env.update(claude_config.env)
+        terminal_env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
     configured_base_url = (
         claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is not None else None
     )
+    base_url = configured_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    if is_databricks_ai_gateway_url(base_url):
+        terminal_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            terminal_env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV)
+            or os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            CLAUDE_CODE_AGENT,
+            via_ug=is_ug_route(base_url),
+            client_surface=client_surface,
+        )
     if _ambient_env_is_non_anthropic_gateway(configured_base_url):
         terminal_env[_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV] = "1"
     # A user-provided env file keeps priority; it replaces the tmux scrub.
@@ -1623,6 +1719,13 @@ def build_native_claude_terminal_env(
         _CLAUDE_CODE_ENV_FILE_ENV
     ):
         terminal_env[_CLAUDE_CODE_ENV_FILE_ENV] = claude_tool_env_file()
+    if _CLAUDE_CODE_API_TIMEOUT_ENV not in terminal_env and not os.environ.get(
+        _CLAUDE_CODE_API_TIMEOUT_ENV
+    ):
+        from omnigent.spec.types import RetryPolicy
+
+        retry_env = RetryPolicy().claude_cli.env()
+        terminal_env[_CLAUDE_CODE_API_TIMEOUT_ENV] = retry_env[_CLAUDE_CODE_API_TIMEOUT_ENV]
     # A raw credential can override the helper or open Claude's API-key menu.
     for name in native_claude_auth_env_unset(claude_config):
         if name in terminal_env:
@@ -3062,10 +3165,22 @@ def _ucode_config_for_profile(
         # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
         # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
-        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: with_gateway_attribution_lines(
-            _DATABRICKS_CODING_AGENT_HEADER, CLAUDE_CODE_AGENT, via_ug=True
+        # The gateway rejects the advisor tool on the Opus route, and Omnigent
+        # does not offer one, so a user-set advisor model would fail every turn.
+        _CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV: "1",
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: "\n".join(
+            value
+            for value in (
+                _DATABRICKS_CODING_AGENT_HEADER,
+                agent_state.env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            )
+            if value
         ),
     }
+    if is_databricks_ai_gateway_url(base_url):
+        env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV], CLAUDE_CODE_AGENT, via_ug=True
+        )
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
     # names.  Without this Claude Code normalises the picked model to a
@@ -3239,10 +3354,11 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         default_env_var = ALIAS_MODEL_ENV_VARS.get(base_alias)
         if default_env_var:
             pin_env.setdefault(default_env_var, family.default_model)
-    attribution_env: dict[str, str] = {}
+    gateway_env: dict[str, str] = {}
     if is_databricks_ai_gateway_url(family.base_url):
+        gateway_env[_CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV] = "1"
         # Keep any headers the user already sends; the config env replaces theirs.
-        attribution_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+        gateway_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
             os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
             CLAUDE_CODE_AGENT,
             via_ug=is_ug_route(family.base_url),
@@ -3251,7 +3367,7 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
             **pin_env,
-            **attribution_env,
+            **gateway_env,
             # Disable beta flags gateways reject (400 "invalid beta flag");
             # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
             **(
@@ -3391,8 +3507,8 @@ def _native_claude_config_from_entry(
     - ``bedrock`` → Bedrock-style gateway config
       (:func:`_bedrock_config_for_native_claude`).
     - ``databricks`` → the existing ucode path keyed on the provider profile.
-    - ``subscription`` → ``None`` (use the ``claude`` CLI's own login, e.g. a
-      Claude Enterprise seat) — intentional, not a fallback to ucode.
+    - ``subscription`` → use the ``claude`` CLI's login without inherited API
+      credentials, or defer to Claude's configured gateway/cloud transport.
 
     :param entry: The resolved provider entry.
     :param refresh_models: Forwarded to the ucode path's model discovery; pass
@@ -3414,10 +3530,17 @@ def _native_claude_config_from_entry(
     if entry.kind == DATABRICKS_KIND:
         log_info_once(_logger, "native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
+    if managed_claude_gateway_signal()[1] or claude_ambient_transport().leaves_login():
+        log_info_once(
+            _logger,
+            "native-claude routing: Claude Code's configured auth (provider %r)",
+            entry.name,
+        )
+        return None
     log_info_once(
         _logger, "native-claude routing: Claude CLI login (subscription provider %r)", entry.name
     )
-    return None
+    return ClaudeNativeUcodeConfig(env={}, subscription_auth=True)
 
 
 # Refresh cadence for the broker-backed apiKeyHelper on the managed connect
@@ -3517,6 +3640,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
     env = {
         _UCODE_CLAUDE_BASE_URL_ENV: f"{workspace_host}/ai-gateway/anthropic",
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
+        _CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV: "1",
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
     }
     model = _connect_broker_default_model()
@@ -3555,11 +3679,12 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
                 "connected workspace host) — using the profile-derived gateway route.",
             )
 
-    env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-        env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
-        CLAUDE_CODE_AGENT,
-        via_ug=adopted_ug_route,
-    )
+    if is_databricks_ai_gateway_url(env[_UCODE_CLAUDE_BASE_URL_ENV]):
+        env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            CLAUDE_CODE_AGENT,
+            via_ug=adopted_ug_route,
+        )
     env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
     return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)
 
@@ -3632,8 +3757,8 @@ def resolve_native_claude_config(
         return resolved
 
     # 1. Spec-driven: reuse the harness routing precedence verbatim. A
-    #    non-None entry decides the config (including a deliberate None for a
-    #    subscription); a None entry means the spec routed to databricks /
+    #    non-None entry decides the config (including None for CLI-owned
+    #    transports); a None entry means the spec routed to databricks /
     #    global auth → fall back to the spec's own ucode profile.
     if spec is not None:
         entry = _resolve_provider_for_build(
@@ -6922,11 +7047,12 @@ def _claude_terminal_request(
         "cwd": str(Path.cwd().resolve()),
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
-    spec["env"] = build_native_claude_terminal_env(claude_config)
+    # This wrapper is the CLI; don't trust a surface inherited from a session's shell.
+    spec["env"] = build_native_claude_terminal_env(claude_config, client_surface="cli")
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
-        # Remove provider/session variables that can override the
-        # ucode apiKeyHelper or make Claude think it is nested.
+        # Remove credentials that override the selected auth and the
+        # marker that makes Claude think it is nested.
         unset_env_vars = [
             *native_claude_auth_env_unset(claude_config),
             _CLAUDE_CODE_NESTED_SESSION_ENV,

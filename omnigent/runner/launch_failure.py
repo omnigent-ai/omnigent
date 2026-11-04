@@ -113,6 +113,19 @@ _AUTH_MARKERS = (
     "not authenticated",
 )
 
+# --- Claude Code install failed or left broken -------------------------------
+# A launcher that installs Claude Code before starting it reports npm's
+# ENOENT text, which also reads like a missing binary.
+_BROKEN_CLAUDE_INSTALL_MARKERS = (
+    "failedtoinstallclaudecode",
+    "claudenativebinarynotinstalled",
+)
+# The launcher's exec of a half-written binary, "Exec format error: '<path>/claude'";
+# matched on compacted text, so only the quoted path may name claude.
+_EXEC_FORMAT_ERROR = re.compile(r"execformaterror:'[^']*claude'")
+# Pane captures wrap long lines and draw borders, which can split a marker.
+_PANE_WRAP = re.compile(r"[\s│┃]+")
+
 # --- binary missing -----------------------------------------------------------
 _MISSING_MARKERS = (
     "command not found",
@@ -133,9 +146,15 @@ _REJECTED_ARGUMENT_MARKERS = (
     "usage: codex",
 )
 
+_BACKGROUND_SESSION_REFUSAL = re.compile(
+    r"that session is running in the\s+background.*?claude attach.*?claude stop",
+    re.DOTALL,
+)
+
 
 # Ordered most-specific first: the root case also reads like a permission /
-# auth problem, so it must win over the broader rules below it.
+# auth problem, and a broken install like a missing binary, so they must win
+# over the broader rules below them.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     _TerminalMatcher(
         "root_permission",
@@ -147,6 +166,38 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+        ),
+    ),
+    _TerminalMatcher(
+        "claude_install_broken",
+        lambda s: _claude_install_is_broken(s.output),
+        FailureDiagnosis(
+            title="Claude Code's install is broken",
+            cause=(
+                "Claude Code could not start because its install failed or is incomplete. "
+                "Launches that update Claude Code at the same time can leave it this way."
+            ),
+            remediation=(
+                "Send your message again. If it fails again, reinstall Claude Code on the "
+                "host with the installer you used, then retry."
+            ),
+        ),
+    ),
+    _TerminalMatcher(
+        "background_session_running",
+        lambda s: _BACKGROUND_SESSION_REFUSAL.search(s.output) is not None,
+        FailureDiagnosis(
+            title="Claude session is already running in the background",
+            cause=(
+                "Claude Code refused to resume this session because it is already "
+                "running in another background process."
+            ),
+            remediation=(
+                "Send your message again to resume a copy of the session here. To "
+                "resume the original instead, inspect the background session on the "
+                "host with `claude attach <session-id>` (the ID is in the terminal "
+                "output), stop it with `claude stop <session-id>`, then retry."
+            ),
         ),
     ),
     _TerminalMatcher(
@@ -209,6 +260,13 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
         ),
     ),
 )
+
+
+def _claude_install_is_broken(output: str) -> bool:
+    compact = _PANE_WRAP.sub("", output)
+    return any(m in compact for m in _BROKEN_CLAUDE_INSTALL_MARKERS) or bool(
+        _EXEC_FORMAT_ERROR.search(compact)
+    )
 
 
 # A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
@@ -277,6 +335,7 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "selected model is at capacity",
     "currently experiencing high demand, which may cause temporary errors",
 )
 _CLAUDE_RESPONSE_STOPPED_MESSAGE = (
@@ -641,6 +700,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The agent CLI on the host is too old for the selected model. Update it on the "
         "host, then start a new session."
     ),
+    "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 
