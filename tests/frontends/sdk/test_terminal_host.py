@@ -12,10 +12,11 @@ import logging
 import re
 import sys
 from collections.abc import Iterable
+from types import SimpleNamespace
 
 import pytest
 from omnigent_client import child_summary_busy
-from omnigent_ui_sdk.terminal._formatter import StreamingText
+from omnigent_ui_sdk.terminal._formatter import StreamingText, StreamLive, StreamReplace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 from prompt_toolkit.output import DummyOutput
 from rich.text import Text
@@ -1755,3 +1756,449 @@ def test_subagent_finished_node_kept_visible_in_selector() -> None:
     node = host._subagents["conv_c1"]
     assert host._subagent_visible(node, host._monotonic()) is True
     assert host._subagent_status_label(node) == "Done"
+
+
+# ── pause / resume rendering ────────────────────────────────────
+
+
+def _capture_stdout(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every ``sys.stdout.write`` payload and silence ``flush``."""
+    writes: list[str] = []
+    monkeypatch.setattr(sys.stdout, "write", lambda data: (writes.append(data), len(data))[1])
+    monkeypatch.setattr(sys.stdout, "flush", lambda: None)
+    return writes
+
+
+def test_paused_host_queues_output_and_replays_it_on_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While paused nothing reaches the terminal; resume paints the queue in order."""
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+
+    host.pause_rendering()
+    host.output(Text("alpha"))
+    host.output(StreamingText(text="bravo\n"))
+    assert host.rendering_paused
+    assert writes == []
+
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert painted.index("alpha") < painted.index("bravo")
+    assert not host.rendering_paused
+    # A second resume has nothing left to replay.
+    writes.clear()
+    host.resume_rendering()
+    assert writes == []
+
+
+def test_paused_host_drops_repaint_requests_until_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timer flips and metadata updates must not repaint while paused.
+
+    ``update_context_usage``/``set_theme``/``set_model_name`` repaint through
+    ``get_app()`` rather than the prompt slot, so a completed turn's toolbar
+    update would otherwise bypass the pause and re-render the detached pane.
+    """
+    host = TerminalHost(model_name="test")
+    invalidations: list[None] = []
+    monkeypatch.setattr(
+        host._prompt, "app", SimpleNamespace(invalidate=lambda: invalidations.append(None))
+    )
+    app_invalidations: list[None] = []
+    monkeypatch.setattr(
+        "omnigent_ui_sdk.terminal._host.get_app",
+        lambda: SimpleNamespace(invalidate=lambda: app_invalidations.append(None)),
+    )
+
+    host.pause_rendering()
+    host.start_timer()
+    host.stop_timer()
+    host.update_context_usage(3100, 200000)
+    host.set_theme(host.theme)
+    host.set_model_name("renamed agent")
+    assert invalidations == []
+    assert app_invalidations == []
+
+    host.resume_rendering()
+    assert len(invalidations) == 1
+    # The latest metadata is retained for the single repaint resume triggers.
+    assert host._model == "renamed agent"
+    assert host._tokens_used == 3100
+
+
+def test_overlay_signature_cleared_while_paused_so_resume_repaints() -> None:
+    """A rebuild finishing while paused clears the stored overlay signature.
+
+    Otherwise the first overlay rebuild after resume would match the recorded
+    signature and skip, leaving the stale pre-pause frame on the reattached pane.
+    """
+    host = TerminalHost(model_name="test")
+    signature = ("target", "content")
+
+    assert host._overlay_signature_to_store(signature) == signature
+    host.pause_rendering()
+    assert host._overlay_signature_to_store(signature) is None
+    host.resume_rendering()
+    assert host._overlay_signature_to_store(signature) == signature
+
+
+def test_paused_live_region_renders_collapse_to_the_latest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive ``StreamLive`` items queue as one, so a long detach replays cheaply."""
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+
+    host.pause_rendering()
+    host.output(StreamLive(Text("draft one")))
+    host.output(StreamLive(Text("draft two")))
+    host.output(StreamingText(text="tail\n"))
+    assert [type(item) for item in host._paused_output] == [StreamLive, StreamingText]
+
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert "draft one" not in painted
+    assert painted.index("draft two") < painted.index("tail")
+
+
+def test_paused_stream_replace_drops_the_streaming_it_supersedes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A committed paragraph replaces the deltas and live drafts queued since the last boundary."""
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+
+    host.pause_rendering()
+    host.output(StreamingText(text="alpha\n"))
+    host.output(StreamLive(Text("draft")))
+    host.output(StreamReplace(Text("paragraph")))
+    host.output(StreamingText(text="beta\n"))
+    assert [type(item) for item in host._paused_output] == [StreamReplace, StreamingText]
+
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert "alpha" not in painted
+    assert "draft" not in painted
+    assert painted.index("paragraph") < painted.index("beta")
+
+
+def test_paused_non_stream_item_keeps_the_streaming_before_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streamed text committed by a later tool panel is not dropped by the next paragraph."""
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+
+    host.pause_rendering()
+    host.output(StreamingText(text="alpha\n"))
+    host.output(Text("panel"))
+    host.output(StreamReplace(Text("paragraph")))
+    assert [type(item) for item in host._paused_output] == [StreamingText, Text, StreamReplace]
+
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert painted.index("alpha") < painted.index("panel") < painted.index("paragraph")
+
+
+def test_resume_rendering_repauses_and_recovers_when_a_replay_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-replay write failure re-pauses with the unreached tail retained.
+
+    The failing item is dropped because it may have been half-written; the host
+    re-pauses so the next resume on reattach actually replays the rest instead of
+    stranding it, and the viewer loops stay parked until that clean replay.
+    """
+    host = TerminalHost(model_name="test")
+    host.pause_rendering()
+    host.output(Text("alpha"))
+    host.output(Text("bravo"))
+    host.output(Text("charlie"))
+
+    fail = {"active": True}
+
+    def _write(data: str) -> int:
+        if fail["active"] and "bravo" in data:
+            raise BrokenPipeError("pane gone mid-replay")
+        return len(data)
+
+    monkeypatch.setattr(sys.stdout, "write", _write)
+    monkeypatch.setattr(sys.stdout, "flush", lambda: None)
+
+    with pytest.raises(BrokenPipeError):
+        host.resume_rendering()
+    assert host.rendering_paused
+    assert not host._render_resumed.is_set()
+    assert [item.plain for item in host._paused_output] == ["charlie"]
+
+    # The pane recovers: a fresh resume drains the retained tail and wakes loops.
+    fail["active"] = False
+    writes = _capture_stdout(monkeypatch)
+    host.resume_rendering()
+    assert "charlie" in "".join(writes)
+    assert not host.rendering_paused
+    assert host._render_resumed.is_set()
+    assert list(host._paused_output) == []
+
+
+def test_resume_rendering_recovers_when_the_skipped_notice_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure printing the skipped-output notice keeps the whole backlog.
+
+    The notice prints before the retained items, so if it fails the backlog and
+    the skipped count are both preserved for a later resume to replay.
+    """
+    monkeypatch.setattr("omnigent_ui_sdk.terminal._host._PAUSED_OUTPUT_LIMIT", 1)
+    host = TerminalHost(model_name="test")
+    host.pause_rendering()
+    host.output(Text("alpha"))  # dropped by the one-item cap
+    host.output(Text("bravo"))  # the retained backlog
+    assert host._paused_output_dropped == 1
+
+    fail = {"active": True}
+
+    def _write(data: str) -> int:
+        if fail["active"] and "skipped" in data:
+            raise BrokenPipeError("pane gone before the notice")
+        return len(data)
+
+    monkeypatch.setattr(sys.stdout, "write", _write)
+    monkeypatch.setattr(sys.stdout, "flush", lambda: None)
+
+    with pytest.raises(BrokenPipeError):
+        host.resume_rendering()
+    assert host.rendering_paused
+    assert host._paused_output_dropped == 1
+    assert [item.plain for item in host._paused_output] == ["bravo"]
+
+    fail["active"] = False
+    writes = _capture_stdout(monkeypatch)
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert "1 earlier output item was skipped" in painted
+    assert "bravo" in painted
+    assert not host.rendering_paused
+    assert list(host._paused_output) == []
+
+
+def test_clear_streamed_text_defers_while_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clearing while paused writes nothing; resume erases the preserved lines.
+
+    The erase must run against the live terminal at resume even when the replay
+    queue is empty, so a cleared region (e.g. a cancel path's stale draft) does
+    not survive on the reattached pane.
+    """
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+    host._streamed_line_count = 3
+    host._text_buffer = "partial tail"
+
+    host.pause_rendering()
+    host.clear_streamed_text()
+
+    assert writes == []
+    assert host._streamed_line_count == 3
+    assert host._text_buffer == ""
+    assert host._pending_streamed_clear
+
+    host.resume_rendering()
+    assert "".join(writes) == "\033[A\033[2K" * 3
+    assert host._streamed_line_count == 0
+    assert not host._pending_streamed_clear
+    assert not host.rendering_paused
+
+
+def test_deferred_clear_erases_before_a_plain_replay_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred clear erases the stale region even when the replay starts plain.
+
+    A plain renderable resets the line counts without erasing, so without the
+    deferred erase at resume the pre-pause lines would survive on the pane.
+    """
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+    host._streamed_line_count = 2
+
+    host.pause_rendering()
+    host.clear_streamed_text()
+    host.output(Text("fresh"))
+    writes.clear()
+
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert painted.startswith("\033[A\033[2K" * 2)
+    assert "fresh" in painted
+    assert host._streamed_line_count == 0
+    assert not host._pending_streamed_clear
+
+
+def test_deferred_clear_re_pauses_when_the_erase_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed deferred erase keeps the clear pending and the backlog intact."""
+    host = TerminalHost(model_name="test")
+    host._streamed_line_count = 1
+
+    host.pause_rendering()
+    host.clear_streamed_text()
+    host.output(Text("fresh"))
+
+    fail = {"active": True}
+
+    def _write(data: str) -> int:
+        if fail["active"] and "\033[2K" in data:
+            raise BrokenPipeError("pane gone before the deferred clear")
+        return len(data)
+
+    monkeypatch.setattr(sys.stdout, "write", _write)
+    monkeypatch.setattr(sys.stdout, "flush", lambda: None)
+
+    with pytest.raises(BrokenPipeError):
+        host.resume_rendering()
+    assert host.rendering_paused
+    assert host._pending_streamed_clear
+    assert [item.plain for item in host._paused_output] == ["fresh"]
+
+    fail["active"] = False
+    writes = _capture_stdout(monkeypatch)
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert painted.startswith("\033[A\033[2K")
+    assert "fresh" in painted
+    assert not host.rendering_paused
+    assert not host._pending_streamed_clear
+    assert list(host._paused_output) == []
+
+
+def test_paused_clear_drops_the_streaming_queued_since_the_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear while paused also cancels the draft queued since the pause."""
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+    host._streamed_line_count = 2
+
+    host.pause_rendering()
+    host.output(StreamingText(text="stale delta\n"))
+    host.output(StreamLive(Text("stale draft")))
+    host.clear_streamed_text()
+    assert list(host._paused_output) == []
+    assert host._pending_streamed_clear
+
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert painted == "\033[A\033[2K" * 2
+    assert host._streamed_line_count == 0
+
+
+def test_paused_clear_after_a_queued_commit_only_drops_the_newer_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queued panel commits the pre-pause lines; a later clear only drops the newer draft.
+
+    Unpaused, the panel would have flushed the partial tail and committed the
+    streamed lines before the clear ran, so the clear must neither erase them
+    nor drop the tail the panel still has to flush.
+    """
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+    host._streamed_line_count = 2
+    host._text_buffer = "partial tail"
+
+    host.pause_rendering()
+    host.output(Text("panel"))
+    host.output(StreamingText(text="stale delta\n"))
+    host.clear_streamed_text()
+    assert [type(item) for item in host._paused_output] == [Text]
+    assert not host._pending_streamed_clear
+    assert host._text_buffer == "partial tail"
+
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert "\033[2K" not in painted
+    assert painted.index("partial tail") < painted.index("panel")
+    assert "stale" not in painted
+    assert host._streamed_line_count == 0
+
+
+def test_failed_streaming_replay_drops_its_unflushed_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``StreamingText`` item that fails mid-replay leaves nothing behind to flush later."""
+    host = TerminalHost(model_name="test")
+    host.pause_rendering()
+    host.output(StreamingText(text="alpha line\nbeta tail"))
+    host.output(Text("charlie"))
+
+    fail = {"active": True}
+
+    def _write(data: str) -> int:
+        if fail["active"] and "alpha" in data:
+            raise BrokenPipeError("pane gone mid-replay")
+        return len(data)
+
+    monkeypatch.setattr(sys.stdout, "write", _write)
+    monkeypatch.setattr(sys.stdout, "flush", lambda: None)
+
+    with pytest.raises(BrokenPipeError):
+        host.resume_rendering()
+    assert host.rendering_paused
+    assert host._text_buffer == ""
+    assert [item.plain for item in host._paused_output] == ["charlie"]
+
+    fail["active"] = False
+    writes = _capture_stdout(monkeypatch)
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert "beta tail" not in painted
+    assert "charlie" in painted
+
+
+def test_dropped_notice_replaces_the_pre_pause_live_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dropped-items notice first erases the live region it would have replaced."""
+    monkeypatch.setattr("omnigent_ui_sdk.terminal._host._PAUSED_OUTPUT_LIMIT", 1)
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+    host.output(StreamLive(Text("draft")))
+    assert host._live_line_count == 1
+
+    host.pause_rendering()
+    host.output(Text("alpha"))
+    host.output(Text("bravo"))
+    writes.clear()
+
+    host.resume_rendering()
+    assert writes[0].startswith("\033[A\033[2K")
+    painted = "".join(writes)
+    assert "1 earlier output item was skipped" in painted
+    assert "alpha" not in painted
+    assert painted.index("skipped") < painted.index("bravo")
+    assert host._live_line_count == 0
+
+
+def test_paused_output_keeps_the_newest_items_and_reports_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the queue limit the oldest items go, and resume says how many."""
+    monkeypatch.setattr("omnigent_ui_sdk.terminal._host._PAUSED_OUTPUT_LIMIT", 2)
+    host = TerminalHost(model_name="test")
+    writes = _capture_stdout(monkeypatch)
+
+    host.pause_rendering()
+    for word in ("alpha", "bravo", "charlie", "delta"):
+        host.output(Text(word))
+
+    host.resume_rendering()
+    painted = "".join(writes)
+    assert "alpha" not in painted
+    assert "bravo" not in painted
+    assert "2 earlier output items were skipped" in painted
+    assert painted.index("skipped") < painted.index("charlie") < painted.index("delta")

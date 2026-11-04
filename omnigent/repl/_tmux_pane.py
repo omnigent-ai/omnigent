@@ -24,6 +24,8 @@ See ``designs/REPL_TMUX_PANE_SPLIT.md`` for the full design.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -31,8 +33,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from omnigent.inner.tmux_hooks import CLIENTS_CHANGED_CHANNEL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -656,3 +661,103 @@ def read_pane_option(pane_id: str, name: str) -> str | None:
         return None
     out = result.stdout.strip()
     return out or None
+
+
+# ── Viewer-aware rendering ────────────────────────────────────
+
+
+async def _tmux_output(*args: str) -> str | None:
+    """Run ``tmux *args`` against this pane's server; ``None`` on any failure."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        await proc.wait()
+        raise
+    if proc.returncode != 0:
+        return None
+    return stdout.decode(errors="replace")
+
+
+async def _server_signals_client_changes() -> bool:
+    """Whether the hosting tmux server wakes :data:`CLIENTS_CHANGED_CHANNEL`.
+
+    Only a runner-launched start-on-attach server carries both hooks; the REPL
+    must not park a ``wait-for`` client in a user's own tmux, and must not pause
+    on a server that cannot wake it when a viewer returns.
+    """
+    hooks = await _tmux_output("show-hooks", "-g")
+    if hooks is None:
+        return False
+    lines = hooks.splitlines()
+    return all(
+        any(line.startswith(f"{hook}[") and CLIENTS_CHANGED_CHANNEL in line for line in lines)
+        for hook in ("client-attached", "client-detached")
+    )
+
+
+async def _attached_client_count(pane_id: str) -> int | None:
+    """``#{session_attached}`` for *pane_id*'s session, or ``None`` if unreadable."""
+    out = await _tmux_output("display-message", "-p", "-t", pane_id, "#{session_attached}")
+    if out is None:
+        return None
+    try:
+        return int(out.strip())
+    except ValueError:
+        return None
+
+
+async def watch_tmux_clients(on_change: Callable[[int], None]) -> None:
+    """Report this pane's attached-client count now and after every change.
+
+    Samples ``#{session_attached}`` before each wait so the caller learns the
+    current state even when a startup attach/detach pair cancelled both channel
+    signals, then blocks in ``tmux wait-for`` and re-reports only when the count
+    changes. Returns without calling *on_change* outside a runner-hosted tmux
+    pane, and whenever tmux stops answering.
+
+    :param on_change: Receives ``#{session_attached}`` for the pane's session,
+        once at startup and again whenever it changes.
+    """
+    pane_id = _tmux_pane_id()
+    if not _is_in_tmux() or pane_id is None or not await _server_signals_client_changes():
+        return
+    last_reported: int | None = None
+    while True:
+        count = await _attached_client_count(pane_id)
+        if count is None:
+            return
+        if count != last_reported:
+            on_change(count)
+            last_reported = count
+        try:
+            waiter = await asyncio.create_subprocess_exec(
+                "tmux",
+                "wait-for",
+                CLIENTS_CHANGED_CHANNEL,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except OSError:
+            return
+        try:
+            returncode = await waiter.wait()
+        except asyncio.CancelledError:
+            with contextlib.suppress(ProcessLookupError):
+                waiter.terminate()
+            await waiter.wait()
+            raise
+        if returncode != 0:
+            return
