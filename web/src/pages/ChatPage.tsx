@@ -2186,11 +2186,7 @@ export function composerOffersClear(harness: string | null, info: ServerInfo | "
   );
 }
 
-/**
- * Whether the composer offers ``/rewind`` for a session on *harness*: Claude
- * sessions on a server reporting ``session_rewind``, its own capability like
- * claude-sdk ``/clear``'s. Elsewhere a typed /rewind stays plaintext.
- */
+/** Leave /rewind as text or a project skill on older servers. */
 export function composerOffersRewind(
   harness: string | null,
   info: ServerInfo | "loading",

@@ -151,10 +151,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `session_rewind`; otherwise a typed `/rewind` is sent as text, or runs a
   custom command of that name (likewise `/clear`). States: loading prompts,
   prompts failed to load, no prompts, older prompts loading or failed, refused
-  while a turn runs or the runner and host are offline (error under the
-  composer), prompt arriving after the new session opened (filled unless the
-  user has typed there), an attachment that could not be restored (a warning
-  names it).
+  while a turn runs or with neither a usable runner nor a saved host binding
+  (error under the composer), prompt arriving after the new session opened
+  (filled unless the user has typed, cleared or sent a draft there), an
+  attachment that could not be restored (a warning names it).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
