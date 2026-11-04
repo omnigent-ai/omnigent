@@ -1292,14 +1292,16 @@ class TestProviderManagedProfiles:
         assert replacement is not None
         assert (replacement.sandbox_id != host.sandbox_id) is gone
 
+    @pytest.mark.parametrize("revoked", [False, True])
     async def test_offline_clear_continuation_keeps_the_accepted_profile(
-        self, env: _Env, monkeypatch: pytest.MonkeyPatch
+        self, env: _Env, monkeypatch: pytest.MonkeyPatch, revoked: bool
     ) -> None:
         """A claude-sdk ``/clear`` with no live runner hands on the sandbox profile.
 
         The continuation is bound to the source's host alone, so it must carry
         the accepted reference itself: after the source is deleted it still
-        wakes the sandbox.
+        wakes the sandbox. A profile revoked since it was accepted refuses the
+        clear, leaving no continuation and the source where it was.
         """
         source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
         source = env.conversations.get_conversation(source_id)
@@ -1308,11 +1310,26 @@ class TestProviderManagedProfiles:
         assert snapshot is not None
         monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda *_a, **_k: "claude-sdk")
         monkeypatch.setattr(sessions_routes, "_get_runner_client", AsyncMock(return_value=None))
+        sessions_before = env.persisted()[0]
+        if revoked:
+            env.recording.allowed_users.clear()
 
         cleared = await env.client.post(
             f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
         )
 
+        if revoked:
+            assert cleared.status_code == 403, cleared.text
+            assert env.persisted()[0] == sessions_before
+            after = env.conversations.get_conversation(source_id)
+            assert after is not None
+            assert (after.host_id, after.workspace, after.runner_id) == (
+                source.host_id,
+                source.workspace,
+                source.runner_id,
+            )
+            assert env.catalog.get_session_snapshot(source_id) == snapshot
+            return
         assert cleared.status_code == 202, cleared.text
         continuation_id = cleared.json()["session_id"]
         continuation = env.conversations.get_conversation(continuation_id)
