@@ -2375,6 +2375,8 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
         "  app_name: Must not leak into bare server config\n"
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    # Keep the resolved server config off the real ~/.omnigent/config.yaml.
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "data" / "anchor"))
 
     db_path = tmp_path / "chat.db"
     artifact_dir = tmp_path / "artifacts"
@@ -2564,6 +2566,58 @@ def test_server_explicit_config_overrides_omnigent_config_env(
     assert result.exit_code == 0, result.output
     assert captured["config"] == str(explicit.resolve())
     bind_probe.assert_called_once_with("127.0.0.1", 44771)
+
+
+def test_server_without_config_flag_serves_resolved_server_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without ``-c``, ``OMNIGENT_CONFIG`` supplies branding and the user title guidance."""
+    import uvicorn.server
+    from fastapi.testclient import TestClient
+
+    server_config_file = tmp_path / "server.yaml"
+    server_config_file.write_text("branding:\n  app_name: Resolved Server\n")
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "session_title_instructions: Prefix titles with the current date.\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(server_config_file))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    observed: dict[str, Any] = {}
+    from omnigent.server import app as app_module
+
+    real_create_app = app_module.create_app
+
+    def spy_create_app(**kwargs: Any) -> Any:
+        observed["server_config"] = kwargs["server_config"]
+        return real_create_app(**kwargs)
+
+    def run_app_lifespan(self: Any, **kwargs: Any) -> None:
+        with TestClient(self.config.app) as client:
+            observed["branding"] = client.get("/v1/info").json()["branding"]
+
+    monkeypatch.setattr(app_module, "create_app", spy_create_app)
+    monkeypatch.setattr(uvicorn.server.Server, "run", run_app_lifespan)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert observed["branding"]["app_name"] == "Resolved Server"
+    assert observed["server_config"]["session_title_instructions"] == (
+        "Prefix titles with the current date."
+    )
 
 
 @pytest.mark.parametrize("authority", [False, 123, [], {}, "", " ", "x" * 129])
