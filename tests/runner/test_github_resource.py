@@ -528,6 +528,8 @@ def test_github_changed_files_maps_pr_file_statuses(monkeypatch: pytest.MonkeyPa
     assert by_path["src/fileA.py"]["status"] == "modified"
     assert by_path["fileB.py"]["status"] == "deleted"
     assert by_path["new/name.py"]["status"] == "renamed"
+    assert by_path["new/name.py"]["previous_path"] == "old/name.py"
+    assert by_path["src/fileA.py"]["previous_path"] is None
     # Line counts and the display name come straight from the PR file entry.
     assert by_path["newfile.py"]["lines_added"] == 1
     assert by_path["src/fileA.py"]["name"] == "fileA.py"
@@ -975,10 +977,11 @@ def test_summarize_checks_empty() -> None:
     }
 
 
+@pytest.mark.parametrize("lookup", ["workspace", "reference"])
 def test_github_info_includes_body_and_comments(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, monkeypatch: pytest.MonkeyPatch, lookup: str
 ) -> None:
-    """Issue comments and review bodies appear together, without minimized comments."""
+    """Both PR paths include comments, reviews, commits and actual force-push times."""
     view = {
         "number": 8,
         "title": "t",
@@ -1017,6 +1020,33 @@ def test_github_info_includes_body_and_comments(
             },
         ],
     }
+    timeline = {
+        "nodes": [
+            {
+                "__typename": "HeadRefForcePushedEvent",
+                "id": "force-push",
+                "actor": {"login": "pusher"},
+                "createdAt": "2026-09-05T08:00:00Z",
+                "beforeCommit": {"oid": "a" * 40},
+                "afterCommit": {
+                    "oid": "b" * 40,
+                    "url": "https://github.com/o/r/commit/" + "b" * 40,
+                },
+            },
+            {
+                "__typename": "PullRequestCommit",
+                "id": "commit",
+                "url": "https://github.com/o/r/pull/8/commits/b",
+                "commit": {
+                    "oid": "b" * 40,
+                    "messageHeadline": "Update implementation",
+                    "committedDate": "2026-09-05T07:40:00Z",
+                    "author": {"name": "Commit Author", "user": {"login": "author"}},
+                },
+            },
+        ],
+        "pageInfo": {"hasPreviousPage": False},
+    }
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None
@@ -1028,12 +1058,29 @@ def test_github_info_includes_body_and_comments(
             return (0, json.dumps({"nameWithOwner": "o/r"}), "")
         if head == ("pr", "view"):
             return (0, json.dumps(view), "")
+        if argv[:4] == ["api", "--hostname", "github.com", "graphql"]:
+            query = next(arg for arg in argv if arg.startswith("query="))
+            assert "PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT" in query
+            assert "pushedDate" not in query
+            assert "afterCommit { oid url }" in query
+            assert argv[argv.index("--cache") + 1] == "30s"
+            assert "includeComments=false" in argv
+            assert "comments(last: 100) @include(if: $includeComments)" in query
+            return (
+                0,
+                json.dumps({"data": {"repository": {"pullRequest": {"timelineItems": timeline}}}}),
+                "",
+            )
         return (1, "", "no stub")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
     monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
 
-    info = github_info(str(repo))
+    info = (
+        github_info(str(repo))
+        if lookup == "workspace"
+        else github_resource._reference_info(str(repo), PullRequestRef.from_url(view["url"]))
+    )
     assert info["pr"]["body"] == "## Summary\nDoes things."
     assert info["pr"]["comments"] == [
         {
@@ -1050,6 +1097,27 @@ def test_github_info_includes_body_and_comments(
         },
     ]
     assert not info["pr"].get("comments_partial")
+    assert info["pr"]["timeline_events"] == [
+        {
+            "id": "commit",
+            "kind": "commit",
+            "author": "author",
+            "created_at": "2026-09-05T07:40:00Z",
+            "url": "https://github.com/o/r/pull/8/commits/b",
+            "sha": "b" * 40,
+            "message": "Update implementation",
+        },
+        {
+            "id": "force-push",
+            "kind": "force_push",
+            "author": "pusher",
+            "created_at": "2026-09-05T08:00:00Z",
+            "url": "https://github.com/o/r/commit/" + "b" * 40,
+            "sha": "b" * 40,
+            "previous_sha": "a" * 40,
+        },
+    ]
+    assert info["pr"]["timeline_partial"] is False
 
 
 def test_github_info_empty_body_is_null(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1118,6 +1186,8 @@ def test_shape_comments_filters_minimized_and_caps() -> None:
     assert github_resource._comments_payload({"comments": [], "url": "u"}) == {
         "comments": [],
         "comments_partial": True,
+        "timeline_events": [],
+        "timeline_partial": True,
     }
     payload = github_resource._comments_payload({"comments": raw, "reviews": []})
     assert len(payload["comments"]) == github_resource._MAX_COMMENTS
@@ -1128,6 +1198,43 @@ def test_shape_comments_filters_minimized_and_caps() -> None:
     payload = github_resource._comments_payload({"comments": visible, "reviews": empty_reviews})
     assert len(payload["comments"]) == 60
     assert "comments_partial" not in payload
+
+
+@pytest.mark.parametrize("missing", [None, "malformed"])
+def test_timeline_handles_deleted_users_and_commits(missing) -> None:
+    payload = github_resource._timeline_payload(
+        {
+            "nodes": [
+                None,
+                {"__typename": "PullRequestCommit", "id": "missing", "commit": None},
+                {
+                    "__typename": "PullRequestCommit",
+                    "id": "commit",
+                    "commit": {"author": {"name": "Git Author", "user": missing}},
+                },
+                {
+                    "__typename": "PullRequestCommit",
+                    "id": "no-author",
+                    "commit": {"author": missing},
+                },
+                {
+                    "__typename": "HeadRefForcePushedEvent",
+                    "id": "force-push",
+                    "actor": missing,
+                    "beforeCommit": missing,
+                    "afterCommit": missing,
+                },
+            ],
+            "pageInfo": {"hasPreviousPage": False},
+        },
+    )
+    commit, no_author, force_push = payload["timeline_events"]
+    assert commit["author"] == "Git Author"
+    assert no_author["author"] is None
+    assert force_push["author"] is None
+    assert force_push["sha"] is None and force_push["previous_sha"] is None
+    assert force_push["url"] is None
+    assert payload["timeline_partial"] is True
 
 
 def test_gh_scrubs_env_tokens_in_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1204,6 +1311,8 @@ _PR_WITHOUT_CHECKS = {
     "headRefName": "feature",
     "headRefOid": "a" * 40,
     "baseRefOid": "b" * 40,
+    "headRepository": {"id": "R_1", "name": "repo"},
+    "headRepositoryOwner": {"id": "U_1", "login": "contributor"},
     "body": "Description",
     "comments": [],
     "reviews": [
@@ -1274,7 +1383,7 @@ def test_github_info_resolves_pr_when_checks_field_is_forbidden(
         github_resource._PR_VIEW_FIELDS,
         github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
     ]
-    assert not any(c[0] == "api" for c in calls)
+    assert not any(c[0] == "api" and "/commits/" in c[1] for c in calls)
 
 
 def test_reference_info_keeps_auth_when_checks_field_is_forbidden(
@@ -1290,6 +1399,7 @@ def test_reference_info_keeps_auth_when_checks_field_is_forbidden(
     assert info["pr"] is not None, calls
     assert info["pr"]["title"] == "Add thing"
     assert info["pr"]["head_sha"] == "a" * 40
+    assert info["pr"]["head_repository_url"] == "https://github.com/contributor/repo"
     assert not (info["pr"].get("checks") or {}).get("total")
     assert info["pr"]["checks_supported"] is False
     assert info["pr"]["body"] == "Description"
@@ -1356,7 +1466,7 @@ def test_commit_fallback_fetch_retries_without_forbidden_checks_field(
     ]
 
 
-@pytest.mark.parametrize("failure", [None, "api", "enterprise_auth"])
+@pytest.mark.parametrize("failure", [None, "api", "enterprise_auth", "invalid_json"])
 def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatch, failure):
     old = [{"body": f"old-{i}", "createdAt": "2026-01-01"} for i in range(100)]
     latest = [{"body": f"new-{i}", "createdAt": "2026-10-26"} for i in range(100)]
@@ -1378,11 +1488,27 @@ def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatc
                 ),
                 "",
             )
+        if failure == "invalid_json":
+            return 0, "{", ""
         if failure:
             return 1, "", "rate limited"
         return (
             0,
-            json.dumps({"data": {"repository": {"pullRequest": {"comments": {"nodes": latest}}}}}),
+            json.dumps(
+                {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "comments": {"nodes": latest},
+                                "timelineItems": {
+                                    "nodes": [],
+                                    "pageInfo": {"hasPreviousPage": True},
+                                },
+                            }
+                        }
+                    }
+                }
+            ),
             "",
         )
 
@@ -1395,13 +1521,64 @@ def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatc
     )
     assert data is not None
     assert data["comments"] == (old if failure else latest)
+    payload = github_resource._comments_payload(data)
+    assert payload["timeline_events"] == []
+    assert payload["timeline_partial"] is True
     assert len(calls) == (1 if failure == "enterprise_auth" else 2)
     if failure == "enterprise_auth":
         return
     assert calls[1][0][:4] == ["api", "--hostname", "github.com", "graphql"]
+    assert "--cache" not in calls[1][0]
+    assert "includeComments=true" in calls[1][0]
     assert "number=17" in calls[1][0]
     assert calls[1][1]["token"] == "selected-token"
     assert github_resource._comments_payload(data)["comments_partial"] is True
     shaped = github_resource._shape_comments(old + latest)
     assert len(shaped) == 100
     assert shaped[-1]["body"] == "new-99"
+
+
+@pytest.mark.parametrize("fields", ["title,url", "reviewRequests,latestReviews"])
+def test_metadata_only_reads_do_not_load_timeline(monkeypatch, fields):
+    calls = []
+
+    def gh(argv, **_kwargs):
+        calls.append(argv)
+        return 0, json.dumps({"url": "https://github.com/o/r/pull/8", "title": "title"}), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    assert github_resource._gh_pr_view([], fields, cwd="/workspace") is not None
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("pr_url", "head", "owner", "expected"),
+    [
+        (
+            "https://github.com/acme/repo/pull/1",
+            {"id": "R_1", "name": "repo"},
+            {"id": "U_1", "login": "acme"},
+            "https://github.com/acme/repo",
+        ),
+        (
+            "https://github.com/acme/repo/pull/1",
+            {"id": "R_2", "name": "repo-fork"},
+            {"id": "U_2", "login": "contributor"},
+            "https://github.com/contributor/repo-fork",
+        ),
+        (
+            "https://ghe.example.com/acme/repo/pull/1",
+            {"id": "R_2", "name": "repo"},
+            {"id": "U_2", "login": "contributor"},
+            "https://ghe.example.com/contributor/repo",
+        ),
+        # gh reports a deleted fork as null.
+        ("https://github.com/acme/repo/pull/1", None, None, None),
+        ("https://github.com/acme/repo/pull/1", {"id": "R_2", "name": "repo"}, None, None),
+    ],
+)
+def test_head_repository_url(
+    pr_url: str, head: object, owner: object, expected: str | None
+) -> None:
+    reference = PullRequestRef.from_url(pr_url)
+    assert github_resource._head_repository_url(reference, head, owner) == expected
