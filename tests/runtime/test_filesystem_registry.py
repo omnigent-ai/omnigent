@@ -744,17 +744,18 @@ def test_get_baseline_returns_none_when_no_snapshot(tmp_path: Path) -> None:
 def test_first_observation_preserves_known_or_unknown_original(
     registry: AgentEditFilesystemRegistry, operation: str, original: str | None
 ) -> None:
-    assert registry.needs_snapshot("file.txt")
+    assert registry.needs_snapshot("file.txt", session_id="session")
     _inject(registry, "file.txt", operation, "session")
     registry.seed_snapshot("file.txt", "written by a tool call\n", session_id="session")
     _inject(registry, "file.txt", "modified", "session")
-    assert not registry.needs_snapshot("file.txt")
+    assert not registry.needs_snapshot("file.txt", session_id="session")
+    assert registry.needs_snapshot("file.txt", session_id="another session")
     assert registry.get_baseline("file.txt") == original
     # The later snapshot matches the disk but is not the session's original.
     listed = registry.list_changed_files("session", limit=10, check_disk=True)
     assert [(r["path"], r["status"]) for r in listed] == [("file.txt", operation)]
     registry.unregister_conversation("session")
-    assert registry.needs_snapshot("file.txt")
+    assert registry.needs_snapshot("file.txt", session_id="session")
 
 
 def test_get_baseline_returns_snapshot_for_non_git_workspace(tmp_path: Path) -> None:

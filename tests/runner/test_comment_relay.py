@@ -560,7 +560,7 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
     await patch_file("failed.txt", "@@ -1 +1 @@\n-first\n+second\n")
     read.assert_not_awaited()
     resolve.assert_not_called()
-    assert not registry.needs_snapshot("failed.txt")
+    assert not registry.needs_snapshot("failed.txt", session_id=relay_env.session_id)
     assert registry.get_baseline("failed.txt") is None
 
     first_read_started = asyncio.Event()
@@ -609,6 +609,17 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
     subprocess.run(["git", "init", str(tmp_path / "repo")], check=True, capture_output=True)
     await patch_file("repo/file.txt", "@@ -1 +1 @@\n-old\n+new\n")
     assert read.await_count == resolve.call_count == 2
+
+    # Another session's original for the same path is not this session's original.
+    registry.seed_snapshot("shared.txt", "other\n", session_id="conv_other")
+    registry.record_change("shared.txt", "modified", "conv_other")
+    (tmp_path / "shared.txt").write_text("first\n")
+    await patch_file("shared.txt", "@@ -1 +1 @@\n-old\n+first\n")
+    assert read.await_count == resolve.call_count == 3
+    (tmp_path / "shared.txt").write_text("old\n")
+    assert registry.get_changed_file(relay_env.session_id, "shared.txt", check_disk=True) is None
+    other = registry.get_changed_file("conv_other", "shared.txt", check_disk=True)
+    assert other is not None and other["status"] == "modified"
 
 
 @pytest.mark.asyncio

@@ -1856,15 +1856,15 @@ async def test_a_save_during_another_keeps_the_original_the_first_replaced(
     monkeypatch.setattr(CallerProcessFilesystem, "write", hold_the_first_write_result)
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
     url = f"{base}/filesystem/hello.txt"
-    first = asyncio.create_task(client.put(url, json={"content": "intermediate\n"}))
-    await first_written.wait()
-    second = asyncio.create_task(client.request(method, url, json=body))
+    saves = [asyncio.create_task(client.put(url, json={"content": "intermediate\n"}))]
     try:
-        finished, _ = await asyncio.wait({second}, timeout=1.0)
+        await asyncio.wait_for(first_written.wait(), timeout=5)
+        saves.append(asyncio.create_task(client.request(method, url, json=body)))
+        finished, _ = await asyncio.wait({saves[1]}, timeout=1.0)
         assert not finished
     finally:
         release_first.set()
-        saved = await asyncio.gather(first, second)
+        saved = await asyncio.wait_for(asyncio.gather(*saves), timeout=5)
 
     assert [response.status_code for response in saved] == [200, 200], [r.text for r in saved]
     assert (workspace / "hello.txt").read_text() == "final\n"
@@ -1905,49 +1905,46 @@ async def test_changes_keep_a_file_saved_as_the_readable_prefix_of_its_original(
 
 
 @pytest.mark.asyncio
-async def test_changes_report_an_edited_file_deleted_outside_the_session(
-    client: httpx.AsyncClient,
-    workspace: Path,
-) -> None:
-    """A file removed from a shell after an edit shows as deleted, not modified."""
-    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    edited = await client.put(
-        f"{base}/filesystem/src/main.py", json={"content": "print('edited')", "encoding": "utf-8"}
-    )
-    assert edited.status_code == 200, edited.text
-
-    (workspace / "src" / "main.py").unlink()
-
-    listed = (await client.get(f"{base}/changes")).json()["data"]
-    assert [(e["path"], e["status"]) for e in listed] == [("src/main.py", "deleted")]
-    diff = await client.get(f"{base}/diff/src/main.py")
-    assert diff.status_code == 200, diff.text
-    assert diff.json()["before"] == "print('hi')"
-    assert diff.json()["after"] is None
-
-
-@pytest.mark.asyncio
-async def test_changes_drop_a_new_file_deleted_outside_the_session(
+@pytest.mark.parametrize(
+    ("path", "status", "original", "before"),
+    [
+        pytest.param("src/main.py", "modified", "print('hi')", "print('hi')", id="edited-file"),
+        pytest.param("notes.txt", "created", "", None, id="new-file"),
+    ],
+)
+async def test_changes_follow_a_saved_file_deleted_outside_the_session(
     app: FastAPI,
     client: httpx.AsyncClient,
     workspace: Path,
+    path: str,
+    status: str,
+    original: str,
+    before: str | None,
 ) -> None:
-    """A file the session created and a shell then removed leaves nothing to review."""
+    """A saved file removed from a shell shows as deleted, unless the session created it."""
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    created = await client.put(
-        f"{base}/filesystem/notes.txt", json={"content": "new", "encoding": "utf-8"}
+    saved = await client.put(
+        f"{base}/filesystem/{path}", json={"content": "new", "encoding": "utf-8"}
     )
-    assert created.status_code == 200, created.text
+    assert saved.status_code == 200, saved.text
     listed = (await client.get(f"{base}/changes")).json()["data"]
-    assert [(e["path"], e["status"]) for e in listed] == [("notes.txt", "created")]
-    assert app.state.filesystem_registry.get_baseline("notes.txt") == ""
-    diff = await client.get(f"{base}/diff/notes.txt")
+    assert [(e["path"], e["status"]) for e in listed] == [(path, status)]
+    assert app.state.filesystem_registry.get_baseline(path) == original
+    diff = await client.get(f"{base}/diff/{path}")
     assert diff.status_code == 200, diff.text
-    assert (diff.json()["before"], diff.json()["after"]) == (None, "new")
+    assert (diff.json()["before"], diff.json()["after"]) == (before, "new")
 
-    (workspace / "notes.txt").unlink()
+    (workspace / path).unlink()
 
-    assert (await client.get(f"{base}/changes")).json()["data"] == []
+    listed = (await client.get(f"{base}/changes")).json()["data"]
+    diff = await client.get(f"{base}/diff/{path}")
+    if status == "created":
+        assert listed == []
+        assert diff.status_code == 404, diff.text
+    else:
+        assert [(e["path"], e["status"]) for e in listed] == [(path, "deleted")]
+        assert diff.status_code == 200, diff.text
+        assert (diff.json()["before"], diff.json()["after"]) == (before, None)
 
 
 @pytest.mark.asyncio

@@ -623,8 +623,8 @@ class FilesystemRegistry(ABC):
 
     # ── Concrete: snapshot (no-op default) ────────────────────────
 
-    def needs_snapshot(self, path: str) -> bool:
-        """Whether an observed edit still needs an original outside Git."""
+    def needs_snapshot(self, path: str, *, session_id: str) -> bool:
+        """Whether *session_id*'s observed edit of *path* still needs an original outside Git."""
         return False
 
     def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
@@ -1016,12 +1016,14 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._snapshots_lock:
             return self._snapshots.get(norm)
 
-    def needs_snapshot(self, path: str) -> bool:
+    def needs_snapshot(self, path: str, *, session_id: str) -> bool:
         norm = _normalize_path(path, self._cwd)
         if norm is None or Path(norm).is_absolute() or _is_ephemeral(norm):
             return False
         with self._snapshots_lock:
-            return norm not in self._snapshots
+            return norm not in self._snapshots or norm not in self._session_snapshots.get(
+                session_id, {}
+            )
 
     def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
         """Seed a pre-write snapshot for *path* if one does not already exist.
@@ -1605,8 +1607,8 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
 
     _run_repository_git: GitCommandRunner | None = None
 
-    def needs_snapshot(self, path: str) -> bool:
-        return self._owner(path) is None and super().needs_snapshot(path)
+    def needs_snapshot(self, path: str, *, session_id: str) -> bool:
+        return self._owner(path) is None and super().needs_snapshot(path, session_id=session_id)
 
     def with_git_runner(self, run_git: GitCommandRunner) -> MultiRepositoryFilesystemRegistry:
         """Bind one request's executor while sharing the existing fallback history."""

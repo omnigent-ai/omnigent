@@ -2883,15 +2883,15 @@ async def test_runner_os_env_concurrent_writes_keep_the_first_original(
             )
         )
 
-    first = write_notes("intermediate\n")
-    await first_written.wait()
-    second = write_notes("final\n")
+    writes = [write_notes("intermediate\n")]
     try:
-        finished, _ = await asyncio.wait({second}, timeout=1.0)
+        await asyncio.wait_for(first_written.wait(), timeout=5)
+        writes.append(write_notes("final\n"))
+        finished, _ = await asyncio.wait({writes[1]}, timeout=1.0)
         assert not finished
     finally:
         release_first.set()
-        await asyncio.gather(first, second)
+        await asyncio.wait_for(asyncio.gather(*writes), timeout=5)
 
     assert notes.read_text() == "final\n"
     assert filesystem_registry.get_baseline("notes.txt") == "initial\n"

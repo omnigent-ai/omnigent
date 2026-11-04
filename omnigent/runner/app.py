@@ -5256,7 +5256,9 @@ def create_runner_app(
                 async with _native_file_changes_lock:
                     for change in changes:
                         try:
-                            if registry.needs_snapshot(change.path):
+                            if registry.needs_snapshot(
+                                change.path, session_id=_captured_session_id
+                            ):
                                 current = None
                                 if change.patch is not None:
                                     environment = resource_registry.resolve_environment(
