@@ -32,7 +32,6 @@ import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { renderTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { emptyTriggerFields, renderTriggerPrompt, splitTriggerPrompt } from "./triggerTemplates";
 
@@ -2651,11 +2650,17 @@ describe("editing template prompts", () => {
       "false",
     );
     expect(screen.queryByRole("button", { name: "Edit system prompt" })).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Your prompt"), { target: { value: "" } });
-    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    for (const value of ["", "  \n"]) {
+      fireEvent.change(screen.getByLabelText("Your prompt"), { target: { value } });
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      expect(screen.getByText("Your prompt can't be empty.")).toBeVisible();
+      expect(screen.queryByText(/After saving, the full text/)).not.toBeInTheDocument();
+    }
     fireEvent.change(screen.getByLabelText("Your prompt"), {
       target: { value: "Investigate it." },
     });
+    expect(screen.queryByText("Your prompt can't be empty.")).not.toBeInTheDocument();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input.prompt).toBe(

@@ -24,6 +24,9 @@ to customize.
   separation. Unrecognized or ambiguous prompt formats remain fully editable
   as a single Prompt field. Edits that remove the template signature or add
   ambiguous section headings show a notice before saving as a single prompt.
+  Your prompt must contain text; clearing it shows a required-field message.
+  Explicitly clearing only the posting-rule body in System prompt is supported
+  and preserves the separate prompts when saved and reopened.
   The detail page also keeps the system prompt collapsed by default, with a
   bounded read-only preview when expanded; use Edit automation to change it.
 - `workspace`: connected-host setup disables workspace browsing while the
