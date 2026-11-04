@@ -717,9 +717,20 @@ class NativeInterruptRunner:
             cancel_pending_mcp_startup,
             clear_active_turn_id_if_matches,
             read_mcp_startup,
+            record_codex_interrupt,
         )
 
         state, bridge_dir = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
+        if state is None or state.session_id != conv_id:
+            return Response(status_code=204)
+        observed = state
+        try:
+            state = record_codex_interrupt(bridge_dir, expected=observed)
+        except OSError:
+            # Stop remains available even when the local durability fence cannot
+            # be written. The request still targets only the observed turn.
+            self._logger.warning("Could not persist the Codex Stop fence", exc_info=True)
+            state = observed
         if state is None:
             return Response(status_code=204)
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)
@@ -744,7 +755,7 @@ class NativeInterruptRunner:
                     },
                     timeout=10.0,
                 )
-            except Exception:  # the bridge flip already took effect locally.
+            except Exception:  # noqa: BLE001 — the bridge flip already took effect locally.
                 self._logger.warning(
                     "Failed to publish cancelled MCP startup for %s", conv_id, exc_info=True
                 )
@@ -762,7 +773,7 @@ class NativeInterruptRunner:
                             "turn/interrupt",
                             {"threadId": state.thread_id, "turnId": ""},
                         )
-                    except Exception:  # the local cancel already took effect.
+                    except Exception:  # noqa: BLE001 — local cancellation already took effect.
                         self._logger.warning(
                             "Codex-native MCP startup interrupt failed for session=%s thread=%s",
                             conv_id,
@@ -796,7 +807,7 @@ class NativeInterruptRunner:
                                     self._resource_registry.note_external_session_status(
                                         conv_id, "idle"
                                     )
-                                except Exception:  # the clear already succeeded.
+                                except Exception:  # noqa: BLE001 — the clear already succeeded.
                                     self._logger.warning(
                                         "Codex-native idle publish failed for session=%s",
                                         conv_id,
@@ -804,7 +815,10 @@ class NativeInterruptRunner:
                                     )
 
                             cleared = clear_active_turn_id_if_matches(
-                                bridge_dir, state.active_turn_id, on_cleared=_publish_idle
+                                bridge_dir,
+                                state.active_turn_id,
+                                on_cleared=_publish_idle,
+                                expected_owner=state,
                             )
                             self._logger.info(
                                 "Codex-native interrupt reconciled an already-ended turn "
@@ -831,7 +845,7 @@ class NativeInterruptRunner:
                         # deferred parent-wake cancel. A dropped sub-agent completion
                         # can still leave its parent waiting; reconciled separately.
                         return Response(status_code=204)
-        except Exception as exc:  # surface active-turn interrupt failures.
+        except Exception as exc:  # noqa: BLE001 — surface all native control failures.
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
                 conv_id,

@@ -2557,6 +2557,16 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         transport="ws://127.0.0.1:43210",
         client_name="omnigent-codex-native-runner",
     )
+    original_connect = fake_client.connect
+
+    async def connect_after_stop_fence() -> None:
+        fenced = codex_native_bridge.read_bridge_state(bridge_dir)
+        assert fenced is not None
+        assert fenced.interrupt_generation == 1
+        assert fenced.interrupted_turn_id == "turn_codex"
+        await original_connect()
+
+    monkeypatch.setattr(fake_client, "connect", connect_after_stop_fence)
     close_cancelled: list[bool] = []
     if stalled_close:
         from omnigent.runner.native import interrupt as native_interrupt
@@ -2648,6 +2658,10 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         f"codex-native interrupt must call turn/interrupt with the active "
         f"thread/turn ids; got {fake_client.requests!r}."
     )
+    fenced = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert fenced is not None
+    assert fenced.interrupt_generation == 1
+    assert fenced.interrupted_turn_id == "turn_codex"
 
     # 2) NO marker persisted — a synthesized [System: interrupted] would diverge
     # the web UI from Codex's own session (the mismatch this revert removes).
@@ -2877,6 +2891,10 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
         f"codex-native stop_session must call turn/interrupt with the active "
         f"thread/turn ids; got {fake_client.requests!r}."
     )
+    fenced = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert fenced is not None
+    assert fenced.interrupt_generation == 1
+    assert fenced.interrupted_turn_id == "turn_codex_stop"
 
     # 2) NO marker persisted — the in-process floor would have synthesized one.
     marker_texts = [
