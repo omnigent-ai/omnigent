@@ -8,7 +8,7 @@ import { ApiError } from "@/lib/sessionsApi";
 
 export const QUERY_RETRY_BASE_MS = 1_000;
 export const QUERY_RETRY_MAX_MS = 30_000;
-/** Longest Retry-After honored; past it, the query's next poll takes over. */
+/** Longest Retry-After wait; a larger hint is capped here, before jitter. */
 export const QUERY_RETRY_AFTER_MAX_MS = 60_000;
 /** Extra wait added on top of a Retry-After, as a fraction of it. */
 export const RETRY_AFTER_JITTER = 0.25;
