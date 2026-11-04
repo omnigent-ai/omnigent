@@ -2954,9 +2954,8 @@ def test_mcp_tools_result_drops_unknown_sign_in_state():
     "fields",
     [
         {"state": "bogus"},
+        # test_mcp_servers_result_validates_reported_account_state covers the URL predicate.
         {"authorization_url": "javascript:alert(1)"},
-        {"authorization_url": "https://user:pass@auth.example.test/"},
-        {"authorization_url": "https://auth.example.test/\nfoo"},
         {"authorization_url": "https://auth.example.test/?" + "a" * MCP_LOGIN_MAX_URL},
     ],
 )

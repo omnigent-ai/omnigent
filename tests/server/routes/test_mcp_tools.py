@@ -73,7 +73,10 @@ def tools_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
 
     @app.exception_handler(OmnigentError)
     async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
-        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
 
     return app, registry, hosts
 
@@ -379,9 +382,11 @@ async def test_mcp_login_requests_rejected_before_the_host(
 
 
 # A live host absent from this replica's registry is re-addressed only when sharded.
-@pytest.mark.parametrize(("sharded", "status"), [(True, 400), (False, 409)])
+@pytest.mark.parametrize(
+    ("sharded", "status", "code"), [(True, 400, "wrong_replica"), (False, 409, "conflict")]
+)
 async def test_mcp_login_for_a_host_on_another_replica(
-    tools_app, monkeypatch: pytest.MonkeyPatch, sharded: bool, status: int
+    tools_app, monkeypatch: pytest.MonkeyPatch, sharded: bool, status: int, code: str
 ) -> None:
     app, _, _ = tools_app
     monkeypatch.setattr(_host_launch, "_deployment_is_sharded", lambda: sharded)
@@ -389,7 +394,7 @@ async def test_mcp_login_for_a_host_on_another_replica(
         response = await client.post(
             _LOGIN_URL, json={"harness": "claude", "server": "docs"}, headers=_OWNER
         )
-    assert response.status_code == status
+    assert (response.status_code, response.json()["error"]["code"]) == (status, code)
 
 
 @pytest.mark.parametrize("outcome,status", [("timeout", 504), ("disconnect", 502)])
