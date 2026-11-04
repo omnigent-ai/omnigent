@@ -1149,6 +1149,8 @@ export interface SideChatComposerDraft {
   quotes?: ReplyQuote[];
   text: string;
   files: File[];
+  /** Failed startup inputs handed back into this draft, so a reopened session doesn't add them again. */
+  startupInputIds?: string[];
 }
 
 /** The empty composer, shared so an absent entry keeps a stable identity (a
@@ -2816,7 +2818,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
-    const replacesFailedInputs = failedStartupInputsReplacedBy(submitConversationId);
+    const replacedOnTurn = failedStartupInputsReplacedBy(submitConversationId);
+    let replacesFailedInputs = replacedOnTurn();
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
     const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
@@ -2841,6 +2844,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     inFlightSends.set(stableId, false);
     try {
       await waitForPrior();
+      replacesFailedInputs = replacedOnTurn();
       if (initialDraft && !initialSendPending()) return;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
@@ -3189,7 +3193,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
-    const replacesFailedInputs = failedStartupInputsReplacedBy(submitConversationId);
+    const replacedOnTurn = failedStartupInputsReplacedBy(submitConversationId);
+    let replacesFailedInputs = replacedOnTurn();
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -3198,6 +3203,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     try {
       await waitForPrior();
+      replacesFailedInputs = replacedOnTurn();
       // See `send`: rekey inside the call, before the new id is visible.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
@@ -3271,14 +3277,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // does. One with no answer may have run, so its inputs come back only if the server kept them.
       const replaced = replacesFailedInputs.replaces_failed_inputs;
       if (replaced && failTarget !== null && err instanceof ApiError && err.code !== null) {
-        failSet({
-          failedSendDraft: {
-            conversationId: failTarget,
-            text: commandText,
-            files: [],
-            serverRefused: true,
-            startupInputIds: replaced,
-          },
+        const refused = {
+          conversationId: failTarget,
+          text: commandText,
+          files: [],
+          serverRefused: true,
+          startupInputIds: replaced,
+        };
+        failSet((s) => {
+          const waiting = s.failedSendDraft;
+          // Messages a failed launch handed back may still wait for the composer.
+          const handedBack = waiting?.recovered === true && waiting.stableId === undefined;
+          return { failedSendDraft: handedBack ? joinFailedSendDrafts(waiting, refused) : refused };
         });
       } else if (replaced && failTarget !== null) {
         failSet((s) => forgetReturnedStartupInputs(s, replaced));
@@ -7819,17 +7829,20 @@ const ATTACHMENT_LIST = new Intl.ListFormat("en", { style: "long", type: "conjun
 
 /**
  * The failed startup inputs a send replaces: those already handed back to its
- * composer, so the server can drop them. Read before the composer clears its draft.
+ * composer, so the server can drop them. Called before the composer clears its
+ * draft; the returned reader drops ids that a denied send ahead of it took back.
  */
-function failedStartupInputsReplacedBy(conversationId: string | null): {
-  replaces_failed_inputs?: string[];
-} {
-  if (conversationId === null) return {};
-  const ids = new Set([
-    ...(setterForState(conversationId)?.returnedStartupInputs ?? []),
-    ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
-  ]);
-  return ids.size === 0 ? {} : { replaces_failed_inputs: [...ids] };
+function failedStartupInputsReplacedBy(
+  conversationId: string | null,
+): () => { replaces_failed_inputs?: string[] } {
+  if (conversationId === null) return () => ({});
+  const returned = setterForState(conversationId)?.returnedStartupInputs ?? [];
+  const drafted = getSessionDraft(conversationId)?.startupInputIds ?? [];
+  return () => {
+    const stillReturned = setterForState(conversationId)?.returnedStartupInputs ?? [];
+    const ids = new Set([...returned.filter((id) => stillReturned.includes(id)), ...drafted]);
+    return ids.size === 0 ? {} : { replaces_failed_inputs: [...ids] };
+  };
 }
 
 /** Stop treating startup inputs as handed back: the server dropped them, or a later read may offer them. */
@@ -7862,7 +7875,7 @@ function settleReplacedStartupInputs(
  * Hand the viewer's startup messages a failed managed launch left undelivered
  * back to the composer: drop the bubbles still showing them as sending and
  * restore their text after any draft already waiting there. Each is handed back
- * once: this entry remembers it, as does a saved draft that names it.
+ * once: this entry remembers it, as does a draft or unanswered send that names it.
  * The composer can't take back uploaded files, so a notice names the attachments.
  *
  * @param conversationId - The session whose launch failed.
@@ -7893,15 +7906,26 @@ function returnFailedStartupInputs(
   const held = new Set([
     ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
     ...(state.failedSendDraft?.startupInputIds ?? []),
+    ...(peekUnsentSend(conversationId)?.startupInputIds ?? []),
+    ...(useChatStore.getState().sideChatComposers[conversationId]?.startupInputIds ?? []),
     ...inWaitingDraft,
     ...inComposer,
   ]);
-  // Ids a saved draft or pending resend already holds count as returned.
+  // Ids a composer's draft, an unanswered send or a pending resend already holds count as returned.
   const inputs = unreturned.filter((input) => !held.has(input.pendingId));
-  const blocks = state.blocks.filter((block) => !isStartupLookupNotice(block));
+  // A draft holding a saved send's text may lack its files, which the composer can't take back.
+  const withoutFiles = new Set([
+    ...(state.failedSendDraft?.files.length ? [] : inWaitingDraft),
+    ...(state.restoredSendDraft?.files.length ? [] : inComposer),
+  ]);
+  const attachments = startupAttachmentsNotice(
+    unreturned.filter((input) => !held.has(input.pendingId) || withoutFiles.has(input.pendingId)),
+  );
+  const kept = state.blocks.filter((block) => !isStartupLookupNotice(block));
+  const blocks = attachments ? [...kept, attachments] : kept;
   const waiting = handedBackDraft(state.failedSendDraft, inWaitingDraft);
   const patch: Partial<ConversationState> = {
-    ...(blocks.length === state.blocks.length ? {} : { blocks }),
+    ...(blocks.length === state.blocks.length && attachments === null ? {} : { blocks }),
     ...(unreturned.length === 0
       ? {}
       : {
@@ -7915,7 +7939,6 @@ function returnFailedStartupInputs(
     ...(inComposer.length === 0 ? {} : { pendingRetryStableId: null, restoredSendDraft: null }),
   };
   if (inputs.length === 0) return patch;
-  const attachments = startupAttachmentsNotice(inputs);
   return {
     ...patch,
     pendingUserMessages: withoutFailedStartupBubbles(
@@ -7924,7 +7947,6 @@ function returnFailedStartupInputs(
       unacknowledged,
     ),
     failedSendDraft: failedStartupDraft(conversationId, waiting, inputs),
-    ...(attachments ? { blocks: [...blocks, attachments] } : {}),
   };
 }
 

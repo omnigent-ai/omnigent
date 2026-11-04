@@ -51,12 +51,14 @@ describe("session drafts", () => {
         notText: { text: 42 },
         nullEntry: null,
         badStartupIds: { text, startupInputIds: ["pending_first", 42] },
+        noStartupIds: { text, startupInputIds: [] },
       }),
     );
     const { getSessionDraft } = await import("./sessionDrafts");
     expect(getSessionDraft("invalid")).toEqual({ text, files: [] });
     expect(getSessionDraft("newer")).toEqual({ text, files: [] });
     expect(getSessionDraft("badStartupIds")).toEqual({ text, files: [] });
+    expect(getSessionDraft("noStartupIds")).toEqual({ text, files: [] });
     expect(getSessionDraft("notText")).toBeUndefined();
     expect(getSessionDraft("nullEntry")).toBeUndefined();
   });

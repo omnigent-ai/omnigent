@@ -529,15 +529,24 @@ function SideChatComposer({
     if (!failed) return;
     const { accepted, errors } = validateAttachments(failed.files, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
+    // The composer outlives the session's entry, so it keeps the startup inputs it takes.
+    const taken = failed.startupInputIds ?? [];
     if (hasNewerInput) {
       updateComposer(childId, (draft) => ({
         ...draft,
         text: joinParagraphs([draft.text, failed.text]),
         files: [...draft.files, ...accepted],
+        ...(taken.length > 0
+          ? { startupInputIds: [...new Set([...(draft.startupInputIds ?? []), ...taken])] }
+          : {}),
       }));
       return;
     }
-    updateComposer(childId, () => ({ text: failed.text, files: accepted }));
+    updateComposer(childId, () => ({
+      text: failed.text,
+      files: accepted,
+      ...(taken.length > 0 ? { startupInputIds: taken } : {}),
+    }));
     // Track the displayed draft for delivery; filtered files require a fresh send ID.
     const entry = conversationRegistry.peek(childId)!;
     const restored = entry.getState().restoredSendDraft;

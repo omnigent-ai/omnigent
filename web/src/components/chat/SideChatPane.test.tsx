@@ -15,7 +15,7 @@ import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
-import { useChatStore, type ChatState } from "@/store/chatStore";
+import { retryFailedStartupLookup, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { SideChatPane } from "./SideChatPane";
@@ -1763,6 +1763,22 @@ it("adds a failed launch's recovered message after the grid composer's newer dra
 
   expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
   expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("New quote");
+
+  // Evicted while the composer holds the input, the reopened session doesn't add it again.
+  const { sessionHarness, boundAgentId } = entry.getState();
+  act(() => conversationRegistry.release(childId));
+  conversationRegistry.acquire(childId).setState({
+    sessionHarness,
+    boundAgentId,
+    sessionStatus: "idle",
+    loadingConversation: false,
+    abortController: new AbortController(),
+  });
+  vi.spyOn(sessionsApi, "listFailedInputs").mockResolvedValue([
+    { pendingId: "pending_first", content: [{ type: "input_text", text: "saved on server" }] },
+  ]);
+  await act(() => retryFailedStartupLookup(childId));
+  expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
   const post = vi.spyOn(sessionsApi, "postEvent").mockResolvedValue({ queued: true });
   fireEvent.click(screen.getByTestId("side-chat-send"));
   await waitFor(() => expect(post).toHaveBeenCalledOnce());
