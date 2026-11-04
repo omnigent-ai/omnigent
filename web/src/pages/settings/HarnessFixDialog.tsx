@@ -194,6 +194,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const startDeviceLogin = useCallback(async () => {
     const id = ++runId.current;
     setError("");
+    setInstallError(null);
     setDeviceLogin(null);
     setPhase("progress");
     if (host.harness_login_supported !== true) {
@@ -249,6 +250,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const start = useCallback(async () => {
     if (requiresManualSetup) {
       setError("");
+      setInstallError(null);
       setStillNotReady(false);
       setUpdatedNeedsSetup(false);
       setPhase("setup");
@@ -256,6 +258,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     }
     const id = ++runId.current;
     setError("");
+    setInstallError(null);
     setStillNotReady(false);
     setUpdatedNeedsSetup(false);
     setPhase("progress");
@@ -297,6 +300,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     credentialDefaultSettled.current = false;
     setChoice("personal");
     setError("");
+    setInstallError(null);
     setStillNotReady(false);
     setUpdatedNeedsSetup(false);
     setChecking(false);
@@ -346,6 +350,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const retry = () => {
     runId.current += 1;
     setError("");
+    setInstallError(null);
     setDeviceLogin(null);
     setStillNotReady(false);
     setUpdatedNeedsSetup(false);
@@ -449,6 +454,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const switchAccount = async () => {
     const id = ++runId.current;
     setError("");
+    setInstallError(null);
     setPhase("progress");
     try {
       const result = await logoutHarnessOnHost(hostId, harness);

@@ -15,7 +15,7 @@
  * each step's state.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { CheckIcon, CircleCheckIcon, CircleDashedIcon, CopyIcon, InfoIcon } from "lucide-react";
 
 import {
@@ -58,6 +58,7 @@ export function HarnessSetupDialog({
   const setupStepsByHarness = useHarnessSetupSteps();
   const info = useServerInfo();
   const [installError, setInstallError] = useState<Error | null>(null);
+  useEffect(() => setInstallError(null), [open, harness, hostProp?.host_id]);
   // Re-resolve the host LIVE from the hosts query rather than trusting the
   // snapshot passed at open time: a successful install / credential write
   // patches the ["hosts"] cache, and the dialog must reflect that (flip ✓)
