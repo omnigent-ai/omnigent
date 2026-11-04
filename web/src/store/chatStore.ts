@@ -7875,7 +7875,7 @@ function failedStartupInputsReplacedBy(
     const ids = [
       ...new Set([
         ...returned.filter((id) => stillReturned.includes(id) && !ahead.has(id)),
-        ...drafted,
+        ...drafted.filter((id) => !ahead.has(id)),
       ]),
     ];
     if (send) nameStartupInputsOut(conversationId, send, ids);

@@ -4122,6 +4122,44 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
+  it("doesn't name a reloaded draft's startup inputs in a send queued behind a resend naming them", async () => {
+    onTestFinished(clearSessionDrafts);
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+    setSessionDraft("conv_real", {
+      text: "saved on server",
+      files: [],
+      startupInputIds: ["pending_first"],
+    });
+    const posts: unknown[] = [];
+    let denyResend: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input) === "/v1/sessions/conv_real/failed-inputs")
+        return mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
+      if (String(input).endsWith("/v1/sessions/conv_real/events") && init?.method === "POST") {
+        posts.push(JSON.parse(String(init.body)));
+        if (posts.length === 1)
+          return new Promise<Response>((resolve) => {
+            denyResend = () => resolve(mockResponse({ queued: false, denied: true }));
+          });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+
+    const resend = useChatStore.getState().send("saved on server", "agent_xyz");
+    await vi.waitFor(() => expect(denyResend).toBeDefined());
+    const queued = useChatStore.getState().send("something else", "agent_xyz");
+    denyResend!();
+    await Promise.all([resend, queued]);
+    await settle();
+
+    expect(posts).toHaveLength(2);
+    expect(posts[0]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+    expect(posts[1]).not.toHaveProperty("replaces_failed_inputs");
+  });
+
   it.each([
     {
       resend: "skill-command resend",
