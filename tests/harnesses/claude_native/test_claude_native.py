@@ -9282,7 +9282,7 @@ def test_provider_config_for_native_claude_attributes_a_unity_gateway(
     assert terminal_env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         *preserved_headers,
         "Databricks-Custom-Coding-Agent: claude-code",
-        "Databricks-Custom-Client-Surfaces: omnigent, omnigent-desktop",
+        "Databricks-Custom-Client-Surfaces: omnigent-desktop",
     ]
 
 
