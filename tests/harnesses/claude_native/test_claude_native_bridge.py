@@ -4297,6 +4297,29 @@ def test_augment_claude_args_allows_reading_session_attachments(
 
 
 @pytest.mark.parametrize(
+    ("launch_args", "expected_permissions"),
+    [((), None), (("--permission-mode", "auto"), {"defaultMode": "auto"})],
+    ids=["none", "auto"],
+)
+def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
+    launch_args: tuple[str, ...],
+    expected_permissions: dict[str, str] | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache path Claude would read as a glob gets no allow rule; the launch mode stays."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data[1]"))
+
+    settings = _load_invocation_settings(
+        augment_claude_args(
+            launch_args, bridge_dir=tmp_path / "bridge", python_executable="/venv/bin/python"
+        )
+    )
+
+    assert settings.get("permissions") == expected_permissions
+
+
+@pytest.mark.parametrize(
     ("directory", "expected"),
     [
         (
