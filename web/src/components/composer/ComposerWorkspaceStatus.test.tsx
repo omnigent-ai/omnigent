@@ -57,7 +57,9 @@ describe("ComposerWorkspaceStatus", () => {
   it("shows the full working directory path in a hover tooltip", async () => {
     const user = userEvent.setup();
     render(<ComposerWorkspaceStatus {...base} workspacePath="/home/alice/projects/repo" />);
-    await user.hover(screen.getByTestId("composer-workspace-dir"));
+    const directory = screen.getByTestId("composer-workspace-dir");
+    expect(directory).not.toHaveAttribute("title");
+    await user.hover(directory);
     expect(await screen.findByRole("tooltip", {}, TOOLTIP_WAIT)).toHaveTextContent(
       "Working directory: /home/alice/projects/repo",
     );
@@ -75,6 +77,7 @@ describe("ComposerWorkspaceStatus", () => {
     );
     const worktree = screen.getByTestId("composer-git-branch");
     expect(worktree).toHaveTextContent("Branch unavailable");
+    expect(worktree).not.toHaveAttribute("title");
     await user.hover(worktree);
     expect(await screen.findByRole("tooltip", {}, TOOLTIP_WAIT)).toHaveTextContent(
       "Branch unavailable. Created on branch feature/created.",
