@@ -650,9 +650,7 @@ function McpRow({
         >
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground group-aria-expanded:rotate-90" />
           <LetterAvatar name={server.name} />
-          <span className="shrink-0 font-medium text-foreground">
-            {mcpServerDisplayName(server.name)}
-          </span>
+          <span className="shrink-0 font-medium text-foreground">{serverLabel}</span>
           {data?.connection === "connected" && (
             <span className="shrink-0 text-muted-foreground">
               · {data.tools.length}
@@ -682,7 +680,7 @@ function McpRow({
               ? `Update ${host.name} to list tools.`
               : query.error instanceof ApiError && query.error.status === 503
                 ? "Host is busy probing other MCP servers. Collapse and reopen to retry."
-                : `Couldn't reach ${mcpServerDisplayName(server.name)}.`}
+                : `Couldn't reach ${serverLabel}.`}
           </Notice>
         ) : data ? (
           <McpServerDetails
