@@ -2297,6 +2297,8 @@ def test_install_harness_result_failure_round_trip() -> None:
         request_id="req_install_3",
         status="failed",
         error="npm not found",
+        command="npm install -g @openai/codex",
+        output_tail="npm: missing",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostInstallHarnessResultFrame)
@@ -2305,6 +2307,8 @@ def test_install_harness_result_failure_round_trip() -> None:
     assert decoded.version is None
     assert decoded.gateway_inference is None
     assert decoded.error == "npm not found"
+    assert decoded.command == original.command
+    assert decoded.output_tail == original.output_tail
 
 
 def test_refresh_harnesses_frames_round_trip() -> None:
@@ -2878,3 +2882,19 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
                 }
             )
         )
+
+
+def test_install_harness_old_failure_frame() -> None:
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.install_harness_result",
+                "request_id": "old",
+                "status": "failed",
+                "error": "failed",
+            }
+        )
+    )
+    assert isinstance(decoded, HostInstallHarnessResultFrame)
+    assert decoded.command is None
+    assert decoded.output_tail is None

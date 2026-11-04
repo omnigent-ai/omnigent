@@ -1014,6 +1014,8 @@ async def _receive_loop(
                         "version": frame.version,
                         "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
+                        "command": frame.command,
+                        "output_tail": frame.output_tail,
                     }
                 )
             continue

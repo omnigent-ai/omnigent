@@ -282,7 +282,18 @@ export async function installHarnessOnHost(
     `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/install`,
     { method: "POST" },
   );
-  if (!res.ok) throw await apiErrorFromResponse(res);
+  if (!res.ok) {
+    const error = await apiErrorFromResponse(res.clone());
+    try {
+      const body = (await res.json()) as Record<string, unknown>;
+      if (typeof body.command === "string") error.command = body.command;
+      if (typeof body.output_tail === "string") error.outputTail = body.output_tail;
+      if (typeof body.setup_command === "string") error.setupCommand = body.setup_command;
+    } catch {
+      // Preserve the existing error for empty or non-JSON responses.
+    }
+    throw error;
+  }
   return (await res.json()) as InstallHarnessResult;
 }
 

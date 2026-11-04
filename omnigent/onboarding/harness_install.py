@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,7 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.cli_diagnostics import redact_secrets
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.harnesses.opencode_native.client import (
@@ -1183,6 +1185,23 @@ def _installer_failure_reason(returncode: int, stderr_tail: str) -> str:
     return f"installer exited with code {returncode}"
 
 
+def scrub_installer_output(output: str) -> str:
+    """Redact installer credentials before returning a bounded diagnostic tail."""
+    output = re.sub(r"(?im)(authorization\s*:\s*)[^\r\n]+", r"\1[REDACTED]", output)
+    output = re.sub(
+        r"(?i)((?:_authToken|[a-z_][a-z0-9_]*_(?:TOKEN|KEY|SECRET))\s*=\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s]+)",
+        r"\1[REDACTED]",
+        output,
+    )
+    output = redact_secrets(output)
+    return (
+        "\n".join(output.splitlines()[-20:])
+        .encode("utf-8")[-4096:]
+        .decode("utf-8", errors="ignore")
+    )
+
+
 def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
     """Run an installer, teeing its stderr so it is both shown and readable.
 
@@ -1222,7 +1241,9 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
         with stream:
             for line in stream:
                 with tail_lock:
-                    tail.append(line)
+                    tail.append(scrub_installer_output(line) + "\n")
+                    while sum(map(len, tail)) > 16384 and len(tail) > 1:
+                        tail.popleft()
                 sys.stderr.write(line)
                 sys.stderr.flush()
 
@@ -1232,11 +1253,14 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
     pump.start()
     try:
         returncode = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         # Killing only the installer would leave npm lifecycle scripts or the
         # inner shell of ``curl | bash`` running and writing to the pipe.
         _proc.kill_tree(proc)
         proc.wait()
+        pump.join(timeout=_INSTALLER_TEE_DRAIN_TIMEOUT_S)
+        with tail_lock:
+            exc.stderr = "".join(tail).encode("utf-8")
         raise
     finally:
         pump.join(timeout=_INSTALLER_TEE_DRAIN_TIMEOUT_S)
@@ -1257,6 +1281,8 @@ class HarnessInstallResult(NamedTuple):
 
     installed: bool
     reason: str | None
+    command: str | None = None
+    output_tail: str | None = None
 
 
 def try_install_harness_cli(key: str) -> HarnessInstallResult:
@@ -1274,10 +1300,11 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     identically.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
+    :returns: A :class:`HarnessInstallResult` with the outcome, reason,
+        command and scrubbed stderr tail. Successful when the CLI
         resolves via :func:`resolve_cli_binary` and passes its version range
         (including the no-op where it was already present), otherwise
-        ``(False, reason)`` naming the failure (manual-only spec, missing
+        a reason naming the failure (manual-only spec, missing
         installer, timeout, OS error, a diagnosed or bare non-zero exit, a
         post-install binary-not-found, or a CLI still outside its range).
     :raises KeyError: If *key* has no install spec.
@@ -1287,14 +1314,24 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
         # Manual-only CLI (e.g. cursor-agent): caller shows install_hint.
         return HarnessInstallResult(False, f"{spec.binary!r} is not installable automatically")
     cmd = harness_install_command(key)
+    command = shlex.join(cmd)
+
+    def failed(reason: str, output: str = "") -> HarnessInstallResult:
+        return HarnessInstallResult(
+            False, scrub_installer_output(reason), command, scrub_installer_output(output) or None
+        )
+
     if shutil.which(cmd[0]) is None:
-        return HarnessInstallResult(False, f"{cmd[0]!r} is not available on the host")
+        return failed(f"{cmd[0]!r} is not available on the host")
     try:
         returncode, stderr_tail = _run_installer(cmd, timeout=300)
-    except subprocess.TimeoutExpired:
-        return HarnessInstallResult(False, "install timed out after 300s")
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stderr or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        return failed("install timed out after 300s", output)
     except OSError as exc:
-        return HarnessInstallResult(False, f"install command failed to run: {exc}")
+        return failed(f"install command failed to run: {exc}")
     invalidate_harness_probe_caches()
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
@@ -1321,16 +1358,12 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
             os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
         return HarnessInstallResult(True, None)
     if returncode != 0:
-        return HarnessInstallResult(False, _installer_failure_reason(returncode, stderr_tail))
+        return failed(_installer_failure_reason(returncode, stderr_tail), stderr_tail)
     if resolved is not None:
         version, required = harness_cli_version(key)
         found = f"{version} (requires {required})" if version and required else "unsupported"
-        return HarnessInstallResult(
-            False, f"installer completed but {spec.binary!r} is still {found}"
-        )
-    return HarnessInstallResult(
-        False, f"installer completed but {spec.binary!r} could not be found"
-    )
+        return failed(f"installer completed but {spec.binary!r} is still {found}", stderr_tail)
+    return failed(f"installer completed but {spec.binary!r} could not be found", stderr_tail)
 
 
 def install_harness_cli(key: str) -> bool:

@@ -1378,6 +1378,50 @@ describe("HarnessFixDialog", () => {
     expect(props.onFixed).not.toHaveBeenCalled();
   });
 
+  it.each([true, false])(
+    "shows install failure diagnostics when available: %s",
+    async (withDetails) => {
+      const user = userEvent.setup();
+      const command = "npm install -g @earendil-works/pi-coding-agent";
+      vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === "/v1/harnesses") return json(catalog);
+        if (url.endsWith("/install"))
+          return json(
+            {
+              detail: "host install failed: permission denied (npm EACCES)",
+              ...(withDetails
+                ? { command, output_tail: "npm error code EACCES\npermission denied" }
+                : {}),
+            },
+            { status: 502 },
+          );
+        throw new Error(`Unexpected URL: ${url}`);
+      });
+      renderDialog({ mode: "update", harness: "pi-native", harnessLabel: "Pi" });
+      expect(
+        await screen.findByText("host install failed: permission denied (npm EACCES)"),
+      ).toBeVisible();
+      if (withDetails) {
+        expect(screen.getByText("Ran on Local laptop")).toBeVisible();
+        expect(screen.getAllByText(command)).toHaveLength(2);
+        await user.click(screen.getByRole("button", { name: "Copy install command" }));
+        expect(copyText).toHaveBeenCalledWith(command);
+        const summary = screen.getByText("Installer output");
+        expect(summary.closest("details")).not.toHaveAttribute("open");
+        await user.click(summary);
+        expect(summary.closest("details")).toHaveAttribute("open");
+        expect(screen.getByText(/npm error code EACCES/)).toBeVisible();
+        expect(screen.getByRole("button", { name: "Copy manual install command" })).toBeVisible();
+        expect(screen.queryByText("omni setup")).toBeNull();
+      } else {
+        expect(screen.getByRole("button", { name: "Copy omni setup" })).toBeVisible();
+        expect(screen.queryByText("Installer output")).toBeNull();
+      }
+      expect(screen.getByText("Run this yourself on Local laptop")).toBeVisible();
+    },
+  );
+
   it("passes the installed version to the ready notice", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = String(input);

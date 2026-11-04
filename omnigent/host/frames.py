@@ -855,6 +855,8 @@ class HostInstallHarnessResultFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host that doesn't report
         it) — never treat it as "nothing is gateway-backed".
+    :param command: Shell-quoted installer argv, absent on older hosts.
+    :param output_tail: Scrubbed installer diagnostics, up to 20 lines / 4 KB.
     :param error: Why the install failed, e.g. ``"npm not found"`` or
         ``"install timed out"``. ``None`` on success.
     """
@@ -866,6 +868,8 @@ class HostInstallHarnessResultFrame:
     version: str | None = None
     gateway_inference: dict[str, bool] | None = None
     error: str | None = None
+    command: str | None = None
+    output_tail: str | None = None
 
 
 @dataclass
@@ -1809,6 +1813,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "version": frame.version,
                 "gateway_inference": frame.gateway_inference,
                 "error": frame.error,
+                "command": frame.command,
+                "output_tail": frame.output_tail,
             }
         )
     if isinstance(frame, HostRefreshHarnessesFrame):
@@ -3028,6 +3034,8 @@ def _decode_install_harness_result(msg: _JsonObject) -> HostInstallHarnessResult
         version=_optional_nullable_str(msg, "version"),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
+        command=_optional_nullable_str(msg, "command"),
+        output_tail=_optional_nullable_str(msg, "output_tail"),
     )
 
 

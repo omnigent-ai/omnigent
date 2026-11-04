@@ -404,6 +404,9 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string | null;
+  command: string | null = null;
+  outputTail: string | null = null;
+  setupCommand = "omni setup";
   constructor(message: string, status: number, code: string | null) {
     super(message);
     this.name = "ApiError";

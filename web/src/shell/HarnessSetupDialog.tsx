@@ -38,6 +38,8 @@ import {
   resolveSetupSteps,
   type ResolvedSetupStep,
 } from "@/lib/harnessSetup";
+import { ApiError } from "@/lib/sessionsApi";
+import { ErrorState } from "@/pages/settings/HarnessFixDialog";
 import { HarnessCredentialForm } from "@/shell/HarnessCredentialForm";
 
 export function HarnessSetupDialog({
@@ -55,6 +57,7 @@ export function HarnessSetupDialog({
 }) {
   const setupStepsByHarness = useHarnessSetupSteps();
   const info = useServerInfo();
+  const [installError, setInstallError] = useState<Error | null>(null);
   // Re-resolve the host LIVE from the hosts query rather than trusting the
   // snapshot passed at open time: a successful install / credential write
   // patches the ["hosts"] cache, and the dialog must reflect that (flip ✓)
@@ -112,6 +115,7 @@ export function HarnessSetupDialog({
     // useInstallHarness) are both observer-independent, so a concurrent second
     // install can't strand this one. A lost toast is cosmetic; a stuck spinner
     // or an unpatched badge is the bug we're avoiding.
+    setInstallError(null);
     install.mutate(h, {
       onSuccess: (result) => {
         // The install succeeded, but the harness may still need a credential
@@ -124,7 +128,7 @@ export function HarnessSetupDialog({
             : `${name} installed on ${host?.name} — one more step to finish setup.`,
         );
       },
-      onError: (err) => showToast(`Couldn't install ${name}: ${err.message}`, { duration: 0 }),
+      onError: (err) => setInstallError(err),
     });
   };
 
@@ -148,6 +152,14 @@ export function HarnessSetupDialog({
             <DialogDescription>{`${name} needs a bit more setup on ${host?.name}.`}</DialogDescription>
           ) : null}
         </DialogHeader>
+
+        {installError && (
+          <ErrorState
+            error={installError.message}
+            hostName={host?.name ?? "this host"}
+            diagnostics={installError instanceof ApiError ? installError : null}
+          />
+        )}
 
         {collapsed && !allDone ? (
           // No step the UI can perform (curl-install / own-login harness, or no
