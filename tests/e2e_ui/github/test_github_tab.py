@@ -562,11 +562,11 @@ def test_no_pr_keeps_linking_when_another_provider_discovery_fails(
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_be_visible()
 
 
-@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile", "canvas"])
 def test_post_top_level_pr_comment(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
 ) -> None:
-    """The same composer posts and retains drafts through every PR-panel entry point."""
+    """Comments and push history share a feed through every PR-panel entry point."""
     base_url, session_id = seeded_session
     _stub_github(page, pr_count=2)
     pr_url = _INFO["pr"]["url"]
@@ -575,6 +575,7 @@ def test_post_top_level_pr_comment(
             **_INFO["pr"]["comments"][0],
             "body": f"Earlier comment {index + 1}",
             "url": f"{pr_url}#comment-{index}",
+            "created_at": "2026-10-25T06:00:00Z" if index == 29 else "2026-09-05T07:32:02Z",
         }
         for index in range(30)
     ]
@@ -584,7 +585,30 @@ def test_post_top_level_pr_comment(
         "selected_pr_url": pr_url,
         "capabilities": {"comment_posting": True},
         "selected_account": "octocat",
-        "pr": {**_INFO["pr"], "comments": comments},
+        "pr": {
+            **_INFO["pr"],
+            "comments": comments,
+            "timeline_events": [
+                {
+                    "id": "commit-1",
+                    "kind": "commit",
+                    "author": "octocat",
+                    "created_at": "2026-10-24T12:00:00Z",
+                    "url": "https://example.com/acme/app/commit/" + "a" * 40,
+                    "sha": "a" * 40,
+                    "message": "Address review feedback",
+                },
+                {
+                    "id": "force-push-1",
+                    "kind": "force_push",
+                    "author": "octocat",
+                    "created_at": "2026-10-25T12:00:00Z",
+                    "url": "https://example.com/acme/app/commit/" + "b" * 40,
+                    "sha": "b" * 40,
+                    "previous_sha": "a" * 40,
+                },
+            ],
+        },
     }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
     posts = []
@@ -603,7 +627,11 @@ def test_post_top_level_pr_comment(
     page.route(re.compile(r"/resources/github/comments$"), post_comment)
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
-    page.goto(f"{base_url}/c/{session_id}")
+    if entry == "canvas":
+        from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
+
+        _stub_server_info(page, canvas=True, session_pull_requests=True)
+    page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
     panel = (
         page.get_by_test_id("github-panel-drawer")
         if mobile
@@ -628,6 +656,20 @@ def test_post_top_level_pr_comment(
     composer_top = textbox.evaluate("el => el.getBoundingClientRect().top")
     feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     expect(panel.get_by_text("Earlier comment 30", exact=True)).to_be_in_viewport()
+    rows = feed.get_by_role("listitem")
+    expect(rows).to_have_count(32)
+    expect(rows.nth(29)).to_contain_text("committed")
+    expect(rows.nth(29)).to_contain_text("Address review feedback")
+    expect(
+        rows.nth(29).get_by_role("link", name="Open commit aaaaaaa on GitHub", exact=True)
+    ).to_have_attribute("href", "https://example.com/acme/app/commit/" + "a" * 40)
+    expect(rows.nth(30)).to_contain_text("Earlier comment 30")
+    expect(rows.nth(31)).to_contain_text("force-pushed")
+    expect(rows.nth(31)).to_contain_text("bbbbbbb")
+    expect(
+        rows.nth(31).get_by_role("link", name="Open commit bbbbbbb on GitHub", exact=True)
+    ).to_have_attribute("href", "https://example.com/acme/app/commit/" + "b" * 40)
+    page.screenshot(path=str(tmp_path / f"push-history-{entry}.png"))
     assert textbox.evaluate("el => el.getBoundingClientRect().top") == pytest.approx(
         composer_top, abs=1
     )
@@ -658,6 +700,9 @@ def test_post_top_level_pr_comment(
     expect(textbox).to_have_value("")
     panel.get_by_role("button", name="Refresh", exact=True).click()
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    expect(rows).to_have_count(33)
+    expect(rows.nth(31)).to_contain_text("force-pushed")
+    expect(rows.nth(32)).to_contain_text("Thanks for reviewing!")
     feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_in_viewport()
     expect(post_button).to_be_in_viewport()
@@ -1105,3 +1150,113 @@ def test_reply_to_inline_review_conversation(
     ]
     ranged.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-range-posted.png"))
+
+
+# Two additions match "added": the first on line 2, the second on line 4.
+_FIND_PATCH = (
+    "diff --git a/src/app/main.py b/src/app/main.py\n"
+    "index e69de29..4b825dc 100644\n"
+    "--- a/src/app/main.py\n"
+    "+++ b/src/app/main.py\n"
+    "@@ -1,2 +1,4 @@\n"
+    " line1\n"
+    "+added line\n"
+    " line2\n"
+    "+added again\n"
+)
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
+def test_changes_find_reveals_collapsed_and_filtered(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """Find reveals a collapsed file's match, highlights it, and steps through matches.
+
+    Exercises find reveal, navigation, and highlighting through both panel entry points.
+    Filter-dependent hints are covered by component tests.
+    """
+    base_url, session_id = seeded_session
+    mobile = entry == "composer-mobile"
+    page.emulate_media(color_scheme="dark" if mobile else "light")
+    _stub_github(page, pr_count=2)
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda route: route.fulfill(json={**_PR_DIFF, "patch": _FIND_PATCH}),
+    )
+    page.set_viewport_size({"width": 390 if mobile else 1440, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    if mobile:
+        page.get_by_test_id("composer-pr-link").click()
+    else:
+        open_right_rail(page)
+        panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role(
+        "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
+    ).click()
+    tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+
+    file = panel.locator('[data-github-file="src/app/main.py"]')
+    file.get_by_role("button", name=re.compile(r"main\.py"), expanded=True).click()
+    expect(file.locator("diffs-container")).to_have_count(0)
+
+    panel.get_by_role("button", name="Find in changes", exact=True).click()
+    find = panel.get_by_role("textbox", name="Find in changes", exact=True)
+    expect(find).to_be_focused()
+    find.fill("added")
+    expect(panel.get_by_text("1 of 2", exact=True)).to_be_visible()
+    expect(file.locator("diffs-container")).to_have_count(1)
+
+    def wait_for_highlight(line: str) -> None:
+        # Painting runs in an effect after the counter updates, so poll for the new range.
+        page.wait_for_function(
+            """([line]) => [...(CSS.highlights.get("pr-find-active") ?? [])].some((range) =>
+                range.startContainer.isConnected && range.toString() === "added"
+                && range.startContainer.parentElement.closest("[data-line]")
+                    ?.getAttribute("data-line") === line)""",
+            arg=[line],
+        )
+
+    def highlighted() -> list[dict[str, str | None]]:
+        return page.evaluate(
+            """() => [...(CSS.highlights.get("pr-find-active") ?? [])].map((range) => ({
+                text: range.toString(),
+                line: range.startContainer.parentElement.closest("[data-line]")
+                    ?.getAttribute("data-line") ?? null,
+            }))"""
+        )
+
+    first = file.locator('[data-line="2"][data-line-type="change-addition"]')
+    expect(first).to_be_in_viewport()
+    wait_for_highlight("2")
+    assert highlighted() == [{"text": "added", "line": "2"}]
+    page.screenshot(path=str(tmp_path / f"find-{entry}-first-match.png"))
+
+    find.press("Enter")
+    expect(panel.get_by_text("2 of 2", exact=True)).to_be_visible()
+    wait_for_highlight("4")
+    assert highlighted() == [{"text": "added", "line": "4"}]
+    expect(file.locator('[data-line="4"][data-line-type="change-addition"]')).to_be_in_viewport()
+
+    if not mobile:
+        # The highlight survives a diff re-render in the other layout.
+        panel.get_by_role("button", name="Switch to split view", exact=True).click()
+        wait_for_highlight("4")
+        assert highlighted() == [{"text": "added", "line": "4"}]
+        panel.get_by_role("button", name="Switch to unified view", exact=True).click()
+
+    find.press("Escape")
+    expect(find).to_have_count(0)
+    page.wait_for_function("() => !CSS.highlights.has('pr-find-active')")
+    assert highlighted() == []
+
+    # Ctrl/Cmd+F reopens the bar from inside the Changes tab.
+    file.get_by_role("button", name=re.compile(r"main\.py"), expanded=True).focus()
+    page.keyboard.press("ControlOrMeta+f")
+    expect(panel.get_by_role("textbox", name="Find in changes", exact=True)).to_be_focused()
+    page.screenshot(path=str(tmp_path / f"find-{entry}-reopened.png"))

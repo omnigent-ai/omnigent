@@ -283,9 +283,12 @@ actions.
 
 **Rename shortcut:** in an owner-managed top-level session on desktop, press
 Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
-The header title becomes an input with its text selected. Enter or blur saves;
-Escape cancels. The shortcut leaves terminals, code editors, and open menus or
-dialogs alone. It is listed in Keyboard shortcuts and Settings.
+With the sidebar open, the session's sidebar row becomes the same inline rename
+field as its Rename menu item, text selected, so you can click the next row and
+rename again. With the sidebar closed, or the row hidden in a collapsed project
+or section, the header title becomes the input instead. Enter or blur
+saves; Escape cancels. The shortcut leaves terminals, code editors, and open
+menus or dialogs alone. It is listed in Keyboard shortcuts and Settings.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
@@ -600,6 +603,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
   The desktop shortcut, including draft preservation, cancellation, and reload:
+  `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_hotkey_edits_sidebar_rows_in_sequence`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_rename_hotkey_from_composer_persists_and_cancels`.
   The iOS drawer rename under the soft keyboard:
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,

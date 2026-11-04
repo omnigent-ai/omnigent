@@ -290,15 +290,17 @@ describe("TasksPage list", () => {
     const suggestions = screen.getByTestId("tasks-suggestions");
     expect(within(suggestions).getByText("Suggested Automations")).toBeInTheDocument();
     const cards = within(suggestions).getAllByTestId(/^suggestion-/);
-    expect(cards).toHaveLength(3);
+    expect(cards).toHaveLength(4);
     expect(cards.map((r) => r.getAttribute("data-testid"))).toEqual([
       "suggestion-trigger-jira",
       "suggestion-trigger-slack",
       "suggestion-trigger-github",
+      "suggestion-trigger-linear",
     ]);
     expect(within(suggestions).getByText("Jira tickets")).toBeInTheDocument();
     expect(within(suggestions).getByText("Slack messages")).toBeInTheDocument();
-    expect(within(suggestions).getByText("GitHub issues")).toBeInTheDocument();
+    expect(within(suggestions).getByText("GitHub")).toBeInTheDocument();
+    expect(within(suggestions).getByText("Linear issues")).toBeInTheDocument();
   });
 
   it("shows suggestions below populated lists and the full gallery on Templates", () => {
@@ -312,11 +314,12 @@ describe("TasksPage list", () => {
     const suggestions = screen.getByTestId("tasks-suggestions");
     expect(screen.getByRole("tab", { name: "Templates" })).toHaveAttribute("aria-selected", "true");
     const cards = within(suggestions).getAllByTestId(/^suggestion-/);
-    expect(cards).toHaveLength(3);
+    expect(cards).toHaveLength(4);
     expect(cards.map((c) => c.getAttribute("data-testid"))).toEqual([
       "suggestion-trigger-jira",
       "suggestion-trigger-slack",
       "suggestion-trigger-github",
+      "suggestion-trigger-linear",
     ]);
     const jiraCard = within(suggestions).getByTestId("suggestion-trigger-jira");
     expect(jiraCard).toHaveTextContent("Jira tickets");
@@ -616,28 +619,31 @@ describe("trigger templates", () => {
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-trigger")).toBe("");
   });
 
-  it.each(["jira", "slack", "github"])("opens the %s builder from its gallery card", (source) => {
-    vi.mocked(useViewerId).mockReturnValue("alice");
-    setTasks([]);
-    renderPage("/tasks?view=templates");
-    expect(
-      screen.queryByRole("dialog", { name: "Introducing Automations" }),
-    ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByTestId(`suggestion-trigger-${source}`));
-    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
-      "data-initial-trigger",
-      source,
-    );
-    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
-      "data-initial-template",
-      source,
-    );
-    expect(analytics).toHaveBeenCalledWith({
-      type: "click",
-      componentId: `tasks.template.${source}`,
-      componentKind: "button",
-    });
-  });
+  it.each(["jira", "slack", "github", "linear"])(
+    "opens the %s builder from its gallery card",
+    (source) => {
+      vi.mocked(useViewerId).mockReturnValue("alice");
+      setTasks([]);
+      renderPage("/tasks?view=templates");
+      expect(
+        screen.queryByRole("dialog", { name: "Introducing Automations" }),
+      ).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId(`suggestion-trigger-${source}`));
+      expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+        "data-initial-trigger",
+        source,
+      );
+      expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+        "data-initial-template",
+        source,
+      );
+      expect(analytics).toHaveBeenCalledWith({
+        type: "click",
+        componentId: `tasks.template.${source}`,
+        componentKind: "button",
+      });
+    },
+  );
 
   it.each([
     ["can't keep one session per automation", { scheduled_task_session_modes: false }],

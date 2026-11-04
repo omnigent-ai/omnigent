@@ -31,6 +31,7 @@ class ClaudeProgramStatusPoller:
         fallback: SessionStatusPoller,
         on_status: Callable[[str, str | None], None],
         *,
+        on_replay: Callable[[str, str | None], None] | None = None,
         omnigent_session_id: str | None = None,
         terminal_instance_id: str | None = None,
         terminal_launch_id: str | None = None,
@@ -42,6 +43,7 @@ class ClaudeProgramStatusPoller:
         self._reader = reader
         self._fallback = fallback
         self._on_status = on_status
+        self._on_replay = on_replay or on_status
         self._omnigent_session_id = omnigent_session_id
         self._terminal_instance_id = terminal_instance_id
         self._terminal_launch_id = terminal_launch_id
@@ -52,6 +54,7 @@ class ClaudeProgramStatusPoller:
         self._error_activity_epoch: int | None = None
         self._clock = clock
         self._last: ProgramStatus | None = None
+        self._observation_version = 0
         self._error_report: ProgramStatus | None = None
         self._error_since: float | None = None
         self._error_failed = False
@@ -59,6 +62,11 @@ class ClaudeProgramStatusPoller:
         self._retired = False
         self._resync_lock = threading.Lock()
         self._resync_requested = False
+
+    @property
+    def observation_version(self) -> int:
+        """Include errors hidden from publication and changes in the fallback source."""
+        return self._observation_version + self._fallback.observation_version
 
     @property
     def active(self) -> bool:
@@ -85,8 +93,6 @@ class ClaudeProgramStatusPoller:
         with self._resync_lock:
             requested = self._resync_requested
             self._resync_requested = False
-        if requested:
-            self._last = None
         report = self._reader.status
         if self._retired:
             return
@@ -107,15 +113,21 @@ class ClaudeProgramStatusPoller:
         self._error_observed = is_error
         if report is not None:
             self._using_osc = True
-            if report != self._last:
+            changed = report != self._last
+            if changed:
+                self._observation_version += 1
+            if changed or requested:
                 self._last = report
                 # The StopFailure hook owns the failed edge and carries the API
                 # error text; an error report here would fail the turn first, bare.
                 if report.state != "error":
                     status = "running" if report.state in {"working", "blocked"} else "idle"
-                    self._on_status(status, blocked_reason(report))
+                    publish = self._on_status if changed else self._on_replay
+                    publish(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)
         else:
+            if self._last is not None:
+                self._observation_version += 1
             if self._using_osc:
                 self._fallback.resync()
             self._using_osc = False
@@ -159,7 +171,7 @@ class ClaudeProgramStatusPoller:
                 self._on_status("failed", None)
 
     def resync(self) -> None:
-        """Re-arm the next poll after a reconnect or a forwarded idle edge."""
+        """Re-arm the next poll while retaining the native transition baseline."""
         with self._resync_lock:
             self._resync_requested = True
         self._fallback.resync()
@@ -167,4 +179,5 @@ class ClaudeProgramStatusPoller:
     def retire(self) -> None:
         """Let terminal lifecycle handling own the outcome after process exit."""
         self._retired = True
+        self._observation_version += 1
         self._fallback.retire()

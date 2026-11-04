@@ -669,7 +669,16 @@ class ClaudeTerminalDialog(RuntimeError):
     Deliberately not a :class:`ClaudePromptTimeout`: the pane is healthy and
     the dialog is answerable from the embedded terminal, so delivery handlers
     must report it without reaping the pane.
+
+    :param message: Human-readable refusal.
+    :param awaits_answer: Whether the refusal names a dialog waiting for the
+        person's answer and nothing was typed, so the same delivery can run
+        again once :func:`terminal_dialog_pending` reports it closed.
     """
+
+    def __init__(self, message: str, *, awaits_answer: bool = False) -> None:
+        super().__init__(message)
+        self.awaits_answer = awaits_answer
 
 
 class ClaudeInputBoxOccupied(ClaudeTerminalDialog):
@@ -2931,7 +2940,8 @@ def augment_claude_args(
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Optional raw ``AgentSpec.instructions``
         (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag.
+        Code's native ``--append-system-prompt`` flag, placed before a
+        caller-supplied inline prompt instead of replacing it.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -2974,8 +2984,7 @@ def augment_claude_args(
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    if append_system_prompt:
-        args.extend(["--append-system-prompt", append_system_prompt])
+    args = _merge_append_system_prompt(args, append_system_prompt)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -3060,6 +3069,41 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
         return args
     existing = [tool for tool in args[value_idx].split(",") if tool]
     args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
+    return args
+
+
+def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
+    """Put ``extra`` before the caller's ``--append-system-prompt`` value.
+
+    Claude Code keeps only the last value of the flag, so ``extra`` joins that
+    value in place, or a new flag carries it. The scan stops at a bare ``--``.
+    Other caller tokens, including an ``--append-system-prompt-file``, are left
+    as they are. Claude Code 2.1.295+ applies such a file before the inline
+    prompt; 2.1.161 and 2.1.278 refuse to start with both.
+
+    :param args: Claude CLI argument list to mutate-and-return.
+    :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
+    :returns: ``args`` whose last prompt value carries both prompts.
+    """
+    if not extra:
+        return args
+    flag = "--append-system-prompt"
+    joined_prefix = f"{flag}="
+    location: tuple[int, int] | None = None
+    idx = 0
+    while idx < len(args) and args[idx] != "--":
+        if args[idx].startswith(joined_prefix):
+            location = (idx, len(joined_prefix))
+        elif args[idx] == flag and idx + 1 < len(args):
+            location = (idx + 1, 0)
+            idx += 1
+        idx += 1
+    if location is None:
+        args.extend([flag, extra])
+        return args
+    value_idx, offset = location
+    existing = args[value_idx][offset:]
+    args[value_idx] = args[value_idx][:offset] + (f"{extra}\n\n{existing}" if existing else extra)
     return args
 
 
@@ -5104,7 +5148,8 @@ def inject_slash_command(
     )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
-            "Answer the pending Claude question or permission request before changing settings."
+            "Answer the pending Claude question or permission request before changing settings.",
+            nothing_typed=True,
         )
     # Clear any draft the user is mid-typing; otherwise the command below
     # concatenates with their text and Enter submits
@@ -6260,6 +6305,27 @@ def input_box_reads_clear(bridge_dir: Path, *, repaint: bool = False) -> bool:
     return False
 
 
+def terminal_dialog_pending(bridge_dir: Path) -> bool:
+    """
+    Check whether a dialog only the terminal shows still holds Claude Code.
+
+    The dialogs :func:`_terminal_dialog_headline` names (a settings error, an
+    exit confirmation, an MCP approval) have no web card; the person answers
+    them in the embedded terminal.
+
+    :param bridge_dir: The session's native bridge directory.
+    :returns: ``True`` while such a dialog is on screen; ``False`` once it
+        closed, or when the pane cannot be read.
+    """
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    return _terminal_dialog_headline(_capture_pane(socket_path, target)) is not None
+
+
 def auto_mode_billing_notice_visible(pane: str) -> bool:
     """Recognize the exact informational notice below the live pane's last rule."""
     return _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_NOTICE)
@@ -7266,7 +7332,8 @@ def _wait_for_claude_prompt_ready(
             raise ClaudeTerminalDialog(
                 f"Claude Code is waiting for an answer in its terminal ({headline}), "
                 "so the message was not delivered. Open the terminal, answer the "
-                "prompt, then resend your message." + _format_terminal_failure_tail(pane)
+                "prompt, then resend your message." + _format_terminal_failure_tail(pane),
+                awaits_answer=True,
             )
         dialog_headline = headline
         # A launcher asking for a password, e.g. sudo writing managed settings.
