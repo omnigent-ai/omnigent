@@ -199,13 +199,6 @@ describe("full skill descriptions", () => {
     Object.defineProperty(element, "scrollWidth", { configurable: true, value: scrollWidth });
   }
 
-  it("keeps every row's description to one line, highlighted or not", () => {
-    render(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
-    expect(description("triage")).toHaveTextContent(triage);
-    expect(description("triage")).toHaveClass("truncate");
-    expect(description("review")).toHaveClass("truncate");
-  });
-
   it("shows a cut-off description in full in a hover tooltip after a short delay", () => {
     render(<SlashCommandMenu {...props} commands={commands} activeIndex={0} />);
     overflowDescription("triage", 900);

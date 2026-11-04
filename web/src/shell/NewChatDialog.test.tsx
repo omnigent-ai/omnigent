@@ -9337,7 +9337,7 @@ describe("NewChatLandingScreen skills menu", () => {
     });
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "ArrowDown" });
     expect(screen.getByTestId("slash-menu-item-triage")).toHaveAttribute("data-active", "true");
-    expect(description).toHaveClass("truncate");
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).not.toBeInTheDocument();
     act(() => {
       vi.advanceTimersByTime(400);
     });

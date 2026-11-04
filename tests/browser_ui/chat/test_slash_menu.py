@@ -364,6 +364,15 @@ def test_slash_menu_shows_full_skill_description(page: Page, chat_session_contra
     expect(triage).to_be_visible()
     assert description.evaluate(_IS_CUT_OFF)
     rows_before = [review_pr.bounding_box(), triage.bounding_box()]
+    tooltip = page.get_by_test_id("slash-menu-tooltip-triage")
+
+    # Hovering a cut-off row that isn't highlighted shows its full text without moving any row.
+    expect(triage).not_to_have_attribute("data-active", "true")
+    triage.hover()
+    expect(tooltip).to_have_text(_LONG_SKILL_DESCRIPTION)
+    assert [review_pr.bounding_box(), triage.bounding_box()] == rows_before
+    page.mouse.move(0, 0, steps=5)
+    expect(tooltip).to_have_count(0)
 
     # A description that fits never gets a tooltip, hovered or highlighted.
     review_pr.hover()
@@ -376,7 +385,6 @@ def test_slash_menu_shows_full_skill_description(page: Page, chat_session_contra
     # Resting the highlight on the cut-off row shows its full text over a one-line row.
     composer.press("ArrowDown")
     expect(triage).to_have_attribute("data-active", "true")
-    tooltip = page.get_by_test_id("slash-menu-tooltip-triage")
     expect(tooltip).to_have_text(_LONG_SKILL_DESCRIPTION)
     assert description.evaluate(_IS_CUT_OFF), "the highlighted row keeps one line"
     assert [review_pr.bounding_box(), triage.bounding_box()] == rows_before
