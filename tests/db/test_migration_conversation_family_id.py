@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
-from omnigent.db.db_models import Uuid16
+from omnigent.db.db_models import SqlConversationMetadata, Uuid16
 
 
 def test_family_id_migration_preserves_metadata_and_indexes_membership() -> None:
@@ -95,13 +95,26 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
         column = next(c for c in inspector.get_columns(table) if c["name"] == "family_id")
         family_index = next(i for i in inspector.get_indexes(table) if i["name"] == index)
         return (
-            str(column["type"]),
+            type(column["type"].as_generic()),
+            column["type"].length if engine.dialect.name == "mysql" else None,
             column["nullable"],
             column["default"],
             family_index["column_names"],
+            bool(family_index["unique"]),
         )
 
     before = schema()
+    orm_table = SqlConversationMetadata.__table__
+    orm_column = orm_table.c.family_id
+    orm_index = next(i for i in orm_table.indexes if i.name == index)
+    assert before == (
+        type(orm_column.type.load_dialect_impl(engine.dialect).as_generic()),
+        16 if engine.dialect.name == "mysql" else None,
+        orm_column.nullable,
+        orm_column.server_default,
+        list(orm_index.columns.keys()),
+        orm_index.unique,
+    )
 
     def migrate(operation: Callable[[], None]) -> None:
         with engine.connect() as connection:
@@ -136,7 +149,7 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
                     {"name": index},
                 ).scalar_one()
         assert schema() == before
-        assert before[1:] == (True, None, ["workspace_id", "family_id", "id"])
+        assert before[2:] == (True, None, ["workspace_id", "family_id", "id"], False)
     finally:
         if (
             engine.dialect.name == "postgresql"
