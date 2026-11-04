@@ -461,8 +461,14 @@ class SessionStatusPoller:
         self._last_mtime: float | None = None
         self._last_edge: tuple[str, str | None] | None = None
         self._last_status: SessionStatus | None = None
+        self._observation_version = 0
         self._resync_lock = threading.Lock()
         self._resync_requested = False
+
+    @property
+    def observation_version(self) -> int:
+        """Advance on native state changes or retirement, including unpublished states."""
+        return self._observation_version
 
     @property
     def active(self) -> bool:
@@ -540,6 +546,7 @@ class SessionStatusPoller:
             extra={"session_id": self._omnigent_session_id},
         )
         self._exhausted = True
+        self._observation_version += 1
 
     def resync(self) -> None:
         """Request that the watcher re-assert the file on its next tick.
@@ -581,6 +588,7 @@ class SessionStatusPoller:
             # File vanished (clean exit unlinks it, or a crash). Exit
             # detection rides the PTY watcher, so just stop polling.
             self._exhausted = True
+            self._observation_version += 1
             return
         if self._last_mtime is not None and mtime == self._last_mtime:
             return
@@ -593,9 +601,13 @@ class SessionStatusPoller:
             # detail whose vocabulary can grow. We are now blind to this
             # transition, so drop the dedup baseline: the next readable
             # status must publish rather than be swallowed as a duplicate.
+            if self._last_status is not None:
+                self._observation_version += 1
             self._last_status = None
             self._last_edge = None
             return
+        if status != self._last_status:
+            self._observation_version += 1
         self._last_status = status
         edge = (status.runner_status, status.blocked_on)
         if edge == self._last_edge:

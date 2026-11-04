@@ -54,6 +54,7 @@ class ClaudeProgramStatusPoller:
         self._error_activity_epoch: int | None = None
         self._clock = clock
         self._last: ProgramStatus | None = None
+        self._observation_version = 0
         self._error_report: ProgramStatus | None = None
         self._error_since: float | None = None
         self._error_failed = False
@@ -61,6 +62,11 @@ class ClaudeProgramStatusPoller:
         self._retired = False
         self._resync_lock = threading.Lock()
         self._resync_requested = False
+
+    @property
+    def observation_version(self) -> int:
+        """Include errors hidden from publication and changes in the fallback source."""
+        return self._observation_version + self._fallback.observation_version
 
     @property
     def active(self) -> bool:
@@ -108,6 +114,8 @@ class ClaudeProgramStatusPoller:
         if report is not None:
             self._using_osc = True
             changed = report != self._last
+            if changed:
+                self._observation_version += 1
             if changed or requested:
                 self._last = report
                 # The StopFailure hook owns the failed edge and carries the API
@@ -118,6 +126,8 @@ class ClaudeProgramStatusPoller:
                     publish(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)
         else:
+            if self._last is not None:
+                self._observation_version += 1
             if self._using_osc:
                 self._fallback.resync()
             self._using_osc = False
@@ -169,4 +179,5 @@ class ClaudeProgramStatusPoller:
     def retire(self) -> None:
         """Let terminal lifecycle handling own the outcome after process exit."""
         self._retired = True
+        self._observation_version += 1
         self._fallback.retire()

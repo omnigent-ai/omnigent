@@ -1629,10 +1629,15 @@ class SessionResourceRegistry:
                 loop.call_soon_threadsafe(_publish_status_if_current, status, blocked_on, None)
 
         def _publish_replayed_status(status: str, blocked_on: str | None) -> None:
+            if status_poller is None:
+                return
+            observation_version = status_poller.observation_version
             epoch = self.session_activity_epoch(session_id)
 
             def publish() -> None:
                 # Compare and publish on the loop, without yielding to a newer turn.
+                if status_poller.observation_version != observation_version:
+                    return
                 _publish_status(
                     status, blocked_on, record_activity=True, replay_activity_epoch=epoch
                 )

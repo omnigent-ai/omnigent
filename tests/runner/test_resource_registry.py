@@ -1351,7 +1351,9 @@ async def test_queued_turn_republishes_running_after_stop(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["file", "osc"])
 @pytest.mark.parametrize("forwarded", ["running", "waiting"])
-@pytest.mark.parametrize("intervening", ["none", "failed", "new-turn", "removed"])
+@pytest.mark.parametrize(
+    "intervening", ["none", "failed", "new-turn", "removed", "source-invalidated", "retired"]
+)
 async def test_native_idle_reasserts_a_lost_forwarded_completion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1389,11 +1391,39 @@ async def test_native_idle_reasserts_a_lost_forwarded_completion(
         registry.note_session_turn_started(session_id)
     elif intervening == "removed":
         registry.terminal_registry._by_conversation[session_id].pop(("claude", "main"))
+    elif intervening == "source-invalidated":
+        if program_status_path is not None:
+            program_status_path.write_text(
+                json.dumps(
+                    {
+                        "relay_pid": os.getpid(),
+                        "pid": 123,
+                        "status": {"state": "error", "app": "claude-code"},
+                    }
+                )
+            )
+        else:
+            modified = status_file.stat().st_mtime_ns + 1_000_000_000
+            status_file.write_text(json.dumps({"kind": "interactive", "status": "unknown"}))
+            os.utime(status_file, ns=(modified, modified))
+        on_tick()
+    elif intervening == "retired":
+        registry._status_pollers[session_id].retire()
     epoch = registry.session_activity_epoch(session_id)
     await asyncio.sleep(0)
     assert statuses == (["idle", "idle"] if intervening == "none" else ["idle"])
     assert registry.session_activity_epoch(session_id) == epoch
-    assert registry.session_turn_is_active(session_id) == (intervening in {"new-turn", "removed"})
+    assert registry.session_turn_is_active(session_id) == (
+        intervening in {"new-turn", "removed", "source-invalidated", "retired"}
+    )
+    if source == "osc" and intervening == "source-invalidated":
+        poller = registry._status_pollers[session_id]
+        after_grace = poller._clock() + 10
+        monkeypatch.setattr(poller, "_clock", lambda: after_grace)
+        on_tick()
+        await asyncio.sleep(0)
+        assert statuses == ["idle", "failed"]
+        assert not registry.session_turn_is_active(session_id)
 
 
 @pytest.mark.asyncio
