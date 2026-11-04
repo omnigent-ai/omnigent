@@ -3935,7 +3935,7 @@ def register_core_routes(
         :param copy_history: ``False`` copies none of the source's items or
             files, whatever it holds when the fork commits.
         :param continue_source: Create the fork on the source's host and
-            workspace, as a same-owner continuation.
+            workspace, with its routing switches, as a same-owner continuation.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(

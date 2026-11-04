@@ -329,7 +329,7 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     The runner gets a marked request, so only a server that continues the work
     makes it release the client; an older runner's 204 still continues. The new
     session keeps the source's host, workspace, branch, runner, sandbox
-    repositories and run settings but none of its files; the source keeps its
+    repositories, run settings and routing switches but none of its files; the source keeps its
     history and gets a notice plus a redirect.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
@@ -341,6 +341,9 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     repos = ["https://github.com/acme/api", "https://github.com/acme/web#main"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
     store.set_labels(source_id, sandbox_labels)
+    store.update_conversation(
+        source_id, cost_control_mode_override="on", subagent_routing_override="on"
+    )
 
     resp = await client.post(
         f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
@@ -367,6 +370,7 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
         "feature/parser",
     )
     assert (fork.model_override, fork.reasoning_effort) == ("claude-opus-4-7", "high")
+    assert (fork.cost_control_mode_override, fork.subagent_routing_override) == ("on", "on")
     assert fork.terminal_launch_args == ["--permission-mode", "acceptEdits"]
     assert fork.labels["team"] == "core"
     # A relaunch of the shared sandbox still re-clones the repositories.

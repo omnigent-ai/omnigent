@@ -2291,8 +2291,8 @@ class ConversationStore(ABC):
             source holds when the fork commits, e.g. for ``/clear``. A
             truncation; exclusive with both cutoffs.
         :param continue_source: Also copy the source's host, workspace and
-            branch, in the same write that creates the fork, for a same-owner
-            continuation of the source's work.
+            branch (in the same write that creates the fork) and its routing
+            switches, for a same-owner continuation of the source's work.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the

@@ -5476,8 +5476,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             source holds when the fork commits. A truncation; exclusive with
             both cutoffs.
         :param continue_source: Also copy the source's host, workspace and
-            branch, in the same write that creates the fork, for a same-owner
-            continuation of the source's work.
+            branch (in the same write that creates the fork) and its routing
+            switches, for a same-owner continuation of the source's work.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -5598,7 +5598,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Model-family-bound overrides (reasoning_effort, model_override, and
             # — same gate — harness_override) copy only when copy_model_settings.
             # The routing switches (cost_control_mode_override,
-            # subagent_routing_override) are intentionally never carried onto a fork.
+            # subagent_routing_override) are carried only onto a continuation.
             # An explicit dialog pick (override_*_set) supersedes the inherited
             # value — the fork dialog seeds the picker from the source, so an
             # untouched picker sends nothing and inheritance stands.
@@ -5618,6 +5618,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "model_override": fork_model,
                     "harness_override": (
                         source_overrides["harness_override"] if copy_model_settings else None
+                    ),
+                    **(
+                        {
+                            key: source_overrides[key]
+                            for key in ("cost_control_mode_override", "subagent_routing_override")
+                        }
+                        if continue_source
+                        else {}
                     ),
                 }
             )
