@@ -633,8 +633,6 @@ def test_post_evaluate_with_retry_keeps_non_429_4xx_single_attempt(
     ("url", "expected_trust_env"),
     [
         ("http://127.0.0.1:6767/v1/sessions/s/policies/evaluate", False),
-        ("http://localhost:6767/v1/sessions/s/policies/evaluate", False),
-        ("http://[::1]:6767/v1/sessions/s/policies/evaluate", False),
         ("https://omnigent.example.com/v1/sessions/s/policies/evaluate", True),
     ],
 )

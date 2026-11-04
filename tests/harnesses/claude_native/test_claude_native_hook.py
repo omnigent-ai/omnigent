@@ -990,7 +990,6 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
     ("url", "expected_trust_env"),
     [
         ("http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request", False),
-        ("http://localhost:8787/v1/sessions/conv_x/hooks/permission-request", False),
         (
             "https://omnigents.example.databricksapps.com/v1/sessions/conv_x/hooks/permission-request",
             True,

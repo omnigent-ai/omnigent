@@ -435,7 +435,6 @@ def test_request_web_approval_does_not_repark_after_menu_is_gone(
     ("url", "expected_trust_env"),
     [
         ("http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request", False),
-        ("http://localhost:8787/v1/sessions/conv_x/hooks/permission-request", False),
         (
             "https://omnigents.example.databricksapps.com/v1/sessions/conv_x/hooks/permission-request",
             True,

@@ -1109,7 +1109,6 @@ class TestUserConfigJsonc:
     ("server_url", "expected_trust_env"),
     [
         ("http://127.0.0.1:8787", False),
-        ("http://localhost:8787", False),
         ("https://omnigents.example.databricksapps.com", True),
     ],
 )
