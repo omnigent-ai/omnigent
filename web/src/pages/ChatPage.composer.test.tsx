@@ -404,6 +404,23 @@ describe("Composer session drafts", () => {
     expect(getSessionDraft("conv_real")?.text).toBe("draft during startup");
   });
 
+  it("focuses the composer on a switch unless an inline rename has focus", () => {
+    render(<Composer {...composerProps()} />);
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(textarea()).toHaveFocus();
+
+    const rename = document.createElement("input");
+    rename.setAttribute("data-inline-rename", "");
+    document.body.append(rename);
+    try {
+      rename.focus();
+      act(() => useChatStore.setState({ conversationId: "conv_draft" }));
+      expect(rename).toHaveFocus();
+    } finally {
+      rename.remove();
+    }
+  });
+
   it("restores attached files when switching back to a conversation", async () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {

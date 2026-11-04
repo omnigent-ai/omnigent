@@ -1129,14 +1129,38 @@ def upload_pr_attachment(
     )
 
 
+def _full_revision(head_sha: str | None, base_sha: str | None) -> tuple[str, str]:
+    """Return both SHAs of a pinned read, rejecting a partial or malformed pair."""
+    if (
+        not head_sha
+        or not base_sha
+        or not _COMMIT_SHA.fullmatch(head_sha)
+        or not _COMMIT_SHA.fullmatch(base_sha)
+    ):
+        raise ValueError("Expected full head and base commit SHAs")
+    return head_sha, base_sha
+
+
 def pr_changed_files(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
 ) -> dict[str, Any]:
-    """List the selected PR's changed files; empty when no provider serves it."""
+    """List the selected PR's changed files; empty when no provider serves it.
+
+    Providers without :class:`ReviewThreadsFacet` (GitLab, Azure DevOps) ignore
+    ``head_sha``/``base_sha`` and list the current revision.
+    """
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": "list", "data": [], "has_more": False}
+    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+        head, base = _full_revision(head_sha, base_sha)
+        return facet.review_changed_files(root, reference, head_sha=head, base_sha=base)
     return facet.changed_files(root, reference)
 
 
@@ -1154,14 +1178,8 @@ def pr_diff(
     if facet is None:
         return {"object": PR_DIFF_OBJECT, "patch": ""}
     if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
-        if (
-            not head_sha
-            or not base_sha
-            or not _COMMIT_SHA.fullmatch(head_sha)
-            or not _COMMIT_SHA.fullmatch(base_sha)
-        ):
-            raise ValueError("Expected full head and base commit SHAs")
-        return facet.review_diff(root, reference, head_sha=head_sha, base_sha=base_sha)
+        head, base = _full_revision(head_sha, base_sha)
+        return facet.review_diff(root, reference, head_sha=head, base_sha=base)
     return facet.pr_diff(root, reference)
 
 
