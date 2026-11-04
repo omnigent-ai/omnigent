@@ -85,6 +85,17 @@ def test_system_prompt_preset_is_scoped_to_the_agent(monkeypatch, preset) -> Non
     assert env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] == (preset or "")
 
 
+@pytest.mark.parametrize("context_window", [None, 1_000_000])
+def test_context_window_is_scoped_to_the_agent(monkeypatch, context_window) -> None:
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_CONTEXT_WINDOW", "200000")
+    spec = _make_spec()
+    spec.executor.context_window = context_window
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+    assert env["HARNESS_CLAUDE_SDK_CONTEXT_WINDOW"] == (
+        "" if context_window is None else str(context_window)
+    )
+
+
 def test_databricks_auth_sets_databricks_env_vars() -> None:
     """
     ``executor.auth: {type: databricks, profile: …}`` sets
