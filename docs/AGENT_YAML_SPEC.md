@@ -663,6 +663,42 @@ os_env:
 Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
+A sandboxed `codex` executor can use an HTTPS gateway through the same proxy.
+Bind the gateway host with `https_bearer`, set `env` to
+`OMNIGENT_CODEX_GATEWAY_TOKEN`, and allow the gateway's exact Responses route.
+The runner replaces the provider's auth command with a fixed command that
+prints only the placeholder. The trusted parent runs the source command and
+renews its token; Codex receives a private home without host auth or provider
+configuration. A missing or mismatched binding prevents launch.
+
+```yaml
+executor:
+  config:
+    harness: codex
+    web_search: false
+    disable_native_tools: true
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt # or linux_bwrap
+    egress_rules:
+      - "POST model.example.com/cyber/v1/responses"
+    credential_proxy:
+      - type: https_bearer
+        target: model.example.com
+        env: OMNIGENT_CODEX_GATEWAY_TOKEN
+        source:
+          command: /usr/local/bin/get-model-token
+          refresh_interval_seconds: 300
+```
+
+Use a gateway provider whose OpenAI base URL is
+`https://model.example.com/cyber/v1` and whose wire API is `responses`.
+The command and its dependencies must be controlled by the operator and kept
+outside sandbox-writable paths. Locked Codex profiles should disable both
+web search and native tools so their shell and file operations use Omnigent
+tools and policies.
+
 ### Git over SSH from a sandbox
 
 `sandbox.git_ssh` grants one Git repository and one SSH operation at a time.
@@ -713,7 +749,7 @@ support it; other backends reject the setting.
 
 ### Refreshing proxy credentials
 
-File and Unix socket credential sources can opt into renewal with
+File, command, and Unix socket credential sources can opt into renewal with
 `refresh_interval_seconds`. The trusted parent re-reads the source on the first
 request after that interval; sandbox placeholders stay the same. For example,
 a local token broker can mint replacement GitHub App tokens before they expire:
@@ -743,8 +779,9 @@ when the workspace is read-only. Hard-linked files and sockets are rejected.
 Canonical source paths stay protected through launcher serialization: Linux
 rejects mounts that expose them, including implicit toolchain mounts; macOS
 denies file access and Unix-socket connections even under implicit read grants.
-These protections also apply to startup-only Unix socket sources. Existing
-startup-only file, environment, and command sources are unchanged.
+These protections also apply to startup-only Unix socket sources. Command
+sources run in the trusted parent with a filtered environment and a bounded
+timeout. Their stdout, stderr, and command text are omitted from worker errors.
 
 Source checks run before startup resolution and every refresh. A symlink source
 must retain its original canonical target for the session; replacing the file
@@ -758,9 +795,9 @@ be ready before the helper starts: a source failure during startup prevents
 launch, rather than producing a recoverable request-time 502. Without a refresh
 interval, sources resolve once at startup.
 Environment sources cannot refresh because a running process inherits a fixed
-environment. Shell command sources remain startup-only: a sandbox might otherwise
-replace a script or dependency before the trusted parent executes it again. Use
-a private broker for renewable credentials instead.
+environment. Keep renewable command executables, scripts, and dependencies
+outside sandbox-writable paths; a private Unix socket broker is appropriate
+when that ownership cannot be guaranteed.
 
 ## Tools
 

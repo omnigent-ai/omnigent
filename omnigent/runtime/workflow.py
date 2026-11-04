@@ -13,6 +13,7 @@ import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 
@@ -39,6 +40,7 @@ from omnigent.errors import (
     restart_on_stale_cursor,
 )
 from omnigent.harness_aliases import is_claude_sdk_harness_name
+from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND, CODEX_GATEWAY_TOKEN_ENV
 from omnigent.inner.model_egress import (
     UCODE_SIGNER_BINDING_ID,
     registered_model_provider_binding,
@@ -1494,6 +1496,54 @@ def _apply_codex_provider_env(
         # default model_provider. (Gateway mode never reaches here: it resolves a
         # provider above, and the executor rejects a double pin.)
         env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
+    _bind_codex_gateway_credential(env, spec)
+
+
+def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None:
+    """Use a host-bound placeholder for an explicitly brokered Codex gateway."""
+    base_url = env.get("HARNESS_CODEX_GATEWAY_BASE_URL")
+    sandbox = spec.os_env.sandbox if spec.os_env is not None else None
+    proxy = sandbox.credential_proxy if sandbox is not None else None
+    if proxy is None:
+        return
+    reserved_bindings = [
+        entry for entry in proxy.entries if CODEX_GATEWAY_TOKEN_ENV in entry.inject_env
+    ]
+    if not base_url:
+        if reserved_bindings:
+            raise OmnigentError(
+                "Codex gateway credential_proxy requires a gateway HTTPS provider",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    bindings = [
+        entry
+        for entry in proxy.entries
+        if entry.host == host or CODEX_GATEWAY_TOKEN_ENV in entry.inject_env
+    ]
+    if not bindings:
+        return
+    if (
+        len(bindings) != 1
+        or parsed.scheme != "https"
+        or parsed.port is not None
+        or parsed.username is not None
+        or not host
+        or bindings[0].host != host
+        or bindings[0].scheme != "bearer"
+        or bindings[0].inject_env != [CODEX_GATEWAY_TOKEN_ENV]
+        or sandbox is None
+        or sandbox.type not in ("linux_bwrap", "darwin_seatbelt")
+        or not sandbox.egress_rules
+    ):
+        raise OmnigentError(
+            "Codex gateway credential_proxy requires one matching HTTPS bearer "
+            "binding with env OMNIGENT_CODEX_GATEWAY_TOKEN and active egress rules",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] = BROKERED_CODEX_AUTH_COMMAND
 
 
 def _build_codex_spawn_env(
@@ -1508,17 +1558,8 @@ def _build_codex_spawn_env(
     Maps spec.executor fields → the ``HARNESS_CODEX_*`` env vars
     defined in ``omnigent/inner/codex_harness.py``. Mirrors
     :func:`_build_claude_sdk_spawn_env` — same per-spawn env-var
-    pattern from §Step 5a. The codex-specific env vars
-    (``HARNESS_CODEX_PATH``, ``HARNESS_CODEX_ENABLE_WEB_SEARCH``,
-    ``HARNESS_CODEX_DISABLE_NATIVE_TOOLS``) are not threaded
-    through here in v1: the legacy
-    :func:`omnigent.inner.executor_factory.create_executor`
-    path doesn't surface them either, so AP-side parity is
-    preserved by leaving them at the inner executor's defaults.
-    Operators who want non-default values set those env vars
-    on the Omnigent server directly (they propagate to the subprocess
-    through normal env inheritance — the wrap's per-spawn
-    overrides only override, they don't filter).
+    pattern from §Step 5a. Explicit web search and native-tool settings
+    override the harness defaults for this launch.
 
     :param spec: The agent spec.
     :param workdir: The bundle's on-disk path (extracted by the
@@ -1541,6 +1582,18 @@ def _build_codex_spawn_env(
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
     _apply_codex_provider_env(env, spec, provider)
+    for config_key, env_key in (
+        ("web_search", "HARNESS_CODEX_ENABLE_WEB_SEARCH"),
+        ("disable_native_tools", "HARNESS_CODEX_DISABLE_NATIVE_TOOLS"),
+    ):
+        value = spec.executor.config.get(config_key)
+        if value is not None:
+            if not isinstance(value, bool):
+                raise OmnigentError(
+                    f"executor.config.{config_key} must be a boolean",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            env[env_key] = "true" if value else "false"
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.
