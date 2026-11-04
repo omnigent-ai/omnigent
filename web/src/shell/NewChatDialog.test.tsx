@@ -3646,7 +3646,8 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
       arcaPreviewRecovery: true,
     });
     vi.mocked(connectArcaHost).mockClear();
-    vi.mocked(fetchHosts).mockClear();
+    // Tests override the host list; start each one from the empty default.
+    vi.mocked(fetchHosts).mockReset().mockResolvedValue([]);
   });
   afterEach(() => {
     cleanup();
@@ -3830,8 +3831,8 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
       },
       taggedArcaHost: "arca-1",
     },
-    // Without an identity the landing would poll for the new host, so it stops quietly instead.
-    { completion: "through host polling", result: { ok: true }, taggedArcaHost: null },
+    // Without an identity the landing polls for the new host and still tags it.
+    { completion: "through host polling", result: { ok: true }, taggedArcaHost: "arca-1" },
   ])(
     "keeps a host picked during the connect when it finishes $completion",
     async ({ result, taggedArcaHost }) => {

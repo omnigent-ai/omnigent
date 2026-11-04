@@ -211,6 +211,7 @@ function flowHarness() {
     commandLine: (url) => `arca ssh isaac omni host --server ${url} …`,
     loginCommandLine: (url) => `arca ssh isaac omni login ${url}`,
     startLogin: (serverUrl) => {
+      if (world.failStart) throw new Error("spawn failed");
       const login = {
         serverUrl,
         canceled: false,
@@ -225,6 +226,7 @@ function flowHarness() {
       return login;
     },
     startConnect: (serverUrl, onOutput) => {
+      if (world.failStart) throw new Error("spawn failed");
       const connect = {
         serverUrl,
         onOutput,
@@ -555,6 +557,46 @@ describe("arca connect console flow", () => {
     assert.equal(world.windows[2].options.modal, true);
   });
 
+  it("keeps running in the background when the output can't open on consent", async () => {
+    const { world, flow } = flowHarness();
+    const result = flow.run(null, SERVER);
+    world.failWindows = true;
+    assert.doesNotThrow(() => world.sendFrom(world.windows[0], "arca-connect:confirm"));
+    assert.equal(world.connects.length, 1);
+    assert.equal(world.connects[0].canceled, false);
+    world.connects[0].finish({ ok: true });
+    assert.deepEqual(await result, { ok: true, shownInConsole: false });
+  });
+
+  it("settles and shows the failure when the command can't start", async () => {
+    const { world, flow } = flowHarness();
+    world.failStart = true;
+    const { result } = confirmedRun(world, flow);
+    assert.deepEqual(await result, {
+      ok: false,
+      error: "Connecting to Arca failed.",
+      shownInConsole: true,
+    });
+    const output = world.windows[1];
+    assert.equal(channelPayloads(output, "arca-connect:done").length, 1);
+
+    world.failStart = false;
+    void flow.run(null, SERVER);
+    assert.equal(world.windows.at(-1).options.modal, true, "a new run asks consent again");
+  });
+
+  it("ends the output's running state when sign-in can't start", async () => {
+    const { world, flow } = flowHarness();
+    const { result } = confirmedRun(world, flow);
+    const output = world.windows[1];
+    world.failStart = true;
+    world.connects[0].finish({ ok: false, authError: true });
+    assert.equal((await result).error, "Connecting to Arca failed.");
+    assert.deepEqual(channelPayloads(output, "arca-connect:done"), [
+      { ok: false, error: "Connecting to Arca failed." },
+    ]);
+  });
+
   describe("with inline progress", () => {
     it("runs in the background after consent and opens no window", async () => {
       const { world, flow } = flowHarness();
@@ -626,12 +668,15 @@ describe("arca connect console flow", () => {
     it("keeps only the tail of a long output for a late window", () => {
       const { world, flow } = flowHarness();
       confirmedRun(world, flow, { inlineProgress: true });
-      world.connects[0].onOutput("x".repeat(OUTPUT_BACKLOG_CHARS));
+      const line = "0123456789abcde\n";
+      // One extra leading character makes the cut land inside the first line.
+      world.connects[0].onOutput(`x${line.repeat(OUTPUT_BACKLOG_CHARS / line.length)}`);
       world.connects[0].onOutput("tail\n");
       flow.showOutput(null, SERVER);
       const [backlog] = channelPayloads(world.windows[1], "arca-connect:output");
-      assert.equal(backlog.length, OUTPUT_BACKLOG_CHARS);
-      assert.ok(backlog.endsWith("tail\n"));
+      assert.ok(backlog.length <= OUTPUT_BACKLOG_CHARS);
+      assert.ok(backlog.startsWith(line), "the replay starts on a whole line");
+      assert.ok(backlog.endsWith(`${line}tail\n`));
     });
 
     it("opens the output with the error when the connect fails", async () => {
@@ -681,17 +726,6 @@ describe("arca connect console flow", () => {
       world.failWindows = false;
       void flow.run(null, SERVER);
       assert.equal(world.windows.at(-1).options.modal, true, "a new run asks consent again");
-    });
-
-    it("keeps running in the background when the output can't open on consent", async () => {
-      const { world, flow } = flowHarness();
-      const result = flow.run(null, SERVER);
-      world.failWindows = true;
-      assert.doesNotThrow(() => world.sendFrom(world.windows[0], "arca-connect:confirm"));
-      assert.equal(world.connects.length, 1);
-      assert.equal(world.connects[0].canceled, false);
-      world.connects[0].finish({ ok: true });
-      assert.deepEqual(await result, { ok: true, shownInConsole: false });
     });
 
     it("opens the output when sign-in needs the browser", async () => {

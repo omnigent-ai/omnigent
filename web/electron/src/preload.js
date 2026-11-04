@@ -181,8 +181,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
   /**
    * Connect the user's Arca instance (Databricks-internal) to the window's
-   * server as a host, via `arca ssh`. Native consent is asked in the main
-   * process. Resolves a `{ ok, error?, authError? }` result. A page that
+   * server as a host, via `arca ssh`. Consent is asked in a shell-owned
+   * console, and the run then continues in the background. Resolves a
+   * `{ ok, error?, authError?, canceled? }` result once it settles. A page that
    * shows the progress itself passes `{ inlineProgress: true }`.
    * @param {{ inlineProgress?: boolean }} [options]
    */

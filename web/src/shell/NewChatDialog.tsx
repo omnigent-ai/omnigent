@@ -5268,16 +5268,16 @@ export function NewChatLandingScreen() {
   // The Arca row is remembered by host ID, never inferred from its machine hostname.
   // A recovery-capable desktop restores preview identity on demand. Older
   // shells keep Run on Arca visible because reconnecting is their only recovery.
+  function landingHostLabel(): string {
+    if (connectingThisMachine) return "Connecting…";
+    if (arcaTargetPending) return "Connecting to Arca…";
+    if (sandboxSelected) return selectedSandboxLabel;
+    return selectedHostDisplayName ?? "No host selected";
+  }
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
   const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
   const showArcaOption = arcaEnabled && (!arcaPreviewRecovery || !arcaHostOnline);
-  const hostLabel = connectingThisMachine
-    ? "Connecting…"
-    : arcaTargetPending
-      ? "Connecting to Arca…"
-      : sandboxSelected
-        ? selectedSandboxLabel
-        : (selectedHostDisplayName ?? "No host selected");
+  const hostLabel = landingHostLabel();
   const hostTooltipRows =
     connectingThisMachine || arcaTargetPending
       ? [
@@ -5537,8 +5537,9 @@ export function NewChatLandingScreen() {
       // Sequential by design: each poll must see the previous one's result.
       /* oxlint-disable no-await-in-loop */
       const deadline = Date.now() + 30_000;
+      // Polling continues after the user picks another host so the Arca row
+      // is still tagged; only the selection and the soft-fail are skipped.
       while (Date.now() < deadline) {
-        if (choiceMoved()) return;
         const hostList = await queryClient.fetchQuery({
           queryKey: ["hosts", { includeSandbox: false }],
           queryFn: () => fetchHosts(false),

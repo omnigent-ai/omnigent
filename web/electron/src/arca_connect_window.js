@@ -11,7 +11,9 @@
  * dialog (see confirmHostEnrollment for why consent must live outside the
  * server's page). Button messages are accepted only from these windows' own
  * webContents. The SPA can only ask to SHOW a run's output, never to start
- * one past consent.
+ * one past consent. A page that shows progress itself may defer the output
+ * window (`inlineProgress`), but sign-in and failure always open it, and the
+ * run stops once every window that asked for it has closed.
  *
  * All Electron surfaces are injected so the flow is unit-testable.
  */
@@ -324,13 +326,36 @@ function createArcaConnectFlow({
     };
 
     const appendOutput = (text) => {
-      output = (output + text).slice(-OUTPUT_BACKLOG_CHARS);
+      output += text;
+      if (output.length > OUTPUT_BACKLOG_CHARS) {
+        const tail = output.slice(-OUTPUT_BACKLOG_CHARS);
+        // Replay from a whole line, never mid-character or mid-escape sequence.
+        const lineStart = tail.indexOf("\n") + 1;
+        output = lineStart > 0 && lineStart < tail.length ? tail.slice(lineStart) : tail;
+      }
       sendLive("arca-connect:output", text);
+    };
+
+    // Ends the run on a failure the command itself didn't report.
+    const failRun = (message, error) => {
+      if (settled) return;
+      log(`arca connect: ${message}: ${error?.message ?? error}`);
+      phase = "done";
+      done = { ok: false, error: "Connecting to Arca failed." };
+      sendLive("arca-connect:done", done);
+      openOutput();
+      settle({ ok: false, error: done.error, shownInConsole: alive(outputWin) });
     };
 
     const runCommand = (login = false) => {
       phase = "running";
-      connect = login ? startLogin(serverUrl) : startConnect(serverUrl, appendOutput);
+      try {
+        connect = login ? startLogin(serverUrl) : startConnect(serverUrl, appendOutput);
+      } catch (error) {
+        connect = null;
+        failRun("starting the command failed", error);
+        return;
+      }
       started = {
         login,
         command: login ? loginCommandLine(serverUrl) : commandLine(serverUrl),
@@ -364,15 +389,12 @@ function createArcaConnectFlow({
         settle({ ...result, shownInConsole: alive(outputWin) });
       };
       void connect.promise.then(finish).catch((error) => {
-        // Starting the next command can throw; the run must still settle.
-        log(`arca connect: finishing the run failed: ${error?.message ?? error}`);
-        phase = "done";
         try {
-          connect.cancel();
+          connect?.cancel();
         } catch {
           // Already exited.
         }
-        settle({ ok: false, error: "Connecting to Arca failed." });
+        failRun("finishing the run failed", error);
       });
     };
 

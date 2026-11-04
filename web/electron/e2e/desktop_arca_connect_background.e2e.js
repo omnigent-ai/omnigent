@@ -20,7 +20,9 @@ const deps = desktopDepsAvailable();
 const HOST_ID = "fedcba9876543210fedcba9876543210";
 const testOptions = {
   timeout: 180_000,
-  skip: !deps.ok ? `missing deps: ${deps.missing.join(", ")}` : process.platform === "win32",
+  skip: !deps.ok
+    ? `missing deps: ${deps.missing.join(", ")}`
+    : process.platform === "win32" && "fixture arca uses a POSIX shell wrapper",
 };
 
 /* oxlint-disable no-shadow -- Serialized entrypoints run in separate processes. */
@@ -120,8 +122,10 @@ function processExists(pid) {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    assert.equal(error.code, "ESRCH");
-    return false;
+    // EPERM means the pid exists but belongs to someone else.
+    if (error.code === "EPERM") return true;
+    if (error.code === "ESRCH") return false;
+    throw error;
   }
 }
 
@@ -224,13 +228,18 @@ async function withDesktop(name, run) {
   } finally {
     if (desktop) {
       await desktop.electronApp.close().catch(() => {});
-      await desktop.stopDisplayCapture();
-      // The display capture's name carries its start time; keep it past the rename.
-      const capture = fs.readdirSync(recordDir).find((file) => /^display@\d+\.webm$/.test(file));
-      if (filming && capture) {
-        fs.writeFileSync(path.join(recordDir, "capture-start.txt"), capture.match(/\d+/)[0]);
+      try {
+        await desktop.stopDisplayCapture();
+        // The display capture's name carries its start time; keep it past the rename.
+        const capture = fs.readdirSync(recordDir).find((file) => /^display@\d+\.webm$/.test(file));
+        if (filming && capture) {
+          fs.writeFileSync(path.join(recordDir, "capture-start.txt"), capture.match(/\d+/)[0]);
+        }
+        saveRecording(recordDir, name);
+      } catch (error) {
+        // A recording problem must not skip killing the fixture's processes.
+        console.warn(`saving the recording failed: ${error?.message ?? error}`);
       }
-      saveRecording(recordDir, name);
     }
     // Only connects that never exited can still be running; other pids may be reused.
     let running = [];
