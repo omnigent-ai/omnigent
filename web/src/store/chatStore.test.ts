@@ -22587,9 +22587,16 @@ describe("a send cut off by a reload", () => {
       savedAs: "stable_reload",
       draft: { text: "saved on server" },
     },
+    {
+      unanswered: "a queued edited resend behind an unanswered send",
+      send: { text: "rerun the failing test" },
+      queued: { text: "saved on server, edited", startupInputIds: ["pending_first"] },
+      savedAs: "item_first",
+      draft: { text: "rerun the failing test\n\nsaved on server, edited", serverRefused: false },
+    },
   ])(
     "keeps $unanswered whose sender is named after the failed launch's inputs came back",
-    async ({ send, savedAs, draft }) => {
+    async ({ send, queued, savedAs, draft }) => {
       vi.mocked(getCurrentUserId).mockReturnValue(null);
       let identityChanged: (() => void) | undefined;
       vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
@@ -22600,6 +22607,10 @@ describe("a send cut off by a reload", () => {
       failManagedLaunch("conv_reload", "saved on server");
       sessionFailedInputs.get("conv_reload")![0]!.item_id = savedAs;
       rememberUnsentSend("conv_reload", { stableId: "stable_reload", authorId: "user_a", ...send });
+      if (queued)
+        rememberQueuedSends("conv_reload", [
+          { stableId: "stable_queued", authorId: "user_a", ...queued },
+        ]);
 
       await useChatStore.getState().switchTo("conv_reload");
       await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));

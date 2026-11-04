@@ -7931,7 +7931,7 @@ function settleReplacedStartupInputs(
  * Hand the viewer's startup messages a failed managed launch left undelivered
  * back to the composer: drop the bubbles still showing them as sending and
  * restore their text after any draft already waiting there. Each is handed back
- * once: this entry remembers it, as does a draft or unanswered send that names it.
+ * once: this entry remembers it, as does a draft, unanswered or queued send that names it.
  * The composer can't take back uploaded files, so a notice names the attachments.
  *
  * @param conversationId - The session whose launch failed.
@@ -7963,11 +7963,12 @@ function returnFailedStartupInputs(
     ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
     ...(state.failedSendDraft?.startupInputIds ?? []),
     ...(peekUnsentSend(conversationId)?.startupInputIds ?? []),
+    ...peekQueuedSends(conversationId).flatMap((send) => send.startupInputIds ?? []),
     ...(useChatStore.getState().sideChatComposers[conversationId]?.startupInputIds ?? []),
     ...inWaitingDraft,
     ...inComposer,
   ]);
-  // Ids a composer's draft, an unanswered send or a pending resend already holds count as returned.
+  // Ids a composer's draft, a saved unanswered or queued send, or a resend holds count as returned.
   const inputs = unreturned.filter((input) => !held.has(input.pendingId));
   // A draft holding a saved send's text may lack its files, which the composer can't take back.
   const withoutFiles = new Set([
