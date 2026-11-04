@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 from omnigent.runner import environment_filesystem
+from omnigent.runtime import filesystem_registry
 from omnigent.runtime.filesystem_registry import (
     _CURSOR_PLUMBING_PATHS,
     AgentEditFilesystemRegistry,
@@ -88,7 +89,7 @@ def test_created_then_modified_shows_added(registry: AgentEditFilesystemRegistry
     _inject(registry, "trip.md", "created", conv_id)
     _inject(registry, "trip.md", "modified", conv_id)
 
-    results = registry.list_changed_files(conv_id, limit=10)
+    results = registry.list_changed_files(conv_id, limit=10, check_disk=True)
 
     # Exactly one record should appear for trip.md.
     assert len(results) == 1, (
@@ -111,7 +112,7 @@ def test_modified_only_shows_modified(registry: AgentEditFilesystemRegistry) -> 
     conv_id = "conv_test_modified_only"
     _inject(registry, "existing.md", "modified", conv_id)
 
-    results = registry.list_changed_files(conv_id, limit=10)
+    results = registry.list_changed_files(conv_id, limit=10, check_disk=True)
 
     # Exactly one record — the single injected event for existing.md.
     # More than 1 would mean dedup is broken; 0 would mean the event was filtered.
@@ -171,7 +172,7 @@ def test_ephemeral_files_are_suppressed(registry: AgentEditFilesystemRegistry) -
     _inject(registry, ".cursor/rules/style.md", "created", conv_id)
     _inject(registry, "real_file.md", "created", conv_id)
 
-    results = registry.list_changed_files(conv_id, limit=50)
+    results = registry.list_changed_files(conv_id, limit=50, check_disk=True)
     paths = [r["path"] for r in results]
 
     assert sorted(paths) == [".cursor/rules/style.md", "real_file.md"], (
@@ -179,7 +180,7 @@ def test_ephemeral_files_are_suppressed(registry: AgentEditFilesystemRegistry) -
         "Ephemeral artifacts and Omnigent's .cursor plumbing must be suppressed."
     )
     for f in hidden:
-        assert registry.get_changed_file(conv_id, f) is None, f
+        assert registry.get_changed_file(conv_id, f, check_disk=True) is None, f
 
 
 def test_created_modified_multiple_times_stays_added(
@@ -192,7 +193,7 @@ def test_created_modified_multiple_times_stays_added(
     _inject(registry, "notes.md", "modified", conv_id)
     _inject(registry, "notes.md", "modified", conv_id)
 
-    results = registry.list_changed_files(conv_id, limit=10)
+    results = registry.list_changed_files(conv_id, limit=10, check_disk=True)
 
     assert len(results) == 1
     # Three subsequent edits must not degrade the status from "created" to "modified".
@@ -239,7 +240,7 @@ def test_deleted_then_created_shows_modified(registry: AgentEditFilesystemRegist
     _inject(registry, "replaced.md", "deleted", conv_id)
     _inject(registry, "replaced.md", "created", conv_id)
 
-    results = registry.list_changed_files(conv_id, limit=10)
+    results = registry.list_changed_files(conv_id, limit=10, check_disk=True)
 
     assert len(results) == 1, f"Expected 1 record for replaced.md, got {len(results)}."
     assert results[0]["status"] == "modified", (
@@ -265,8 +266,8 @@ def test_session_isolation_events_not_shared_between_sessions(
     # Record an event attributed to session A only.
     _inject(registry, "shared.md", "modified", conv_a)
 
-    results_a = registry.list_changed_files(conv_a, limit=10)
-    results_b = registry.list_changed_files(conv_b, limit=10)
+    results_a = registry.list_changed_files(conv_a, limit=10, check_disk=True)
+    results_b = registry.list_changed_files(conv_b, limit=10, check_disk=True)
 
     # Session A must see its own event.
     assert any(r["path"] == "shared.md" for r in results_a), (
@@ -306,8 +307,12 @@ def test_each_session_compares_the_disk_with_its_own_baseline(
 
     target.write_text(reverted_to)
 
-    assert [r["path"] for r in registry.list_changed_files(conv_a, limit=10)] == expected_paths_a
-    assert [r["path"] for r in registry.list_changed_files(conv_b, limit=10)] == expected_paths_b
+    assert [
+        r["path"] for r in registry.list_changed_files(conv_a, limit=10, check_disk=True)
+    ] == expected_paths_a
+    assert [
+        r["path"] for r in registry.list_changed_files(conv_b, limit=10, check_disk=True)
+    ] == expected_paths_b
 
 
 def test_limit_parameter_caps_results(registry: AgentEditFilesystemRegistry) -> None:
@@ -322,7 +327,7 @@ def test_limit_parameter_caps_results(registry: AgentEditFilesystemRegistry) -> 
     for i in range(5):
         _inject(registry, f"file_{i}.md", "created", conv_id)
 
-    results = registry.list_changed_files(conv_id, limit=3)
+    results = registry.list_changed_files(conv_id, limit=3, check_disk=True)
 
     # At most 3 records must be returned.
     assert len(results) <= 3, (
@@ -367,8 +372,8 @@ def test_changes_follow_edits_made_outside_tool_calls(
         target.write_bytes(outside_edit)
         os.utime(target, (1_700_000_000, 1_700_000_000))
 
-    listed = registry.list_changed_files(conv_id, limit=10)
-    single = registry.get_changed_file(conv_id, "notes.md")
+    listed = registry.list_changed_files(conv_id, limit=10, check_disk=True)
+    single = registry.get_changed_file(conv_id, "notes.md", check_disk=True)
 
     if expected_status is None:
         assert listed == []
@@ -407,7 +412,7 @@ def test_disk_check_can_be_skipped_when_the_runner_cannot_see_the_edits(
     assert registry.get_changed_file(conv_id, "notes.md", check_disk=False) == next(
         r for r in listed if r["path"] == "notes.md"
     )
-    assert registry.list_changed_files(conv_id, limit=10) == []
+    assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == []
 
 
 def test_a_snapshot_taken_after_the_first_change_never_becomes_the_original(
@@ -421,7 +426,7 @@ def test_a_snapshot_taken_after_the_first_change_never_becomes_the_original(
     registry.seed_snapshot("notes.md", "written by a tool call\n", session_id=conv_id)
     _inject(registry, "notes.md", "modified", conv_id)
 
-    listed = registry.list_changed_files(conv_id, limit=10)
+    listed = registry.list_changed_files(conv_id, limit=10, check_disk=True)
     assert [(r["path"], r["status"]) for r in listed] == [("notes.md", "modified")]
     # The diff view has no baseline either, since the late snapshot is not the original.
     assert registry.get_baseline("notes.md") is None
@@ -438,7 +443,7 @@ def test_changes_keep_recorded_entries_where_lookups_cannot_be_confined(
     recorded = registry.list_changed_files(conv_id, limit=10, check_disk=False)
     shutil.rmtree(registry.cwd / "docs")
 
-    assert registry.list_changed_files(conv_id, limit=10) == recorded
+    assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == recorded
 
 
 @pytest.mark.parametrize("beneath_supported", [True, False], ids=["dir-fd", "path-fallback"])
@@ -447,6 +452,8 @@ def test_changes_keep_recorded_entries_where_lookups_cannot_be_confined(
     [
         pytest.param("notes.md", "notes.md", id="leaf"),
         pytest.param("docs/notes.md", "docs", id="parent"),
+        pytest.param("notes.md", "", id="workspace"),
+        pytest.param("notes.md", "..", id="ancestor"),
     ],
 )
 def test_changes_never_read_through_a_symlink_out_of_the_workspace(
@@ -462,28 +469,32 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
         "_BENEATH_SUPPORTED",
         beneath_supported and environment_filesystem._BENEATH_SUPPORTED,
     )
-    workspace, outside = tmp_path / "workspace", tmp_path / "outside"
+    workspace, outside = tmp_path / "home" / "workspace", tmp_path / "outside"
     (workspace / "docs").mkdir(parents=True)
-    outside.mkdir()
     registry = AgentEditFilesystemRegistry(watch_path=workspace)
     conv_id = "conv_symlink"
     (workspace / path).write_text("secret\n")
     registry.seed_snapshot(path, "secret\n", session_id=conv_id)
     _inject(registry, path, "modified", conv_id)
     recorded = registry.list_changed_files(conv_id, limit=10, check_disk=False)
-    (outside / "notes.md").write_text("secret\n")
-    os.utime(outside / "notes.md", (1_600_000_000, 1_600_000_000))
-    swapped_path = workspace / swapped
-    if swapped == "docs":
-        shutil.rmtree(swapped_path)
-        swapped_path.symlink_to(outside, target_is_directory=True)
-    else:
+    outside_file = outside / ("workspace/notes.md" if swapped == ".." else "notes.md")
+    outside_file.parent.mkdir(parents=True)
+    outside_file.write_text("secret\n")
+    os.utime(outside_file, (1_600_000_000, 1_600_000_000))
+    swapped_path = workspace.parent if swapped == ".." else workspace / swapped
+    if swapped == "notes.md":
         swapped_path.unlink()
-        swapped_path.symlink_to(outside / "notes.md")
+        swapped_path.symlink_to(outside_file)
+    else:
+        if swapped == "docs":
+            shutil.rmtree(swapped_path)
+        else:
+            swapped_path.rename(tmp_path / "moved")
+        swapped_path.symlink_to(outside, target_is_directory=True)
 
-    listed = registry.list_changed_files(conv_id, limit=10)
+    listed = registry.list_changed_files(conv_id, limit=10, check_disk=True)
 
-    if swapped == "docs" or not environment_filesystem._BENEATH_SUPPORTED:
+    if swapped != "notes.md" or not environment_filesystem._BENEATH_SUPPORTED:
         assert listed == recorded
     else:
         link = os.lstat(swapped_path)
@@ -495,6 +506,55 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
                 "modified_at": int(link.st_mtime),
             }
         ]
+
+
+@pytest.mark.parametrize("change", ["rewritten-in-place", "replaced-at-the-same-size-and-time"])
+def test_changes_read_a_file_again_only_after_it_may_have_changed(
+    registry: AgentEditFilesystemRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    """Repeat listings reuse a comparison until the file's version changes."""
+    conv_id = "conv_cached_comparison"
+    target = registry.cwd / "notes.md"
+    target.write_text("original\n")
+    registry.seed_snapshot("notes.md", "original\n", session_id=conv_id)
+    _inject(registry, "notes.md", "modified", conv_id)
+    target.write_text("original\n")
+    opened: list[object] = []
+    open_path = os.open
+
+    def counting_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if path == "notes.md":
+            opened.append(path)
+        return open_path(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", counting_open)
+
+    for _ in range(2):
+        assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == []
+    # A file written just now could change again without a new timestamp.
+    assert len(opened) == 2
+
+    monkeypatch.setattr(filesystem_registry, "_RACY_NS", float("-inf"))
+    for _ in range(2):
+        assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == []
+    assert len(opened) == 3
+
+    compared = os.stat(target)
+    if change == "rewritten-in-place":
+        target.write_text("changed!\n")
+        os.utime(target, ns=(compared.st_atime_ns, compared.st_mtime_ns + 1_000_000_000))
+    else:
+        replacement = registry.cwd / "replacement"
+        replacement.write_text("changed!\n")
+        os.utime(replacement, ns=(compared.st_atime_ns, compared.st_mtime_ns))
+        os.replace(replacement, target)
+
+    listed = registry.list_changed_files(conv_id, limit=10, check_disk=True)
+
+    assert [(r["path"], r["status"]) for r in listed] == [("notes.md", "modified")]
+    assert len(opened) == 4
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
@@ -528,7 +588,10 @@ def test_changes_report_a_fifo_without_waiting_for_a_writer(
         replace_with_fifo()
     listed: list[dict[str, object]] = []
     worker = threading.Thread(
-        target=lambda: listed.extend(registry.list_changed_files(conv_id, limit=10)), daemon=True
+        target=lambda: listed.extend(
+            registry.list_changed_files(conv_id, limit=10, check_disk=True)
+        ),
+        daemon=True,
     )
 
     worker.start()
@@ -741,7 +804,7 @@ def test_git_list_changed_files_excludes_terminals_dir(tmp_path: Path) -> None:
     (tmp_path / "real_change.py").write_text("agent wrote this")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    results = reg.list_changed_files("any-conv", limit=100)
+    results = reg.list_changed_files("any-conv", limit=100, check_disk=True)
 
     paths = [r["path"] for r in results]
     # The real source file must appear — confirms list_changed_files is working.
@@ -790,7 +853,7 @@ def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
     (tmp_path / "real_change.py").write_text("agent wrote this")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    results = reg.list_changed_files("any-conv", limit=100)
+    results = reg.list_changed_files("any-conv", limit=100, check_disk=True)
 
     paths = [r["path"] for r in results]
     assert sorted(paths) == [".cursor/rules/style.md", "real_change.py"], (
@@ -798,13 +861,13 @@ def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
         "Git-backed changed files should suppress temp/editor artifacts and .cursor plumbing."
     )
     for file_path in hidden:
-        result = reg.get_changed_file("any-conv", file_path)
+        result = reg.get_changed_file("any-conv", file_path, check_disk=True)
         assert result is None, (
             f"Expected get_changed_file to hide {file_path!r}, got {result!r}. "
             "Direct file lookup should match the changed-files list."
         )
 
-    real_result = reg.get_changed_file("any-conv", "real_change.py")
+    real_result = reg.get_changed_file("any-conv", "real_change.py", check_disk=True)
     assert real_result is not None
     assert real_result["status"] == "created"
 
@@ -855,7 +918,7 @@ def test_git_list_changed_files_raises_on_timeout(tmp_path: Path, monkeypatch) -
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     with pytest.raises(GitStatusUnavailable, match="timed out"):
-        reg.list_changed_files("any-conv", limit=100)
+        reg.list_changed_files("any-conv", limit=100, check_disk=True)
 
 
 def test_git_list_changed_files_raises_on_nonzero_exit(tmp_path: Path, monkeypatch) -> None:
@@ -879,7 +942,7 @@ def test_git_list_changed_files_raises_on_nonzero_exit(tmp_path: Path, monkeypat
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     with pytest.raises(GitStatusUnavailable, match="exited 128"):
-        reg.list_changed_files("any-conv", limit=100)
+        reg.list_changed_files("any-conv", limit=100, check_disk=True)
 
 
 def test_git_get_changed_file_raises_on_timeout(tmp_path: Path, monkeypatch) -> None:
@@ -899,7 +962,7 @@ def test_git_get_changed_file_raises_on_timeout(tmp_path: Path, monkeypatch) -> 
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     with pytest.raises(GitStatusUnavailable, match="timed out"):
-        reg.get_changed_file("any-conv", "a.txt")
+        reg.get_changed_file("any-conv", "a.txt", check_disk=True)
 
 
 def test_git_get_changed_file_raises_on_nonzero_exit(tmp_path: Path, monkeypatch) -> None:
@@ -919,7 +982,7 @@ def test_git_get_changed_file_raises_on_nonzero_exit(tmp_path: Path, monkeypatch
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     with pytest.raises(GitStatusUnavailable, match="exited 128"):
-        reg.get_changed_file("any-conv", "a.txt")
+        reg.get_changed_file("any-conv", "a.txt", check_disk=True)
 
 
 def test_git_get_changed_file_returns_none_when_unchanged(tmp_path: Path) -> None:
@@ -937,7 +1000,7 @@ def test_git_get_changed_file_returns_none_when_unchanged(tmp_path: Path) -> Non
     )
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    assert reg.get_changed_file("any-conv", "a.txt") is None
+    assert reg.get_changed_file("any-conv", "a.txt", check_disk=True) is None
 
 
 def test_git_list_changed_files_expands_untracked_nested_dir(tmp_path: Path) -> None:
@@ -965,7 +1028,7 @@ def test_git_list_changed_files_expands_untracked_nested_dir(tmp_path: Path) -> 
     nested.write_text("outline content")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    results = reg.list_changed_files("any-conv", limit=100)
+    results = reg.list_changed_files("any-conv", limit=100, check_disk=True)
 
     paths = [r["path"] for r in results]
     assert nested_rel in paths, (
@@ -1025,7 +1088,7 @@ def test_git_list_changed_files_honors_env_timeout(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _capture)
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    reg.list_changed_files("any-conv", limit=100)
+    reg.list_changed_files("any-conv", limit=100, check_disk=True)
 
     assert seen["timeout"] == pytest.approx(42.0), (
         f"Expected the env-overridden 42s timeout, got {seen['timeout']!r}."
@@ -1059,7 +1122,7 @@ def test_git_list_changed_files_excludes_skip_dirs_via_pathspec(tmp_path: Path) 
     (tmp_path / "real_change.py").write_text("agent wrote this")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    paths = [r["path"] for r in reg.list_changed_files("any-conv", limit=100)]
+    paths = [r["path"] for r in reg.list_changed_files("any-conv", limit=100, check_disk=True)]
 
     assert "real_change.py" in paths, f"Expected 'real_change.py' in results but got {paths}."
     assert not any(p.startswith("node_modules/") for p in paths), (
@@ -1555,8 +1618,10 @@ def test_create_filesystem_registry_broken_gitlink(tmp_path: Path, marker: str) 
     (tmp_path / "notes.txt").write_text("after")
     registry.seed_snapshot("notes.txt", "before", session_id="session")
     registry.record_change("notes.txt", "modified", "session")
-    assert [r["path"] for r in registry.list_changed_files("session", limit=100)] == ["notes.txt"]
-    record = registry.get_changed_file("session", "notes.txt")
+    assert [
+        r["path"] for r in registry.list_changed_files("session", limit=100, check_disk=True)
+    ] == ["notes.txt"]
+    record = registry.get_changed_file("session", "notes.txt", check_disk=True)
     assert record is not None and record["status"] == "modified"
     assert registry.get_baseline("notes.txt") == "before"
 
@@ -1566,7 +1631,9 @@ def test_create_filesystem_registry_broken_gitlink(tmp_path: Path, marker: str) 
     (tmp_path / "notes.txt").write_text("next edit")
     assert isinstance(registry, MultiRepositoryFilesystemRegistry)
     reader = registry.with_git_runner(_trusted_test_git)
-    assert [r["path"] for r in reader.list_changed_files("session", limit=100)] == ["notes.txt"]
+    assert [
+        r["path"] for r in reader.list_changed_files("session", limit=100, check_disk=True)
+    ] == ["notes.txt"]
     assert reader.get_baseline("notes.txt") == "committed"
 
 
@@ -1766,7 +1833,7 @@ def test_multi_repo_parent_preserves_head_changes_and_recovers_without_hooks(
         "beta/same.txt": "modified",
         "beta/gone.txt": "deleted",
     }
-    changes = reader.list_changed_files("session", limit=100)
+    changes = reader.list_changed_files("session", limit=100, check_disk=True)
     assert {record["path"]: record["status"] for record in changes} == expected
     assert all(record["repository_root"] == record["path"].split("/")[0] for record in changes)
     for name in ("alpha", "beta"):
@@ -1782,7 +1849,10 @@ def test_multi_repo_parent_preserves_head_changes_and_recovers_without_hooks(
     (tmp_path / "notes.txt").write_text("after")
     registry.seed_snapshot("notes.txt", "before", session_id="session")
     registry.record_change("notes.txt", "modified", "session")
-    assert {r["path"]: r["status"] for r in reader.list_changed_files("session", limit=100)} == {
+    assert {
+        r["path"]: r["status"]
+        for r in reader.list_changed_files("session", limit=100, check_disk=True)
+    } == {
         **expected,
         "notes.txt": "modified",
     }
@@ -1792,20 +1862,23 @@ def test_multi_repo_parent_preserves_head_changes_and_recovers_without_hooks(
     # Reconstruct the registry as after a runner restart, retaining only disk state.
     restarted = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(_trusted_test_git)
     assert {
-        r["path"]: r["status"] for r in restarted.list_changed_files("session", limit=100)
+        r["path"]: r["status"]
+        for r in restarted.list_changed_files("session", limit=100, check_disk=True)
     } == expected
     _trusted_test_git(["add", "."], alpha, 5).check_returncode()
     _trusted_test_git(["commit", "-m", "finish alpha"], alpha, 5).check_returncode()
     _trusted_test_git(["restore", "."], beta, 5).check_returncode()
-    assert restarted.list_changed_files("session", limit=100) == []
+    assert restarted.list_changed_files("session", limit=100, check_disk=True) == []
     (beta / "same.txt").write_text("next edit\n")
-    assert [r["path"] for r in restarted.list_changed_files("session", limit=100)] == [
-        "beta/same.txt"
-    ]
+    assert [
+        r["path"] for r in restarted.list_changed_files("session", limit=100, check_disk=True)
+    ] == ["beta/same.txt"]
     for index in range(10_001):
         registry.record_change(f"beta/old-{index}", "deleted", "history")
     registry.record_change("notes.txt", "deleted", "history")
-    assert {r["path"] for r in reader.list_changed_files("history", limit=100)} == {
+    assert {
+        r["path"] for r in reader.list_changed_files("history", limit=100, check_disk=True)
+    } == {
         "beta/same.txt",
         "notes.txt",
     }
@@ -1836,7 +1909,9 @@ def test_multi_repo_git_command_bounds_and_cold_scoped_read(
         return _trusted_test_git(argv, cwd, timeout)
 
     reader = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(run_git)
-    assert len(reader.list_changed_files("session", limit=100)) == repository_count
+    assert (
+        len(reader.list_changed_files("session", limit=100, check_disk=True)) == repository_count
+    )
     assert calls == [
         (command, tmp_path / f"repo-{i}")
         for i in range(repository_count)
@@ -1847,7 +1922,7 @@ def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     monkeypatch.setattr(
         cold, "_repository_roots", lambda: pytest.fail("scoped read scanned siblings")
     )
-    record = cold.get_changed_file("session", "repo-0/same.txt")
+    record = cold.get_changed_file("session", "repo-0/same.txt", check_disk=True)
     assert record is not None and record["repository_root"] == "repo-0"
     assert cold.get_baseline("repo-0/same.txt") == "original\n"
     assert calls == [("status", tmp_path / "repo-0"), ("show", tmp_path / "repo-0")]
@@ -1876,7 +1951,7 @@ def test_multi_repo_discovery_bounds_fail_without_partial_results(
                 "omnigent.runtime.filesystem_registry.time.monotonic", lambda: next(clock)
             )
         with pytest.raises(GitStatusUnavailable, match=r"discovery limit|32 repositories"):
-            reader.list_changed_files("session", limit=100)
+            reader.list_changed_files("session", limit=100, check_disk=True)
 
 
 def test_large_parent_preserves_loose_files_and_discovers_late_repositories(
@@ -1888,14 +1963,16 @@ def test_large_parent_preserves_loose_files_and_discovers_late_repositories(
     reader.record_change("notes.txt", "deleted", "session")
     with monkeypatch.context() as patches:
         patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: 0)
-        assert [r["path"] for r in reader.list_changed_files("session", limit=100)] == [
-            "notes.txt"
-        ]
+        assert [
+            r["path"] for r in reader.list_changed_files("session", limit=100, check_disk=True)
+        ] == ["notes.txt"]
         repo = tmp_path / "repo"
         repo.mkdir()
         _init_git_with_commit(repo, "file.txt", "original")
         (repo / "file.txt").write_text("changed")
-        assert {r["path"] for r in reader.list_changed_files("session", limit=100)} == {
+        assert {
+            r["path"] for r in reader.list_changed_files("session", limit=100, check_disk=True)
+        } == {
             "notes.txt",
             "repo/file.txt",
         }
@@ -1930,9 +2007,11 @@ def test_multi_repo_requires_runner_and_surfaces_failed_repository(tmp_path: Pat
     (tmp_path / "broken" / ".git").mkdir(parents=True)
     registry = MultiRepositoryFilesystemRegistry(tmp_path)
     with pytest.raises(GitStatusUnavailable, match="session runner"):
-        registry.list_changed_files("session", limit=100)
+        registry.list_changed_files("session", limit=100, check_disk=True)
     with pytest.raises(GitStatusUnavailable, match="Repository 'broken': git status exited"):
-        registry.with_git_runner(_trusted_test_git).list_changed_files("session", limit=100)
+        registry.with_git_runner(_trusted_test_git).list_changed_files(
+            "session", limit=100, check_disk=True
+        )
 
 
 def test_git_line_counts_modified(tmp_path: Path) -> None:
@@ -1941,7 +2020,7 @@ def test_git_line_counts_modified(tmp_path: Path) -> None:
     (tmp_path / "f.py").write_text("a\nB\nc\nd\n")  # 1 line changed, 1 added → +2 -1
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    [rec] = reg.list_changed_files("any-conv", limit=100)
+    [rec] = reg.list_changed_files("any-conv", limit=100, check_disk=True)
     assert rec["status"] == "modified"
     assert rec["lines_added"] == 2, rec
     assert rec["lines_removed"] == 1, rec
@@ -1957,7 +2036,11 @@ def test_git_line_counts_untracked_is_none(tmp_path: Path) -> None:
     (tmp_path / "new.py").write_text("one\ntwo\nthree\n")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.py")
+    rec = next(
+        r
+        for r in reg.list_changed_files("any-conv", limit=100, check_disk=True)
+        if r["path"] == "new.py"
+    )
     assert rec["status"] == "created"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
@@ -1972,7 +2055,11 @@ def test_git_line_counts_staged_new_file_added_only(tmp_path: Path) -> None:
     )
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.py")
+    rec = next(
+        r
+        for r in reg.list_changed_files("any-conv", limit=100, check_disk=True)
+        if r["path"] == "new.py"
+    )
     assert rec["status"] == "created"
     assert rec["lines_added"] == 3, rec
     assert rec["lines_removed"] == 0, rec
@@ -1984,7 +2071,7 @@ def test_git_line_counts_deleted_removed_only(tmp_path: Path) -> None:
     (tmp_path / "gone.py").unlink()
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    [rec] = reg.list_changed_files("any-conv", limit=100)
+    [rec] = reg.list_changed_files("any-conv", limit=100, check_disk=True)
     assert rec["status"] == "deleted"
     assert rec["lines_added"] == 0, rec
     assert rec["lines_removed"] == 3, rec
@@ -1999,7 +2086,11 @@ def test_git_line_counts_binary_is_none(tmp_path: Path) -> None:
     )
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "img.bin")
+    rec = next(
+        r
+        for r in reg.list_changed_files("any-conv", limit=100, check_disk=True)
+        if r["path"] == "img.bin"
+    )
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
 
@@ -2026,7 +2117,7 @@ def test_git_line_counts_numstat_failure_degrades_but_status_intact(
 
     monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _fail_numstat)
 
-    [rec] = reg.list_changed_files("any-conv", limit=100)
+    [rec] = reg.list_changed_files("any-conv", limit=100, check_disk=True)
     assert rec["status"] == "modified"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
@@ -2085,7 +2176,7 @@ def test_git_last_changed_files_snapshots_the_paths_still_on_disk(tmp_path: Path
     assert reg.last_changed_files() is None
 
     # limit=1 caps the page returned, not what the snapshot retains.
-    reg.list_changed_files("conv", limit=1)
+    reg.list_changed_files("conv", limit=1, check_disk=True)
     assert sorted(reg.last_changed_files() or []) == ["kept.txt", "new.txt"]
 
 

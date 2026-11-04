@@ -103,9 +103,9 @@ async def test_native_write_reaches_changes_registry(
     finally:
         relay.close()
 
-    entries = registry.list_changed_files(_SESSION_ID, limit=10)
+    entries = registry.list_changed_files(_SESSION_ID, limit=10, check_disk=True)
     assert [(entry["path"], entry["status"]) for entry in entries] == [("report.md", "created")]
     # Later edits must retain the confirmed creation's empty original.
     assert registry.get_baseline("report.md") == ""
     # Changes bind to the relay's session, not the provider's own id.
-    assert registry.list_changed_files("provider-session", limit=10) == []
+    assert registry.list_changed_files("provider-session", limit=10, check_disk=True) == []

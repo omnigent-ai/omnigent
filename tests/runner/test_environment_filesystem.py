@@ -27,14 +27,19 @@ from omnigent.entities.environment_filesystem import (
     InvalidPath,
     PathUnreachable,
 )
+from omnigent.entities.session_resources import terminal_environment_resource_id
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
-from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
-from tests.runner.helpers import NullServerClient
+from omnigent.runtime.filesystem_registry import (
+    GitFilesystemRegistry,
+    MultiRepositoryFilesystemRegistry,
+)
+from omnigent.terminals.registry import TerminalRegistry
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
 @pytest.fixture
@@ -1810,9 +1815,11 @@ async def test_diff_endpoint_returns_404_when_file_not_in_registry(
 
 @pytest.mark.asyncio
 async def test_changes_drop_a_file_saved_back_to_its_original_content(
+    app: FastAPI,
     client: httpx.AsyncClient,
 ) -> None:
     """Saving a file's original content again leaves nothing to review."""
+    assert type(app.state.filesystem_registry) is MultiRepositoryFilesystemRegistry
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
 
     edited = await client.put(
@@ -1821,6 +1828,9 @@ async def test_changes_drop_a_file_saved_back_to_its_original_content(
     assert edited.status_code == 200, edited.text
     listed = (await client.get(f"{base}/changes")).json()["data"]
     assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
+    diff = await client.get(f"{base}/diff/hello.txt")
+    assert diff.status_code == 200, diff.text
+    assert (diff.json()["before"], diff.json()["after"]) == ("hello world", "edited")
 
     reverted = await client.put(
         f"{base}/filesystem/hello.txt", json={"content": "hello world", "encoding": "utf-8"}
@@ -1938,7 +1948,13 @@ async def test_changes_keep_edits_made_in_a_forked_copy_of_the_workspace(workspa
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "edits_land_in",
-    ["copy-on-write-spec", "forked-spec", "scratch-spec", "copy-on-write-environment"],
+    [
+        "copy-on-write-spec",
+        "forked-spec",
+        "scratch-spec",
+        "copy-on-write-environment",
+        "no-primary-environment",
+    ],
 )
 async def test_changes_keep_recorded_edits_the_runner_cannot_see(
     registry: SessionResourceRegistry,
@@ -1946,7 +1962,7 @@ async def test_changes_keep_recorded_edits_the_runner_cannot_see(
     monkeypatch: pytest.MonkeyPatch,
     edits_land_in: str,
 ) -> None:
-    """Overlay, forked and scratch writes miss the runner's tree, so it must not reconcile."""
+    """Writes the runner's tree cannot see must keep their recorded Changes entries."""
     from omnigent.inner.datamodel import WritePathSpec
 
     os_env = OSEnvSpec(
@@ -1972,7 +1988,7 @@ async def test_changes_keep_recorded_edits_the_runner_cannot_see(
             start_in_scratch=True,
             sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
         )
-    else:
+    elif edits_land_in == "copy-on-write-environment":
         monkeypatch.setitem(
             registry._primary_envs,
             "conv_test",
@@ -1980,6 +1996,8 @@ async def test_changes_keep_recorded_edits_the_runner_cannot_see(
                 cwd=workspace, sandbox=SimpleNamespace(copy_on_write_roots=[workspace])
             ),
         )
+    else:
+        monkeypatch.delitem(registry._primary_envs, "conv_test")
 
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         """Return the session snapshot that points at the agent under test."""
@@ -2018,6 +2036,48 @@ async def test_changes_keep_recorded_edits_the_runner_cannot_see(
         ("hello.txt", "modified"),
         ("notes.txt", "created"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal's edits land under its own root, so the runner's tree cannot confirm a revert."""
+    terminal_root = tmp_path / "terminal"
+    terminal_root.mkdir()
+    (terminal_root / "notes.txt").write_text("new")
+    terminal_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process", cwd=str(terminal_root), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    assert terminal_env is not None
+    terminals = TerminalRegistry()
+    terminals._by_conversation["conv_test"] = {
+        ("bash", "s1"): make_test_terminal_instance("bash", "s1", tmp_path, os_env=terminal_env)
+    }
+    monkeypatch.setattr(registry, "_terminal_registry", terminals)
+    changes = app.state.filesystem_registry
+    changes.seed_snapshot("hello.txt", "hello world", session_id="conv_test")
+    changes.record_change("hello.txt", "modified", "conv_test")
+    changes.record_change("notes.txt", "created", "conv_test")
+    environment_id = terminal_environment_resource_id("bash", "s1")
+    base = f"/v1/sessions/conv_test/resources/environments/{environment_id}"
+
+    listed = await client.get(f"{base}/changes")
+    diff = await client.get(f"{base}/diff/notes.txt")
+
+    assert listed.status_code == 200, listed.text
+    assert sorted((e["path"], e["status"]) for e in listed.json()["data"]) == [
+        ("hello.txt", "modified"),
+        ("notes.txt", "created"),
+    ]
+    assert diff.status_code == 200, diff.text
+    assert (diff.json()["before"], diff.json()["after"]) == (None, "new")
 
 
 @pytest.mark.asyncio

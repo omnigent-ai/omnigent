@@ -546,7 +546,7 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
     assert read.await_count == 2
     assert resolve.call_count == 1
     for path in ("failed.txt", "continued.txt"):
-        record = registry.get_changed_file(relay_env.session_id, path)
+        record = registry.get_changed_file(relay_env.session_id, path, check_disk=True)
         assert record is not None and record["status"] == "modified"
     assert registry.get_baseline("continued.txt") == "old\n"
     assert events.get_nowait() == {
@@ -599,7 +599,9 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
             release_first_read.set()
             await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
         assert app.state.filesystem_registry.get_baseline(path) == original
-        record = app.state.filesystem_registry.get_changed_file(relay_env.session_id, path)
+        record = app.state.filesystem_registry.get_changed_file(
+            relay_env.session_id, path, check_disk=True
+        )
         assert record is not None and record["status"] == "modified"
     assert read.await_count == resolve.call_count == 2
     for call in read.await_args_list:

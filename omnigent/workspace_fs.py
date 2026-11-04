@@ -557,7 +557,10 @@ class WorkspaceReader:
         :raises WorkspaceReaderError: 500 when ``git status`` fails.
         """
         try:
-            raw_changes = self._registry.list_changed_files(session_id, limit=10_000)
+            # The host reads this workspace directly, so it can compare with the disk.
+            raw_changes = self._registry.list_changed_files(
+                session_id, limit=10_000, check_disk=True
+            )
         except GitStatusUnavailable as exc:
             raise WorkspaceReaderError(500, "git_status_failed", exc.reason) from exc
         data = [
@@ -592,7 +595,7 @@ class WorkspaceReader:
             raise WorkspaceReaderError(400, "invalid_path", "Cannot diff the workspace root")
 
         try:
-            record = self._registry.get_changed_file(session_id, relative_path)
+            record = self._registry.get_changed_file(session_id, relative_path, check_disk=True)
         except GitStatusUnavailable as exc:
             raise WorkspaceReaderError(500, "git_status_failed", exc.reason) from exc
         if record is None:

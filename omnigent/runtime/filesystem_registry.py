@@ -35,7 +35,10 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from omnigent.runner.environment_filesystem import FileVersion
 
 try:
     import fcntl
@@ -196,6 +199,20 @@ def _is_harness_plumbing(path: str) -> bool:
     :returns: ``True`` when the path is in :data:`_CURSOR_PLUMBING_PATHS`.
     """
     return Path(path).as_posix() in _CURSOR_PLUMBING_PATHS
+
+
+# Files modified this recently are compared again, since a write within the
+# filesystem's timestamp resolution can leave every stat field unchanged.
+_RACY_NS = 2_000_000_000
+
+
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    """Return *path*'s ``(st_dev, st_ino)``, or ``None`` when it cannot be read."""
+    try:
+        directory_stat = os.stat(path)
+    except OSError:
+        return None
+    return directory_stat.st_dev, directory_stat.st_ino
 
 
 def _net_operation(first: str, last: str) -> str | None:
@@ -652,22 +669,22 @@ class FilesystemRegistry(ABC):
 
     @abstractmethod
     def list_changed_files(
-        self, conversation_id: str, *, limit: int, check_disk: bool = True
+        self, conversation_id: str, *, limit: int, check_disk: bool
     ) -> list[dict[str, Any]]:
         """Return changed files visible to *conversation_id*, newest first.
 
         :param conversation_id: The session to query, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
         :param check_disk: Whether recorded changes may be compared with the
-            workspace on disk. Pass ``False`` when the session's writes land in
-            a copy-on-write overlay this process cannot read.
+            workspace on disk. Pass ``False`` when the session's writes may land
+            outside this registry's root, e.g. in a copy-on-write overlay.
         :returns: List of file-record dicts with ``path``, ``status``,
             ``bytes``, and ``modified_at`` fields, newest first.
         """
 
     @abstractmethod
     def get_changed_file(
-        self, session_id: str, path: str, *, check_disk: bool = True
+        self, session_id: str, path: str, *, check_disk: bool
     ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
@@ -699,7 +716,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
     operation.  No filesystem-watcher thread is started — only tool-call
     operations appear in the Files panel.  Reads compare those records with
     the disk, so a file reverted or deleted outside a tool call drops out or
-    shows as deleted.
+    shows as deleted.  A session's original for a path is the content just
+    before its first recorded change there, so earlier edits made outside a
+    tool call, e.g. from a shell, count as part of that original.
 
     Each session maintains its own event list so changes are naturally isolated
     between sessions.  Events are not persisted; they are lost on server restart
@@ -730,6 +749,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # Per-session originals for disk reconciliation: session_id → {normalized
         # path → content before its first change, or ``None`` if not snapshotted}.
         self._session_snapshots: dict[str, dict[str, str | None]] = {}
+        # Last disk comparison per session and path: (file version, matched original).
+        self._comparisons: dict[str, dict[str, tuple[FileVersion, bool]]] = {}
+        self._root_identity = _directory_identity(self._cwd)
 
     def record_change(
         self,
@@ -758,6 +780,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             return
         if _is_ephemeral(norm):
             return
+        if self._root_identity is None:
+            self._root_identity = _directory_identity(self._cwd)
         with self._snapshots_lock:
             self._snapshots.setdefault(norm, "" if operation == "created" else None)
             self._snapshot_sessions.setdefault(session_id, set()).add(norm)
@@ -794,12 +818,13 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             self._session_events.pop(conversation_id, None)
         with self._snapshots_lock:
             self._session_snapshots.pop(conversation_id, None)
+            self._comparisons.pop(conversation_id, None)
             paths = self._snapshot_sessions.pop(conversation_id, set())
             for p in paths:
                 self._snapshots.pop(p, None)
 
     def list_changed_files(
-        self, conversation_id: str, *, limit: int, check_disk: bool = True
+        self, conversation_id: str, *, limit: int, check_disk: bool
     ) -> list[dict[str, Any]]:
         """Return files changed by the agent in *conversation_id*'s session.
 
@@ -860,7 +885,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         return records[:limit]
 
     def get_changed_file(
-        self, session_id: str, path: str, *, check_disk: bool = True
+        self, session_id: str, path: str, *, check_disk: bool
     ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
@@ -901,17 +926,25 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         Reverts and deletes made outside a tool call record no event, so with
         *check_disk* the net operation is checked against the file now on disk.
         A file whose content matches the snapshot *session_id* took has no
-        change left to show.
+        change left to show. A file version already compared is not read again.
         """
-        from omnigent.runner.environment_filesystem import compare_file_beneath
+        from omnigent.runner.environment_filesystem import compare_file_beneath, file_version
 
         status, size, modified_at = event.operation, event.bytes, event.modified_at
-        if check_disk:
+        if check_disk and self._root_identity is not None:
             baseline = (
                 None if status == "created" else self._session_baseline(session_id, event.path)
             )
+            with self._snapshots_lock:
+                known = self._comparisons.get(session_id, {}).get(event.path)
             try:
-                stat, matches = compare_file_beneath(self._cwd, event.path, baseline)
+                file_stat, matches = compare_file_beneath(
+                    self._cwd,
+                    event.path,
+                    baseline,
+                    root_identity=self._root_identity,
+                    known=known,
+                )
             except (FileNotFoundError, NotADirectoryError):
                 if status == "created":
                     return None
@@ -919,11 +952,18 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             except OSError:
                 pass
             else:
+                settled_at = max(file_stat.st_mtime_ns, file_stat.st_ctime_ns)
+                if baseline is not None and time.time_ns() - settled_at > _RACY_NS:
+                    with self._snapshots_lock:
+                        self._comparisons.setdefault(session_id, {})[event.path] = (
+                            file_version(file_stat),
+                            matches,
+                        )
                 if matches:
                     return None
                 if status != "created":
                     status = "modified"
-                size, modified_at = stat.st_size, int(stat.st_mtime)
+                size, modified_at = file_stat.st_size, int(file_stat.st_mtime)
         return {"path": event.path, "status": status, "bytes": size, "modified_at": modified_at}
 
     def _session_baseline(self, session_id: str, path: str) -> bytes | None:
@@ -966,7 +1006,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         Must be called **before** writing new content to the file so the
         snapshot captures the original (pre-modification) state.  If a
         snapshot for *path* already exists this is a no-op.  *session_id*
-        compares the disk only with a snapshot taken before its first change.
+        compares the disk only with a snapshot taken before its first recorded
+        change, so edits made earlier outside a tool call are part of it.
 
         :param path: Normalized path relative to the workspace root,
             e.g. ``"src/foo.py"``.
@@ -1199,7 +1240,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         return self._last_changes
 
     def list_changed_files(
-        self, conversation_id: str, *, limit: int, check_disk: bool = True
+        self, conversation_id: str, *, limit: int, check_disk: bool
     ) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.
 
@@ -1292,7 +1333,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         return records[:limit]
 
     def get_changed_file(
-        self, session_id: str, path: str, *, check_disk: bool = True
+        self, session_id: str, path: str, *, check_disk: bool
     ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
@@ -1610,7 +1651,7 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
         )
 
     def list_changed_files(
-        self, conversation_id: str, *, limit: int, check_disk: bool = True
+        self, conversation_id: str, *, limit: int, check_disk: bool
     ) -> list[dict[str, Any]]:
         roots = self._repository_roots()
         records = self._list_observed_files(
@@ -1621,7 +1662,7 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
                 records.extend(
                     self._prefix(record, prefix)
                     for record in self._reader(root).list_changed_files(
-                        conversation_id, limit=10_001
+                        conversation_id, limit=10_001, check_disk=check_disk
                     )
                 )
             except GitStatusUnavailable as exc:
@@ -1634,7 +1675,7 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
         return records[:limit]
 
     def get_changed_file(
-        self, session_id: str, path: str, *, check_disk: bool = True
+        self, session_id: str, path: str, *, check_disk: bool
     ) -> dict[str, Any] | None:
         owner = self._owner(path)
         if owner is None:
@@ -1643,7 +1684,7 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
         norm = _normalize_path(path, self._cwd)
         assert norm is not None
         relative = norm[len(prefix) + 1 :] if prefix else norm
-        record = self._reader(root).get_changed_file(session_id, relative)
+        record = self._reader(root).get_changed_file(session_id, relative, check_disk=check_disk)
         return self._prefix(record, prefix) if record else None
 
     def get_baseline(self, path: str) -> str | None:

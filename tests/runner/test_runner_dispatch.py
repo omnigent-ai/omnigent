@@ -2739,7 +2739,9 @@ async def test_runner_os_env_writes_over_a_binary_file_stay_in_changes(tmp_path:
             conversation_id="conv_binary_truncate",
             filesystem_registry=filesystem_registry,
         )
-        listed = filesystem_registry.list_changed_files("conv_binary_truncate", limit=10)
+        listed = filesystem_registry.list_changed_files(
+            "conv_binary_truncate", limit=10, check_disk=True
+        )
         assert [(r["path"], r["status"], r["bytes"]) for r in listed] == [
             ("logo.png", "modified", len(content))
         ]
@@ -2773,13 +2775,15 @@ async def test_runner_os_env_edit_of_a_crlf_file_reverted_outside_leaves_changes
         conversation_id="conv_crlf_revert",
         filesystem_registry=filesystem_registry,
     )
-    listed = filesystem_registry.list_changed_files("conv_crlf_revert", limit=10)
+    listed = filesystem_registry.list_changed_files("conv_crlf_revert", limit=10, check_disk=True)
     assert [(r["path"], r["status"]) for r in listed] == [("notes.txt", "modified")]
     assert filesystem_registry.get_baseline("notes.txt") == original.decode()
 
     (tmp_path / "notes.txt").write_bytes(original)
 
-    assert filesystem_registry.list_changed_files("conv_crlf_revert", limit=10) == []
+    assert (
+        filesystem_registry.list_changed_files("conv_crlf_revert", limit=10, check_disk=True) == []
+    )
 
 
 @pytest.mark.asyncio
@@ -2830,7 +2834,7 @@ async def test_runner_os_env_snapshot_reads_only_a_complete_text_original(
     registry.record_change("notes", "modified", "conv_seed")
     await _seed_os_env_snapshot(os_env, "notes", registry, "conv_seed")
 
-    listed = registry.list_changed_files("conv_seed", limit=10)
+    listed = registry.list_changed_files("conv_seed", limit=10, check_disk=True)
     assert [(r["path"], r["status"]) for r in listed] == [("notes", "modified")]
 
 

@@ -205,19 +205,28 @@ _BENEATH_SUPPORTED = (
 )
 
 
-def _open_parent_beneath(root: Path, rel: str) -> tuple[int, str]:
+def _open_parent_beneath(
+    root: Path, rel: str, root_identity: tuple[int, int] | None = None
+) -> tuple[int, str]:
     """Open the parent of *root*/*rel* without following a symlinked component.
 
     :param root: Absolute directory the path is relative to.
     :param rel: ``/``-separated path relative to *root*.
+    :param root_identity: ``(st_dev, st_ino)`` the opened *root* must have, or
+        ``None`` to accept whatever directory *root* names now.
     :returns: A descriptor for the parent, which the caller closes, and the
         leaf name.
-    :raises OSError: ``ELOOP`` when a parent is a symlink, otherwise the
-        error from opening a component.
+    :raises OSError: ``ESTALE`` when *root* is no longer *root_identity*,
+        ``ELOOP`` when a parent is a symlink, otherwise the error from opening
+        a component.
     """
     *parents, leaf = rel.split("/")
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
+        if root_identity is not None:
+            root_stat = os.fstat(fd)
+            if (root_stat.st_dev, root_stat.st_ino) != root_identity:
+                raise OSError(errno.ESTALE, "Directory was replaced", str(root))
         for name in parents:
             try:
                 next_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
@@ -270,12 +279,37 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
         os.close(fd)
 
 
+FileVersion = tuple[int, int, int, int, int]
+
+
+def file_version(file_stat: os.stat_result) -> FileVersion:
+    """Identify one version of a file's content by inode, size and change times.
+
+    ``st_ctime_ns`` changes on every write and cannot be set back, so a file
+    rewritten in place and given its old ``st_mtime`` is still a new version.
+    """
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
 def compare_file_beneath(
-    root: Path, rel: str, expected: bytes | None
+    root: Path,
+    rel: str,
+    expected: bytes | None,
+    *,
+    root_identity: tuple[int, int],
+    known: tuple[FileVersion, bool] | None = None,
 ) -> tuple[os.stat_result, bool]:
     """Stat *root*/*rel* and report whether it is a regular file holding *expected*.
 
-    Like :func:`_lstat_beneath`, no component is followed if it is a symlink.
+    Like :func:`_lstat_beneath`, no component is followed if it is a symlink,
+    and the opened *root* must still be the directory *root_identity* names,
+    so a workspace or ancestor swapped for a symlink is never read through.
     Only a regular file is opened, without blocking, so a FIFO or device at
     the path cannot stall the caller, and only a file of the expected size
     is read. Platforms without ``dir_fd`` support raise without looking the
@@ -285,20 +319,25 @@ def compare_file_beneath(
     :param root: Absolute directory the path is relative to.
     :param rel: ``/``-separated path relative to *root*, e.g. ``"src/foo.py"``.
     :param expected: Content to compare against, or ``None`` to only stat.
+    :param root_identity: ``(st_dev, st_ino)`` of *root* when it was trusted.
+    :param known: A :func:`file_version` and whether it held *expected*; a
+        file still at that version is not read again.
     :returns: The leaf's own ``stat`` result and whether its content equals
         *expected*.
     :raises FileNotFoundError: When the path does not exist.
     :raises NotADirectoryError: When a parent component is not a directory.
-    :raises OSError: When a parent is a symlink, the path cannot be read, or
-        the platform lacks ``dir_fd`` support.
+    :raises OSError: When *root* was replaced, a parent is a symlink, the path
+        cannot be read, or the platform lacks ``dir_fd`` support.
     """
     if not _BENEATH_SUPPORTED:
         raise OSError(errno.ENOTSUP, "Cannot look up a path without following symlinks", rel)
-    dir_fd, leaf = _open_parent_beneath(root, rel)
+    dir_fd, leaf = _open_parent_beneath(root, rel, root_identity)
     try:
         leaf_stat = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)
         if expected is None or not stat.S_ISREG(leaf_stat.st_mode):
             return leaf_stat, False
+        if known is not None and known[0] == file_version(leaf_stat):
+            return leaf_stat, known[1]
         file_fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     finally:
         os.close(dir_fd)

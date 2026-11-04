@@ -2675,7 +2675,7 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
             return None
 
         def list_changed_files(
-            self, session_id: str, *, limit: int = 10_000, check_disk: bool = True
+            self, session_id: str, *, limit: int = 10_000, check_disk: bool
         ) -> list[Any]:
             del session_id, limit, check_disk
             return []
@@ -2762,7 +2762,7 @@ async def test_slow_changed_files_listing_leaves_the_default_executor_free(
             return None
 
         def list_changed_files(
-            self, session_id: str, *, limit: int = 10_000, check_disk: bool = True
+            self, session_id: str, *, limit: int = 10_000, check_disk: bool
         ) -> list[Any]:
             del session_id, limit, check_disk
             listing_threads.append(threading.current_thread().name)
