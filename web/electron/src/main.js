@@ -5132,7 +5132,8 @@ function registerIpc() {
   // shared), never refused; the runner itself enforces CONNECT_TIMEOUT_MS so
   // a wedged command always settles. No local process outlives the connect:
   // the enrolled host keeps its own outbound tunnel from the Arca box.
-  // The window and Arca target an Arca IPC acts for, or the gate's error.
+
+  // Resolves the sender's window and Arca server URL, or the gate's error.
   const arcaConnectTarget = (event) => {
     if (!databricksInternalFeaturesEnabled()) {
       return { error: "Arca support is not enabled on this machine." };
@@ -5153,15 +5154,17 @@ function registerIpc() {
     return { win, arcaServerUrl };
   };
 
-  // After consent the connect runs in the background and the page shows its
-  // progress, so the console only opens for sign-in, a failure, or on request.
-  ipcMain.handle("omnigent:arca-connect", async (event) => {
+  // A page that shows the connect's progress itself opts in with
+  // `inlineProgress`; its output then opens only for sign-in, a failure, or on
+  // request. Older pages keep the output opening as soon as the user confirms.
+  ipcMain.handle("omnigent:arca-connect", async (event, options) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-connect is only available to a connected server page");
     }
     const target = arcaConnectTarget(event);
     if (target.error) return { ok: false, error: target.error };
     const { win, arcaServerUrl } = target;
+    const runOptions = { inlineProgress: options?.inlineProgress === true };
     // An auto-connect already running shares its outcome instead of racing a
     // second `arca ssh`.
     const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);
@@ -5173,7 +5176,7 @@ function registerIpc() {
         isPinnedOriginSender(event) &&
         !win.isDestroyed()
       ) {
-        return arcaConnectFlow.run(win, arcaServerUrl, { inlineProgress: true });
+        return arcaConnectFlow.run(win, arcaServerUrl, runOptions);
       }
       return status.state === "online"
         ? { ok: true, alreadyRunning: status.alreadyRunning === true, identity: status.identity }
@@ -5184,7 +5187,7 @@ function registerIpc() {
             authError: status.errorKind === "omni-auth",
           };
     }
-    return arcaConnectFlow.run(win, arcaServerUrl, { inlineProgress: true });
+    return arcaConnectFlow.run(win, arcaServerUrl, runOptions);
   });
 
   // SPA → show the in-flight connect's live output in a non-blocking shell

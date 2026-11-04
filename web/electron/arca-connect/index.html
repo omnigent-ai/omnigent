@@ -1,11 +1,7 @@
 <!doctype html>
 <!--
-  Arca connect console — a SHELL-OWNED page (see src/arca_connect_window.js for
-  the trust model). The consent view shows the exact command that will run on
-  the user's Arca instance; the output view streams that command's live output
-  into the terminal pane below while the app stays usable. All dynamic values
-  are set via textContent — never innerHTML — since the server URL is
-  remote-influenced data.
+  Shell-owned Arca consent and output page; trust model in src/arca_connect_window.js.
+  Set dynamic values via textContent only: the server URL is remote-influenced.
 -->
 <html lang="en">
   <head>

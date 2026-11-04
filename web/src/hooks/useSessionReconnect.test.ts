@@ -219,7 +219,7 @@ describe("useSessionReconnect", () => {
     vi.mocked(supportsArcaConnectOutput).mockReturnValue(true);
     const pending = deferred<ArcaConnectResult>();
     vi.mocked(connectArcaHost).mockReturnValue(pending.promise);
-    const { result } = renderHook(() =>
+    const { result, rerender } = renderHook(() =>
       useSessionReconnect({ ...localSession, hostId: "arca-host" }),
     );
     expect(result.current.showArcaOutput).toBeUndefined();
@@ -229,6 +229,11 @@ describe("useSessionReconnect", () => {
       reconnect = result.current.reconnect();
     });
     expect(result.current.arcaConnecting).toBe(true);
+    expect(connectArcaHost).toHaveBeenCalledWith({ inlineProgress: true });
+    // A stable callback keeps memoized consumers from re-rendering during the connect.
+    const showArcaOutput = result.current.showArcaOutput;
+    rerender();
+    expect(result.current.showArcaOutput).toBe(showArcaOutput);
     expect(toast.loading).toHaveBeenCalledWith(
       "Reconnecting Arca…",
       expect.objectContaining({ action: expect.objectContaining({ label: "Show output" }) }),

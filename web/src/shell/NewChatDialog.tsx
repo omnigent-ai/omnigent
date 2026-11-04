@@ -309,6 +309,7 @@ import {
 } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+import { openArcaConnectOutput } from "@/lib/arcaConnectOutput";
 import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -319,7 +320,6 @@ import {
   hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
-  showArcaConnectOutput,
   supportsArcaConnectOutput,
   type HostIdentity,
 } from "@/lib/nativeBridge";
@@ -5487,7 +5487,7 @@ export function NewChatLandingScreen() {
       allHosts.filter((h) => h.status === "online").map((h) => h.host_id),
     );
     try {
-      const res = await connectArcaHost();
+      const res = await connectArcaHost({ inlineProgress: true });
       if (!res.ok) {
         // Deliberate dismissals are not failures, and failures the connect
         // console already displayed must not be echoed as a second error —
@@ -7587,7 +7587,7 @@ export function NewChatLandingScreen() {
               <button
                 type="button"
                 className="underline underline-offset-2 hover:no-underline"
-                onClick={() => void showArcaConnectOutput()}
+                onClick={openArcaConnectOutput}
                 data-testid="new-chat-landing-arca-show-output"
               >
                 Show output

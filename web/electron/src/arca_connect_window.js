@@ -222,26 +222,37 @@ function createArcaConnectFlow({
     let done = null;
     let consentWin = null;
     let outputWin = null;
+    /** Live sends wait for the output window's backlog replay, so nothing arrives twice. */
+    let outputReady = false;
 
-    // Closing the window that asked stops a background run, as closing the
-    // console did when it was a sheet on that window.
-    const parentClosed = (() => {
-      const onClosed = () => stop();
-      try {
-        parentWin?.once?.("closed", onClosed);
-      } catch {
-        // Not an event emitter (or mid-teardown); nothing to watch.
-      }
-      return {
-        dispose: () => {
-          try {
-            parentWin?.removeListener?.("closed", onClosed);
-          } catch {
-            // Parent already gone.
-          }
-        },
+    // A background run stops once every window that asked for it has closed:
+    // nothing is left to show its progress or offer Stop.
+    const watchers = new Map();
+    const watch = (win) => {
+      if (!win || watchers.has(win) || typeof win.once !== "function") return;
+      const onClosed = () => {
+        watchers.delete(win);
+        if (watchers.size === 0) stop();
       };
-    })();
+      try {
+        if (win.isDestroyed?.()) return;
+        win.once("closed", onClosed);
+        watchers.set(win, onClosed);
+      } catch {
+        // Mid-teardown; nothing to watch.
+      }
+    };
+    const unwatchAll = () => {
+      for (const [win, onClosed] of watchers) {
+        try {
+          win.removeListener?.("closed", onClosed);
+        } catch {
+          // Window already gone.
+        }
+      }
+      watchers.clear();
+    };
+    watch(parentWin);
 
     const sendTo = (win, channel, payload) => {
       try {
@@ -260,7 +271,7 @@ function createArcaConnectFlow({
       if (settled) return;
       settled = true;
       if (activeRun?.promise === promise) activeRun = null;
-      parentClosed.dispose();
+      unwatchAll();
       resolveRun(result);
     };
     const stop = () => {
@@ -275,6 +286,10 @@ function createArcaConnectFlow({
       // Nothing is running anymore, so a window still offering Stop and Hide
       // would be stale.
       if (alive(outputWin)) outputWin.close();
+    };
+
+    const sendLive = (channel, payload) => {
+      if (outputReady) sendTo(outputWin, channel, payload);
     };
 
     const openOutput = (requestedBy) => {
@@ -293,17 +308,19 @@ function createArcaConnectFlow({
           if (started) sendTo(win, "arca-connect:started", started);
           if (output) sendTo(win, "arca-connect:output", output);
           if (done) sendTo(win, "arca-connect:done", done);
+          outputReady = true;
         },
         // Hiding the output never stops the run; Stop connecting does.
         onClosed: () => {
           outputWin = null;
+          outputReady = false;
         },
       });
     };
 
     const appendOutput = (text) => {
       output = (output + text).slice(-OUTPUT_BACKLOG_CHARS);
-      sendTo(outputWin, "arca-connect:output", text);
+      sendLive("arca-connect:output", text);
     };
 
     const runCommand = (login = false) => {
@@ -313,7 +330,7 @@ function createArcaConnectFlow({
         login,
         command: login ? loginCommandLine(serverUrl) : commandLine(serverUrl),
       };
-      sendTo(outputWin, "arca-connect:started", started);
+      sendLive("arca-connect:started", started);
       // Sign-in waits on the user's browser, so its instructions are shown.
       if (login) openOutput();
       void connect.promise.then((result) => {
@@ -337,7 +354,7 @@ function createArcaConnectFlow({
         };
         // A failure is reported where its output can be read.
         if (!done.ok) openOutput();
-        sendTo(outputWin, "arca-connect:done", done);
+        sendLive("arca-connect:done", done);
         settle({ ...result, shownInConsole: alive(outputWin) });
       });
     };
@@ -380,16 +397,22 @@ function createArcaConnectFlow({
       promise,
       target: arcaTarget(serverUrl),
       updateReason: (nextReason) => {
-        if (phase !== "asking" || !alive(consentWin)) return;
         reason = nextReason ?? null;
+        const asking = phase === "asking";
+        const shown = asking ? consentWin : outputWin;
+        if (!alive(shown)) return;
         try {
-          consentWin.setTitle?.(titleFor(reason));
+          shown.setTitle?.(titleFor(reason));
         } catch {
           // Window mid-teardown.
         }
-        sendTo(consentWin, "arca-connect:init", initPayload("consent"));
+        // A loading output window reads the new reason when it replays.
+        if (asking || outputReady) {
+          sendTo(shown, "arca-connect:init", initPayload(asking ? "consent" : "output"));
+        }
       },
       surface: (requestedBy) => {
+        watch(requestedBy);
         if (phase === "asking") surface(consentWin);
         else openOutput(requestedBy);
       },

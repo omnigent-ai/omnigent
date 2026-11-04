@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyMacElectronShellAttribute,
   checkDbcert,
+  connectArcaHost,
   getServerPicker,
   hasDbcertPreflightBridge,
   isAndroidShell,
@@ -212,6 +213,16 @@ describe("supportsArcaConnect", () => {
       window as unknown as { omnigentDesktop: Record<string, unknown> }
     ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
     expect(supportsArcaConnect()).toBe(true);
+  });
+
+  it("passes the page's progress opt-in to the shell", async () => {
+    setElectron(true);
+    const connect = vi.fn(() => Promise.resolve({ ok: true }));
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.connectArcaHost = connect;
+    expect(await connectArcaHost({ inlineProgress: true })).toEqual({ ok: true });
+    expect(connect).toHaveBeenCalledWith({ inlineProgress: true });
   });
 });
 

@@ -3,13 +3,13 @@ import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
 import { onRunnerHealthPolled, refreshRunnerHealth } from "@/hooks/useRunnerHealth";
+import { openArcaConnectOutput } from "@/lib/arcaConnectOutput";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
   getHostIdentity,
   isElectronShell,
-  showArcaConnectOutput,
   supportsArcaConnect,
   supportsArcaConnectOutput,
 } from "@/lib/nativeBridge";
@@ -115,12 +115,12 @@ export function useSessionReconnect({
               onClick: (event) => {
                 // Keep the progress toast; the output opens in its own window.
                 event.preventDefault();
-                void showArcaConnectOutput();
+                openArcaConnectOutput();
               },
             },
           })
         : toast.loading("Reconnecting Arca…");
-      const result = await connectArcaHost();
+      const result = await connectArcaHost({ inlineProgress: true });
       if (inFlight.current !== operation) return;
       if (!result.ok) {
         if (!result.canceled && !result.shownInConsole) {
@@ -302,9 +302,7 @@ export function useSessionReconnect({
     arcaConnecting,
     /** Opens the running Arca connect's output; absent when the shell can't show it. */
     showArcaOutput:
-      arcaConnecting && supportsArcaConnectOutput()
-        ? () => void showArcaConnectOutput()
-        : undefined,
+      arcaConnecting && supportsArcaConnectOutput() ? openArcaConnectOutput : undefined,
     dialogOpen,
     setDialogOpen,
     localReconnect: canReconnectThisMachine

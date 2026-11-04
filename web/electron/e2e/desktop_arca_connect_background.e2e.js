@@ -1,6 +1,4 @@
-// Real desktop shell, preload, main process, consent sheet, and output window
-// against a real `omnigent server`. Arca is a local fixture executable that
-// streams progress and waits for the test to finish; no live Arca or SSH.
+// Real desktop shell and `omnigent server` with a fixture arca CLI (no live Arca or SSH).
 // Run after building the SPA: node --test web/electron/e2e/desktop_arca_connect_background.e2e.js
 "use strict";
 
@@ -46,6 +44,7 @@ async function fixtureArca({ stateDir, hostId }) {
   for (let waited = 1; ; waited += 1) {
     if (fs.existsSync(file("fail"))) {
       process.stderr.write("arca: the instance did not become reachable over SSH\n");
+      event("connect-exit", { pid: process.pid });
       process.exitCode = 255;
       return;
     }
@@ -73,6 +72,7 @@ async function fixtureArca({ stateDir, hostId }) {
   );
   process.stdout.write("\n__OMNIGENT_ARCA_IDENTITY_END__\n");
   event("connect-complete");
+  event("connect-exit", { pid: process.pid });
 }
 
 /** Treat the local server as Databricks-managed and use the fixture arca, before main loads. */
@@ -208,7 +208,16 @@ async function withDesktop(name, run) {
       }
       saveRecording(recordDir, name);
     }
-    for (const event of readEvents().filter((entry) => entry.name === "command")) {
+    // Only connects that never exited can still be running; other pids may be reused.
+    let running = [];
+    try {
+      const events = readEvents();
+      const exited = new Set(events.filter((e) => e.name === "connect-exit").map((e) => e.pid));
+      running = events.filter((e) => e.name === "connect-start" && !exited.has(e.pid));
+    } catch {
+      /* An unreadable events log leaves nothing known to kill. */
+    }
+    for (const event of running) {
       try {
         process.kill(event.pid, "SIGKILL");
       } catch {

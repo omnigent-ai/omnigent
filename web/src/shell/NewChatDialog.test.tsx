@@ -3753,6 +3753,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
       fireEvent.click(await screen.findByText("Run on Arca"));
       const progress = await screen.findByTestId("new-chat-landing-arca-progress");
       expect(progress).toHaveTextContent(/Connecting to Arca… A cold instance can take a few/);
+      expect(connectArcaHost).toHaveBeenCalledWith({ inlineProgress: true });
       fireEvent.click(screen.getByTestId("new-chat-landing-arca-show-output"));
       expect(showArcaConnectOutput).toHaveBeenCalledOnce();
 

@@ -220,7 +220,7 @@ interface ElectronDesktopApi extends NativeShellApi {
   /** Desktop feature gates (MDM-managed); absent on older shells. */
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
   /** Connect the user's Arca instance to the window's server as a host. */
-  connectArcaHost?: () => Promise<ArcaConnectResult>;
+  connectArcaHost?: (options?: ArcaConnectOptions) => Promise<ArcaConnectResult>;
   /**
    * Show the in-flight Arca connect's live output in a non-blocking window;
    * resolves false when none is running. Absent on shells whose connect
@@ -362,6 +362,14 @@ export interface DbcertRefreshOptions {
 export type DbcertStatusResult = { ok: true; valid: boolean } | { ok: false; error: string };
 
 /** Result of connecting the Arca instance as a host, from the desktop shell. */
+export interface ArcaConnectOptions {
+  /**
+   * The page shows the connect's progress itself, so a shell that can run it
+   * in the background opens the output only on request, for sign-in, or on failure.
+   */
+  inlineProgress?: boolean;
+}
+
 export interface ArcaConnectResult extends HostActionResult {
   /** Actual daemon identity captured on Arca for this selected server target. */
   identity?: { serverUrl: string; hostId: string };
@@ -1185,13 +1193,13 @@ export function supportsArcaConnect(): boolean {
  * consent and runs `arca ssh` — resolving only once the remote host daemon
  * started (or failed). A no-op `{ ok: false }` outside the shell.
  */
-export async function connectArcaHost(): Promise<ArcaConnectResult> {
+export async function connectArcaHost(options?: ArcaConnectOptions): Promise<ArcaConnectResult> {
   const electron = electronApi();
   if (!electron?.connectArcaHost) {
     return { ok: false, error: "not running under the desktop shell" };
   }
   try {
-    return await electron.connectArcaHost();
+    return await electron.connectArcaHost(options);
   } catch (err) {
     console.warn("[nativeBridge] electron connectArcaHost failed:", err);
     return { ok: false, error: String(err) };

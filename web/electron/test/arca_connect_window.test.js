@@ -171,9 +171,13 @@ function flowHarness() {
       this.contentSize = [width, height];
     }
     loadFile() {
-      // The page "loads" immediately: fire the init + show hooks.
-      this.webContents.emit("did-finish-load");
-      this.emit("ready-to-show");
+      const finishLoad = () => {
+        this.webContents.emit("did-finish-load");
+        this.emit("ready-to-show");
+      };
+      // The page "loads" immediately unless the test finishes it by hand.
+      if (world.deferLoad) this.finishLoad = finishLoad;
+      else finishLoad();
     }
     isDestroyed() {
       return this.destroyed;
@@ -459,7 +463,7 @@ describe("arca connect console flow", () => {
     const output = world.windows[2];
     world.sendFrom(output, "arca-connect:stop");
     assert.equal(world.connects[0].canceled, true);
-    assert.equal(output.destroyed, true, "a stopped run's output window stays open");
+    assert.equal(output.destroyed, true, "a stopped run closes its output window");
     const settled = await result;
     assert.equal(settled.canceled, true);
   });
@@ -473,6 +477,39 @@ describe("arca connect console flow", () => {
     assert.equal(world.connects[0].canceled, true);
     assert.equal((await result).canceled, true);
     assert.equal(parent.listenerCount("closed"), 0);
+  });
+
+  it("keeps a background run while another window that re-attached is open", async () => {
+    const { world, flow } = flowHarness();
+    const first = Object.assign(new EventEmitter(), { isDestroyed: () => false });
+    const second = Object.assign(new EventEmitter(), { isDestroyed: () => false });
+    const result = flow.run(first, SERVER, { inlineProgress: true });
+    world.sendFrom(world.windows[0], "arca-connect:confirm");
+    assert.equal(flow.showOutput(second, SERVER), true);
+
+    first.emit("closed");
+    assert.equal(world.connects[0].canceled, false);
+    second.emit("closed");
+    assert.equal(world.connects[0].canceled, true);
+    assert.equal((await result).canceled, true);
+    assert.equal(second.listenerCount("closed"), 0);
+  });
+
+  it("relabels the output window when a preview re-attaches after consent", () => {
+    const { world, flow } = flowHarness();
+    confirmedRun(world, flow);
+    const output = world.windows[1];
+    assert.equal(output.options.title, "Connect Arca");
+    void flow.run(null, SERVER, { reason: "preview-reconnect" });
+    assert.equal(world.windows.length, 2);
+    assert.equal(output.title, "Reconnect Arca");
+    assert.deepEqual(
+      [
+        channelPayloads(output, "arca-connect:init").at(-1).view,
+        channelPayloads(output, "arca-connect:init").at(-1).reason,
+      ],
+      ["output", "preview-reconnect"],
+    );
   });
 
   it("re-attaches to an in-flight run instead of refusing", async () => {
@@ -542,6 +579,25 @@ describe("arca connect console flow", () => {
       world.connects[0].finish({ ok: true });
       assert.deepEqual(await result, { ok: true, shownInConsole: true });
       assert.equal(flow.showOutput(parent, SERVER), false);
+    });
+
+    it("sends nothing live until a loading output window has replayed", () => {
+      const { world, flow } = flowHarness();
+      confirmedRun(world, flow, { inlineProgress: true });
+      world.deferLoad = true;
+      world.connects[0].onOutput("before\n");
+      flow.showOutput(null, SERVER);
+      const output = world.windows[1];
+      world.connects[0].onOutput("while loading\n");
+      assert.deepEqual(output.webContents.sent, []);
+
+      output.finishLoad();
+      assert.deepEqual(channelPayloads(output, "arca-connect:output"), ["before\nwhile loading\n"]);
+      world.connects[0].onOutput("after\n");
+      assert.deepEqual(channelPayloads(output, "arca-connect:output"), [
+        "before\nwhile loading\n",
+        "after\n",
+      ]);
     });
 
     it("keeps only the tail of a long output for a late window", () => {
