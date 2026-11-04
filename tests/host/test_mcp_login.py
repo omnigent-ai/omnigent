@@ -536,15 +536,15 @@ async def test_queued_starts_finish_within_the_start_budget(
     logins = host_logins()
     loop = asyncio.get_running_loop()
     began = loop.time()
-    first, second = await asyncio.gather(
+    results = await asyncio.gather(
         logins.start(_server()), logins.start(_server("other")), return_exceptions=True
     )
-    # Stopping the CLI may follow the budget, still well inside the server's wait.
+    # Stopping the flag check may follow the budget, still well inside the server's wait.
     assert loop.time() - began < budget(1.0 + 2.5)
-    assert isinstance(first, dict) and first["state"] == "failed"
-    assert isinstance(second, LoginError) and second.status == "busy"
-    assert [login.state for login in logins._logins.values()] == ["failed"]
-    assert all(login.process.returncode is not None for login in logins._logins.values())
+    assert [getattr(result, "status", result) for result in results] == ["busy", "busy"]
+    # The budget ran out before either sign-in CLI was launched.
+    assert logins._logins == {}
+    assert not fake_cli.exists()
 
 
 async def test_cancel_restart_and_close_stop_the_cli(

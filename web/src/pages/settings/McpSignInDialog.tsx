@@ -278,8 +278,8 @@ function PendingSteps({
     setSubmitting(true);
     setSubmitError(null);
     submitMcpLoginCallback(hostId, login.login_id, value)
-      // Sending the same address twice would reuse its one-time code.
       .then((next) => {
+        // Sending the same address twice would reuse its one-time code.
         setCallbackUrl("");
         onSubmitted(next);
       })

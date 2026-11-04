@@ -554,9 +554,12 @@ const CONNECTION_STATUS: Record<McpServerTools["connection"], { label: string; c
 
 const SIGNED_IN_STATUS = { label: "Signed in", color: "bg-success" };
 
+function isHarnessSignedIn(data: McpServerTools) {
+  return data.connection === "needs_auth" && data.harness_sign_in === "signed_in";
+}
+
 function mcpRowStatus(data: McpServerTools) {
-  if (data.connection === "needs_auth" && data.harness_sign_in === "signed_in")
-    return SIGNED_IN_STATUS;
+  if (isHarnessSignedIn(data)) return SIGNED_IN_STATUS;
   return CONNECTION_STATUS[data.connection];
 }
 
@@ -569,7 +572,7 @@ function McpServerDetails({
   harnessLabel: string;
   onSignIn: () => void;
 }) {
-  if (data.connection === "needs_auth" && data.harness_sign_in === "signed_in") {
+  if (isHarnessSignedIn(data)) {
     return (
       <Notice>
         Signed in through {harnessLabel}, so its sessions can use this server. Omnigent can't list

@@ -439,6 +439,9 @@ class HostMcpLogins:
         else:
             # Older CLIs open a browser on the host; ``true`` stands in for it on Linux.
             env["BROWSER"] = "true"
+        # A CLI launched after the deadline would only be stopped again at once.
+        if asyncio.get_running_loop().time() >= deadline:
+            raise LoginError("busy", "The sign-in took too long to start")
         master_fd, slave_fd = pty.openpty()
         try:
             # Wide enough that the CLI never wraps the authorization URL.
