@@ -1130,14 +1130,14 @@ describe("Composer slash-command menu", () => {
     expect(props.onSend).not.toHaveBeenCalled();
   });
 
-  function renderClearComposer(
+  /** Render the composer for a *harness* session on a server reporting *advertised*. */
+  function renderSessionComposer(
     harness: "claude-native" | "codex-native" | "claude-sdk",
     advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
   ) {
     const { sessionHarness } = useChatStore.getState();
     onTestFinished(() => useChatStore.setState({ sessionHarness }));
     useChatStore.setState({ sessionHarness: harness });
-    const clearContext = vi.spyOn(useChatStore.getState(), "clearContext").mockResolvedValue();
     const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
     render(
       <CapabilitiesProvider
@@ -1146,6 +1146,15 @@ describe("Composer slash-command menu", () => {
         <Composer {...props} />
       </CapabilitiesProvider>,
     );
+    return props;
+  }
+
+  function renderClearComposer(
+    harness: "claude-native" | "codex-native" | "claude-sdk",
+    advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
+  ) {
+    const props = renderSessionComposer(harness, advertised);
+    const clearContext = vi.spyOn(useChatStore.getState(), "clearContext").mockResolvedValue();
     fireEvent.change(textarea(), { target: { value: "/cle" } });
     return { clearContext, onSend: props.onSend };
   }
@@ -1193,9 +1202,6 @@ describe("Composer slash-command menu", () => {
     harness: "claude-native" | "claude-sdk" | "codex-native",
     advertised: Partial<typeof FALLBACK_SERVER_INFO>,
   ) {
-    const { sessionHarness } = useChatStore.getState();
-    onTestFinished(() => useChatStore.setState({ sessionHarness }));
-    useChatStore.setState({ sessionHarness: harness });
     const prompts = vi.spyOn(sessionsApi, "fetchRewindPrompts").mockResolvedValue({
       prompts: [
         { itemId: "msg_second", text: "Add parser tests" },
@@ -1203,13 +1209,8 @@ describe("Composer slash-command menu", () => {
       ],
       olderCursor: null,
     });
+    const props = renderSessionComposer(harness, advertised);
     const rewindToPrompt = vi.spyOn(useChatStore.getState(), "rewindToPrompt");
-    const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
-    render(
-      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...advertised }}>
-        <Composer {...props} />
-      </CapabilitiesProvider>,
-    );
     return { prompts, rewindToPrompt, onSend: props.onSend };
   }
 
