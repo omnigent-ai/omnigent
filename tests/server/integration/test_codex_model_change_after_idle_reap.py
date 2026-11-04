@@ -457,11 +457,14 @@ async def test_codex_settings_wait_for_reaping_uses_the_readiness_budget(
     session.assert_applied(response, model=_LATEST_MODEL)
 
 
+@pytest.mark.parametrize("clear_bridge", [False, True], ids=["stale-bridge", "missing-bridge"])
 async def test_goal_read_after_idle_reap_does_not_wake_codex(
-    client: httpx.AsyncClient, native_session: _NativeSession
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    clear_bridge: bool,
 ) -> None:
     session = native_session
-    await session.reap(clear_bridge=False)
+    await session.reap(clear_bridge=clear_bridge)
 
     response = await client.get(f"/v1/sessions/{session.session_id}/codex_goal")
 
@@ -470,6 +473,7 @@ async def test_goal_read_after_idle_reap_does_not_wake_codex(
     assert session.codex.launches == 1
     assert session.codex.requests == []
     assert session.terminals.get(session.session_id, "codex", "main") is None
+    assert not any(event.get("type") == "response.error" for event in session.events)
 
 
 async def test_goal_read_forwards_to_a_live_codex_backend(
@@ -485,7 +489,18 @@ async def test_goal_read_forwards_to_a_live_codex_backend(
     assert session.codex.launches == 1
 
 
-@pytest.mark.parametrize("guard", ["pane", "backend", "startup-failure", "changed-bridge"])
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "pane",
+        "missing-state-pane",
+        "backend",
+        "missing-state-backend",
+        "startup-failure",
+        "missing-state-startup-failure",
+        "changed-bridge",
+    ],
+)
 async def test_goal_read_preserves_failure_for_a_loaded_or_failed_bridge(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
@@ -494,16 +509,16 @@ async def test_goal_read_preserves_failure_for_a_loaded_or_failed_bridge(
     guard: str,
 ) -> None:
     session = native_session
-    await session.reap(clear_bridge=False)
-    if guard == "pane":
+    await session.reap(clear_bridge=guard.startswith("missing-state-"))
+    if guard.endswith("pane"):
         session.terminals._by_conversation[session.session_id] = {
             ("codex", "main"): make_test_terminal_instance("codex", "main", tmp_path)
         }
-    elif guard == "backend":
+    elif guard.endswith("backend"):
         native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] = SimpleNamespace(
             close=AsyncMock()
         )
-    elif guard == "startup-failure":
+    elif guard.endswith("startup-failure"):
         bridge.record_app_server_stopped(session.codex.bridge_dir)
     else:
         state = bridge.read_bridge_state(session.codex.bridge_dir)
@@ -519,7 +534,8 @@ async def test_goal_read_preserves_failure_for_a_loaded_or_failed_bridge(
 
     response = await client.get(f"/v1/sessions/{session.session_id}/codex_goal")
 
-    assert response.status_code == 503, response.text
+    expected_status = 502 if guard.startswith("missing-state-") else 503
+    assert response.status_code == expected_status, response.text
     assert response.json()["error"] == "codex_native_goal_failed"
     assert session.codex.launches == 1
     assert session.codex.requests == []
@@ -533,21 +549,23 @@ async def test_goal_read_preserves_failure_for_a_loaded_or_failed_bridge(
         ("DELETE", "", None),
     ],
 )
+@pytest.mark.parametrize("clear_bridge", [False, True], ids=["stale-bridge", "missing-bridge"])
 async def test_goal_mutations_keep_refusal_after_idle_reap(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     method: str,
     suffix: str,
     body: dict[str, str] | None,
+    clear_bridge: bool,
 ) -> None:
     session = native_session
-    await session.reap(clear_bridge=False)
+    await session.reap(clear_bridge=clear_bridge)
 
     response = await client.request(
         method, f"/v1/sessions/{session.session_id}/codex_goal{suffix}", json=body
     )
 
-    assert response.status_code == 503, response.text
+    assert response.status_code == (502 if clear_bridge else 503), response.text
     assert session.codex.launches == 1
     assert session.codex.requests == []
 

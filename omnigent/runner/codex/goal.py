@@ -14,6 +14,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
 from fastapi.responses import JSONResponse, Response
@@ -21,8 +23,8 @@ from fastapi.responses import JSONResponse, Response
 from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 
 
-class BridgeStateForSession(Protocol):
-    """Callable that resolves a live Codex app-server bridge state."""
+class BridgeStateAndDirForSession(Protocol):
+    """Callable that resolves a Codex app-server bridge state and its directory."""
 
     async def __call__(
         self,
@@ -30,7 +32,7 @@ class BridgeStateForSession(Protocol):
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> CodexNativeBridgeState | None: ...
+    ) -> tuple[CodexNativeBridgeState | None, Path]: ...
 
 
 class ClientSafeErrorDetail(Protocol):
@@ -45,12 +47,13 @@ class CodexGoalRunner:
     def __init__(
         self,
         *,
-        bridge_state_for_session: BridgeStateForSession,
+        bridge_state_and_dir_for_session: BridgeStateAndDirForSession,
         client_safe_error_detail: ClientSafeErrorDetail,
         logger: logging.Logger,
-        bridge_is_inactive: Callable[[str, CodexNativeBridgeState], bool] | None = None,
+        bridge_is_inactive: Callable[[str, CodexNativeBridgeState | None, Path], bool]
+        | None = None,
     ) -> None:
-        self._bridge_state_for_session = bridge_state_for_session
+        self._bridge_state_and_dir_for_session = bridge_state_and_dir_for_session
         self._client_safe_error_detail = client_safe_error_detail
         self._logger = logger
         self._bridge_is_inactive = bridge_is_inactive
@@ -145,8 +148,16 @@ class CodexGoalRunner:
         """Execute one Codex app-server goal JSON-RPC request."""
         from omnigent.harnesses.codex_native.app_server import client_for_transport
 
-        state = await self._bridge_state_for_session(conv_id, action=f"goal {action}")
+        state, bridge_dir = await self._bridge_state_and_dir_for_session(
+            conv_id, action=f"goal {action}"
+        )
         if state is None:
+            if (
+                method == "thread/goal/get"
+                and self._bridge_is_inactive is not None
+                and self._bridge_is_inactive(conv_id, None, bridge_dir)
+            ):
+                return {"goal": None}
             return self._bridge_error(action)
         codex_client = client_for_transport(
             state.socket_path,
@@ -159,7 +170,7 @@ class CodexGoalRunner:
                 if (
                     method == "thread/goal/get"
                     and self._bridge_is_inactive is not None
-                    and self._bridge_is_inactive(conv_id, state)
+                    and self._bridge_is_inactive(conv_id, state, bridge_dir)
                 ):
                     # Idle reaping leaves its old bridge file behind. Match the
                     # disconnected-runner read without waking an autonomous goal.

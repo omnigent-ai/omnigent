@@ -3913,29 +3913,34 @@ def create_runner_app(
             else _native_runtime.codex_native_bridge_dir(conv_id)
         )
 
-    def _codex_goal_bridge_is_inactive(conv_id: str, state: CodexNativeBridgeState) -> bool:
+    def _codex_goal_bridge_is_inactive(
+        conv_id: str,
+        state: CodexNativeBridgeState | None,
+        bridge_dir: Path,
+    ) -> bool:
         """Recognize an unloaded bridge without a recorded startup failure."""
         from omnigent.harnesses.codex_native.bridge import (
-            bridge_dir_for_codex_home,
             read_bridge_startup_error,
             read_bridge_state,
         )
 
-        registry = resource_registry.terminal_registry
-        if (
-            registry is None
-            or registry.get(conv_id, "codex", "main") is not None
-            or conv_id in _native_runtime._AUTO_CODEX_APP_SERVERS
-        ):
+        def has_live_owner() -> bool:
+            registry = resource_registry.terminal_registry
+            return (
+                registry is None
+                or registry.get(conv_id, "codex", "main") is not None
+                or conv_id in _native_runtime._AUTO_CODEX_APP_SERVERS
+            )
+
+        if has_live_owner():
             return False
-        bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
+        current_state = read_bridge_state(bridge_dir)
         return (
-            read_bridge_state(bridge_dir) == state
-            and read_bridge_startup_error(bridge_dir) is None
-        )
+            current_state is None if state is None else current_state == state
+        ) and read_bridge_startup_error(bridge_dir) is None
 
     codex_goal_runner = CodexGoalRunner(
-        bridge_state_for_session=_codex_native_bridge_state_for_session,
+        bridge_state_and_dir_for_session=_codex_native_bridge_state_and_dir_for_session,
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
         bridge_is_inactive=_codex_goal_bridge_is_inactive,
