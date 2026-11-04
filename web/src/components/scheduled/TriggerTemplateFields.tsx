@@ -305,7 +305,7 @@ export function TriggerTemplateFields({
                   className="inline-flex size-4 shrink-0 cursor-pointer items-center justify-center rounded-sm text-warning focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   onClick={(event) => {
                     event.preventDefault();
-                    setWarningsOpen((open) => !open);
+                    setWarningsOpen(true);
                   }}
                 >
                   <TriangleAlertIcon className="size-3.5" aria-hidden="true" />

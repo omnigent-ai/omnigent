@@ -2398,18 +2398,20 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     extraInfo: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
     sessionLink = "https://omni.example.com/c/CONVERSATION_ID",
   ) {
-    return render(
+    const onOpenChange = vi.fn();
+    const result = render(
       <CapabilitiesProvider
         info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true, ...extraInfo }}
       >
         <CreateScheduledTaskDialog
           open
-          onOpenChange={vi.fn()}
+          onOpenChange={onOpenChange}
           initialTrigger={source}
           sessionLink={sessionLink}
         />
       </CapabilitiesProvider>,
     );
+    return { ...result, onOpenChange };
   }
 
   /** Open a builder Select the Radix-in-jsdom way and pick an option. */
@@ -2443,7 +2445,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   }
 
   it("replaces the prompt with a trigger builder, runs hourly and keeps one session", () => {
-    renderTrigger("jira");
+    const { onOpenChange } = renderTrigger("jira");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");
@@ -2459,6 +2461,11 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
     expect(screen.queryByRole("tooltip")).toBeNull();
     expect(screen.queryByTestId("task-trigger-untrusted-note")).toBeNull();
+    // Touch focuses the trigger before delivering its click.
+    const warningsButton = screen.getByRole("button", { name: "Session instructions warnings" });
+    fireEvent.focus(warningsButton);
+    fireEvent.click(warningsButton);
+    expect(screen.getByRole("tooltip")).toBeInTheDocument();
     // The tooltip warns the source is untrusted and says link-back writes there.
     expect(showWarnings().getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
       "Anyone who can create a ticket in this project can add instructions that the agent may follow. The agent runs with your tools and your permissions. Make sure you trust them.",
@@ -2472,6 +2479,12 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
       "This only works if the agent has a Jira MCP server where this task runs. Without one, each run stops and says so in its reply.",
     );
+    expect(screen.getByRole("tooltip")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("button", { name: "Session instructions warnings" }), {
+      key: "Escape",
+    });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(onOpenChange).not.toHaveBeenCalled();
     const linkBack = screen.getByRole("checkbox", {
       name: "Comment the session link on the ticket",
     });
