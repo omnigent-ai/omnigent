@@ -26,7 +26,7 @@ from contextlib import contextmanager, suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, TextIO
 from unittest.mock import Mock
@@ -82,6 +82,7 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     OSEnvSandboxSpec,
 )
+from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
@@ -4133,7 +4134,7 @@ def test_augment_claude_args_mirrors_launch_overrides_into_settings(
 
     settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-fable-5"
-    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["permissions"]["defaultMode"] == "auto"
     assert settings["effortLevel"] == "xhigh"
 
 
@@ -4257,6 +4258,95 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
     assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
 
 
+@pytest.mark.parametrize(
+    ("launch_args", "default_mode"),
+    [
+        ((), None),
+        (("--permission-mode", "default"), "default"),
+        (("--permission-mode", "auto"), "auto"),
+    ],
+    ids=["none", "default", "auto"],
+)
+def test_augment_claude_args_allows_reading_session_attachments(
+    launch_args: tuple[str, ...],
+    default_mode: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude reads this session's attachment cache, outside the workspace, without a prompt."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    bridge_dir = tmp_path / "bridge"
+    attachment = materialize_attachment(
+        {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,iVBORw0KGgo=",
+            "filename": "image.png",
+        },
+        bridge_dir,
+    )
+    assert attachment is not None
+
+    settings = _load_invocation_settings(
+        augment_claude_args(
+            launch_args, bridge_dir=bridge_dir, python_executable="/venv/bin/python"
+        )
+    )
+
+    permissions = settings.get("permissions", {})
+    assert permissions.get("defaultMode") == default_mode
+    assert permissions.get("allow") == [f"Read(/{attachment.parent.as_posix()}/**)"]
+
+
+@pytest.mark.parametrize(
+    ("launch_args", "expected_permissions"),
+    [((), None), (("--permission-mode", "auto"), {"defaultMode": "auto"})],
+    ids=["none", "auto"],
+)
+def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
+    launch_args: tuple[str, ...],
+    expected_permissions: dict[str, str] | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache path Claude would read as a glob gets no allow rule; the launch mode stays."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data[1]"))
+
+    settings = _load_invocation_settings(
+        augment_claude_args(
+            launch_args, bridge_dir=tmp_path / "bridge", python_executable="/venv/bin/python"
+        )
+    )
+
+    assert settings.get("permissions") == expected_permissions
+
+
+@pytest.mark.parametrize(
+    ("directory", "expected"),
+    [
+        (
+            PureWindowsPath(r"C:\Users\alice\.omnigent\attachments\k"),
+            "Read(//c/Users/alice/.omnigent/attachments/k/**)",
+        ),
+        (PureWindowsPath(r"\\server\share\attachments\k"), None),
+        (PureWindowsPath(r"C:attachments\k"), None),
+        (PurePosixPath("attachments/k"), None),
+        (PurePosixPath("/home/a[1]/.omnigent/attachments/k"), None),
+    ],
+    ids=[
+        "windows-drive",
+        "windows-unc",
+        "windows-drive-relative",
+        "relative",
+        "glob-metacharacters",
+    ],
+)
+def test_claude_read_rule_only_emits_exact_absolute_patterns(
+    directory: PurePath, expected: str | None
+) -> None:
+    """Paths Claude would not match literally get no rule, so reads still prompt."""
+    assert claude_native_bridge._claude_read_rule(directory) == expected
+
+
 def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
     tmp_path: Path,
 ) -> None:
@@ -4269,7 +4359,7 @@ def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
 
     settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-sonnet-5"
-    assert "permissions" not in settings
+    assert "defaultMode" not in settings.get("permissions", {})
     assert "effortLevel" not in settings
 
 
@@ -4296,7 +4386,7 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
 
     settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-new"
-    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["permissions"]["defaultMode"] == "auto"
     assert settings["effortLevel"] == "high"
 
 
