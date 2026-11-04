@@ -665,42 +665,47 @@ def _remote_nwo(root: str, remote: str) -> str | None:
     return _owner_repo_from_url(url.strip())
 
 
-def _commit_lookup_repo(root: str) -> str | None:
-    """The repo the branch was pushed to — where its commit (and PR) live.
-
-    The branch's tracking remote (``branch.<name>.remote``), else ``origin``. One
-    repo suffices: ``commits/{sha}/pulls`` resolves the PR across the fork network
-    (it reports the PR's own base repo, whatever that is), and a commit that
-    wasn't pushed to this repo won't be in the base repo either — so querying more
-    repos for the same commit is redundant.
-    """
+def _commit_lookup_remote(root: str) -> str:
+    """The branch's tracking remote if it names a repo, else ``origin``."""
     rc, br, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
     branch = br.strip()
     if rc == 0 and branch and branch != "HEAD":
         rc, remote, _ = _git(["config", f"branch.{branch}.remote"], cwd=root)
         remote = remote.strip()
-        if rc == 0 and remote and remote != ".":
-            nwo = _remote_nwo(root, remote)
-            if nwo:
-                return nwo
-    return _remote_nwo(root, "origin")
+        if rc == 0 and remote and remote != "." and _remote_nwo(root, remote):
+            return remote
+    return "origin"
 
 
-def _remotes_by_repo(root: str, lookup_repo: str) -> dict[str, list[str]]:
-    """Remotes keyed by lower-cased ``owner/repo`` on the hosts serving ``lookup_repo``."""
+def _commit_lookup_repo(root: str) -> str | None:
+    """The repo the branch was pushed to — where its commit (and PR) live.
+
+    The repo of :func:`_commit_lookup_remote`. One repo suffices:
+    ``commits/{sha}/pulls`` resolves the PR across the fork network (it reports
+    the PR's own base repo, whatever that is), and a commit that wasn't pushed
+    to this repo won't be in the base repo either — so querying more repos for
+    the same commit is redundant.
+    """
+    return _remote_nwo(root, _commit_lookup_remote(root))
+
+
+def _remotes_by_repo(root: str, lookup_remote: str) -> dict[str, list[str]]:
+    """Remotes keyed by lower-cased ``owner/repo`` on the host of ``lookup_remote``."""
     rc, out, _ = _git(["remote"], cwd=root)
-    remotes: list[tuple[str, str | None, str]] = []
+    urls: dict[str, str] = {}
     for remote in out.split() if rc == 0 else []:
         rc, url, _ = _git(["remote", "get-url", remote], cwd=root)
-        nwo = _owner_repo_from_url(url.strip()) if rc == 0 else None
-        if nwo:
-            remotes.append((remote, host_of(url), nwo.lower()))
+        if rc == 0:
+            urls[remote] = url.strip()
+    if lookup_remote not in urls:
+        return {}
     # A same-named repo on another host, such as a GitLab mirror, is a different repo.
-    hosts = {host for _, host, nwo in remotes if nwo == lookup_repo.lower()}
+    lookup_host = host_of(urls[lookup_remote])
     by_repo: dict[str, list[str]] = {}
-    for remote, host, nwo in remotes:
-        if host in hosts:
-            by_repo.setdefault(nwo, []).append(remote)
+    for remote, url in urls.items():
+        nwo = _owner_repo_from_url(url)
+        if nwo and host_of(url) == lookup_host:
+            by_repo.setdefault(nwo.lower(), []).append(remote)
     return by_repo
 
 
@@ -733,7 +738,7 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     GitHub then lists every open PR that merges the base past the commit. So an
     open row is skipped when the commit is already on that PR's base branch
     locally (:func:`_contained_in_base_branch`), read from remotes of the base repo
-    on the queried fork's host.
+    on the host of the queried fork's remote.
     """
     shas = _head_commit_shas(root)
     repo = _commit_lookup_repo(root)
@@ -755,7 +760,7 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
         key = (sha, base_full.lower(), base_ref)
         if key not in on_base_branch:
             if base_remotes is None:
-                base_remotes = _remotes_by_repo(root, repo)
+                base_remotes = _remotes_by_repo(root, _commit_lookup_remote(root))
             remotes = base_remotes.get(base_full.lower(), [])
             on_base_branch[key] = _contained_in_base_branch(root, sha, remotes, base_ref)
         return not on_base_branch[key]

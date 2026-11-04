@@ -369,6 +369,7 @@ def test_resolve_pr_via_commit_ignores_same_named_repo_on_another_host(
     _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
     _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
     _run(["git", "remote", "add", "mirror", "git@gitlab.com:acme/repo.git"], repo)
+    _run(["git", "remote", "add", "mirror-fork", "git@gitlab.com:acme-dev/repo.git"], repo)
     _run(["git", "update-ref", "refs/remotes/upstream/main", "main"], repo)
     _run(["git", "update-ref", "refs/remotes/mirror/main", "feature"], repo)
     row = {
