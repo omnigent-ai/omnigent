@@ -37,7 +37,7 @@ _COMPLETED_STATE_REVISION = "9e82957bd115"
 _SESSION_MODE_PREVIOUS = "b2e4f6a8c013"
 _SESSION_MODE_REVISION = "d0a1f879a01d"
 _RUN_OUTCOME_REVISION = "e7c3a1b9d240"
-_RUN_OUTCOME_COLUMNS = {"outcome_success", "outcome_emoji", "outcome_text", "outcome_recorded_at"}
+_RUN_OUTCOME_COLUMNS = {"outcome_success", "outcome_payload", "outcome_recorded_at"}
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -146,12 +146,14 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         "host_id",
         "lease_expires_at",
         "outcome_success",
-        "outcome_emoji",
-        "outcome_text",
+        "outcome_payload",
         "outcome_recorded_at",
     }
-    for name in ("outcome_success", "outcome_emoji", "outcome_text", "outcome_recorded_at"):
+    for name in _RUN_OUTCOME_COLUMNS:
         assert columns[name]["nullable"] is True
+    # The CockroachDB dialect reflects INT8 as SQLAlchemy Integer.
+    timestamp_type = sa.Integer if db_engine.dialect.name == "cockroachdb" else sa.BigInteger
+    assert isinstance(columns["outcome_recorded_at"]["type"], timestamp_type)
 
 
 def test_workspace_id_leads_primary_keys(db_engine: Engine) -> None:
@@ -440,6 +442,36 @@ def test_scheduled_task_runs_status_check_rejects_bad_code(db_engine: Engine) ->
                     "VALUES (X'00000000000000000000000000005bad', "
                     "X'00000000000000000000000000000001', 99, 1)"
                 )
+            )
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_runs_outcome_payload_size_check(db_engine: Engine) -> None:
+    """The size CHECK caps ``outcome_payload`` at 2,048 stored bytes on insert and update.
+
+    Declared lengths are not enforced on every engine (SQLite ignores them), so the
+    CHECK is what bounds the column on both the migrated and the ORM-built schema.
+    """
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
+    row = {"scheduled_task_id": b"a" * 16, "status": 3, "scheduled_at": 1}
+    with db_engine.begin() as conn:
+        conn.execute(runs.insert().values(id=b"1" * 16, outcome_payload=b"x" * 2048, **row))
+        conn.execute(runs.insert().values(id=b"2" * 16, outcome_payload=None, **row))
+        assert (
+            conn.execute(
+                sa.select(sa.func.length(runs.c.outcome_payload)).where(runs.c.id == b"1" * 16)
+            ).scalar_one()
+            == 2048
+        )
+    with pytest.raises(IntegrityError):
+        with db_engine.begin() as conn:
+            conn.execute(runs.insert().values(id=b"3" * 16, outcome_payload=b"x" * 2049, **row))
+    with pytest.raises(IntegrityError):
+        with db_engine.begin() as conn:
+            conn.execute(
+                runs.update()
+                .where(runs.c.id == b"2" * 16)
+                .values(outcome_payload="é".encode() * 1025)
             )
 
 
@@ -959,29 +991,28 @@ def test_run_outcome_migration_keeps_existing_runs_and_round_trips(
         config.attributes["connection"] = conn
         command.upgrade(config, _RUN_OUTCOME_REVISION)
     runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    outcome_columns = (runs.c.outcome_success, runs.c.outcome_payload, runs.c.outcome_recorded_at)
+    payload = '{"plaintext":{"emoji":"🧯","text":"Build still red"}}'.encode()
     with engine.begin() as conn:
-        assert conn.execute(
-            sa.select(runs.c.outcome_success, runs.c.outcome_emoji, runs.c.outcome_text)
-        ).one() == (None, None, None)
+        assert conn.execute(sa.select(*outcome_columns)).one() == (None, None, None)
         conn.execute(
             runs.insert().values(
                 id=b"b" * 16,
                 outcome_success=False,
-                outcome_emoji="🧯",
-                outcome_text="Build still red",
+                outcome_payload=payload,
                 outcome_recorded_at=2,
                 **run_values,
             )
         )
-        row = conn.execute(
-            sa.select(runs.c.outcome_success, runs.c.outcome_emoji, runs.c.outcome_text).where(
-                runs.c.id == b"b" * 16
-            )
-        ).one()
-        assert (bool(row.outcome_success), row.outcome_emoji, row.outcome_text) == (
+        row = conn.execute(sa.select(*outcome_columns).where(runs.c.id == b"b" * 16)).one()
+        assert (
+            bool(row.outcome_success),
+            bytes(row.outcome_payload),
+            row.outcome_recorded_at,
+        ) == (
             False,
-            "🧯",
-            "Build still red",
+            payload,
+            2,
         )
     with engine.begin() as conn:
         config.attributes["connection"] = conn

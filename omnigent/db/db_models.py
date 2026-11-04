@@ -41,6 +41,11 @@ from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
+# Largest stored ``scheduled_task_runs.outcome_payload`` envelope. The plaintext
+# variant of the longest outcome is under 700 bytes; the rest leaves room for an
+# encrypted variant's overhead.
+RUN_OUTCOME_PAYLOAD_MAX_BYTES = 2048
+
 
 class Uuid16(TypeDecorator[str]):
     """A uuid stored as 16 raw bytes, presented to Python as bare 32-char hex.
@@ -1620,8 +1625,10 @@ class SqlScheduledTaskRun(OmnigentBase):
         ``None`` unless ``status = 'failed'``.
     :param outcome_success: Whether the agent reached the run's goal, as it
         recorded; ``None`` when it recorded nothing.
-    :param outcome_emoji: The emoji the agent chose for the outcome.
-    :param outcome_text: A few words on the outcome.
+    :param outcome_payload: The outcome's emoji and text in an envelope private
+        to the scheduled-task store, at most
+        :data:`RUN_OUTCOME_PAYLOAD_MAX_BYTES` bytes; ``None`` when nothing was
+        recorded.
     :param outcome_recorded_at: Unix epoch seconds of the latest recording.
     """
 
@@ -1665,14 +1672,25 @@ class SqlScheduledTaskRun(OmnigentBase):
     # What the agent recorded about reaching the run's goal, all NULL until it
     # records one. Separate from ``status``, which only tracks the run lifecycle.
     outcome_success: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    outcome_emoji: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    outcome_text: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # The agent's emoji and words, which can repeat task content, so they are
+    # opaque to the database: a storage-private envelope that the store encodes
+    # and decodes, bounded by ck_scheduled_task_runs_outcome_payload_size.
+    outcome_payload: Mapped[bytes | None] = mapped_column(
+        LargeBinary(RUN_OUTCOME_PAYLOAD_MAX_BYTES), nullable=True
+    )
     outcome_recorded_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
             "status IN (1, 2, 3, 4, 5, 6)",
             name="ck_scheduled_task_runs_dispatch_status",
+        ),
+        # Declared lengths are not enforced on every engine; length() of a
+        # binary value counts bytes on SQLite, MySQL, PostgreSQL and CockroachDB.
+        CheckConstraint(
+            "outcome_payload IS NULL OR length(outcome_payload) <= "
+            f"{RUN_OUTCOME_PAYLOAD_MAX_BYTES}",
+            name="ck_scheduled_task_runs_outcome_payload_size",
         ),
         UniqueConstraint(
             "workspace_id",
