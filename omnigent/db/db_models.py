@@ -1618,6 +1618,11 @@ class SqlScheduledTaskRun(OmnigentBase):
     :param error_code: Short failure classification (e.g. ``"timeout"``,
         ``"rate_limited"``) for future retryable-vs-terminal retry logic;
         ``None`` unless ``status = 'failed'``.
+    :param outcome_success: Whether the agent reached the run's goal, as it
+        recorded; ``None`` when it recorded nothing.
+    :param outcome_emoji: The emoji the agent chose for the outcome.
+    :param outcome_text: A few words on the outcome.
+    :param outcome_recorded_at: Unix epoch seconds of the latest recording.
     """
 
     __tablename__ = "scheduled_task_runs"
@@ -1657,6 +1662,12 @@ class SqlScheduledTaskRun(OmnigentBase):
     # "rate_limited") for future retry logic. Bounded plain string, not a blob;
     # no CHECK constraint (no code taxonomy defined yet).
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # What the agent recorded about reaching the run's goal, all NULL until it
+    # records one. Separate from ``status``, which only tracks the run lifecycle.
+    outcome_success: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    outcome_emoji: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    outcome_text: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    outcome_recorded_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -1700,6 +1711,17 @@ class SqlScheduledTaskRun(OmnigentBase):
             "workspace_id",
             "conversation_id",
             "status",
+            "id",
+        ),
+        # A session's newest run in one status, read backward: recording an
+        # outcome looks up the latest delivered run of a continued session,
+        # which collects one run per firing.
+        Index(
+            "ix_scheduled_task_runs_conversation_status_scheduled",
+            "workspace_id",
+            "conversation_id",
+            "status",
+            "scheduled_at",
             "id",
         ),
     )
