@@ -154,6 +154,12 @@ async def test_clear_surfaces_a_failed_injection(
 
 
 _RUNNER_ID = "runner_live"
+_REVIEW_SKILL = {"name": "review", "description": "Review the change.", "content": "Review it."}
+_SKILL_INPUT = {"type": "slash_command", "data": {"kind": "skill", "name": "review"}}
+_MESSAGE_INPUT = {
+    "type": "message",
+    "data": {"role": "user", "content": [{"type": "input_text", "text": "Q3"}]},
+}
 _OWNER = "alice@example.com"
 _EDITOR = "bob@example.com"
 _HOST_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
@@ -247,7 +253,7 @@ async def create_placed_session(
     :param user: Creating user on an app with permissions, e.g. ``"alice@example.com"``.
     :returns: The session id.
     """
-    agent = await create_test_agent(client, user=user)
+    agent = await create_test_agent(client, user=user, skills=[_REVIEW_SKILL])
     resp = await client.post(
         "/v1/sessions",
         headers={"X-Forwarded-Email": user} if user else None,
@@ -418,11 +424,11 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A message or a second ``/clear`` sent mid-move, after the release, is refused.
+    """A message, skill or second ``/clear`` sent mid-move, after the release, is refused.
 
-    The message would otherwise run in the original chat while viewers follow
-    the new, empty one; the second clear would release and fork again. The
-    first clear still completes, and the guard ends with it.
+    The message or skill would otherwise run in the original chat while
+    viewers follow the new, empty one; the second clear would release and fork
+    again. The first clear still completes, and the guard ends with it.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
@@ -439,15 +445,8 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
                 f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
             )
         )
-        sent.append(
-            await client.post(
-                f"/v1/sessions/{source_id}/events",
-                json={
-                    "type": "message",
-                    "data": {"role": "user", "content": [{"type": "input_text", "text": "Q3"}]},
-                },
-            )
-        )
+        for turn_input in (_MESSAGE_INPUT, _SKILL_INPUT):
+            sent.append(await client.post(f"/v1/sessions/{source_id}/events", json=turn_input))
 
     live_runner.on_clear = act_from_another_tab
     before = len((await client.get("/v1/sessions")).json()["data"])
@@ -458,15 +457,15 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
 
     assert resp.status_code == 202, resp.text
     new_id = resp.json()["session_id"]
-    assert [response.status_code for response in sent] == [409], sent[0].text
-    assert "moving to a new session" in sent[0].text
+    assert [response.status_code for response in sent] == [409, 409], [r.text for r in sent]
+    assert all("moving to a new session" in response.text for response in sent)
     assert [response.status_code for response in second_clear] == [409], second_clear[0].text
     assert "already moving" in second_clear[0].text
     assert len(clear_requests(live_runner)) == 1
     assert len((await client.get("/v1/sessions")).json()["data"]) == before + 1
     assert not orchestration._session_is_moving(source_id)
-    source_messages = [body for path, body in live_runner.posts if body.get("type") == "message"]
-    assert source_messages == []
+    started = [body for path, body in live_runner.posts if body.get("type") == "message"]
+    assert started == []
     assert "Q3" not in message_texts(store, source_id)
     assert live_runner.superseded == [(source_id, new_id, "clear")]
     # The guard ends with the move: the original chat takes messages again.
@@ -754,6 +753,8 @@ async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize
         (None, "runner", 503, "Couldn't reach this session's runner"),
         (200, "running", 400, "Stop the current turn"),
         (200, "starting", 400, "Stop the current turn"),
+        (200, "skill_starting", 400, "Stop the current turn"),
+        (200, "failed_starting", 400, "Stop the current turn"),
         (200, "none", 503, "runner is offline"),
         (200, "editor", 403, ""),
         (200, "sub_agent", 400, "only available in a top-level session"),
@@ -783,15 +784,22 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     source_id = await create_placed_session(
         auth_client,
         store,
-        runner_id={"none": None, "starting": "runner_gone"}.get(placement, _RUNNER_ID),
+        runner_id=None
+        if placement == "none"
+        else "runner_gone"
+        if placement.endswith("starting")
+        else _RUNNER_ID,
         host=placement != "none",
         user=_OWNER,
     )
     caller = _OWNER
     message_task: asyncio.Task[httpx.Response] | None = None
     release_message = asyncio.Event()
-    if placement == "starting":
-        # A message to the offline runner waits on runner recovery.
+    if placement.endswith("starting"):
+        # An input to the offline runner waits on runner recovery; a failed
+        # session still shows "failed" while its recovery input is pending.
+        if placement == "failed_starting":
+            monkeypatch.setitem(sessions_module._session_status_cache, source_id, "failed")
         recovering = asyncio.Event()
         resolve_runner = sessions_module._get_runner_client
 
@@ -805,10 +813,7 @@ async def test_claude_sdk_clear_refusals_create_no_session(
         message_task = asyncio.create_task(
             auth_client.post(
                 f"/v1/sessions/{source_id}/events",
-                json={
-                    "type": "message",
-                    "data": {"role": "user", "content": [{"type": "input_text", "text": "Q3"}]},
-                },
+                json=_SKILL_INPUT if placement == "skill_starting" else _MESSAGE_INPUT,
                 headers={"X-Forwarded-Email": _OWNER},
             )
         )

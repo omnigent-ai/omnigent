@@ -875,6 +875,11 @@ _RUNNER_EVENT_TYPES = frozenset(
 )
 
 
+# Inputs that can start a turn: each counts as in flight until its request
+# ends, and is refused while ``/clear`` moves the session.
+_TURN_STARTING_EVENT_TYPES = frozenset({"message", "session_message", _SLASH_COMMAND_TYPE})
+
+
 def register_events_routes(
     router: APIRouter,
     *,
@@ -1031,7 +1036,7 @@ def register_events_routes(
                                     session_id,
                                     event,
                                     in_flight=in_flight
-                                    if event.type in {"message", "session_message"}
+                                    if event.type in _TURN_STARTING_EVENT_TYPES
                                     else None,
                                 )
                             )
@@ -1047,7 +1052,7 @@ def register_events_routes(
                 request,
                 session_id,
                 body,
-                in_flight=in_flight if body.type in {"message", "session_message"} else None,
+                in_flight=in_flight if body.type in _TURN_STARTING_EVENT_TYPES else None,
             )
 
     router.include_router(event_router)

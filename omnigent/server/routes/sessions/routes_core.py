@@ -199,13 +199,13 @@ from omnigent.server.routes._sessions.orchestration import (
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
-    _list_status_with_starting,
     _mark_session_moving,
     _persist_external_conversation_item,
     _persist_model_change_note,
     _publish_runner_recovered_status,
     _run_managed_launch,
     _session_is_moving,
+    _session_is_starting,
     _spawn_archive_stop,
     _validate_session_model_selection,
     ensure_runner_connected,
@@ -4633,9 +4633,10 @@ def register_core_routes(
                 f"This chat is already moving to a new session; wait before running {command}.",
                 code=ErrorCode.CONFLICT,
             )
-        # A message still waiting on its runner counts as a running turn.
+        # An input still reaching its runner counts as a running turn, whatever
+        # status the session shows (a failed one can be recovering).
         status = _session_status_from_cache(source.id, source.live_status)
-        if _list_status_with_starting(status, source.id) == "running":
+        if status == "running" or _session_is_starting(source.id):
             raise OmnigentError(
                 f"Stop the current turn before running {command}.",
                 code=ErrorCode.INVALID_INPUT,
