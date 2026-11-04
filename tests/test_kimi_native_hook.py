@@ -564,9 +564,9 @@ def test_request_web_approval_does_not_repark_after_menu_is_gone(
 @pytest.mark.parametrize(
     ("url", "expected_trust_env"),
     [
-        ("http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request", False),
+        ("http://127.0.0.1:8787/v1/sessions/conv_x/hooks/native-permission-request", False),
         (
-            "https://omnigents.example.databricksapps.com/v1/sessions/conv_x/hooks/permission-request",
+            "https://omnigents.example.databricksapps.com/v1/sessions/conv_x/hooks/native-permission-request",
             True,
         ),
     ],
@@ -591,14 +591,14 @@ def test_request_web_approval_bypasses_proxy_only_for_loopback(
             del json
             return httpx.Response(
                 200,
-                json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+                json={"action": "accept"},
                 request=httpx.Request("POST", request_url),
             )
 
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
 
-    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
-    assert kimi_native_hook._request_web_approval(url, {}, body) == "allow"
+    body = {"elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval(url, {}, body) == "accept"
     assert captured_trust_env == [expected_trust_env]
 
 
