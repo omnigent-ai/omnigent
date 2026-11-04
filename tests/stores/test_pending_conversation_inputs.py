@@ -124,6 +124,7 @@ def test_host_pagination_and_workspace_isolation(db_uri):
     with workspace_scope(17):
         assert store.list_host_conversation_ids(host_id) == []
         assert store.list_pending_inputs(ids[0]) == []
+        assert store.list_pending_inputs_by_id(ids[0]) == ([], None)
     if not db_uri.startswith("sqlite"):
         return  # The plan check below uses SQLite's EXPLAIN syntax.
     with store._session("test_host_query_plan") as db:
@@ -229,6 +230,7 @@ def test_pending_input_id_pages_carry_submission_positions(db_uri):
     saved = store.append(session.id, [_input() for _ in range(5)])
     sent = MessageData(role="user", content=[{"type": "input_text", "text": "delivered"}])
     store.append(session.id, [NewConversationItem(type="message", response_id="turn", data=sent)])
+    store.append(store.create_conversation().id, [_input()])
     first, cursor = store.list_pending_inputs_by_id(session.id, limit=2)
     second, cursor = store.list_pending_inputs_by_id(session.id, after=cursor, limit=2)
     third, end = store.list_pending_inputs_by_id(session.id, after=cursor, limit=2)

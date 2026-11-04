@@ -1734,12 +1734,37 @@ it.each([false, true])(
 );
 
 it.each([
-  { sent: "after the reopened session reads its inputs again", readFirst: true, refused: false },
-  { sent: "before the reopened session reads its inputs", readFirst: false, refused: false },
-  { sent: "refused before the reopened session reads its inputs", readFirst: false, refused: true },
+  {
+    into: "after the grid composer's newer draft",
+    sent: "after the reopened session reads its inputs again",
+    newer: true,
+    readFirst: true,
+    refused: false,
+  },
+  {
+    into: "after the grid composer's newer draft",
+    sent: "before the reopened session reads its inputs",
+    newer: true,
+    readFirst: false,
+    refused: false,
+  },
+  {
+    into: "after the grid composer's newer draft",
+    sent: "refused before the reopened session reads its inputs",
+    newer: true,
+    readFirst: false,
+    refused: true,
+  },
+  {
+    into: "to an empty grid composer",
+    sent: "before the reopened session reads its inputs",
+    newer: false,
+    readFirst: false,
+    refused: false,
+  },
 ])(
-  "adds a failed launch's recovered message after the grid composer's newer draft and names it in a send $sent",
-  async ({ readFirst, refused }) => {
+  "adds a failed launch's recovered message $into and names it in a send $sent",
+  async ({ newer, readFirst, refused }) => {
     const entry = conversationRegistry.acquire(childId);
     entry.setState({
       sessionStatus: "idle",
@@ -1748,13 +1773,14 @@ it.each([
     });
     useChatStore.setState({ send: initialStoreState.send });
     renderPane(<SideChatPane childId={childId} fullSession />);
-    act(() =>
-      useChatStore.getState().updateSideChatComposer(childId, () => ({
-        text: "newer",
-        files: [],
-        quotes: [{ id: "new", before: "", text: "New quote" }],
-      })),
-    );
+    if (newer)
+      act(() =>
+        useChatStore.getState().updateSideChatComposer(childId, () => ({
+          text: "newer",
+          files: [],
+          quotes: [{ id: "new", before: "", text: "New quote" }],
+        })),
+      );
     act(() =>
       entry.setState({
         failedSendDraft: {
@@ -1767,8 +1793,9 @@ it.each([
       }),
     );
 
-    expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
-    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("New quote");
+    const shown = newer ? "newer\n\nsaved on server" : "saved on server";
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(shown);
+    if (newer) expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("New quote");
 
     // Evicted while the composer holds the input, the reopened session doesn't add it again.
     const { sessionHarness, boundAgentId } = entry.getState();
@@ -1784,7 +1811,7 @@ it.each([
       { pendingId: "pending_first", content: [{ type: "input_text", text: "saved on server" }] },
     ]);
     if (readFirst) await act(() => retryFailedStartupLookup(childId));
-    expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(shown);
     const post = vi.spyOn(sessionsApi, "postEvent");
     if (refused)
       post.mockRejectedValue(

@@ -5569,6 +5569,32 @@ describe("Composer reply quotes", () => {
     },
   );
 
+  it("restores a failed launch's message into an empty composer, naming its inputs in the saved draft", async () => {
+    const props = composerProps();
+    render(<Composer {...props} />);
+
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "run the linter next",
+          files: [],
+          startupInputIds: ["pending_first"],
+          recovered: true,
+        },
+      }),
+    );
+
+    expect(textarea()).toHaveValue("run the linter next");
+    expect(props.onSend).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(getSessionDraft("conv_test")).toMatchObject({
+        text: "run the linter next",
+        startupInputIds: ["pending_first"],
+      }),
+    );
+  });
+
   it("drops a failed-send draft whose message already committed under its stable id", () => {
     const stableId = "e".repeat(32);
     render(<Composer {...composerProps()} />);
