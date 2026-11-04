@@ -5255,40 +5255,44 @@ def create_runner_app(
                     return
                 async with _native_file_changes_lock:
                     for change in changes:
-                        try:
-                            if registry.needs_snapshot(
-                                change.path, session_id=_captured_session_id
-                            ):
-                                current = None
-                                if change.patch is not None:
-                                    environment = resource_registry.resolve_environment(
-                                        _captured_session_id, "default", relay_spec
+                        # Editor and tool saves hold this lock until they record their original.
+                        async with registry.change_lock(change.path):
+                            try:
+                                if registry.needs_snapshot(
+                                    change.path, session_id=_captured_session_id
+                                ):
+                                    current = None
+                                    if change.patch is not None:
+                                        environment = resource_registry.resolve_environment(
+                                            _captured_session_id, "default", relay_spec
+                                        )
+                                        result = await environment.read(
+                                            change.move_path or change.path,
+                                            max_bytes=1_048_576,
+                                            regular_only=True,
+                                        )
+                                        if not result.get("error") and isinstance(
+                                            result.get("content"), str
+                                        ):
+                                            current = result["content"]
+                                    original = await run_slow_io(
+                                        resolve_native_original, change, current
                                     )
-                                    result = await environment.read(
-                                        change.move_path or change.path,
-                                        max_bytes=1_048_576,
-                                        regular_only=True,
-                                    )
-                                    if not result.get("error") and isinstance(
-                                        result.get("content"), str
-                                    ):
-                                        current = result["content"]
-                                original = await run_slow_io(
-                                    resolve_native_original, change, current
+                                    if original is not None:
+                                        registry.seed_snapshot(
+                                            change.path, original, session_id=_captured_session_id
+                                        )
+                            except Exception:
+                                _logger.warning(
+                                    "native original recovery failed for session=%s path=%r",
+                                    _captured_session_id,
+                                    change.path,
+                                    exc_info=True,
+                                    extra={"session_id": _captured_session_id},
                                 )
-                                if original is not None:
-                                    registry.seed_snapshot(
-                                        change.path, original, session_id=_captured_session_id
-                                    )
-                        except Exception:
-                            _logger.warning(
-                                "native original recovery failed for session=%s path=%r",
-                                _captured_session_id,
-                                change.path,
-                                exc_info=True,
-                                extra={"session_id": _captured_session_id},
+                            registry.record_change(
+                                change.path, change.operation, _captured_session_id
                             )
-                        registry.record_change(change.path, change.operation, _captured_session_id)
                 _maybe_signal_changed_files(
                     _captured_session_id,
                     _publish_event,

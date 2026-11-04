@@ -45,6 +45,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import create_runner_app, native_file_observer
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 from omnigent.runner.native import ResolvedSpec
 from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -620,6 +621,84 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
     assert registry.get_changed_file(relay_env.session_id, "shared.txt", check_disk=True) is None
     other = registry.get_changed_file("conv_other", "shared.txt", check_disk=True)
     assert other is not None and other["status"] == "modified"
+
+
+@pytest.mark.parametrize("app", [True], indirect=True)
+async def test_native_observer_waits_for_an_editor_save_of_the_same_file(
+    relay_env: _RelayEnv,
+    app: FastAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A native edit of an editor save not yet recorded keeps the original that save replaced."""
+    resources = SessionResourceRegistry(runner_workspace=tmp_path)
+    environment = resources.resolve_environment(relay_env.session_id, "default")
+    request.addfinalizer(environment.close)
+    for name in ("resolve_environment", "live_environment"):
+        monkeypatch.setattr(
+            app.state.session_resource_registry, name, getattr(resources, name), raising=False
+        )
+    start = Mock(wraps=bridge.start_tool_relay)
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
+    response = await _launch_terminal(
+        relay_env.client, relay_env.session_id, bridge_inject_dir=True
+    )
+    assert response.status_code == 200, response.text
+    observe = start.call_args.kwargs["file_change_observer"]
+    registry = app.state.filesystem_registry
+    write_file, change_lock = CallerProcessFilesystem.write, registry.change_lock
+    saved, release_save, native_locking = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def held_write(self: CallerProcessFilesystem, *args: Any, **kwargs: Any) -> Any:
+        result = await write_file(self, *args, **kwargs)
+        saved.set()
+        await release_save.wait()
+        return result
+
+    def tracked_lock(path: str) -> Any:
+        if saved.is_set():
+            native_locking.set()
+        return change_lock(path)
+
+    monkeypatch.setattr(CallerProcessFilesystem, "write", held_write)
+    monkeypatch.setattr(registry, "change_lock", tracked_lock)
+    (tmp_path / "notes.txt").write_text("A\n")
+    save = asyncio.create_task(
+        relay_env.client.put(
+            f"/v1/sessions/{relay_env.session_id}/resources/environments/default"
+            "/filesystem/notes.txt",
+            json={"content": "B\n"},
+        )
+    )
+    native: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(saved.wait(), timeout=5)
+        (tmp_path / "notes.txt").write_text("C\n")
+        native = asyncio.create_task(
+            observe(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "notes.txt"},
+                    "tool_response": {"filePath": "notes.txt", "originalFile": "B\n"},
+                }
+            )
+        )
+        locking = asyncio.create_task(native_locking.wait())
+        await asyncio.wait({native, locking}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+        locking.cancel()
+    finally:
+        release_save.set()
+        response = await asyncio.wait_for(save, timeout=5)
+        if native is not None:
+            await asyncio.wait_for(native, timeout=5)
+    assert response.status_code == 200, response.text
+    (tmp_path / "notes.txt").write_text("B\n")
+    record = registry.get_changed_file(relay_env.session_id, "notes.txt", check_disk=True)
+    assert record is not None and record["status"] == "modified"
+    (tmp_path / "notes.txt").write_text("A\n")
+    assert registry.get_changed_file(relay_env.session_id, "notes.txt", check_disk=True) is None
 
 
 @pytest.mark.asyncio
