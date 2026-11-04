@@ -230,8 +230,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 - Hover the model/effort pill to see the tooltip; click it to open configuration.
 - Hover the host chip (status dot and machine icon) to see the host and whether
-  it is connected; click it to open the host menu. Connecting hosts show no
-  status dot.
+  it is connected; click it to open the host menu. The status indicator remains
+  visible while connecting or without a selected host; the label describes
+  those states without claiming Online or Offline.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
 - With focus in the prompt, press Shift+Tab to step the permission mode without

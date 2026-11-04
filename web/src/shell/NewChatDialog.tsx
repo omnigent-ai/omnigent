@@ -6971,7 +6971,9 @@ export function NewChatLandingScreen() {
                         <DropdownMenuTrigger asChild>
                           <ComposerHostTrigger
                             label={hostChipLabel}
-                            status={hostChipStatus}
+                            status={
+                              sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
+                            }
                             cloud={isCloudHost}
                             className={cn(
                               connectingThisMachine &&

@@ -3183,7 +3183,10 @@ describe("Run on this machine (desktop host enrollment)", () => {
 
     const chip = screen.getByTestId("new-chat-landing-host-chip");
     await waitFor(() => expect(chip).toHaveAccessibleName("Host: Connecting…"));
-    expect(within(chip).queryByTestId("new-chat-landing-host-status")).toBeNull();
+    expect(within(chip).getByTestId("new-chat-landing-host-status")).toHaveAttribute(
+      "data-status",
+      "offline",
+    );
     expect(chip.className).toContain("after:animate-pulse");
     expect(chip.className).toContain("after:content-['Connecting…']");
 
@@ -6606,7 +6609,11 @@ describe("NewChatLandingScreen", () => {
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
     expect(hostChip).toHaveAccessibleName(expect.stringContaining("No host selected"));
     expect(hostChip).not.toHaveAccessibleName(expect.stringContaining("Offline"));
-    expect(within(hostChip).queryByTestId("new-chat-landing-host-status")).toBeNull();
+    expect(hostChip).toBeEnabled();
+    expect(within(hostChip).getByTestId("new-chat-landing-host-status")).toHaveAttribute(
+      "data-status",
+      "offline",
+    );
     expect(hostChip.querySelector(".bg-success")).toBeNull();
     expect(hostChip.querySelector(".lucide-laptop")).not.toBeNull();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
