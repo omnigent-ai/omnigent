@@ -66,7 +66,8 @@ async function fetchSideChats(parentId: string): Promise<{ open: string[]; close
       last_id?: string | null;
     };
     rows.push(...page.data);
-    after = page.has_more && page.last_id ? page.last_id : null;
+    // A cursor that doesn't advance would page forever.
+    after = page.has_more && page.last_id && page.last_id !== after ? page.last_id : null;
   } while (after !== null);
   /* oxlint-enable no-await-in-loop */
   // Pages come in id order; tabs open in creation order.

@@ -22,7 +22,6 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
     MessageData,
-    NewConversationItem,
     PagedList,
     StoredFile,
 )
@@ -708,20 +707,6 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation(agent_id=agent["id"])
     other_parent = store.create_conversation(agent_id=agent["id"])
-    store.append(
-        parent.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_parent",
-                data=MessageData(
-                    role="assistant",
-                    agent="test",
-                    content=[{"type": "output_text", "text": "Parent answer"}],
-                ),
-            )
-        ],
-    )
 
     async def fork(source_id: str, body: dict[str, Any]) -> dict:
         response = await client.post(f"/v1/sessions/{source_id}/fork", json=body)

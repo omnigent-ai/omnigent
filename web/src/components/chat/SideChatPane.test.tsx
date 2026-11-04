@@ -1423,6 +1423,31 @@ describe("history a side chat copied from its parent", () => {
     expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
   });
 
+  it("waits for the session before choosing which history to hide", () => {
+    loadingSession.id = childId;
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+    const { rerender } = renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([
+          userItem(`${childId.slice(0, 12)}copy`, "resp_copy", "Copied reply"),
+          userItem("item_side", "resp_side", "Asked in the side chat"),
+        ]),
+      }),
+    );
+    expect(screen.queryByText("Asked in the side chat")).toBeNull();
+
+    loadingSession.id = null;
+    listSideChat();
+    rerender(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied reply")).toBeNull();
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
+
   it("hides nothing when the fork copied nothing", () => {
     listSideChat();
     const entry = conversationRegistry.acquire(childId);

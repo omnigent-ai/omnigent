@@ -97,6 +97,9 @@ interface CopiedBlock {
   ctx?: { itemId?: string | null };
 }
 
+/** Leading side-chat id characters on items it copied; the server's `SIDE_CHAT_COPY_ID_PREFIX_LEN`. */
+const SIDE_CHAT_COPY_ID_PREFIX_LEN = 12;
+
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
 function isPendingSideChat(id: string): boolean {
   return id.startsWith("pending:");
@@ -178,7 +181,7 @@ export function SideChatPane({
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
-  const { session } = useSession(pending ? null : childId);
+  const { session, isLoading: sessionLoading } = useSession(pending ? null : childId);
   const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
   const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   useLayoutEffect(() => {
@@ -222,23 +225,28 @@ export function SideChatPane({
   // A newer side chat's copied items have ids starting with its own id's first 12
   // characters, so every device hides exactly the copied history; older ones use
   // this browser's snapshot.
-  const copiedIdPrefix = session?.sideChatParentId ? childId.slice(0, 12) : undefined;
-  const useLocalBoundary = filterHistory && !pending && copiedIdPrefix === undefined;
+  const copiedIdPrefix = session?.sideChatParentId
+    ? childId.slice(0, SIDE_CHAT_COPY_ID_PREFIX_LEN)
+    : undefined;
+  // Until the snapshot says which rule applies, show nothing and capture nothing.
+  const awaitingRule = filterHistory && !pending && sessionLoading;
+  const useLocalBoundary =
+    filterHistory && !pending && !sessionLoading && copiedIdPrefix === undefined;
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
   // pre-load render.
   const boundaryRef = useRef<{
     childId: string;
-    ids: Set<string> | null;
+    // `undefined` until this browser's stored boundary has been read.
+    ids: Set<string> | null | undefined;
     loadSeen: boolean;
   } | null>(null);
   if (boundaryRef.current === null || boundaryRef.current.childId !== childId) {
-    boundaryRef.current = {
-      childId,
-      ids: useLocalBoundary ? readInheritedBoundary(childId) : null,
-      loadSeen: false,
-    };
+    boundaryRef.current = { childId, ids: undefined, loadSeen: false };
+  }
+  if (useLocalBoundary && boundaryRef.current.ids === undefined) {
+    boundaryRef.current.ids = readInheritedBoundary(childId);
   }
   if (loadingConversation) boundaryRef.current.loadSeen = true;
   // Capture once, when the fork's load has actually completed — even if it is
@@ -254,14 +262,15 @@ export function SideChatPane({
   ) {
     const ids = new Set(
       blocks
-        .map((b) => (b as { ctx?: { itemId?: string | null } }).ctx?.itemId)
+        .map((b) => (b as CopiedBlock).ctx?.itemId)
         .filter((id): id is string => typeof id === "string"),
     );
     boundaryRef.current.ids = ids;
     writeInheritedBoundary(childId, ids);
   }
-  const inherited = boundaryRef.current.ids;
+  const inherited = boundaryRef.current.ids ?? null;
   const visibleBlocks = useMemo(() => {
+    if (awaitingRule) return [];
     if (filterHistory && copiedIdPrefix !== undefined) {
       return blocks.filter(
         (b) => !((b as CopiedBlock).ctx?.itemId ?? "").startsWith(copiedIdPrefix),
@@ -270,10 +279,10 @@ export function SideChatPane({
     return inherited === null
       ? blocks
       : blocks.filter((b) => {
-          const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
+          const id = (b as CopiedBlock).ctx?.itemId;
           return !(typeof id === "string" && inherited.has(id));
         });
-  }, [blocks, inherited, filterHistory, copiedIdPrefix]);
+  }, [blocks, inherited, filterHistory, copiedIdPrefix, awaitingRule]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
