@@ -68,6 +68,7 @@ function makeWrapper() {
 }
 
 const RUN: api.ScheduledTaskRun = {
+  sessionCostUsd: null,
   id: "run_1",
   scheduledTaskId: "st_1",
   status: "running",
