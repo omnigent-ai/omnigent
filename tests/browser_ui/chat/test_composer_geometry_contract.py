@@ -27,6 +27,7 @@ from tests.browser_ui.chat._geometry_helpers import (
     box,
     drag_thumb_with_mouse,
     drag_thumb_with_touch,
+    native_touch_emulation,
     open_landing,
     open_live,
     park_at_bottom,
@@ -144,10 +145,16 @@ def _agents(*, skills: bool = False, picker_navigation: bool = False) -> list[di
 
 
 @pytest.mark.parametrize("viewport", [PHONE, TABLET, DESKTOP], ids=["phone", "tablet", "desktop"])
+@pytest.mark.parametrize(
+    "touch",
+    [False, pytest.param(True, marks=pytest.mark.browser_context_args(has_touch=True))],
+    ids=["mouse", "touch"],
+)
 def test_landing_and_live_cards_share_the_geometry_contract(
     page: Page,
     chat_session_contract: ChatSessionContract,
     viewport: dict[str, int],
+    touch: bool,
 ) -> None:
     """Both composer surfaces remain centered, bounded, and aligned at every breakpoint."""
     chat = chat_session_contract
@@ -162,6 +169,25 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert_within_viewport(box(_action_row(page, surface)), viewport["width"])
         assert_within_viewport(box(_submit(page, surface)), viewport["width"])
         assert document_width(page) <= viewport["width"]
+        submit = box(_submit(page, surface))
+        if touch:
+            assert submit["width"] >= 44 and submit["height"] >= 44
+        else:
+            assert submit["height"] < 44
+        attach = page.get_by_test_id(
+            "new-chat-landing-attach" if surface == "landing" else "composer-attach"
+        )
+        assert_no_overlap(box(attach), submit)
+        attach.click()
+        menu = page.get_by_role("menu", name="Add", exact=True)
+        expect(menu).to_be_visible()
+        _settle_menu(menu)
+        assert_within_viewport(box(menu), viewport["width"])
+        if touch:
+            for row in menu.get_by_role("menuitem").all():
+                bounds = box(row)
+                assert bounds["width"] >= 44 and bounds["height"] >= 44
+        page.keyboard.press("Escape")
         widths.append(card["width"])
     if viewport == DESKTOP:
         assert widths[0] == pytest.approx(widths[1], abs=TOLERANCE)
@@ -607,6 +633,8 @@ def test_queued_rows_and_nested_workspace_share_the_tray_grid(
     chat_session_contract: ChatSessionContract,
 ) -> None:
     chat = chat_session_contract
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
     open_live(page, chat, DESKTOP)
     chat.emit_busy("geometry-turn")
     composer = page.get_by_label("Message the agent")
@@ -843,6 +871,214 @@ def test_composer_hides_native_scrollbar_without_disabling_scroll(
     assert composer.evaluate("el => el.scrollTop") > 0
 
 
+@pytest.mark.parametrize("surface", ["landing", "live"])
+def test_list_continuation_keeps_the_new_item_in_view(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    surface: str,
+) -> None:
+    _surface(page, chat_session_contract, surface, DESKTOP)
+    composer = _input(page, surface)
+    composer.click()
+    composer.press_sequentially("- item 1")
+    for index in range(2, 13):
+        composer.press("Shift+Enter")
+        composer.press_sequentially(f"item {index}")
+    assert composer.evaluate("el => el.scrollHeight > el.clientHeight")
+
+    composer.press("Shift+Enter")
+    expect(composer).to_have_value(re.compile(r"  - item 12\n  - $"))
+
+    def hidden_below_caret() -> float:
+        return composer.evaluate("el => el.scrollHeight - el.scrollTop - el.clientHeight")
+
+    try:
+        poll_until(lambda: hidden_below_caret() <= TOLERANCE, timeout_s=2, interval_s=0.05)
+    except AssertionError:
+        pytest.fail(f"new list item is {hidden_below_caret():.0f}px below the visible box")
+
+
+_ITEMS = "\n".join(f"  - item {index}" for index in range(1, 13))
+_TEXT_BELOW = "\n\nmore\ntext\nbelow"
+
+
+def _line_box(composer: Locator, line: int) -> dict[str, float]:
+    """Visual ``line``'s (0-based) top and bottom in scroll coordinates, and the box's view."""
+    return composer.evaluate(
+        """(el, line) => {
+          const style = getComputedStyle(el);
+          const lineHeight = parseFloat(style.lineHeight);
+          const top = parseFloat(style.paddingTop) + line * lineHeight;
+          return {top, bottom: top + lineHeight, scrollTop: el.scrollTop,
+            clientHeight: el.clientHeight};
+        }""",
+        line,
+    )
+
+
+def _line_in_view(composer: Locator, line: int) -> bool:
+    """Whether visual ``line`` (0-based) is fully inside the box's scrolled view."""
+    box = _line_box(composer, line)
+    return (
+        box["scrollTop"] <= box["top"] + TOLERANCE
+        and box["bottom"] <= box["scrollTop"] + box["clientHeight"] + TOLERANCE
+    )
+
+
+def _align_line(composer: Locator, line: int, edge: str) -> float:
+    """Scroll visual ``line`` flush with the box's ``edge`` and return the new scrollTop."""
+    box = _line_box(composer, line)
+    top = box["top"] if edge == "top" else box["bottom"] - box["clientHeight"]
+    scroll_top = composer.evaluate(
+        "(el, top) => { el.scrollTop = top; return el.scrollTop; }", top
+    )
+    assert scroll_top == pytest.approx(top, abs=TOLERANCE), f"line {line} cannot reach the {edge}"
+    return scroll_top
+
+
+def _assert_scrolls_to_reveal(composer: Locator, line: int, scroll_before: float) -> None:
+    """Wait for the nearest scrollTop to ``scroll_before`` that shows visual ``line`` fully."""
+    box = _line_box(composer, line)
+    expected = min(max(scroll_before, box["bottom"] - box["clientHeight"]), box["top"])
+
+    def scroll_top() -> float:
+        return composer.evaluate("el => el.scrollTop")
+
+    try:
+        poll_until(lambda: abs(scroll_top() - expected) <= TOLERANCE, timeout_s=2, interval_s=0.05)
+    except AssertionError:
+        pytest.fail(
+            f"scrollTop is {scroll_top():.1f} ({scroll_before:.1f} before); "
+            f"{expected:.1f} shows line {line} with the least scrolling"
+        )
+
+
+@pytest.mark.parametrize(
+    ("edit", "expected"),
+    [
+        pytest.param("Alt+Enter", _ITEMS + "\n", id="alt-enter"),
+        pytest.param("paste", _ITEMS + "\nalpha\nbeta", id="paste"),
+        pytest.param(
+            "Shift+Enter above more text", _ITEMS + "\n  - " + _TEXT_BELOW, id="list-mid-draft"
+        ),
+    ],
+)
+def test_inserted_lines_scroll_in_without_jumping_past_the_caret(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    edit: str,
+    expected: str,
+) -> None:
+    chat = chat_session_contract
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=chat.base_url)
+    _surface(page, chat, "landing", DESKTOP)
+    composer = _input(page, "landing")
+    composer.click()
+    composer.fill(_ITEMS)
+    if edit.endswith("above more text"):
+        composer.evaluate(
+            """(el, below) => {
+              el.setRangeText(below, el.value.length, el.value.length, "preserve");
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+            }""",
+            _TEXT_BELOW,
+        )
+
+    def hidden_below() -> float:
+        return composer.evaluate("el => el.scrollHeight - el.scrollTop - el.clientHeight")
+
+    hidden_before = hidden_below()
+    assert composer.evaluate("el => el.scrollTop") > 0
+    assert _line_in_view(composer, _ITEMS.count("\n"))
+    if edit == "paste":
+        page.evaluate("text => navigator.clipboard.writeText(text)", "\nalpha\nbeta")
+        page.keyboard.press("ControlOrMeta+V")
+    else:
+        composer.press(edit.split()[0])
+    expect(composer).to_have_value(expected)
+
+    try:
+        poll_until(
+            lambda: abs(hidden_below() - hidden_before) <= TOLERANCE,
+            timeout_s=2,
+            interval_s=0.05,
+        )
+    except AssertionError:
+        pytest.fail(
+            f"{hidden_below():.0f}px is below the box after {edit}, {hidden_before:.0f}px before"
+        )
+
+
+@pytest.mark.parametrize(
+    ("caret_line", "aligned_line", "padding", "scrolls"),
+    [
+        pytest.param(0, 15, None, True, id="caret-above-the-box"),
+        pytest.param(11, 15, None, False, id="caret-in-view"),
+        # Padding like the Inbox reply box's; the new line is flush with or just below the bottom.
+        pytest.param(10, 11, "8px 10px", False, id="padded-new-line-at-the-bottom-edge"),
+        pytest.param(10, 10, "8px 10px", True, id="padded-new-line-below-the-box"),
+    ],
+)
+def test_alt_enter_scrolls_only_as_far_as_the_caret_line(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    caret_line: int,
+    aligned_line: int,
+    padding: str | None,
+    scrolls: bool,
+) -> None:
+    _surface(page, chat_session_contract, "landing", DESKTOP)
+    composer = _input(page, "landing")
+    composer.click()
+    draft = _ITEMS + _TEXT_BELOW
+    composer.fill(draft)
+    if padding:
+        composer.evaluate("(el, padding) => { el.style.padding = padding; }", padding)
+    caret = len("\n".join(draft.split("\n")[: caret_line + 1]))
+    composer.evaluate("(el, caret) => el.setSelectionRange(caret, caret)", caret)
+    scroll_before = _align_line(composer, aligned_line, "bottom")
+    assert _line_in_view(composer, caret_line + 1) is not scrolls
+
+    composer.press("Alt+Enter")
+    expect(composer).to_have_value(draft[:caret] + "\n" + draft[caret:])
+    _assert_scrolls_to_reveal(composer, caret_line + 1, scroll_before)
+
+
+@pytest.mark.parametrize(
+    ("aligned_line", "edge", "scrolls"),
+    [
+        pytest.param(12, "bottom", True, id="caret-below-the-box"),
+        pytest.param(13, "top", False, id="caret-in-view"),
+    ],
+)
+def test_paste_inside_a_wrapped_word_scrolls_only_as_far_as_its_line(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    aligned_line: int,
+    edge: str,
+    scrolls: bool,
+) -> None:
+    chat = chat_session_contract
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=chat.base_url)
+    _surface(page, chat, "landing", DESKTOP)
+    composer = _input(page, "landing")
+    composer.click()
+    # Too long for one line, the word moves below "wrap" (line 12) before it breaks,
+    # though the text up to the caret alone would fit after "wrap".
+    draft = _ITEMS + "\nwrap " + "x" * 400 + "\n" + _ITEMS
+    caret = len(_ITEMS + "\nwrap x")
+    composer.fill(draft)
+    composer.evaluate("(el, caret) => el.setSelectionRange(caret, caret)", caret)
+    scroll_before = _align_line(composer, aligned_line, edge)
+    assert _line_in_view(composer, 13) is not scrolls
+    assert _line_in_view(composer, 12) is scrolls
+
+    page.evaluate("text => navigator.clipboard.writeText(text)", "y")
+    page.keyboard.press("ControlOrMeta+V")
+    expect(composer).to_have_value(draft[:caret] + "y" + draft[caret:])
+    _assert_scrolls_to_reveal(composer, 13, scroll_before)
+
+
 @pytest.mark.browser_context_args(has_touch=True)
 def test_composer_growth_reflows_without_covering_output(
     page: Page,
@@ -936,19 +1172,29 @@ def test_composer_growth_reflows_without_covering_output(
     composer.click()
     touch_baseline = settled_geometry(page)
     assert_clearance(touch_baseline, "native touch baseline")
-    touch = scroll_with_native_touch(page)
-    assert touch["settledDistance"] > 100, touch
-    assert touch["settledScrollTop"] < touch["initialScrollTop"], touch
-    assert "pointercancel" in touch["events"] and "scroll" in touch["events"], touch
-    assert touch["events"].index("pointercancel") < touch["events"].index("scroll"), touch
-    touch_settled = settled_geometry(page)
-    assert touch_settled["distanceFromBottom"] == pytest.approx(touch["settledDistance"], abs=8)
-    composer.press("Shift+Enter")
-    touch_grown = settled_geometry(page)
-    assert_reader_anchor(touch_settled, touch_grown, "native touch composer growth")
-    assert abs(touch_grown["overlap"]) <= TOLERANCE
+    # Keep touch input emulated while measuring: ending it resizes touch-sized targets.
+    with native_touch_emulation(page) as touch_session:
+        touch = scroll_with_native_touch(page, touch_session)
+        assert touch["settledDistance"] > 100, touch
+        assert touch["settledScrollTop"] < touch["initialScrollTop"], touch
+        assert "pointercancel" in touch["events"] and "scroll" in touch["events"], touch
+        assert touch["events"].index("pointercancel") < touch["events"].index("scroll"), touch
+        touch_settled = settled_geometry(page)
+        assert touch_settled["distanceFromBottom"] == pytest.approx(
+            touch["settledDistance"], abs=8
+        )
+        composer.press("Shift+Enter")
+        touch_grown = settled_geometry(page)
+        assert_reader_anchor(touch_settled, touch_grown, "native touch composer growth")
+        assert abs(touch_grown["overlap"]) <= TOLERANCE
 
     page.set_viewport_size({"width": 1280, "height": 720})
+    # Rows measured under touch keep their larger message-font heights after
+    # unmounting; reload so the desktop checks start from desktop measurements.
+    page.reload()
+    expect(page.get_by_text("Turn 20 response", exact=False).first).to_be_visible()
+    composer = page.get_by_label("Message the agent")
+    composer.click()
     composer.fill("")
     settled_geometry(page)
     scroll_to_distance_from_bottom(page, 180)
