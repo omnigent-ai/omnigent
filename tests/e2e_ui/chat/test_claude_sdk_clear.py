@@ -7,6 +7,7 @@ while the original keeps its turn and a notice linking to the new session.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 
@@ -14,6 +15,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.chat.test_claude_sdk_terminated_cli_recovery import (
     _create_claude_sdk_session,
 )
@@ -48,7 +50,10 @@ def test_claude_sdk_clear_follows_a_new_empty_session(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
-    """``/clear`` from the composer opens an empty session on the same runner."""
+    """``/clear`` from the composer opens an empty session on the same runner.
+
+    A message sent there gets a reply without the old conversation in view.
+    """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     created: list[str] = []
     try:
@@ -74,6 +79,22 @@ def test_claude_sdk_clear_follows_a_new_empty_session(
         cleared = httpx.get(f"{live_server}/v1/sessions/{cleared_id}").json()
         assert cleared["runner_id"] == runner_id
         assert session_mentions(live_server, source_id, f"/c/{cleared_id}")
+
+        # A turn in the new session starts fresh: the old reply is not there.
+        follow_up = f"clear-follow-up-{uuid.uuid4().hex[:6]}"
+        configure_mock_llm(
+            mock_llm_server_url, [{"text": "fresh two"}] * 20, key=follow_up, match=follow_up
+        )
+        send_and_wait(page, f"Say fresh. {follow_up}", "fresh two")
+        expect(page.locator(ASSISTANT).filter(has_text="ack one")).to_have_count(0)
+        # Nor did the model get the old turn as context.
+        follow_up_requests = [
+            body
+            for body in map(json.dumps, get_mock_requests(mock_llm_server_url))
+            if follow_up in body
+        ]
+        assert follow_up_requests
+        assert not any(token in body for body in follow_up_requests)
     finally:
         for session_id in created:
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
