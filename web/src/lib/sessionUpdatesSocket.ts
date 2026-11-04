@@ -45,8 +45,9 @@ type FrameListener = (frame: SessionUpdatesFrame) => void;
 // threshold rather than hard-coding the literal.
 export const HEARTBEAT_WATCHDOG_MS = 70_000;
 
-// A socket must stay open this long before its close earns the fast retry while
-// hidden, so a server that accepts and then drops every socket still backs off.
+// A socket must stay open this long before its close resets the backoff ramp
+// (and, while hidden, earns the fast retry), so a server that accepts and then
+// drops every socket still backs off.
 export const HEALTHY_CONNECTION_MS = 5_000;
 
 /**
@@ -212,7 +213,6 @@ class SessionUpdatesSocket {
     this.openedAt = null;
     ws.onopen = () => {
       this.openedAt = Date.now();
-      this.failedAttempts = 0;
       this.setConnected(true);
       // Start the silence watchdog: from here we expect at least a
       // heartbeat within the window or we treat the link as dead.
@@ -229,6 +229,9 @@ class SessionUpdatesSocket {
       this.ws = null;
       this.clearWatchdog();
       this.setConnected(false);
+      // Only a connection that stayed up restarts the ramp; one dropped right
+      // after opening keeps backing off instead of redialing every 250 ms.
+      if (wasHealthy) this.failedAttempts = 0;
       if (this.started) this.scheduleReconnect(wasHealthy);
     };
   }

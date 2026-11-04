@@ -1821,7 +1821,8 @@ function WorkspacePanelImpl({
           data-workspace-panel-content
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
         >
-          {showContentSearch && showFilesPanel && !pending && (
+          {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
+          {showContentSearch && showFilesPanel && !pending && !isMobile && (
             <div
               className={cn(
                 "min-h-0 flex-1 flex-col",

@@ -491,7 +491,7 @@ def test_side_chat_model_settings_before_and_after_first_message(
     for resource in ("items", "child_sessions", "resources/terminals"):
         contract.json(f"{path}/{resource}", list_payload([]))
     contract.response(f"{path}/read-state", method="PUT")
-    contract.route(f"**{path}/stream*", lambda route: route.continue_(url=chat.stream.url))
+    contract.route(f"**{path}/stream*", chat.route_stream)
 
     page.goto(chat.url)
     chat.wait_for_stream()
