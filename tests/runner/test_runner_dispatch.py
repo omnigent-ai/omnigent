@@ -2792,6 +2792,7 @@ async def test_runner_os_env_edit_of_a_crlf_file_reverted_outside_leaves_changes
     [
         pytest.param(b"\x89PNG\x00\xff", [1], None, id="binary"),
         pytest.param(b"0123456789\n", [1, 8], None, id="larger-than-the-read-cap"),
+        pytest.param(b"0123456\n", [1, 8], "0123456\n", id="exactly-the-read-cap"),
         pytest.param(b"a\r\nb\r\n", [1, 8], "a\r\nb\r\n", id="complete-text"),
     ],
 )

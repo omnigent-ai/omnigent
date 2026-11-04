@@ -32,7 +32,11 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
+from omnigent.runner.environment_filesystem import (
+    CallerProcessFilesystem,
+    compare_file_beneath,
+    search_indexed_paths,
+)
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import (
     GitFilesystemRegistry,
@@ -1814,13 +1818,25 @@ async def test_diff_endpoint_returns_404_when_file_not_in_registry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_edit_first", [False, True], ids=["saved", "after-a-failed-edit"])
 async def test_changes_drop_a_file_saved_back_to_its_original_content(
     app: FastAPI,
     client: httpx.AsyncClient,
+    workspace: Path,
+    failed_edit_first: bool,
 ) -> None:
     """Saving a file's original content again leaves nothing to review."""
     assert type(app.state.filesystem_registry) is MultiRepositoryFilesystemRegistry
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    original = "hello world"
+    if failed_edit_first:
+        failed = await client.patch(
+            f"{base}/filesystem/hello.txt", json={"old_text": "absent", "new_text": "edited"}
+        )
+        assert failed.is_error, failed.text
+        assert (await client.get(f"{base}/changes")).json()["data"] == []
+        original = "changed outside the app"
+        (workspace / "hello.txt").write_text(original)
 
     edited = await client.put(
         f"{base}/filesystem/hello.txt", json={"content": "edited", "encoding": "utf-8"}
@@ -1830,10 +1846,15 @@ async def test_changes_drop_a_file_saved_back_to_its_original_content(
     assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
     diff = await client.get(f"{base}/diff/hello.txt")
     assert diff.status_code == 200, diff.text
-    assert (diff.json()["before"], diff.json()["after"]) == ("hello world", "edited")
+    assert (diff.json()["before"], diff.json()["after"]) == (original, "edited")
+    if failed_edit_first:
+        # The content the failed edit saw is not the original of the save that followed.
+        (workspace / "hello.txt").write_text("hello world")
+        listed = (await client.get(f"{base}/changes")).json()["data"]
+        assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
 
     reverted = await client.put(
-        f"{base}/filesystem/hello.txt", json={"content": "hello world", "encoding": "utf-8"}
+        f"{base}/filesystem/hello.txt", json={"content": original, "encoding": "utf-8"}
     )
     assert reverted.status_code == 200, reverted.text
 
@@ -1894,6 +1915,7 @@ async def test_changes_report_an_edited_file_deleted_outside_the_session(
 
 @pytest.mark.asyncio
 async def test_changes_drop_a_new_file_deleted_outside_the_session(
+    app: FastAPI,
     client: httpx.AsyncClient,
     workspace: Path,
 ) -> None:
@@ -1905,6 +1927,10 @@ async def test_changes_drop_a_new_file_deleted_outside_the_session(
     assert created.status_code == 200, created.text
     listed = (await client.get(f"{base}/changes")).json()["data"]
     assert [(e["path"], e["status"]) for e in listed] == [("notes.txt", "created")]
+    assert app.state.filesystem_registry.get_baseline("notes.txt") == ""
+    diff = await client.get(f"{base}/diff/notes.txt")
+    assert diff.status_code == 200, diff.text
+    assert (diff.json()["before"], diff.json()["after"]) == (None, "new")
 
     (workspace / "notes.txt").unlink()
 
@@ -3391,6 +3417,57 @@ def test_search_indexed_paths_never_describes_a_symlink(tmp_path: Path) -> None:
     entries = search_indexed_paths(root, ["b-link", "a/b.txt", "b-docs", "real/b.md"], "b")
 
     assert [(e.path, e.type, e.bytes) for e in entries] == [("real/b.md", "file", 2)]
+
+
+@pytest.mark.parametrize(
+    ("on_disk", "grows_by", "requested_sizes", "matches"),
+    [
+        pytest.param(b"another size\n", 0, [], False, id="different-size"),
+        pytest.param(b"original\n", 0, [10], True, id="same-content"),
+        pytest.param(b"original\n", 4, [10], False, id="grows-while-compared"),
+    ],
+)
+def test_compare_file_beneath_reads_at_most_one_byte_past_the_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    on_disk: bytes,
+    grows_by: int,
+    requested_sizes: list[int],
+    matches: bool,
+) -> None:
+    """Only a file of the original's size is read, and never past one extra byte."""
+    target = tmp_path / "notes.md"
+    target.write_bytes(on_disk)
+    root = os.stat(tmp_path)
+    reads: list[int] = []
+    fdopen = os.fdopen
+
+    class _RecordedReads:
+        def __init__(self, handle: BinaryIO) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> _RecordedReads:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            self._handle.close()
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            with target.open("ab") as growth:
+                growth.write(b"x" * grows_by)
+            reads.append(size)
+            return self._handle.read(size)
+
+    monkeypatch.setattr(os, "fdopen", lambda fd, mode: _RecordedReads(fdopen(fd, mode)))
+
+    _, same = compare_file_beneath(
+        tmp_path, "notes.md", b"original\n", root_identity=(root.st_dev, root.st_ino)
+    )
+
+    assert (same, reads) == (matches, requested_sizes)
 
 
 @pytest.mark.asyncio

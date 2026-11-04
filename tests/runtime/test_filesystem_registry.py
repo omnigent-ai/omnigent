@@ -347,6 +347,9 @@ def test_limit_parameter_caps_results(registry: AgentEditFilesystemRegistry) -> 
         pytest.param("created", None, None, None, id="new-file-deleted"),
         pytest.param("deleted", "original\n", b"original\n", None, id="deleted-file-restored"),
         pytest.param("deleted", "original\n", b"other\n", "modified", id="deleted-file-replaced"),
+        pytest.param(
+            "deleted", None, b"original\n", "modified", id="deleted-file-restored-without-baseline"
+        ),
     ],
 )
 def test_changes_follow_edits_made_outside_tool_calls(
@@ -416,23 +419,6 @@ def test_disk_check_can_be_skipped_when_the_runner_cannot_see_the_edits(
     assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == []
 
 
-def test_a_snapshot_taken_after_the_first_change_never_becomes_the_original(
-    registry: AgentEditFilesystemRegistry,
-) -> None:
-    """Once a session changes a file with no snapshot, its original stays unknown."""
-    conv_id = "conv_late_snapshot"
-    (registry.cwd / "notes.md").write_text("original\n")
-    _inject(registry, "notes.md", "modified", conv_id)
-
-    registry.seed_snapshot("notes.md", "written by a tool call\n", session_id=conv_id)
-    _inject(registry, "notes.md", "modified", conv_id)
-
-    listed = registry.list_changed_files(conv_id, limit=10, check_disk=True)
-    assert [(r["path"], r["status"]) for r in listed] == [("notes.md", "modified")]
-    # The diff view has no baseline either, since the late snapshot is not the original.
-    assert registry.get_baseline("notes.md") is None
-
-
 def test_changes_keep_recorded_entries_where_lookups_cannot_be_confined(
     registry: AgentEditFilesystemRegistry,
     monkeypatch: pytest.MonkeyPatch,
@@ -485,12 +471,13 @@ def test_changes_keep_recorded_entries_while_the_workspace_is_gone(
 
 @pytest.mark.parametrize("beneath_supported", [True, False], ids=["dir-fd", "path-fallback"])
 @pytest.mark.parametrize(
-    ("path", "swapped"),
+    ("path", "swapped", "at_open"),
     [
-        pytest.param("notes.md", "notes.md", id="leaf"),
-        pytest.param("docs/notes.md", "docs", id="parent"),
-        pytest.param("notes.md", "", id="workspace"),
-        pytest.param("notes.md", "..", id="ancestor"),
+        pytest.param("notes.md", "notes.md", False, id="leaf"),
+        pytest.param("notes.md", "notes.md", True, id="leaf-at-open"),
+        pytest.param("docs/notes.md", "docs", False, id="parent"),
+        pytest.param("notes.md", "", False, id="workspace"),
+        pytest.param("notes.md", "..", False, id="ancestor"),
     ],
 )
 def test_changes_never_read_through_a_symlink_out_of_the_workspace(
@@ -499,6 +486,7 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
     beneath_supported: bool,
     path: str,
     swapped: str,
+    at_open: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A path swapped for a symlink must not reveal the size, time or content of its target."""
@@ -520,20 +508,34 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
     outside_file.write_text("secret\n")
     os.utime(outside_file, (1_600_000_000, 1_600_000_000))
     swapped_path = workspace.parent if swapped == ".." else workspace / swapped
-    if swapped == "notes.md":
-        swapped_path.unlink()
-        swapped_path.symlink_to(outside_file)
-    else:
-        if swapped == "docs":
-            shutil.rmtree(swapped_path)
+
+    def swap() -> None:
+        if swapped == "notes.md":
+            swapped_path.unlink()
+            swapped_path.symlink_to(outside_file)
         else:
-            swapped_path.rename(tmp_path / "moved")
-        swapped_path.symlink_to(outside, target_is_directory=True)
+            if swapped == "docs":
+                shutil.rmtree(swapped_path)
+            else:
+                swapped_path.rename(tmp_path / "moved")
+            swapped_path.symlink_to(outside, target_is_directory=True)
+
+    if at_open:
+        open_path = os.open
+
+        def swap_then_open(name: object, flags: int, *args: object, **kwargs: object) -> int:
+            if name == "notes.md" and not swapped_path.is_symlink():
+                swap()
+            return open_path(name, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", swap_then_open)
+    else:
+        swap()
 
     with caplog.at_level(logging.DEBUG, logger=filesystem_registry.__name__):
         listed = registry.list_changed_files(conv_id, limit=10, check_disk=True)
 
-    if swapped != "notes.md" or not environment_filesystem._BENEATH_SUPPORTED:
+    if swapped != "notes.md" or at_open or not environment_filesystem._BENEATH_SUPPORTED:
         assert listed == recorded
         assert caplog.messages == [f"could not compare {path} with its original"]
     else:
@@ -740,15 +742,17 @@ def test_get_baseline_returns_none_when_no_snapshot(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("operation,original", [("created", ""), ("modified", None)])
 def test_first_observation_preserves_known_or_unknown_original(
-    tmp_path: Path, operation: str, original: str | None
+    registry: AgentEditFilesystemRegistry, operation: str, original: str | None
 ) -> None:
-    registry = AgentEditFilesystemRegistry(tmp_path)
     assert registry.needs_snapshot("file.txt")
-    registry.record_change("file.txt", operation, "session")
-    registry.seed_snapshot("file.txt", "intermediate", session_id="session")
-    registry.record_change("file.txt", "modified", "session")
+    _inject(registry, "file.txt", operation, "session")
+    registry.seed_snapshot("file.txt", "written by a tool call\n", session_id="session")
+    _inject(registry, "file.txt", "modified", "session")
     assert not registry.needs_snapshot("file.txt")
     assert registry.get_baseline("file.txt") == original
+    # The later snapshot matches the disk but is not the session's original.
+    listed = registry.list_changed_files("session", limit=10, check_disk=True)
+    assert [(r["path"], r["status"]) for r in listed] == [("file.txt", operation)]
     registry.unregister_conversation("session")
     assert registry.needs_snapshot("file.txt")
 

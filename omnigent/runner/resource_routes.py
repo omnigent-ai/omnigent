@@ -76,6 +76,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.entities.environment_filesystem import FilesystemEntry
+    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -1804,6 +1805,39 @@ def register_resource_routes(
             follow_outward_links=follow_outward_links,
         )
 
+    async def _read_original(fs: CallerProcessFilesystem, relative_path: str) -> str | None:
+        """Return *relative_path*'s complete text before an editor save, if it has one."""
+        if filesystem_registry is None:
+            return None
+        try:
+            existing = await fs.read(relative_path, limit=None)
+        except Exception:  # noqa: BLE001
+            return None  # a new or unreadable file has no original to keep
+        if not existing.encoding or existing.truncated:
+            return None
+        return existing.data.decode(existing.encoding, errors="replace")
+
+    def _record_editor_change(
+        session_id: str,
+        environment_id: str,
+        agent_spec: AgentSpec | None,
+        relative_path: str,
+        original: str | None,
+        operation: str,
+    ) -> None:
+        """Record a successful editor save, seeding the *original* it replaced first."""
+        if filesystem_registry is None:
+            return
+        if original is not None:
+            # A file read under another root must not decide reverts in this one.
+            on_disk = _changes_visible_on_disk(
+                session_id, environment_id, agent_spec, filesystem_registry
+            )
+            filesystem_registry.seed_snapshot(
+                relative_path, original, session_id=session_id if on_disk else None
+            )
+        filesystem_registry.record_change(relative_path, operation, session_id)
+
     @app.put(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
@@ -1828,28 +1862,20 @@ def register_resource_routes(
         encoding = body.get("encoding", "utf-8")
         create_parents = body.get("create_parents", True)
         content_bytes = content_str.encode(encoding)
-        try:
-            existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and not existing.truncated and filesystem_registry is not None:
-                # A file read under another root must not decide reverts in this one.
-                on_disk = _changes_visible_on_disk(
-                    session_id, environment_id, agent_spec, filesystem_registry
-                )
-                filesystem_registry.seed_snapshot(
-                    relative_path,
-                    existing.data.decode(existing.encoding, errors="replace"),
-                    session_id=session_id if on_disk else None,
-                )
-        except Exception:  # noqa: BLE001
-            pass
+        original = await _read_original(fs, relative_path)
         result = await fs.write(
             relative_path,
             content_bytes,
             create_parents=create_parents,
         )
-        if filesystem_registry is not None:
-            operation = "created" if result.created else "modified"
-            filesystem_registry.record_change(relative_path, operation, session_id)
+        _record_editor_change(
+            session_id,
+            environment_id,
+            agent_spec,
+            relative_path,
+            original,
+            "created" if result.created else "modified",
+        )
         return JSONResponse(
             status_code=200,
             content={
@@ -1882,20 +1908,7 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
-        try:
-            existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and not existing.truncated and filesystem_registry is not None:
-                # A file read under another root must not decide reverts in this one.
-                on_disk = _changes_visible_on_disk(
-                    session_id, environment_id, agent_spec, filesystem_registry
-                )
-                filesystem_registry.seed_snapshot(
-                    relative_path,
-                    existing.data.decode(existing.encoding, errors="replace"),
-                    session_id=session_id if on_disk else None,
-                )
-        except Exception:  # noqa: BLE001
-            pass
+        original = await _read_original(fs, relative_path)
         body = await request.json()
         edit_req = TextEditRequest(
             old_text=body.get("old_text"),
@@ -1903,8 +1916,9 @@ def register_resource_routes(
             replace_all=body.get("replace_all", False),
         )
         result = await fs.edit_text(relative_path, edit_req)
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        _record_editor_change(
+            session_id, environment_id, agent_spec, relative_path, original, result.operation
+        )
         return JSONResponse(
             status_code=200,
             content={
