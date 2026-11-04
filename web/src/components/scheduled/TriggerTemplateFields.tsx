@@ -296,37 +296,31 @@ export function TriggerTemplateFields({
       <div className="flex flex-col gap-1.5">
         <div className="flex items-center gap-1.5">
           <Label htmlFor="task-trigger-instructions">Instructions for each session</Label>
-          <TooltipProvider>
-            <Tooltip open={warningsOpen} onOpenChange={setWarningsOpen}>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  aria-label="Session instructions warnings"
-                  className="inline-flex size-4 shrink-0 cursor-pointer items-center justify-center rounded-sm text-warning focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  onClick={(event) => {
-                    event.preventDefault();
-                    setWarningsOpen(true);
-                  }}
-                >
-                  <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="top" className="block max-w-xs space-y-2 text-warning">
-                {!toolsProvided && (
+          {!toolsProvided && (
+            <TooltipProvider>
+              <Tooltip open={warningsOpen} onOpenChange={setWarningsOpen}>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Session instructions warnings"
+                    className="inline-flex size-4 shrink-0 cursor-pointer items-center justify-center rounded-sm text-warning focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      setWarningsOpen(true);
+                    }}
+                  >
+                    <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="block max-w-xs space-y-2 text-warning">
                   <p data-testid="task-trigger-tools-note">
                     This only works if the agent has {template.toolsExample} where this task runs.
                     Without one, each run stops and says so in its reply.
                   </p>
-                )}
-                <p data-testid="task-trigger-untrusted-note">
-                  Anyone who can {authorAction} can add instructions that the agent may follow. The
-                  agent runs with your tools and your permissions. Make sure you trust them.
-                  {fields.linkBack &&
-                    ` Link-back posts to ${triggerServiceName(source)} with your account.`}
-                </p>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
         </div>
         <Textarea
           id="task-trigger-instructions"
@@ -350,6 +344,18 @@ export function TriggerTemplateFields({
           {OMNIGENT_ATTRIBUTION}&quot;.
         </p>
       </div>
+
+      <p
+        className="flex items-start gap-1.5 text-sm text-destructive"
+        data-testid="task-trigger-untrusted-note"
+      >
+        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+        <span>
+          Anyone who can {authorAction} may direct the agent using your tools and permissions. Only
+          use trusted sources.
+          {fields.linkBack && ` Links are posted with your ${triggerServiceName(source)} account.`}
+        </span>
+      </p>
 
       {renderedPrompt !== "" && (
         <details className="group" data-testid="task-trigger-preview">

@@ -136,9 +136,10 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   that the free-text condition is evaluated before session creation. An empty
   condition blocks saving. Toggle the link checkbox below the trigger and check
   that only the comment or reply step changes. Hover, focus, or tap the warning
-  icon beside Instructions for each session to read the integration and source
-  warnings; Escape dismisses them without closing the modal. The run limit and
-  posting attribution share one note below the instructions.
+  icon beside Instructions for each session to read the integration requirement;
+  Escape dismisses it without closing the modal. The source and link-posting
+  warnings stay visible in red below the instructions. The run limit and posting
+  attribution share one note below the instructions.
 - Manually repeat the three creation entry points at a narrow viewport, use
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
