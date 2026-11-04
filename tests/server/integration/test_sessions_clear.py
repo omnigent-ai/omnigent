@@ -374,6 +374,49 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
     assert not orchestration._session_is_starting(source_id)
 
 
+async def test_claude_sdk_clear_ignores_attachments_in_the_history_it_drops(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file only a native harness can open doesn't stop ``/clear``, which keeps no history.
+
+    The history can hold such a file, e.g. from before the agent was
+    reinstalled as claude-sdk; the empty continuation never sees it.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    report = SqlAlchemyFileStore(db_uri).create(
+        filename="report.xlsx", bytes=16, session_id=source_id
+    )
+    store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_3",
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {"type": "input_file", "file_id": report.id},
+                        {"type": "input_text", "text": "Q3"},
+                    ],
+                ),
+            )
+        ],
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert store.list_items(resp.json()["session_id"]).data == []
+    assert len(clear_requests(live_runner)) == 1
+
+
 @pytest.mark.parametrize("cancelled_during", ["fork", "runner_binding"])
 async def test_a_cancelled_clear_request_still_finishes_the_move(
     client: httpx.AsyncClient,
