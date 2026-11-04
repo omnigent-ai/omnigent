@@ -114,16 +114,18 @@ def _fail_workspace_reads_while_asleep(page: Page, recorder: _SandboxWakeRecorde
 
 def _open_asleep_session(
     request: pytest.FixtureRequest, base_url: str, session_id: str
-) -> tuple[Page, _SandboxWakeRecorder]:
-    """Create the recorded page after setup and patch the session asleep."""
+) -> tuple[Page, _SandboxWakeRecorder, list[Route]]:
+    """Create the recorded page after setup, patch the session asleep and hold its wake."""
     recorder = _SandboxWakeRecorder(session_id)
     page: Page = request.getfixturevalue("page")
     force_host_asleep(page, session_id, host_online=recorder.host_online)
     _fail_workspace_reads_while_asleep(page, recorder)
+    # The rail defaults open, so the panel can request the wake as the page loads.
+    held = hold_wake_requests(page, session_id)
     page.on("request", recorder.on_request)
     page.on("response", recorder.on_response)
     page.goto(f"{base_url}/c/{session_id}")
-    return page, recorder
+    return page, recorder, held
 
 
 def test_opening_files_wakes_asleep_sandbox(
@@ -132,8 +134,7 @@ def test_opening_files_wakes_asleep_sandbox(
 ) -> None:
     """Opening the Workspace rail on Files starts the sandbox and lists its files."""
     base_url, session_id = asleep_session_file
-    page, recorder = _open_asleep_session(request, base_url, session_id)
-    held = hold_wake_requests(page, session_id)
+    page, recorder, held = _open_asleep_session(request, base_url, session_id)
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
     _hold_for_viewer(request, page)
 
