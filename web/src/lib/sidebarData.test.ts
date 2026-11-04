@@ -9,6 +9,7 @@ import {
   sessionRowsPage,
   titleSortKey,
 } from "./sidebarData";
+import { titleToken } from "@/test/sidebarMockHelpers";
 
 const row = (id: string, updated_at: number): Conversation => ({
   id,
@@ -19,13 +20,6 @@ const row = (id: string, updated_at: number): Conversation => ({
   labels: {},
   permission_level: 4,
 });
-
-/** The server's ``sort_by=title`` continuation token for a row. */
-const titleToken = (session: Conversation) => {
-  const json = JSON.stringify([titleSortKey(session.title), session.id]);
-  const binary = String.fromCharCode(...new TextEncoder().encode(json));
-  return `title.${btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
-};
 
 describe("scope merge", () => {
   it("buffers rows below the shallower tail until both scopes advance", () => {

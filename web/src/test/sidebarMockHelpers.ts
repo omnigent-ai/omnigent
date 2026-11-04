@@ -3,6 +3,7 @@ import { vi } from "vitest";
 import type { Conversation, useConversations } from "@/hooks/useConversations";
 import type { SidebarListQuery } from "@/hooks/useSidebarData";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
+import { titleSortKey } from "@/lib/sidebarData";
 
 export function conversationHooksMock() {
   return {
@@ -50,6 +51,13 @@ export function conversationHooksMock() {
     fetchProjectSessionIds: () => Promise.resolve([]),
     PROJECT_LABEL_KEY,
   };
+}
+
+/** The server's ``sort_by=title`` continuation token for a session at its current title. */
+export function titleToken(session: Pick<Conversation, "id" | "title">): string {
+  const json = JSON.stringify([titleSortKey(session.title), session.id]);
+  const binary = String.fromCharCode(...new TextEncoder().encode(json));
+  return `title.${btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
 }
 
 export function conversation(id: string, partial: Partial<Conversation> = {}): Conversation {

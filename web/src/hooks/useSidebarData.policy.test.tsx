@@ -17,6 +17,7 @@ import {
   PINNED_LABEL_KEY,
 } from "@/lib/sessionListCache";
 import { sessionRowsPage, type ScopeCacheData } from "@/lib/sidebarData";
+import { titleToken } from "@/test/sidebarMockHelpers";
 import type { Session } from "@/lib/types";
 import type * as IdentityModule from "@/lib/identity";
 import {
@@ -88,12 +89,6 @@ const response = (rows: Conversation[], more = false) => ({
   ok: true,
   json: async () => sessionRowsPage(rows, more),
 });
-/** The server's ``sort_by=title`` continuation token for a row titled by its id. */
-const titleToken = (id: string) =>
-  `title.${btoa(JSON.stringify([`0${id}`, id]))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "")}`;
 beforeEach(() => {
   groupingUi = false;
   titleSort = true;
@@ -120,7 +115,7 @@ beforeEach(() => {
     );
     if (pinned) next.labels[PINNED_LABEL_KEY] = "1";
     const page = sessionRowsPage([next], !pinned && !p.has("after"));
-    if (p.get("sort_by") === "title") page.last_id = titleToken(next.id);
+    if (p.get("sort_by") === "title") page.last_id = titleToken(next);
     return { ok: true, json: async () => page };
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -537,7 +532,7 @@ it.each([
     // Each next page sends the previous page's cursor back unchanged, a token under Name.
     const continuations = listCalls("mine").flatMap(([url]) => params(url).getAll("after"));
     expect(new Set(continuations)).toEqual(
-      new Set([sortBy === "title" ? titleToken("mine") : "mine"]),
+      new Set([sortBy === "title" ? titleToken(row("mine")) : "mine"]),
     );
     expect(client.getQueryData(["conversations", "", false, null, "mine", sortBy])).toBeDefined();
     expect(client.getQueryData(["conversations", "", false, null, "mine"])).toBeDefined();
