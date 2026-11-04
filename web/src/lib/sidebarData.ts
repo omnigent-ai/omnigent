@@ -134,7 +134,10 @@ function scopeTail(rows: Conversation[], cursor: string | null | undefined) {
   }
 }
 
-/** Only the merged prefix above both unfinished scopes' tails is complete. */
+/**
+ * Only the merged prefix above both unfinished scopes' tails is complete.
+ * Under Name, `watermark` is a position: only its `id` and folded `title` are meaningful.
+ */
 export function mergeScopeRows(
   mine: Conversation[],
   shared: Conversation[],

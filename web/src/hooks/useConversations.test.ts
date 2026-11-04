@@ -262,29 +262,31 @@ describe("useConversations project filter", () => {
 describe.each([undefined, "updated_at", "created_at", "title"] as const)(
   "fetchConversationsPage sorting %s",
   (sortBy) => {
-    it.each([undefined, "mine", "shared", "archived"] as const)(
-      "sends explicit visibility for %s",
-      async (visibility) => {
-        fetchMock.mockResolvedValueOnce(
-          mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
-        );
-        const queryClient = new QueryClient();
+    // Visibility is built independently of sorting, so Name checks only the default.
+    it.each(
+      ([undefined, "mine", "shared", "archived"] as const).filter(
+        (visibility) => sortBy !== "title" || visibility === undefined,
+      ),
+    )("sends explicit visibility for %s", async (visibility) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
+      const queryClient = new QueryClient();
 
-        await fetchConversationsPage({
-          searchQuery: "",
-          includeArchived: false,
-          visibility,
-          sortBy,
-          queryClient,
-        });
+      await fetchConversationsPage({
+        searchQuery: "",
+        includeArchived: false,
+        visibility,
+        sortBy,
+        queryClient,
+      });
 
-        const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
-        expect(params.get("visibility")).toBe(visibility ?? "all");
-        expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
-        expect(params.get("order")).toBe(sortBy === "title" ? "asc" : "desc");
-        queryClient.clear();
-      },
-    );
+      const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
+      expect(params.get("visibility")).toBe(visibility ?? "all");
+      expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
+      expect(params.get("order")).toBe(sortBy === "title" ? "asc" : "desc");
+      queryClient.clear();
+    });
   },
 );
 

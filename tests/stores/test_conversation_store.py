@@ -3245,6 +3245,13 @@ def test_title_sort_key_follows_every_title_write(
     """Each write path that sets a title also stores the matching Name key."""
     created = conversation_store.create_conversation(title="Plan B")
     untitled = conversation_store.create_conversation()
+    bundled = conversation_store.create_session_with_agent(
+        agent_id="7a1e2d3c4b5a49688f7e6d5c4b3a2918",
+        agent_name="bundled-agent",
+        agent_bundle_location="7a1e2d3c4b5a49688f7e6d5c4b3a2918/bundle1",
+        agent_description=None,
+        title="Atlas",
+    ).conversation
     child = conversation_store.create_conversation(
         kind="sub_agent", parent_conversation_id=created.id
     )
@@ -3277,6 +3284,7 @@ def test_title_sort_key_follows_every_title_write(
     expected = {
         created.id: "0plan b",
         untitled.id: "1",
+        bundled.id: "0atlas",
         child.id: f"20untitled:{child.id}",
         bundled_child.id: "20scout",
         renamed.id: "0" + "q" * 511,
