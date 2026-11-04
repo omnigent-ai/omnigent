@@ -233,6 +233,79 @@ async def test_deleting_the_original_during_the_handoff_never_strands_the_contin
 
 
 @pytest.mark.parametrize("command", COMMANDS)
+async def test_refuses_input_sent_while_it_moves_the_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """A message, skill, ``/compact`` or repeated command sent mid-move is refused.
+
+    Another tab acts while the move is under way: during ``/clear``'s release,
+    or while the runner sets the rewound session up (``/rewind`` frees no
+    client). The message, skill or compact (an SDK compact runs a turn) would
+    otherwise run in the original chat while viewers follow the new one, and
+    the repeated command would fork again. The first command still completes,
+    and the guard ends with it.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    turns_sent: list[httpx.Response] = []
+    repeated: list[httpx.Response] = []
+
+    async def act_from_another_tab() -> None:
+        # Only the first move acts; an unguarded repeat must not recurse.
+        live_runner.on_clear = live_runner.on_session_init = None
+        repeated.append(await continue_session(client, store, source_id, command))
+        for turn_input in (_MESSAGE_INPUT, _SKILL_INPUT, _COMPACT_INPUT):
+            turns_sent.append(
+                await client.post(f"/v1/sessions/{source_id}/events", json=turn_input)
+            )
+
+    if command == "clear":
+        live_runner.on_clear = act_from_another_tab
+    else:
+        live_runner.on_session_init = act_from_another_tab
+    before = len((await client.get("/v1/sessions")).json()["data"])
+
+    resp = await continue_session(client, store, source_id, command)
+
+    assert resp.is_success, resp.text
+    new_id = resp.json()["session_id"]
+    assert [r.status_code for r in turns_sent] == [409, 409, 409], [r.text for r in turns_sent]
+    assert all("moving to a new session" in r.text for r in turns_sent)
+    assert [body for _path, body in live_runner.posts if body.get("type") == "compact"] == []
+    assert [r.status_code for r in repeated] == [409], repeated[0].text
+    assert "already moving" in repeated[0].text
+    # Only the first command released a client or made a session.
+    assert len([b for _path, b in live_runner.posts if b.get("type") == "clear"]) == (
+        1 if command == "clear" else 0
+    )
+    assert len((await client.get("/v1/sessions")).json()["data"]) == before + 1
+    assert not orchestration._session_is_moving(source_id)
+    assert [body for _path, body in live_runner.posts if body.get("type") == "message"] == []
+    assert "Q3" not in message_texts(store, source_id)
+    assert live_runner.superseded == [(source_id, new_id, command)]
+    # The guard ends with the move: the original chat takes messages again.
+    resumed = await client.post(
+        f"/v1/sessions/{source_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "Q4"}]},
+        },
+    )
+    assert resumed.status_code < 300, resumed.text
+    compacted = await client.post(f"/v1/sessions/{source_id}/events", json=_COMPACT_INPUT)
+    assert compacted.status_code < 300, compacted.text
+    assert [body for _path, body in live_runner.posts if body.get("type") == "compact"] == [
+        {"type": "compact"}
+    ]
+    assert not orchestration._session_is_starting(source_id)
+
+
+@pytest.mark.parametrize("command", COMMANDS)
 async def test_a_continuation_that_fails_after_runner_setup_leaves_nothing_behind(
     client: httpx.AsyncClient,
     db_uri: str,

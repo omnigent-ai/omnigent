@@ -48,14 +48,12 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 from tests._helpers.polling import poll_until_async
 from tests.server.helpers import create_test_agent
 from tests.server.integration._session_continuation import (
-    _COMPACT_INPUT,
     _EDITOR,
     _HOST_ID,
     _MESSAGE_INPUT,
     _OWNER,
     _READER,
     _RUNNER_ID,
-    _SKILL_INPUT,
     LiveRunner,
     bind_to_host,
     create_placed_session,
@@ -290,75 +288,6 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert live_runner.superseded == [(source_id, new_id, "clear")]
     # Listed in the owner's other tabs once placed.
     assert new_id in live_runner.announced
-
-
-async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_session(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A message, skill, ``/compact`` or second ``/clear`` sent mid-move is refused.
-
-    Each arrives after the release. The message, skill or compact (an SDK
-    compact runs a turn) would otherwise run in the original chat while
-    viewers follow the new, empty one; the second clear would release and fork
-    again. The first clear still completes, and the guard ends with it.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store)
-    sent: list[httpx.Response] = []
-    second_clear: list[httpx.Response] = []
-
-    async def act_from_another_tab() -> None:
-        # Only the first release acts; a second clear reaching its own release
-        # (when unguarded) must not recurse.
-        live_runner.on_clear = None
-        second_clear.append(
-            await client.post(
-                f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
-            )
-        )
-        for turn_input in (_MESSAGE_INPUT, _SKILL_INPUT, _COMPACT_INPUT):
-            sent.append(await client.post(f"/v1/sessions/{source_id}/events", json=turn_input))
-
-    live_runner.on_clear = act_from_another_tab
-    before = len((await client.get("/v1/sessions")).json()["data"])
-
-    resp = await client.post(
-        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
-    )
-
-    assert resp.status_code == 202, resp.text
-    new_id = resp.json()["session_id"]
-    assert [response.status_code for response in sent] == [409, 409, 409], [r.text for r in sent]
-    assert all("moving to a new session" in response.text for response in sent)
-    assert [body for _path, body in live_runner.posts if body.get("type") == "compact"] == []
-    assert [response.status_code for response in second_clear] == [409], second_clear[0].text
-    assert "already moving" in second_clear[0].text
-    assert len(clear_requests(live_runner)) == 1
-    assert len((await client.get("/v1/sessions")).json()["data"]) == before + 1
-    assert not orchestration._session_is_moving(source_id)
-    started = [body for path, body in live_runner.posts if body.get("type") == "message"]
-    assert started == []
-    assert "Q3" not in message_texts(store, source_id)
-    assert live_runner.superseded == [(source_id, new_id, "clear")]
-    # The guard ends with the move: the original chat takes messages again.
-    resumed = await client.post(
-        f"/v1/sessions/{source_id}/events",
-        json={
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": "Q4"}]},
-        },
-    )
-    assert resumed.status_code < 300, resumed.text
-    compacted = await client.post(f"/v1/sessions/{source_id}/events", json=_COMPACT_INPUT)
-    assert compacted.status_code < 300, compacted.text
-    assert [body for _path, body in live_runner.posts if body.get("type") == "compact"] == [
-        {"type": "compact"}
-    ]
-    assert not orchestration._session_is_starting(source_id)
 
 
 async def test_claude_sdk_clear_ignores_attachments_in_the_history_it_drops(
