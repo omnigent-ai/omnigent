@@ -24,6 +24,8 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
+import { MOBILE_CHOICE_CLASS, MOBILE_CHOICE_LIST_CLASS } from "./mobileChoiceClasses";
 
 interface ExitPlanModeReviewProps {
   /** Plan markdown from the ExitPlanMode tool_input, e.g. `"# Plan\n…"`. */
@@ -65,27 +67,53 @@ export function ExitPlanModeReview({
             className="min-h-20 text-ui"
             componentId="plan.feedback"
           />
-          <div className="flex flex-wrap gap-2">
-            <Button size="sm" onClick={() => onReject(feedback)} componentId="plan.reject">
+          <div className={cn("flex flex-wrap gap-2", MOBILE_CHOICE_LIST_CLASS)}>
+            <Button
+              size="sm"
+              className={MOBILE_CHOICE_CLASS}
+              onClick={() => onReject(feedback)}
+              componentId="plan.reject"
+            >
               <XIcon className="mr-1 size-3.5" />
               Reject plan
             </Button>
-            <Button size="sm" variant="ghost" onClick={() => setRejecting(false)}>
+            <Button
+              size="sm"
+              variant="ghost"
+              className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+              onClick={() => setRejecting(false)}
+            >
               Cancel
             </Button>
           </div>
         </div>
       ) : (
-        <div className="flex flex-wrap gap-2 pt-1">
-          <Button size="sm" onClick={onAcceptAuto} componentId="plan.accept_auto">
+        <div className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}>
+          <Button
+            size="sm"
+            className={MOBILE_CHOICE_CLASS}
+            onClick={onAcceptAuto}
+            componentId="plan.accept_auto"
+          >
             <ZapIcon className="mr-1 size-3.5" />
             Yes, and use auto mode
           </Button>
-          <Button size="sm" variant="outline" onClick={onAccept} componentId="plan.accept_manual">
+          <Button
+            size="sm"
+            variant="outline"
+            className={MOBILE_CHOICE_CLASS}
+            onClick={onAccept}
+            componentId="plan.accept_manual"
+          >
             <CheckIcon className="mr-1 size-3.5" />
             Yes, manually approve edits
           </Button>
-          <Button size="sm" variant="outline" onClick={() => setRejecting(true)}>
+          <Button
+            size="sm"
+            variant="outline"
+            className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+            onClick={() => setRejecting(true)}
+          >
             <XIcon className="mr-1 size-3.5" />
             Reject with feedback
           </Button>
