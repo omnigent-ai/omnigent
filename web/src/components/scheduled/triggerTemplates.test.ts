@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   compileGithubQuery,
   compileJiraJql,
+  describeLinearFilter,
   describeSlackFilter,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
@@ -180,6 +181,38 @@ describe("describeSlackFilter", () => {
     ).toBe(
       'whose text doesn\'t contain "resolved", that are about a production outage and not posted by @alerts-bot',
     );
+  });
+});
+
+describe("describeLinearFilter", () => {
+  const filter = (...conditions: TriggerCondition[]) =>
+    describeLinearFilter(fields({ scope: "ENG", conditions }));
+
+  it("joins the rows into one clause, with me as the owner", () => {
+    expect(filter()).toBe("");
+    expect(
+      filter(
+        { field: "label", operator: "is", value: "Bug" },
+        { field: "status", operator: "is_not", value: "Done" },
+        { field: "priority", operator: "is", value: "Urgent" },
+        { field: "project", operator: "is_not", value: "Mobile app" },
+        { field: "creator", operator: "is", value: "Me" },
+        { field: "text", operator: "not_contains", value: "flaky" },
+      ),
+    ).toBe(
+      'that have label "Bug", don\'t have status "Done", have priority "Urgent", aren\'t in project "Mobile app", were created by you and don\'t have "flaky" in the title or description',
+    );
+  });
+
+  it("describes each assignee row", () => {
+    const assignee = (operator: TriggerCondition["operator"], value = "") =>
+      filter({ field: "assignee", operator, value });
+    expect(assignee("is", "me")).toBe("that are assigned to you");
+    expect(assignee("is_not", "ana@example.com")).toBe(
+      'that aren\'t assigned to "ana@example.com"',
+    );
+    expect(assignee("empty")).toBe("that are unassigned");
+    expect(assignee("not_empty")).toBe("that are assigned to someone");
   });
 });
 
@@ -405,6 +438,44 @@ describe("renderTriggerPrompt", () => {
     );
     expect(unfiltered).toContain("Watch: new Slack messages in #eng-support\n");
     expect(unfiltered).toContain("Every top-level message counts.");
+  });
+
+  it("renders the Linear search, reading every newest-first page before starting sessions", () => {
+    const prompt = renderTriggerPrompt(
+      "linear",
+      fields({
+        scope: "ENG, OPS",
+        conditions: [{ field: "label", operator: "is", value: "Bug" }],
+        instructions: "Investigate the issue.",
+      }),
+      CTX,
+    );
+
+    expect(prompt).toContain(
+      "This automation watches Linear and starts one Omnigent session for each newly created issue that matches.",
+    );
+    expect(prompt).toContain('Watch: new Linear issues in teams ENG, OPS that have label "Bug"');
+    expect(prompt).toContain(
+      'Use your Linear tools to list the issues created in teams ENG, OPS since that time, for example list_issues with team set to each team in turn, createdAt set to that time in ISO 8601 and orderBy "createdAt". Only issues that have label "Bug" count.',
+    );
+    // Linear lists newest first, so a partial read can't checkpoint by the last result.
+    expect(prompt).toContain(
+      "The tool lists newest first: follow the cursor while hasNextPage is true until you have read every page, then work through the results oldest first. If you can't read every page, start no sessions in this run and keep the previous check time.",
+    );
+    expect(prompt).not.toContain("stop at the last result you read");
+    expect(prompt).toContain('title "Linear <issue identifier>"');
+    expect(prompt).toContain(
+      "gives the issue's identifier, link, title and description between <linear-issue> and </linear-issue> lines.",
+    );
+    expect(prompt).toContain(
+      'Comment "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" on each issue you started a session for.',
+    );
+    expect(prompt).toContain("say that this automation needs a Linear MCP server where it runs.");
+
+    const unfiltered = renderTriggerPrompt("linear", fields({ scope: "ENG", conditions: [] }), CTX);
+    expect(unfiltered).toContain("Watch: new Linear issues in team ENG\n");
+    expect(unfiltered).toContain("with team set to that team,");
+    expect(unfiltered).toContain("Every issue counts.");
   });
 
   it("shell-quotes the GitHub example so an apostrophe can't break it", () => {

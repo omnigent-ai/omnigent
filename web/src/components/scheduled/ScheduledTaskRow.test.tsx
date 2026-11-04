@@ -167,3 +167,29 @@ describe("card-body navigation", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 });
+
+describe("last-run failure warning", () => {
+  it.each(["active", "paused"] as const)("shows a red warning on a %s automation", (state) => {
+    renderRow(task({ state, lastRunStatus: "failed" }), {}, { detailPage: true });
+    const warning = screen.getByRole("img", { name: "Last run failed" });
+    expect(warning).toHaveClass("text-status-red");
+    expect(warning).toHaveAttribute("title", "Last run failed");
+    expect(screen.getByTestId("task-row-open")).toHaveAccessibleDescription("Last run failed");
+    expect(screen.getByTestId("task-row-open")).toHaveAttribute("aria-describedby", warning.id);
+    fireEvent.click(warning);
+    expect(navigate).toHaveBeenCalledWith("/tasks/st_1");
+  });
+
+  it.each([null, "succeeded", "running", "skipped"] as const)(
+    "does not warn for %s",
+    (lastRunStatus) => {
+      renderRow(task({ lastRunStatus }));
+      expect(screen.queryByRole("img", { name: "Last run failed" })).toBeNull();
+    },
+  );
+
+  it("also warns when the detail page is disabled", () => {
+    renderRow(task({ state: "paused", lastRunStatus: "failed" }));
+    expect(screen.getByRole("img", { name: "Last run failed" })).toBeInTheDocument();
+  });
+});

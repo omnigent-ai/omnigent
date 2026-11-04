@@ -20,6 +20,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pydantic import BaseModel, ConfigDict
+
+
+class ScheduledRunLogContext(BaseModel):
+    """Occurrence identity retained with a saved prompt across replica changes."""
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    run_id: str
+    task_workspace_id: int
+    scheduled_at: int
+    trigger_key: str | None = None
+    target: str
+    session_mode: str
+
 
 @dataclass
 class ScheduledTask:
@@ -58,10 +74,10 @@ class ScheduledTask:
     :param session_id: The session a ``"continue"`` task sends its prompt to.
         ``None`` until its first firing creates one, unless the owner picked an
         existing session.
-    :param workspace: Absolute existing path where a fired session's connected
-        host runner should start. ``None`` only for legacy or invalid rows.
-    :param base_branch: Reserved legacy column; scheduled tasks currently do
-        not create git worktrees at fire time.
+    :param workspace: Connected-host directory or managed-sandbox repository URL.
+        ``None`` uses the execution target's default workspace.
+    :param base_branch: Create a random worktree from this ref for each new
+        session. ``None`` runs in the selected workspace; ``"HEAD"`` opts in.
     :param execution_target: ``"connected_host"`` for a pinned host, or
         ``"managed_sandbox"`` for a fresh sandbox per occurrence.
     :param host_id: Specific connected host to run on. ``None`` only for legacy

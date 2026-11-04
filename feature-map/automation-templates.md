@@ -1,8 +1,9 @@
 # Automation templates
 
 Automations has Your automations and Templates tabs. The template gallery is
-also previewed when the user has no automations. Selecting a template opens
-the creation modal with its integration settings ready to customize.
+also previewed below Your automations, including when automations already exist.
+Selecting a template opens the creation modal with its integration settings ready
+to customize.
 
 ## Sub-features
 
@@ -10,13 +11,23 @@ the creation modal with its integration settings ready to customize.
   switching preserves the list's search and state filter.
 - `navigation`: Templates is linkable and survives refresh and browser back;
   old template-page links open the Templates tab.
-- `preview`: the empty list shows a template preview; populated lists and
-  filtered-empty lists do not.
-- `create`: a gallery item or empty-state preview opens integration setup;
+- `preview`: empty and populated lists show suggested automations in the All
+  filter with no search; searches and Active/Paused filters hide the preview.
+- `create`: a gallery item or suggested automation opens integration setup;
   New automation opens a blank form.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
-  browsing again; saved paths and sandbox setup are preserved.
+  browsing again; saved paths and sandbox setup are preserved. When the default
+  sandbox provider supplies a repository catalog and the server supports it,
+  sandbox setup shows Repository instead of a folder picker. Provider default
+  leaves the repository unpinned; choosing it on edit clears an existing pin.
+  Switching between a connected host and a sandbox clears incompatible selections.
+  Selecting a Git repository shows the optional Random worktree checkbox. Other
+  directories hide the checkbox and its help text. Older servers do not offer the
+  option. If an enabled setting cannot be verified, its status and a turn-off
+  action remain visible. It defaults off;
+  when on, each new session starts in a fresh worktree from HEAD, and continuing
+  runs reuse that session's worktree. Editing can turn it off again.
 - `harness-settings`: model, effort, and permission controls follow the selected
   harness. Codex and Devin efforts follow the selected model; Pi exposes thinking
   levels. Connected hosts and sandboxes supply their own catalogs. Default keeps
@@ -27,7 +38,7 @@ the creation modal with its integration settings ready to customize.
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
   failures still allow Default.
-- `capabilities`: Jira, Slack, and GitHub templates require session continuity
+- `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `responsive`: gallery items have icons, descriptions, hourly polling summaries,
   access requirements, pointer cursors, and keyboard focus indicators. Desktop
@@ -37,11 +48,15 @@ the creation modal with its integration settings ready to customize.
 
 - **Standalone web:** open Automations from the sidebar, then Templates, or
   follow `/tasks?view=templates`. Old `/tasks/templates` links redirect here.
-- **Empty state:** open Your automations with no saved automations and select
-  a preview beneath the empty-state message.
+- **Your automations:** select a suggestion beneath the saved automations or
+  empty-state message, with All selected and the search cleared.
 - **Creation modal:** click New automation on either tab to start from scratch.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
-  the same connected-host workspace availability applies.
+  the same workspace and sandbox Repository controls apply. Unrelated edits
+  preserve a continued session when the repository is unchanged or a legacy
+  directory pin is cleared. Selecting
+  another repository unlocks model/permission settings for a new session;
+  restoring the saved selection locks them again.
 - **Mobile web:** use the same tabs and creation paths after opening Automations.
 - **Managed embedded:** open Automations through the host navigation; tabs,
   gallery, and modal use the same components under the host's mount path.
@@ -60,7 +75,18 @@ creation round-trip test supplies its own isolated host. No agent turn is needed
   capability gating, and both creation buttons' paths.
 - `web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx` covers offline
   workspace browsing in create/edit setup, disconnect/reconnect, preserving a
-  saved workspace, and sandbox creation with offline connected hosts.
+  saved workspace, and sandbox creation with offline connected hosts. It also
+  covers repository/default selections, legacy edits, target switching, and
+  continued-session setting locks, plus Random worktree on/off in the shared modal.
+- `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
+  uses its own built-SPA browser contract, with a synthetic provider catalog,
+  to cover repository creation, replacement, clearing, and reopening on desktop
+  and mobile. It does not verify actual sandbox execution.
+- In the creation modal, choose a connected host and Git repository, enable
+  Random worktree, save, and reopen Edit to confirm it stayed enabled. Run twice
+  with New session each run and check that the sessions have distinct worktree
+  paths. Disable the option and run again: the new session uses the selected
+  directory. With Continue in the same session, later runs reuse its worktree.
 - Manually repeat the three creation entry points at a narrow viewport, use
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
@@ -69,6 +95,10 @@ creation round-trip test supplies its own isolated host. No agent turn is needed
   harness such as Cursor. Check that only supported settings appear, model changes
   clear unsupported effort choices, and saved selections survive reopening. Repeat
   with a sandbox and an offline connected host; saved overrides remain readable.
+- With a provider catalog, create an automation from New automation or a template,
+  choose the sandbox and a repository, save, and reopen Edit. Change the repository,
+  then select Provider default and save again; reopen to confirm both persist.
+  Repeat through the row menu and detail page, including at a narrow viewport.
 - For managed, repeat in a deployment containing this UI version; local
   standalone evidence does not verify host styling or navigation integration.
 
