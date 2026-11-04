@@ -139,8 +139,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Settings with the session’s host preselected. Host-native entries are limited
   to the active harness; a claude-sdk session on a host lists its Claude servers,
   only the organization-managed ones when its agent sets `skills: none` (or, with a
-  status saying why, when its agent can’t be loaded). A host
-  lookup failure leaves known agent entries visible. It is absent before a session starts and from side chat. When the
+  status saying why, while the session-agent request is loading or after it
+  fails). A host lookup failure leaves known agent entries visible. It is absent before a session starts and from side chat. When the
   server has the MCP registry on, each registry service row also shows its
   account state. States: connected; sign-in required, with an inline **Sign in**
   that runs the popup sign-in and flips the row to connected, or a **Sign in

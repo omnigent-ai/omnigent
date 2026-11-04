@@ -4185,6 +4185,9 @@ describe("Composer MCP status command", () => {
       );
       // A hidden row awaiting sign-in does not keep the panel polling.
       expect(hostPollInterval(hostRows)).toBe(userRowShown ? 5000 : false);
+      // A managed row awaiting sign-in polls whether or not user rows show.
+      const managedSignIn = { ...hostRows[0], auth_status: "sign_in_required" as const };
+      expect(hostPollInterval([managedSignIn])).toBe(5000);
       expect(sessionAgentQueryMock).toHaveBeenCalledWith("conv_mcp");
     },
   );
