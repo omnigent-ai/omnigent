@@ -43,22 +43,19 @@ import {
   harnessAuthableOnHost,
   harnessCredentialFamily,
   harnessInstallableOnHost,
+  MIN_TMUX_VERSION,
   type HarnessCredentialKind,
 } from "@/lib/harnessSetup";
 import { canonicalNativeHarness, harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { ApiError } from "@/lib/sessionsApi";
+import {
+  harnessFixMode,
+  harnessStatus,
+  type HarnessFixMode,
+  type HarnessFixResult,
+} from "@/lib/harnessFix";
 import { cn } from "@/lib/utils";
 import { HarnessCredentialForm } from "@/shell/HarnessCredentialForm";
-
-export type HarnessFixMode = "reconfigure" | "update" | "install" | "switch";
-
-export interface HarnessFixResult {
-  configuredHarnesses: Record<string, boolean | string>;
-  credentialKind?: HarnessCredentialKind;
-  version?: string;
-  gatewayInference?: Record<string, boolean> | null;
-  harnessAccounts?: Record<string, HarnessAccount> | null;
-}
 
 export interface HarnessFixDialogProps {
   open: boolean;
@@ -80,7 +77,16 @@ type Phase =
   | "device-error"
   | "credentials"
   | "setup"
+  | "tmux"
   | "error";
+
+// Phases that each work on the harness's credentials; moving between them on
+// Check again would discard the sign-in the user is in the middle of.
+const AUTH_PHASES: ReadonlySet<Phase> = new Set(["choose", "personal", "isaac", "credentials"]);
+
+// A sign-in on a host without a usable tmux succeeds but leaves tmux as the
+// blocker, so it continues to the tmux step instead of announcing "ready".
+const TMUX_STEP = { mode: "tmux", phase: "tmux" } as const;
 
 type DeviceLoginState =
   { kind: "code"; login: HarnessLoginStart } | { kind: "resuming"; loginId: string } | null;
@@ -96,7 +102,7 @@ interface FinishOptions {
 }
 
 export function HarnessFixDialog(props: HarnessFixDialogProps) {
-  const { open, onOpenChange, mode, host, harness, harnessLabel, onFixed } = props;
+  const { open, onOpenChange, mode: requestedMode, host, harness, harnessLabel, onFixed } = props;
   const hostId = host.host_id;
   const hostName = host.name;
   const queryClient = useQueryClient();
@@ -133,17 +139,24 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
         ? "credentials"
         : "setup";
   const installable = harnessInstallableOnHost(info, harness, host);
+  // Entry phase for a fix mode. ``startsUpdate`` is false when a readiness
+  // change, not the user, lands on "update": show the Update button instead.
+  const phaseForMode = useCallback(
+    (fixMode: HarnessFixMode, startsUpdate = true): Phase => {
+      if (fixMode === "switch") return "confirm";
+      if (fixMode === "tmux") return "tmux";
+      if (!installable && (fixMode === "install" || fixMode === "update")) return "setup";
+      if (fixMode === "update") return startsUpdate ? "progress" : "install";
+      if (fixMode === "install" && !hasCredentialCards) return "install";
+      return credentialChoicePhase;
+    },
+    [credentialChoicePhase, hasCredentialCards, installable],
+  );
+  // The dialog follows readiness as Check again or an install reports it, so the
+  // active mode can move on from the one the dialog was opened with.
+  const [mode, setMode] = useState<HarnessFixMode>(requestedMode);
   const requiresManualSetup = !installable && (mode === "install" || mode === "update");
-  const initialPhase: Phase =
-    mode === "switch"
-      ? "confirm"
-      : requiresManualSetup
-        ? "setup"
-        : mode === "update"
-          ? "progress"
-          : mode === "install" && !hasCredentialCards
-            ? "install"
-            : credentialChoicePhase;
+  const initialPhase = phaseForMode(requestedMode);
 
   const [phase, setPhase] = useState<Phase>(initialPhase);
   const [choice, setChoice] = useState<HarnessCredentialKind>("personal");
@@ -253,6 +266,28 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     setPhase(credentialChoicePhase);
   }, [credentialChoicePhase, mode]);
 
+  // The step that fixes *configured*'s readiness for this harness, or null when
+  // the current phase already addresses it (the user's fix just hasn't landed).
+  const nextStep = useCallback(
+    (configured: Record<string, boolean | string>) => {
+      const nextMode = harnessFixMode(
+        harnessStatus(harness, { ...host, configured_harnesses: configured }).reason,
+      );
+      const nextPhase = phaseForMode(nextMode, false);
+      const samePhase =
+        nextPhase === phase || (AUTH_PHASES.has(nextPhase) && AUTH_PHASES.has(phase));
+      return samePhase ? null : { mode: nextMode, phase: nextPhase };
+    },
+    [harness, host, phase, phaseForMode],
+  );
+
+  const enterStep = useCallback((step: { mode: HarnessFixMode; phase: Phase }) => {
+    setMode(step.mode);
+    setPhase(step.phase);
+    setStillNotReady(false);
+    setUpdatedNeedsSetup(false);
+  }, []);
+
   const start = useCallback(async () => {
     if (requiresManualSetup) {
       setError("");
@@ -276,7 +311,10 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
         });
         return;
       }
-      if (mode === "update") needsSetup();
+      // The CLI is now usable but the host's tmux isn't: the tmux step comes next.
+      const step = nextStep(result.configured_harnesses);
+      if (step?.mode === "tmux") enterStep(step);
+      else if (mode === "update") needsSetup();
       else if (hasCredentialCards) authenticate(choice);
       else setPhase(credentialChoicePhase);
     } catch (reason) {
@@ -285,6 +323,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   }, [
     authenticate,
     choice,
+    enterStep,
     fail,
     finish,
     harness,
@@ -293,6 +332,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     installHarness,
     mode,
     needsSetup,
+    nextStep,
     requiresManualSetup,
   ]);
   const startRef = useRef(start);
@@ -309,15 +349,16 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     setChecking(false);
     setEmailHint("");
     setDeviceLogin(null);
+    setMode(requestedMode);
     setPhase(initialPhaseRef.current);
-    if (mode === "update" && installableRef.current) void startRef.current();
+    if (requestedMode === "update" && installableRef.current) void startRef.current();
     return () => {
       runId.current += 1;
       const loginId = activeLogin.current;
       activeLogin.current = null;
       if (loginId) void cancelHarnessLogin(hostId, harness, loginId).catch(() => undefined);
     };
-  }, [harness, hostId, mode, open]);
+  }, [harness, hostId, requestedMode, open]);
 
   useEffect(() => {
     if (
@@ -356,7 +397,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     setDeviceLogin(null);
     setStillNotReady(false);
     setUpdatedNeedsSetup(false);
-    setPhase(initialPhase);
+    setPhase(phaseForMode(mode));
     if (mode === "update" && installable) void start();
   };
 
@@ -411,7 +452,9 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
           harnessAccounts: result.harness_accounts,
         });
       } else {
-        setStillNotReady(true);
+        const step = nextStep(result.configured_harnesses);
+        if (step) enterStep(step);
+        else setStillNotReady(true);
       }
     } catch (reason) {
       fail(reason, id);
@@ -421,6 +464,10 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   };
 
   const onCredentialStored = (result: StoreCredentialResult) => {
+    if (result.configured_harnesses[harness] === "tmux-unavailable") {
+      enterStep(TMUX_STEP);
+      return;
+    }
     finish({
       configuredHarnesses: result.configured_harnesses,
       announce: false,
@@ -517,6 +564,10 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
           const signedIn = harnessAccounts?.[accountKey];
           const identity = [signedIn?.email, signedIn?.plan].filter(Boolean).join(" · ");
           setDeviceLogin(null);
+          if (configuredHarnesses?.[harness] === "tmux-unavailable") {
+            enterStep(TMUX_STEP);
+            return;
+          }
           finish({
             configuredHarnesses,
             credentialKind: "personal",
@@ -549,7 +600,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
       if (pollAbort.current === controller) pollAbort.current = null;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [accountKey, deviceLogin, finish, harness, harnessLabel, hostId, hostName]);
+  }, [accountKey, deviceLogin, enterStep, finish, harness, harnessLabel, hostId, hostName]);
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -575,7 +626,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
             />
           ) : phase === "install" ? (
             <DialogDescription>
-              Install {harnessLabel} on {hostName}.
+              {mode === "update" ? "Update" : "Install"} {harnessLabel} on {hostName}.
             </DialogDescription>
           ) : phase === "choose" && credentialDecisionPending ? (
             <CredentialDetectionState hostName={hostName} />
@@ -629,6 +680,12 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               hostName={hostName}
               stillNotReady={stillNotReady}
             />
+          ) : phase === "tmux" ? (
+            <TmuxSetup
+              harnessLabel={harnessLabel}
+              hostName={hostName}
+              stillNotReady={stillNotReady}
+            />
           ) : (
             <ProgressState mode={mode} hostName={hostName} harnessLabel={harnessLabel} />
           )}
@@ -651,7 +708,9 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               <Button variant="outline" onClick={() => setOpen(false)}>
                 Cancel
               </Button>
-              <Button onClick={() => void start()}>Install</Button>
+              <Button onClick={() => void start()}>
+                {mode === "update" ? "Update" : "Install"}
+              </Button>
             </>
           ) : phase === "choose" ? (
             <>
@@ -701,7 +760,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               </Button>
               <Button onClick={() => void startDeviceLogin()}>Try again</Button>
             </>
-          ) : phase === "personal" || phase === "isaac" || phase === "setup" ? (
+          ) : phase === "personal" || phase === "isaac" || phase === "setup" || phase === "tmux" ? (
             <>
               <Button variant="outline" onClick={() => setOpen(false)}>
                 Close
@@ -1114,6 +1173,38 @@ function SetupCommand({
   );
 }
 
+function TmuxSetup({
+  harnessLabel,
+  hostName,
+  stillNotReady,
+}: {
+  harnessLabel: string;
+  hostName: string;
+  stillNotReady: boolean;
+}) {
+  return (
+    <>
+      <DialogDescription>
+        {harnessLabel} runs in tmux, which needs version {MIN_TMUX_VERSION} or newer on {hostName}.
+        Install or upgrade tmux there, then check again.
+      </DialogDescription>
+      <CommandRow command="brew install tmux" label="Copy brew install tmux" />
+      <p className="text-sm text-muted-foreground">
+        On macOS, use Homebrew (run{" "}
+        <code className="font-mono text-foreground">brew upgrade tmux</code> if it&apos;s already
+        installed but outdated); on Linux, use your package manager. Check that{" "}
+        <code className="font-mono text-foreground">tmux -V</code> works in a terminal. If Omnigent
+        still can&apos;t find it, quit and reopen the Omnigent app.
+      </p>
+      {stillNotReady && (
+        <p role="status" className="text-sm text-destructive">
+          {harnessLabel} still isn’t ready on {hostName}.
+        </p>
+      )}
+    </>
+  );
+}
+
 function CredentialForms({
   harnessLabel,
   hostName,
@@ -1219,6 +1310,7 @@ function dialogTitle(
   if (phase === "personal") return `Sign in to ${harnessLabel} on ${hostName}`;
   if (phase === "isaac") return `Set up Isaac for ${harnessLabel} on ${hostName}`;
   if (phase === "setup") return `Set up ${harnessLabel} on ${hostName}`;
+  if (phase === "tmux") return `Set up tmux on ${hostName}`;
   if (phase === "error") {
     if (mode === "update") return `Couldn’t update ${harnessLabel}`;
     if (mode === "install") return `Couldn’t install ${harnessLabel}`;
@@ -1230,5 +1322,6 @@ function dialogTitle(
     if (mode === "install") return `Installing ${harnessLabel}…`;
     return `Reconfiguring ${harnessLabel}…`;
   }
+  if (mode === "update") return `Update ${harnessLabel}`;
   return mode === "install" ? `Install ${harnessLabel}` : `Reconfigure ${harnessLabel}`;
 }

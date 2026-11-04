@@ -120,6 +120,24 @@ def test_classify_codex_error_budget_exhausted_not_auth() -> None:
     )
 
 
+def test_classify_codex_error_ip_access_list_refusal_not_auth() -> None:
+    """A workspace IP access list refusal (HTTP 403) is not a sign-in failure.
+
+    Signing in again cannot clear a network policy, so the re-auth status and
+    hint would point the user at the wrong fix.
+    """
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    # Synthetic address, workspace and request id; the wording is the gateway's.
+    acl_message = (
+        "unexpected status 403 Forbidden: Source IP address: 203.0.113.7 is blocked by "
+        "Databricks IP ACL for workspace: 1234567890123456 "
+        "[ReqId: 00000000-0000-4000-8000-000000000000]"
+    )
+    structured_403 = {"codexErrorInfo": {"httpStatusCode": 403}}
+    assert fwd._classify_codex_error(structured_403, acl_message) == generic
+    assert fwd._classify_codex_error({}, acl_message) == generic
+
+
 @pytest.mark.parametrize(
     "request_id",
     [
@@ -974,7 +992,33 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
+@pytest.mark.parametrize(
+    ("message", "expected_output"),
+    [
+        ("model stream broke", "model stream broke"),
+        (
+            "Incomplete response returned, reason: max_output_tokens",
+            "Incomplete response returned, reason: max_output_tokens\n\n"
+            "The model reached its response length limit. Ask it to continue or split "
+            "the request into smaller parts.",
+        ),
+        (
+            "Incomplete response returned, reason: content_filter",
+            "Incomplete response returned, reason: content_filter",
+        ),
+        (
+            "Invalid max_output_tokens configuration",
+            "Invalid max_output_tokens configuration",
+        ),
+        (
+            "Failed to shutdown thread persistence",
+            "Failed to shutdown thread persistence",
+        ),
+    ],
+)
+async def test_post_turn_status_edge_surfaces_generic_error_output(
+    message: str, expected_output: str
+) -> None:
     """A failed edge with a generic error surfaces the message as output.
 
     The reason must reach the server (as ``output``) rather than being dropped;
@@ -986,7 +1030,7 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
         turn_id="turn_123",
         source="turn/completed:turn-error",
         error=fwd._CodexTerminalError(
-            message="model stream broke",
+            message=message,
             kind=fwd._CODEX_ERROR_KIND_GENERIC,
         ),
     )
@@ -998,7 +1042,9 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
     assert body["type"] == "external_session_status"
     data = body["data"]
     assert data["status"] == "failed"
-    assert data["output"] == "model stream broke"
+    assert data["output"] == expected_output
+    assert edge.error is not None
+    assert edge.error.message == message
     # Generic errors do not demand re-auth.
     assert "reauth_required" not in data
 
@@ -1026,6 +1072,37 @@ async def test_post_turn_status_edge_auth_error_includes_reauth_hint() -> None:
     assert data["reauth_required"] is True
     assert "401 Unauthorized" in data["output"]
     assert fwd._CODEX_REAUTH_HINT in data["output"]
+
+
+@pytest.mark.asyncio
+async def test_provider_token_command_failure_posts_without_codex_login_hint(
+    tmp_path: Path,
+) -> None:
+    """A failed model provider token command is not a Codex login problem."""
+    _seed_active_turn(tmp_path, "turn_123")
+    message = (
+        "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+        "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
+        "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools "
+        "access token. Run `isaac` to log in and try again."
+    )
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": message, "codexErrorInfo": "other"},
+        }
+    }
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+    assert edge is not None
+    client = _RecordingClient()
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    data = client.posts[0][1]["data"]
+    assert data["status"] == "failed"
+    assert data["output"] == message
+    assert "reauth_required" not in data
 
 
 @pytest.mark.asyncio

@@ -911,6 +911,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                     </pre>
                   ) : (
                     <FilePathAwareMessageResponse
+                      className="text-message"
                       breaks
                       mode="static"
                       remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
@@ -950,7 +951,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </div>
         )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40">
           {ts && (
             <span
               className="select-none text-[11px] leading-4 text-foreground/56"
@@ -1112,6 +1113,8 @@ function AssistantBubble({
   const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
   const spansFullColumn = isWide || hasError;
   const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
+  // Shrink-wrapped to a short reply, tool rows would cut their titles off mid-column.
+  const hasToolRows = bubble.items.some((it) => it.kind === "tool" || it.kind === "native_tool");
 
   return (
     <>
@@ -1121,12 +1124,17 @@ function AssistantBubble({
         data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
+        className={cn(
+          "mobile-app:gap-0",
+          spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]",
+        )}
       >
         {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
-            (spansFullColumn || foldOnly || hasSubagentNotice) && "w-full",
+            // The final code card has its own margin inside the custom pre wrapper.
+            "mobile-app:[&_.message-markdown>.chat-code-block:last-child>[data-streamdown=code-block]]:mb-0",
+            (spansFullColumn || foldOnly || hasSubagentNotice || hasToolRows) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
         >
@@ -1158,10 +1166,10 @@ function AssistantBubble({
         {!foldOnly && !errorOnly && (
           <div
             className={cn(
-              "flex items-center gap-3 py-1",
+              "flex mobile-app:flex-wrap items-center gap-3 py-1 mobile-app:py-0",
               actionsPersistent
                 ? "opacity-100"
-                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
             )}
           >
             <MessageActions>

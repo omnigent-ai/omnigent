@@ -23,15 +23,18 @@ import shutil
 import signal
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
 import pytest
 import yaml
 
+from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
@@ -69,6 +72,7 @@ def _spawn_host_daemon(
     live_server: str,
     mock_llm_server_url: str,
     interactive_shells: list[str] | None = None,
+    closed_console: str | None = None,
 ) -> _SpawnedHostDaemon:
     """
     Spawn an isolated host daemon for a single host e2e test.
@@ -92,6 +96,7 @@ def _spawn_host_daemon(
     :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
         ``"http://127.0.0.1:12345"``.
     :param interactive_shells: Optional deterministic host inventory for tests.
+    :param closed_console: Standard stream backed by an OS pipe with no reader.
     :returns: The spawned daemon handle and its host_id.
     """
     omni_dir = tmp_path / ".omnigent"
@@ -135,6 +140,19 @@ def _spawn_host_daemon(
             ),
             live_server,
             *interactive_shells,
+        ]
+    if closed_console is not None:
+        command = [
+            runner_executable(),
+            "-c",
+            "import os, runpy, sys; "
+            "descriptor = 1 if sys.argv.pop(1) == 'stdout' else 2; "
+            "reader, writer = os.pipe(); os.close(reader); "
+            "os.dup2(writer, descriptor); os.close(writer); "
+            "runpy.run_module('omnigent.host._daemon_entry', run_name='__main__')",
+            closed_console,
+            "--server",
+            live_server,
         ]
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
@@ -451,11 +469,13 @@ def test_host_name_only_config_generates_host_id(
             proc.wait()
 
 
+@pytest.mark.parametrize("closed_console", [None, "stdout", "stderr"])
 def test_host_launch_runner_and_session_round_trip(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
     mock_llm_server_url: str,
+    closed_console: str | None,
 ) -> None:
     """
     Full golden-path e2e: connect host, upload agent, create
@@ -474,6 +494,7 @@ def test_host_launch_runner_and_session_round_trip(
         tmp_path=tmp_path,
         live_server=live_server,
         mock_llm_server_url=mock_llm_server_url,
+        closed_console=closed_console,
     )
     host_proc = daemon.proc
     host_id = daemon.host_id
@@ -549,6 +570,9 @@ def test_host_launch_runner_and_session_round_trip(
         assert body["status"] == "completed", f"Session failed: {body.get('error')}"
         text = final_assistant_text(body)
         assert marker in text, f"Marker {marker!r} missing from response: {text!r}"
+        if closed_console == "stdout":
+            assert "Host console output is unavailable" in daemon.daemon_log.read_text()
+        assert host_proc.poll() is None
 
     finally:
         host_proc.send_signal(signal.SIGTERM)
@@ -1617,3 +1641,43 @@ def test_host_side_chat_recovers_after_shared_runner_exits(
             except subprocess.TimeoutExpired:
                 daemon.proc.kill()
                 daemon.proc.wait()
+
+
+def test_closed_console_preserves_real_host_auth_rejection(tmp_path: Path) -> None:
+    """An actual rejected upgrade retains the fatal exit code through Python shutdown."""
+    requests: list[str] = []
+
+    class RefusingServer(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            requests.append(self.path)
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), RefusingServer) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        daemon = _spawn_host_daemon(
+            tmp_path=tmp_path,
+            live_server=f"http://127.0.0.1:{server.server_port}",
+            mock_llm_server_url="http://127.0.0.1:9",
+            closed_console="stderr",
+        )
+        try:
+            assert daemon.proc.wait(timeout=45) == HOST_FATAL_EXIT_CODE
+            log = daemon.daemon_log.read_text()
+            assert any(path.endswith("/tunnel") for path in requests)
+            assert "HTTP 403" in log
+            assert "Host console output is unavailable" in log
+            assert "BrokenPipeError" not in log
+        finally:
+            if daemon.proc.poll() is None:
+                daemon.proc.terminate()
+                daemon.proc.wait(timeout=10)
+            server.shutdown()
+            thread.join(timeout=5)

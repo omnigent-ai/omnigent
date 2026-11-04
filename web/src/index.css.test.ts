@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { transform } from "lightningcss";
 import { type ComponentProps, createElement } from "react";
 import { createPortal } from "react-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -635,6 +636,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
     shell.setAttribute("data-android-native", "");
     document.body.appendChild(shell);
     shells.push(shell);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       createElement(
         TooltipProvider,
@@ -675,7 +677,12 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           onShowHiddenChange: () => {},
         }),
       ),
-      { container: shell },
+      {
+        container: shell,
+        // The panel reads session snapshots for its tab labels.
+        wrapper: ({ children }) =>
+          createElement(QueryClientProvider, { client: queryClient }, children),
+      },
     );
     const rail = shell.querySelector<HTMLElement>('aside[aria-label="Workspace"]');
     expect(rail, "the rail <aside> the CSS selector keys on is gone").not.toBeNull();
@@ -1246,6 +1253,34 @@ describe("index.css electron-mac window drag region", () => {
     expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
     unmarkMacShell();
     expect(strip.matches(dragSelector)).toBe(false);
+  });
+});
+
+describe("index.css macOS desktop font smoothing", () => {
+  const SMOOTHING_DECL = /-webkit-font-smoothing\s*:\s*antialiased/;
+  const smoothingRules = cssBlocks
+    .map(([block]) => block)
+    .filter((block) => /-webkit-font-smoothing\s*:/.test(block));
+
+  it("antialiases text only under the macOS desktop shell marker", () => {
+    // Browsers and the other shells keep the platform's default smoothing.
+    expect(smoothingRules.map(selectorOf)).toEqual(["html[data-electron-mac]"]);
+    expect(smoothingRules[0]).toMatch(SMOOTHING_DECL);
+  });
+
+  it("keeps the declaration through build minification", () => {
+    const minified = new TextDecoder().decode(
+      transform({
+        filename: "index.css",
+        code: new TextEncoder().encode(indexCssSource),
+        minify: true,
+        targets: TARGETS,
+      }).code,
+    );
+    const macRootRules = [
+      ...minified.matchAll(/(?:^|\})html\[data-electron-mac\]\{([^}]*)\}/g),
+    ].map(([, body]) => body);
+    expect(macRootRules.some((body) => /-webkit-font-smoothing:antialiased/.test(body))).toBe(true);
   });
 });
 

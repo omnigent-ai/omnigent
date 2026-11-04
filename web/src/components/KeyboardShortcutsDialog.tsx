@@ -22,6 +22,7 @@ import {
   MOD_KEY,
   newSessionShortcutKeys,
   SHIFT_KEY,
+  SPLIT_TERMINAL_KEYS,
   VIEW_MODE_TOGGLE_KEYS,
 } from "@/components/KeyboardShortcut";
 import {
@@ -124,6 +125,14 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     ],
   },
   {
+    title: "Panes",
+    note: "in grids and split terminals",
+    items: [
+      { label: "Focus previous pane", keys: [MOD_KEY, ALT_KEY, SHIFT_KEY, BRACKET_LEFT] },
+      { label: "Focus next pane", keys: [MOD_KEY, ALT_KEY, SHIFT_KEY, BRACKET_RIGHT] },
+    ],
+  },
+  {
     title: "Slash commands",
     note: "while the suggestions menu is open",
     items: [
@@ -153,8 +162,10 @@ function shortcutGroupsFor(
   submitWithModEnter: boolean,
   preventsKeyboardSubmit: boolean,
   contentSearch: boolean,
+  grids: boolean,
+  splitTerminal: boolean,
 ): ShortcutGroup[] {
-  return SHORTCUT_GROUPS.map((group) => {
+  const groups = SHORTCUT_GROUPS.map((group) => {
     if (group.title === "General") {
       return {
         ...group,
@@ -209,8 +220,23 @@ function shortcutGroupsFor(
           ),
       };
     }
+    if (group.title === "Panes") {
+      return {
+        ...group,
+        items: [
+          ...(grids || splitTerminal ? group.items : []),
+          ...(splitTerminal
+            ? [
+                { label: "Split terminal right", keys: SPLIT_TERMINAL_KEYS.columns },
+                { label: "Split terminal down", keys: SPLIT_TERMINAL_KEYS.rows },
+              ]
+            : []),
+        ],
+      };
+    }
     return group;
   });
+  return groups.filter((group) => group.items.length > 0);
 }
 
 /**
@@ -235,6 +261,8 @@ export function KeyboardShortcutsList({
     readSubmitWithModEnter(),
     preventsKeyboardSubmit,
     !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
+    !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
+    !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
   );
   const settings = variant === "settings";
   return (

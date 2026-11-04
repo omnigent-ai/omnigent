@@ -16,7 +16,7 @@ def test_rename_hotkey_from_composer_persists_and_cancels(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The shortcut edits the current title without losing the chat draft."""
+    """With the sidebar closed, the shortcut edits the header title and keeps the draft."""
     base_url, session_id = seeded_session
     original_title = "Session before rename"
     response = httpx.patch(
@@ -29,6 +29,11 @@ def test_rename_hotkey_from_composer_persists_and_cancels(
 
     composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible(timeout=30_000)
+    # An open sidebar takes the edit in the session's row instead.
+    page.get_by_role("button", name="Close sidebar", exact=True).click()
+    expect(page.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
+    # Move the pointer off the toggle so the closed sidebar does not peek open.
+    composer.click()
     composer.fill("Keep this draft while renaming")
     modifier = "Meta" if sys.platform == "darwin" else "Control"
     page.keyboard.press(f"{modifier}+Alt+r")
@@ -49,6 +54,8 @@ def test_rename_hotkey_from_composer_persists_and_cancels(
     expect(composer).to_have_value("Keep this draft while renaming")
     page.reload()
     expect(page.get_by_test_id("header-title")).to_have_text(renamed_title)
+    page.get_by_role("button", name="Close sidebar", exact=True).click()
+    expect(page.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
 
     composer.click()
     page.keyboard.press(f"{modifier}+Alt+r")

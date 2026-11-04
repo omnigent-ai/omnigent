@@ -5,7 +5,7 @@
 // on unmount.
 
 import { renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { useSidebarToggleHotkeys } from "./useSidebarToggleHotkeys";
 
@@ -82,10 +82,19 @@ describe("useSidebarToggleHotkeys", () => {
     expect(onToggleRight).not.toHaveBeenCalled();
   });
 
-  it("ignores auto-repeat (holding the chord doesn't flap the panel)", () => {
+  it("claims but ignores auto-repeat (holding the chord doesn't flap the panel)", () => {
     const { onToggleLeft } = setup(false);
-    press({ ctrlKey: true, altKey: true, repeat: true }, "BracketLeft");
+    const repeated = new KeyboardEvent("keydown", {
+      code: "BracketLeft",
+      ctrlKey: true,
+      altKey: true,
+      repeat: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(repeated);
     expect(onToggleLeft).not.toHaveBeenCalled();
+    expect(repeated.defaultPrevented).toBe(true);
   });
 
   it("ignores AltGraph chords (Ctrl+Alt produced by intl layouts)", () => {
@@ -129,6 +138,52 @@ describe("useSidebarToggleHotkeys", () => {
     document.body.dispatchEvent(ev);
     expect(ev.defaultPrevented).toBe(true);
     expect(stopSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["claims the chord before a focused terminal", "xterm", false, 1, 0],
+    ["leaves the chord to a focused code editor on macOS", "monaco-editor", true, 0, 1],
+    ["toggles from a focused code editor on Win/Linux", "monaco-editor", false, 1, 0],
+  ])("%s", (_name, surfaceClass, isMac, toggles, surfaceKeydowns) => {
+    const { onToggleRight } = setup(isMac);
+    const surface = document.createElement("div");
+    surface.className = surfaceClass;
+    const input = document.createElement("textarea");
+    surface.append(input);
+    document.body.append(surface);
+    onTestFinished(() => surface.remove());
+    input.focus();
+    const onSurfaceKeyDown = vi.fn();
+    input.addEventListener("keydown", onSurfaceKeyDown);
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        code: "BracketRight",
+        ...(isMac ? { metaKey: true } : { ctrlKey: true }),
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+
+    expect(onToggleRight).toHaveBeenCalledTimes(toggles);
+    expect(onSurfaceKeyDown).toHaveBeenCalledTimes(surfaceKeydowns);
+  });
+
+  it("leaves an unset side unclaimed for another binding", () => {
+    const onToggleRight = vi.fn();
+    renderHook(() => useSidebarToggleHotkeys({ onToggleRight }, false));
+    const ev = new KeyboardEvent("keydown", {
+      code: "BracketLeft",
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(false);
+    press({ ctrlKey: true, altKey: true }, "BracketRight");
+    expect(onToggleRight).toHaveBeenCalledTimes(1);
   });
 
   it("unbinds on unmount", () => {

@@ -70,7 +70,7 @@ async def _expect_pending(
         await expect(workspace).to_have_count(0)
     else:
         await expect(workspace).to_have_text("repo")
-        await expect(workspace).to_have_attribute("title", "/work/repo")
+        await expect(workspace).to_have_accessible_name("Working directory: /work/repo")
         await expect(workspace_loading).to_have_count(0)
         if workspace_pending:
             await expect(workspace).to_be_disabled()

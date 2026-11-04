@@ -283,6 +283,14 @@ describe("ErrorBanner", () => {
       "client_update_required",
       "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
     ],
+    [
+      "codex_provider_auth_failed",
+      "Codex couldn't get a token from the model provider's sign-in command on the host.",
+    ],
+    [
+      "harness_not_configured",
+      "The harness isn't set up on the host, so this session can't start.",
+    ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();

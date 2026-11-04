@@ -35,6 +35,8 @@ from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     CAP_HARNESS_ACCOUNTS,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
+    SERVER_CAPABILITIES,
+    SERVER_CAPABILITIES_HEADER,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -327,7 +329,14 @@ def create_host_tunnel_router(
                 )
                 return
 
-        await ws.accept()
+        await ws.accept(
+            headers=[
+                (
+                    SERVER_CAPABILITIES_HEADER.lower().encode("ascii"),
+                    ",".join(SERVER_CAPABILITIES).encode("ascii"),
+                )
+            ]
+        )
         conn: HostConnection | None = None
         host_persisted = False
         stage = "hello"
@@ -763,6 +772,7 @@ def _import_session_queue_payload(total: int, session: HostImportedLocalSession)
         "items": session.items,
         "title": session.title,
         "source": session.source,
+        "archived": session.archived,
     }
 
 

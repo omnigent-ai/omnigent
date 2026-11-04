@@ -1372,8 +1372,8 @@ async def _serve_tunnel_once(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
                             )
-                            # Only the idle watchdog sets shutdown_event; tell the
-                            # server this exit attests no active work.
+                            # Only idle exits (idle watchdog, or a hung-up host's
+                            # finished work) set shutdown_event: attest no active work.
                             await ws.close(code=1000, reason=RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)
                             break
                         try:
@@ -1500,6 +1500,7 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
     from omnigent.host.frames import CAP_MCP_REGISTRY
     from omnigent.inner.native_attachments import (
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
@@ -1515,6 +1516,7 @@ async def _send_hello(
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,
+                    CAP_SIDE_CHAT_SETTINGS,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,

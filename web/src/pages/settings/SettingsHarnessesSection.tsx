@@ -36,15 +36,21 @@ import { BRAND_HARNESSES } from "@/components/onboarding/harnessBrand";
 import {
   HARNESS_CREDENTIAL_COPY,
   harnessInstallableOnHost,
-  harnessReadinessOnHost,
   harnessWarningBadgeText,
+  MIN_TMUX_VERSION,
   missingHarnessCredentialCopy,
   type HarnessCredentialKind,
 } from "@/lib/harnessSetup";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { BackButton, HarnessCatalog } from "./HarnessCatalog";
-import { HarnessFixDialog, type HarnessFixMode } from "./HarnessFixDialog";
+import { HarnessFixDialog } from "./HarnessFixDialog";
+import {
+  applyHarnessFixResult,
+  harnessFixMode,
+  harnessStatus,
+  type HarnessFixMode,
+} from "@/lib/harnessFix";
 import { useSettingsRoute } from "../../shell/settingsNav";
 
 interface HarnessEntry {
@@ -269,22 +275,11 @@ export const SettingsHarnessesSection = () => {
             harnessAccounts,
           }) => {
             const { host: fixedHost, entry } = fixTarget;
-            queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (cachedHosts) =>
-              cachedHosts?.map((cachedHost) =>
-                cachedHost.host_id === fixedHost.host_id
-                  ? {
-                      ...cachedHost,
-                      configured_harnesses: configuredHarnesses,
-                      ...(harnessAccounts !== undefined
-                        ? { harness_accounts: harnessAccounts }
-                        : {}),
-                      ...(gatewayInference !== undefined
-                        ? { gateway_inference: gatewayInference }
-                        : {}),
-                    }
-                  : cachedHost,
-              ),
-            );
+            applyHarnessFixResult(queryClient, fixedHost.host_id, {
+              configuredHarnesses,
+              harnessAccounts,
+              gatewayInference,
+            });
             if (credentialKind) {
               setCredentialKinds((current) => ({
                 ...current,
@@ -379,22 +374,6 @@ function HostSelect({
       </DropdownMenu>
     </div>
   );
-}
-
-/** Readiness of *harness* on *host*, reduced to what the grid and details show. */
-function harnessStatus(harness: string, host: Host | null) {
-  const readiness = harnessReadinessOnHost(harness, host);
-  return {
-    ready: readiness.state === "available" && readiness.reason === "ready",
-    // Only "setup-required" / "broken" are actionable. A host that reports no
-    // readiness (older host → `readiness-unknown`) stays neutral: no badge, no
-    // Set-up button, rather than a false "needs setup" on a working harness.
-    needsSetup: readiness.state === "setup-required" || readiness.state === "broken",
-    reason:
-      readiness.reason === "ready" || readiness.reason === "readiness-unknown"
-        ? null
-        : readiness.reason,
-  };
 }
 
 function credentialPresentation(
@@ -578,7 +557,7 @@ function HarnessCard({
   onFix: (mode: HarnessFixMode) => void;
 }) {
   const status = harnessStatus(entry.harness, host);
-  const mode = fixMode(status.reason);
+  const mode = harnessFixMode(status.reason);
   const canFix = canSetup && !!host && !host.sandbox_provider;
   const opensDetail = status.ready || (status.needsSetup && canFix);
   const navigate = useNavigate();
@@ -672,7 +651,7 @@ function HarnessDetail({
 }) {
   const status = harnessStatus(entry.harness, host);
   const credentialProblem = isCredentialProblem(status.reason);
-  const mode = fixMode(status.reason);
+  const mode = harnessFixMode(status.reason);
   const canFix = canSetup && !!host && !host.sandbox_provider;
   const gateway = host?.gateway_inference?.[entry.harness] === true;
   const account = host?.harness_accounts?.[harnessAccountKey(entry.harness)];
@@ -832,12 +811,6 @@ function HarnessDetail({
   );
 }
 
-function fixMode(reason: string | null): HarnessFixMode {
-  if (reason === "version-too-low") return "update";
-  if (reason === "binary-missing" || reason === "unconfigured") return "install";
-  return "reconfigure";
-}
-
 function isCredentialProblem(reason: string | null): boolean {
   return reason === "needs-auth";
 }
@@ -871,16 +844,21 @@ function HarnessWarning({
   const copy =
     reason === "readiness-error"
       ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
-      : mode === "update"
-        ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
-        : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
-  const action = !installable
-    ? "Set up"
-    : mode === "update"
-      ? "Update"
-      : mode === "install"
-        ? "Install"
-        : "Reconfigure";
+      : mode === "tmux"
+        ? `${entry.name} needs tmux ${MIN_TMUX_VERSION} or newer on ${host.name}. Install or upgrade tmux so new sessions can use ${entry.name}.`
+        : mode === "update"
+          ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
+          : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
+  const action =
+    mode === "tmux"
+      ? "Set up tmux"
+      : !installable
+        ? "Set up"
+        : mode === "update"
+          ? "Update"
+          : mode === "install"
+            ? "Install"
+            : "Reconfigure";
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-ui">
       <div className="flex min-w-0 flex-1 items-start gap-3">

@@ -3,15 +3,20 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
+import { EmbeddedProvider } from "@/lib/embedded";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
+import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
+import { MESSAGE_FONT_SIZE_MOBILE_QUERY, UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -58,7 +63,6 @@ vi.mock("next-themes", () => ({
     setTheme: mocks.setTheme,
   }),
 }));
-vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => mocks.isEmbedded }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
@@ -221,13 +225,24 @@ function LocationProbe() {
 }
 
 function renderPage(path = "/settings") {
+  // The Appearance section lists the agent catalog (picker visibility), so the
+  // page needs a query client like it has in the real app. Retries off so a
+  // failed fetch surfaces as an empty list instead of hanging the test.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const Embed = mocks.isEmbedded ? EmbeddedProvider : Fragment;
   return render(
-    <TooltipProvider>
-      <MemoryRouter initialEntries={[path]}>
-        <SettingsPage />
-        <LocationProbe />
-      </MemoryRouter>
-    </TooltipProvider>,
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <Embed>
+          <MemoryRouter initialEntries={[path]}>
+            <SettingsPage />
+            <LocationProbe />
+          </MemoryRouter>
+        </Embed>
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -259,6 +274,7 @@ afterEach(() => {
   // tests don't leak state into each other.
   localStorage.clear();
   document.documentElement.style.removeProperty("--desktop-ui-font-size");
+  document.documentElement.style.removeProperty("--mobile-message-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
@@ -336,6 +352,7 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 describe("SettingsPage", () => {
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
+    localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
   });
 
   it("groups General settings into titled outlined cards and hides its description on mobile", () => {
@@ -372,6 +389,31 @@ describe("SettingsPage", () => {
 
     expect(toggle).not.toBeChecked();
     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+  });
+
+  it("opens sub-agents full screen by default and persists the panel setting", async () => {
+    renderPage("/settings/general");
+    const toggle = await screen.findByTestId("open-subagents-in-panel-toggle");
+    expect(screen.getByTestId("settings-group-sessions")).toContainElement(toggle);
+    expect(toggle).toHaveAccessibleName("Open sub-agents in the Workspace panel");
+    expect(toggle).not.toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(localStorage.getItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY)).toBe("on");
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY)).toBeNull();
+
+    // A save that storage refuses leaves the switch showing what is stored.
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    const toastError = vi.spyOn(toast, "error").mockImplementation(() => "");
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(toastError).toHaveBeenCalledTimes(1);
   });
 
   it("asks before terminal copying by default and explains the scope", () => {
@@ -493,7 +535,9 @@ describe("SettingsPage", () => {
       "md:hidden",
     );
     expect(
-      screen.getByText("Set text across the interface. Icons and spacing stay fixed."),
+      screen.getByText(
+        "Sets interface text. Conversation text is larger on touch devices and narrow screens. Icons and spacing stay fixed.",
+      ),
     ).toHaveClass("max-md:hidden");
     expect(screen.getByText("Choose how Omnigent looks on this device.")).toHaveClass(
       "max-md:hidden",
@@ -522,22 +566,56 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
-  it("opens the embedded host's theme settings in a new tab", () => {
+  it("offers explicit modes and links the automatic browser mode to Databricks settings", () => {
     mocks.isEmbedded = true;
     const url = "https://workspace.example.com/settings/user/preferences";
     vi.spyOn(host, "getOmnigentThemeSettingsUrl").mockReturnValue(url);
     renderPage("/settings/appearance");
 
-    expect(screen.queryByTestId("theme-system")).not.toBeInTheDocument();
-    for (const name of [
-      "Click to open Databricks user preferences page.",
-      "Open Databricks preferences",
+    for (const [name, value] of [
+      ["Light", "light"],
+      ["Dark", "dark"],
+      ["Use Databricks setting", "system"],
     ]) {
-      const link = screen.getByRole("link", { name });
-      expect(link).toHaveAttribute("href", url);
-      expect(link).toHaveAttribute("target", "_blank");
-      expect(link).toHaveAttribute("rel", "noreferrer");
+      fireEvent.click(
+        within(screen.getByRole("radiogroup", { name: "Mode" })).getByRole("radio", {
+          name,
+        }),
+      );
+      expect(mocks.setTheme).toHaveBeenLastCalledWith(value);
     }
+    const link = screen.getByRole("link", { name: "Databricks appearance settings" });
+    expect(link).toHaveAttribute("href", url);
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noreferrer");
+  });
+
+  it("keeps System, Light and Dark in the embedded Electron app", () => {
+    mocks.isEmbedded = true;
+    Object.defineProperty(window, "omnigentDesktop", {
+      value: { kind: "electron" },
+      configurable: true,
+    });
+    renderPage("/settings/appearance");
+
+    expect(
+      within(screen.getByRole("radiogroup", { name: "Mode" })).getByRole("radio", {
+        name: "System",
+      }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(
+      within(screen.getByRole("radiogroup", { name: "Mode" })).getByRole("radio", {
+        name: "Light",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("radiogroup", { name: "Mode" })).getByRole("radio", {
+        name: "Dark",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Databricks appearance settings" }),
+    ).not.toBeInTheDocument();
   });
 
   it("renders the Terminal theme radiogroup with auto selected by default", () => {
@@ -907,6 +985,92 @@ describe("SettingsPage", () => {
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("14px");
   });
 
+  it("keeps touch message sizes stable through rotation and untouched field blur", () => {
+    let narrow = true;
+    let coarse = true;
+    const widthChanges = new Set<() => void>();
+    const pointerChanges = new Set<() => void>();
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      get matches() {
+        return query === UI_FONT_SIZE_MOBILE_QUERY
+          ? narrow
+          : query === MESSAGE_FONT_SIZE_MOBILE_QUERY && (narrow || coarse);
+      },
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+      addEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChanges.add(callback as () => void);
+        if (query === MESSAGE_FONT_SIZE_MOBILE_QUERY) pointerChanges.add(callback as () => void);
+      },
+      removeEventListener: (_type: unknown, callback: unknown) => {
+        widthChanges.delete(callback as () => void);
+        pointerChanges.delete(callback as () => void);
+      },
+    }));
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-size-input");
+    expect(screen.getByText("Interface 14px · Messages 16px")).toBeInTheDocument();
+    expect(screen.getByText("Interface 14px · Messages 16px")).toHaveAttribute("role", "status");
+    expect(input).toHaveAccessibleDescription("Interface 14px · Messages 16px");
+    act(() => {
+      narrow = false;
+      widthChanges.forEach((callback) => callback());
+    });
+    expect(input).toHaveValue(13);
+    expect(screen.getByText("Interface 13px · Messages 16px")).toBeInTheDocument();
+    act(() => {
+      coarse = false;
+      pointerChanges.forEach((callback) => callback());
+    });
+    expect(screen.getByText("Interface 13px · Messages 13px")).toBeInTheDocument();
+    act(() => {
+      coarse = true;
+      pointerChanges.forEach((callback) => callback());
+    });
+    fireEvent.focus(input);
+    fireEvent.blur(input);
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
+    expect(screen.getByText("Interface 13px · Messages 16px")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    expect(screen.getByText("Interface 14px · Messages 16px")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    expect(screen.getByText("Interface 15px · Messages 17px")).toBeInTheDocument();
+  });
+
+  it("reports the applied message size when saving a font choice fails", () => {
+    localStorage.setItem("omnigent:ui-font-size", "18");
+    let widthChange = () => {};
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      matches: query === MESSAGE_FONT_SIZE_MOBILE_QUERY,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChange = callback as () => void;
+      },
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    renderPage("/settings/appearance");
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    fireEvent.click(screen.getByTestId("ui-font-size-dec"));
+    expect(screen.getByText("Interface 17px · Messages 19px")).toBeInTheDocument();
+    expect(document.documentElement.style.getPropertyValue("--mobile-message-font-size")).toBe(
+      "19px",
+    );
+    act(() => widthChange());
+    expect(screen.getByText("Interface 17px · Messages 19px")).toBeInTheDocument();
+    cleanup();
+    renderPage("/settings/appearance");
+    expect(screen.getByText("Interface 17px · Messages 19px")).toBeInTheDocument();
+  });
+
   it("disables the steppers at the min and max bounds", () => {
     localStorage.setItem("omnigent:ui-font-size", "18");
     renderPage("/settings/appearance");
@@ -988,6 +1152,7 @@ describe("SettingsPage", () => {
       target: { value: "Fira Code" },
     });
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
+    localStorage.setItem("omnigent:hidden-picker-agents", '["polly"]');
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -1055,6 +1220,7 @@ describe("SettingsPage", () => {
       "false",
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
+    expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {

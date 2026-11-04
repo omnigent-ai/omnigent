@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -13,10 +14,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
@@ -36,7 +38,63 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import make_test_terminal_instance
+
+# Stands in for Claude: completes OSC negotiation, reports working, then one report per key.
+_CLAUDE_OSC_PEER_SCRIPT = (
+    "import os,sys,tty\n"
+    "tty.setraw(0)\n"
+    "if sys.argv[1]=='osc':\n"
+    " os.write(1,b'\\x1b]7501;?\\x1b\\\\\\x1b[c')\n"
+    " reply=b''\n"
+    " while not reply.endswith(b'\\x1b\\\\'): reply+=os.read(0,1)\n"
+    " assert reply.startswith(b'\\x1b]7501;?')\n"
+    " reply=b''\n"
+    " while not reply.endswith(b'c'): reply+=os.read(0,1)\n"
+    " os.write(1,b'\\x1b]7501;state=working:app=claude-code\\x07')\n"
+    "reports={b'b':b'state=blocked:kind=permission',b'd':b'state=done',"
+    "b'i':b'state=idle',b'e':b'state=error',b'w':b'state=working',"
+    "b'c':b'state=clear',b'u':b'state=clear',b'x':b'state=idle:id=child',"
+    "b'o':b'state=idle:app=other',b'a':b'state=clear:app=other',"
+    "b'y':b'state=clear:id=child'}\n"
+    "while True:\n"
+    " key=os.read(0,1)\n"
+    " if key==b'q': break\n"
+    " if key==b'r':\n"
+    "  open(sys.argv[2],'w').write(str(tuple(os.get_terminal_size())))\n"
+    "  continue\n"
+    " body=(b'' if key==b'u' else b'app=claude-code:')+reports[key]\n"
+    " os.write(1,b'\\x1b]7501;'+body+b'\\x1b\\\\')\n"
+)
+
+
+def _claude_osc_peer(path: Path, *, error_detail: str | None = None) -> Path:
+    script = _CLAUDE_OSC_PEER_SCRIPT
+    if error_detail is not None:
+        report = b"state=error:msg=" + base64.b64encode(error_detail.encode())
+        script = script.replace("b'e':b'state=error'", f"b'e':{report!r}")
+    path.write_text(script)
+    return path
+
+
+def _claude_osc_spec(
+    tmp_path: Path, peer: Path, protocol: str, sandbox_type: str
+) -> TerminalEnvSpec:
+    return TerminalEnvSpec(
+        command=sys.executable,
+        args=[str(peer), protocol, str(tmp_path / "size")],
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type,
+                read_paths=[str(Path(__file__).resolve().parents[2])],
+                write_paths=[str(tmp_path)],
+            ),
+        ),
+        keep_alive_after_exit=True,
+    )
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
@@ -56,9 +114,14 @@ from tests.runner.helpers import make_test_terminal_instance
     ],
 )
 async def test_claude_program_status_real_launch_and_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str, sandbox_type: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    protocol: str,
+    sandbox_type: str,
 ) -> None:
     """Exercise startup negotiation, raw PTY transport, status arbitration and cleanup."""
+    caplog.set_level(logging.INFO)
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     if protocol == "disabled":
         monkeypatch.setenv("OMNIGENT_FEATURES", "-claude_osc_status")
@@ -66,52 +129,14 @@ async def test_claude_program_status_real_launch_and_fallback(
     sessions = config / "sessions"
     sessions.mkdir(parents=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
-    peer = tmp_path / "peer.py"
-    peer.write_text(
-        "import os,sys,tty\n"
-        "tty.setraw(0)\n"
-        "if sys.argv[1]=='osc':\n"
-        " os.write(1,b'\\x1b]7501;?\\x1b\\\\\\x1b[c')\n"
-        " reply=b''\n"
-        " while not reply.endswith(b'\\x1b\\\\'): reply+=os.read(0,1)\n"
-        " assert reply.startswith(b'\\x1b]7501;?')\n"
-        " reply=b''\n"
-        " while not reply.endswith(b'c'): reply+=os.read(0,1)\n"
-        " os.write(1,b'\\x1b]7501;state=working:app=claude-code\\x07')\n"
-        "reports={b'b':b'state=blocked:kind=permission',b'd':b'state=done',"
-        "b'i':b'state=idle',b'e':b'state=error',b'w':b'state=working',"
-        "b'c':b'state=clear',b'u':b'state=clear',b'x':b'state=idle:id=child',"
-        "b'o':b'state=idle:app=other',b'a':b'state=clear:app=other',"
-        "b'y':b'state=clear:id=child'}\n"
-        "while True:\n"
-        " key=os.read(0,1)\n"
-        " if key==b'q': break\n"
-        " if key==b'r':\n"
-        "  open(sys.argv[2],'w').write(str(tuple(os.get_terminal_size())))\n"
-        "  continue\n"
-        " body=(b'' if key==b'u' else b'app=claude-code:')+reports[key]\n"
-        " os.write(1,b'\\x1b]7501;'+body+b'\\x1b\\\\')\n"
-    )
+    peer = _claude_osc_peer(tmp_path / "peer.py")
     terminals = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminals)
     statuses: list[tuple[str, str | None]] = []
     registry.set_session_status_publisher(
         lambda _, state, reason: statuses.append((state, reason))
     )
-    spec = TerminalEnvSpec(
-        command=sys.executable,
-        args=[str(peer), protocol, str(tmp_path / "size")],
-        os_env=OSEnvSpec(
-            type="caller_process",
-            cwd=str(tmp_path),
-            sandbox=OSEnvSandboxSpec(
-                type=sandbox_type,
-                read_paths=[str(Path(__file__).resolve().parents[2])],
-                write_paths=[str(tmp_path)],
-            ),
-        ),
-        keep_alive_after_exit=True,
-    )
+    spec = _claude_osc_spec(tmp_path, peer, protocol, sandbox_type)
 
     async def wait_status(state: str, reason: str | None = None) -> None:
         async with asyncio.timeout(10):
@@ -158,15 +183,16 @@ async def test_claude_program_status_real_launch_and_fallback(
         assert reader.status.state == "working"
         # A contradictory file and a quiet screen must not override live OSC.
         status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
-        await asyncio.sleep(1.4)  # Real elapsed time, longer than the pane idle threshold.
+        # Real elapsed time, longer than the pane idle threshold.
+        # custom-lint: disable-next=sleep-then-assert -- the fixed window is what's tested
+        await asyncio.sleep(1.4)
         assert statuses == [("running", None)]
-        for key in ("x", "o", "a", "y"):
+        # Child and other-app reports are ignored. The permission report arrives on the
+        # same stream after them, so once it is published they have all been read.
+        for key in ("x", "o", "a", "y", "b"):
             await instance.send(keys=key)
-        await asyncio.sleep(0.3)
-        assert reader.status is not None and reader.status.state == "working"
-        assert statuses == [("running", None)]
-        await instance.send(keys="b")
         await wait_status("running", "permission prompt")
+        assert statuses == [("running", None), ("running", "permission prompt")]
         for source in ("reconnect", "forwarded_idle"):
             before = len(statuses)
             if source == "reconnect":
@@ -180,6 +206,14 @@ async def test_claude_program_status_real_launch_and_fallback(
         for key, state in (("d", "idle"), ("w", "running"), ("i", "idle")):
             await instance.send(keys=key)
             await wait_status(state)
+        for forwarded in ("running", "waiting"):
+            before = len(statuses)
+            registry.note_external_session_status("osc-test", forwarded)
+            async with asyncio.timeout(5):
+                while len(statuses) == before:
+                    await asyncio.sleep(0.02)
+            assert statuses[-1] == ("idle", None)
+            assert not registry.session_turn_is_active("osc-test")
         for key in ("c", "u"):
             await instance.send(keys=key)
             await wait_status("idle")  # Falls back to the still-unchanged status file.
@@ -190,8 +224,27 @@ async def test_claude_program_status_real_launch_and_fallback(
         async with asyncio.timeout(5):
             while reader.status is None or reader.status.state != "error":
                 await asyncio.sleep(0.02)
-        await asyncio.sleep(0.3)  # Longer than a poll, so a published failure would show here.
+        # Receiving the report does not mean the background poller has observed it yet.
+        await poll_until_async(
+            lambda: any(
+                getattr(record, "event_name", None) == "claude_program_error_observed"
+                for record in caplog.records
+            ),
+            timeout_s=5,
+        )
         assert statuses[-1] == ("running", None)
+        observations = [
+            record_to_row(record, source="runner")
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "claude_program_error_observed"
+        ]
+        assert len(observations) == 1
+        assert observations[0]["session_id"] == "osc-test"
+        assert observations[0]["attributes"]["terminal_instance_id"] == instance.diagnostic_id
+        assert (
+            observations[0]["attributes"]["terminal_launch_id"]
+            == instance.lifecycle_trace.launch_id
+        )
         reader.path.unlink()
         reader.path.mkdir()  # Make snapshot replacement fail while the command keeps running.
         await instance.send(keys="b")
@@ -206,6 +259,117 @@ async def test_claude_program_status_real_launch_and_fallback(
         await terminals.shutdown()
     assert reader.status is None
     assert not reader.path.exists()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_detail", [None, "API Error: 499"])
+async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_detail: str | None
+) -> None:
+    """A turn whose StopFailure hook never reaches the runner still ends, failed once."""
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    terminals = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminals)
+    statuses: list[tuple[str, str | None]] = []
+    registry.set_session_status_publisher(
+        lambda _, state, reason: statuses.append((state, reason))
+    )
+    failures: list[tuple[str, str]] = []
+    if error_detail is not None:
+
+        def publish_failure(session_id: str, detail: str) -> None:
+            failures.append((session_id, detail))
+            statuses.append(("failed", None))
+
+        registry.set_session_failure_publisher(publish_failure)
+    spec = _claude_osc_spec(
+        tmp_path, _claude_osc_peer(tmp_path / "peer.py", error_detail=error_detail), "osc", "none"
+    )
+    try:
+        await registry.launch_required_terminal(
+            "osc-test", "claude", "main", spec, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+        )
+        instance = terminals.get("osc-test", "claude", "main")
+        assert instance is not None and instance.program_status is not None
+        poller = registry._status_pollers["osc-test"]
+        raw_status = Mock(wraps=poller._on_status)
+        monkeypatch.setattr(poller, "_on_status", raw_status)
+        async with asyncio.timeout(5):
+            while instance.program_status.child_pid is None:
+                await asyncio.sleep(0.02)
+        await _wait_for_status_edge(statuses, ("running", None))
+        await instance.send(keys="e")
+        # No hook edge arrives, so the runner's grace period is what ends the turn.
+        await _wait_for_status_edge(statuses, ("failed", None), timeout=15)
+        await asyncio.sleep(0.5)
+        assert statuses.count(("failed", None)) == 1
+        assert raw_status.call_args_list.count(call("failed", None)) == int(error_detail is None)
+        assert failures == ([("osc-test", error_detail)] if error_detail is not None else [])
+    finally:
+        await terminals.shutdown()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_claude_osc_error_is_not_failed_again_once_the_hook_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forwarded StopFailure edge ends the turn, so the grace period adds no second failure."""
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    terminals = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminals)
+    statuses: list[tuple[str, str | None]] = []
+    registry.set_session_status_publisher(
+        lambda _, state, reason: statuses.append((state, reason))
+    )
+    spec = _claude_osc_spec(tmp_path, _claude_osc_peer(tmp_path / "peer.py"), "osc", "none")
+    try:
+        await registry.launch_required_terminal(
+            "osc-test", "claude", "main", spec, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+        )
+        instance = terminals.get("osc-test", "claude", "main")
+        assert instance is not None and instance.program_status is not None
+        poller = registry._status_pollers["osc-test"]
+        raw_status = Mock(wraps=poller._on_status)
+        monkeypatch.setattr(poller, "_on_status", raw_status)
+        async with asyncio.timeout(5):
+            while instance.program_status.child_pid is None:
+                await asyncio.sleep(0.02)
+        await _wait_for_status_edge(statuses, ("running", None))
+        await instance.send(keys="e")
+        async with asyncio.timeout(5):
+            while instance.program_status.status is None or (
+                instance.program_status.status.state != "error"
+            ):
+                await asyncio.sleep(0.02)
+        # The StopFailure edge reaches the runner as a terminal edge, clearing the turn.
+        registry.note_external_session_status("osc-test", "failed")
+        await asyncio.sleep(6.0)  # Past the production grace period.
+        assert statuses[-1] == ("running", None)
+        assert ("failed", None) not in statuses
+        assert call("failed", None) not in raw_status.call_args_list
+        epoch = registry.session_activity_epoch("osc-test")
+        before = len(statuses)
+        await instance.send(keys="w")
+        async with asyncio.timeout(5):
+            while len(statuses) == before:
+                await asyncio.sleep(0.02)
+        assert statuses[-1] == ("running", None)
+        assert registry.session_turn_is_active("osc-test")
+        assert registry.session_activity_epoch("osc-test") > epoch
+    finally:
+        await terminals.shutdown()
+
+
+async def _wait_for_status_edge(
+    statuses: list[tuple[str, str | None]], edge: tuple[str, str | None], *, timeout: float = 10
+) -> None:
+    async with asyncio.timeout(timeout):
+        while not statuses or statuses[-1] != edge:
+            await asyncio.sleep(0.02)
 
 
 @pytest.mark.asyncio
@@ -389,6 +553,7 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("codex", "main", tmp_path)
+    registry.set_client_surface("conv_codex", "desktop")
 
     async def _fake_launch(
         conversation_id: str,
@@ -407,7 +572,8 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
         :param kwargs: Additional launch kwargs.
         :returns: The fake terminal instance.
         """
-        del spec, kwargs
+        del kwargs
+        assert spec.env == {"OMNIGENT_CLIENT_SURFACE": "desktop", "KEEP_ME": "present"}
         terminal_registry._by_conversation.setdefault(conversation_id, {})[
             (terminal_name, session_key)
         ] = instance
@@ -436,7 +602,11 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
         "conv_codex",
         "codex",
         "main",
-        TerminalEnvSpec(command="codex", args=["--remote", "ws://127.0.0.1:1234"]),
+        TerminalEnvSpec(
+            command="codex",
+            args=["--remote", "ws://127.0.0.1:1234"],
+            env={"OMNIGENT_CLIENT_SURFACE": "cli", "KEEP_ME": "present"},
+        ),
         resource_role=CODEX_NATIVE_TERMINAL_ROLE,
     )
 
@@ -457,6 +627,8 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     assert record.session_id == "conv_codex"
     assert record.attributes["terminal_id"] == view.id
     assert record.attributes["terminal_instance_id"] == instance.diagnostic_id
+    await registry.cleanup_session("conv_codex")
+    assert registry.client_surface_env("conv_codex") == {"OMNIGENT_CLIENT_SURFACE": "unknown"}
 
 
 @pytest.mark.asyncio
@@ -728,8 +900,9 @@ class _FakeStatusPoller:
     ``sessions/<pid>.json``.
     """
 
-    def __init__(self, on_status: object) -> None:
+    def __init__(self, on_status: object, on_failure: Callable[[str], None] | None = None) -> None:
         self._on_status = on_status
+        self._on_failure = on_failure
         self.active = False
         self.blocked_on: str | None = None
         self.ticks = 0
@@ -750,10 +923,17 @@ class _FakeStatusPoller:
         """Simulate the file reporting a new status."""
         self._on_status(status, blocked_on)
 
+    def emit_failure(self, detail: str) -> None:
+        assert self._on_failure is not None
+        self._on_failure(detail)
+
 
 async def _observe_native_with_fake_poller(
     tmp_path: Path,
     session_id: str,
+    activity_publisher: Callable[[str, str], None] | None = None,
+    *,
+    failure_publisher: Callable[[str, str], None] | None = None,
 ) -> tuple[dict[str, object], list[str], list[_FakeStatusPoller], SessionResourceRegistry]:
     """Observe a claude-native terminal with an injected fake poller.
 
@@ -772,10 +952,21 @@ async def _observe_native_with_fake_poller(
     registry.set_session_status_publisher(
         lambda _sid, status, _reason=None: statuses.append(status)
     )
+    if activity_publisher is not None:
+        registry.set_terminal_activity_publisher(activity_publisher)
+    if failure_publisher is not None:
+        registry.set_session_failure_publisher(failure_publisher)
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
+    def _fake_build(
+        *,
+        session_id: str,
+        instance: object,
+        on_status: object,
+        on_failure: Callable[[str], None],
+        on_replay: Callable[[str, str | None], None],
+    ) -> _FakeStatusPoller:
         del session_id, instance
-        poller = _FakeStatusPoller(on_status)
+        poller = _FakeStatusPoller(on_status, on_failure)
         pollers.append(poller)
         return poller
 
@@ -810,6 +1001,8 @@ async def _observe_native_with_real_poller(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     session_id: str,
+    *,
+    program_status_path: Path | None = None,
 ) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
     """Observe a Claude terminal with a real poller and caller-written status file."""
     config_dir = tmp_path / "claude"
@@ -822,6 +1015,10 @@ async def _observe_native_with_real_poller(
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
+    if program_status_path is not None:
+        from omnigent.terminals.program_status import ProgramStatusReader
+
+        instance.program_status = ProgramStatusReader(program_status_path)
     terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
     watcher = Mock()
     monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
@@ -958,6 +1155,133 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("intervening_event", ["none", "failed-hook", "idle-hook", "new-turn"])
+@pytest.mark.parametrize("with_detail", [False, True])
+async def test_queued_fallback_failure_preserves_newer_turn_state(
+    tmp_path: Path, intervening_event: str, with_detail: bool
+) -> None:
+    """A pending watcher failure must not replace a hook or end a newer turn."""
+    session_id = "conv_queued_failure"
+    failures: list[tuple[str, str]] = []
+    _, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id, failure_publisher=lambda sid, detail: failures.append((sid, detail))
+    )
+    poller = pollers[0]
+    poller.emit("running")
+    await asyncio.sleep(0)
+    if with_detail:
+        poller.emit_failure("API Error: 499")
+    else:
+        poller.emit("failed")
+    if intervening_event != "none":
+        registry.note_external_session_status(
+            session_id, "idle" if intervening_event == "idle-hook" else "failed"
+        )
+    if intervening_event == "new-turn":
+        registry.note_session_turn_started(session_id)
+    await asyncio.sleep(0)
+    assert statuses == (
+        ["running", "failed"] if intervening_event == "none" and not with_detail else ["running"]
+    )
+    assert failures == (
+        [(session_id, "API Error: 499")] if intervening_event == "none" and with_detail else []
+    )
+    assert registry.session_turn_is_active(session_id) == (intervening_event == "new-turn")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "reason", "with_detail"),
+    [
+        ("running", None, False),
+        ("running", "permission prompt", False),
+        ("idle", None, False),
+        ("failed", None, False),
+        ("failed", None, True),
+    ],
+)
+@pytest.mark.parametrize("replacement", [False, True], ids=["removed", "replaced"])
+@pytest.mark.parametrize("queued_first", [False, True], ids=["late-read", "queued-read"])
+async def test_old_terminal_status_cannot_change_its_successor(
+    tmp_path: Path,
+    status: str,
+    reason: str | None,
+    with_detail: bool,
+    replacement: bool,
+    queued_first: bool,
+) -> None:
+    """A stale watcher must not publish or change activity after its terminal leaves."""
+    session_id = "conv_terminal_replaced"
+    failures: list[tuple[str, str]] = []
+    _, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id, failure_publisher=lambda sid, detail: failures.append((sid, detail))
+    )
+    poller = pollers[0]
+    poller.emit("running")
+    await asyncio.sleep(0)
+
+    def emit() -> None:
+        if with_detail:
+            poller.emit_failure("API Error: 499")
+        else:
+            poller.emit(status, reason)
+
+    if queued_first:
+        emit()
+    terminals = registry._terminal_registry
+    assert terminals is not None
+    if replacement:
+        terminals._by_conversation[session_id][("claude", "main")] = make_test_terminal_instance(
+            "claude", "main", tmp_path / "replacement"
+        )
+        registry.note_session_turn_started(session_id)
+    else:
+        terminals._by_conversation[session_id].pop(("claude", "main"))
+        registry.note_external_session_status(session_id, "idle")
+    current_epoch = registry.session_activity_epoch(session_id)
+    if not queued_first:
+        emit()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert failures == []
+    assert registry.session_turn_is_active(session_id) is replacement
+    assert registry.session_activity_epoch(session_id) == current_epoch
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_change", ["none", "removed", "replaced"])
+@pytest.mark.parametrize("queued_first", [False, True], ids=["late-read", "queued-read"])
+async def test_terminal_activity_and_ticks_require_the_observed_instance(
+    tmp_path: Path, terminal_change: str, queued_first: bool
+) -> None:
+    """Old watcher callbacks cannot wake a removed session or inspect its replacement."""
+    session_id = "conv_activity_replaced"
+    activity: list[str] = []
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id, lambda _session_id, terminal_id: activity.append(terminal_id)
+    )
+    poller = pollers[0]
+    poller.active = True
+    on_activity, on_tick = callbacks["on_activity"], callbacks["on_tick"]
+    assert callable(on_activity) and callable(on_tick)
+    if queued_first:
+        on_activity()
+    terminals = registry.terminal_registry
+    if terminal_change == "replaced":
+        terminals._by_conversation[session_id][("claude", "main")] = make_test_terminal_instance(
+            "claude", "main", tmp_path / "replacement"
+        )
+    elif terminal_change == "removed":
+        terminals._by_conversation[session_id].pop(("claude", "main"))
+    if not queued_first:
+        on_activity()
+    on_tick()
+    await asyncio.sleep(0)
+    assert activity == (["terminal_claude_main"] if terminal_change == "none" else [])
+    assert poller.ticks == (1 if terminal_change == "none" else 0)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "poll_before_stop", [False, True], ids=["busy-read-after-stop", "busy-read-before-stop"]
 )
@@ -1025,27 +1349,145 @@ async def test_queued_turn_republishes_running_after_stop(
 
 
 @pytest.mark.asyncio
-async def test_failed_hook_does_not_republish_stale_running_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("source", ["file", "osc"])
+@pytest.mark.parametrize("forwarded", ["running", "waiting"])
+@pytest.mark.parametrize(
+    "intervening", ["none", "failed", "new-turn", "removed", "source-invalidated", "retired"]
+)
+async def test_native_idle_reasserts_a_lost_forwarded_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    forwarded: str,
+    intervening: str,
 ) -> None:
-    """A failed turn stays failed while its busy status file catches up."""
-    session_id = "conv_failed_status"
+    session_id = "conv_lost_idle"
+    program_status_path = tmp_path / "program-status.json" if source == "osc" else None
     on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
-        tmp_path, monkeypatch, session_id
+        tmp_path, monkeypatch, session_id, program_status_path=program_status_path
     )
-    status_file.write_text(
-        json.dumps({"kind": "interactive", "sessionId": "claude-failed-status", "status": "busy"}),
-        encoding="utf-8",
+    if program_status_path is not None:
+        program_status_path.write_text(
+            json.dumps(
+                {
+                    "relay_pid": os.getpid(),
+                    "pid": 123,
+                    "status": {"state": "idle", "app": "claude-code"},
+                }
+            )
+        )
+    else:
+        status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["idle"]
+
+    registry.note_external_session_status(session_id, forwarded)
+    assert registry.session_turn_is_active(session_id)
+    on_tick()
+    if intervening == "failed":
+        registry.note_external_session_status(session_id, "failed")
+    elif intervening == "new-turn":
+        registry.note_session_turn_started(session_id)
+    elif intervening == "removed":
+        registry.terminal_registry._by_conversation[session_id].pop(("claude", "main"))
+    elif intervening == "source-invalidated":
+        if program_status_path is not None:
+            program_status_path.write_text(
+                json.dumps(
+                    {
+                        "relay_pid": os.getpid(),
+                        "pid": 123,
+                        "status": {"state": "error", "app": "claude-code"},
+                    }
+                )
+            )
+        else:
+            modified = status_file.stat().st_mtime_ns + 1_000_000_000
+            status_file.write_text(json.dumps({"kind": "interactive", "status": "unknown"}))
+            os.utime(status_file, ns=(modified, modified))
+        on_tick()
+    elif intervening == "retired":
+        registry._status_pollers[session_id].retire()
+    epoch = registry.session_activity_epoch(session_id)
+    await asyncio.sleep(0)
+    assert statuses == (["idle", "idle"] if intervening == "none" else ["idle"])
+    assert registry.session_activity_epoch(session_id) == epoch
+    assert registry.session_turn_is_active(session_id) == (
+        intervening in {"new-turn", "removed", "source-invalidated", "retired"}
     )
+    if source == "osc" and intervening == "source-invalidated":
+        poller = registry._status_pollers[session_id]
+        after_grace = poller._clock() + 10
+        monkeypatch.setattr(poller, "_clock", lambda: after_grace)
+        on_tick()
+        await asyncio.sleep(0)
+        assert statuses == ["idle", "failed"]
+        assert not registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["file", "osc"])
+@pytest.mark.parametrize("pending_resync", [False, True])
+async def test_failed_hook_does_not_republish_stale_running_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, pending_resync: bool
+) -> None:
+    """A replay cannot clear failure; a native error-to-work transition can."""
+    session_id = "conv_failed_status"
+    program_status_path = tmp_path / "program-status.json" if source == "osc" else None
+    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id, program_status_path=program_status_path
+    )
+
+    def write_state(state: str) -> None:
+        if program_status_path is not None:
+            program_status_path.write_text(
+                json.dumps(
+                    {
+                        "relay_pid": os.getpid(),
+                        "pid": 123,
+                        "status": {"state": state, "app": "claude-code"},
+                    }
+                )
+            )
+        else:
+            status_file.write_text(
+                json.dumps(
+                    {
+                        "kind": "interactive",
+                        "sessionId": "claude-failed-status",
+                        "status": "busy" if state == "working" else state,
+                    }
+                )
+            )
+            modified = status_file.stat().st_mtime_ns + 1_000_000_000
+            os.utime(status_file, ns=(modified, modified))
+
+    write_state("working")
     on_tick()
     await asyncio.sleep(0)
     assert statuses == ["running"]
 
+    if pending_resync:
+        registry.note_external_session_status(session_id, "idle")
     registry.note_external_session_status(session_id, "failed")
     on_tick()
     await asyncio.sleep(0)
     assert statuses == ["running"]
     assert not registry.session_turn_is_active(session_id)
+    epoch = registry.session_activity_epoch(session_id)
+
+    write_state("error" if source == "osc" else "idle")
+    on_tick()
+    await asyncio.sleep(0)
+    settled = ["running"] if source == "osc" else ["running", "idle"]
+    assert statuses == settled
+    write_state("working")
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == [*settled, "running"]
+    assert registry.session_turn_is_active(session_id)
+    assert registry.session_activity_epoch(session_id) > epoch
 
 
 @pytest.mark.asyncio
@@ -1236,8 +1678,89 @@ async def test_required_terminal_exit_after_omnigent_reap_is_expected(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe_error", "omnigent_killed", "closed_outside"),
+    [
+        # A live tmux whose only session was killed.
+        ("no current target", False, True),
+        ("no current target", True, False),
+        # The tmux server itself was killed, e.g. by ``killall tmux``.
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", False, True),
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", True, False),
+    ],
+)
+async def test_required_terminal_exit_names_a_session_killed_outside_omnigent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    probe_error: str,
+    omnigent_killed: bool,
+    closed_outside: bool,
+) -> None:
+    """A Claude session tmux reports killed is outside Omnigent unless Omnigent killed it.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :param monkeypatch: Pytest fixture that stubs the tmux subprocess.
+    :param caplog: Captures the exit-observed telemetry row.
+    :param probe_error: The has-session failure tmux gave once the session was gone.
+    :param omnigent_killed: Whether the stop path's ``kill_session`` ended the pane.
+    :param closed_outside: Expected ``closed_outside_omnigent`` on the exit.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.private_dir.mkdir(parents=True)
+    instance.keep_alive_after_exit = True
+    instance._last_session_probe_error = f"tmux command failed (rc=1): {probe_error}"
+    bridge_dir = tmp_path / "bridge"
+    claude_bridge.write_tmux_target(
+        bridge_dir, socket_path=instance.private_dir / "tmux.sock", tmux_target="main"
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    terminal_registry._by_conversation.setdefault("conv_killed", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_killed"
+    )
+    on_activity = callbacks["on_activity"]
+    on_exit = callbacks["on_exit"]
+    assert callable(on_activity) and callable(on_exit)
+    on_activity()
+    if omnigent_killed:
+        claude_bridge.kill_session(bridge_dir)
+    with caplog.at_level(logging.INFO):
+        on_exit()
+        await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].expected_close is False
+    assert exits[0].closed_outside_omnigent is closed_outside
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    assert record.attributes["terminal_closed_outside_omnigent"] == str(closed_outside).lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_before_exit", [False, True], ids=["current", "superseded"])
 async def test_required_terminal_exit_while_running_is_failure(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, replace_before_exit: bool
 ) -> None:
     """A required terminal that vanishes mid-turn is still a failure.
 
@@ -1269,6 +1792,26 @@ async def test_required_terminal_exit_while_running_is_failure(
     on_activity()
     on_exit = callbacks["on_exit"]
     assert callable(on_exit)
+    if replace_before_exit:
+        replacement = make_test_terminal_instance("claude", "main", tmp_path / "replacement")
+        terminal_registry._by_conversation["conv_run"][("claude", "main")] = replacement
+        replacement_callbacks = await _observe_native_agent_terminal_and_capture(
+            registry, terminal_registry, replacement, "conv_run"
+        )
+        registry.note_session_turn_started("conv_run")
+        on_exit()
+        await registry.wait_for_terminal_exit_cleanup()
+        assert exits == []
+        assert terminal_registry.get("conv_run", "claude", "main") is replacement
+        assert registry.terminal_resource_role("conv_run", "terminal_claude_main") == (
+            CLAUDE_NATIVE_TERMINAL_ROLE
+        )
+        assert registry._terminal_lifecycles[("conv_run", "terminal_claude_main")] == (
+            TerminalLifecycle.REQUIRED
+        )
+        assert registry.session_turn_is_active("conv_run")
+        on_exit = replacement_callbacks["on_exit"]
+        assert callable(on_exit)
     on_exit()
     await asyncio.wait_for(exit_published.wait(), timeout=1.0)
 
@@ -1278,6 +1821,7 @@ async def test_required_terminal_exit_while_running_is_failure(
         record
         for record in caplog.records
         if getattr(record, "event_name", None) == "terminal_exit_observed"
+        and record.attributes["superseded"] is False
     )
     assert record.attributes["session_status_before_exit"] == "running"
 
@@ -2041,9 +2585,16 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
         lambda _sid, status, reason=None: edges.append((status, reason))
     )
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
+    def _fake_build(
+        *,
+        session_id: str,
+        instance: object,
+        on_status: object,
+        on_failure: Callable[[str], None],
+        on_replay: Callable[[str, str | None], None],
+    ) -> _FakeStatusPoller:
         del session_id, instance
-        poller = _FakeStatusPoller(on_status)
+        poller = _FakeStatusPoller(on_status, on_failure)
         pollers.append(poller)
         return poller
 
@@ -2396,14 +2947,16 @@ async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transfer", [False, True])
+@pytest.mark.parametrize("replace_during_tick", [False, True])
 async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     transfer: bool,
+    replace_during_tick: bool,
 ) -> None:
     import omnigent.harnesses.claude_native.bridge as claude_bridge
 
-    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "source")
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "source")
     instance = registry.terminal_registry.get("source", "claude", "main")
     assert instance is not None
     original_bridge = tmp_path / "cli-direct-bridge"
@@ -2421,9 +2974,25 @@ async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge
         assert registry.terminal_registry.get("target", "claude", "main") is instance
     on_tick = callbacks["on_tick"]
     assert callable(on_tick)
+    if replace_during_tick:
+        poller = pollers[-1]
+        original_tick = poller.tick
+
+        def replace_after_read() -> None:
+            original_tick()
+            registry.terminal_registry._by_conversation["target" if transfer else "source"][
+                ("claude", "main")
+            ] = make_test_terminal_instance("claude", "main", tmp_path / "replacement")
+
+        monkeypatch.setattr(poller, "tick", replace_after_read)
     instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
     on_tick()
 
+    if replace_during_tick:
+        acknowledge.assert_not_called()
+        resolve_conversation_bridge.assert_not_called()
+        assert poller.ticks == 1
+        return
     acknowledge.assert_called_once_with(
         original_bridge,
         expected_socket_path=str(instance.socket_path),
