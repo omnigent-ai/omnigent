@@ -8325,12 +8325,7 @@ async function listFailedStartupInputs(
   signal?: AbortSignal,
 ): Promise<FailedInput[]> {
   try {
-    const inputs = await listFailedInputs(conversationId, { signal });
-    forgetUnsentSendSavedAsFailed(conversationId, inputs);
-    // A send awaiting its answer that the server saved is handed back here, so its failure isn't.
-    for (const { itemId } of inputs)
-      if (itemId !== undefined && inFlightSends.has(itemId)) inFlightSends.set(itemId, true);
-    return inputs;
+    return await listFailedInputs(conversationId, { signal });
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) return [];
     throw error;
@@ -8449,6 +8444,10 @@ async function lookUpFailedStartupInputs(
   if (entry.disposed || lookup.superseded()) return true;
   if (inputs === null) return false;
   lookup.read();
+  forgetUnsentSendSavedAsFailed(conversationId, inputs);
+  // A send awaiting its answer that the server saved is handed back here, so its failure isn't.
+  for (const { itemId } of inputs)
+    if (itemId !== undefined && inFlightSends.has(itemId)) inFlightSends.set(itemId, true);
   handBackFailedStartupInputs(entry, conversationId, inputs, unacknowledged);
   return true;
 }

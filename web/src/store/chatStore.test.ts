@@ -23180,6 +23180,59 @@ describe("a send cut off by a reload", () => {
     },
   );
 
+  it("restores a refused untouched resend of a reload's unanswered send that a superseded read listed", async () => {
+    onTestFinished(clearSessionDrafts);
+    seedSession("conv_reload", []);
+    failManagedLaunch("conv_reload", "saved on server");
+    sessionFailedInputs.get("conv_reload")![0]!.item_id = "stable_reload";
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      text: "saved on server",
+      authorId: "user_a",
+    });
+    let answerOlderRead: (() => void) | undefined;
+    let refuseResend: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === "/v1/sessions/conv_reload/failed-inputs" && answerOlderRead === undefined) {
+        const listed = defaultFetchHandler(input, init);
+        return new Promise<Response>((resolve) => {
+          answerOlderRead = () => resolve(listed);
+        });
+      }
+      if (url === "/v1/sessions/conv_reload/events" && refuseResend === undefined)
+        return new Promise<Response>((resolve) => {
+          refuseResend = () => resolve(mockResponse({}, { ok: false, status: 503 }));
+        });
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo("conv_reload");
+    await vi.waitFor(() => expect(answerOlderRead).toBeDefined());
+    expect(takeFailedSendDraft("conv_reload", false, true)?.text).toBe("saved on server");
+    const resend = useChatStore.getState().send("saved on server", "agent_xyz");
+    await vi.waitFor(() => expect(refuseResend).toBeDefined());
+    const [, posted] =
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_reload/events")).at(-1) ??
+      [];
+    expect(JSON.parse(String(posted?.body))).toMatchObject({
+      data: { stable_id: "stable_reload" },
+    });
+
+    // A runner bound meanwhile, so a later Retry reads nothing back.
+    sessionFailedInputs.set("conv_reload", []);
+    await retryFailedStartupLookup("conv_reload");
+    answerOlderRead!();
+    await tick();
+    await tick();
+    expect(peekUnsentSend("conv_reload")?.stableId).toBe("stable_reload");
+
+    refuseResend!();
+    await resend;
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().failedSendDraft?.text).toBe("saved on server"),
+    );
+  });
+
   it("keeps each queued message for the next load until it leaves the queue", async () => {
     seedSession("conv_queue", []);
     await useChatStore.getState().switchTo("conv_queue");
