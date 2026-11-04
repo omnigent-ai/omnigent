@@ -3497,7 +3497,8 @@ function SectionHeader({
           />
         </span>
       ) : null}
-      <span className="min-w-0 truncate">{title}</span>
+      {/* Project folder names sit heavier than their session rows. */}
+      <span className={cn("min-w-0 truncate", icon && "font-medium")}>{title}</span>
       {/* Trailing chevron, rotating on expand. Headers without a leading icon
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}
