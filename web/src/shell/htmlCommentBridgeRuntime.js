@@ -227,7 +227,9 @@
     restoreHide = null;
   }
 
-  function settleScrollRestore() {
+  // `report` saves the offset the page shows when the reader or a comment pick ends the
+  // restore. A spent budget doesn't, so a page that loads slowly keeps the reader's offset.
+  function settleScrollRestore(report) {
     revealPage();
     if (!scrollRestore) return;
     const anchoring = scrollRestore.anchoring;
@@ -241,8 +243,7 @@
     for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
       window.removeEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, true);
     }
-    // Save where the page ended up, so an offset a shorter rewrite can't reach isn't retried.
-    onScroll();
+    if (report) onScroll();
   }
 
   // Keys typed into a form field or editable text move its caret or value, not the page.
@@ -295,7 +296,7 @@
       window.scrollTo({ left: window.scrollX, top: scrollRestore.top, behavior: "instant" });
     }
     if (readerMoved || performance.now() >= scrollRestore.deadline) {
-      settleScrollRestore();
+      settleScrollRestore(readerMoved);
       return;
     }
     scrollRestore.inputs = [];
@@ -356,7 +357,7 @@
   let scrollReportFrame = 0;
   let scrollReportMissed = false;
   function onScroll() {
-    if (scrollRestore && readerMovedDuringRestore()) settleScrollRestore();
+    if (scrollRestore && readerMovedDuringRestore()) settleScrollRestore(true);
     if (scrollRestore || scrollReportFrame) return;
     scrollReportFrame = requestAnimationFrame(function () {
       scrollReportFrame = 0;
@@ -378,7 +379,7 @@
     const viewTop = scrollRestore ? scrollRestore.top : window.scrollY;
     if (top >= viewTop && top + rect.height <= viewTop + vh) return; // already fully visible
     const target = top - vh / 2 + rect.height / 2;
-    settleScrollRestore();
+    settleScrollRestore(true);
     window.scrollTo({ top: target < 0 ? 0 : target, behavior: "smooth" });
   }
 
@@ -537,7 +538,7 @@
           // panel), so list refreshes that keep the same active comment don't
           // yank the reader's scroll position.
           if (nextKey && nextKey !== prevKey) {
-            if (explicit) settleScrollRestore();
+            if (explicit) settleScrollRestore(true);
             scrollActiveIntoView();
           }
         }

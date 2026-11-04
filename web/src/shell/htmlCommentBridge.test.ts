@@ -450,16 +450,16 @@ describe("bridge runtime scroll position", () => {
     const writes = scrollTo.mock.calls.length;
     vi.advanceTimersToNextFrame();
     expect(scrollTo).toHaveBeenCalledTimes(writes);
-    expect(sentScrollOffsets(port)).toEqual([640]);
+    expect(sentScrollOffsets(port)).toEqual([]);
 
     // After the restore settles, the reader's own scrolling is reported again.
     userScrollTo(700);
     vi.advanceTimersToNextFrame();
-    expect(sentScrollOffsets(port)).toEqual([640, 700]);
+    expect(sentScrollOffsets(port)).toEqual([700]);
   });
 
-  it("shows the page short of the saved offset once the budget runs out", () => {
-    fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+  it("shows the page short of the saved offset once the budget runs out, without reporting it", () => {
+    const { scrollTo, setPageHeight } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
     const hide = addRestoreHide();
     const port = startRuntime({ restoreScroll: restoreTo(640) });
     vi.advanceTimersByTime(BUDGET_MS - 20);
@@ -468,9 +468,14 @@ describe("bridge runtime scroll position", () => {
     vi.advanceTimersByTime(40);
     expect(hide.isConnected).toBe(false);
     expect(window.scrollY).toBe(232);
-    // Saving the offset the page reached keeps the next remount from hiding it for a full budget.
+
+    // Content that arrives after the budget leaves the clamp in place, and the parent keeps 640.
+    const writes = scrollTo.mock.calls.length;
+    setPageHeight(2_000);
     vi.advanceTimersToNextFrame();
-    expect(sentScrollOffsets(port)).toEqual([232]);
+    expect(scrollTo).toHaveBeenCalledTimes(writes);
+    expect(window.scrollY).toBe(232);
+    expect(sentScrollOffsets(port)).toEqual([]);
   });
 
   it("re-asserts the saved offset once when a throttled frame lands past the budget", () => {
@@ -487,7 +492,7 @@ describe("bridge runtime scroll position", () => {
     expect(hide.isConnected).toBe(false);
     vi.advanceTimersToNextFrame();
     expect(scrollTo).toHaveBeenCalledTimes(2);
-    expect(sentScrollOffsets(port)).toEqual([640]);
+    expect(sentScrollOffsets(port)).toEqual([]);
   });
 
   it("turns scroll anchoring off until the restore settles, then gives the page its own", () => {

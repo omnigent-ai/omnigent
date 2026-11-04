@@ -204,6 +204,17 @@ _HTML_ARTIFACT = (
     + " 600);</script></body></html>"
 )
 
+# The plan with its later steps arriving after the restore budget, as a slow fetch would.
+_HTML_ARTIFACT_LOADING_SLOWLY = (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Plan</title>"
+    "<style>body{font-family:sans-serif;margin:24px}section{min-height:220px}</style>"
+    "</head><body><h1>Migration plan</h1>"
+    + _plan_steps(1, 8)
+    + "<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', "
+    + json.dumps(_plan_steps(9, 40) + "<p id='loaded'>All steps loaded.</p>")
+    + "), 3000);</script></body></html>"
+)
+
 # The plan rewritten with a CSP that blocks every script, the preview's runtime included.
 _HTML_ARTIFACT_WITHOUT_SCRIPTS = (
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
@@ -328,6 +339,28 @@ def test_html_preview_scroll_survives_tab_switch(
     expect(preview.locator("style[data-omni-restore-hide]")).to_have_count(1)
     preview.locator("#reviewed").click()
     expect(preview.locator("#reviewed")).to_be_checked()
+
+
+def test_html_preview_scroll_survives_slow_load(
+    request: pytest.FixtureRequest,
+    seeded_html_sessions: tuple[str, str, str],
+) -> None:
+    """A preview that loads after the restore budget keeps the reader's offset for the next one."""
+    base_url, session_a, _ = seeded_html_sessions
+    page: Page = request.getfixturevalue("page")
+    offset = _open_html_artifact(page, base_url, session_a)
+    assert offset > 1000
+
+    _seed_file(base_url, session_a, "plan.html", _HTML_ARTIFACT_LOADING_SLOWLY)
+    preview = page.frame_locator(_HTML_PREVIEW)
+    expect(preview.locator("#loaded")).to_be_attached(timeout=15_000)
+    expect(preview.locator("html")).to_have_css("opacity", "1")
+    # The budget ran out while the page was short, so it shows where the clamp left it.
+    assert _settled_html_scroll(page) < offset
+
+    # A rewrite that loads in time reopens where the reader was, not at the clamp.
+    _seed_file(base_url, session_a, "plan.html", _HTML_ARTIFACT)
+    _expect_html_scroll(page, offset)
 
 
 def test_html_preview_scroll_survives_session_switch(
