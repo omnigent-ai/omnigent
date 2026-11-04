@@ -4832,7 +4832,7 @@ async def test_list_session_items_filters_by_item_type(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """``type`` keeps only items of that type; an unknown type is a 422, not a 500."""
+    """``type`` keeps only items of that type, across pages; an unknown type is a 422."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     SqlAlchemyConversationStore(db_uri).append(
@@ -4850,6 +4850,11 @@ async def test_list_session_items_filters_by_item_type(
                     agent="test-agent", name="search", arguments="{}", call_id="call_1"
                 ),
             ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "again"}]),
+            ),
         ],
     )
     items_url = f"/v1/sessions/{session['id']}/items"
@@ -4861,9 +4866,21 @@ async def test_list_session_items_filters_by_item_type(
         ]
         for item_type in ("message", "function_call")
     }
+    # The cursor of a filtered page continues with the next item of that type.
+    first = (await client.get(items_url, params={"type": "message", "limit": 1})).json()
+    second = (
+        await client.get(
+            items_url, params={"type": "message", "limit": 1, "after": first["last_id"]}
+        )
+    ).json()
     bogus = await client.get(items_url, params={"type": "bogus"})
 
-    assert by_type == {"message": ["message"], "function_call": ["function_call"]}
+    assert by_type == {"message": ["message", "message"], "function_call": ["function_call"]}
+    pages = [
+        ([item["content"][0]["text"] for item in page["data"]], page["has_more"])
+        for page in (first, second)
+    ]
+    assert pages == [(["hi"], True), (["again"], False)]
     assert bogus.status_code == 422, bogus.text
 
 
