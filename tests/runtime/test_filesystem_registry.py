@@ -447,6 +447,42 @@ def test_changes_keep_recorded_entries_where_lookups_cannot_be_confined(
     assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == recorded
 
 
+@pytest.mark.parametrize(
+    "registry_class", [AgentEditFilesystemRegistry, MultiRepositoryFilesystemRegistry]
+)
+@pytest.mark.parametrize("removal", ["renamed-away", "replaced-by-a-file"])
+def test_changes_keep_recorded_entries_while_the_workspace_is_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry_class: type[AgentEditFilesystemRegistry],
+    removal: str,
+) -> None:
+    """A workspace that disappears mid-listing cannot show its files were reverted or deleted."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = registry_class(watch_path=workspace)
+    conv_id = "conv_workspace_gone"
+    (workspace / "notes.md").write_text("original\n")
+    registry.seed_snapshot("notes.md", "original\n", session_id=conv_id)
+    _inject(registry, "notes.md", "modified", conv_id)
+    _inject(registry, "new.md", "created", conv_id)
+    recorded = registry.list_changed_files(conv_id, limit=10, check_disk=False)
+    compare = environment_filesystem.compare_file_beneath
+
+    def compare_after_the_workspace_is_gone(*args, **kwargs):
+        if workspace.is_dir():
+            workspace.rename(tmp_path / "moved")
+            if removal == "replaced-by-a-file":
+                workspace.write_text("not a directory\n")
+        return compare(*args, **kwargs)
+
+    monkeypatch.setattr(
+        environment_filesystem, "compare_file_beneath", compare_after_the_workspace_is_gone
+    )
+
+    assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == recorded
+
+
 @pytest.mark.parametrize("beneath_supported", [True, False], ids=["dir-fd", "path-fallback"])
 @pytest.mark.parametrize(
     ("path", "swapped"),

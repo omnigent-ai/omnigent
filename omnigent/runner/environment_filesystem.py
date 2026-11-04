@@ -216,12 +216,17 @@ def _open_parent_beneath(
         ``None`` to accept whatever directory *root* names now.
     :returns: A descriptor for the parent, which the caller closes, and the
         leaf name.
-    :raises OSError: ``ESTALE`` when *root* is no longer *root_identity*,
-        ``ELOOP`` when a parent is a symlink, otherwise the error from opening
-        a component.
+    :raises OSError: ``ESTALE`` when *root* is missing or no longer
+        *root_identity*, ``ELOOP`` when a parent is a symlink, otherwise the
+        error from opening a component.
     """
     *parents, leaf = rel.split("/")
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except (FileNotFoundError, NotADirectoryError):
+        if root_identity is None:
+            raise
+        raise OSError(errno.ESTALE, "Directory was replaced", str(root)) from None
     try:
         if root_identity is not None:
             root_stat = os.fstat(fd)
@@ -326,8 +331,9 @@ def compare_file_beneath(
         *expected*.
     :raises FileNotFoundError: When the path does not exist.
     :raises NotADirectoryError: When a parent component is not a directory.
-    :raises OSError: When *root* was replaced, a parent is a symlink, the path
-        cannot be read, or the platform lacks ``dir_fd`` support.
+    :raises OSError: When *root* is missing or was replaced, a parent is a
+        symlink, the path cannot be read, or the platform lacks ``dir_fd``
+        support.
     """
     if not _BENEATH_SUPPORTED:
         raise OSError(errno.ENOTSUP, "Cannot look up a path without following symlinks", rel)

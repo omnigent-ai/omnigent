@@ -1831,10 +1831,14 @@ def register_resource_routes(
         try:
             existing = await fs.read(relative_path, limit=None)
             if existing.encoding and not existing.truncated and filesystem_registry is not None:
+                # A file read under another root must not decide reverts in this one.
+                on_disk = _changes_visible_on_disk(
+                    session_id, environment_id, agent_spec, filesystem_registry
+                )
                 filesystem_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),
-                    session_id=session_id,
+                    session_id=session_id if on_disk else None,
                 )
         except Exception:  # noqa: BLE001
             pass
@@ -1881,10 +1885,14 @@ def register_resource_routes(
         try:
             existing = await fs.read(relative_path, limit=None)
             if existing.encoding and not existing.truncated and filesystem_registry is not None:
+                # A file read under another root must not decide reverts in this one.
+                on_disk = _changes_visible_on_disk(
+                    session_id, environment_id, agent_spec, filesystem_registry
+                )
                 filesystem_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),
-                    session_id=session_id,
+                    session_id=session_id if on_disk else None,
                 )
         except Exception:  # noqa: BLE001
             pass

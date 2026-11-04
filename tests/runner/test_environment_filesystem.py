@@ -2052,6 +2052,7 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     app: FastAPI,
     client: httpx.AsyncClient,
     registry: SessionResourceRegistry,
+    workspace: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2059,6 +2060,8 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     terminal_root = tmp_path / "terminal"
     terminal_root.mkdir()
     (terminal_root / "notes.txt").write_text("new")
+    (terminal_root / "shared.txt").write_text("terminal text")
+    (workspace / "shared.txt").write_text("workspace text")
     terminal_env = create_os_environment(
         OSEnvSpec(
             type="caller_process", cwd=str(terminal_root), sandbox=OSEnvSandboxSpec(type="none")
@@ -2076,17 +2079,30 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     changes.record_change("notes.txt", "created", "conv_test")
     environment_id = terminal_environment_resource_id("bash", "s1")
     base = f"/v1/sessions/conv_test/resources/environments/{environment_id}"
+    primary = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
 
+    in_terminal = await client.put(f"{base}/filesystem/shared.txt", json={"content": "edited"})
+    # The workspace copy now matches the terminal's original, not its own.
+    in_workspace = await client.put(
+        f"{primary}/filesystem/shared.txt", json={"content": "terminal text"}
+    )
     listed = await client.get(f"{base}/changes")
     diff = await client.get(f"{base}/diff/notes.txt")
+    listed_in_workspace = await client.get(f"{primary}/changes")
 
+    assert (in_terminal.status_code, in_workspace.status_code) == (200, 200)
     assert listed.status_code == 200, listed.text
     assert sorted((e["path"], e["status"]) for e in listed.json()["data"]) == [
         ("hello.txt", "modified"),
         ("notes.txt", "created"),
+        ("shared.txt", "modified"),
     ]
     assert diff.status_code == 200, diff.text
     assert (diff.json()["before"], diff.json()["after"]) == (None, "new")
+    assert listed_in_workspace.status_code == 200, listed_in_workspace.text
+    assert [(e["path"], e["status"]) for e in listed_in_workspace.json()["data"]] == [
+        ("shared.txt", "modified")
+    ]
 
 
 @pytest.mark.asyncio
