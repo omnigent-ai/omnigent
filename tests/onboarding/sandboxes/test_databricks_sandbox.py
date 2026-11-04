@@ -613,5 +613,5 @@ def test_workspace_client_tags_user_agent(monkeypatch: pytest.MonkeyPatch) -> No
     )
     launcher._workspace_client()
 
-    assert ("omnigent-databricks", VERSION) in captured["extra"]
+    assert ("omnigent-oss", VERSION) in captured["extra"]
     assert captured["config"] is not None

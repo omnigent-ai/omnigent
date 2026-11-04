@@ -337,7 +337,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 credentials_strategy=_owner_token_strategy(self._owner_access_token),
                 http_timeout_seconds=_EXEC_HTTP_TIMEOUT_S,
             )
-            config.with_user_agent_extra("omnigent-databricks", _OMNIGENT_VERSION)
+            config.with_user_agent_extra("omnigent-oss", _OMNIGENT_VERSION)
             self._client = WorkspaceClient(config=config)
         return self._client
 
