@@ -1112,6 +1112,7 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
         while True:
             response = await auth_client.get(url, params=params)
             assert response.status_code == 200, response.text
+            assert response.headers["cache-control"] == "no-store"
             page = response.json()
             pages += 1
             entries.extend(page["data"])
@@ -1127,6 +1128,9 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     # One saved input per page, so another sender's leaves an empty page.
     assert await read_all("alice") == (["first", "second"], 3)
     assert await read_all("bob") == (["from bob"], 3)
+    auth_client.headers["X-Forwarded-Email"] = "carol"
+    response = await auth_client.get(url)
+    assert response.status_code == 404, response.text
     # Each names its saved item, so a client can match it to the send it made.
     auth_client.headers["X-Forwarded-Email"] = "alice"
     entries = sorted((await auth_client.get(url)).json()["data"], key=lambda e: e["position"])
