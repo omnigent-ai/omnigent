@@ -1192,7 +1192,7 @@ def build_native_controls(
         conv_id: str,
         bridge_dir: Path,
         *,
-        wait_budget_s: float = _CLAUDE_PANE_READY_TIMEOUT_S,
+        ready_deadline: float | None = None,
     ) -> bool:
         """Heal a dead-but-registered Claude pane before typing into it.
 
@@ -1218,44 +1218,44 @@ def build_native_controls(
         produced no pane is not waited on either (inject keeps its own short
         advertisement timeout in both cases).
 
-        :returns: ``False`` only when a recreated pane was still not ready when
-            *wait_budget_s* ran out; every other case is ``True``.
+        :returns: ``False`` when terminal recovery exhausts the readiness deadline;
+            every other case is ``True``.
         """
         from omnigent.harnesses.claude_native.bridge import claude_pane_ready
 
-        terminal_registry = resource_registry.terminal_registry if resource_registry else None
-        if terminal_registry is None:
-            return True
-        terminal_name = native_terminal_name("claude-native")
-        if terminal_name is None:
-            return True
-        # This probe duplicates the ensure path's own detection on purpose: its
-        # only job is to decide whether the readiness poll below runs at all.
-        instance = terminal_registry.get(conv_id, terminal_name, "main")
-        if instance is not None and await instance.is_alive():
-            return True
-        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
-        if terminal_registry.get(conv_id, terminal_name, "main") is None:
-            # The ensure swallows its own failures, so an unregistered pane here
-            # means nothing was created and nothing is booting. Waiting cannot
-            # help; let the injection fail fast as it did before.
-            return True
-        deadline = time.monotonic() + wait_budget_s
-        while True:
-            if await asyncio.to_thread(claude_pane_ready, bridge_dir):
-                return True
-            if time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(_CLAUDE_PANE_READY_POLL_S)
-        # Logged, else a pane that recreates but never boots is indistinguishable
-        # from a plain slow request. The caller decides whether to type anyway.
-        _logger.warning(
-            "claude-native pane not ready %ss after re-create for session=%s",
-            wait_budget_s,
-            conv_id,
-            extra={"session_id": conv_id},
-        )
-        return False
+        started = time.monotonic()
+        pane_deadline = started + _CLAUDE_PANE_READY_TIMEOUT_S
+        if ready_deadline is not None:
+            pane_deadline = min(pane_deadline, ready_deadline)
+        try:
+            async with asyncio.timeout(max(0.0, pane_deadline - time.monotonic())):
+                terminal_registry = (
+                    resource_registry.terminal_registry if resource_registry else None
+                )
+                if terminal_registry is None:
+                    return True
+                terminal_name = native_terminal_name("claude-native")
+                if terminal_name is None:
+                    return True
+                instance = terminal_registry.get(conv_id, terminal_name, "main")
+                if instance is not None and await instance.is_alive():
+                    return True
+                await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+                if terminal_registry.get(conv_id, terminal_name, "main") is None:
+                    # No registered pane can become ready; injection fails fast.
+                    return True
+                while True:
+                    if await asyncio.to_thread(claude_pane_ready, bridge_dir):
+                        return True
+                    await asyncio.sleep(_CLAUDE_PANE_READY_POLL_S)
+        except TimeoutError:
+            _logger.warning(
+                "claude-native pane not ready %ss after recovery started for session=%s",
+                time.monotonic() - started,
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            return False
 
     async def _handle_claude_native_effort_change(
         conv_id: str,
@@ -1397,10 +1397,17 @@ def build_native_controls(
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         # The pane heal shares the switch's budget: a terminal that cannot boot
         # answers "still starting" instead of spending the budget in the prompt wait.
-        if not await _prepare_claude_native_pane_for_injection(
-            conv_id, bridge_dir, wait_budget_s=deadline.remaining_s()
-        ):
-            tail = await asyncio.to_thread(claude_pane_failure_tail, bridge_dir)
+        pane_ready = await _prepare_claude_native_pane_for_injection(
+            conv_id, bridge_dir, ready_deadline=deadline.at
+        )
+        if not pane_ready or deadline.is_set():
+            tail = ""
+            if not deadline.is_set():
+                try:
+                    async with asyncio.timeout(deadline.remaining_s()):
+                        tail = await asyncio.to_thread(claude_pane_failure_tail, bridge_dir)
+                except TimeoutError:
+                    pass
             detail = (
                 "The Claude terminal is still starting, so the switch was not sent. "
                 "Retry in a moment." + tail

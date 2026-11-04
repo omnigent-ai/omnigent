@@ -9,6 +9,7 @@ entry plus a missing tmux socket surfaced as ``503 claude_native_*_failed``.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from pathlib import Path
@@ -682,3 +683,122 @@ async def test_failed_recreate_does_not_wait(
         f"a recreate that made no pane must not be polled; got {pane_ready_calls!r}"
     )
     assert elapsed < 5.0, f"failed recreate stalled {elapsed:.1f}s instead of failing fast"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocked_stage",
+    [
+        "not-ready",
+        "liveness",
+        "recreation",
+        "readiness",
+        "diagnostics",
+        "diagnostic-ready",
+        "cancelled",
+    ],
+)
+async def test_events_model_change_reports_a_terminal_still_starting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    blocked_stage: str,
+) -> None:
+    """Startup and diagnostic waits share one deadline and never inject after expiry."""
+    conv_id = "18293a4b5c6d7e8f901a2b3c4d5e6f708"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 0.15)
+    monkeypatch.setattr(
+        native_controls,
+        "_CLAUDE_PANE_READY_TIMEOUT_S",
+        0.05 if blocked_stage in {"diagnostics", "diagnostic-ready"} else 30.0,
+    )
+    release_capture = threading.Event()
+    stage_entered = threading.Event()
+    release_launch = asyncio.Event()
+    typed: list[str] = []
+    diagnostic_calls: list[Path] = []
+
+    async def _unready_launch(*_args: Any, **_kwargs: Any) -> SessionResourceView:
+        if blocked_stage in {"recreation", "cancelled"}:
+            stage_entered.set()
+            await release_launch.wait()
+            raise AssertionError("startup must expire before the terminal is recreated")
+        _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+        return SessionResourceView(
+            id="terminal_claude_main", type="terminal", session_id=conv_id, name="claude"
+        )
+
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_claude", _unready_launch)
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", _unready_launch)
+    if blocked_stage == "liveness":
+        terminal = registry.get(conv_id, "claude", "main")
+        assert terminal is not None
+
+        async def _blocked_liveness() -> bool:
+            stage_entered.set()
+            await release_launch.wait()
+            return False
+
+        terminal.is_alive = _blocked_liveness  # type: ignore[method-assign]
+
+    def _not_ready(_bridge_dir: Path) -> bool:
+        if blocked_stage == "readiness":
+            stage_entered.set()
+            assert release_capture.wait(3.0), "readiness capture was not released"
+        return False
+
+    def _diagnostics(capture_bridge_dir: Path) -> str:
+        diagnostic_calls.append(capture_bridge_dir)
+        if blocked_stage == "diagnostics":
+            stage_entered.set()
+            assert release_capture.wait(3.0), "diagnostic capture was not released"
+        return " Last terminal output:\nPlugin dev mode"
+
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", _not_ready)
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_failure_tail", _diagnostics)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "inject_slash_command",
+        lambda *_args, **kwargs: typed.append(kwargs["command"]),
+    )
+    started = time.monotonic()
+    try:
+        async with _runner_client(app) as client:
+            request = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={"type": "model_change", "model": "claude-opus-4-7"},
+                )
+            )
+            if blocked_stage == "cancelled":
+                assert await asyncio.to_thread(stage_entered.wait, 0.75)
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+                assert typed == []
+                assert diagnostic_calls == []
+                return
+            resp = await asyncio.wait_for(request, timeout=0.75)
+        elapsed = time.monotonic() - started
+    finally:
+        release_capture.set()
+        release_launch.set()
+
+    assert typed == []
+    assert resp.status_code == 503, resp.text
+    expected_detail = (
+        "The Claude terminal is still starting, so the switch was not sent. Retry in a moment."
+    )
+    if blocked_stage == "diagnostic-ready":
+        expected_detail += " Last terminal output:\nPlugin dev mode"
+    assert resp.json() == {"error": "claude_native_model_failed", "detail": expected_detail}
+    assert elapsed < 0.6, f"startup response exceeded its shared 0.15s deadline: {elapsed:.2f}s"
+    if blocked_stage not in {"not-ready", "diagnostic-ready"}:
+        assert stage_entered.is_set(), f"did not exercise blocked {blocked_stage}"
+    if blocked_stage not in {"diagnostics", "diagnostic-ready"}:
+        assert diagnostic_calls == [], "expired controls must not capture diagnostics"
