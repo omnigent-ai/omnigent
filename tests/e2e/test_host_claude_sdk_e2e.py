@@ -50,7 +50,8 @@ def test_clear_claude_sdk_continues_empty_on_the_same_host(
 
     The SDK replays the Omnigent transcript into a fresh client, so a cleared
     session that still recalled the planted word would mean the history came
-    along. The original keeps a notice linking to the new session.
+    along. The original keeps a notice linking to the new session, and
+    resuming it still recalls the word.
     """
     workspace = tmp_path / "clear_sdk_ws"
     workspace.mkdir()
@@ -107,3 +108,14 @@ def test_clear_claude_sdk_continues_empty_on_the_same_host(
             http_client, session_id=cleared_id, marker="NOCODEWORD", timeout=180.0
         )
         assert word not in reply, f"cleared claude-sdk session recalled {word!r}: {reply!r}"
+
+        # The original can still be resumed, with its earlier context intact.
+        _send_user_message(
+            http_client,
+            session_id=source_id,
+            text="Reply with exactly the code word I gave you earlier, and nothing else.",
+        )
+        recalled = _poll_for_assistant_marker(
+            http_client, session_id=source_id, marker=word, timeout=240.0
+        )
+        assert word in recalled, recalled
