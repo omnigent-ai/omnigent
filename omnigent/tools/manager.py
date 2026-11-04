@@ -34,6 +34,7 @@ from omnigent.tools.builtins import (
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
     SysScheduledTaskUpdateTool,
+    SysSessionAnswerElicitationTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
@@ -453,6 +454,12 @@ class ToolManager:
         Spec opt-ins control advertisement, not server authority.
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
+
+        ``sys_session_answer_elicitation`` rides the same send/close opt-in:
+        it lets the caller approve or deny a pending elicitation (approval
+        prompt) raised by a direct child — e.g. an antigravity-native
+        child's ``agy_permission`` prompt — without a human in the loop.
+        Child-only, same as send/close.
         """
         from omnigent.tools.builtins.session_message import SysSessionMessageTool
 
@@ -485,6 +492,10 @@ class ToolManager:
             sub_specs=sub_specs,
         )
         self._tools[SysSessionCloseTool.name()] = SysSessionCloseTool()
+        # Answering a child's pending elicitation is a write scoped to the
+        # same direct-child relationship send/close already require, so it
+        # rides the same opt-in rather than introducing a new flag.
+        self._tools[SysSessionAnswerElicitationTool.name()] = SysSessionAnswerElicitationTool()
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)

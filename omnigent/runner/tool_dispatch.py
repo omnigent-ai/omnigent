@@ -87,6 +87,9 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.session_answer_elicitation import (
+    SysSessionAnswerElicitationTool,
+)
 from omnigent.tools.builtins.session_message import SysSessionMessageTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
@@ -326,6 +329,17 @@ _SESSION_QUERY_TOOLS = frozenset(
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 _UI_TOOLS = frozenset({UiOpenFileTool.name()})
 
+# Priority 5f.0b: Answer a direct child's pending elicitation. Dispatches
+# via the Omnigent server's existing elicitation-resolve REST endpoint
+# (POST /sessions/{id}/elicitations/{eid}/resolve) — the SAME endpoint the
+# web UI's ApprovalCard posts to — so resolution semantics (server-side
+# harness Future, sidebar badge clear, runner forward) stay identical
+# regardless of who answers. Child-only, like send/close: enforced by
+# ``_answer_child_elicitation_via_rest`` comparing the target's
+# ``parent_session_id`` to the caller's own id, not by the resolve route
+# (which only checks the caller's general edit access to the target).
+_SESSION_ANSWER_ELICITATION_TOOLS = frozenset({SysSessionAnswerElicitationTool.name()})
+
 # The title bound the rename tool advertises to the LLM — read once from the
 # tool schema so the dispatcher can never drift from the published contract.
 _SESSION_RENAME_TITLE_MAX_CHARS: int = SysSessionRenameTool().get_schema()["function"][
@@ -484,6 +498,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _SESSION_ANSWER_ELICITATION_TOOLS
     | _UI_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
@@ -890,6 +905,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _SESSION_ANSWER_ELICITATION_TOOLS
     | _UI_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
@@ -5408,6 +5424,181 @@ def _omnigent_error_message(resp: httpx.Response) -> str | None:
     return None
 
 
+_ELICITATION_DECISION_TO_ACTION: dict[str, str] = {"allow": "accept", "deny": "decline"}
+
+
+async def _answer_child_elicitation_via_rest(
+    args: _JsonObject,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Resolve a direct child's pending elicitation via the server's resolve route.
+
+    ``sys_session_answer_elicitation``'s runner-dispatched handler. Reuses
+    the exact endpoint the web UI's ApprovalCard posts to —
+    ``POST /v1/sessions/{id}/elicitations/{eid}/resolve`` — via
+    :func:`omnigent.server.routes._sessions.orchestration._resolve_elicitation`
+    on the server side, so a native child's permission prompt (e.g.
+    antigravity-native's ``agy_permission``) resolves exactly as if a human
+    had clicked approve/reject in the UI.
+
+    Three checks before forwarding the verdict:
+
+    1. ``session_id`` resolves to a real session (else ``session_not_found``).
+    2. Its ``parent_session_id`` equals the caller's own ``conversation_id``
+       (else ``session_out_of_tree`` — a grandchild, a sibling, and the
+       caller's own elicitations are all refused; the resolve route only
+       checks the caller's general edit access, which an orchestrator
+       typically has across its whole tree, so this extra gate is enforced
+       here, not there).
+    3. The elicitation is still pending per
+       ``GET /v1/sessions/{id}/elicitations/{eid}`` (else
+       ``elicitation_not_pending`` — covers both an unknown id and one
+       already resolved; the server's pending index does not distinguish
+       the two once drained).
+
+    The caller's own id rides along as ``_meta.answered_by_session_id`` on
+    the forwarded :class:`~omnigent.server.schemas.ElicitationResult`, the
+    same ``_meta`` channel Codex's persist choices already use — the verdict
+    forward (``_forward_approval_to_runner``) carries it to the runner
+    verbatim, so it lands in the same audit/event trail the UI path writes,
+    without a parallel one. No "always allow" option is offered: the
+    mapped ``action`` is always a one-shot ``accept``/``decline``.
+
+    :param args: Parsed tool arguments: ``session_id``, ``elicitation_id``,
+        ``decision`` (``"allow"``/``"deny"``), optional ``reason``.
+    :param conversation_id: The calling session's own id, e.g.
+        ``"conv_caller"`` — the required parent of ``session_id``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: JSON ``{"resolved": true, "session_id", "elicitation_id",
+        "decision"}`` on success; a JSON error object otherwise.
+    """
+    if server_client is None:
+        return json.dumps({"error": "sys_session_answer_elicitation requires server access"})
+    if not conversation_id:
+        return json.dumps({"error": "sys_session_answer_elicitation requires a session id"})
+    target_id = args.get("session_id")
+    elicitation_id = args.get("elicitation_id")
+    decision = args.get("decision")
+    reason = args.get("reason")
+    if not isinstance(target_id, str) or not target_id:
+        return json.dumps(
+            {"error": "sys_session_answer_elicitation requires a non-empty 'session_id' string"}
+        )
+    if not isinstance(elicitation_id, str) or not elicitation_id:
+        return json.dumps(
+            {
+                "error": "sys_session_answer_elicitation requires a non-empty "
+                "'elicitation_id' string"
+            }
+        )
+    if decision not in _ELICITATION_DECISION_TO_ACTION:
+        return json.dumps(
+            {"error": "sys_session_answer_elicitation requires decision to be 'allow' or 'deny'"}
+        )
+    if reason is not None and not isinstance(reason, str):
+        return json.dumps({"error": "sys_session_answer_elicitation 'reason' must be a string"})
+    try:
+        safe_elicitation_id = _route_identifier(elicitation_id, "Elicitation")
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_answer_elicitation: {exc}"})
+
+    try:
+        snap_resp = await server_client.get(
+            f"{_session_url(target_id)}",
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps(
+            {"error": f"sys_session_answer_elicitation failed to look up session: {exc}"}
+        )
+    if snap_resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target_id})
+    if snap_resp.status_code in (401, 403):
+        return json.dumps({"error": "session_out_of_tree", "session_id": target_id})
+    if snap_resp.status_code != 200:
+        return json.dumps(
+            {"error": f"sys_session_answer_elicitation lookup returned {snap_resp.status_code}"}
+        )
+    snap_data = snap_resp.json()
+    if snap_data.get("parent_session_id") != conversation_id:
+        return json.dumps(
+            {
+                "error": "session_out_of_tree",
+                "session_id": target_id,
+                "message": (
+                    "target is not a direct child of the calling session; "
+                    "sys_session_answer_elicitation is child-only."
+                ),
+            }
+        )
+
+    try:
+        state_resp = await server_client.get(
+            f"{_session_url(target_id)}/elicitations/{safe_elicitation_id}", timeout=30.0
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps(
+            {"error": f"sys_session_answer_elicitation failed to check elicitation: {exc}"}
+        )
+    if state_resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target_id})
+    if state_resp.status_code in (401, 403):
+        return json.dumps({"error": "session_out_of_tree", "session_id": target_id})
+    if state_resp.status_code != 200:
+        return json.dumps(
+            {
+                "error": "sys_session_answer_elicitation elicitation lookup returned "
+                f"{state_resp.status_code}"
+            }
+        )
+    state_data = state_resp.json()
+    if state_data.get("status") != "pending":
+        return json.dumps(
+            {
+                "error": "elicitation_not_pending",
+                "session_id": target_id,
+                "elicitation_id": elicitation_id,
+                "message": "elicitation_id is unknown or already resolved",
+            }
+        )
+
+    meta: _JsonObject = {"answered_by_session_id": conversation_id}
+    if reason:
+        meta["reason"] = reason
+    body = {"action": _ELICITATION_DECISION_TO_ACTION[decision], "_meta": meta}
+    try:
+        resolve_resp = await server_client.post(
+            f"{_session_url(target_id)}/elicitations/{safe_elicitation_id}/resolve",
+            json=body,
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_answer_elicitation resolve failed: {exc}"})
+    if resolve_resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target_id})
+    if resolve_resp.status_code in (401, 403):
+        return json.dumps({"error": "session_out_of_tree", "session_id": target_id})
+    if resolve_resp.status_code >= 400:
+        return json.dumps(
+            {
+                "error": "sys_session_answer_elicitation resolve returned "
+                f"{resolve_resp.status_code}"
+            }
+        )
+    return json.dumps(
+        {
+            "resolved": True,
+            "session_id": target_id,
+            "elicitation_id": elicitation_id,
+            "decision": decision,
+        }
+    )
+
+
 async def _session_share_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -7076,6 +7267,12 @@ async def execute_tool(
                 conversation_id=conversation_id,
                 server_client=server_client,
                 agent_spec=agent_spec,
+            )
+        elif tool_name in _SESSION_ANSWER_ELICITATION_TOOLS:
+            output = await _answer_child_elicitation_via_rest(
+                args,
+                conversation_id=conversation_id,
+                server_client=server_client,
             )
         elif tool_name in _WEB_FETCH_TOOLS:
             output = await _execute_web_fetch_tool(

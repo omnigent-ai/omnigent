@@ -446,6 +446,8 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     assert "sys_session_send" not in names
     assert "sys_session_close" not in names
     assert "sys_session_create" not in names
+    # Answering a child's elicitation rides the same opt-in as send/close.
+    assert "sys_session_answer_elicitation" not in names
     # Sharing has its OWN dedicated `share:` flag (default `none`), so it
     # is absent here even though this spec also lacks spawn/agents. A
     # regression registering it by default would let any prompt-injected
@@ -473,6 +475,7 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_send" in names
     assert "sys_session_close" in names
     assert "sys_session_create" in names
+    assert "sys_session_answer_elicitation" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
     # Intelligent routing advisor stays hidden when routing is disabled.

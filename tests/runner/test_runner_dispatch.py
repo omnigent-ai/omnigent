@@ -7629,6 +7629,227 @@ async def test_session_close_rejects_top_level_target() -> None:
     assert patched is False
 
 
+# ── sys_session_answer_elicitation runner dispatch ───────────────────
+#
+# ``_answer_child_elicitation_via_rest`` lets a parent session resolve a
+# pending elicitation (approval prompt) raised by one of its DIRECT child
+# sessions, reusing the exact server endpoint
+# (POST /sessions/{id}/elicitations/{eid}/resolve) the web UI's
+# ApprovalCard already posts to. These tests cover the REST path's
+# direct-child-only gate — stricter than close's same-root-tree gate,
+# since answering a sibling's or grandchild's prompt must never be
+# allowed even though the caller may have ordinary read/edit access to
+# it (an orchestrator typically does, across its whole spawn tree).
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision,expected_action", [("allow", "accept"), ("deny", "decline")])
+async def test_answer_elicitation_resolves_direct_child_prompt(
+    decision: str, expected_action: str
+) -> None:
+    """A direct child's pending elicitation resolves via the shared resolve route."""
+    from omnigent.runner.tool_dispatch import _answer_child_elicitation_via_rest
+
+    resolved_body: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200, json={"id": "conv_target", "parent_session_id": "conv_caller"}
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_target/elicitations/elicit_abc123"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "status": "pending",
+                    "message": "Antigravity wants to run: pwd",
+                    "phase": "agy_permission",
+                    "policy_name": "agy_native_permission",
+                },
+            )
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_target/elicitations/elicit_abc123/resolve"
+        ):
+            resolved_body.update(json.loads(request.content))
+            return httpx.Response(202, json={"queued": False})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _answer_child_elicitation_via_rest(
+                {
+                    "session_id": "conv_target",
+                    "elicitation_id": "elicit_abc123",
+                    "decision": decision,
+                    "reason": "looks safe",
+                },
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out == {
+        "resolved": True,
+        "session_id": "conv_target",
+        "elicitation_id": "elicit_abc123",
+        "decision": decision,
+    }
+    assert resolved_body["action"] == expected_action
+    # The parent's id rides the same ``_meta`` channel Codex's persist
+    # choices already use, so it reaches the same audit/event trail the
+    # UI path writes without a parallel one.
+    assert resolved_body["_meta"]["answered_by_session_id"] == "conv_caller"
+    assert resolved_body["_meta"]["reason"] == "looks safe"
+
+
+@pytest.mark.asyncio
+async def test_answer_elicitation_rejects_non_direct_child_without_resolving() -> None:
+    """
+    A target whose ``parent_session_id`` is not the caller is refused with
+    ``session_out_of_tree`` and NO elicitation lookup or resolve call is
+    issued — proving a sibling, grandchild, or unrelated session (even one
+    the caller can otherwise read/edit) cannot have its prompt answered.
+    """
+    from omnigent.runner.tool_dispatch import _answer_child_elicitation_via_rest
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200, json={"id": "conv_target", "parent_session_id": "conv_someone_else"}
+            )
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _answer_child_elicitation_via_rest(
+                {
+                    "session_id": "conv_target",
+                    "elicitation_id": "elicit_abc123",
+                    "decision": "allow",
+                },
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["error"] == "session_out_of_tree"
+    assert out["session_id"] == "conv_target"
+
+
+@pytest.mark.asyncio
+async def test_answer_elicitation_rejects_own_session_as_target() -> None:
+    """A session answering its OWN elicitation is refused — it is not its own child."""
+    from omnigent.runner.tool_dispatch import _answer_child_elicitation_via_rest
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            # A top-level or self session has no parent, so it can never
+            # equal the caller's own id.
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _answer_child_elicitation_via_rest(
+                {
+                    "session_id": "conv_caller",
+                    "elicitation_id": "elicit_abc123",
+                    "decision": "allow",
+                },
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["error"] == "session_out_of_tree"
+
+
+@pytest.mark.asyncio
+async def test_answer_elicitation_unknown_session_returns_not_found() -> None:
+    """A 404 on the session lookup maps to ``session_not_found``."""
+    from omnigent.runner.tool_dispatch import _answer_child_elicitation_via_rest
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "x"})
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _answer_child_elicitation_via_rest(
+                {
+                    "session_id": "conv_missing",
+                    "elicitation_id": "elicit_abc123",
+                    "decision": "allow",
+                },
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out == {"error": "session_not_found", "session_id": "conv_missing"}
+
+
+@pytest.mark.asyncio
+async def test_answer_elicitation_unknown_or_resolved_id_without_resolving() -> None:
+    """
+    When the elicitation-status endpoint reports anything but ``pending``
+    (unknown id, or one already resolved — the server's pending index does
+    not distinguish the two once drained), the tool refuses with
+    ``elicitation_not_pending`` and issues no resolve POST.
+    """
+    from omnigent.runner.tool_dispatch import _answer_child_elicitation_via_rest
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200, json={"id": "conv_target", "parent_session_id": "conv_caller"}
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_target/elicitations/elicit_gone"
+        ):
+            return httpx.Response(200, json={"status": "resolved"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _answer_child_elicitation_via_rest(
+                {
+                    "session_id": "conv_target",
+                    "elicitation_id": "elicit_gone",
+                    "decision": "deny",
+                },
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["error"] == "elicitation_not_pending"
+    assert out["session_id"] == "conv_target"
+    assert out["elicitation_id"] == "elicit_gone"
+
+
+@pytest.mark.asyncio
+async def test_answer_elicitation_rejects_invalid_decision() -> None:
+    """An out-of-enum ``decision`` is refused before any HTTP call."""
+    from omnigent.runner.tool_dispatch import _answer_child_elicitation_via_rest
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _answer_child_elicitation_via_rest(
+                {
+                    "session_id": "conv_target",
+                    "elicitation_id": "elicit_abc123",
+                    "decision": "always_allow",
+                },
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert "decision" in out["error"]
+
+
 def test_agent_tools_are_runner_local() -> None:
     """
     ``sys_agent_get`` / ``sys_agent_download`` dispatch locally in the
