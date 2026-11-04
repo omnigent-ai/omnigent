@@ -4135,29 +4135,20 @@ def register_events_routes(
         managed_launches_for_delete = getattr(request.app.state, "managed_launches", None)
         if managed_launches_for_delete is not None:
             managed_launches_for_delete.finish(session_id)
-        # Managed-host cleanup: when the session's host is backed by a
-        # server-provisioned sandbox (host_type="managed"), terminate
-        # the sandbox and delete the host row — which also revokes its
-        # launch token. Best-effort by design — the provider's lifetime
-        # cap reaps stragglers. External (laptop) hosts have no
-        # sandbox_id and are never touched.
+        # Managed-host cleanup: terminate a server-provisioned sandbox and
+        # delete its host row (revoking its token) once no other session, such
+        # as a /clear continuation, uses it. Best-effort: the provider's
+        # lifetime cap reaps stragglers. Laptop hosts are never touched.
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
-            bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
-            if bound_host is not None and bound_host.sandbox_provider is not None:
-                from omnigent.server.managed_hosts import terminate_managed_host
+            from omnigent.server.managed_hosts import release_session_managed_host
 
-                await terminate_managed_host(
-                    bound_host,
-                    host_store_for_managed,
-                    # Supplies the launcher for the provider-side
-                    # terminate; None (config removed since launch)
-                    # still deletes the row and revokes the token.
-                    getattr(request.app.state, "sandbox_config", None),
-                    # Other sessions may still be bound to this host.
-                    keep_if_bound=True,
-                    capture_logs=capture_logs,
-                )
+            await release_session_managed_host(
+                conv.host_id,
+                host_store_for_managed,
+                getattr(request.app.state, "sandbox_config", None),
+                capture_logs=capture_logs,
+            )
         try:
             import time as _time
 

@@ -32,6 +32,7 @@ import omnigent.runtime
 from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import MessageData, NewConversationItem
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.managed_hosts import (
     REQUESTED_HOST_ID_LABEL_KEY,
@@ -639,7 +640,9 @@ async def test_stopping_or_archiving_the_original_leaves_the_continuation_runnin
     assert (original.runner_id, original.host_id) == (None, _HOST_ID)
 
 
-@pytest.mark.parametrize("deleted", ["before_fork", "after_fork"])
+@pytest.mark.parametrize(
+    "deleted", ["before_fork", "after_fork", "after_fork_then_failure", "not_then_failure"]
+)
 async def test_deleting_the_original_during_the_handoff_never_strands_the_continuation(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -651,19 +654,32 @@ async def test_deleting_the_original_during_the_handoff_never_strands_the_contin
     """A delete of the original racing the clear never leaves a sandbox-less continuation.
 
     Once the continuation exists it already holds the host, so the delete keeps
-    the sandbox; a delete that lands first leaves no continuation behind.
+    the sandbox; a delete that lands first leaves no continuation behind. If
+    the continuation then fails to be placed, removing it releases the sandbox
+    it was the last user of, but not one the original still uses.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     host_store, launcher = install_managed_sandbox(app, db_uri, monkeypatch)
     source_id = await create_placed_session(client, store)
     before = len((await client.get("/v1/sessions")).json()["data"])
+    if deleted.endswith("then_failure"):
+        resolve_runner = sessions_module._get_runner_client
+
+        async def reject_the_continuation(session_id: str, *args: Any, **kwargs: Any) -> Any:
+            if session_id != source_id:
+                raise OmnigentError(
+                    "the runner rejected the new session", code=ErrorCode.RUNNER_UNAVAILABLE
+                )
+            return await resolve_runner(session_id, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", reject_the_continuation)
     loop = asyncio.get_running_loop()
     paused, resume = asyncio.Event(), threading.Event()
     fork = SqlAlchemyConversationStore.fork_conversation
 
     def fork_around_the_delete(self: Any, *args: Any, **kwargs: Any) -> Any:
-        forked = fork(self, *args, **kwargs) if deleted == "after_fork" else None
+        forked = fork(self, *args, **kwargs) if deleted != "before_fork" else None
         loop.call_soon_threadsafe(paused.set)
         assert resume.wait(timeout=10)
         return forked if forked is not None else fork(self, *args, **kwargs)
@@ -673,15 +689,27 @@ async def test_deleting_the_original_during_the_handoff_never_strands_the_contin
         client.post(f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}})
     )
     await asyncio.wait_for(paused.wait(), timeout=10)
-    removed = await client.delete(f"/v1/sessions/{source_id}")
+    if deleted != "not_then_failure":
+        removed = await client.delete(f"/v1/sessions/{source_id}")
+        assert removed.status_code == 200, removed.text
     resume.set()
     cleared = await asyncio.wait_for(clearing, timeout=10)
 
-    assert removed.status_code == 200, removed.text
-    if deleted == "before_fork":
+    if deleted == "not_then_failure":
+        # The original still uses the sandbox, so only the continuation goes.
+        assert cleared.status_code >= 400, cleared.text
+        assert len((await client.get("/v1/sessions")).json()["data"]) == before
+        original = store.get_conversation(source_id)
+        assert original is not None and original.host_id == _HOST_ID
+        assert host_store.get_host(_HOST_ID) is not None
+        assert launcher.terminated == []
+        return
+    if deleted != "after_fork":
+        # No session is left on the sandbox, so it is torn down.
         assert cleared.status_code >= 400, cleared.text
         assert len((await client.get("/v1/sessions")).json()["data"]) == before - 1
         assert launcher.terminated == ["sb-clear"]
+        assert host_store.get_host(_HOST_ID) is None
         return
     assert cleared.status_code == 202, cleared.text
     continuation = store.get_conversation(cleared.json()["session_id"])

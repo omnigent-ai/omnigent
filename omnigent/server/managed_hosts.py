@@ -4643,6 +4643,34 @@ async def terminate_managed_host(
                 )
 
 
+async def release_session_managed_host(
+    host_id: str,
+    host_store: HostStore,
+    config: ManagedSandboxDeployment | None,
+    *,
+    capture_logs: bool = False,
+) -> None:
+    """
+    Tear down a gone session's managed sandbox unless another session uses it.
+
+    For a session row that was just deleted: a host with no sandbox provider
+    (e.g. a laptop) is never touched, and a managed host another session is
+    still bound to (e.g. a ``/clear`` continuation) is kept.
+
+    :param host_id: The deleted session's host.
+    :param host_store: Store holding the host row.
+    :param config: The deployment's sandbox config, or ``None`` (the row is
+        still deleted and its token revoked).
+    :param capture_logs: Log the sandbox's log tails before terminating.
+    """
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or host.sandbox_provider is None:
+        return
+    await terminate_managed_host(
+        host, host_store, config, keep_if_bound=True, capture_logs=capture_logs
+    )
+
+
 async def _log_sandbox_logs_best_effort(
     launcher: SandboxHostLauncher, sandbox_id: str, *, host_id: str
 ) -> None:

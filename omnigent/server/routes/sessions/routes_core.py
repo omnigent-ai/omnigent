@@ -526,6 +526,29 @@ def register_core_routes(
             await _delete_unreturned_session(session_id)
             raise
 
+    async def _release_unreturned_fork_host(request: Request, host_id: str | None) -> None:
+        """Tear down a deleted fork's managed sandbox if nothing else uses it.
+
+        A fork may have been the sandbox's last reference (its source deleted
+        meanwhile), so its removal ends the sandbox like a session delete.
+        Best-effort: the original error is what the caller reports.
+        """
+        host_store = getattr(request.app.state, "host_store", None)
+        if host_id is None or host_store is None:
+            return
+        from omnigent.server.managed_hosts import release_session_managed_host
+
+        try:
+            await release_session_managed_host(
+                host_id, host_store, getattr(request.app.state, "sandbox_config", None)
+            )
+        except Exception:
+            _logger.warning(
+                "Failed to release the managed host %s of an unreturned fork",
+                host_id,
+                exc_info=True,
+            )
+
     async def _delete_unreturned_session(session_id: str) -> None:
         """Delete a session whose creating request failed, with its unshared files."""
         if file_store is not None:
@@ -4746,6 +4769,7 @@ def register_core_routes(
             except Exception:
                 # Leave no announced fork for a retry to duplicate.
                 await _delete_unreturned_session(fork.id)
+                await _release_unreturned_fork_host(request, fork.host_id)
                 raise
 
             # Best-effort, as for native supersession: the fork already holds the
