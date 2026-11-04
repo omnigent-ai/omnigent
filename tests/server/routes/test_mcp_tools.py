@@ -333,6 +333,15 @@ async def test_mcp_login_host_errors(
     "user,capabilities,method,path,body,status",
     [
         ("stranger", (CAP_MCP_LOGIN,), "GET", "/abc", None, 403),
+        ("stranger", (CAP_MCP_LOGIN,), "POST", "", {"harness": "claude", "server": "x"}, 403),
+        (
+            "stranger",
+            (CAP_MCP_LOGIN,),
+            "POST",
+            "/abc/callback",
+            {"callback_url": "http://localhost:1/callback?code=c"},
+            403,
+        ),
         (None, (CAP_MCP_LOGIN,), "DELETE", "/abc", None, 401),
         ("owner", (CAP_MCP_TOOLS,), "GET", "/abc", None, 501),
         ("owner", (CAP_MCP_LOGIN,), "GET", "/a.b", None, 422),
