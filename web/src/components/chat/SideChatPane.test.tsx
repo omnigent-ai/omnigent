@@ -1894,62 +1894,6 @@ it.each([
   },
 );
 
-it.each([false, true])(
-  "keeps the ids of a grid composer's sends a read didn't list for a later read, evicted: %s",
-  async (evicted) => {
-    const entry = renderRecoveringGridPane();
-    const text = "first\n\nsecond";
-    act(() =>
-      entry.setState({
-        failedSendDraft: {
-          conversationId: childId,
-          text,
-          files: [],
-          sentAs: ["stable_first", "stable_second"],
-          recovered: true,
-        },
-      }),
-    );
-    expect(screen.getByTestId("side-chat-input")).toHaveValue(text);
-    if (evicted) {
-      const { sessionHarness, boundAgentId } = entry.getState();
-      act(() => conversationRegistry.release(childId));
-      conversationRegistry.acquire(childId).setState({
-        sessionHarness,
-        boundAgentId,
-        sessionStatus: "idle",
-        loadingConversation: false,
-        abortController: new AbortController(),
-      });
-    }
-    const listed = [
-      {
-        pendingId: "pending_first",
-        itemId: "stable_first",
-        content: [{ type: "input_text" as const, text: "first" }],
-      },
-    ];
-    vi.spyOn(sessionsApi, "listFailedInputs").mockImplementation(async () => [...listed]);
-    await act(() => retryFailedStartupLookup(childId));
-    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
-      startupInputIds: ["pending_first"],
-      sentAs: ["stable_second"],
-    });
-
-    listed.push({
-      pendingId: "pending_second",
-      itemId: "stable_second",
-      content: [{ type: "input_text", text: "second" }],
-    });
-    await act(() => retryFailedStartupLookup(childId));
-    expect(screen.getByTestId("side-chat-input")).toHaveValue(text);
-    expect(useChatStore.getState().sideChatComposers[childId]?.startupInputIds).toEqual([
-      "pending_first",
-      "pending_second",
-    ]);
-  },
-);
-
 it("doesn't hand back a send whose text was deleted from the grid composer before a failed send replaced it", async () => {
   const entry = renderRecoveringGridPane();
   act(() =>

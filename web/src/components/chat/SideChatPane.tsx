@@ -965,7 +965,7 @@ function SideChatComposer({
               const target = queuedMessages.find((message) => message.queueId === queueId);
               if (!target) return;
               const restored = restoreReplyDraft(target.text, target.replyDraft);
-              // Recalling replaces the draft, so its sends are dropped as clearing drops them.
+              // Record the replaced draft's sends as dropped so a later send can name their inputs.
               clearComposer(childId);
               updateComposer(childId, () => ({
                 ...restored,

@@ -23125,6 +23125,65 @@ describe("a send cut off by a reload", () => {
     },
   );
 
+  it.each([false, true])(
+    "keeps the ids of a grid composer's sends a read didn't list for a later read, evicted: %s",
+    async (evicted) => {
+      onTestFinished(() => useChatStore.setState({ sideChatComposers: {} }));
+      seedSession("conv_reload", []);
+      seedSession("conv_other", []);
+      await useChatStore.getState().switchTo("conv_reload");
+      const text = "first\n\nsecond";
+      const sentAs = ["stable_first", "stable_second"];
+      conversationRegistry.peek("conv_reload")!.setState({
+        failedSendDraft: {
+          conversationId: "conv_reload",
+          text,
+          files: [],
+          sentAs,
+          recovered: true,
+        },
+      });
+      // The grid composer takes the draft back as its pane does.
+      expect(takeFailedSendDraft("conv_reload", false, true, "sideChat")?.text).toBe(text);
+      useChatStore
+        .getState()
+        .updateSideChatComposer("conv_reload", () => ({ text, files: [], sentAs }));
+      if (evicted) {
+        await useChatStore.getState().switchTo("conv_other");
+        releaseConversation("conv_reload");
+        await useChatStore.getState().switchTo("conv_reload");
+      }
+      sessionFailedInputs.set("conv_reload", [
+        {
+          pending_id: "pending_first",
+          item_id: "stable_first",
+          content: [{ type: "input_text", text: "first" }],
+        },
+      ]);
+      await retryFailedStartupLookup("conv_reload");
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(useChatStore.getState().sideChatComposers.conv_reload).toEqual({
+        text,
+        files: [],
+        startupInputIds: ["pending_first"],
+        sentAs: ["stable_second"],
+      });
+
+      sessionFailedInputs.get("conv_reload")!.push({
+        pending_id: "pending_second",
+        item_id: "stable_second",
+        content: [{ type: "input_text", text: "second" }],
+      });
+      await retryFailedStartupLookup("conv_reload");
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(useChatStore.getState().sideChatComposers.conv_reload).toEqual({
+        text,
+        files: [],
+        startupInputIds: ["pending_first", "pending_second"],
+      });
+    },
+  );
+
   it.each([
     { resent: "edited", text: "saved on server, edited", handedBack: false },
     // The server takes an untouched resend under the input's id as a retry of the failed input.

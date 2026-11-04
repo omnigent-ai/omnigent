@@ -3832,8 +3832,7 @@ function ComposerImpl(
   };
 
   // The recalled message replaces the composer's content, so the draft holds only its failed
-  // startup inputs: its resend replaces them, and a reload doesn't offer them again. The
-  // replaced text's sends are dropped as clearing drops them.
+  // startup inputs: its resend replaces them, and a reload doesn't offer them again.
   const takeBackQueued = (message: {
     queueId: string;
     text: string;
@@ -3841,6 +3840,7 @@ function ComposerImpl(
     startupInputIds?: string[];
   }) => {
     if (conversationId) {
+      // Record the replaced draft's sends as dropped so a later send can name their inputs.
       rememberDroppedDraftSends(conversationId, getSessionDraft(conversationId)?.sentAs);
       replaceSessionDraftStartupInputs(
         conversationId,
