@@ -48,7 +48,7 @@ concurrency:
 jobs:
   resolve:
     name: Resolve release tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.r.outputs.tag }}
       version: ${{ steps.r.outputs.version }}
@@ -82,7 +82,7 @@ jobs:
   pr:
     name: Open homebrew-tap formula PR
     needs: resolve
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Canonical repo only — forks/mirrors have no PyPI release or the App token.
     if: needs.resolve.outputs.is_final == 'true' && github.repository == 'omnigent-ai/omnigent'
     env:

@@ -24,9 +24,11 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 import weakref
 from contextlib import suppress
+from pathlib import Path
 from typing import Protocol, TypedDict
 
 import psutil  # type: ignore[import-untyped]
@@ -135,6 +137,24 @@ def spawn_kwargs() -> SpawnKwargs:
     return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
 
 
+def pipe_supervised_command(command: str, *args: str) -> tuple[str, ...]:
+    """Retain a POSIX group leader while descendants hold captured output pipes.
+
+    Use with ``spawn_kwargs()`` and captured stdout/stderr. The supervisor
+    inherits stdin, cwd and env, and buffers output until EOF, like communicate.
+    Windows retains direct execution and its existing tree-cleanup behavior.
+    """
+    if not IS_POSIX:
+        return (command, *args)
+    return (
+        sys.executable,
+        "-I",
+        str(Path(__file__).with_name("_pipe_supervisor.py")),
+        command,
+        *args,
+    )
+
+
 def remember_process_group(process: _ProcessLike) -> None:
     """Remember the isolated group while its leader is still observable."""
     pid = process.pid
@@ -220,6 +240,17 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
         procs.extend(root.children(recursive=True))
     return procs
+
+
+def process_create_time(pid: int) -> float | None:
+    """Return the OS start time identifying the process at *pid*, or ``None``.
+
+    Pairs with the PID to detect reuse: a recycled PID reports a different
+    start time, letting a caller reject a stale PID before acting on it.
+    """
+    with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+        return _process_start_stamp(psutil.Process(pid))
+    return None
 
 
 def _process_start_stamp(proc: psutil.Process) -> float:
@@ -387,6 +418,9 @@ def kill_tree(process: _ProcessLike | None) -> None:
     Like :func:`terminate_tree` but with ``SIGKILL`` (POSIX) /
     ``TerminateProcess`` (Windows). Use after a grace period when a graceful
     terminate did not take.
+
+    After the leader exits, unobserved descendants may survive: signaling
+    their former group requires a remembered live identity to avoid PID reuse.
     """
     if process is None:
         return

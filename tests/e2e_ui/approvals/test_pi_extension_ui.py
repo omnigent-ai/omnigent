@@ -49,6 +49,9 @@ def test_pi_extension_dialog_renders_and_returns_the_answer(
 
         card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
         expect(card).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+        row = page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+        awaiting = row.locator('[data-testid="session-state-badge"][data-state="awaiting"]')
+        expect(awaiting).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
         if method == "confirm":
             expect(card.locator(_FORM)).to_have_count(0)
             expect(card.get_by_text(_CONFIRM_TITLE, exact=False)).to_be_visible()
@@ -60,7 +63,8 @@ def test_pi_extension_dialog_renders_and_returns_the_answer(
             expect(card.get_by_text("Pi needs your input")).to_be_visible()
             form = card.locator(_FORM)
             expect(form.get_by_text(_EDITOR_TITLE, exact=True)).to_be_visible()
-            expected = "two\nlines"
+            expect(form.get_by_role("textbox")).to_have_value("original note")
+            expected = "  two\nlines\n"
             form.get_by_role("textbox").fill(expected)
             form.locator(_SUBMIT).click()
 
@@ -76,3 +80,4 @@ def test_pi_extension_dialog_renders_and_returns_the_answer(
             assert verdict["confirmed"] is True, verdict
         else:
             assert verdict["value"] == expected, verdict
+        expect(awaiting).to_have_count(0, timeout=_MOCK_ELICITATION_TIMEOUT_MS)

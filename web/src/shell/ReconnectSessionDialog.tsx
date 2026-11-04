@@ -345,11 +345,9 @@ export function ReconnectSessionDialog({
                 </div>
               )}
             </TabsContent>
-            {/* forceMount keeps the fork form's state (notably the
-              created-fork ref after a failed launch) across tab switches —
-              losing it would re-fork on retry. The explicit hidden class is
-              required: `flex` would otherwise override the native [hidden]
-              display:none that Radix puts on the inactive panel. */}
+            {/* forceMount keeps the fork form and its running clone across tab
+              switches. The hidden class is required: `flex` would otherwise
+              override the [hidden] display:none Radix puts on inactive panels. */}
             <TabsContent
               value="clone"
               forceMount
@@ -361,6 +359,7 @@ export function ReconnectSessionDialog({
                 sourceWorkspace={sourceWorkspace}
                 sourceHostId={sourceHostId}
                 sourceGitBranch={sourceGitBranch}
+                visible={open && resolvedTab === "clone"}
                 onClose={() => onOpenChange(false)}
               />
             </TabsContent>

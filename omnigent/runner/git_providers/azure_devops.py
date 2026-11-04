@@ -656,6 +656,11 @@ def _pr_payload(
         "head_ref": _short_ref(pr.get("sourceRefName")),
         "head_sha": _commit(pr, "lastMergeSourceCommit"),
         "base_sha": _commit(pr, "lastMergeTargetCommit"),
+        "head_repository_url": (
+            _text(_nested(pr, "forkSource", "repository", "webUrl"))
+            if pr.get("forkSource")
+            else url.rsplit("/pullrequest/", 1)[0]
+        ),
         "checks": checks,
         "body": description if isinstance(description, str) and description.strip() else None,
         "comments": comments[:_MAX_COMMENTS],
@@ -1200,6 +1205,11 @@ class AzureDevOpsPullRequests:
         :raises ValueError: Always.
         """
         raise ValueError("Editing Azure DevOps pull request reviewers is not supported yet.")
+
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Reject comment posting for this provider."""
+        del root, reference, body
+        raise ValueError("Posting comments for this provider is not supported yet.")
 
     def edit_details(
         self,

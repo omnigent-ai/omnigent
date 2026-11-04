@@ -89,15 +89,6 @@ def test_structured_user_message_is_not_promoted_to_summary() -> None:
 
 
 def _transcript(*, segment_only: bool = False) -> list[dict[str, Any]]:
-    def message(kind: str, uid: str, parent: str | None, content: Any) -> dict[str, Any]:
-        return {
-            "type": kind,
-            "uuid": uid,
-            "parentUuid": parent,
-            "sessionId": _EXTERNAL_SESSION_ID,
-            "message": {"role": kind, "content": content},
-        }
-
     metadata: dict[str, Any] = {
         "trigger": "manual",
         "preservedSegment": {
@@ -112,9 +103,9 @@ def _transcript(*, segment_only: bool = False) -> list[dict[str, Any]]:
             "uuids": ["request", "call", "result"],
         }
     return [
-        message("user", "old", None, "older context already summarized"),
-        message("user", "request", "old", "continue the retained request"),
-        message(
+        _claude_record("user", "old", None, "older context already summarized"),
+        _claude_record("user", "request", "old", "continue the retained request"),
+        _claude_record(
             "assistant",
             "call",
             "request",
@@ -127,7 +118,7 @@ def _transcript(*, segment_only: bool = False) -> list[dict[str, Any]]:
                 }
             ],
         ),
-        message(
+        _claude_record(
             "user",
             "result",
             "call",
@@ -147,7 +138,7 @@ def _transcript(*, segment_only: bool = False) -> list[dict[str, Any]]:
             "compactMetadata": metadata,
         },
         {
-            **message("user", "summary", "boundary", "summary of older context"),
+            **_claude_record("user", "summary", "boundary", "summary of older context"),
             "isCompactSummary": True,
             "isVisibleInTranscriptOnly": True,
         },
@@ -1049,3 +1040,403 @@ def test_later_native_string_is_not_promoted_to_summary() -> None:
     user_record = records[2]
     assert "isCompactSummary" not in user_record
     assert "isVisibleInTranscriptOnly" not in user_record
+
+
+_SERVER_TOOL_CALL_ID = "srvtoolu_01retained"
+
+
+def _server_tool_transcript(
+    tool_name: str, result_type: str, result_content: Any
+) -> list[dict[str, Any]]:
+    # Claude Code writes one record per content block; blocks of one API
+    # response share message.id, which is how it rejoins them on resume.
+    return [
+        _claude_record("user", "old", None, "older context already summarized"),
+        _claude_record("user", "request", "old", "ask the advisor about the retry policy"),
+        _claude_record(
+            "assistant", "asking", "request", [{"type": "text", "text": "Asking."}], "msg_asking"
+        ),
+        _claude_record(
+            "assistant",
+            "call",
+            "asking",
+            [
+                {
+                    "type": "server_tool_use",
+                    "id": _SERVER_TOOL_CALL_ID,
+                    "name": tool_name,
+                    "input": {"query": "retry policy"},
+                }
+            ],
+            "msg_server_tool",
+        ),
+        _claude_record(
+            "assistant",
+            "result",
+            "call",
+            [
+                {
+                    "type": result_type,
+                    "tool_use_id": _SERVER_TOOL_CALL_ID,
+                    "content": result_content,
+                }
+            ],
+            "msg_server_tool",
+        ),
+        _claude_record(
+            "assistant", "done", "result", [{"type": "text", "text": "Consulted."}], "msg_done"
+        ),
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "boundary",
+            "parentUuid": None,
+            "compactMetadata": {
+                "trigger": "manual",
+                "preservedMessages": {
+                    "anchorUuid": "summary",
+                    "uuids": ["request", "asking", "call", "result", "done"],
+                },
+            },
+        },
+        {
+            **_claude_record("user", "summary", "boundary", "summary of older context"),
+            "isCompactSummary": True,
+            "isVisibleInTranscriptOnly": True,
+        },
+    ]
+
+
+def _records_holding_server_tool_pair(
+    records: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    call_record = result_record = None
+    for record in records:
+        content = record.get("message", {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") == "server_tool_use" and block.get("id") == _SERVER_TOOL_CALL_ID:
+                call_record = record
+            elif block.get("tool_use_id") == _SERVER_TOOL_CALL_ID:
+                result_record = record
+    return call_record, result_record
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "result_type", "result_content"),
+    [
+        (
+            "advisor",
+            "advisor_tool_result",
+            {"type": "advisor_result", "content": [{"type": "text", "text": "Use backoff."}]},
+        ),
+        (
+            "web_search",
+            "web_search_tool_result",
+            [
+                {
+                    "type": "web_search_result",
+                    "url": "https://example.test/retries",
+                    "title": "Retries",
+                }
+            ],
+        ),
+    ],
+)
+def test_server_tool_pair_stays_rejoinable_across_save_and_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    result_type: str,
+    result_content: Any,
+) -> None:
+    bridge, _ = _write_transcript(
+        tmp_path, monkeypatch, _server_tool_transcript(tool_name, result_type, result_content)
+    )
+    posted: list[dict[str, Any]] = []
+    _persist(bridge, posted)
+
+    records = _records(posted[0]["data"]["compacted_messages"])
+
+    call_record, result_record = _records_holding_server_tool_pair(records)
+    assert call_record is not None and result_record is not None
+    # A server_tool_use whose result is not in the same resumed message is replayed
+    # as "[Tool use interrupted]" and the orphaned result is rejected by the API.
+    call_message_id = call_record["message"].get("id")
+    assert call_record is result_record or (
+        call_message_id is not None and call_message_id == result_record["message"].get("id")
+    ), (
+        f"{tool_name} server_tool_use and {result_type} were resumed as separate records "
+        f"with message ids {call_message_id!r} / {result_record['message'].get('id')!r}"
+    )
+
+
+_ADVISOR_RESULT = {"type": "advisor_result", "content": [{"type": "text", "text": "Use backoff."}]}
+
+
+def _claude_record(
+    kind: str, uid: str, parent: str | None, content: Any, message_id: str | None = None
+) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": kind, "content": content}
+    if message_id is not None:
+        message["id"] = message_id
+    return {
+        "type": kind,
+        "uuid": uid,
+        "parentUuid": parent,
+        "sessionId": _EXTERNAL_SESSION_ID,
+        "message": message,
+    }
+
+
+def test_snapshot_keeps_claude_message_ids_for_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, _ = _write_transcript(
+        tmp_path,
+        monkeypatch,
+        _server_tool_transcript("advisor", "advisor_tool_result", _ADVISOR_RESULT),
+    )
+    posted: list[dict[str, Any]] = []
+    _persist(bridge, posted)
+
+    snapshot = CompactionData(**posted[0]["data"]).compacted_messages
+    assert snapshot is not None
+    assert [message.get("message_id") for message in snapshot] == [
+        None,
+        None,
+        "msg_asking",
+        "msg_server_tool",
+        "msg_server_tool",
+        "msg_done",
+    ]
+    records = _records(snapshot)
+    assert [record["message"].get("id") for record in records[1:]] == [
+        None,
+        None,
+        "msg_asking",
+        "msg_server_tool",
+        "msg_done",
+    ]
+
+
+def test_sdk_fallback_snapshot_keeps_claude_message_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_agent_sdk import get_session_messages
+
+    call = {"type": "server_tool_use", "id": "srvtoolu_02", "name": "advisor", "input": {}}
+    result = {
+        "type": "advisor_tool_result",
+        "tool_use_id": "srvtoolu_02",
+        "content": _ADVISOR_RESULT,
+    }
+    # Only the summary's chain reaches the SDK reader; a post-compaction turn
+    # gives that fallback snapshot an advisor pair to keep ids for.
+    entries = [
+        *_server_tool_transcript("advisor", "advisor_tool_result", _ADVISOR_RESULT),
+        _claude_record("user", "next", "summary", "ask again"),
+        _claude_record("assistant", "call-2", "next", [call], "msg_post"),
+        _claude_record("assistant", "result-2", "call-2", [result], "msg_post"),
+    ]
+    bridge, transcript = _write_transcript(tmp_path, monkeypatch, entries)
+    sdk_messages = get_session_messages(_EXTERNAL_SESSION_ID)
+    monkeypatch.setattr("claude_agent_sdk.get_session_messages", lambda _session_id: sdk_messages)
+    transcript.unlink()
+    posted: list[dict[str, Any]] = []
+
+    _persist(bridge, posted, allow_snapshot_fallback=True)
+
+    snapshot = posted[0]["data"]["compacted_messages"]
+    assert [message.get("message_id") for message in snapshot] == [
+        None,
+        None,
+        "msg_post",
+        "msg_post",
+    ]
+    assert [record["message"]["content"] for record in _records(snapshot)[1:]] == [
+        "summary of older context",
+        "ask again",
+        [call, result],
+    ]
+
+
+def _legacy_assistant_entry(content: list[dict[str, Any]], *source_ids: str) -> dict[str, Any]:
+    entry: dict[str, Any] = {"type": "message", "role": "assistant", "content": content}
+    if source_ids:
+        entry["forwarded_source_ids"] = list(source_ids)
+    return entry
+
+
+def _later_assistant_item(source_id: str, text: str) -> dict[str, Any]:
+    return {
+        "id": uuid.uuid5(
+            uuid.NAMESPACE_URL, f"omnigent-external-item:conversation-test:{source_id}"
+        ).hex,
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("call_type", "result_type"),
+    [("server_tool_use", "advisor_tool_result"), ("mcp_tool_use", "mcp_tool_result")],
+)
+def test_legacy_snapshot_rejoins_split_server_tool_pair_on_resume(
+    call_type: str, result_type: str
+) -> None:
+    call = {"type": call_type, "id": _SERVER_TOOL_CALL_ID, "name": "advisor", "input": {}}
+    note = {"type": "text", "text": "Checking."}
+    result = {"type": result_type, "tool_use_id": _SERVER_TOOL_CALL_ID, "content": _ADVISOR_RESULT}
+
+    records = _records(
+        [
+            {"type": "message", "role": "user", "content": "summary of older context"},
+            _legacy_assistant_entry([{"type": "text", "text": "Asking."}], "asking:0:message"),
+            _legacy_assistant_entry([call]),
+            _legacy_assistant_entry([note], "note:0:message"),
+            _legacy_assistant_entry([result], "result:0:message"),
+            _legacy_assistant_entry([{"type": "text", "text": "Consulted."}], "done:0:message"),
+        ],
+        # Items the forwarder posted for the merged records must still be deduplicated.
+        [
+            _later_assistant_item("note:0:message", "Checking."),
+            _later_assistant_item("result:0:message", "[Advisor response]"),
+        ],
+    )
+
+    assert [record["message"]["content"] for record in records[1:]] == [
+        "summary of older context",
+        [{"type": "text", "text": "Asking."}],
+        [call, note, result],
+        [{"type": "text", "text": "Consulted."}],
+    ]
+    assert all(record["parentUuid"] == parent["uuid"] for parent, record in pairwise(records))
+
+
+def test_orphaned_server_tool_result_is_dropped_on_resume(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    result = {
+        "type": "advisor_tool_result",
+        "tool_use_id": _SERVER_TOOL_CALL_ID,
+        "content": _ADVISOR_RESULT,
+    }
+
+    with caplog.at_level(logging.WARNING):
+        records = _records(
+            [
+                {"type": "message", "role": "user", "content": "summary of older context"},
+                _legacy_assistant_entry([result], "orphan:0:message"),
+                _legacy_assistant_entry([{"type": "text", "text": "Consulted."}, result]),
+            ],
+            # The dropped entry's items stay covered by the snapshot.
+            [_later_assistant_item("orphan:0:message", "[Advisor response]")],
+        )
+
+    # The dropped results are diagnosable by call id; their content is not logged.
+    assert caplog.text.count(f"tool_use_ids=['{_SERVER_TOOL_CALL_ID}']") == 2
+    assert "Use backoff." not in caplog.text
+
+    assert [record["message"]["content"] for record in records[1:]] == [
+        "summary of older context",
+        [{"type": "text", "text": "Consulted."}],
+    ]
+    assert all(record["parentUuid"] == parent["uuid"] for parent, record in pairwise(records))
+
+
+def test_snapshot_of_only_orphaned_results_still_covers_its_items() -> None:
+    result = {
+        "type": "advisor_tool_result",
+        "tool_use_id": _SERVER_TOOL_CALL_ID,
+        "content": _ADVISOR_RESULT,
+    }
+
+    records = _records(
+        [_legacy_assistant_entry([result], "orphan:0:message")],
+        [_later_assistant_item("orphan:0:message", "[Advisor response]")],
+    )
+
+    assert [record["type"] for record in records] == ["system"]
+
+
+@pytest.mark.parametrize("result_message_id", ["msg_call", None])
+def test_server_tool_result_is_not_folded_across_another_response(
+    result_message_id: str | None,
+) -> None:
+    call = {"type": "server_tool_use", "id": _SERVER_TOOL_CALL_ID, "name": "advisor", "input": {}}
+    result = {
+        "type": "advisor_tool_result",
+        "tool_use_id": _SERVER_TOOL_CALL_ID,
+        "content": _ADVISOR_RESULT,
+    }
+    other_reply = {"type": "text", "text": "Unrelated reply."}
+    result_entry = _legacy_assistant_entry([result])
+    if result_message_id is not None:
+        result_entry["message_id"] = result_message_id
+
+    records = _records(
+        [
+            {"type": "message", "role": "user", "content": "summary of older context"},
+            {**_legacy_assistant_entry([call]), "message_id": "msg_call"},
+            {**_legacy_assistant_entry([other_reply]), "message_id": "msg_other"},
+            result_entry,
+        ]
+    )
+
+    assert [
+        (record["message"]["content"], record["message"].get("id")) for record in records[1:]
+    ] == [
+        ("summary of older context", None),
+        ([call], "msg_call"),
+        ([other_reply], "msg_other"),
+    ]
+
+
+def test_already_paired_server_tool_entry_is_left_unchanged() -> None:
+    call = {"type": "server_tool_use", "id": _SERVER_TOOL_CALL_ID, "name": "advisor", "input": {}}
+    result = {
+        "type": "advisor_tool_result",
+        "tool_use_id": _SERVER_TOOL_CALL_ID,
+        "content": _ADVISOR_RESULT,
+    }
+    # A snapshot taken after a cold resume reads the rebuilt record holding the pair.
+    paired = [{"type": "text", "text": "Asking."}, call, result, {"type": "text", "text": "Done."}]
+
+    records = _records(
+        [
+            {"type": "message", "role": "user", "content": "summary of older context"},
+            {**_legacy_assistant_entry(paired, "paired:0:message"), "message_id": "msg_pair"},
+        ],
+        [_later_assistant_item("paired:0:message", "Asking.")],
+    )
+
+    assert [record["message"] for record in records[1:]] == [
+        {"role": "user", "content": "summary of older context"},
+        {"role": "assistant", "content": paired, "id": "msg_pair"},
+    ]
+
+
+def test_rejoined_server_tool_pair_keeps_its_response_message_id() -> None:
+    call = {"type": "server_tool_use", "id": _SERVER_TOOL_CALL_ID, "name": "advisor", "input": {}}
+    result = {
+        "type": "advisor_tool_result",
+        "tool_use_id": _SERVER_TOOL_CALL_ID,
+        "content": _ADVISOR_RESULT,
+    }
+
+    records = _records(
+        [
+            {"type": "message", "role": "user", "content": "summary of older context"},
+            _legacy_assistant_entry([call]),
+            {**_legacy_assistant_entry([result]), "message_id": "msg_pair"},
+        ]
+    )
+
+    assert records[2]["message"] == {
+        "role": "assistant",
+        "content": [call, result],
+        "id": "msg_pair",
+    }

@@ -12,8 +12,10 @@ import queue
 import signal
 import sys
 import tarfile
+import tempfile
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -32,6 +34,7 @@ from omnigent.runner._entry import (
     _AgentSpecCache,
     _apply_host_interactive_shells,
     _host_interactive_shells_from_env,
+    _ignore_finish_work_signal_until_handled,
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _install_signal_handlers,
@@ -52,6 +55,7 @@ from omnigent.runner._entry import (
     _runner_workspace_from_env,
     _RunnerDatabricksAuth,
     _server_url_from_env,
+    _work_still_active,
     main,
 )
 from omnigent.runner.identity import (
@@ -71,6 +75,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
 )
+from omnigent.terminals.pane_reaper import PaneRef
 from omnigent.util import event_loop_watchdog as watchdog
 from tests._helpers.session import bundle_files
 from tests.budgets import budget
@@ -763,27 +768,31 @@ def test_managed_mint_factory_serves_cached_token_when_refresh_fails(
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("refusal_status", [400, 401, 403])
 def test_managed_mint_factory_no_factory_when_server_definitively_refuses(
     monkeypatch: pytest.MonkeyPatch,
+    refusal_status: int,
 ) -> None:
-    """A definitive no-mint (HTTP 400/404) installs no factory → bare requests.
+    """A probe-time mint refusal installs no factory → bare requests.
 
     HTTP 400 (no auth provider / header mode) and 404 (an older server
     without the endpoint) mean the server will never mint for this runner,
     so the runner must fall back to unauthenticated requests — correct on a
-    no-auth server. No factory is installed.
+    no-auth server. A no-bearer 401/403 at the probe is dropped the same
+    way, so later lookups rediscover credentials. No factory is installed.
 
     :param monkeypatch: Pytest environment patch fixture.
+    :param refusal_status: The probe mint's HTTP status.
     :returns: None.
     """
 
     def _refuses(
         mint_url: str, server_url: str, binding_token: str, **_kw: object
     ) -> tuple[str, float]:
-        """Reject the mint the way a no-auth / header-mode server does (400)."""
+        """Reject the probe mint with the parametrized status."""
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
-            "unsupported", request=request, response=httpx.Response(400, request=request)
+            "refused", request=request, response=httpx.Response(refusal_status, request=request)
         )
 
     monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuses)
@@ -848,21 +857,25 @@ def test_managed_mint_factory_recovers_after_transient_boot_failure(
     assert len(calls) == 2  # probe (failed) + successful re-mint
 
 
+@pytest.mark.parametrize("status_code", [400, 401, 403])
 def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
     monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
 ) -> None:
-    """A post-install definitive 400 latches ``declined`` → bare requests.
+    """A post-install definitive refusal latches ``declined`` → bare requests.
 
     The boot-race regression from CI: the runner starts before the server
     listens, so the construction probe hits a connection error (transient →
-    factory installs), then every request-time mint gets the definitive
-    HTTP 400 of a no-auth server. Without the latch, the factory returns
+    factory installs), then every request-time mint is refused — HTTP 400
+    from a no-auth server, or 401/403 when no proxy bearer or cached token
+    was ever presented. Without the latch, the factory returns
     ``None`` forever and ``_RunnerDatabricksAuth`` fails closed — bricking
     every runner→server callback (``spec_resolver_failed``). With it, the
-    first 400 flips the factory to declined and callbacks go out bare,
+    first refusal flips the factory to declined and callbacks go out bare,
     exactly as if no factory had been installed.
 
     :param monkeypatch: Pytest environment patch fixture.
+    :param status_code: The definitive refusal the mint endpoint answers with.
     :returns: None.
     """
     calls: list[int] = []
@@ -870,13 +883,13 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
     def _boot_blip_then_refuse(
         mint_url: str, server_url: str, binding_token: str, **_kw: object
     ) -> tuple[str, float]:
-        """Fail the boot probe with a connection error, then 400 every mint."""
+        """Fail the boot probe with a connection error, then refuse every mint."""
         calls.append(1)
         if len(calls) == 1:
             raise httpx.ConnectError("server not listening yet")
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
-            "no auth provider", request=request, response=httpx.Response(400, request=request)
+            "refused", request=request, response=httpx.Response(status_code, request=request)
         )
 
     monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _boot_blip_then_refuse)
@@ -893,7 +906,7 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
     request2 = httpx.Request("GET", "http://server/v1/responses/turn_1")
     sent2 = next(auth.auth_flow(request2))
     assert "Authorization" not in sent2.headers
-    assert len(calls) == 2  # probe blip + the single definitive 400
+    assert len(calls) == 2  # probe blip + the single definitive refusal
 
 
 @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
@@ -949,38 +962,42 @@ def test_managed_mint_factory_latches_declined_on_5xx_with_no_cache(
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("refusal_status", [502, 401, 403])
 def test_declined_latch_recovers_when_bare_request_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
+    refusal_status: int,
 ) -> None:
-    """A rejected bare request clears the 5xx decline and re-mints.
+    """A rejected bare request clears a recoverable decline and re-mints.
 
-    The decline latched by an intermediary 5xx is a guess that the server
-    doesn't need auth. When a bare callback then gets a re-auth signal
-    (401/403/OIDC redirect), the guess was wrong — the server was merely
-    down. The auth flow must clear the latch, mint a fresh token from the
-    recovered server, and retry the request authenticated, so the runner
-    heals without a process restart.
+    A decline latched by an intermediary 5xx, or by a 401/403 sent with no
+    proxy bearer (the server mints only once a session is bound to the
+    runner), is a guess that the server doesn't need auth. When a bare
+    callback then gets a re-auth signal (401/403/OIDC redirect), the guess
+    was wrong. The auth flow must clear the latch, mint a fresh token, and
+    retry the request authenticated, so the runner heals without a process
+    restart.
 
     :param monkeypatch: Pytest environment patch fixture.
+    :param refusal_status: The first mint's status, before the server mints.
     :returns: None.
     """
     calls: list[int] = []
 
-    def _5xx_then_mint(
+    def _refuse_then_mint(
         mint_url: str, server_url: str, binding_token: str, **_kw: object
     ) -> tuple[str, float]:
-        """Answer 502 for the first mint (server down), then mint fine."""
+        """Refuse the first mint, then mint fine."""
         calls.append(1)
         if len(calls) == 1:
             request = httpx.Request("POST", mint_url)
             raise httpx.HTTPStatusError(
-                "bad gateway",
+                "refused",
                 request=request,
-                response=httpx.Response(502, request=request),
+                response=httpx.Response(refusal_status, request=request),
             )
         return ("jwt-recovered", time.time() + 1800)
 
-    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse_then_mint)
 
     factory = _ManagedMintTokenFactory(
         "https://s.example.com/v1/runners/r/token",
@@ -989,6 +1006,7 @@ def test_declined_latch_recovers_when_bare_request_is_rejected(
     )
     assert factory() is None
     assert factory.declined is True
+    assert factory.declined_without_proxy_bearer is (refusal_status != 502)
 
     auth = _RunnerDatabricksAuth(factory)
     request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
@@ -1001,12 +1019,15 @@ def test_declined_latch_recovers_when_bare_request_is_rejected(
     retried = gen.send(httpx.Response(401))
     assert retried.headers.get("Authorization") == "Bearer jwt-recovered"
     assert factory.declined is False
+    assert factory.declined_without_proxy_bearer is False
     with pytest.raises(StopIteration):
         gen.send(httpx.Response(200))
 
 
+@pytest.mark.parametrize("refusal_status", [502, 401, 403])
 def test_declined_latch_stays_bare_when_bare_request_succeeds(
     monkeypatch: pytest.MonkeyPatch,
+    refusal_status: int,
 ) -> None:
     """A successful bare request keeps the decline latched (no-auth server).
 
@@ -1015,23 +1036,24 @@ def test_declined_latch_stays_bare_when_bare_request_succeeds(
     every callback.
 
     :param monkeypatch: Pytest environment patch fixture.
+    :param refusal_status: The status every mint is refused with.
     :returns: None.
     """
     calls: list[int] = []
 
-    def _bad_gateway(
+    def _refuse(
         mint_url: str, server_url: str, binding_token: str, **_kw: object
     ) -> tuple[str, float]:
-        """Answer every mint with 502."""
+        """Refuse every mint."""
         calls.append(1)
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
-            "bad gateway",
+            "refused",
             request=request,
-            response=httpx.Response(502, request=request),
+            response=httpx.Response(refusal_status, request=request),
         )
 
-    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _bad_gateway)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse)
 
     factory = _ManagedMintTokenFactory(
         "https://s.example.com/v1/runners/r/token",
@@ -1232,19 +1254,21 @@ def test_declined_latch_from_definitive_refusal_is_not_reset_on_rejection(
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("rejection_status", [401, 403])
 def test_managed_mint_factory_proxy_auth_failure_falls_through_to_sdk(
     monkeypatch: pytest.MonkeyPatch,
+    rejection_status: int,
 ) -> None:
-    """A 403 on the proxy bearer sets proxy_auth_failed → factory not installed."""
+    """A 401/403 on the proxy bearer sets proxy_auth_failed → factory not installed."""
     calls: list[int] = []
 
     def _proxy_rejects(*args: Any, **kwargs: Any) -> tuple[str, float]:
         calls.append(1)
         request = httpx.Request("POST", "https://s.example.com/v1/runners/r/token")
         raise httpx.HTTPStatusError(
-            "403",
+            str(rejection_status),
             request=request,
-            response=httpx.Response(403, request=request),
+            response=httpx.Response(rejection_status, request=request),
         )
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "https://s.example.com")
@@ -1273,8 +1297,10 @@ def test_managed_mint_factory_proxy_auth_failure_falls_through_to_sdk(
     assert installed is None
 
 
+@pytest.mark.parametrize("rejection_status", [401, 403])
 def test_initial_host_token_re_resolves_to_sdk_when_proxy_auth_fails(
     monkeypatch: pytest.MonkeyPatch,
+    rejection_status: int,
 ) -> None:
     """When managed mint proxy_auth_fails, _InitialAuthTokenFactory falls back to SDK/OIDC."""
 
@@ -1288,7 +1314,9 @@ def test_initial_host_token_re_resolves_to_sdk_when_proxy_auth_fails(
     def _proxy_rejects(*args: Any, **kwargs: Any) -> tuple[str, float]:
         request = httpx.Request("POST", "https://app.databricksapps.com/v1/runners/r/token")
         raise httpx.HTTPStatusError(
-            "403", request=request, response=httpx.Response(403, request=request)
+            "rejected",
+            request=request,
+            response=httpx.Response(rejection_status, request=request),
         )
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
@@ -1306,7 +1334,7 @@ def test_initial_host_token_re_resolves_to_sdk_when_proxy_auth_fails(
     factory.invalidate()
 
     # The fallback tries managed mint first (proxy bearer = expired-host-bearer).
-    # That 403s → proxy_auth_failed → re-resolves to SDK/OIDC.
+    # That 401/403s → proxy_auth_failed → re-resolves to SDK/OIDC.
     token = factory()
     assert token == "sdk-token"
 
@@ -1418,6 +1446,67 @@ def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
     mint_factory._cached_expires_at = time.time() - 1.0
 
     assert factory() == "sdk-token"
+
+
+def test_initial_host_token_fallback_recovers_from_no_bearer_mint_decline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected host bearer's no-bearer mint fallback recovers, not fails closed.
+
+    With no SDK/OIDC credential, the fallback mint's 401 (no session bound yet)
+    sends the callback bare and re-mints once the bare request is rejected.
+    Models the non-delegated launch path: an initial host bearer without
+    ``OMNIGENT_RUNNER_DELEGATED_AUTH``.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_databricks_creds(*args: object, **kwargs: object) -> tuple[object, str]:
+        """Stand in for _resolve_databricks_auth with no Databricks config."""
+        raise DatabricksAuthError("no Databricks config")
+
+    calls: list[int] = []
+
+    def _blip_then_401_then_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        """Fail the boot probe, 401 the next mint, then mint fine."""
+        calls.append(1)
+        request = httpx.Request("POST", "https://s.example.com/v1/runners/r/token")
+        if len(calls) == 1:
+            raise httpx.ConnectError("server not listening yet")
+        if len(calls) == 2:
+            raise httpx.HTTPStatusError(
+                "401", request=request, response=httpx.Response(401, request=request)
+            )
+        return ("jwt-bound", time.time() + 1800)
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://s.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN", "host-bearer")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.delenv("OMNIGENT_RUNNER_DELEGATED_AUTH", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _no_databricks_creds
+    )
+    monkeypatch.setattr(
+        "omnigent.runner._entry._mint_managed_owner_token", _blip_then_401_then_mint
+    )
+
+    factory = _make_auth_token_factory()
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    factory.invalidate()
+
+    auth = _RunnerDatabricksAuth(factory)
+    gen = auth.auth_flow(httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents"))
+    bare = next(gen)  # must NOT raise (fail closed)
+    assert "Authorization" not in bare.headers
+    assert isinstance(factory._fallback_factory, _ManagedMintTokenFactory)
+
+    retried = gen.send(httpx.Response(401))
+    assert retried.headers.get("Authorization") == "Bearer jwt-bound"
+    assert factory.declined is False
 
 
 def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
@@ -1948,6 +2037,39 @@ def test_load_runner_idle_timeout_reads_nested_runner_config(
     assert _load_runner_idle_timeout_s_from_config() == 12.5
 
 
+@pytest.mark.parametrize("timeout_s", [86400, 0])
+def test_create_app_native_panes_inherit_runner_idle_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timeout_s: int
+) -> None:
+    """Native terminals must survive the runner's configured idle window."""
+    import omnigent.runner._entry as entry_mod
+
+    class _FakeProcessManager:
+        instance_dir = tmp_path
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", "1")
+    monkeypatch.delenv("OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S", raising=False)
+    (tmp_path / "config.yaml").write_text(f"runner:\n  idle_timeout_s: {timeout_s}\n")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.HarnessProcessManager", _FakeProcessManager
+    )
+    monkeypatch.setattr(entry_mod.httpx, "AsyncClient", _TrackingAsyncClient)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+
+    app = entry_mod.create_app(auth_resolved=True)
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    assert reaper._idle_timeout_s == timeout_s
+    if timeout_s:
+        pane = PaneRef("conv_idle", "terminal:codex:main", "codex", tmp_path / "tmux.sock")
+        assert reaper._classify(0.0, [pane], busy_convs=set()) == []
+        assert reaper._classify(3601.0, [pane], busy_convs=set()) == []
+        assert reaper._classify(float(timeout_s), [pane], busy_convs=set()) == [pane]
+
+
 def test_load_runner_idle_timeout_zero_disables_watchdog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2415,6 +2537,155 @@ def test_run_parent_death_killer_logs_reason_before_hard_exit(
     ), f"expected a parent-death exit log line, got {[r.message for r in caplog.records]}"
 
 
+def _finish_work_killer(
+    has_active_work: Callable[[], bool],
+    *,
+    finish_work_set: bool = True,
+    finish_work_max_s: float = 5.0,
+    signal_wait_s: float = 2.0,
+) -> list[str]:
+    """Run an already-orphaned killer with the finish-work path wired; return events."""
+    import threading
+
+    events: list[str] = []
+    finish_work = threading.Event()
+    if finish_work_set:
+        finish_work.set()
+    _run_parent_death_killer(
+        os.getppid() + 100000,  # already "orphaned"
+        lambda: events.append("stop"),
+        finish_work=finish_work,
+        has_active_work=has_active_work,
+        request_idle_shutdown=lambda: events.append("idle_close"),
+        poll_interval_s=0.01,
+        grace_s=0.01,
+        idle_grace_s=0.01,
+        signal_wait_s=signal_wait_s,
+        finish_work_max_s=finish_work_max_s,
+        exit_fn=lambda code: events.append("exit"),
+    )
+    return events
+
+
+def test_run_parent_death_killer_finishes_in_flight_work_after_hangup() -> None:
+    """A hung-up host's runner closes as idle only after its turn finishes."""
+    probes: list[str] = []
+
+    def has_active_work() -> bool:
+        probes.append("probe")
+        if len(probes) == 2:
+            raise RuntimeError("dictionary changed size during iteration")
+        return len(probes) < 5
+
+    events = _finish_work_killer(has_active_work)
+
+    assert len(probes) == 5, "shutdown must wait until the work reports idle"
+    assert events == ["idle_close", "exit"]
+
+
+def test_run_parent_death_killer_without_hangup_stops_despite_active_work() -> None:
+    """A plain parent death (``host stop``) waits out only the short finish-work
+    grace window, then stops a busy runner instead of finishing its turn.
+
+    The window lets a lagging hangup signal become visible; a plain death never
+    sets it, so the runner stops once the window elapses.
+    """
+    started = time.monotonic()
+    events = _finish_work_killer(lambda: True, finish_work_set=False, signal_wait_s=0.2)
+    elapsed = time.monotonic() - started
+
+    assert events == ["stop", "exit"]
+    assert elapsed >= 0.2, "a busy non-hangup orphan must wait out the finish-work grace window"
+    assert elapsed < 3.0, "it must stop at the grace window, not enter the finishing deadline"
+
+
+def test_run_parent_death_killer_bounds_finishing_work(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Work that never finishes is stopped once the bound passes."""
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner._entry"):
+        events = _finish_work_killer(lambda: True, finish_work_max_s=0.05)
+    elapsed = time.monotonic() - started
+
+    assert events == ["stop", "exit"]
+    assert any("did not finish" in record.message for record in caplog.records)
+    assert elapsed < 2.0, "finishing work must stop at its bound, not run unbounded"
+
+
+def test_run_parent_death_killer_idle_runner_exits_immediately_after_hangup() -> None:
+    """An idle runner exits on a hangup exactly as on any parent death."""
+    started = time.monotonic()
+    events = _finish_work_killer(lambda: False)
+    elapsed = time.monotonic() - started
+
+    assert events == ["stop", "exit"]
+    assert elapsed < 1.0, "an idle runner must skip the grace and finishing waits"
+
+
+def test_run_parent_death_killer_waits_for_a_late_finish_work_signal() -> None:
+    """A finish-work signal landing just after parent death still saves the turn.
+
+    The signal is delivered through the event loop, which can lag the
+    parent-death probe; the killer must not tear down a busy runner before a
+    just-delivered hangup request becomes visible.
+    """
+    import threading
+
+    events: list[str] = []
+    finish_work = threading.Event()
+    probes: list[str] = []
+
+    def has_active_work() -> bool:
+        probes.append("probe")
+        return len(probes) < 4
+
+    # The signal becomes visible only after the killer has already observed
+    # the orphaned parent and begun waiting for it.
+    threading.Timer(0.05, finish_work.set).start()
+
+    _run_parent_death_killer(
+        os.getppid() + 100000,  # already "orphaned"
+        lambda: events.append("stop"),
+        finish_work=finish_work,
+        has_active_work=has_active_work,
+        request_idle_shutdown=lambda: events.append("idle_close"),
+        poll_interval_s=0.01,
+        grace_s=0.5,
+        signal_wait_s=0.5,
+        idle_grace_s=0.01,
+        finish_work_max_s=5.0,
+        exit_fn=lambda code: events.append("exit"),
+    )
+
+    assert events == ["idle_close", "exit"], (
+        "a finish-work signal arriving after parent death must still finish the turn"
+    )
+
+
+def test_work_still_active_treats_any_exception_as_active() -> None:
+    """A probe failure of any type counts as active so the watchdog never dies."""
+
+    def boom() -> bool:
+        raise ValueError("state mutated during probe")
+
+    assert _work_still_active(boom) is True
+
+
+def test_ignore_finish_work_signal_until_handled_masks_the_default_kill() -> None:
+    """A boot-time finish-work signal is ignored so it cannot kill the runner."""
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    if RUNNER_FINISH_WORK_SIGNAL is None:
+        pytest.skip("no finish-work signal on this platform")
+    previous = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+    try:
+        _ignore_finish_work_signal_until_handled()
+        assert signal.getsignal(RUNNER_FINISH_WORK_SIGNAL) is signal.SIG_IGN
+    finally:
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, previous)
+
+
 def test_install_crash_logging_records_uncaught_exception(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2480,6 +2751,150 @@ async def test_install_signal_handlers_records_signal_reason() -> None:
             loop.remove_signal_handler(sig)
 
     assert reasons == ["received SIGTERM"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_finish_work_signal_sets_event() -> None:
+    """The host's hangup signal flags in-flight work to finish, without stopping."""
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    stop_event = asyncio.Event()
+    finish_work = threading.Event()
+    _install_signal_handlers(stop_event, finish_work_event=finish_work)
+    loop = asyncio.get_running_loop()
+    try:
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, RUNNER_FINISH_WORK_SIGNAL):
+            loop.remove_signal_handler(sig)
+
+    assert finish_work.is_set()
+    assert not stop_event.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_degraded_finish_work_replaces_sig_ign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded loop installs a plain finish-work handler, never leaving SIG_IGN.
+
+    SIG_IGN survives exec, so a persisted boot-time ignore would silently leak
+    into agent subprocesses. When loop registration fails, a plain handler must
+    take its place: it resets to the default on exec and still records the
+    hangup for the parent-death backstop.
+    """
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    loop = asyncio.get_running_loop()
+
+    def _broken_add_signal_handler(sig: int, *args: Any) -> None:
+        raise RuntimeError("the fd 6 must be in non-blocking mode")
+
+    monkeypatch.setattr(loop, "add_signal_handler", _broken_add_signal_handler)
+    # Boot ignores the signal; the degraded install must swap SIG_IGN out.
+    previous = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+    signal.signal(RUNNER_FINISH_WORK_SIGNAL, signal.SIG_IGN)
+    finish_work = threading.Event()
+    try:
+        _install_signal_handlers(asyncio.Event(), finish_work_event=finish_work)
+        handler = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+        assert handler is not signal.SIG_IGN
+        assert callable(handler)
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert finish_work.is_set()
+    finally:
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, previous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_replaces_sig_ign_when_loop_lacks_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loop that cannot register signals still swaps the boot-time SIG_IGN out.
+
+    ``add_signal_handler`` raises ``NotImplementedError`` on loops without signal
+    support. That is suppressed without marking the install degraded, so the
+    inherited SIG_IGN must still be replaced or it would survive exec and stop
+    the runner from ever observing a hangup.
+    """
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    loop = asyncio.get_running_loop()
+
+    def _unsupported_add_signal_handler(sig: int, *args: Any) -> None:
+        raise NotImplementedError("signals are not supported on this loop")
+
+    monkeypatch.setattr(loop, "add_signal_handler", _unsupported_add_signal_handler)
+    previous = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+    signal.signal(RUNNER_FINISH_WORK_SIGNAL, signal.SIG_IGN)
+    finish_work = threading.Event()
+    try:
+        _install_signal_handlers(asyncio.Event(), finish_work_event=finish_work)
+        handler = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+        assert handler is not signal.SIG_IGN
+        assert callable(handler)
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert finish_work.is_set()
+    finally:
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, previous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGHUP") or sys.platform == "win32",
+    reason="POSIX signal dispositions",
+)
+async def test_install_signal_handlers_leaves_sighup_alone() -> None:
+    """SIGHUP keeps its disposition, so a standalone or adopted runner still dies by it.
+
+    Host-managed runners live in their own session and learn about a hangup
+    through the host's finish-work signal instead.
+    """
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    before = signal.getsignal(signal.SIGHUP)
+    finish_work = threading.Event()
+    loop = asyncio.get_running_loop()
+    _install_signal_handlers(asyncio.Event(), finish_work_event=finish_work)
+    try:
+        assert signal.getsignal(signal.SIGHUP) is before
+        assert not finish_work.is_set()
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, RUNNER_FINISH_WORK_SIGNAL):
+            if sig is not None:
+                loop.remove_signal_handler(sig)
 
 
 @pytest.mark.asyncio

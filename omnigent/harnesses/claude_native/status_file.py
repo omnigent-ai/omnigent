@@ -19,6 +19,9 @@ on:
 - :func:`read_session_status` — read the file and map its interactive
   status to the runner's ``running`` / ``idle`` vocabulary.
 
+A cold resume also reads the registry, through :func:`find_background_holder`,
+to learn whether a background job still runs the session it is about to resume.
+
 The file is an **undocumented internal detail** of Claude Code, so the
 watcher that consumes this treats an unresolved / unreadable file as
 "fall back to the PTY watcher", never as an error.
@@ -31,9 +34,11 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+
+import psutil
 
 _logger = logging.getLogger(__name__)
 
@@ -182,6 +187,7 @@ def resolve_status_file(
     :param expected_session_id: Claude session uuid from the bridge, or
         ``None`` before the first hook reports it.
     :param config_dir: Explicit Claude config dir override (tests).
+    :param on_replay: Optional callback for an unchanged status reasserted by resync.
     :param now: Monotonic-independent wall clock override (tests); uses
         :func:`time.time` when ``None``.
     :returns: The resolved file path, or ``None`` when no confident match
@@ -253,6 +259,133 @@ def read_session_status(path: Path) -> SessionStatus | None:
     )
 
 
+@dataclass(frozen=True)
+class BackgroundHolder:
+    """A live Claude process, other than an interactive TUI, running a session.
+
+    :param pid: The holder's process id, e.g. ``4242``.
+    :param kind: Its registry ``kind``, e.g. ``"bg"`` for a background job.
+    :param job_id: Its background job id, e.g. ``"ab12cd34"``, or ``None``
+        when the record names none.
+    """
+
+    pid: int
+    kind: str
+    job_id: str | None
+
+
+# Registry kinds whose live record makes Claude Code refuse ``--resume`` of the
+# session; it ignores interactive and unrecognized kinds.
+_BACKGROUND_SESSION_KINDS = frozenset({"bg", "daemon", "daemon-worker"})
+# Larger record names are not pids, and probing them overflows.
+_MAX_PID = 2**31 - 1
+
+
+def _live_session_records(
+    session_id: str, config_dir: Path | None
+) -> Iterator[tuple[int, dict[str, object]]]:
+    """Yield ``(pid, record)`` for every live registry record naming *session_id*.
+
+    Unreadable or malformed records are skipped, never raised.
+    """
+    wanted = session_id.lower()
+    try:
+        entries = list(sessions_dir(config_dir).glob("*.json"))
+    except OSError:
+        return
+    for entry in entries:
+        # Claude reads only records named after an ASCII pid.
+        stem = entry.stem
+        if not (stem.isascii() and stem.isdigit()) or not 0 < int(stem) <= _MAX_PID:
+            continue
+        record = _read_json_file(entry)
+        if record is None:
+            continue
+        record_session_id = record.get("sessionId")
+        if not isinstance(record_session_id, str) or record_session_id.lower() != wanted:
+            continue
+        pid = int(stem)
+        try:
+            alive = _is_recorded_process(pid, record.get("procStart"))
+        except (OSError, OverflowError, psutil.Error):
+            continue
+        if alive:
+            yield pid, record
+
+
+def find_background_holder(
+    session_id: str,
+    *,
+    config_dir: Path | None = None,
+) -> BackgroundHolder | None:
+    """Find a live background Claude process that runs *session_id*.
+
+    Matches Claude's background-resume guard using registry kind, session ID,
+    and process identity.
+
+    :param session_id: Claude session uuid, matched case-insensitively, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``.
+    :param config_dir: Explicit Claude config dir override (tests).
+    :returns: The holder, or ``None`` when no live background process runs
+        the session or the registry cannot be read.
+    """
+    for pid, record in _live_session_records(session_id, config_dir):
+        kind = record.get("kind")
+        if not isinstance(kind, str) or kind not in _BACKGROUND_SESSION_KINDS:
+            continue
+        job_id = record.get("jobId")
+        return BackgroundHolder(
+            pid=pid,
+            kind=kind,
+            job_id=job_id if isinstance(job_id, str) and job_id else None,
+        )
+    return None
+
+
+def session_has_live_process(session_id: str, *, config_dir: Path | None = None) -> bool:
+    """Whether any live Claude process, interactive or not, has *session_id* open.
+
+    :param session_id: Claude session uuid, matched case-insensitively.
+    :param config_dir: Explicit Claude config dir override (tests).
+    :returns: ``True`` when a live registry record names the session.
+    """
+    return next(_live_session_records(session_id, config_dir), None) is not None
+
+
+def session_pids(session_id: str, *, config_dir: Path | None = None) -> list[int]:
+    """Return the live Claude processes the registry names for *session_id*.
+
+    :param session_id: Claude session uuid, matched case-insensitively.
+    :param config_dir: Explicit Claude config dir override (tests).
+    :returns: Their pids, e.g. ``[4242]``; empty when none is live.
+    """
+    return [pid for pid, _record in _live_session_records(session_id, config_dir)]
+
+
+def _is_recorded_process(pid: int, proc_start: object) -> bool:
+    """Whether *pid* is still the live process a registry record describes.
+
+    :param pid: Process id the record is named after.
+    :param proc_start: The record's ``procStart``, the process start time from
+        ``/proc/<pid>/stat`` on Linux, so a recycled pid does not count.
+    :returns: ``True`` when the process is alive and, where procfs exists,
+        started when the record says.
+    """
+    if pid == os.getpid() or not psutil.pid_exists(pid):
+        return False
+    if not isinstance(proc_start, str):
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        # No procfs (macOS): liveness is the only signal available.
+        return True
+    # Fields after the parenthesized command name start at field 3, so the
+    # start time (field 22) is index 19.
+    fields = stat.rsplit(")", 1)[-1].split()
+    return len(fields) <= 19 or fields[19] == proc_start
+
+
 # Attempts to resolve the file before giving up and leaving the PTY
 # watcher authoritative for the session's lifetime. At the claude-native
 # poll cadence (~0.2s) this is a few seconds — long enough for a booting
@@ -311,8 +444,10 @@ class SessionStatusPoller:
         session_id_getter: Callable[[], str | None],
         config_dir: Path | None = None,
         omnigent_session_id: str | None = None,
+        on_replay: Callable[[str, str | None], None] | None = None,
     ) -> None:
         self._on_status = on_status
+        self._on_replay = on_replay or on_status
         self._pane_pid_getter = pane_pid_getter
         # Claude's own session uuid, resolved lazily from the bridge.
         self._session_id_getter = session_id_getter
@@ -326,8 +461,14 @@ class SessionStatusPoller:
         self._last_mtime: float | None = None
         self._last_edge: tuple[str, str | None] | None = None
         self._last_status: SessionStatus | None = None
+        self._observation_version = 0
         self._resync_lock = threading.Lock()
         self._resync_requested = False
+
+    @property
+    def observation_version(self) -> int:
+        """Advance on native state changes or retirement, including unpublished states."""
+        return self._observation_version
 
     @property
     def active(self) -> bool:
@@ -351,14 +492,13 @@ class SessionStatusPoller:
             self._resync_requested = False
         if requested:
             self._last_mtime = None
-            self._last_edge = None
         if self._exhausted:
             return
         if self._path is None:
             self._try_resolve()
-            if self._path is None:
+            if self._path is None or self._exhausted:
                 return
-        self._read_and_publish()
+        self._read_and_publish(reassert=requested)
 
     def _try_resolve(self) -> None:
         """Attempt one resolution, retiring to the PTY watcher on timeout."""
@@ -406,12 +546,13 @@ class SessionStatusPoller:
             extra={"session_id": self._omnigent_session_id},
         )
         self._exhausted = True
+        self._observation_version += 1
 
     def resync(self) -> None:
         """Request that the watcher re-assert the file on its next tick.
 
         The file changes only when Claude's status changes. A server recycle
-        or forwarded idle edge must re-arm the watcher so it reports the current
+        or forwarded status edge must re-arm the watcher so it reports the current
         value again. A request during an in-flight read stays pending for the
         following tick instead of being overwritten by that read.
 
@@ -431,12 +572,14 @@ class SessionStatusPoller:
 
         ``None`` unless the last read was ``waiting`` and carried a reason.
         """
+        if self._exhausted:
+            return None
         status = self._last_status
         if status is None or status.raw_status != "waiting":
             return None
         return status.blocked_on
 
-    def _read_and_publish(self) -> None:
+    def _read_and_publish(self, *, reassert: bool = False) -> None:
         """Read the resolved file and fire the callback on a status change."""
         assert self._path is not None
         try:
@@ -445,22 +588,31 @@ class SessionStatusPoller:
             # File vanished (clean exit unlinks it, or a crash). Exit
             # detection rides the PTY watcher, so just stop polling.
             self._exhausted = True
+            self._observation_version += 1
             return
         if self._last_mtime is not None and mtime == self._last_mtime:
             return
         self._last_mtime = mtime
         status = read_session_status(self._path)
+        if self._exhausted:
+            return
         if status is None:
             # An unrecognized literal — the file is an undocumented internal
             # detail whose vocabulary can grow. We are now blind to this
             # transition, so drop the dedup baseline: the next readable
             # status must publish rather than be swallowed as a duplicate.
+            if self._last_status is not None:
+                self._observation_version += 1
             self._last_status = None
             self._last_edge = None
             return
+        if status != self._last_status:
+            self._observation_version += 1
         self._last_status = status
         edge = (status.runner_status, status.blocked_on)
         if edge == self._last_edge:
+            if reassert:
+                self._on_replay(status.runner_status, status.blocked_on)
             return
         self._last_edge = edge
         self._on_status(status.runner_status, status.blocked_on)

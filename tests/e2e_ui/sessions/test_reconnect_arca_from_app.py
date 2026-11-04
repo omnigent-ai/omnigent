@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from urllib.parse import urlparse
 
 import pytest
-from playwright.sync_api import Locator, Page, Route, expect
+from playwright.sync_api import Locator, Page, Request, Route, expect
 
 from tests.e2e_ui.conftest import fetch_with_retry
 
@@ -253,3 +253,55 @@ def test_desktop_arca_reconnect_failure_offers_retry(
     expect(host_picker).to_have_attribute("aria-label", re.compile(r"e2e's arca, online$"))
     expect(page.get_by_text("Arca is back online.", exact=True)).to_be_visible()
     page.wait_for_timeout(1500)
+
+
+def test_desktop_send_reconnects_offline_arca_then_sends(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Sending to an offline Arca reconnects it, through a failed try, and sends once it's back."""
+    host_picker, host_state = _open_offline_arca_chat(
+        page, seeded_session, remembered=True, host_name="arca-devbox"
+    )
+    events_path = f"/v1/sessions/{seeded_session[1]}/events"
+    posts: list[str] = []
+
+    def _record_post(request: Request) -> None:
+        if request.method == "POST" and urlparse(request.url).path == events_path:
+            posts.append(request.post_data or "")
+
+    page.on("request", _record_post)
+
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_have_attribute("placeholder", "Send a message to reconnect Arca…")
+    composer.fill("hello after the reconnect")
+    composer.press("Enter")
+    expect(page.get_by_text("Reconnecting Arca…", exact=True)).to_be_visible()
+    expect(page.get_by_text("Waiting for host", exact=True)).to_be_visible()
+    assert page.evaluate("window.__connectArcaCalls") == 1
+    page.wait_for_timeout(1500)
+    # A send into the offline host could record a failed turn, so nothing posts yet.
+    assert posts == []
+
+    # A failed reconnect keeps the message waiting; the dialog's retry brings Arca back.
+    page.evaluate("window.__finishArcaReconnect({ ok: false, error: 'Arca did not start.' })")
+    dialog = page.get_by_test_id("reconnect-session-dialog")
+    expect(dialog).to_be_visible()
+    expect(page.get_by_text("Waiting for host", exact=True)).to_be_visible()
+    page.wait_for_timeout(1200)
+    dialog.get_by_role("button", name="Reconnect Arca", exact=True).click()
+    assert page.evaluate("window.__connectArcaCalls") == 2
+    assert posts == []
+
+    host_state["online"] = True
+    with page.expect_request(
+        lambda request: request.method == "POST" and urlparse(request.url).path == events_path,
+        timeout=30_000,
+    ) as sent:
+        page.evaluate("window.__finishArcaReconnect({ ok: true })")
+    assert "hello after the reconnect" in (sent.value.post_data or "")
+    expect(dialog).not_to_be_visible()
+    expect(host_picker).to_have_attribute("aria-label", re.compile(r"arca-devbox, online$"))
+    expect(page.get_by_text("Waiting for host", exact=True)).not_to_be_visible()
+    page.wait_for_timeout(1500)
+    assert len(posts) == 1

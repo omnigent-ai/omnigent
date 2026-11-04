@@ -41,7 +41,10 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.databricks_ai_gateway import (
+    CLIENT_SURFACES_HEADER,
     CODEX_AGENT,
+    CODING_AGENT_HEADER,
+    REQUEST_TAGS_HEADER,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
 )
@@ -68,7 +71,9 @@ from omnigent.models.codex_model_vocabulary import (
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.spec.repo_scope import repo_scope_dirs
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
@@ -755,22 +760,39 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     return env
 
 
+@dataclass(frozen=True)
+class CodexSkillSources:
+    """
+    Existing Codex skill roots, split by who loads them, each in priority order.
+
+    :param linked: The bundle, host Codex, and ``~/.agents`` skills that the
+        launch symlinks into ``$CODEX_HOME/skills``. Codex ranks them as user
+        skills.
+    :param native: The repo-scope ``.agents/skills`` dirs, nearest first, which
+        Codex reads from its own cwd and ranks above user skills.
+    """
+
+    linked: list[Path]
+    native: list[Path]
+
+
 def codex_skill_sources(
     bundle_dir: Path | None,
     home: Path,
     *,
     codex_home: Path | None = None,
-) -> list[Path]:
+    workspace: Path | None = None,
+) -> CodexSkillSources:
     """
-    Build the ordered Codex skill-source list: bundle skills, then host skills.
+    Find every Codex skill root, split into linked and native groups.
 
     The single source of truth for *where* Codex skills come from, shared
-    by :func:`populate_codex_skills_from_bundle` (which symlinks them into
-    ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
-    provider — so the linked set and the menu cannot drift on which roots
-    are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    the host-installed Codex skills dir, then ``~/.agents/skills`` (a bundled
-    skill shadows a host skill of the same name). Only existing directories
+    by :func:`populate_codex_skills_from_bundle` (which symlinks only the
+    ``linked`` group into ``$CODEX_HOME/skills/``) and the slash-command
+    menu's ``codex_host_skills`` provider, which lists both groups. The
+    ``linked`` order is the agent's own ``<bundle>/skills/``, then the
+    host-installed Codex skills dir, then ``~/.agents/skills``: an earlier
+    source shadows a later skill of the same name. Only existing directories
     are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
@@ -782,18 +804,31 @@ def codex_skill_sources(
         ``$CODEX_HOME`` for its config, so the native launch passes the
         resolved home here to keep the seeded skills and the menu in step with
         the CLI's own ``$CODEX_HOME``.
-    :returns: Existing skill-dir roots in priority order.
+    :param workspace: Codex's working directory. Codex reads ``.agents/skills``
+        from it up to the repository root, or from it alone outside a
+        repository. ``None`` leaves ``native`` empty.
+    :returns: The linked and native skill roots.
     """
-    sources: list[Path] = []
+    linked: list[Path] = []
     if bundle_dir is not None and (bundle_dir / "skills").is_dir():
-        sources.append(bundle_dir / "skills")
+        linked.append(bundle_dir / "skills")
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
-        sources.append(host)
+        linked.append(host)
     shared = home / ".agents" / "skills"
     if shared.is_dir():
-        sources.append(shared)
-    return sources
+        linked.append(shared)
+    native: list[Path] = []
+    if workspace is not None:
+        # A home-directory workspace keeps ~/.agents/skills at its user-tier rank.
+        user_tier = os.path.realpath(shared)
+        native = [
+            skills
+            for directory in repo_scope_dirs(workspace, outside_repo="self")
+            if (skills := directory / ".agents" / "skills").is_dir()
+            and os.path.realpath(skills) != user_tier
+        ]
+    return CodexSkillSources(linked=linked, native=native)
 
 
 def select_codex_skill_dirs(
@@ -974,11 +1009,13 @@ def populate_codex_skills_from_bundle(
     Populate a CODEX_HOME's ``skills/`` from a bundle + host skills.
 
     Shared by the wrapped ``codex`` executor and the ``codex-native``
-    launch path so both expose the same skill surface. Builds the source
-    list in priority order — the agent's own ``<bundle>/skills/`` before
-    the host skills dir (so a bundled skill shadows a host skill of the same
-    name) — and delegates to :func:`_populate_codex_skills`, which honours
-    ``skills_filter`` (``"all"`` / ``"none"`` / list of names).
+    launch path so both expose the same skill surface. Links the ``linked``
+    roots of :func:`codex_skill_sources` in priority order — the agent's own
+    ``<bundle>/skills/`` before the host skills dir (so a bundled skill shadows
+    a host skill of the same name) — and delegates to
+    :func:`_populate_codex_skills`, which honours ``skills_filter`` (``"all"`` /
+    ``"none"`` / list of names). Repo-scope skills are not linked: Codex reads
+    them from its cwd, so a link would register each one twice.
 
     :param codex_home: The CODEX_HOME whose ``skills/`` subdir Codex
         scans, e.g. a per-conversation temp dir or the per-bridge native
@@ -1002,7 +1039,7 @@ def populate_codex_skills_from_bundle(
     """
     skill_sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
     _populate_codex_skills(
-        codex_home / "skills", skills_filter, skill_sources, copy_skills=copy_skills
+        codex_home / "skills", skills_filter, skill_sources.linked, copy_skills=copy_skills
     )
 
 
@@ -1297,6 +1334,8 @@ def materialize_codex_provider_config(
     config_overrides: Iterable[str],
     *,
     retry_policy: RetryPolicy | None = None,
+    effective_providers: Mapping[str, object] | None = None,
+    client_surface: str | None = None,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -1314,11 +1353,22 @@ def materialize_codex_provider_config(
     :param config_overrides: Pending Codex config override strings.
     :param retry_policy: Omnigent retry policy to apply through Codex's native
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
+    :param effective_providers: Provider tables resolved by Codex's ``config/read``.
+        Only attribution headers are copied from inherited providers.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(codex_home, 0o700)
     config_path = codex_home / "config.toml"
+    from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+
+    gateway_providers = {
+        name: provider
+        for name, provider in (effective_providers or {}).items()
+        if isinstance(provider, Mapping)
+        and isinstance(base_url := provider.get("base_url"), str)
+        and is_databricks_ai_gateway_url(base_url)
+    }
 
     provider_overrides: list[str] = []
     argv_overrides: list[str] = []
@@ -1327,7 +1377,7 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides and not config_path.is_file():
+    if not provider_overrides and not config_path.is_file() and not gateway_providers:
         return argv_overrides
     if not provider_overrides and config_path.is_symlink():
         return argv_overrides
@@ -1337,7 +1387,7 @@ def materialize_codex_provider_config(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
     providers = document.get("model_providers")
-    if providers is None and not provider_overrides:
+    if providers is None and not provider_overrides and not gateway_providers:
         if config_path.is_file() and not config_path.is_symlink():
             os.chmod(config_path, 0o600)
         return argv_overrides
@@ -1355,7 +1405,11 @@ def materialize_codex_provider_config(
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
 
-    from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+    for provider_name in gateway_providers:
+        if provider_name in providers or provider_name in CODEX_BUILTIN_PROVIDERS:
+            continue
+        # A partial table adds metadata; Codex still owns routing and auth.
+        providers[provider_name] = tomlkit.inline_table()
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
@@ -1373,12 +1427,38 @@ def materialize_codex_provider_config(
         provider_config["stream_max_retries"] = policy.max_retries
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
-        base_url = provider_config.get("base_url")
+        resolved = (effective_providers or {}).get(provider_name)
+        effective = resolved if isinstance(resolved, Mapping) else provider_config
+        base_url = effective.get("base_url")
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
             headers = provider_config.get("http_headers")
-            provider_config["http_headers"] = with_gateway_attribution(
-                headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
+            effective_headers = effective.get("http_headers")
+            attributed = with_gateway_attribution(
+                effective_headers if isinstance(effective_headers, Mapping) else None,
+                CODEX_AGENT,
+                base_url,
+                client_surface=client_surface,
             )
+            attribution_headers = {
+                name: value
+                for name, value in attributed.items()
+                if name.lower()
+                in (
+                    CODING_AGENT_HEADER.lower(),
+                    CLIENT_SURFACES_HEADER.lower(),
+                    REQUEST_TAGS_HEADER.lower(),
+                )
+            }
+            replaced_header_names = {name.lower() for name in attribution_headers}
+            # Codex retains inherited routing and credentials; write only attribution.
+            provider_config["http_headers"] = {
+                **{
+                    name: value
+                    for name, value in (headers.items() if isinstance(headers, Mapping) else ())
+                    if name.lower() not in replaced_header_names
+                },
+                **attribution_headers,
+            }
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -2191,6 +2271,7 @@ def _databricks_codex_config_overrides(
     base_url: str,
     auth_command: str,
     auth_refresh_interval_ms: int | None = None,
+    auth_config: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Return TOML-fragment overrides for the Codex per-conversation config.
 
@@ -2202,10 +2283,28 @@ def _databricks_codex_config_overrides(
         a bearer token, e.g. ``"databricks auth token --host ..."``.
     :param auth_refresh_interval_ms: Refresh cadence in milliseconds,
         e.g. ``900000``.
+    :param auth_config: ucode's structured auth command, args and timeout.
+        Invalid or missing values retain the legacy shell helper and defaults.
     :returns: Codex TOML-fragment override strings.
     """
     provider_name = "omnigent_databricks"
-    auth_command_json = json.dumps(auth_command)
+    command = "sh"
+    args = ["-c", auth_command]
+    timeout_ms = _GATEWAY_AUTH_TIMEOUT_MS
+    if auth_config is not None:
+        configured_command = auth_config.get("command")
+        configured_args = auth_config.get("args", [])
+        if (
+            isinstance(configured_command, str)
+            and configured_command.strip()
+            and isinstance(configured_args, list)
+            and all(isinstance(arg, str) for arg in configured_args)
+        ):
+            command = configured_command
+            args = configured_args
+        configured_timeout = auth_config.get("timeout_ms")
+        if type(configured_timeout) is int and configured_timeout > 0:
+            timeout_ms = configured_timeout
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
@@ -2214,9 +2313,9 @@ def _databricks_codex_config_overrides(
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
             f"base_url={json.dumps(base_url)},"
-            'auth={command="sh",'
-            f'args=["-c",{auth_command_json}],'
-            f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
+            f"auth={{command={json.dumps(command)},"
+            f"args={json.dumps(args)},"
+            f"timeout_ms={timeout_ms},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
             'wire_api="responses"}'
@@ -2990,11 +3089,25 @@ class _CodexAppServerSession:
                 else None
             ),
         )
-        self._codex_config_overrides = materialize_codex_provider_config(
-            self._codex_home_dir,
-            self._codex_config_overrides,
-            retry_policy=self._retry_policy,
-        )
+        if self._signer is None:
+            from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
+
+            self._codex_config_overrides = await prepare_codex_provider_config(
+                self._codex_home_dir,
+                self._codex_config_overrides,
+                codex_path=self._codex_path,
+                cwd=Path(self._cwd or os.getcwd()),
+                env=self._env,
+                retry_policy=self._retry_policy,
+                client_surface=harness_client_surface(),
+            )
+        else:
+            # The signer replaces gateway attribution from its own launch metadata.
+            self._codex_config_overrides = materialize_codex_provider_config(
+                self._codex_home_dir,
+                self._codex_config_overrides,
+                retry_policy=self._retry_policy,
+            )
         if self._signer is not None:
             self._codex_config_overrides.extend(
                 [

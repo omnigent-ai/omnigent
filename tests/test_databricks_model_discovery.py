@@ -114,9 +114,9 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
     ).families
 
     assert families == {
-        "opus": "databricks-claude-opus-4-8",
-        "sonnet": "databricks-claude-3-7-sonnet",
-        "haiku": "databricks-claude-3-5-haiku",
+        "opus": "system.ai.claude-opus-4-8",
+        "sonnet": "system.ai.claude-3-7-sonnet",
+        "haiku": "system.ai.claude-3-5-haiku",
     }
     assert paths == [
         "/api/2.1/unity-catalog/model-services",
@@ -129,12 +129,12 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
     [
         # Two successful empty listings return empty instead of inventing models.
         (_UC_EMPTY, _GATEWAY_EMPTY, {}, ()),
-        # A transient model-services failure does not hide the legacy catalog.
+        # A transient model-services failure canonicalizes the legacy catalog.
         (
             _UC_DOWN,
             (200, {"data": [{"id": "databricks-claude-haiku-4-5"}]}),
-            {"haiku": "databricks-claude-haiku-4-5"},
-            ("databricks-claude-haiku-4-5",),
+            {"haiku": "system.ai.claude-haiku-4-5"},
+            ("system.ai.claude-haiku-4-5",),
         ),
         # Removed UC services do not revive stale models when legacy 404s.
         (_UC_EMPTY, _GATEWAY_GONE, {}, ()),
@@ -172,8 +172,8 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
                     ]
                 },
             ),
-            {"opus": "databricks-claude-opus-5"},
-            ("databricks-claude-opus-5", "databricks-claude-opus-4-8"),
+            {"opus": "system.ai.claude-opus-5"},
+            ("system.ai.claude-opus-5", "system.ai.claude-opus-4-8"),
         ),
         # An authoritative listing with no Claude at all yields an empty
         # catalog, not an error.
@@ -271,13 +271,13 @@ def test_duplicate_spellings_collapse_onto_the_databricks_id() -> None:
         ),
     )
     assert catalog.families == {  # type: ignore[attr-defined]
-        "opus": "databricks-claude-opus-5",
-        "sonnet": "databricks-claude-sonnet-5",
+        "opus": "system.ai.claude-opus-5",
+        "sonnet": "system.ai.claude-sonnet-5",
     }
     assert catalog.model_ids == (  # type: ignore[attr-defined]
-        "databricks-claude-sonnet-5",
-        "databricks-claude-opus-5",
-        "databricks-claude-opus-4-8",
+        "system.ai.claude-sonnet-5",
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
     )
 
 
@@ -287,7 +287,7 @@ def test_a_model_only_unity_catalog_serves_keeps_its_own_spelling() -> None:
         (200, {"data": [{"id": "databricks-claude-opus-5"}]}),
     )
     assert catalog.families == {  # type: ignore[attr-defined]
-        "opus": "databricks-claude-opus-5",
+        "opus": "system.ai.claude-opus-5",
         "haiku": "system.ai.claude-haiku-4-5",
     }
 
@@ -412,10 +412,11 @@ def test_discover_codex_models_empty_listing_is_authoritative() -> None:
 
 
 def test_select_servable_model_matches_legacy_spelling() -> None:
-    """A legacy ``databricks-`` request resolves to the served ``system.ai.`` id."""
+    """A legacy ``databricks-`` or codex-slug request resolves to the served ``system.ai.`` id."""
     from omnigent.models.databricks_model_discovery import select_servable_model
 
     servable = ("system.ai.gpt-5-6-luna", "system.ai.gpt-5-5")
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
+    assert select_servable_model("gpt-5.6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None

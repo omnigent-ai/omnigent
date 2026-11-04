@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type * as WorkspaceChangedFiles from "./useWorkspaceChangedFiles";
 import {
   usePullRequestChangedFiles,
+  usePullRequestDiff,
   usePullRequestInfo,
   useUpdateSessionPr,
 } from "./usePullRequests";
@@ -116,6 +117,42 @@ it("preserves changed-file incompleteness from the host response", async () => {
   expect(result.current.data).toEqual({ ...payload, available: true });
 });
 
+it("pins the changed-file list to the same revision as the diff", async () => {
+  const url = "https://github.com/example/one/pull/42";
+  const revision = `${"b".repeat(40)}:${"a".repeat(40)}`;
+  const fetchMock = vi.fn(
+    async () => new Response(JSON.stringify({ object: "list", data: [] }), { status: 200 }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { result } = renderHook(
+    () => ({
+      changes: usePullRequestChangedFiles("conv", true, url, revision),
+      diff: usePullRequestDiff("conv", true, url, revision),
+    }),
+    {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    },
+  );
+
+  await waitFor(() =>
+    expect(result.current.changes.isSuccess && result.current.diff.isSuccess).toBe(true),
+  );
+  const queries = fetchMock.mock.calls.map((call: unknown[]) => {
+    const request = new URL(String(call[0]), "http://localhost");
+    return [request.pathname.split("/").pop(), Object.fromEntries(request.searchParams)];
+  });
+  const pinned = { pr_url: url, base_sha: "b".repeat(40), head_sha: "a".repeat(40) };
+  expect(queries).toEqual(
+    expect.arrayContaining([
+      ["changes", pinned],
+      ["diff", pinned],
+    ]),
+  );
+});
+
 it("replaces the default selection and the removed PR's cached metadata", async () => {
   const url = "https://github.com/example/one/pull/42";
   const empty = { object: "session.github.info", tracking_available: true, prs: [] };
@@ -134,6 +171,39 @@ it("replaces the default selection and the removed PR's cached metadata", async 
   await act(() => result.current.mutateAsync({ url, action: "remove" }));
   expect(client.getQueryData(["github-info", "conv"])).toMatchObject(empty);
   expect(client.getQueryData(["github-info", "conv", url])).toMatchObject(empty);
+});
+
+it("keeps a link to its own session when the panel switches sessions", async () => {
+  const url = "https://github.com/example/one/pull/42";
+  const linked = { object: "session.github.info", tracking_available: true, prs: [{ url }] };
+  const other = { object: "session.github.info", tracking_available: true, prs: [] };
+  let answer: (response: Response) => void = () => {};
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = resolve;
+        }),
+    ),
+  );
+  const client = new QueryClient();
+  client.setQueryData(["github-info", "conv_2"], other);
+  const { result, rerender } = renderHook(({ id }) => useUpdateSessionPr(id), {
+    initialProps: { id: "conv_1" },
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  result.current.mutate({ url, action: "attach" });
+  await waitFor(() => expect(result.current.isPending).toBe(true));
+
+  rerender({ id: "conv_2" });
+  expect(result.current.isIdle).toBe(true);
+  answer(new Response(JSON.stringify(linked), { status: 200 }));
+
+  await waitFor(() => expect(client.getQueryData(["github-info", "conv_1"])).toMatchObject(linked));
+  expect(client.getQueryData(["github-info", "conv_2"])).toEqual(other);
 });
 
 it("does not restore an unlinked GitLab MR from an older host's stale selection", async () => {

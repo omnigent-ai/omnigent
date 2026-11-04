@@ -33,6 +33,9 @@ from omnigent.db.utils import (
 _PREVIOUS_HEAD = "9d820f91deef"
 _DISPATCH_PREVIOUS = "nf12ab34cd56"
 _DISPATCH_REVISION = "c8e4f2a6b901"
+_COMPLETED_STATE_REVISION = "9e82957bd115"
+_SESSION_MODE_PREVIOUS = "b2e4f6a8c013"
+_SESSION_MODE_REVISION = "d0a1f879a01d"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -82,6 +85,8 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         timestamp_type = sa.Integer if db_engine.dialect.name == "cockroachdb" else sa.BigInteger
         assert isinstance(columns[name]["type"], timestamp_type)
         assert columns[name]["nullable"] is (name != "created_at")
+    assert columns["session_mode"]["nullable"] is False
+    assert columns["session_id"]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -109,6 +114,8 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "next_run_at",
         "project_id",
         "delegation_ref",
+        "session_mode",
+        "session_id",
     }
 
 
@@ -212,6 +219,16 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "workspace_id",
         "id",
     ]
+    assert runs_idx_cols["ix_scheduled_task_runs_conversation_id"] == [
+        "workspace_id",
+        "conversation_id",
+    ]
+    assert runs_idx_cols["ix_scheduled_task_runs_conversation_status"] == [
+        "workspace_id",
+        "conversation_id",
+        "status",
+        "id",
+    ]
     unique_keys = {
         key["name"]: key["column_names"]
         for key in insp.get_unique_constraints("scheduled_task_runs")
@@ -223,13 +240,15 @@ def test_expected_indexes(db_engine: Engine) -> None:
     ]
 
 
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
     """A raw insert omitting ``state`` / ``workspace_id`` / ``execution_target``
-    picks up their defaults.
+    / ``session_mode`` picks up their defaults.
 
     Only the integer server_defaults (``state`` / ``workspace_id`` /
-    ``execution_target``) are exercised here — all are omitted from the insert
-    and must fall back to their defaults.
+    ``execution_target`` / ``session_mode``) are exercised here — all are
+    omitted from the insert and must fall back to their defaults, on both the
+    migrated and the model-built schema.
     """
     with db_engine.begin() as conn:
         conn.execute(
@@ -241,15 +260,17 @@ def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
                 "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', 'u', 'ag_1', 'UTC', 1)"
             )
         )
-        state, workspace_id, execution_target = conn.execute(
+        state, workspace_id, execution_target, session_mode, session_id = conn.execute(
             sa.text(
-                "SELECT state, workspace_id, execution_target FROM scheduled_tasks "
-                "WHERE id = X'00000000000000000000000000000de1'"
+                "SELECT state, workspace_id, execution_target, session_mode, session_id "
+                "FROM scheduled_tasks WHERE id = X'00000000000000000000000000000de1'"
             )
         ).one()
     assert state == 1  # 1 = 'active'
     assert workspace_id == 0
     assert execution_target == 1  # 1 = 'connected_host'
+    assert session_mode == 1  # 1 = 'new'
+    assert session_id is None
 
 
 def test_execution_target_check_rejects_bad_code(db_engine: Engine) -> None:
@@ -270,6 +291,48 @@ def test_execution_target_check_rejects_bad_code(db_engine: Engine) -> None:
                     "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', 'u', 'ag', 'UTC', 99, 1)"
                 )
             )
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_session_mode_check_rejects_bad_code(db_engine: Engine) -> None:
+    """Migrated and model-built ``session_mode`` CHECKs both reject codes outside 1-2."""
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    # MySQL reports CHECK violations as OperationalError (3819).
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"v" * 16,
+                name="bad mode",
+                prompt=b"p",
+                rrule="FREQ=DAILY;BYHOUR=9",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                session_mode=3,
+                created_at=1,
+            )
+        )
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_session_mode_accepts_a_continued_session(db_engine: Engine) -> None:
+    """Migrated and model-built schemas both store a continued session."""
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"s" * 16,
+                name="continued",
+                prompt=b"p",
+                rrule="FREQ=DAILY;BYHOUR=9",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                session_mode=2,
+                session_id=b"c" * 16,
+                created_at=1,
+            )
+        )
+        row = conn.execute(sa.select(tasks.c.session_mode, tasks.c.session_id)).one()
+    assert (row.session_mode, row.session_id) == (2, b"c" * 16)
 
 
 def test_rrule_accepts_recurring_row(db_engine: Engine) -> None:
@@ -311,7 +374,7 @@ def test_state_check_rejects_bad_code(db_engine: Engine) -> None:
     """The ``scheduled_tasks.state`` CHECK rejects codes outside the closed set.
 
     State is stored as a stable int code (see enum_codecs SCHEDULED_TASK_STATE,
-    codes 1-3); a code outside that range must fail the CHECK.
+    codes 1-4); a code outside that range must fail the CHECK.
     """
     with pytest.raises(IntegrityError):
         with db_engine.begin() as conn:
@@ -324,6 +387,26 @@ def test_state_check_rejects_bad_code(db_engine: Engine) -> None:
                     "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', 'u', 'ag', 'UTC', 99, 1)"
                 )
             )
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_state_check_accepts_completed(db_engine: Engine) -> None:
+    """Migrated and model-built schemas both accept the completed state."""
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"d" * 16,
+                name="ended",
+                prompt=b"p",
+                rrule="FREQ=DAILY;COUNT=2",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                state=4,
+                created_at=1,
+            )
+        )
+        assert conn.execute(sa.select(tasks.c.state)).scalar_one() == 4
 
 
 def test_scheduled_task_runs_status_check_rejects_bad_code(db_engine: Engine) -> None:
@@ -718,3 +801,127 @@ def test_downgrade_drops_both_tables(tmp_path: Path) -> None:
 
     engine.dispose()
     clear_engine_cache()
+
+
+def test_completed_state_downgrade_requires_live_connection() -> None:
+    config = _build_alembic_config("postgresql://")
+    config.output_buffer = StringIO()
+    with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
+        command.downgrade(config, f"{_COMPLETED_STATE_REVISION}:{_DISPATCH_REVISION}", sql=True)
+    assert "ALTER TABLE" not in config.output_buffer.getvalue()
+
+
+def test_completed_state_migration_round_trips(dispatch_migration_engine: Engine) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _COMPLETED_STATE_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    values = {
+        "name": "ended",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;COUNT=2",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    with engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"a" * 16, state=4, **values))
+        conn.execute(tasks.insert().values(id=b"b" * 16, state=2, **values))
+    with pytest.raises(RuntimeError, match="Reconcile completed"), engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _DISPATCH_REVISION)
+    with engine.connect() as conn:
+        assert (
+            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            == _COMPLETED_STATE_REVISION
+        )
+    # After reconciling, the downgrade restores the narrower check.
+    with engine.begin() as conn:
+        conn.execute(tasks.update().where(tasks.c.state == 4).values(state=1, next_run_at=None))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _DISPATCH_REVISION)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.state).order_by(tasks.c.id)).scalars().all() == [
+            1,
+            2,
+        ]
+    # MySQL reports CHECK violations as OperationalError (3819).
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"c" * 16, state=4, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _COMPLETED_STATE_REVISION)
+    with engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"c" * 16, state=4, **values))
+
+
+def _conversation_indexes(engine: Engine) -> dict[str, list[str]]:
+    return {
+        i["name"]: list(i["column_names"])
+        for i in sa.inspect(engine).get_indexes("scheduled_task_runs")
+        if i["name"].startswith("ix_scheduled_task_runs_conversation")
+    }
+
+
+def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _SESSION_MODE_PREVIOUS)
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _SESSION_MODE_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        # A task saved before the migration keeps a new session per run.
+        assert conn.execute(sa.select(tasks.c.session_mode, tasks.c.session_id)).one() == (
+            1,
+            None,
+        )
+        conn.execute(
+            tasks.insert().values(id=b"b" * 16, session_mode=2, session_id=b"c" * 16, **values)
+        )
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _SESSION_MODE_PREVIOUS)
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
+    assert not columns & {"session_mode", "session_id"}
+    assert _conversation_indexes(engine) == {
+        "ix_scheduled_task_runs_conversation_id": ["workspace_id", "conversation_id"]
+    }
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2
+        config.attributes["connection"] = conn
+        command.upgrade(config, _SESSION_MODE_REVISION)
+    # Both rows come back on a new session per run, with the wider run index beside the old.
+    with engine.begin() as conn:
+        rows = conn.execute(
+            sa.select(tasks.c.id, tasks.c.session_mode, tasks.c.session_id).order_by(tasks.c.id)
+        ).all()
+    assert [(row.session_mode, row.session_id) for row in rows] == [(1, None), (1, None)]
+    assert _conversation_indexes(engine) == {
+        "ix_scheduled_task_runs_conversation_id": ["workspace_id", "conversation_id"],
+        "ix_scheduled_task_runs_conversation_status": [
+            "workspace_id",
+            "conversation_id",
+            "status",
+            "id",
+        ],
+    }

@@ -25,7 +25,7 @@ jobs:
       !endsWith(github.actor, '[bot]') &&
       github.event.issue.pull_request != null &&
       contains(github.event.comment.body, '/autoformat')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
 
     steps:
