@@ -25,7 +25,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Playwright, expect
 
 from omnigent.harnesses.antigravity_native.bridge import (
     _AGY_IDLE_MARKER,
@@ -57,12 +57,8 @@ _AGY_START_DELAY_S = float(os.environ.get("OMNIGENT_E2E_AGY_START_DELAY_S", "30"
 
 
 @pytest.fixture(autouse=True)
-def _playwright_browsers_outside_isolated_home(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep Playwright's browser cache reachable after the mock fixture relocates HOME."""
-    if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
-        monkeypatch.setenv(
-            "PLAYWRIGHT_BROWSERS_PATH", str(Path.home() / ".cache" / "ms-playwright")
-        )
+def _playwright_browsers_outside_isolated_home(playwright: Playwright) -> None:
+    """Start Playwright with its platform-specific cache before isolating agy's HOME."""
 
 
 @pytest.fixture
@@ -85,11 +81,19 @@ def slow_agy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def stack_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+def stack_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    antigravity_model: list[str] | None,  # noqa: F811
+) -> Path:
     """Give the spawned server and runner a data dir whose logs stay with the test."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT",
+        data_dir / "antigravity-native",
+    )
     return data_dir
 
 
