@@ -421,6 +421,20 @@ def test_executor_factory_decodes_os_env_json(
                     "write_paths": None,
                     "write_files": None,
                     "allow_network": False,
+                    "credential_proxy": {
+                        "entries": [
+                            {
+                                "host": "model.example.com",
+                                "scheme": "bearer",
+                                "source": {
+                                    "kind": "command",
+                                    "command": "/usr/local/bin/get-model-token",
+                                    "refresh_interval_seconds": 300,
+                                },
+                                "inject_env": ["OMNIGENT_CODEX_GATEWAY_TOKEN"],
+                            }
+                        ],
+                    },
                 },
                 "fork": False,
             }
@@ -451,6 +465,10 @@ def test_executor_factory_decodes_os_env_json(
     # default ``True``.
     assert os_env_value.sandbox.allow_network is False
     assert os_env_value.sandbox.read_paths == ["/srv/data"]
+    binding = os_env_value.sandbox.credential_proxy.entries[0]
+    assert binding.source.kind == "command"
+    assert binding.source.refresh_interval_seconds == 300
+    assert binding.inject_env == ["OMNIGENT_CODEX_GATEWAY_TOKEN"]
 
 
 def test_executor_factory_falls_back_on_malformed_os_env_json(

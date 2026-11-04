@@ -391,7 +391,7 @@ class CredentialSourceSpec:
     :param path: File or Unix socket path (``~`` is expanded).
     :param command: Shell command whose stdout is the secret when
         ``kind="command"``, e.g. ``"gh auth token"``.
-    :param refresh_interval_seconds: Re-resolve file or Unix socket sources on
+    :param refresh_interval_seconds: Re-resolve file, command, or Unix socket sources on
         access after this interval. ``None`` resolves only at startup.
     """
 

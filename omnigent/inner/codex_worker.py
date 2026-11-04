@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .credential_proxy import prepare_credential_proxy_runtime
 from .datamodel import OSEnvSpec
 from .egress.controller import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .model_signer import SignerReadiness
+from .os_env import (
+    _build_credential_proxy_parent_env,
+    _write_credential_proxy_files,
+    build_helper_env,
+)
 from .sandbox import (
     cleanup_private_tmpdir,
     create_exec_launcher,
@@ -22,6 +29,22 @@ from .sandbox import (
 )
 
 _FRAMEWORK_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+CODEX_GATEWAY_TOKEN_ENV = "OMNIGENT_CODEX_GATEWAY_TOKEN"
+BROKERED_CODEX_AUTH_COMMAND = f'printf %s "${CODEX_GATEWAY_TOKEN_ENV}"'
+BROKERED_CODEX_ENV = "OMNIGENT_CODEX_BROKERED_GATEWAY"
+BROKERED_CODEX_HOST_ENV_NAMES = frozenset(
+    {"SSH_AUTH_SOCK", "GH_CONFIG_DIR", "GLAB_CONFIG_DIR", "BROWSER"}
+)
+
+
+def is_brokered_codex_host_env(name: str) -> bool:
+    """Identify inherited auth and host configuration excluded from a brokered worker."""
+    return (
+        name.startswith(("DATABRICKS_", "OPENAI_", "XDG_"))
+        or name in BROKERED_CODEX_HOST_ENV_NAMES
+    )
+
+
 _BROKERED_AUTH_SECRET_ENV = frozenset(
     {
         "DATABRICKS_BEARER",
@@ -110,9 +133,10 @@ def prepare_codex_worker(
     worker_env: MutableMapping[str, str] | None = None,
 ) -> CodexWorkerLaunch:
     """Prepare a contained worker or propagate the containment failure."""
+    brokered_gateway = worker_env is not None and worker_env.get(BROKERED_CODEX_ENV) == "1"
     if os_env is None or (os_env.sandbox is not None and os_env.sandbox.type == "none"):
-        if signer_readiness is not None:
-            raise OSError("signer-backed Codex worker requires an active sandbox")
+        if signer_readiness is not None or brokered_gateway:
+            raise OSError("brokered Codex worker requires an active sandbox")
         return CodexWorkerLaunch(launch_path=codex_path, sandboxed=False)
     sandbox_spec = os_env.sandbox
     if signer_readiness is not None and sandbox_spec is not None and sandbox_spec.egress_rules:
@@ -123,8 +147,8 @@ def prepare_codex_worker(
 
     policy = resolve_sandbox(os_env, cwd)
     if not policy.active:
-        if signer_readiness is not None:
-            raise OSError("signer-backed Codex worker requires an active sandbox")
+        if signer_readiness is not None or brokered_gateway:
+            raise OSError("brokered Codex worker requires an active sandbox")
         return CodexWorkerLaunch(launch_path=codex_path, sandboxed=False)
     if signer_readiness is not None and worker_env is None:
         raise ValueError("signer-backed Codex worker requires an owned worker environment")
@@ -135,6 +159,16 @@ def prepare_codex_worker(
     )
     if egress_rules and worker_env is None:
         raise ValueError("egress-filtered Codex worker requires an owned worker environment")
+    if brokered_gateway:
+        if sandbox_spec is None or sandbox_spec.credential_proxy is None or not egress_rules:
+            raise ValueError("brokered Codex gateway requires credential_proxy and egress rules")
+        bindings = [
+            entry
+            for entry in sandbox_spec.credential_proxy.entries
+            if CODEX_GATEWAY_TOKEN_ENV in entry.inject_env
+        ]
+        if len(bindings) != 1 or bindings[0].scheme != "bearer":
+            raise ValueError("brokered Codex gateway requires one bearer token binding")
 
     codex_dir = Path(codex_path).resolve(strict=False).parent
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
@@ -146,6 +180,16 @@ def prepare_codex_worker(
             raise ValueError("signer relay and public CA must share one public directory")
         policy = with_additional_read_roots(policy, [signer_readiness.ca_bundle_path.parent])
     staged_env = dict(worker_env) if worker_env is not None else None
+    if brokered_gateway and staged_env is not None:
+        for key in tuple(staged_env):
+            if is_brokered_codex_host_env(key):
+                staged_env.pop(key, None)
+        staged_env["HOME"] = str(codex_home)
+        staged_env["CODEX_HOME"] = str(codex_home)
+        staged_env["CFFIXED_USER_HOME"] = str(codex_home)
+        staged_env["CODEX_SQLITE_HOME"] = str(codex_home)
+        for name in ("TMPDIR", "TMP", "TEMP"):
+            staged_env[name] = str(codex_home)
     if signer_readiness is not None:
         assert staged_env is not None
         for key in _BROKERED_AUTH_SECRET_ENV:
@@ -191,6 +235,35 @@ def prepare_codex_worker(
                 staged_env.pop(key, None)
             egress_tmpdir = create_private_tmpdir()
             policy = with_additional_write_roots(policy, [egress_tmpdir])
+            credential_runtime = None
+            if policy.credential_proxy is not None:
+                parent_env = _build_credential_proxy_parent_env(
+                    helper_env=build_helper_env(os.environ, policy),
+                    parent_env=os.environ,
+                    spec=policy.credential_proxy,
+                )
+                credential_runtime = prepare_credential_proxy_runtime(
+                    policy.credential_proxy,
+                    parent_env=parent_env,
+                    sandbox=policy,
+                    cwd=cwd,
+                )
+                if brokered_gateway:
+                    # OS tools have their own proxy runtime. Codex only needs
+                    # the model placeholder, not unrelated injected credentials.
+                    token = credential_runtime.helper_env_updates.get(CODEX_GATEWAY_TOKEN_ENV)
+                    if token is not None:
+                        staged_env[CODEX_GATEWAY_TOKEN_ENV] = token
+                else:
+                    staged_env.update(credential_runtime.helper_env_updates)
+                    _write_credential_proxy_files(
+                        staged_env, credential_runtime.sandbox_files, egress_tmpdir
+                    )
+            if brokered_gateway and (
+                credential_runtime is None
+                or CODEX_GATEWAY_TOKEN_ENV not in credential_runtime.helper_env_updates
+            ):
+                raise ValueError("brokered Codex gateway token placeholder is unavailable")
             egress_handle = start_egress_proxy(
                 rules=egress_rules,
                 tmpdir=egress_tmpdir,
@@ -199,6 +272,9 @@ def prepare_codex_worker(
                 # of its environment. Match the terminal path: relay access is
                 # tokenless, while destination/method/path policy remains strict.
                 require_auth=False,
+                credential_rewrites=(
+                    credential_runtime.rewrites if credential_runtime is not None else None
+                ),
             )
             apply_egress_env(
                 staged_env,

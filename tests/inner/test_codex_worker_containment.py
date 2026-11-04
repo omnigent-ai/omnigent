@@ -17,10 +17,18 @@ import pytest
 from omnigent.inner.codex_executor import _CodexAppServerSession
 from omnigent.inner.codex_worker import (
     _BROKERED_AUTH_SECRET_ENV,
+    BROKERED_CODEX_ENV,
+    CODEX_GATEWAY_TOKEN_ENV,
     prepare_codex_catalog_probe,
     prepare_codex_worker,
 )
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+)
 from omnigent.inner.model_signer import SignerReadiness
 from omnigent.inner.sandbox import SandboxPolicy, with_additional_write_roots
 
@@ -109,6 +117,26 @@ def test_active_sandbox_preflights_before_creating_launcher(
         )
 
     create_launcher.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "os_env",
+    [None, OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))],
+)
+def test_brokered_gateway_rejects_missing_sandbox(
+    tmp_path: Path, os_env: OSEnvSpec | None
+) -> None:
+    worker_env = {BROKERED_CODEX_ENV: "1"}
+    with pytest.raises(OSError, match="requires an active sandbox"):
+        prepare_codex_worker(
+            codex_path="/bin/codex",
+            cwd=tmp_path,
+            codex_home=tmp_path,
+            os_env=os_env,
+            spawn_env_names=list(worker_env),
+            worker_env=worker_env,
+        )
+    assert worker_env == {BROKERED_CODEX_ENV: "1"}
 
 
 def test_successful_active_sandbox_returns_owned_launcher(
@@ -335,12 +363,103 @@ def test_non_signer_egress_rules_route_only_through_owned_proxy(
         tmpdir=egress_tmpdir,
         allow_private_destinations=True,
         require_auth=False,
+        credential_rewrites=None,
     )
 
     worker.close()
     worker.close()
     handle.stop.assert_called_once_with()
     assert not egress_tmpdir.exists()
+
+
+def test_brokered_gateway_rewrites_only_parent_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    codex = tmp_path / "codex"
+    codex.touch()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    launcher = tmp_path / "launcher"
+    launcher.touch()
+    egress_dir = tmp_path / "egress"
+    proxy = Mock(
+        relay_port=43124,
+        socket_path=egress_dir / "relay.sock",
+        ca_bundle_path=egress_dir / "ca.pem",
+    )
+    binding = CredentialProxyEntry(
+        host="model.example.com",
+        scheme="bearer",
+        source=CredentialSourceSpec(kind="env", env="PARENT_MODEL_TOKEN"),
+        inject_env=[CODEX_GATEWAY_TOKEN_ENV],
+    )
+    credentials = CredentialProxySpec(
+        entries=[
+            binding,
+            CredentialProxyEntry(
+                host="other.example.com",
+                scheme="bearer",
+                source=CredentialSourceSpec(kind="env", env="PARENT_OTHER_TOKEN"),
+                inject_env=["OPENAI_API_KEY", "HOME"],
+            ),
+        ]
+    )
+    policy = _active_policy(tmp_path)
+    policy.credential_proxy = credentials
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
+    monkeypatch.setenv("PARENT_MODEL_TOKEN", "real-parent-token")
+    monkeypatch.setenv("PARENT_OTHER_TOKEN", "other-parent-token")
+    monkeypatch.setattr("omnigent.inner.codex_worker.resolve_sandbox", lambda *_: policy)
+    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", lambda *_: backend)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_worker.create_exec_launcher", lambda *_: str(launcher)
+    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", lambda: egress_dir)
+    start_proxy = Mock(return_value=proxy)
+    monkeypatch.setattr("omnigent.inner.codex_worker.start_egress_proxy", start_proxy)
+    worker_env = {
+        "PATH": os.environ["PATH"],
+        "CODEX_HOME": str(codex_home),
+        BROKERED_CODEX_ENV: "1",
+        "DATABRICKS_TOKEN": "ambient-token",
+        "OPENAI_API_KEY": "ambient-key",
+        "XDG_CONFIG_HOME": "/host/config",
+        "SSH_AUTH_SOCK": "/host/ssh-agent.sock",
+        "GH_CONFIG_DIR": "/host/gh",
+        "HOME": "/host/home",
+    }
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=tmp_path,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(
+            sandbox=OSEnvSandboxSpec(
+                type="darwin_seatbelt",
+                egress_rules=["POST model.example.com/cyber/v1/responses"],
+                credential_proxy=credentials,
+            )
+        ),
+        spawn_env_names=list(worker_env),
+        worker_env=worker_env,
+    )
+    try:
+        rewrite = start_proxy.call_args.kwargs["credential_rewrites"][0]
+        assert rewrite.host == "model.example.com"
+        assert rewrite.real_secret == "real-parent-token"
+        assert worker_env[CODEX_GATEWAY_TOKEN_ENV] == rewrite.synthetic
+        assert rewrite.synthetic.startswith("oa_cred_")
+        assert "real-parent-token" not in repr(worker_env)
+        assert "DATABRICKS_TOKEN" not in worker_env
+        assert "OPENAI_API_KEY" not in worker_env
+        assert "other-parent-token" not in repr(worker_env)
+        assert "XDG_CONFIG_HOME" not in worker_env
+        assert "SSH_AUTH_SOCK" not in worker_env
+        assert "GH_CONFIG_DIR" not in worker_env
+        assert worker_env["HOME"] == str(codex_home)
+        assert worker_env["TMPDIR"] == str(codex_home)
+    finally:
+        worker.close()
 
 
 def test_non_signer_egress_setup_rolls_back_before_return(
@@ -396,6 +515,61 @@ def test_non_signer_egress_setup_rolls_back_before_return(
         )
 
     handle.stop.assert_called_once_with()
+    assert not egress_tmpdir.exists()
+
+
+def test_brokered_gateway_command_failure_leaves_worker_unstarted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    codex = tmp_path / "codex"
+    codex.touch()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    egress_tmpdir = tmp_path / "egress"
+    binding = CredentialProxyEntry(
+        host="model.example.com",
+        scheme="bearer",
+        source=CredentialSourceSpec(kind="command", command="exit 7"),
+        inject_env=[CODEX_GATEWAY_TOKEN_ENV],
+    )
+    credentials = CredentialProxySpec(entries=[binding])
+    policy = _active_policy(tmp_path)
+    policy.credential_proxy = credentials
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
+    start_proxy = Mock()
+    create_launcher = Mock()
+
+    def _create_tmpdir() -> Path:
+        egress_tmpdir.mkdir()
+        return egress_tmpdir
+
+    monkeypatch.setattr("omnigent.inner.codex_worker.resolve_sandbox", lambda *_: policy)
+    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", lambda *_: backend)
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", _create_tmpdir)
+    monkeypatch.setattr("omnigent.inner.codex_worker.start_egress_proxy", start_proxy)
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
+    worker_env = {"PATH": os.environ["PATH"], BROKERED_CODEX_ENV: "1"}
+
+    with pytest.raises(ValueError, match="command source failed"):
+        prepare_codex_worker(
+            codex_path=str(codex),
+            cwd=tmp_path,
+            codex_home=codex_home,
+            os_env=OSEnvSpec(
+                sandbox=OSEnvSandboxSpec(
+                    type="darwin_seatbelt",
+                    egress_rules=["POST model.example.com/cyber/v1/responses"],
+                    credential_proxy=credentials,
+                )
+            ),
+            spawn_env_names=list(worker_env),
+            worker_env=worker_env,
+        )
+
+    assert worker_env == {"PATH": os.environ["PATH"], BROKERED_CODEX_ENV: "1"}
+    start_proxy.assert_not_called()
+    create_launcher.assert_not_called()
     assert not egress_tmpdir.exists()
 
 

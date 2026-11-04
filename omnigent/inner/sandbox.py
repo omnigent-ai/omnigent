@@ -570,9 +570,9 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     policy = _get_backend(sandbox_spec.type).resolve(spec, cwd)
     if policy.credential_proxy is not None:
         for entry in policy.credential_proxy.entries:
-            if (
-                entry.source.kind == "unix_socket"
-                or entry.source.refresh_interval_seconds is not None
+            if entry.source.kind == "unix_socket" or (
+                entry.source.refresh_interval_seconds is not None
+                and entry.source.kind != "command"
             ):
                 protect_credential_source(entry.source, policy, cwd=cwd)
     if policy.git_ssh:
