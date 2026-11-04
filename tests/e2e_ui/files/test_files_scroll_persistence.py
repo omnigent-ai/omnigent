@@ -204,6 +204,16 @@ _HTML_ARTIFACT = (
     + " 600);</script></body></html>"
 )
 
+# The plan rewritten with a CSP that blocks every script, the preview's runtime included.
+_HTML_ARTIFACT_WITHOUT_SCRIPTS = (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta http-equiv='Content-Security-Policy' content=\"script-src 'none'\">"
+    "<title>Plan</title></head><body><h1>Revised migration plan</h1>"
+    "<label><input type='checkbox' id='reviewed'> Reviewed</label>"
+    + _plan_steps(1, 40)
+    + "</body></html>"
+)
+
 _HTML_PREVIEW = 'iframe[title="HTML preview"]'
 
 
@@ -289,7 +299,10 @@ def test_html_preview_scroll_survives_tab_switch(
     request: pytest.FixtureRequest,
     seeded_html_sessions: tuple[str, str, str],
 ) -> None:
-    """Scroll an HTML artifact, open another file tab, return: the offset is restored."""
+    """Scroll an HTML artifact, open another file tab, return: the offset is restored.
+
+    A rewrite that blocks the preview's runtime still shows once the hide style expires.
+    """
     base_url, session_a, _ = seeded_html_sessions
     page: Page = request.getfixturevalue("page")
     offset = _open_html_artifact(page, base_url, session_a)
@@ -304,6 +317,17 @@ def test_html_preview_scroll_survives_tab_switch(
 
     page.locator('[role="button"][title="plan.html"]').click()
     _expect_html_scroll(page, offset)
+
+    _seed_file(base_url, session_a, "plan.html", _HTML_ARTIFACT_WITHOUT_SCRIPTS)
+    preview = page.frame_locator(_HTML_PREVIEW)
+    expect(preview.get_by_role("heading", name="Revised migration plan")).to_be_attached(
+        timeout=15_000
+    )
+    expect(preview.locator("html")).to_have_css("opacity", "1", timeout=10_000)
+    # The runtime never ran to remove the style, so its own expiry showed the page.
+    expect(preview.locator("style[data-omni-restore-hide]")).to_have_count(1)
+    preview.locator("#reviewed").click()
+    expect(preview.locator("#reviewed")).to_be_checked()
 
 
 def test_html_preview_scroll_survives_session_switch(
