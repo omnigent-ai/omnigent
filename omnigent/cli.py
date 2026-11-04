@@ -8,6 +8,7 @@ import contextlib
 import contextvars
 import copy
 import errno
+import functools
 import hashlib
 import json
 import logging
@@ -101,6 +102,7 @@ from omnigent.host.local_server import (
     consume_failed_server_log_tail,
     ensure_local_omnigent_server,
     local_server_status,
+    local_server_still_serves,
     local_server_url_if_healthy,
     server_config_signature,
     stop_local_omnigent_server,
@@ -126,6 +128,7 @@ if TYPE_CHECKING:
     import httpx
 
     from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
     from omnigent.server.smart_routing import LLMRoutingClient
@@ -2683,8 +2686,10 @@ def _selected_org_id(server_url: str | None) -> str | None:
     # The pin and login match the URL as given; a record target may be an old
     # spelling, which only its canonical form finds. Both the registry key and the
     # daemon pin come from here, so they agree.
-    return load_databricks_org_id(server_url) or load_databricks_org_id(
-        _normalize_daemon_target_impl(server_url)
+    return (
+        ServerUrl(api_base=server_url).org_id
+        or load_databricks_org_id(server_url)
+        or load_databricks_org_id(_normalize_daemon_target_impl(server_url))
     )
 
 
@@ -2699,6 +2704,51 @@ def _normalize_daemon_target(server_url: str | None) -> str:
         trailing slash, plus ``?o=`` for the workspace selected for it.
     """
     return _normalize_daemon_target_impl(server_url, org_id=_selected_org_id(server_url))
+
+
+def _host_databricks_org_pin(server_url: str | None) -> str | None:
+    """Snapshot routing for a workspace host, including no selected org."""
+    from omnigent.cli_auth import databricks_org_pin
+    from omnigent.util.server_url import is_workspace_hosted_url
+
+    if server_url and is_workspace_hosted_url(server_url):
+        return databricks_org_pin(server_url, _selected_org_id(server_url))
+    return None
+
+
+def _daemon_binding_matches(record: _HostDaemonRecord, server_url: str) -> bool:
+    """Compare immutable launch state, never a target re-read through login state."""
+    desired = _host_databricks_org_pin(server_url)
+    if desired is None or ServerUrl(api_base=desired).org_id is None:
+        # Without a requested selector, an existing daemon for this URL or
+        # proven workspace remains compatible. Check for a conflict once
+        # authentication establishes which selector this launch needs.
+        return True
+    # Legacy daemons may record only their target or server-reported workspace.
+    # Missing pin metadata alone must not interrupt their existing sessions.
+    actual = record.org_pin
+    if actual is None:
+        selected = ServerUrl(api_base=record.target).org_id
+        if selected is None:
+            return (
+                record.workspace_id is None
+                or record.workspace_id == ServerUrl(api_base=desired).org_id
+            )
+        from omnigent.cli_auth import databricks_org_pin
+
+        actual = databricks_org_pin(record.target, selected)
+    return ServerUrl(api_base=actual).org_id == ServerUrl(api_base=desired).org_id
+
+
+def _require_compatible_daemon(record: _HostDaemonRecord, server_url: str) -> None:
+    """Refuse a conflicting binding without interrupting the running host."""
+    if _daemon_binding_matches(record, server_url):
+        return
+    raise click.ClickException(
+        "The running host has a different workspace binding. It was left running "
+        "to preserve its sessions. When its work is finished, stop it with "
+        f"`{_host_stop_command(record.server_url)}` and retry."
+    )
 
 
 def _daemon_host_status_probe(
@@ -3103,6 +3153,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         return _DaemonReuseDecision(reuse=False, config_changed=False)
 
     if target != _LOCAL_DAEMON_MARKER:
+        _require_compatible_daemon(existing, target)
         # Remote / explicit ``--server`` mode: the daemon connects to a server
         # we don't own and can't restart, so the config-signature / heal /
         # "re-run" semantics below don't apply (auth posture is the remote's
@@ -3439,6 +3490,7 @@ def _foreground_daemon_record(
         host_id=host_id,
         resolved_server_url=server_url.rstrip("/") if mode == "local" else None,
         config_sig=server_config_signature(include_features=mode == "local"),
+        org_pin=_host_databricks_org_pin(server_url) if mode == "server" else None,
     )
 
 
@@ -3754,6 +3806,8 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         _record_host_state("reused_local_daemon", running_before=True)
         return False
     sibling = _same_workspace_daemon(server_url)
+    if sibling is not None and server_url:
+        _require_compatible_daemon(sibling, server_url)
     if sibling is not None:
         reason = _same_workspace_daemon_offline_reason(sibling, server_url)
         if reason is not None:
@@ -3818,6 +3872,25 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         action = "started_during_launch"
     _record_host_state(action)
     return decision.config_changed
+
+
+def _reuse_host_daemon_if_compatible(server_url: str) -> bool:
+    """Check for a compatible warm host without spawning or stopping a process."""
+    from omnigent.util.server_url import is_workspace_hosted_url
+
+    if is_workspace_hosted_url(server_url) and _selected_org_id(server_url) is None:
+        return False
+    existing = _find_daemon_record(_normalize_daemon_target(server_url))
+    if existing is not None and _daemon_owner_is_live(existing):
+        return not (
+            existing.log_path is not None and _daemon_host_identity_changed(existing)
+        ) and _daemon_binding_matches(existing, server_url)
+    sibling = _same_workspace_daemon(server_url)
+    return (
+        sibling is not None
+        and _daemon_binding_matches(sibling, server_url)
+        and _same_workspace_daemon_offline_reason(sibling, server_url) is None
+    )
 
 
 def _build_host_daemon_env(
@@ -3922,12 +3995,12 @@ def _build_host_daemon_env(
 
     env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
     env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
-    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR, databricks_org_pin
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR
 
     env.pop(PINNED_DATABRICKS_ORG_ENV_VAR, None)
-    org_id = _selected_org_id(server_url)
-    if server_url and org_id:
-        env[PINNED_DATABRICKS_ORG_ENV_VAR] = databricks_org_pin(server_url, org_id)
+    pin = _host_databricks_org_pin(server_url)
+    if pin is not None:
+        env[PINNED_DATABRICKS_ORG_ENV_VAR] = pin
     return env
 
 
@@ -4034,28 +4107,45 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     """
     import httpx as _httpx
 
-    from omnigent.chat import _remote_headers
+    from omnigent.chat import (
+        _forget_refused_credential,
+        _remember_accepted_credential,
+        _remote_headers,
+    )
     from omnigent.cli_auth import (
         is_workspace_hosted_url,
         load_databricks_org_id,
         load_databricks_workspace_host,
+        pin_databricks_org_id,
         pinned_databricks_org_id,
         store_databricks_auth,
     )
+    from omnigent.inner.databricks_executor import _forget_remembered_profile
 
     org_id = load_databricks_org_id(server)
     headers = _remote_headers(server_url=server, host_id=None)
     try:
         probe = _httpx.get(f"{server}/v1/me", headers=headers, timeout=10.0)
-    except _httpx.HTTPError:
+    except _httpx.HTTPError as error:
+        if is_workspace_hosted_url(server) and org_id is None:
+            raise click.ClickException(
+                "Could not verify the workspace before starting its host. "
+                "Check your connection and retry, or select the workspace with ?o=<org-id>."
+            ) from error
         # Unreachable / transient: let the connect path raise its own,
         # already-actionable error rather than failing the pre-flight.
         return
     if probe.status_code == 200:
         org_id = _verified_databricks_org_id(probe, org_id)
-        if org_id and is_workspace_hosted_url(server):
-            _persist_databricks_org_id(server, org_id)
+        if is_workspace_hosted_url(server):
+            if org_id:
+                _persist_databricks_org_id(server, org_id)
+            # Bind the verified response, not a later read of the shared login file.
+            pin_databricks_org_id(server, org_id)
+        _remember_accepted_credential(server, headers.get("Authorization"))
         return
+    # Neither later clients nor the recovery below may reuse what was refused.
+    _forget_refused_credential(server)
     workspace_host = _databricks_workspace_login_target(server, probe)
     credential_rejected = False
     if workspace_host is None and probe.status_code in (401, 403):
@@ -4065,13 +4155,19 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         if workspace_host is None and "Authorization" in headers:
             try:
                 unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
-            except _httpx.HTTPError:
+            except _httpx.HTTPError as error:
+                if is_workspace_hosted_url(server) and org_id is None:
+                    raise click.ClickException(
+                        "Could not verify the workspace before starting its host. "
+                        "Check your connection and retry."
+                    ) from error
                 return
             workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
         credential_rejected = workspace_host is not None and "Authorization" in headers
     if workspace_host is None:
         return
-    auth_info = _databricks_workspace_auth_info(workspace_host)
+    _forget_remembered_profile(workspace_host)
+    auth_info = _databricks_workspace_auth_info(workspace_host, org_id)
     if auth_info is not None:
         if org_id is None:
             org_id = _workspace_hosted_profile_org_id(
@@ -4081,6 +4177,9 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         if refreshed_probe.status_code == 200:
             org_id = _verified_databricks_org_id(refreshed_probe, org_id)
             store_databricks_auth(server, workspace_host, org_id=org_id)
+            if is_workspace_hosted_url(server):
+                pin_databricks_org_id(server, org_id)
+            _keep_verified_workspace_auth(server, workspace_host, auth_info)
             return
     # User-facing: show the display form (the workspace /omnigent URL, with
     # ?o= when known), not the internal API mount; it round-trips through
@@ -4140,25 +4239,26 @@ def _ensure_backend(server: str | None) -> str:
         # otherwise the session-create call deep in the REPL bring-up
         # surfaces the edge redirect as an opaque non-JSON-response
         # traceback.
-        #
-        # The auth probe (GET /v1/me, ~0.65s) and the daemon tunnel start
-        # (~2s) are independent — run them concurrently so the auth check
-        # is hidden under the longer daemon wait.
-        import concurrent.futures
-
         server = _resolve_server_url(server).api_base
-        with (
-            runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE),
-            concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
-        ):
-            auth_future = pool.submit(_ensure_databricks_server_auth, server)
-            daemon_context = contextvars.copy_context()
-            daemon_future = pool.submit(daemon_context.run, _ensure_host_daemon, server)
-            # Raise auth errors before daemon errors: a login failure is
-            # more actionable than a daemon-connect failure that would
-            # have been caused by the same missing credentials.
-            auth_future.result()
-            daemon_future.result()
+        from omnigent.util.server_url import is_workspace_hosted_url
+
+        with runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE):
+            if is_workspace_hosted_url(server) and _selected_org_id(server) is None:
+                # Discover routing before the host snapshots its binding.
+                _ensure_databricks_server_auth(server)
+                _ensure_host_daemon(server)
+            else:
+                # A known selector is already pinned by URL resolution. Keep
+                # token minting and the auth probe hidden under daemon startup.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    auth_context = contextvars.copy_context()
+                    daemon_context = contextvars.copy_context()
+                    auth_future = pool.submit(
+                        auth_context.run, _ensure_databricks_server_auth, server
+                    )
+                    daemon_future = pool.submit(daemon_context.run, _ensure_host_daemon, server)
+                    auth_future.result()
+                    daemon_future.result()
         return server
     # Local mode: the daemon spawns (or reuses) a persistent local Omnigent server.
     # On a cold start this is the longest silent gap between the user pressing
@@ -5297,6 +5397,13 @@ def server_status(json_output: bool) -> None:
     help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
 )
 @click.option(
+    "--open-in-desktop",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_OPEN_IN_DESKTOP",
+    show_envvar=True,
+    help="Open the host web UI in the Omnigent desktop app instead of a browser.",
+)
+@click.option(
     "--non-interactive",
     "non_interactive",
     is_flag=True,
@@ -5307,7 +5414,7 @@ def server_status(json_output: bool) -> None:
         "launching the browser login flow. Use this in scripts and CI."
     ),
 )
-def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
+def start(server: str | None, no_open: bool, open_in_desktop: bool, non_interactive: bool) -> None:
     """Start Omnigent on this machine, in the background.
 
     The on switch, and the counterpart of ``omnigent stop``: brings up the
@@ -5324,6 +5431,8 @@ def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
         ``"https://example.databricksapps.com"``. ``None`` falls back to
         config; empty string forces local mode.
     :param no_open: When ``True``, skip automatically opening the host web UI.
+    :param open_in_desktop: When ``True``, open the host web UI in the desktop
+        app instead of a browser.
     :param non_interactive: When ``True``, never launch the browser login for
         an un-authed remote server — fail with the ``omnigent login`` hint
         instead.
@@ -5334,6 +5443,7 @@ def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
         stop_command=f"{cli_invocation()} stop",
         non_interactive=non_interactive,
         no_open=no_open,
+        open_in_desktop=open_in_desktop,
     )
 
 
@@ -9544,6 +9654,7 @@ def _maybe_open_host_web_ui(
     *,
     non_interactive: bool,
     no_open: bool,
+    open_in_desktop: bool,
     cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
 ) -> None:
     """Open the host web UI when interactive and enabled."""
@@ -9565,7 +9676,7 @@ def _maybe_open_host_web_ui(
     if base_path:
         web_url = web_url.rstrip("/") + base_path
     try:
-        opened = open_conversation_url(web_url)
+        opened = open_conversation_url(web_url, desktop=open_in_desktop)
     except OSError:
         opened = False
     if not opened:
@@ -9578,6 +9689,7 @@ def _run_background_host(
     stop_command: str,
     non_interactive: bool,
     no_open: bool,
+    open_in_desktop: bool,
 ) -> None:
     """Spawn (or reuse) the detached host daemon and report it.
 
@@ -9600,6 +9712,8 @@ def _run_background_host(
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
     :param no_open: When ``True``, skip automatically opening the host web UI.
+    :param open_in_desktop: When ``True``, open the host web UI in the desktop
+        app instead of a browser.
     :raises click.ClickException: If the daemon cannot be spawned, exits
         immediately, fails to register, or (local mode) never serves its local
         Omnigent server.
@@ -9669,7 +9783,12 @@ def _run_background_host(
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
-    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive, no_open=no_open)
+    _maybe_open_host_web_ui(
+        server_url,
+        non_interactive=non_interactive,
+        no_open=no_open,
+        open_in_desktop=open_in_desktop,
+    )
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -9711,6 +9830,13 @@ def _host_stop_command(explicit_server: str | None) -> str:
     help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
 )
 @click.option(
+    "--open-in-desktop",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_OPEN_IN_DESKTOP",
+    show_envvar=True,
+    help="Open the host web UI in the Omnigent desktop app instead of a browser.",
+)
+@click.option(
     "--background",
     "background",
     is_flag=True,
@@ -9739,6 +9865,7 @@ def host(
     server: str | None,
     background: bool,
     no_open: bool,
+    open_in_desktop: bool,
     non_interactive: bool,
 ) -> None:
     """
@@ -9751,6 +9878,7 @@ def host(
       omnigent host ""   # spawn + connect to a local server
       omnigent host --background   # spawn detached, return immediately
       omnigent host --no-open   # connect without opening the web UI
+      omnigent host --open-in-desktop   # open the web UI in the desktop app
       omnigent host enable   # install and start a per-user system service
       omnigent host disable  # stop and remove the per-user system service
 
@@ -9774,6 +9902,8 @@ def host(
     :param background: When ``True``, spawn the daemon detached and return
         instead of running the daemon loop in the foreground.
     :param no_open: When ``True``, skip automatically opening the host web UI.
+    :param open_in_desktop: When ``True``, open the host web UI in the desktop
+        app instead of a browser.
     :param non_interactive: When ``True``, never launch the browser login
         for an un-authed remote server — fail with the ``omnigent login``
         hint instead.
@@ -9802,6 +9932,7 @@ def host(
             stop_command=_host_stop_command(explicit_server),
             non_interactive=non_interactive,
             no_open=no_open,
+            open_in_desktop=open_in_desktop,
         )
         return
 
@@ -9817,10 +9948,12 @@ def host(
     # gates the Ctrl-C stop-server prompt so we never offer to stop a server
     # we didn't bring up.
     spawned_local_server = False
+    server_still_ours = None
     if not server:
         startup = ensure_local_omnigent_server()
         server = startup.url
         spawned_local_server = startup.spawned
+        server_still_ours = functools.partial(local_server_still_serves, server)
     record = _foreground_daemon_record(
         target=target,
         server_url=server,
@@ -9843,6 +9976,15 @@ def host(
             from omnigent.host.daemon_lifecycle import resolve_daemon_workspace_id
 
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+            from omnigent.cli_auth import pin_databricks_org_id
+            from omnigent.util.server_url import is_workspace_hosted_url
+
+            if is_workspace_hosted_url(server):
+                pin_databricks_org_id(server, _selected_org_id(server))
+                record = _HostDaemonRecord(
+                    **{**asdict(record), "org_pin": _host_databricks_org_pin(server)}
+                )
+                _write_daemon_record(record)
             # A first sign-in is what records the workspace id, so check again.
             workspace_id = resolve_daemon_workspace_id(server)
             sibling = _same_workspace_daemon(
@@ -9851,8 +9993,16 @@ def host(
             if sibling is not None:
                 _raise_live_daemon_conflict(record, sibling)
             workspace_lock = _claim_foreground_workspace(record, server, workspace_id=workspace_id)
-        _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
-        run_host_process(server_url=server, daemon_target=target)
+        _maybe_open_host_web_ui(
+            server,
+            non_interactive=non_interactive,
+            no_open=no_open,
+            open_in_desktop=open_in_desktop,
+            cfg=cfg,
+        )
+        run_host_process(
+            server_url=server, daemon_target=target, server_still_ours=server_still_ours
+        )
         stopped_cleanly = True
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it
@@ -13098,6 +13248,13 @@ def _workspace_api_server_url(server: str) -> str:
 
     server = server.rstrip("/")
     parsed = urlsplit(server)
+    # Shown with the caller's own selector: without it the display falls back
+    # to the stored login record, which can name another workspace on the host.
+    org_id = _org_id_from_url(server)
+
+    def _display(url: str) -> str:
+        return display_server_url(f"{url}?o={org_id}" if org_id else url)
+
     # Strip any ?o= selector / query / fragment before probing: callers append
     # a path (``f"{base}/v1/..."``), so a query-bearing base would push that
     # path into the query (``…/?o=123/v1/me``) and break the probe + expansion.
@@ -13114,7 +13271,7 @@ def _workspace_api_server_url(server: str) -> str:
     # still works.
     if parsed.scheme == "https" and parsed.path == WORKSPACE_UI_PATH:
         root = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
-        expanded = _workspace_api_server_url(root)
+        expanded = _workspace_api_server_url(f"{root}?o={org_id}" if org_id else root)
         return expanded if expanded != root else server
     if parsed.path not in ("", "/") or parsed.scheme != "https":
         return server
@@ -13139,7 +13296,7 @@ def _workspace_api_server_url(server: str) -> str:
         return server
     if _workspace_mount_probe_matches(candidate, api_probe):
         click.echo(
-            f"Using {display_server_url(candidate)} (Databricks workspace-hosted omnigent).",
+            f"Using {_display(candidate)} (Databricks workspace-hosted omnigent).",
             err=True,
         )
         return candidate
@@ -13160,7 +13317,7 @@ def _workspace_api_server_url(server: str) -> str:
             authed_probe = None
         if authed_probe is not None and _workspace_mount_probe_matches(candidate, authed_probe):
             click.echo(
-                f"Using {display_server_url(candidate)} (Databricks workspace-hosted omnigent).",
+                f"Using {_display(candidate)} (Databricks workspace-hosted omnigent).",
                 err=True,
             )
             return candidate
@@ -13323,13 +13480,14 @@ def _resolve_server_url(server: str) -> ServerUrl:
 
         if org_id is not None:
             resolved = ServerUrl(api_base=api_base, org_id=org_id)
-            if resolved.is_workspace_hosted:
-                from omnigent.cli_auth import pin_databricks_org_id
-
-                # Route this command and its children without saving an unverified selector.
-                pin_databricks_org_id(resolved.api_base, org_id)
         else:
             resolved = ServerUrl.from_api_base(api_base)
+        if resolved.is_workspace_hosted and resolved.org_id is not None:
+            from omnigent.cli_auth import pin_databricks_org_id
+
+            # Freeze explicit and saved selectors before concurrent startup can
+            # observe another CLI's login, without saving unverified routing.
+            pin_databricks_org_id(resolved.api_base, resolved.org_id)
         # Every remote CLI command resolves its server here, so this attributes
         # the CLI's own debug-log rows.
         publish_origin_identity(resolved.api_base)
@@ -13355,7 +13513,8 @@ def _resolve_server_url(server: str) -> ServerUrl:
         return _resolved(expanded)  # the canonical host is no better; keep what the user typed
     click.echo(
         f"Note: {display_server_url(normalized)} did not answer as a workspace; "
-        f"using its canonical host {display_server_url(canonical)}."
+        f"using its canonical host "
+        f"{display_server_url(f'{canonical}?o={org_id}' if org_id else canonical)}."
     )
     return _resolved(canonical)
 
@@ -13536,9 +13695,10 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"{DATABRICKS_EXTRA_INSTALL_HINT}"
         )
 
-    from omnigent.cli_auth import is_workspace_hosted_url
+    from omnigent.cli_auth import is_workspace_hosted_url, pin_databricks_org_id
+    from omnigent.inner.databricks_executor import _forget_remembered_profile
 
-    auth_info = _databricks_workspace_auth_info(workspace_host)
+    auth_info = _databricks_workspace_auth_info(workspace_host, org_id)
     if org_id is None and auth_info is not None:
         org_id = _workspace_hosted_profile_org_id(server, workspace_host, auth_info.profile_name)
 
@@ -13592,6 +13752,8 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"The cached Databricks credentials were rejected by {display} "
             f"(HTTP {verify.status_code}) — refreshing the workspace login."
         )
+        # Mint after the login in the default profile order, not the refused one first.
+        _forget_remembered_profile(workspace_host)
         auth_info = _login_and_mint_workspace_auth_info(workspace_host, org_id)
         token = auth_info.token
         if org_id is None:
@@ -13607,6 +13769,10 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"(HTTP {verify.status_code}). Check that your user has access to this app."
         )
     org_id = _verified_databricks_org_id(verify, org_id)
+    if is_workspace_hosted_url(server):
+        pin_databricks_org_id(server, org_id)
+    if auth_info is not None:
+        _keep_verified_workspace_auth(server, workspace_host, auth_info)
     user_id: str | None = None
     with contextlib.suppress(ValueError):
         raw_user = verify.json().get("user_id")
@@ -13647,7 +13813,7 @@ def _login_and_mint_workspace_auth_info(
 ) -> _DatabricksWorkspaceAuthInfo:
     """Run the browser login and return the selected workspace auth info."""
     _run_databricks_browser_login(workspace_host, org_id)
-    auth_info = _databricks_workspace_auth_info(workspace_host)
+    auth_info = _databricks_workspace_auth_info(workspace_host, org_id)
     if auth_info is None:
         raise click.ClickException(
             f"Workspace login completed but no token resolves for {workspace_host}. "
@@ -13741,23 +13907,55 @@ def _verify_databricks_server_token(
 class _DatabricksWorkspaceAuthInfo:
     token: str
     profile_name: str | None
+    # The auth that minted *token*, kept so later clients can reuse it once the
+    # server accepts the token.
+    auth: _DatabricksBearerAuth | None = None
 
 
-def _databricks_workspace_auth_info(workspace_host: str) -> _DatabricksWorkspaceAuthInfo | None:
-    """Mint a bearer and remember the Databricks profile that supplied it."""
+def _databricks_workspace_auth_info(
+    workspace_host: str, org_id: str | None = None
+) -> _DatabricksWorkspaceAuthInfo | None:
+    """Mint a bearer and remember the Databricks profile that supplied it.
+
+    :param workspace_host: The workspace host, e.g. ``"https://ws.databricks.com"``.
+    :param org_id: The ``?o=`` workspace the bearer is for, e.g. ``"123"``; a
+        profile pinned to it is preferred on a host that fronts several.
+    """
     from omnigent.inner.databricks_executor import (
         DatabricksAuthError,
         _resolve_databricks_auth,
     )
 
     try:
-        auth, _host = _resolve_databricks_auth(host=workspace_host)
+        auth, _host = _resolve_databricks_auth(host=workspace_host, workspace_id=org_id)
         token = auth.current_token()
     except (DatabricksAuthError, ImportError, ValueError):
         return None
     if not token:
         return None
-    return _DatabricksWorkspaceAuthInfo(token=token, profile_name=auth.profile_name)
+    return _DatabricksWorkspaceAuthInfo(token=token, profile_name=auth.profile_name, auth=auth)
+
+
+def _keep_verified_workspace_auth(
+    server: str, workspace_host: str, auth_info: _DatabricksWorkspaceAuthInfo
+) -> None:
+    """Reuse the credential *server* just accepted, in this process and the next.
+
+    Later clients in this process take it from the shared token source instead
+    of resolving again, and later processes try its profile first.
+
+    :param server: The server that accepted ``auth_info.token``.
+    :param workspace_host: The workspace the token was minted for, e.g.
+        ``"https://example.databricks.com"``.
+    :param auth_info: The accepted credential.
+    """
+    from omnigent.chat import _adopt_verified_credential
+    from omnigent.inner.databricks_executor import _remember_profile
+
+    if auth_info.profile_name:
+        _remember_profile(workspace_host, auth_info.profile_name)
+    if auth_info.auth is not None:
+        _adopt_verified_credential(server, auth_info.auth)
 
 
 def _databricks_workspace_token(workspace_host: str) -> str | None:
