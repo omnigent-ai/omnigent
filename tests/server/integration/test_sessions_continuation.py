@@ -22,12 +22,13 @@ from starlette.datastructures import Headers
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_PUBLIC
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_events
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.sharing_settings import DefaultPublicSessions
 from omnigent.server.startup_inputs import ManagedStartupInputs
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -38,8 +39,10 @@ from tests.server.integration._session_continuation import (
     _HOST_ID,
     _MESSAGE_INPUT,
     _OWNER,
+    _READER,
     _RUNNER_ID,
     _SKILL_INPUT,
+    _STRANGER,
     LiveRunner,
     bind_to_host,
     continue_session,
@@ -573,3 +576,73 @@ async def test_refusals_create_no_session(
     if placement != "moving":
         # A refused command leaves the session open to messages.
         assert not orchestration._session_is_moving(source_id)
+
+
+@pytest.mark.parametrize("public", ["revoked", "kept"])
+@pytest.mark.parametrize("command", COMMANDS)
+async def test_continuation_keeps_the_original_sharing(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    auth_live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    public: str,
+) -> None:
+    """The session the command continues in is shared exactly as the original.
+
+    Live viewers of the original are all redirected to it, so a reader can
+    open it. It gets no creation-default sharing, even with every new session
+    starting public: an original whose public link was revoked stays private,
+    at every point of the handoff, while one still public stays public.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    monkeypatch.setattr(
+        auth_app.state, "default_public_sessions", lambda: DefaultPublicSessions.ALL
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(auth_client, store, user=_OWNER)
+    owner, reader = {"X-Forwarded-Email": _OWNER}, {"X-Forwarded-Email": _READER}
+    stranger = {"X-Forwarded-Email": _STRANGER}
+    shared = await auth_client.put(
+        f"/v1/sessions/{source_id}/permissions",
+        json={"user_id": _READER, "level": LEVEL_READ},
+        headers=owner,
+    )
+    assert shared.status_code < 300, shared.text
+    if public == "revoked":
+        revoked = await auth_client.delete(
+            f"/v1/sessions/{source_id}/permissions/{RESERVED_USER_PUBLIC}", headers=owner
+        )
+        assert revoked.status_code < 300, revoked.text
+    assert (await auth_client.get(f"/v1/sessions/{source_id}", headers=stranger)).status_code == (
+        200 if public == "kept" else 404
+    )
+    stranger_reads_while_placing: list[int] = []
+    resolve_runner = sessions_module._get_runner_client
+
+    async def read_as_stranger_while_placing(session_id: str, *args: Any, **kwargs: Any) -> Any:
+        if session_id != source_id and not stranger_reads_while_placing:
+            opened = await auth_client.get(f"/v1/sessions/{session_id}", headers=stranger)
+            stranger_reads_while_placing.append(opened.status_code)
+        return await resolve_runner(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", read_as_stranger_while_placing)
+
+    continued = await continue_session(auth_client, store, source_id, command, owner)
+
+    assert continued.is_success, continued.text
+    new_id = continued.json()["session_id"]
+    assert auth_live_runner.superseded == [(source_id, new_id, command)]
+    opened = await auth_client.get(f"/v1/sessions/{new_id}", headers=reader)
+    assert opened.status_code == 200, opened.text
+    # Read-only, as on the original.
+    renamed = await auth_client.patch(
+        f"/v1/sessions/{new_id}", json={"title": "mine"}, headers=reader
+    )
+    assert renamed.status_code == 403, renamed.text
+    expected = 200 if public == "kept" else 404
+    assert stranger_reads_while_placing == [expected]
+    assert (await auth_client.get(f"/v1/sessions/{new_id}", headers=stranger)).status_code == (
+        expected
+    )
