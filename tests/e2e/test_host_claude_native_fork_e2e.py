@@ -956,20 +956,31 @@ def _rewind_and_check_placement(
     """
     Rewind *source_id* to *item_id* and check the fork's placement and notice.
 
+    The fork takes the source's runner, host and workspace; the source keeps
+    its host and workspace to resume on, but not the runner.
+
     :returns: The rewound session's id.
     """
     # /rewind refuses a running turn.
     _wait_until_idle(client, session_id=source_id)
+    # /rewind moves the runner to the new session, so capture it first.
+    placed = client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
+    assert placed["runner_id"] is not None, placed
     resp = client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": item_id}, timeout=60.0)
     assert resp.status_code == 200, resp.text
     rewound_id = str(resp.json()["session_id"])
     assert prompt_fragment in resp.json()["prompt"]
-    source = client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
     rewound = client.get(f"/v1/sessions/{rewound_id}", timeout=30.0).json()
     assert (rewound["runner_id"], rewound["host_id"], rewound["workspace"]) == (
-        source["runner_id"],
-        source["host_id"],
-        source["workspace"],
+        placed["runner_id"],
+        placed["host_id"],
+        placed["workspace"],
+    )
+    source = client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
+    assert (source["runner_id"], source["host_id"], source["workspace"]) == (
+        None,
+        placed["host_id"],
+        placed["workspace"],
     )
     items = client.get(
         f"/v1/sessions/{source_id}/items", params={"limit": 5, "order": "desc"}, timeout=30.0
