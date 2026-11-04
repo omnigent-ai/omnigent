@@ -25,7 +25,7 @@ from tests.e2e.test_host_claude_native_e2e import (
     _poll_for_assistant_marker,
 )
 from tests.e2e.test_host_claude_native_fork_e2e import (
-    _create_sdk_session_on_host,
+    _builtin_agent_id,
     _host_daemon,
     _send_user_message,
     _wait_until_idle,
@@ -38,6 +38,26 @@ pytestmark = pytest.mark.skipif(
         "OMNIGENT_E2E_CLAUDE_SDK=1 (and have `claude` installed + logged in) to run"
     ),
 )
+
+
+def _create_sdk_session_on_host(client: httpx.Client, *, host_id: str, workspace: Path) -> str:
+    """Create a ``sdk-chat-builtin`` claude-sdk session on *host_id*.
+
+    The built-in pins a dated model; the ``sonnet`` alias resolves on any
+    Claude login.
+    """
+    created = client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": _builtin_agent_id(client, "sdk-chat-builtin"),
+            "host_id": host_id,
+            "workspace": str(workspace),
+            "model_override": "sonnet",
+        },
+        timeout=60.0,
+    )
+    created.raise_for_status()
+    return str(created.json()["id"])
 
 
 def test_clear_claude_sdk_continues_empty_on_the_same_host(

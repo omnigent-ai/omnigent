@@ -898,23 +898,3 @@ def _wait_until_idle(client: httpx.Client, *, session_id: str) -> None:
         ),
         timeout_s=60.0,
     )
-
-
-def _create_sdk_session_on_host(client: httpx.Client, *, host_id: str, workspace: Path) -> str:
-    """Create a ``sdk-chat-builtin`` claude-sdk session on *host_id*.
-
-    The built-in pins a dated model; the ``sonnet`` alias resolves on any
-    Claude login.
-    """
-    created = client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": _builtin_agent_id(client, "sdk-chat-builtin"),
-            "host_id": host_id,
-            "workspace": str(workspace),
-            "model_override": "sonnet",
-        },
-        timeout=60.0,
-    )
-    created.raise_for_status()
-    return str(created.json()["id"])
