@@ -42,7 +42,7 @@ def test_debby_is_two_headed_cross_vendor(debby_spec: AgentSpec) -> None:
     A missing/renamed head, or both heads landing on the same harness, removes
     the cross-model contrast that is Debby's entire reason to exist.
     """
-    assert debby_spec.name == "Debby"
+    assert debby_spec.name == "debby"
     fam = {a.name: a.executor.config.get("harness") for a in debby_spec.sub_agents}
     assert sorted(debby_spec.tools.agents) == ["claude", "gpt"]
     assert fam["claude"] == "claude-sdk"

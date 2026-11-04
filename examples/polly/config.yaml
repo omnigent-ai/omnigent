@@ -1,5 +1,5 @@
 spec_version: 1
-name: Polly
+name: polly
 description: >-
   A coding orchestrator that delegates larger tasks to coding agents across
   different harnesses, with an independent reviewer double-checking their work.
