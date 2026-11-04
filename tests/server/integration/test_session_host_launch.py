@@ -3965,18 +3965,19 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
 
 
 @pytest.mark.parametrize(
-    "second_data",
-    [{}, {"wake_only": True}],
-    ids=["same-mode", "resume-then-wake-only"],
+    ("first_data", "second_data"),
+    [({}, {}), ({}, {"wake_only": True}), ({"wake_only": True}, {"wake_only": True})],
+    ids=["same-mode", "resume-then-wake-only", "wake-only-twice"],
 )
 async def test_retry_session_single_flight_launches_and_rotates_once(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    first_data: dict[str, bool],
     second_data: dict[str, bool],
 ) -> None:
-    """Concurrent retries share one launch and rotation; a wake-only caller joins a Resume."""
+    """Concurrent retries share one launch and rotation; a wake-only caller joins any retry."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -4022,7 +4023,7 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     first = asyncio.create_task(
         client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": "retry_session", "data": {}},
+            json={"type": "retry_session", "data": first_data},
         )
     )
     await asyncio.wait_for(launched.wait(), timeout=budget(5.0))
@@ -4041,8 +4042,9 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     assert [response.json() for response in responses] == [expected, expected]
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
     initialize.assert_awaited_once()
-    assert initialize.await_args.kwargs["suppress_recovery_turn"] is False
-    assert initialize.await_args.kwargs["restore_children"] is True
+    first_wake_only = first_data.get("wake_only", False)
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is first_wake_only
+    assert initialize.await_args.kwargs["restore_children"] is not first_wake_only
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.runner_id != original_runner_id
