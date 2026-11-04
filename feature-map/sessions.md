@@ -144,7 +144,8 @@ the header menu), and each place is a separate entry point.
   when there is nothing in its direction or the next page is outside the app,
   such as the workspace root of a workspace-hosted server. Browser tabs and
   the iOS/Android apps show no arrows, and neither do narrow Settings pages,
-  which keep their own back arrow.
+  which keep their own back arrow, or a conversation open beside a Canvas
+  board (focusing the conversation brings them back).
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab. On macOS the browser toolbar can also import the current site's

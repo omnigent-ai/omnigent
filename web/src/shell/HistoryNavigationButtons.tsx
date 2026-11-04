@@ -97,7 +97,9 @@ function HistoryButton({
           componentId={componentId}
           disabled={!enabled}
           onClick={onClick}
-          className="pointer-events-auto border-none text-muted-foreground hover:text-foreground max-md:size-11"
+          // Stay hit-testable while disabled: the desktop title bar marks buttons no-drag,
+          // so a pass-through arrow would be neither clickable nor draggable.
+          className="pointer-events-auto border-none text-muted-foreground hover:text-foreground disabled:pointer-events-auto disabled:cursor-default max-md:size-11"
         >
           {children}
         </Button>

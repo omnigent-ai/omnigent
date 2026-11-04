@@ -106,18 +106,12 @@ describe("HistoryNavigationButtons", () => {
     expect(screen.queryByTestId("history-navigation")).toBeNull();
   });
 
-  it("shows both buttons in the desktop app", () => {
-    (window as ShellWindow).omnigentDesktop = { kind: "electron" };
-    installNavigation(["/c/first", "/c/second"]);
-    renderButtons();
-    expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Forward" })).toBeDisabled();
-  });
-
-  it("follows history changes and steps through the router", () => {
+  it("shows both buttons in the desktop app, follows history, and steps the router", () => {
     (window as ShellWindow).omnigentDesktop = { kind: "electron" };
     const navigation = installNavigation(["/c/first", "/c/second"]);
     renderButtons(["/c/first", "/c/second"]);
+    expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Forward" })).toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(screen.getByRole("status", { name: "Current path" })).toHaveTextContent("/c/first");
@@ -153,5 +147,12 @@ describe("HistoryNavigationButtons", () => {
     navigation.paths[2] = `${root}/c/second`;
     act(() => navigation.moveTo(1));
     expect(screen.getByRole("button", { name: "Forward" })).toBeEnabled();
+
+    // The mount root itself is an app page, with or without a trailing slash.
+    for (const rootPage of [root, `${root}/`]) {
+      navigation.paths[0] = rootPage;
+      act(() => navigation.moveTo(1));
+      expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
+    }
   });
 });
