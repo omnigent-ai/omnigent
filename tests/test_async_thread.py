@@ -167,6 +167,28 @@ async def test_started_work_finishes_before_repeated_cancellation(
 
 
 @pytest.mark.asyncio
+async def test_uncancelled_work_returns_or_raises_to_its_caller(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Without a cancellation, the caller gets the work's result or its exception."""
+    from omnigent.inner.async_utils import finish_before_cancellation
+
+    async def succeed() -> str:
+        return "done"
+
+    async def fail() -> str:
+        raise ValueError("work failed")
+
+    assert await finish_before_cancellation(succeed()) == "done"
+    with pytest.raises(ValueError, match="work failed"):
+        await finish_before_cancellation(fail())
+    assert not any(
+        record.getMessage() == "Work failed after its caller was cancelled"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error", [ValueError("worker failed"), asyncio.CancelledError()])
 async def test_worker_failure_reaches_caller(error: BaseException) -> None:
     caller_loop = asyncio.get_running_loop()
