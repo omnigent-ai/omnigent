@@ -24,6 +24,7 @@ from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
 from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
+    "TERMINAL_CLOSED_OUTSIDE_OMNIGENT",
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
@@ -40,6 +41,8 @@ __all__ = [
 CODEX_COMPACTION_MODEL_FAILED = "codex_compaction_model_failed"
 # A Codex turn failed because the model provider's token command gave Codex no token.
 CODEX_PROVIDER_AUTH_FAILED = "codex_provider_auth_failed"
+# A runner that connected and then exited, as opposed to one that never came up.
+RUNNER_PROCESS_CRASH = "runner_process_crash"
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,19 @@ _AUTH_MARKERS = (
     "not authenticated",
 )
 
+# --- Claude Code install failed or left broken -------------------------------
+# A launcher that installs Claude Code before starting it reports npm's
+# ENOENT text, which also reads like a missing binary.
+_BROKEN_CLAUDE_INSTALL_MARKERS = (
+    "failedtoinstallclaudecode",
+    "claudenativebinarynotinstalled",
+)
+# The launcher's exec of a half-written binary, "Exec format error: '<path>/claude'";
+# matched on compacted text, so only the quoted path may name claude.
+_EXEC_FORMAT_ERROR = re.compile(r"execformaterror:'[^']*claude'")
+# Pane captures wrap long lines and draw borders, which can split a marker.
+_PANE_WRAP = re.compile(r"[\s│┃]+")
+
 # --- binary missing -----------------------------------------------------------
 _MISSING_MARKERS = (
     "command not found",
@@ -130,9 +146,15 @@ _REJECTED_ARGUMENT_MARKERS = (
     "usage: codex",
 )
 
+_BACKGROUND_SESSION_REFUSAL = re.compile(
+    r"that session is running in the\s+background.*?claude attach.*?claude stop",
+    re.DOTALL,
+)
+
 
 # Ordered most-specific first: the root case also reads like a permission /
-# auth problem, so it must win over the broader rules below it.
+# auth problem, and a broken install like a missing binary, so they must win
+# over the broader rules below them.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     _TerminalMatcher(
         "root_permission",
@@ -144,6 +166,38 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+        ),
+    ),
+    _TerminalMatcher(
+        "claude_install_broken",
+        lambda s: _claude_install_is_broken(s.output),
+        FailureDiagnosis(
+            title="Claude Code's install is broken",
+            cause=(
+                "Claude Code could not start because its install failed or is incomplete. "
+                "Launches that update Claude Code at the same time can leave it this way."
+            ),
+            remediation=(
+                "Send your message again. If it fails again, reinstall Claude Code on the "
+                "host with the installer you used, then retry."
+            ),
+        ),
+    ),
+    _TerminalMatcher(
+        "background_session_running",
+        lambda s: _BACKGROUND_SESSION_REFUSAL.search(s.output) is not None,
+        FailureDiagnosis(
+            title="Claude session is already running in the background",
+            cause=(
+                "Claude Code refused to resume this session because it is already "
+                "running in another background process."
+            ),
+            remediation=(
+                "Send your message again to resume a copy of the session here. To "
+                "resume the original instead, inspect the background session on the "
+                "host with `claude attach <session-id>` (the ID is in the terminal "
+                "output), stop it with `claude stop <session-id>`, then retry."
+            ),
         ),
     ),
     _TerminalMatcher(
@@ -208,6 +262,31 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
 )
 
 
+def _claude_install_is_broken(output: str) -> bool:
+    compact = _PANE_WRAP.sub("", output)
+    return any(m in compact for m in _BROKEN_CLAUDE_INSTALL_MARKERS) or bool(
+        _EXEC_FORMAT_ERROR.search(compact)
+    )
+
+
+# A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
+# ``killall tmux`` run anywhere on the host stops that server too.
+TERMINAL_CLOSED_OUTSIDE_OMNIGENT = FailureDiagnosis(
+    title="Claude Code's terminal was closed outside Omnigent",
+    cause=(
+        "Claude Code's tmux session, or the tmux server running it, was ended and Omnigent "
+        "did not end it. A tmux command such as `tmux kill-session`, `tmux kill-server` or "
+        "`killall tmux`, or another tool on the host, closes it this way."
+    ),
+    remediation=(
+        "Send your message again to relaunch Claude Code. Don't use `killall tmux` or kill "
+        "tmux sessions you didn't start; give your own tmux its own server with "
+        "`tmux -L <name>` and stop it with `tmux -L <name> kill-server`."
+    ),
+    category=ErrorCategory.USER,
+)
+
+
 def classify_terminal_failure(
     *,
     command: str | None,
@@ -256,6 +335,7 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "selected model is at capacity",
     "currently experiencing high demand, which may cause temporary errors",
 )
 _CLAUDE_RESPONSE_STOPPED_MESSAGE = (
@@ -279,6 +359,7 @@ _CODEX_PROVIDER_AUTH_FAILURE = re.compile(
     r"|produced an empty token|timed out|failed to start|wrote non-UTF-8)"
 )
 _EXIT_STATUS_PREFIX = re.compile(r"^\s*(?:exit status: -?\d+|signal: \d+[^:\n]*):?\s*")
+_STORAGE_EXHAUSTED_FRAGMENTS = ("no space left on device", "disk quota exceeded")
 # Shells that wrap a token helper; the helper to run is in their arguments.
 _SHELL_PROGRAMS = frozenset({"sh", "bash", "zsh", "dash"})
 # Persisted error labels hold 256 characters.
@@ -382,8 +463,8 @@ def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | Non
     """Explain a model provider token command that failed, naming the command to run.
 
     A custom Codex model provider can set ``auth.command`` (for example
-    ``isaac``) to print a bearer token. When that command fails, every turn
-    fails until the user signs in with it again; ``codex login`` doesn't help.
+    ``isaac``) to print a bearer token. Its output can identify an expired
+    login or exhausted host storage, which need different recovery steps.
 
     :param message: Codex's turn error, e.g. ``"provider auth command `isaac`
         exited with status exit status: 1: ... Run `isaac` to log in and try again."``.
@@ -412,6 +493,18 @@ def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | Non
         if helper_output
         else f"{cause}."
     )
+    if helper_output and any(
+        fragment in helper_output.lower() for fragment in _STORAGE_EXHAUSTED_FRAGMENTS
+    ):
+        return FailureDiagnosis(
+            title="Host storage is full",
+            cause=cause,
+            remediation=(
+                "Free space or inodes on the affected host filesystem, or raise its disk quota, "
+                "then send your message again."
+            ),
+            category=ErrorCategory.HOST,
+        )
     if outcome == "failed to start":
         remediation = (
             f"Check that `{command}` is installed and on PATH on the host, "
@@ -607,6 +700,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The agent CLI on the host is too old for the selected model. Update it on the "
         "host, then start a new session."
     ),
+    "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 

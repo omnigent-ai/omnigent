@@ -25,13 +25,14 @@ from omnigent.harnesses.claude_native.bridge import (
     approval_wait_marker_path,
     build_hook_settings,
     prepare_bridge_dir,
+    read_active_session_id,
     read_transcript_path,
     record_hook_event,
     validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
 )
-from omnigent.native import native_policy_hook
-from tests.native_hook_helpers import make_failing_client
+from omnigent.native import native_policy_hook, policy_allow_cache
+from tests.native_hook_helpers import make_failing_client, make_verdict_client
 
 
 @pytest.fixture(autouse=True)
@@ -259,7 +260,8 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
 
     Claude renders hook stdout immediately, before the background
     forwarder can poll the hook log. This test fails if the banner
-    regresses to the launch conversation URL after ``/clear``.
+    regresses to the launch conversation URL after ``/clear``, or if the
+    replacement loses the old session's title or project.
     """
     requests: list[tuple[str, str, dict[str, object] | None]] = []
 
@@ -318,6 +320,8 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
                     "agent_id": "ag_claude",
                     "runner_id": "runner_one",
                     "labels": {"omnigent.claude_native.bridge_id": "bridge_shared"},
+                    "title": "Fix login flow",
+                    "project_id": "proj_alpha",
                 },
                 request=httpx.Request("GET", url),
             )
@@ -398,6 +402,10 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
             {
                 "agent_id": "ag_claude",
                 "labels": {"omnigent.claude_native.bridge_id": "bridge_shared"},
+                "title": "Fix login flow",
+                "project_id": "proj_alpha",
+                "workspace": None,
+                "git": None,
             },
         ),
         ("PATCH", "http://127.0.0.1:8787/v1/sessions/conv_new", {"runner_id": "runner_one"}),
@@ -429,6 +437,65 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
     rotation_timeout = _FakeHttpxClient.captured_timeouts[0]
     assert isinstance(rotation_timeout, httpx.Timeout)
     assert rotation_timeout.read == claude_native_hook._SESSION_ROTATION_TIMEOUT_S
+
+
+def test_clear_session_start_hook_stops_when_the_unfiled_retry_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A rejected unfiled retry leaves the pane on its old session.
+
+    The hook returns ``None`` so the background forwarder can rotate later; it
+    must not transfer the terminal or repoint the bridge after the failure.
+    """
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Mock rotation endpoints whose creates are all rejected.
+
+        :param request: Incoming request.
+        :returns: Canned Omnigent response.
+        """
+        requests.append((request.method, request.url.path))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_claude",
+                    "runner_id": "runner_one",
+                    "title": "Fix login flow",
+                    "project_id": "proj_foreign",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            body = json.loads(request.content)
+            status = 404 if "project_id" in body else 503
+            return httpx.Response(status, json={"error": {"message": "rejected"}})
+        return httpx.Response(200, json={"id": "ok"})
+
+    real_client = httpx.Client
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        httpx, "Client", lambda **kwargs: real_client(transport=transport, **kwargs)
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+
+    assert claude_native_hook._rotate_session_on_clear(bridge_dir) is None
+
+    assert requests == [
+        ("GET", "/v1/sessions/conv_old"),
+        ("POST", "/v1/sessions"),
+        ("POST", "/v1/sessions"),
+    ]
+    assert read_active_session_id(bridge_dir) == "conv_old"
+    assert "Omnigent rotation failed" in capsys.readouterr().err
 
 
 def test_fork_session_start_hook_forks_before_printing_conversation_url(
@@ -1329,6 +1396,83 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert result["hookSpecificOutput"]["permissionDecisionReason"] == "Blocked by policy"
     assert captured.err == ""
+
+
+def test_evaluate_policy_answer_for_a_switched_session_opens_no_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An answer for the session the hook read cannot open the next session's window.
+
+    The switch lands after the hook reads the active session and before its
+    request, so the server answers for the old session while the bridge
+    already belongs to the new one.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        make_verdict_client({"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 60.0}),
+    )
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_switch", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_old")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:9")
+    read_session = claude_native_hook.read_active_session_id
+
+    def read_then_switch(path: Path) -> str | None:
+        session_id = read_session(path)
+        write_active_session_id(path, "conv_new")
+        return session_id
+
+    monkeypatch.setattr(claude_native_hook, "read_active_session_id", read_then_switch)
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    assert claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)]) == 0
+
+    assert policy_allow_cache._read_state(bridge_dir)[0] == 0
+
+
+def test_evaluate_policy_no_policy_allow_lets_installed_command_answer_in_shell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The direct-server hook records the server's allow window for the shell guard.
+
+    The installed command then answers the next tool call itself. Neither the
+    relay nor the server is reachable, so a call that got past the guard
+    would fail closed with deny output instead of exiting silently.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        make_verdict_client({"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 60.0}),
+    )
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_allow", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    settings = build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:9")
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    assert claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)]) == 0
+    assert capsys.readouterr().out == ""
+
+    command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
 
 
 def test_evaluate_policy_stamps_live_model_from_context_json(

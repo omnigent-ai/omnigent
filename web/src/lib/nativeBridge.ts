@@ -27,6 +27,18 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
+// Mirrors SESSION_HOST_PROTOCOL in electron/src/hostIdentity.js.
+export const SESSION_HOST_PROTOCOL = 1;
+
+export interface BrowserHostOptions {
+  sourceHostId?: string | null;
+  sessionHostProtocol?: number;
+}
+
+export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
+  return hostId ? { sourceHostId: hostId, sessionHostProtocol: SESSION_HOST_PROTOCOL } : {};
+}
+
 export interface BrowserRecentSessionInput {
   type: "keydown" | "keyup";
   key: "Tab" | "Control" | "Escape";
@@ -89,6 +101,11 @@ interface NativeShellApi {
    * returns an unsubscribe.
    */
   onOpenPath?: (callback: (path: string) => void) => () => void;
+  /**
+   * Subscribe to the desktop find bar opening, from the shortcut or the Edit
+   * menu. Absent on older shells / outside Electron; returns an unsubscribe.
+   */
+  onFindOpened?: (callback: () => void) => () => void;
   /**
    * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
    * swipe here (the gesture it repurposed from back-navigation) so the renderer
@@ -204,6 +221,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
+  /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
+  connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
   /** Extend this machine's running Arca instance with an approved mode. */
   extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
   /** Renew this machine's dbcert; Arca Companion copies it to the user's Arca and Arclets. */
@@ -224,14 +243,13 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: {
+    opts?: BrowserHostOptions & {
       force?: boolean;
       agent?: boolean;
-      sourceHostId?: string;
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -249,6 +267,12 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => Promise<{ ok: boolean; error?: string }>;
   /** Clear native key interception when the recent-session gesture was declined. */
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
+  /** Subscribe to the shell's Close Tab (CmdOrCtrl+W); returns an unsubscribe. */
+  onCloseTabRequest?: (callback: () => void) => () => void;
+  /** Opt in to handling Close Tab; without it the shell closes the window. */
+  setCloseTabSupported?: (supported: boolean) => void;
+  /** Close this window. */
+  closeWindow?: () => void;
   /**
    * Inspect the local Google Chrome profiles for cookies in the site tree the
    * conversation's view is on. Metadata only (profile + per-scope counts): no
@@ -648,6 +672,43 @@ export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
 }
 
 /**
+ * Subscribe to the desktop shell's Close Tab (CmdOrCtrl+W). Subscribing also
+ * tells the shell this page handles it; unsubscribing hands it back, so the
+ * shell's plain window close applies again. A no-op off-shell and on shells
+ * that predate the bridge, which keep closing the window themselves.
+ */
+export function onCloseTabRequest(callback: () => void): () => void {
+  const electron = electronApi();
+  if (!electron?.onCloseTabRequest || !electron.setCloseTabSupported) return () => {};
+  let unsubscribe: (() => void) | undefined;
+  try {
+    unsubscribe = electron.onCloseTabRequest(callback);
+    electron.setCloseTabSupported(true);
+    const off = unsubscribe;
+    return () => {
+      try {
+        electron.setCloseTabSupported?.(false);
+      } finally {
+        off();
+      }
+    };
+  } catch (err) {
+    unsubscribe?.();
+    console.warn("[nativeBridge] close-tab subscription failed:", err);
+    return () => {};
+  }
+}
+
+/** Ask the desktop shell to close this window. A no-op outside Electron. */
+export function closeNativeWindow(): void {
+  try {
+    electronApi()?.closeWindow?.();
+  } catch (err) {
+    console.warn("[nativeBridge] close window failed:", err);
+  }
+}
+
+/**
  * True when running inside the Electron desktop shell on macOS — the one
  * platform where the shell hides the native title bar (titleBarStyle
  * "hiddenInset") and the web layer must reserve space for the traffic
@@ -791,6 +852,21 @@ export function onOpenPath(callback: (path: string) => void): () => void {
     return native.onOpenPath(callback);
   } catch (err) {
     console.warn("[nativeBridge] native onOpenPath failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to the desktop find bar opening. A no-op outside the Electron
+ * shell or under a shell too old to send it.
+ */
+export function onFindOpened(callback: () => void): () => void {
+  const native = nativeApi();
+  if (!native?.onFindOpened) return () => {};
+  try {
+    return native.onFindOpened(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onFindOpened failed:", err);
     return () => {};
   }
 }
@@ -1112,6 +1188,29 @@ export async function connectArcaHost(): Promise<ArcaConnectResult> {
     return await electron.connectArcaHost();
   } catch (err) {
     console.warn("[nativeBridge] electron connectArcaHost failed:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Whether this desktop shell can connect a machine the user reaches over SSH. */
+export function supportsSshConnect(): boolean {
+  return typeof electronApi()?.connectSshHost === "function";
+}
+
+/**
+ * Connect `destination` (an ssh alias, host or user@host) to the window's
+ * server as a host. The shell asks consent and handles ssh prompts and the
+ * browser sign-in in its own window. A no-op `{ ok: false }` outside the shell.
+ */
+export async function connectSshHost(destination: string): Promise<ArcaConnectResult> {
+  const electron = electronApi();
+  if (!electron?.connectSshHost) {
+    return { ok: false, error: "not running under the desktop shell" };
+  }
+  try {
+    return await electron.connectSshHost(destination);
+  } catch (err) {
+    console.warn("[nativeBridge] electron connectSshHost failed:", err);
     return { ok: false, error: String(err) };
   }
 }

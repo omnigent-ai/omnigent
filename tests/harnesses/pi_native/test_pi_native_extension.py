@@ -4099,7 +4099,10 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
-def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("next_change", [None, "effort", "model"])
+def test_input_waits_for_inbox_model_change_to_settle(
+    tmp_path: Path, next_change: str | None
+) -> None:
     """A routed web turn runs on the routed model, not the old one.
 
     The executor queues ``model_change`` then ``user_message``; the poller
@@ -4113,25 +4116,46 @@ def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
 
     script = (
         _MODEL_SWITCH_HARNESS
+        + f"const nextChange = {json.dumps(next_change)};\n"
         + r"""
 (async () => {
   let committed = null;
+  let thinking = "off";
+  pi.setThinkingLevel = async (level) => {
+    await sleep(20);
+    thinking = committed ? level : "off";
+  };
   pi.setModel = async (model) => {
     setModelCalls.push(model);
     await sleep(150); // Pi's checkAuth before agent.state.model is set
     committed = model.id;
+    thinking = "off"; // Pi may restore the target model's own default.
     return true;
   };
   await handlers.session_start({}, ctx);
   const file = path.join(inboxDir, "000-model.json");
   fs.writeFileSync(
     file,
-    JSON.stringify({ id: "m1", type: "model_change", model: "databricks-claude-opus-4-1" }),
+    JSON.stringify({
+      id: "m1", type: "model_change",
+      model: "databricks-claude-opus-4-1", thinkingLevel: "medium",
+    }),
   );
+  if (nextChange) {
+    fs.writeFileSync(path.join(inboxDir, "001-settings.json"), JSON.stringify(
+      nextChange === "effort"
+        ? {id: "e2", type: "thinking_level_change", thinkingLevel: "high"}
+        : {id: "m2", type: "model_change",
+           model: "databricks-claude-sonnet-4-6", thinkingLevel: "low"}
+    ));
+  }
   while (fs.existsSync(file)) await sleep(10);
   assert.equal(committed, null); // still in flight
   await handlers.input({ text: "routed turn", source: "extension" }, ctx);
-  assert.equal(committed, "databricks-claude-opus-4-1");
+  assert.equal(committed, nextChange === "model"
+    ? "databricks-claude-sonnet-4-6" : "databricks-claude-opus-4-1");
+  assert.equal(thinking,
+    nextChange === "model" ? "low" : nextChange === "effort" ? "high" : "medium");
   finish();
 })().catch((error) => {
   finish();

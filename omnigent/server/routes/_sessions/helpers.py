@@ -978,55 +978,11 @@ def _structured_ask_user_question(
         questions, malformed options, etc.) — caller falls back to
         the binary preview-only render.
     """
-    if not isinstance(tool_input, dict):
-        return None
-    questions_raw = tool_input.get("questions")
-    if not isinstance(questions_raw, list) or not questions_raw:
-        return None
-    questions: list[dict[str, Any]] = []
-    for entry in questions_raw:
-        if not isinstance(entry, dict):
-            continue
-        question_text = entry.get("question")
-        if not isinstance(question_text, str) or not question_text:
-            continue
-        options_raw = entry.get("options")
-        if not isinstance(options_raw, list):
-            continue
-        options: list[dict[str, Any]] = []
-        for opt in options_raw:
-            if isinstance(opt, dict):
-                label = opt.get("label")
-                if not isinstance(label, str) or not label:
-                    continue
-                option: dict[str, Any] = {"label": label}
-                description = opt.get("description")
-                if isinstance(description, str) and description:
-                    option["description"] = description
-                # ``preview`` is an optional richer snippet some
-                # Claude builds attach to an option (rendered as a
-                # <pre> below the option list when selected). Ride
-                # it through verbatim so the UI can surface it.
-                preview = opt.get("preview")
-                if isinstance(preview, str) and preview:
-                    option["preview"] = preview
-                options.append(option)
-            elif isinstance(opt, str) and opt:
-                options.append({"label": opt})
-        if not options:
-            continue
-        question: dict[str, Any] = {
-            "question": question_text,
-            "options": options,
-            "multiSelect": entry.get("multiSelect") is True,
-        }
-        header = entry.get("header")
-        if isinstance(header, str) and header:
-            question["header"] = header
-        questions.append(question)
-    if not questions:
-        return None
-    return {"questions": questions}
+    # Shared with the claude-sdk elicitation bridge, which can't import
+    # server-route code; imported lazily to keep this module's import graph.
+    from omnigent.server.ask_user_question import structured_ask_user_question
+
+    return structured_ask_user_question(tool_input)
 
 
 def _canonical_tool_input(tool_input: dict[str, Any] | None) -> dict[str, Any]:
@@ -5468,10 +5424,14 @@ def _publish_sandbox_status_impl(
         ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None`` for
         other stages.
     """
-    # "ready" evicts: from then on the session looks like any
-    # host-bound session and the snapshot carries no launch state.
-    # Failures stay cached (mirroring ManagedLaunchTracker retention)
-    # so a reload after a dead launch still shows the reason.
+    from omnigent.server.scheduled.telemetry import start_fire_stage
+
+    if stage in {"provisioning", "cloning", "action_required"}:
+        start_fire_stage("sandbox_create", session_id=session_id)
+    elif stage == "starting":
+        start_fire_stage("sandbox_registration", session_id=session_id)
+    elif stage == "connecting":
+        start_fire_stage("runner_start", session_id=session_id)
     previous = _session_sandbox_status_cache.get(session_id)
     status = SandboxStatus.model_validate(
         {
@@ -5493,6 +5453,8 @@ def _publish_sandbox_status_impl(
             provider=status.provider,
         ),
     )
+    # "ready" evicts launch state; failures stay cached (like ManagedLaunchTracker)
+    # so a reload after a dead launch still shows the reason.
     if status.stage == "ready":
         _session_sandbox_status_cache.pop(session_id, None)
     else:
@@ -6365,6 +6327,7 @@ async def _launch_runner_on_host_impl(
         structured refusal from the host.
     """
     lock = _relaunch_locks.setdefault(conv.id, asyncio.Lock())
+    previous_attempt = _relaunch_last_attempt.get(conv.id)
     async with lock:
         # Re-read under the lock: a binding that moved past the caller's
         # snapshot means another flight just relaunched (concurrently, or
@@ -6381,8 +6344,11 @@ async def _launch_runner_on_host_impl(
                 error_code="session_not_found",
                 error="session was deleted while its relaunch was in flight",
             )
+        last = _relaunch_last_attempt.get(conv.id)
+        # A waiter may already have read the active flight's replacement binding.
+        if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
+            return last
         if fresh.runner_id and fresh.runner_id != conv.runner_id:
-            last = _relaunch_last_attempt.get(conv.id)
             if last is not None and last.runner_id == fresh.runner_id:
                 return last
             return _HostLaunchAttempt(runner_id=fresh.runner_id)
@@ -6407,6 +6373,7 @@ async def _launch_runner_on_host_locked(
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.scheduled_context import current_scheduled_run
 
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
@@ -6462,14 +6429,11 @@ async def _launch_runner_on_host_locked(
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         request_id = secrets.token_hex(8)
-        launch_future: asyncio.Future[HostLaunchResult] = (
-            asyncio.get_running_loop().create_future()
-        )
-        host_conn.pending_launches[request_id] = launch_future
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
                 binding_token=binding_token,
+                scheduled_run=current_scheduled_run(),
                 workspace=conv.workspace,
                 session_id=conv.id,
                 # Canonical harness (see _resolve_harness) so the host runs the
@@ -6484,22 +6448,40 @@ async def _launch_runner_on_host_locked(
                 superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
             )
         )
-        try:
-            host_registry.send_text(host_conn, launch_frame)
-        except ConnectionError:
-            host_conn.pending_launches.pop(request_id, None)
-            _logger.warning(
-                "Host %s connection lost while launching runner for %s",
-                conv.host_id,
-                conv.id,
-                extra=debug_event(
-                    "runner_launch_failed",
-                    session_id=conv.id,
-                    stage="runner_launch",
-                    error_code="host_launch_failed",
-                ),
+        for enqueue_attempt in range(2):
+            launch_future: asyncio.Future[HostLaunchResult] = (
+                asyncio.get_running_loop().create_future()
             )
-            return _HostLaunchAttempt(runner_id=new_runner_id)
+            host_conn.pending_launches[request_id] = launch_future
+            try:
+                host_registry.send_text(host_conn, launch_frame)
+            except ConnectionError:
+                host_conn.pending_launches.pop(request_id, None)
+                launch_future.cancel()
+                replacement = host_registry.get(host_conn.host_id)
+                if (
+                    enqueue_attempt == 0
+                    and replacement is not None
+                    and replacement is not host_conn
+                ):
+                    # send_text rejected before enqueue; reuse this binding and frame once.
+                    await host_registry.admit_launch(replacement, conv.id)
+                    host_conn = replacement
+                    continue
+                _logger.warning(
+                    "Host %s connection lost while launching runner for %s",
+                    conv.host_id,
+                    conv.id,
+                    extra=debug_event(
+                        "runner_launch_failed",
+                        session_id=conv.id,
+                        stage="runner_launch",
+                        error_code="host_launch_failed",
+                        enqueue_attempt=enqueue_attempt + 1,
+                    ),
+                )
+                return _HostLaunchAttempt(runner_id=new_runner_id)
+            break
         try:
             result = await asyncio.wait_for(
                 launch_future,
@@ -6508,7 +6490,6 @@ async def _launch_runner_on_host_locked(
         except TimeoutError:
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
-            host_conn.pending_launches.pop(request_id, None)
             # A slow host, not a refusal: the launch may still land.
             _logger.warning(
                 "Host launch acknowledgement timed out",
@@ -6522,6 +6503,10 @@ async def _launch_runner_on_host_locked(
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
+        finally:
+            host_conn.pending_launches.pop(request_id, None)
+            if not launch_future.done():
+                launch_future.cancel()
         if result.get("status") == "failed":
             refusal_code = result.get("error_code")
             # Unmapped codes (spawn failures) are attributed on the host's own row.
@@ -6782,6 +6767,8 @@ async def _wait_for_managed_runner_tunnel(
     runner_id: str,
     tunnel_registry: TunnelRegistry,
     tracker: ManagedLaunchTracker,
+    *,
+    settle_failure: bool = True,
 ) -> bool:
     """
     Wait for a launched managed runner to connect, failing the launch on timeout.
@@ -6790,8 +6777,9 @@ async def _wait_for_managed_runner_tunnel(
     :param runner_id: Runner id returned by the host launch frame.
     :param tunnel_registry: Runner tunnel registry to wait on.
     :param tracker: Managed launch tracker to settle on failure.
-    :returns: ``True`` when the runner connected; ``False`` after publishing
-        and retaining a failed launch status.
+    :param settle_failure: Publish and settle a timeout immediately. Callers
+        with rollback work can defer settlement until cleanup finishes.
+    :returns: ``True`` when the runner connected; ``False`` on timeout.
     """
     from omnigent.server.routes import sessions as _facade
 
@@ -6812,8 +6800,9 @@ async def _wait_for_managed_runner_tunnel(
         ),
     )
     reason = "managed runner did not connect after launch"
-    tracker.fail(session_id, reason)
-    _publish_sandbox_status(session_id, "failed", reason)
+    if settle_failure:
+        tracker.fail(session_id, reason)
+        _publish_sandbox_status(session_id, "failed", reason)
     return False
 
 
@@ -8366,6 +8355,7 @@ class _SessionEventDispatchResult:
     :param item_id: Store-assigned id of the AP-persisted item, e.g.
         ``"item_abc123"``. ``None`` for the claude-native message
         bypass, which persists nothing AP-side.
+    :param accepted: False when dispatch was handled without runner acceptance.
     :param pending_id: Id of the :mod:`omnigent.runtime.pending_inputs`
         entry recorded for a native-terminal web message, e.g.
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
@@ -8375,6 +8365,7 @@ class _SessionEventDispatchResult:
 
     item_id: str | None
     pending_id: str | None
+    accepted: bool = True
 
 
 def _extract_persistent_item_from_sse(
@@ -9076,30 +9067,41 @@ def _agent_carries_native_fork_history_impl(agent: Agent) -> bool:
     :param agent: The agent whose harness to classify.
     :returns: ``True`` only for transcript-rebuild native harnesses.
     """
-    from omnigent.harness_aliases import canonicalize_harness
-
-    try:
-        spec = (
-            get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.operator_authored)
-            .spec
-        )
-    except Exception:  # noqa: BLE001
-        return False
-    return canonicalize_harness(spec.executor.harness_kind) in _FORK_HISTORY_NATIVE_HARNESSES
+    return _agent_canonical_harness(agent) in _FORK_HISTORY_NATIVE_HARNESSES
 
 
 def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
     """Return whether *agent*'s native harness carries FORK history via preamble.
 
-    Cursor's conversation is server-backed and opencode has no history-import
-    API, so neither can seed a local store for a rebuilt resume; instead the
-    runner replays prior turns as a text preamble on the fork (cursor: the
-    first message; opencode: a ``noReply`` context message).
-    Returns ``False`` when the bundle can't be loaded.
+    Cursor's conversation is server-backed and opencode keeps one store per
+    conversation, so neither can seed a local store for a rebuilt resume; the
+    runner replays prior turns as a text preamble on the fork (opencode first
+    tries a native fork of the source session). Fork-only — switch-agent does
+    not call this, so switching into one still launches fresh. Returns
+    ``False`` when the bundle can't be loaded.
 
     :param agent: The agent whose harness to classify.
     :returns: ``True`` for the cursor-native / opencode-native harnesses.
+    """
+    return _agent_canonical_harness(agent) in _CURSOR_FORK_HISTORY_HARNESSES
+
+
+def _agent_forks_opencode_native_session(agent: Agent) -> bool:
+    """Return whether *agent* runs opencode-native, which can fork the source natively.
+
+    :param agent: The fork target agent.
+    :returns: ``True`` when the target harness is ``opencode-native``.
+    """
+    return _agent_canonical_harness(agent) == "opencode-native"
+
+
+def _agent_canonical_harness(agent: Agent) -> str | None:
+    """Return *agent*'s canonical harness name, or ``None`` when its bundle can't load.
+
+    Only operator-authored bundles expand ``${VAR}`` against the server env.
+
+    :param agent: The agent whose harness to classify.
+    :returns: Canonical harness, e.g. ``"opencode-native"``.
     """
     from omnigent.harness_aliases import canonicalize_harness
 
@@ -9110,8 +9112,8 @@ def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
             .spec
         )
     except Exception:  # noqa: BLE001
-        return False
-    return canonicalize_harness(spec.executor.harness_kind) in _CURSOR_FORK_HISTORY_HARNESSES
+        return None
+    return canonicalize_harness(spec.executor.harness_kind)
 
 
 def _filesystem_attachment_in_history(
@@ -10760,6 +10762,12 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.stores.sandbox_profile_store import PROFILE_LABEL_PREFIX
+
+    if any(key.startswith(PROFILE_LABEL_PREFIX) for key in labels):
+        raise OmnigentError(
+            "Sandbox profile labels are server-owned", code=ErrorCode.INVALID_INPUT
+        )
     from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
     if any(key.startswith(MCP_SELECTION_PREFIX) for key in labels):
@@ -10771,10 +10779,15 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
-    for key in (SCHEDULED_TASK_ORIGIN_LABEL_KEY, CREATED_BY_SESSION_LABEL_KEY):
+    for key in (
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        CREATED_BY_SESSION_LABEL_KEY,
+    ):
         if key in labels:
             raise OmnigentError(
                 f"label {key!r} is server-internal and cannot be set by clients",
@@ -12336,6 +12349,7 @@ __all__ = [
     "_agent_carries_cursor_fork_history",
     "_agent_carries_native_fork_history",
     "_agent_carries_native_fork_history_impl",
+    "_agent_forks_opencode_native_session",
     "_agent_is_native",
     "_agent_is_native_impl",
     "_agent_provider_family",

@@ -1,6 +1,7 @@
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import type { NativeModelOption, SandboxStatus } from "@/lib/types";
 
@@ -26,7 +27,14 @@ export function sandboxModelOptionsKey(
   agentId: string | null,
   user: string | null,
 ) {
-  return ["sandbox-model-options", user, provider, harness, agentId] as const;
+  return [
+    "sandbox-model-options",
+    user,
+    provider,
+    harness,
+    agentId,
+    getOmnigentServerIdentity(),
+  ] as const;
 }
 
 async function fetchSandboxModelOptions(

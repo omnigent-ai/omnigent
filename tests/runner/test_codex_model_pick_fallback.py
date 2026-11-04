@@ -1,4 +1,4 @@
-"""Model picks are checked against the catalog of the actual Codex launch."""
+"""Model picks are checked against the model list of the actual Codex launch shape."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -28,12 +28,23 @@ from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     REAL_CODEX_LAUNCH_CATALOG,
     REAL_CODEX_REPROBED_LAUNCH_CATALOG,
+    REAL_DATABRICKS_PROFILE_CODEX_MODELS,
 )
 
 _CODEX_PATH = "/missing-test-bin/codex"
 _SESSION_ID = "c91a9d508b344ad59c65628ed80b5230"
 _PROVIDER_DEFAULT = "gpt-5.6-terra"
 _RETIRED_PICK = "gpt-5.4-retired"
+
+
+def _unavailable_notice(pick: str, launched: str) -> dict[str, str]:
+    """The in-session notice a launch posts when it replaces an unavailable pick."""
+    return {
+        "source": "execution",
+        "code": "codex_native_model_unavailable",
+        "message": f"{pick} isn't available on this host; using {launched}.",
+        "level": "info",
+    }
 
 
 @dataclass
@@ -49,8 +60,11 @@ class _LaunchHarness:
     events: list[str]
     builds: list[dict[str, Any]]
     resets: list[dict[str, Any]]
+    notices: list[dict[str, Any]]
     probe: AsyncMock
     response_status: dict[str, int]
+    workspace_models: Mock
+    routing: dict[str, bool]
 
     async def launch(self) -> SessionResourceView:
         """Run the production launch path, including snapshot and catalog reads."""
@@ -104,6 +118,20 @@ async def codex_launch_harness(
         "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
         lambda _path: None,
     )
+    databrickscfg = tmp_path / "databrickscfg"
+    databrickscfg.write_text("[session-provider]\nhost = https://workspace.example.com\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(databrickscfg))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        lambda _profile: SimpleNamespace(token="workspace-token"),
+    )
+    workspace_models = Mock(return_value=())
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
+        workspace_models,
+    )
+
+    routing = {"databricks_profile": False}
 
     def resolve_launch(
         *,
@@ -112,10 +140,13 @@ async def codex_launch_harness(
         terminal_launch_args: Sequence[str] = (),
     ) -> codex_app.NativeCodexLaunch:
         del terminal_launch_args
+        provider = "session-provider" if spec is not None else "ambient-provider"
+        if routing["databricks_profile"]:
+            return codex_app.NativeCodexLaunch([], model or _PROVIDER_DEFAULT, provider)
         return codex_app.NativeCodexLaunch(
-            config_overrides=[],
+            config_overrides=[f'model_provider="{provider}"'],
             model=model or _PROVIDER_DEFAULT,
-            profile="session-provider" if spec is not None else "ambient-provider",
+            profile=None,
         )
 
     monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_launch)
@@ -123,13 +154,17 @@ async def codex_launch_harness(
     monkeypatch.setattr(
         codex_app, "codex_reprobed_launch_catalog", REAL_CODEX_REPROBED_LAUNCH_CATALOG
     )
+    monkeypatch.setattr(
+        codex_app, "databricks_profile_codex_models", REAL_DATABRICKS_PROFILE_CODEX_MODELS
+    )
     probe = AsyncMock(return_value=[])
     monkeypatch.setattr(codex_app, "probe_codex_model_options", probe)
     events: list[str] = []
     builds: list[dict[str, Any]] = []
     resets: list[dict[str, Any]] = []
+    notices: list[dict[str, Any]] = []
     snapshot: dict[str, Any] = {"model_override": _RETIRED_PICK}
-    response_status = {"reset": 200}
+    response_status = {"reset": 200, "notice": 200}
     initial_probes = set(model_catalog_store._inflight.values())
 
     def request(request: httpx.Request) -> httpx.Response:
@@ -142,6 +177,10 @@ async def codex_launch_harness(
             # A fork records the Codex thread it minted.
             return httpx.Response(200, json={})
         assert request.method == "POST", "fallback must never unconditionally PATCH the pick"
+        if request.url.path == f"/v1/sessions/{_SESSION_ID}/events":
+            events.append("notice")
+            notices.append(json.loads(request.content)["data"]["item_data"])
+            return httpx.Response(response_status["notice"], json={})
         assert request.url.path == f"/v1/sessions/{_SESSION_ID}/model-override/reset"
         reset = json.loads(request.content)
         assert set(reset) == {"expected_model_override"}
@@ -216,8 +255,11 @@ async def codex_launch_harness(
             events=events,
             builds=builds,
             resets=resets,
+            notices=notices,
             probe=probe,
             response_status=response_status,
+            workspace_models=workspace_models,
+            routing=routing,
         )
     await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
     runner_native._AUTO_CODEX_APP_SERVERS.pop(_SESSION_ID, None)
@@ -244,7 +286,85 @@ async def test_equivalent_gateway_pick_launches_without_reset(
     assert harness.builds[0]["session_id"] == _SESSION_ID
     assert harness.app_server.env["OMNIGENT_CLIENT_SURFACE"] == "desktop"
     assert harness.resets == []
+    assert harness.notices == []
     harness.probe.assert_not_awaited()
+    harness.workspace_models.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("live_listing", "cached_listing", "kept"),
+    [
+        pytest.param(
+            ("system.ai.gpt-5-6-sol", "system.ai.gpt-6-1-sol"), None, True, id="live-serves"
+        ),
+        pytest.param(
+            ("system.ai.gpt-5-6-sol",), ["system.ai.gpt-6-1-sol"], False, id="live-lacks"
+        ),
+        pytest.param(OSError("listing failed"), ["system.ai.gpt-5-6-sol"], True, id="cache-lacks"),
+        pytest.param(OSError("listing failed"), None, True, id="no-listing"),
+    ],
+)
+async def test_profile_launch_validates_the_pick_against_its_workspace_listing(
+    live_listing: tuple[str, ...] | Exception,
+    cached_listing: list[str] | None,
+    kept: bool,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live workspace listing decides; a miss in ucode's copy or no listing keeps the pick."""
+    harness = codex_launch_harness
+    harness.routing["databricks_profile"] = True
+    pick = "gpt-6.1-sol"
+    harness.snapshot["model_override"] = pick
+    # Codex's own list disagrees with the workspace, so only the workspace can decide.
+    harness.seed_catalog(
+        [{"id": "gpt-5.6-sol", "isDefault": True}, *([] if kept else [{"id": pick}])]
+    )
+    if isinstance(live_listing, Exception):
+        harness.workspace_models.side_effect = live_listing
+    else:
+        harness.workspace_models.return_value = live_listing
+    cached_state = None if cached_listing is None else SimpleNamespace(codex_models=cached_listing)
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state", lambda _host: cached_state
+    )
+
+    await harness.launch()
+
+    assert harness.builds[0]["profile"] == "session-provider"
+    if kept:
+        assert harness.builds[0]["model"] == pick
+        assert harness.resets == []
+        assert harness.notices == []
+        assert harness.snapshot["model_override"] == pick
+    else:
+        assert harness.builds[0]["model"] == "system.ai.gpt-5-6-sol"
+        assert harness.resets == [{"expected_model_override": pick}]
+        assert harness.notices == [_unavailable_notice(pick, "gpt-5.6-sol")]
+        assert harness.snapshot["model_override"] is None
+    harness.workspace_models.assert_called_once_with(
+        "https://workspace.example.com", "workspace-token"
+    )
+    harness.probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_profile_fallback_prefers_the_agents_listed_model(
+    codex_launch_harness: _LaunchHarness,
+) -> None:
+    """A profile fallback prefers the agent's listed model over the workspace default."""
+    harness = codex_launch_harness
+    harness.routing["databricks_profile"] = True
+    assert isinstance(harness.agent_spec, AgentSpec)
+    harness.agent_spec.executor.config["model"] = "gpt-5.5"
+    harness.workspace_models.return_value = ("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5")
+
+    await harness.launch()
+
+    assert harness.builds[0]["model"] == "gpt-5.5"
+    assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
+    assert harness.notices == [_unavailable_notice(_RETIRED_PICK, "gpt-5.5")]
 
 
 @pytest.mark.asyncio
@@ -277,7 +397,7 @@ async def test_unavailable_pick_resets_only_after_fallback_terminal_launch(
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fresh evidence retires a pick only after its replacement terminal exists."""
+    """Fresh evidence retires a pick, and says so, only after its replacement terminal exists."""
     harness = codex_launch_harness
     assert isinstance(harness.agent_spec, AgentSpec)
     if agent_model is not None:
@@ -308,7 +428,11 @@ async def test_unavailable_pick_resets_only_after_fallback_terminal_launch(
     assert harness.builds[0]["model"] == (agent_model or _PROVIDER_DEFAULT)
     assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
     assert harness.snapshot["model_override"] is None
+    assert harness.notices == [
+        _unavailable_notice(_RETIRED_PICK, agent_model or _PROVIDER_DEFAULT)
+    ]
     assert harness.events.index("terminal-launch") < harness.events.index("reset")
+    assert harness.events.index("terminal-launch") < harness.events.index("notice")
 
 
 @pytest.mark.asyncio
@@ -332,7 +456,7 @@ async def test_unavailable_pick_also_pinned_by_the_spec_launches_on_the_default(
 async def test_stale_miss_awaits_reprobe_before_deciding_fallback(
     refresh: str, codex_launch_harness: _LaunchHarness
 ) -> None:
-    """Only fresh contrary evidence resets a pick; failed refreshes preserve it."""
+    """A stale miss reloads once; only a fresh miss resets, and an unknown reload keeps it."""
     harness = codex_launch_harness
     pick = "databricks-gpt-5-6-sol"
     harness.snapshot["model_override"] = pick
@@ -363,9 +487,12 @@ async def test_stale_miss_awaits_reprobe_before_deciding_fallback(
         release_probe.set()
         await launch
 
-    assert harness.builds[0]["model"] == (pick if refresh == "hit" else _PROVIDER_DEFAULT)
+    assert harness.builds[0]["model"] == (_PROVIDER_DEFAULT if refresh == "miss" else pick)
     expected_resets = [{"expected_model_override": pick}] if refresh == "miss" else []
     assert harness.resets == expected_resets
+    assert harness.notices == (
+        [_unavailable_notice(pick, _PROVIDER_DEFAULT)] if refresh == "miss" else []
+    )
     harness.probe.assert_awaited_once()
     assert model_catalog_store.read_catalog("codex-native", fingerprint) == (
         fresh_rows if refresh in {"hit", "miss"} else stale_rows
@@ -431,6 +558,7 @@ async def test_failed_fallback_launch_does_not_reset_pick(
 
     assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
     assert harness.resets == []
+    assert harness.notices == []
     if failure != "app-server":
         harness.app_server.close.assert_awaited_once()
 
@@ -463,7 +591,7 @@ async def test_spec_catalog_is_not_replaced_by_ambient_provider_catalog(
     await harness.launch()
 
     assert harness.builds[0]["model"] == (pick if spec_serves_pick else _PROVIDER_DEFAULT)
-    assert harness.builds[0]["profile"] == "session-provider"
+    assert 'model_provider="session-provider"' in harness.builds[0]["extra_config_overrides"]
     assert harness.resets == ([] if spec_serves_pick else [{"expected_model_override": pick}])
     if stale:
         task = model_catalog_store._inflight.get(("codex-native", fingerprint))
@@ -504,6 +632,7 @@ async def test_generic_provider_fallback_rebuilds_model_config_overrides(
 
     monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_launch)
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+    harness.workspace_models.return_value = (f"system.ai.{pick}",)
 
     await harness.launch()
 
@@ -511,6 +640,7 @@ async def test_generic_provider_fallback_rebuilds_model_config_overrides(
     assert f'model="{_PROVIDER_DEFAULT}"' in harness.builds[0]["extra_config_overrides"]
     assert all(pick not in override for override in harness.builds[0]["extra_config_overrides"])
     assert harness.resets == [{"expected_model_override": pick}]
+    harness.workspace_models.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -519,15 +649,17 @@ async def test_failed_pick_reset_keeps_successfully_launched_terminal(
     status: int,
     codex_launch_harness: _LaunchHarness,
 ) -> None:
-    """An old or failing server keeps the terminal and pick; never retry with PATCH."""
+    """Failed reset and notice posts keep the terminal and pick; never retry with PATCH."""
     harness = codex_launch_harness
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
     harness.response_status["reset"] = status
+    harness.response_status["notice"] = status
 
     resource = await harness.launch()
 
     assert resource.id == "terminal_codex_main"
     assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
+    assert harness.notices == [_unavailable_notice(_RETIRED_PICK, _PROVIDER_DEFAULT)]
     assert harness.snapshot["model_override"] == _RETIRED_PICK
     assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
     await asyncio.sleep(0)
@@ -556,6 +688,7 @@ async def test_closed_reset_client_keeps_successfully_launched_terminal(
 
     assert resource.id == "terminal_codex_main"
     assert harness.resets == []
+    assert harness.notices == []
     assert harness.snapshot["model_override"] == _RETIRED_PICK
     assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
     await asyncio.sleep(0)
@@ -587,7 +720,7 @@ async def test_subscription_fallback_pins_only_fresh_account_default(
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fallback on native login never turns yesterday's default into a model pin."""
+    """Native login pins only a fresh account default; an unconfirmed stale miss keeps the pick."""
     harness = codex_launch_harness
 
     def resolve_launch(
@@ -607,10 +740,13 @@ async def test_subscription_fallback_pins_only_fresh_account_default(
 
     await harness.launch()
 
-    assert harness.builds[0]["model"] == (None if stale else "gpt-5.6-sol")
+    assert harness.builds[0]["model"] == (_RETIRED_PICK if stale else "gpt-5.6-sol")
     assert harness.builds[0]["profile"] is None
     assert 'model_provider="openai"' in harness.builds[0]["extra_config_overrides"]
     assert harness.resets == ([] if stale else [{"expected_model_override": _RETIRED_PICK}])
+    assert harness.notices == (
+        [] if stale else [_unavailable_notice(_RETIRED_PICK, "gpt-5.6-sol")]
+    )
 
 
 @pytest.mark.asyncio

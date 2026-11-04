@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import weakref
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from fastapi import (
@@ -22,6 +25,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.policy_allow_cache import ALLOW_CACHE_FIELD, MAX_ALLOW_CACHE_SECONDS
 from omnigent.pi_extension_ui import timeout_seconds, to_elicitation_params, to_ui_response
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -31,10 +35,12 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.caps import RuntimeCaps
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.runtime.policies.builder import (
     any_policies_apply,
     build_policy_engine,
+    policy_specs_cache_age,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.server._elicitation_registry import (
@@ -105,11 +111,102 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.policy_store import PolicyStore
 
 #: Policy-name vendor for a native agent key, where the two differ. Mirrors
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+
+# Serializes same-session policy-engine builds: each build seeds declared label initial
+# values with a read-then-write that can overwrite a value an evaluation already updated.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_policy_engine_build_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _policy_engine_build_lock(session_id: str) -> asyncio.Lock:
+    """
+    Return the lock serializing policy-engine builds for one session.
+
+    Get-or-create is race-free because there is no ``await`` between the
+    lookup and the insert (single event loop). Entries disappear once no
+    caller holds the lock.
+
+    :param session_id: Omnigent conversation id being evaluated, e.g. ``"conv_abc123"``.
+    :returns: The :class:`asyncio.Lock` shared by concurrent builds for ``session_id``.
+    """
+    lock = _policy_engine_build_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _policy_engine_build_locks[session_id] = lock
+    return lock
+
+
+async def _build_policy_engine_serialized(
+    session_id: str,
+    build: Callable[..., PolicyEngine],
+    *args: Any,
+) -> PolicyEngine:
+    """
+    Run ``build`` on a worker thread while holding the session's build lock.
+
+    The locked build runs in its own task behind :func:`asyncio.shield`, so a
+    cancelled request keeps the lock until its worker thread finishes instead of
+    letting the next same-session build overlap it.
+
+    :param session_id: Omnigent conversation id being evaluated, e.g. ``"conv_abc123"``.
+    :param build: Synchronous engine factory, e.g. the handler's ``_build_engine``.
+    :param args: Positional arguments for ``build``.
+    :returns: The built :class:`PolicyEngine`.
+    """
+
+    async def locked_build() -> PolicyEngine:
+        async with _policy_engine_build_lock(session_id):
+            return await asyncio.to_thread(build, *args)
+
+    task = asyncio.ensure_future(locked_build())
+    # Retrieve the outcome even if the caller was cancelled, so a failure isn't reported as
+    # an unretrieved task exception.
+    task.add_done_callback(lambda done: done.cancelled() or done.exception())
+    return await asyncio.shield(task)
+
+
+def _no_policy_allow_body(
+    caps: RuntimeCaps, session_id: str, policy_store: PolicyStore | None
+) -> dict[str, object]:
+    """Build the ALLOW body for an evaluation where no policies apply.
+
+    When the operator enables the allow cache, the body says how long the
+    session's native hooks may reuse this answer instead of asking again: the
+    configured window, capped, minus the age of the policy lists behind the
+    answer. A policy change therefore reaches native hooks within the window.
+
+    :param caps: The server's runtime caps.
+    :param session_id: The evaluated session, e.g. ``"conv_abc123"``.
+    :param policy_store: The policy store the no-policy answer read.
+    :returns: The response body, e.g.
+        ``{"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 42.5}``.
+    """
+    body: dict[str, object] = {"result": "POLICY_ACTION_ALLOW"}
+    resolver = caps.native_hook_allow_cache_seconds
+    if resolver is None:
+        return body
+    try:
+        seconds = float(resolver())
+    except Exception:  # A broken resolver must not fail the gate.
+        _logger.warning("native hook allow-cache resolver failed; not caching", exc_info=True)
+        return body
+    if not math.isfinite(seconds):
+        _logger.warning("native hook allow-cache window %r is not finite; not caching", seconds)
+        return body
+    seconds = min(seconds, MAX_ALLOW_CACHE_SECONDS)
+    seconds -= policy_specs_cache_age(session_id, policy_store)
+    if seconds > 0:
+        body[ALLOW_CACHE_FIELD] = seconds
+    return body
 
 
 def _create_route_decision_id(
@@ -865,7 +962,9 @@ def register_hooks_routes(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",
             )
-        agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+        # A native harness calls this hook once per tool call. Keep the
+        # synchronous store reads below off the event loop shared by all sessions.
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
             return Response(
@@ -873,8 +972,13 @@ def register_hooks_routes(
                 media_type="application/json",
             )
 
-        loaded = _sf.get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        # Warm-cache loads are in-memory; the thread hop covers the cold path
+        # that extracts the bundle from disk.
+        loaded = await asyncio.to_thread(
+            _sf.get_agent_cache().load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
         )
 
         _caps = _sf.get_caps()
@@ -884,13 +988,15 @@ def register_hooks_routes(
         # entirely. This avoids conversation-store reads for labels/state/usage
         # on every tool call for the common no-policy case. Session policies are
         # LRU-cached so this check is cheap after the first call per session.
-        # Users can add policies mid-session — the cache is invalidated on
-        # mutation, so newly added policies are visible on the very next call.
+        # Mutations invalidate that cache, so a newly added policy applies on
+        # the next call, or once a native hook's allow window (see
+        # _no_policy_allow_body) expires.
+        policy_store = get_policy_store()
         if not any_policies_apply(
             spec=loaded.spec,
             conversation_id=session_id,
             default_policies=_caps.default_policies,
-            policy_store=get_policy_store(),
+            policy_store=policy_store,
             phase=phase,
             tool_name=data.get("name") if isinstance(data, dict) else None,
             # A sub-agent conversation's own guardrails live on the CHILD
@@ -899,7 +1005,7 @@ def register_hooks_routes(
             conversation=conv,
         ):
             return Response(
-                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                content=json.dumps(_no_policy_allow_body(_caps, session_id, policy_store)),
                 media_type="application/json",
             )
 
@@ -937,7 +1043,8 @@ def register_hooks_routes(
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine(conv)
+        # The build makes several synchronous store reads.
+        engine = await _build_policy_engine_serialized(session_id, _build_engine, conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
@@ -991,7 +1098,9 @@ def register_hooks_routes(
                 deciding_policy = result.deciding_policy
                 assert deciding_policy is not None
                 async with _native_ask_gate_lock(session_id, deciding_policy):
-                    engine = _build_engine()
+                    # The build lock is taken after the gate lock and never held
+                    # while waiting for it, so the two can't deadlock.
+                    engine = await _build_policy_engine_serialized(session_id, _build_engine)
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,
