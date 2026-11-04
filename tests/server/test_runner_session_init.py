@@ -607,6 +607,36 @@ async def test_forgetting_a_handshake_repeats_only_finished_ones() -> None:
     assert len(client.calls) == 4
 
 
+@pytest.mark.asyncio
+async def test_a_handshake_without_the_hold_repeats_a_held_one() -> None:
+    """A caller without ``hold_subagent_wakes`` outlasts a held handshake, then sends its own."""
+    registry, client = _Registry(), _Client()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conv = _conversation()
+    held = asyncio.create_task(
+        initializer.initialize(conv, client, timeout=10, hold_subagent_wakes=True)  # type: ignore[arg-type]
+    )
+    await client.entered.wait()
+    releasing = asyncio.create_task(initializer.initialize(conv, client, timeout=10))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    assert len(client.calls) == 1
+    client.release.set()
+    await held
+    await releasing
+    assert initializer.is_initialized(conv, client)  # type: ignore[arg-type]
+    # A held caller can share a handshake that sent no hold.
+    await initializer.initialize(conv, client, timeout=10, hold_subagent_wakes=True)  # type: ignore[arg-type]
+    assert len(client.calls) == 2
+
+    initializer.invalidate_session(conv.id)
+    await initializer.initialize(conv, client, timeout=10, hold_subagent_wakes=True)  # type: ignore[arg-type]
+    assert not initializer.is_initialized(conv, client)  # type: ignore[arg-type]
+    await initializer.initialize(conv, client, timeout=10)  # type: ignore[arg-type]
+    assert initializer.is_initialized(conv, client)  # type: ignore[arg-type]
+    holds = [parse_runner_session_init_envelope(call).hold_subagent_wakes for call in client.calls]  # type: ignore[union-attr]
+    assert holds == [True, False, True, False]
+
+
 class _Agents:
     """Agent store stub whose ``get`` finds only the given ids."""
 

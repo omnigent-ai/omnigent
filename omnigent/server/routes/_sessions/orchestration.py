@@ -5974,8 +5974,8 @@ async def _ensure_runner_session_initialized(
     :param require_success: Raise ``runner_unavailable`` when the handshake
         fails instead of using the message path's best-effort fallback.
     :param restore_children: Restore interrupted descendants after a required
-        handshake. ``False`` leaves them, and sub-agent results recovered during
-        the handshake, for the session's next interaction.
+        handshake. ``False`` leaves them, sub-agent results recovered during the
+        handshake, and the session's failed status for its next interaction.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -6038,7 +6038,8 @@ async def _ensure_runner_session_initialized(
             ) from exc
         return False
 
-    await _publish_runner_recovered_status(session_id, conversation_store)
+    if restore_children:
+        await _publish_runner_recovered_status(session_id, conversation_store)
     from omnigent.server.child_session_recovery import (
         restore_active_children,
         schedule_child_restoration,

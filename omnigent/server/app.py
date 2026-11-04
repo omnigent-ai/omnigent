@@ -4823,11 +4823,12 @@ def create_app(
                             clear_skipped_resume(session_id)
                     prefetch_session_routing_catalogs(conv.id, conv, client)
                     # Clear only a root's disconnect failure, after successful init.
-                    # Children retain interruption evidence until continuation runs.
-                    async with store_slots:
-                        await _publish_runner_recovered_status(
-                            conv.id, conversation_store, require_disconnect_code=True
-                        )
+                    # Children, and woken roots, keep that evidence until continuation runs.
+                    if conv.id not in wake_only_root_ids:
+                        async with store_slots:
+                            await _publish_runner_recovered_status(
+                                conv.id, conversation_store, require_disconnect_code=True
+                            )
                     if initialize_runtime:
                         await restore_active_children(
                             conv,

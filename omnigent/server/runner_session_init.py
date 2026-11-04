@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import weakref
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -113,6 +114,8 @@ class RunnerSessionInitializer:
             asyncio.Task[httpx.Response],
         ] = {}
         self._recovery_ids: dict[tuple[str, int, str, str, str | None, bool], str] = {}
+        # The runner holds sub-agent wakes after these until a handshake without the hold.
+        self._holding_tasks: weakref.WeakSet[asyncio.Task[httpx.Response]] = weakref.WeakSet()
 
     def log_decision(
         self,
@@ -169,7 +172,13 @@ class RunnerSessionInitializer:
         )
         for recovery in (False, True):
             task = self._tasks.get((*session_key, recovery))
-            if task is None or not task.done() or task.cancelled() or task.exception() is not None:
+            if (
+                task is None
+                or task in self._holding_tasks
+                or not task.done()
+                or task.cancelled()
+                or task.exception() is not None
+            ):
                 continue
             response = task.result()
             if 200 <= response.status_code < 300 and runner_inference_verified(
@@ -225,7 +234,7 @@ class RunnerSessionInitializer:
             conversation.sub_agent_name,
             resume_interrupted_turn,
         )
-        task = self._tasks.get(key)
+        task = await self._shareable_task(key, hold_subagent_wakes=hold_subagent_wakes)
         if task is None and self._agent_store is not None:
             async with store_slots or nullcontext():
                 agent = await asyncio.to_thread(self._agent_store.get, agent_id)
@@ -250,7 +259,7 @@ class RunnerSessionInitializer:
                     request=httpx.Request("POST", "/v1/sessions"),
                 )
             # Another caller may have started this initialization during the lookup.
-            task = self._tasks.get(key)
+            task = await self._shareable_task(key, hold_subagent_wakes=hold_subagent_wakes)
         decision = "reuse_completed" if task is not None and task.done() else "join_in_flight"
         if task is None:
             decision = "start"
@@ -310,6 +319,8 @@ class RunnerSessionInitializer:
                 name=f"runner-session-init-{init_attempt_id}",
             )
             self._tasks[key] = task
+            if hold_subagent_wakes:
+                self._holding_tasks.add(task)
 
             def _drop_failed(done: asyncio.Task[httpx.Response]) -> None:
                 failed = done.cancelled() or done.exception() is not None
@@ -352,6 +363,21 @@ class RunnerSessionInitializer:
         if response.status_code >= 400 and self._tasks.get(key) is task:
             self._tasks.pop(key, None)
         return response
+
+    async def _shareable_task(
+        self,
+        key: tuple[str, int, str, str, str | None, bool],
+        *,
+        hold_subagent_wakes: bool,
+    ) -> asyncio.Task[httpx.Response] | None:
+        """Return the handshake to share; a caller without the hold retires a held one."""
+        task = self._tasks.get(key)
+        while task is not None and not hold_subagent_wakes and task in self._holding_tasks:
+            await asyncio.wait({task})
+            if self._tasks.get(key) is task:
+                self._tasks.pop(key, None)
+            task = self._tasks.get(key)
+        return task
 
     def invalidate_session(
         self, session_id: str, *, runner_id: str | None = None

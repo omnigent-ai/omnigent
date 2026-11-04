@@ -99,15 +99,9 @@ export function resetSandboxWakesForTesting(): void {
 }
 
 /**
- * Wake a session's asleep sandbox once per visible opening, sharing attempts
- * across remounts. The wake-only `retry_session` it sends resumes no agent work.
- *
- * @param conversationId Session whose sandbox to wake.
- * @param asleep Whether the session's managed sandbox is asleep (`host_asleep`).
- * @param needsSandbox Whether the view has nothing to show until the sandbox wakes.
- * @param awake Whether liveness reports the session's runner online.
- * @param active Whether the view is open and visible to the user.
- * @param canWake Whether the user may restart the session (edit access).
+ * Wake a session's asleep (`host_asleep`) sandbox once per visible opening, sharing
+ * attempts across remounts. A view with cached content needs no wake; the wake-only
+ * `retry_session` it sends never resumes agent work.
  */
 export function useSandboxAutoWake({
   conversationId,
@@ -156,8 +150,8 @@ export function useSandboxAutoWake({
 
   const step = attempt?.step;
   useEffect(() => {
-    // Runner online, by this wake or any other: forget the attempt's outcome.
-    if (conversationId && awake && (step === "settling" || step === "failed")) {
+    // Runner online, by this wake or any other: forget the attempt, even one still in flight.
+    if (conversationId && awake && step !== undefined) {
       setAttempt(conversationId, undefined);
     }
   }, [awake, conversationId, step]);

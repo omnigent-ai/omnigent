@@ -194,6 +194,25 @@ describe("useSandboxAutoWake", () => {
     expect(retryMock).toHaveBeenCalledTimes(2);
   });
 
+  it("forgets a wake still in flight once the runner comes online", async () => {
+    const request = deferred<PostEventResponse>();
+    retryMock.mockReturnValueOnce(request.promise);
+    const { result, rerender } = renderWake(asleepAndOpen);
+    rerender({ ...asleepAndOpen, ...online });
+    expect(result.current.phase).toBe("idle");
+
+    // Asleep again before the first request answers: Start sandbox sends a new wake.
+    rerender(asleepAndOpen);
+    expect(result.current.phase).toBe("idle");
+    await act(async () => {
+      await result.current.wake();
+    });
+    expect(retryMock).toHaveBeenCalledTimes(2);
+    await act(async () => request.reject(new Error("stale")));
+    expect(result.current.phase).toBe("waking");
+    expect(result.current.error).toBeNull();
+  });
+
   it("does not wake a sandbox that was awake when the view opened", async () => {
     const { result, rerender } = renderWake({ ...asleepAndOpen, ...online });
     await act(async () => rerender(asleepAndOpen));

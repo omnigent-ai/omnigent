@@ -2769,6 +2769,9 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
         skipped_resume_runner,
     )
     from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.common import _session_status_cache
+    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
 
     app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
     runner_id = "runner_wake_only_reconnect_test"
@@ -2791,6 +2794,16 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
         children[root.id] = child.id
     woken_id, other_id, woken_child_root_id = root_ids
     woken_child_id = children[woken_child_root_id]
+    for root_id in (woken_id, other_id):
+        store.set_labels(
+            root_id,
+            {
+                "omnigent.last_task_error_code": "runner_disconnected",
+                "omnigent.last_task_error_message": "Disconnected",
+            },
+        )
+        store.set_session_live_status(root_id, "failed")
+        _session_status_cache[root_id] = "failed"
     # The wakes that launched this runner have returned; its connect hook runs next.
     hold_reconnect_recovery(woken_id)
     hold_reconnect_recovery(woken_child_id)
@@ -2815,6 +2828,11 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
 
     monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
     monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
+    monkeypatch.setattr(
+        sessions_routes,
+        "_publish_runner_recovered_status",
+        orchestration._publish_runner_recovered_status_impl,
+    )
 
     await captured["callback"](runner_id, connection)  # type: ignore[operator]
 
@@ -2824,6 +2842,13 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
     assert skipped_resume_runner(woken_child_id) == runner_id
     assert skipped_resume_runner(woken_child_root_id) == runner_id
     assert skipped_resume_runner(other_id) is None
+    # The woken root keeps its failure, and Resume, for the plain retry that continues it.
+    woken, other = store.get_conversation(woken_id), store.get_conversation(other_id)
+    assert woken is not None and other is not None
+    assert _session_status_cache[woken_id] == "failed"
+    assert _last_task_error_from_labels(woken.labels) is not None
+    assert _session_status_cache[other_id] == "idle"
+    assert _last_task_error_from_labels(other.labels) is None
     # Only requested work ends the holds, so a later reconnect leaves the trees too.
     assert reconnect_recovery_deferred(woken_id)
     assert reconnect_recovery_deferred(woken_child_id)

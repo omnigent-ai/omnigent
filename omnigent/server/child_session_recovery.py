@@ -152,18 +152,25 @@ def _restorable(conv: Conversation) -> bool:
     )
 
 
-def _interrupted(conv: Conversation) -> bool:
+def failed_by_runner_loss(conv: Conversation) -> bool:
+    """Whether *conv* still shows the failure of a turn its runner's departure interrupted."""
     from omnigent.server.routes._sessions.common import _session_status_cache
     from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
 
-    status = _session_status_cache.get(conv.id, conv.live_status)
     error = _last_task_error_from_labels(conv.labels)
-    return status in {"running", "waiting"} or (
-        status == "failed"
+    return (
+        _session_status_cache.get(conv.id, conv.live_status) == "failed"
         and error is not None
         and error.get("code")
         in {"runner_disconnected", "runner_failed_to_start", RUNNER_PROCESS_CRASH}
     )
+
+
+def _interrupted(conv: Conversation) -> bool:
+    from omnigent.server.routes._sessions.common import _session_status_cache
+
+    status = _session_status_cache.get(conv.id, conv.live_status)
+    return status in {"running", "waiting"} or failed_by_runner_loss(conv)
 
 
 async def restore_active_children(

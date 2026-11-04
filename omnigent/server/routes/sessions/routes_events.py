@@ -727,6 +727,7 @@ async def _recover_retry_session_once(
     """Run one recovery attempt for :func:`_recover_retry_session`."""
     from omnigent.server.child_session_recovery import (
         clear_skipped_resume,
+        failed_by_runner_loss,
         hold_reconnect_recovery,
         note_skipped_resume,
         skipped_resume_runner,
@@ -779,7 +780,11 @@ async def _recover_retry_session_once(
     owes_resume = (
         not wake_only
         and conv.runner_id is not None
-        and skipped_resume_runner(session_id) == conv.runner_id
+        and (
+            skipped_resume_runner(session_id) == conv.runner_id
+            # A wake leaves the failure in place, so the debt outlives an evicted marker.
+            or (was_connected and failed_by_runner_loss(conv))
+        )
     )
     resumes_wake = (
         owes_resume
