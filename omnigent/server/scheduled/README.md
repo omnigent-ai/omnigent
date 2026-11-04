@@ -361,6 +361,12 @@ the agent to call it once, before its final reply.
 - Recording never changes `status`. A `succeeded` run can have
   `outcome.success` `false`, and a run whose agent never called the tool keeps
   `outcome` `null`.
+- Storage: `outcome_success` and `outcome_recorded_at` are typed columns. The
+  emoji and text can repeat task content, so they are stored together in
+  `outcome_payload`, an envelope private to the store
+  (`{"plaintext": {"emoji", "text"}}`, with `ciphertext` reserved for an
+  encrypting store) that a CHECK caps at 2,048 bytes. The store validates the
+  values itself, whoever calls it.
 
 ### When the server stops partway
 

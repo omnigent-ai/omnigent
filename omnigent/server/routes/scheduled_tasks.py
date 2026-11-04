@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import unicodedata
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -28,10 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
-from omnigent.entities.scheduled_task import (
-    RUN_OUTCOME_EMOJI_MAX_CHARS,
-    RUN_OUTCOME_TEXT_MAX_CHARS,
-)
+from omnigent.entities.scheduled_task import normalize_run_outcome
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -135,56 +131,6 @@ class CreateScheduledTaskRequest(BaseModel):
         return self
 
 
-_EMOJI_ZWJ = "\u200d"
-_EMOJI_KEYCAP = "\u20e3"
-_EMOJI_VARIATION_SELECTORS = frozenset("\ufe0e\ufe0f")
-_EMOJI_KEYCAP_BASES = frozenset("0123456789#*")
-
-
-def _is_emoji_modifier(cp: int) -> bool:
-    """Skin tones and the tag characters of subdivision flags extend the emoji before them."""
-    return 0x1F3FB <= cp <= 0x1F3FF or 0xE0020 <= cp <= 0xE007F
-
-
-def _is_single_emoji(value: str) -> bool:
-    """Whether *value* is one emoji, counting a ZWJ or keycap sequence or a flag as one.
-
-    An approximation of an emoji grapheme without a Unicode segmentation
-    dependency: every code point must be a non-ASCII symbol, a keycap base
-    followed by its keycap mark, a regional indicator of a flag pair, or a
-    joiner, variation selector or modifier attached to one of those.
-    """
-    if not value or len(value) > RUN_OUTCOME_EMOJI_MAX_CHARS:
-        return False
-    bases = 0
-    joined = False
-    regional = 0
-    for index, ch in enumerate(value):
-        cp = ord(ch)
-        if ch == _EMOJI_ZWJ:
-            if bases == 0 or joined:
-                return False
-            joined = True
-            continue
-        if ch in _EMOJI_VARIATION_SELECTORS or ch == _EMOJI_KEYCAP or _is_emoji_modifier(cp):
-            if bases == 0:
-                return False
-            continue
-        if 0x1F1E6 <= cp <= 0x1F1FF:  # regional indicators pair into one flag
-            regional += 1
-            if regional % 2 == 0:
-                continue
-        elif ch in _EMOJI_KEYCAP_BASES:
-            if _EMOJI_KEYCAP not in value[index + 1 : index + 3]:
-                return False
-        elif ch.isascii() or unicodedata.category(ch) not in ("So", "Sm"):
-            return False
-        if not joined:
-            bases += 1
-        joined = False
-    return bases == 1 and not joined and regional % 2 == 0
-
-
 class RecordRunOutcomeRequest(BaseModel):
     """Body for ``PUT /v1/scheduled-tasks/run-outcome``.
 
@@ -202,16 +148,7 @@ class RecordRunOutcomeRequest(BaseModel):
     @model_validator(mode="after")
     def _check_status_fields(self) -> RecordRunOutcomeRequest:
         """Trim and bound ``emoji`` and ``text``; ``emoji`` must be exactly one emoji."""
-        emoji = self.emoji.strip()
-        if not _is_single_emoji(emoji):
-            raise ValueError("emoji must be exactly one emoji, e.g. '🚀'")
-        text = " ".join(self.text.split())
-        if not text:
-            raise ValueError("text must not be empty")
-        if len(text) > RUN_OUTCOME_TEXT_MAX_CHARS:
-            raise ValueError(f"text must be at most {RUN_OUTCOME_TEXT_MAX_CHARS} characters")
-        self.emoji = emoji
-        self.text = text
+        self.emoji, self.text = normalize_run_outcome(self.emoji, self.text)
         return self
 
 

@@ -27,6 +27,104 @@ from pydantic import BaseModel, ConfigDict
 RUN_OUTCOME_EMOJI_MAX_CHARS = 16
 RUN_OUTCOME_TEXT_MAX_CHARS = 80
 
+# Unicode's Extended_Pictographic ranges (emoji-data.txt): the code points that
+# can start an emoji. General symbol categories also hold math, box-drawing and
+# currency signs, which are not emoji.
+_EXTENDED_PICTOGRAPHIC: tuple[tuple[int, int], ...] = (
+    (0x00A9, 0x00A9), (0x00AE, 0x00AE), (0x203C, 0x203C), (0x2049, 0x2049),
+    (0x2122, 0x2122), (0x2139, 0x2139), (0x2194, 0x2199), (0x21A9, 0x21AA),
+    (0x231A, 0x231B), (0x2328, 0x2328), (0x2388, 0x2388), (0x23CF, 0x23CF),
+    (0x23E9, 0x23F3), (0x23F8, 0x23FA), (0x24C2, 0x24C2), (0x25AA, 0x25AB),
+    (0x25B6, 0x25B6), (0x25C0, 0x25C0), (0x25FB, 0x25FE), (0x2600, 0x2605),
+    (0x2607, 0x2612), (0x2614, 0x2685), (0x2690, 0x2705), (0x2708, 0x2712),
+    (0x2714, 0x2714), (0x2716, 0x2716), (0x271D, 0x271D), (0x2721, 0x2721),
+    (0x2728, 0x2728), (0x2733, 0x2734), (0x2744, 0x2744), (0x2747, 0x2747),
+    (0x274C, 0x274C), (0x274E, 0x274E), (0x2753, 0x2755), (0x2757, 0x2757),
+    (0x2763, 0x2767), (0x2795, 0x2797), (0x27A1, 0x27A1), (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF), (0x2934, 0x2935), (0x2B05, 0x2B07), (0x2B1B, 0x2B1C),
+    (0x2B50, 0x2B50), (0x2B55, 0x2B55), (0x3030, 0x3030), (0x303D, 0x303D),
+    (0x3297, 0x3297), (0x3299, 0x3299), (0x1F000, 0x1F0FF), (0x1F10D, 0x1F10F),
+    (0x1F12F, 0x1F12F), (0x1F16C, 0x1F171), (0x1F17E, 0x1F17F), (0x1F18E, 0x1F18E),
+    (0x1F191, 0x1F19A), (0x1F1AD, 0x1F1E5), (0x1F201, 0x1F20F), (0x1F21A, 0x1F21A),
+    (0x1F22F, 0x1F22F), (0x1F232, 0x1F23A), (0x1F23C, 0x1F23F), (0x1F249, 0x1F3FA),
+    (0x1F400, 0x1F53D), (0x1F546, 0x1F64F), (0x1F680, 0x1F6FF), (0x1F774, 0x1F77F),
+    (0x1F7D5, 0x1F7FF), (0x1F80C, 0x1F80F), (0x1F848, 0x1F84F), (0x1F85A, 0x1F85F),
+    (0x1F888, 0x1F88F), (0x1F8AE, 0x1F8FF), (0x1F90C, 0x1F93A), (0x1F93C, 0x1F945),
+    (0x1F947, 0x1FAFF), (0x1FC00, 0x1FFFD),
+)  # fmt: skip
+_EMOJI_ZWJ = "\u200d"
+_EMOJI_KEYCAP = "\u20e3"
+_EMOJI_VARIATION_SELECTORS = frozenset("\ufe0e\ufe0f")
+_EMOJI_KEYCAP_BASES = frozenset("0123456789#*")
+
+
+def _is_extended_pictographic(cp: int) -> bool:
+    return any(start <= cp <= end for start, end in _EXTENDED_PICTOGRAPHIC)
+
+
+def _is_emoji_modifier(cp: int) -> bool:
+    """Skin tones and the tag characters of subdivision flags extend the emoji before them."""
+    return 0x1F3FB <= cp <= 0x1F3FF or 0xE0020 <= cp <= 0xE007F
+
+
+def is_single_emoji(value: str) -> bool:
+    """Whether *value* is one emoji, counting a ZWJ or keycap sequence or a flag as one.
+
+    Approximates one emoji grapheme without a Unicode segmentation dependency:
+    every code point must be an Extended_Pictographic character, a keycap base
+    followed by its keycap mark, a regional indicator of a flag pair, or a
+    joiner, variation selector or modifier attached to one of those.
+    """
+    if not value or len(value) > RUN_OUTCOME_EMOJI_MAX_CHARS:
+        return False
+    bases = 0
+    joined = False
+    regional = 0
+    for index, ch in enumerate(value):
+        cp = ord(ch)
+        if ch == _EMOJI_ZWJ:
+            if bases == 0 or joined:
+                return False
+            joined = True
+            continue
+        if ch in _EMOJI_VARIATION_SELECTORS or ch == _EMOJI_KEYCAP or _is_emoji_modifier(cp):
+            if bases == 0:
+                return False
+            continue
+        if 0x1F1E6 <= cp <= 0x1F1FF:  # regional indicators pair into one flag
+            regional += 1
+            if regional % 2 == 0:
+                continue
+        elif ch in _EMOJI_KEYCAP_BASES:
+            if _EMOJI_KEYCAP not in value[index + 1 : index + 3]:
+                return False
+        elif not _is_extended_pictographic(cp):
+            return False
+        if not joined:
+            bases += 1
+        joined = False
+    return bases == 1 and not joined and regional % 2 == 0
+
+
+def normalize_run_outcome(emoji: str, text: str) -> tuple[str, str]:
+    """Trim and check an outcome's emoji and text, returning the values to store.
+
+    :param emoji: Exactly one emoji, e.g. ``"🚀"``; surrounding spaces are dropped.
+    :param text: A few words; runs of whitespace collapse to single spaces.
+    :returns: The trimmed emoji and the collapsed text.
+    :raises ValueError: If the emoji is not exactly one emoji, or the text is
+        empty or longer than :data:`RUN_OUTCOME_TEXT_MAX_CHARS`.
+    """
+    emoji = emoji.strip()
+    if not is_single_emoji(emoji):
+        raise ValueError("emoji must be exactly one emoji, e.g. '🚀'")
+    text = " ".join(text.split())
+    if not text:
+        raise ValueError("text must not be empty")
+    if len(text) > RUN_OUTCOME_TEXT_MAX_CHARS:
+        raise ValueError(f"text must be at most {RUN_OUTCOME_TEXT_MAX_CHARS} characters")
+    return emoji, text
+
 
 class ScheduledRunLogContext(BaseModel):
     """Occurrence identity retained with a saved prompt across replica changes."""

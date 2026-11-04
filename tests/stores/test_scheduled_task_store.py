@@ -7,6 +7,7 @@ SQLite database.
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -1422,7 +1423,11 @@ def test_record_run_outcome_targets_the_latest_run_of_a_continued_session(
         fired_at=201,
     )
     # Later firings that never delivered their prompt don't take the outcome.
-    for later, status, at in (("failed", "failed", 300), ("skipped", "skipped", 400)):
+    for later, status, at in (
+        ("failed", "failed", 300),
+        ("skipped", "skipped", 400),
+        ("starting", "starting", 450),
+    ):
         store.create_run(
             run_id=_uid(f"run_cont_{later}"),
             scheduled_task_id=_uid("task_cont"),
@@ -1433,18 +1438,19 @@ def test_record_run_outcome_targets_the_latest_run_of_a_continued_session(
             finished_at=at + 2,
         )
     recorded = store.record_run_outcome(
-        _uid("conv_cont"), success=True, emoji="🧹", text="Closed 3 stale PRs", recorded_at=450
+        _uid("conv_cont"), success=True, emoji="🧹", text="Closed 3 stale PRs", recorded_at=460
     )
     assert recorded is not None and recorded.id == _uid("run_cont_2")
     runs, _ = store.list_runs(_uid("task_cont"))
     assert {r.id: r.outcome_success for r in runs} == {
+        _uid("run_cont_starting"): None,
         _uid("run_cont_skipped"): None,
         _uid("run_cont_failed"): None,
         _uid("run_cont_2"): True,
         run_id: None,
     }
     # Once the newer run's turn is done its prompt still counts as delivered.
-    store.update_run(_uid("run_cont_2"), status="succeeded", finished_at=460)
+    store.update_run(_uid("run_cont_2"), status="succeeded", finished_at=470)
     store.create_run(
         run_id=_uid("run_cont_3"),
         scheduled_task_id=_uid("task_cont"),
@@ -1458,6 +1464,97 @@ def test_record_run_outcome_targets_the_latest_run_of_a_continued_session(
         _uid("conv_cont"), success=False, emoji="🚧", text="CI is down", recorded_at=510
     )
     assert newest is not None and newest.id == _uid("run_cont_3")
+
+
+def test_record_run_outcome_breaks_a_scheduled_at_tie_by_id(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Across delivered statuses, the greatest ``(scheduled_at, id)`` takes the outcome."""
+    store.create(
+        scheduled_task_id=_uid("task_tie"),
+        name="tie",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    ids = sorted([_uid("run_tie_a"), _uid("run_tie_b")])
+    for run, status in zip(ids, ("succeeded", "running"), strict=True):
+        store.create_run(
+            run_id=run,
+            scheduled_task_id=_uid("task_tie"),
+            status=status,
+            scheduled_at=100,
+            conversation_id=_uid("conv_tie"),
+            fired_at=101,
+        )
+    recorded = store.record_run_outcome(
+        _uid("conv_tie"), success=True, emoji="✅", text="Done", recorded_at=1
+    )
+    assert recorded is not None and recorded.id == ids[1]
+    runs, _ = store.list_runs(_uid("task_tie"))
+    assert {r.id: r.outcome_success for r in runs} == {ids[0]: None, ids[1]: True}
+
+
+def test_record_run_outcome_stores_an_opaque_bounded_envelope(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """The emoji and text are stored as one plaintext envelope, well under the byte cap."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import RUN_OUTCOME_PAYLOAD_MAX_BYTES, SqlScheduledTaskRun
+
+    run_id = _seed_running_run(store, "envelope")
+    # The largest outcome: the longest emoji, and text whose every character
+    # JSON-escapes to six bytes.
+    emoji = "👨\u200d👩\u200d👧\u200d👦" + "\ufe0f" * 9
+    assert len(emoji) == 16
+    text = "\x01" * 80
+    store.record_run_outcome(
+        _uid("conv_envelope"), success=True, emoji=emoji, text=text, recorded_at=1
+    )
+    with store._engine.connect() as connection:
+        stored = connection.execute(
+            select(SqlScheduledTaskRun.outcome_payload).where(SqlScheduledTaskRun.id == run_id)
+        ).scalar_one()
+    assert json.loads(bytes(stored)) == {"plaintext": {"emoji": emoji, "text": text}}
+    assert len(stored) < RUN_OUTCOME_PAYLOAD_MAX_BYTES // 2
+    [run], _ = store.list_runs(_uid("task_envelope"))
+    assert (run.outcome_emoji, run.outcome_text) == (emoji, text)
+
+
+@pytest.mark.parametrize(
+    ("emoji", "text", "message"),
+    [
+        ("ok", "Done", "exactly one emoji"),
+        ("∑", "Done", "exactly one emoji"),
+        ("✅", " ", "must not be empty"),
+        ("✅", "x" * 81, "at most 80"),
+    ],
+)
+def test_record_run_outcome_rejects_invalid_values_without_writing(
+    store: SqlAlchemyScheduledTaskStore, emoji: str, text: str, message: str
+) -> None:
+    """The store validates on its own, so a direct caller cannot store unbounded values."""
+    _seed_running_run(store, "invalid")
+    with pytest.raises(ValueError, match=message):
+        store.record_run_outcome(
+            _uid("conv_invalid"), success=True, emoji=emoji, text=text, recorded_at=1
+        )
+    [run], _ = store.list_runs(_uid("task_invalid"))
+    assert run.outcome_success is None
+
+
+def test_an_encrypted_outcome_envelope_is_not_read_as_plaintext() -> None:
+    """A ``ciphertext`` envelope needs a store that can decrypt it."""
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import _decode_outcome_payload
+
+    assert _decode_outcome_payload(None) is None
+    with pytest.raises(ValueError, match="encrypted"):
+        _decode_outcome_payload(b'{"ciphertext":{"key_id":"k","data":"AAAA"}}')
+    with pytest.raises(ValueError, match="unrecognized"):
+        _decode_outcome_payload(b'{"plaintext":{},"ciphertext":{}}')
 
 
 def test_record_run_outcome_reads_one_indexed_row_per_status(

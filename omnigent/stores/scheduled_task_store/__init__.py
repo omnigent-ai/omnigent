@@ -378,7 +378,6 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
-    @abstractmethod
     def record_run_outcome(
         self,
         conversation_id: str,
@@ -409,11 +408,18 @@ class ScheduledTaskStore(ABC):
         :param emoji: The emoji summarizing the outcome, e.g. ``"🚀"``.
         :param text: A few words on the outcome, e.g. ``"Opened 2 PRs"``.
         :param recorded_at: Unix epoch seconds of this recording.
+        The default records nothing and returns ``None``, so a store written
+        before outcomes existed still loads; the endpoint then answers 404.
+
         :returns: The updated :class:`ScheduledTaskRun`, or ``None`` when the
             conversation has no delivered run (for example, it was not started
-            by a scheduled task) or the run's task is gone.
+            by a scheduled task), the run's task is gone, or the store does not
+            record outcomes.
+        :raises ValueError: If the emoji or text fails
+            :func:`~omnigent.entities.scheduled_task.normalize_run_outcome`.
         """
-        ...
+        del conversation_id, success, emoji, text, recorded_at
+        return None
 
     @abstractmethod
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:

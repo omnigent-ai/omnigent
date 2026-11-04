@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 import logging
 import uuid
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
+    RUN_OUTCOME_PAYLOAD_MAX_BYTES,
     SqlScheduledTask,
     SqlScheduledTaskRun,
     current_workspace_id,
@@ -41,6 +43,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.entities.scheduled_task import normalize_run_outcome
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.scheduled.run_reconciler import (
     STALE_RUN_ERROR_CODE,
@@ -170,6 +173,47 @@ _SESSION_CREATION_FIELDS = (
 )
 
 
+def _encode_outcome_payload(emoji: str, text: str) -> bytes:
+    """Wrap a run outcome's emoji and text in the ``outcome_payload`` envelope.
+
+    The envelope is a UTF-8 JSON object with exactly one key naming its
+    variant. This store writes ``{"plaintext": {"emoji": ..., "text": ...}}``.
+    ``{"ciphertext": {...}}`` is reserved for a store that encrypts the
+    payload; it must carry the key and algorithm metadata needed to decrypt it.
+
+    :raises ValueError: If the envelope would exceed
+        :data:`RUN_OUTCOME_PAYLOAD_MAX_BYTES`.
+    """
+    payload = json.dumps(
+        {"plaintext": {"emoji": emoji, "text": text}},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(payload) > RUN_OUTCOME_PAYLOAD_MAX_BYTES:
+        raise ValueError("run outcome exceeds the stored size limit")
+    return payload
+
+
+def _decode_outcome_payload(stored: bytes | memoryview | None) -> tuple[str, str] | None:
+    """Unwrap an ``outcome_payload`` envelope into its emoji and text.
+
+    :returns: ``(emoji, text)``, or ``None`` when no outcome was recorded.
+    :raises ValueError: For a ``ciphertext`` envelope, which this store cannot
+        decrypt, or an unrecognized one.
+    """
+    if stored is None:
+        return None
+    envelope = json.loads(bytes(stored).decode("utf-8"))
+    if not isinstance(envelope, dict) or len(envelope) != 1:
+        raise ValueError("unrecognized run outcome envelope")
+    if "ciphertext" in envelope:
+        raise ValueError("an encrypted run outcome needs a store that can decrypt it")
+    plaintext = envelope.get("plaintext")
+    if not isinstance(plaintext, dict):
+        raise ValueError("unrecognized run outcome envelope")
+    return str(plaintext["emoji"]), str(plaintext["text"])
+
+
 def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
     """
     Convert a :class:`SqlScheduledTaskRun` ORM row to a :class:`ScheduledTaskRun`.
@@ -177,6 +221,7 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
     :param row: The SQLAlchemy ORM row to convert.
     :returns: A :class:`ScheduledTaskRun` dataclass instance.
     """
+    outcome = _decode_outcome_payload(row.outcome_payload)
     return ScheduledTaskRun(
         id=row.id,
         scheduled_task_id=row.scheduled_task_id,
@@ -192,8 +237,8 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
         host_id=row.host_id,
         lease_expires_at=row.lease_expires_at,
         outcome_success=row.outcome_success,
-        outcome_emoji=row.outcome_emoji,
-        outcome_text=row.outcome_text,
+        outcome_emoji=outcome[0] if outcome is not None else None,
+        outcome_text=outcome[1] if outcome is not None else None,
         outcome_recorded_at=row.outcome_recorded_at,
     )
 
@@ -932,7 +977,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> ScheduledTaskRun | None:
         """Record the agent's outcome on the conversation's latest delivered run.
 
-        One single-row read per delivered status, each a backward walk of
+        Checks the emoji and text with :func:`normalize_run_outcome` itself, so
+        no caller can store an unbounded value. One single-row read per
+        delivered status, each a backward walk of
         ``ix_scheduled_task_runs_conversation_status_scheduled``, so a continued
         session's run history is never scanned. Takes the task lock before the
         run's, like :meth:`update_run`, so it cannot deadlock with a task
@@ -952,6 +999,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .order_by(SqlScheduledTaskRun.scheduled_at.desc(), SqlScheduledTaskRun.id.desc())
                 .limit(1)
             ).first()
+
+        emoji, text = normalize_run_outcome(emoji, text)
+        payload = _encode_outcome_payload(emoji, text)
 
         def write(session: Session) -> ScheduledTaskRun | None:
             delivered = [
@@ -975,8 +1025,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if row is None:
                 return None
             row.outcome_success = success
-            row.outcome_emoji = emoji
-            row.outcome_text = text
+            row.outcome_payload = payload
             row.outcome_recorded_at = recorded_at
             return _run_to_entity(row)
 

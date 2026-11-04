@@ -37,7 +37,27 @@ def test_one_emoji_is_accepted(emoji: str) -> None:
 
 @pytest.mark.parametrize(
     "emoji",
-    ["", " ", ".", "ok", "1", "你好", "🚀🚧", "👍🏽👍", "🇺", "🇺🇸🇰🇷", "‍🚀", "🚀‍", "️"],
+    [
+        "",
+        " ",
+        ".",
+        "ok",
+        "1",
+        "你好",
+        "🚀🚧",
+        "👍🏽👍",
+        "🇺",
+        "🇺🇸🇰🇷",
+        "\u200d🚀",
+        "🚀\u200d",
+        "\ufe0f",
+        # Symbols that are not emoji.
+        "∑",
+        "±",
+        "°",
+        "█",
+        "€",
+    ],
 )
 def test_anything_but_one_emoji_is_rejected(emoji: str) -> None:
     with pytest.raises(ValidationError, match="exactly one emoji"):
