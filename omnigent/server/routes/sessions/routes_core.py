@@ -4810,6 +4810,10 @@ def register_core_routes(
                         )
                         if not host_bound:
                             raise runner_offline
+                        if runner_initialized:
+                            # Drop the binding to the vanished runner, so the
+                            # fork relaunches on its host like an offline one.
+                            await asyncio.to_thread(conversation_store.clear_runner_id, fork.id)
                 if runner_bound and host_bound:
                     # As native /clear does: the fork now holds the runner, so
                     # stopping or archiving the source must not stop it. The

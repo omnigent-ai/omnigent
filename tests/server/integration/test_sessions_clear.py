@@ -864,7 +864,8 @@ async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
         new_id = resp.json()["session_id"]
         fork = store.get_conversation(new_id)
         assert fork is not None
-        assert (fork.host_id, fork.workspace) == (_HOST_ID, "/work/repo")
+        # Placed on the host alone, holding no runner that went away.
+        assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
         assert live_runner.superseded == [(source_id, new_id, "clear")]
         return
     else:
