@@ -3005,9 +3005,11 @@ describe("useMoveToProject", () => {
     [undefined, false],
     ["updated_at", false],
     ["created_at", false],
+    ["title", false],
     [undefined, true],
     ["updated_at", true],
     ["created_at", true],
+    ["title", true],
   ] as const)(
     "moves a folder-only row into each matching target cache (window sort: %s, archived: %s)",
     async (windowSort, archived) => {
@@ -3036,8 +3038,8 @@ describe("useMoveToProject", () => {
       const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
       queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
       const row = conversation({ id: "conv_deep", project_id: "p_old", archived });
-      for (const sortBy of ["updated_at", "created_at"]) {
-        const sortKey = sortBy === "created_at" ? [sortBy] : [];
+      for (const sortBy of ["updated_at", "created_at", "title"]) {
+        const sortKey = sortBy !== "updated_at" ? [sortBy] : [];
         queryClient.setQueryData(
           ["conversations", "", archived, null, archived ? "archived" : "mine", ...sortKey],
           infinitePage(sortBy === windowSort ? [row] : []),
@@ -3060,8 +3062,8 @@ describe("useMoveToProject", () => {
       result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
 
       await waitFor(() => {
-        for (const sortBy of ["updated_at", "created_at"]) {
-          const sortKey = sortBy === "created_at" ? [sortBy] : [];
+        for (const sortBy of ["updated_at", "created_at", "title"]) {
+          const sortKey = sortBy !== "updated_at" ? [sortBy] : [];
           const target = queryClient.getQueryData<ConversationsInfiniteData>([
             "project-sessions",
             "Sprint 42",

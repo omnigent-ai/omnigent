@@ -6,6 +6,7 @@ grouping is deterministic; everything else comes from the live server.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import uuid
@@ -419,7 +420,8 @@ def named_sessions(request: pytest.FixtureRequest) -> Iterator[_NamedSessions]:
         yield _NamedSessions(base_url, project, folder, unfiled)
     finally:
         for session_id in [*folder.values(), *unfiled.values()]:
-            httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
 
 
 def _pause_for_recording(page: Page, milliseconds: int) -> None:
