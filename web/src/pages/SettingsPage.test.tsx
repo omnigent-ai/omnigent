@@ -1004,7 +1004,7 @@ describe("SettingsPage", () => {
     }));
     renderPage("/settings/appearance");
     const input = screen.getByTestId("ui-font-size-input");
-    expect(input).toHaveValue(14);
+    expect(input).toHaveValue(15);
     act(() => {
       narrow = false;
       widthChanges.forEach((callback) => callback());
@@ -1018,14 +1018,14 @@ describe("SettingsPage", () => {
       narrow = true;
       widthChanges.forEach((callback) => callback());
     });
-    expect(input).toHaveValue(14);
-    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     expect(input).toHaveValue(15);
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    expect(input).toHaveValue(16);
     act(() => {
       narrow = false;
       widthChanges.forEach((callback) => callback());
     });
-    expect(input).toHaveValue(15);
+    expect(input).toHaveValue(16);
   });
 
   it("retains the applied font size when saving a font choice fails", () => {

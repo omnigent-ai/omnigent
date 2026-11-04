@@ -34,17 +34,17 @@ describe("uiFontPreferences", () => {
     expect(UI_FONT_SIZE_DEFAULT).toBe(13);
   });
 
-  it("uses a 14px default on mobile without scaling explicit choices", () => {
+  it("uses a 15px default on mobile without scaling explicit choices", () => {
     vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
     expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_MOBILE_DEFAULT);
-    expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(14);
+    expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(15);
 
     writeUiFontSizePx(12);
     expect(readUiFontSizePx()).toBe(12);
   });
 
   it.each([
-    ["narrow viewport", true, true, 14],
+    ["narrow viewport", true, true, 15],
     ["wide touch viewport", false, true, 13],
     ["wide mouse viewport", false, false, 13],
   ] as const)("uses one applied size on a %s", (_label, narrow, coarse, size) => {

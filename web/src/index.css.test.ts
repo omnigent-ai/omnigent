@@ -955,7 +955,7 @@ describe("index.css body text tokens", () => {
 
     it("keeps the desktop and mobile defaults distinct", () => {
       expect(UI_FONT_SIZE_DEFAULT).toBe(13);
-      expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(14);
+      expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(15);
     });
 
     it("routes inherited body text through the same effective token", () => {

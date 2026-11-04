@@ -1391,10 +1391,10 @@ html[data-electron-mac] .breadcrumb-folder {
 /* Mobile typography and sidebar geometry. The root remains at the global 16px
  * so rem-based controls and spacing keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile defaults to 14px when no preference is saved. An inline value from
+  /* Mobile defaults to 15px when no preference is saved. An inline value from
    * the Appearance setting overrides this directly, without rescaling. */
   :root {
-    --desktop-ui-font-size: 14px;
+    --desktop-ui-font-size: 15px;
     --mobile-ui-font-size: var(--desktop-ui-font-size);
     --ui-ramp-anchor: var(--mobile-ui-font-size);
     --text-sm: calc(var(--mobile-ui-font-size) - 1px);

@@ -138,7 +138,7 @@ def test_message_font_size_survives_rotation_and_reload(
             if reload:
                 page.reload()
             assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
-            interface_px = saved_size if saved_size is not None else (14 if width < 768 else 13)
+            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 13)
             message_px = interface_px
             for element in prose:
                 expect(element).to_have_css("font-size", f"{message_px}px")
@@ -178,7 +178,7 @@ def test_large_message_fallback_keeps_message_font_size(
         for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
             fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
             expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
-            expected_px = (14 if width < 768 else 13) if touch else 12
+            expected_px = (15 if width < 768 else 13) if touch else 12
             expect(fallback).to_have_css("font-size", f"{expected_px}px")
 
 
@@ -207,13 +207,13 @@ def test_custom_browser_font_default_matches_rendered_sizes_and_settings(
         assert not page.evaluate("matchMedia('(min-width: 48rem)').matches")
         assert not page.evaluate("matchMedia('(pointer: coarse)').matches")
         for selector in ('[data-role="user"] p', '[data-testid="assistant-text-section"] p'):
-            expect(page.locator(selector)).to_have_css("font-size", "14px")
+            expect(page.locator(selector)).to_have_css("font-size", "15px")
         expect(page.get_by_role("textbox", name="Message the agent", exact=True)).to_have_css(
-            "font-size", "14px"
+            "font-size", "15px"
         )
         page.goto(f"{chat.contract.base_url}/settings/appearance")
-        expect(page.get_by_test_id("ui-font-size-input")).to_have_value("14")
-        expect(page.get_by_test_id("ui-font-size-input")).to_have_css("font-size", "14px")
+        expect(page.get_by_test_id("ui-font-size-input")).to_have_value("15")
+        expect(page.get_by_test_id("ui-font-size-input")).to_have_css("font-size", "15px")
         assert page.evaluate("localStorage.getItem('omnigent:ui-font-size')") is None
     finally:
         try:
