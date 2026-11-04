@@ -109,9 +109,8 @@ async def _post_clear(
     :returns: The server response and the forwarded clear bodies.
     """
     from omnigent.runtime import set_runner_client
-    from omnigent.server.routes import sessions as sessions_module
 
-    monkeypatch.setattr(sessions_module, "_resolve_harness", lambda *_a, **_k: harness)
+    resolve_harness_as(monkeypatch, harness)
 
     runner, captured = _fake_runner_returning(clear_status)
     set_runner_client(runner)
@@ -363,7 +362,9 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     session keeps the source's host, workspace, branch, runner, sandbox
     repositories, run settings and routing switches but none of its files; the
     source keeps its history and gets a notice plus a redirect. A source on a
-    runner with no host keeps its workspace and branch too.
+    runner with no host keeps its workspace and branch too. An empty source
+    that gains an item mid-clear (e.g. a concurrent clear's notice) still
+    yields an empty session.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     live_runner.clear_status = runner_status
@@ -371,6 +372,22 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     source_id = await create_placed_session(client, store, turns=turns, host=host)
     if not host:
         set_runner_workspace(db_uri, source_id, "/work/repo", "feature/parser")
+    written_meanwhile = ["Earlier clear notice"] if turns == 0 else []
+    if written_meanwhile:
+        live_runner.on_clear = lambda: store.append(
+            source_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_notice",
+                    data=MessageData(
+                        role="assistant",
+                        content=[{"type": "output_text", "text": written_meanwhile[0]}],
+                        agent="test-agent",
+                    ),
+                )
+            ],
+        )
     file_store = SqlAlchemyFileStore(db_uri)
     file_store.create("notes.txt", bytes=5, session_id=source_id)
     repos = ["https://github.com/acme/api", "https://github.com/acme/web#main"]
@@ -393,7 +410,7 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     # The old session's client is freed before the new session is initialized.
     initialized = [(path, body.get("session_id")) for path, body in live_runner.posts]
     assert live_runner.posts.index(release) < initialized.index(("/v1/sessions", new_id))
-    assert message_texts(store, new_id) == []
+    assert store.list_items(new_id).data == []
     assert file_store.list(new_id).data == []
     assert [stored.filename for stored in file_store.list(source_id).data] == ["notes.txt"]
     fork = store.get_conversation(new_id)
@@ -421,48 +438,11 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     # Untitled, so the first message names it like any new chat.
     assert fork.title is None
     history = [text for turn in range(1, turns + 1) for text in (f"Q{turn}", f"A{turn}")]
+    history += written_meanwhile
     assert message_texts(store, source_id)[:-1] == history
     notice = message_texts(store, source_id)[-1]
     assert "ended by `/clear`" in notice and f"(/c/{new_id})" in notice
     assert live_runner.superseded == [(source_id, new_id, "clear")]
-
-
-async def test_claude_sdk_clear_copies_no_item_written_while_it_runs(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An empty source that gains an item mid-clear still yields an empty session.
-
-    A concurrent clear's notice can land in the source after this clear has
-    looked at it; the new session must not inherit it.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store, turns=0)
-    live_runner.on_clear = lambda: store.append(
-        source_id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_notice",
-                data=MessageData(
-                    role="assistant",
-                    content=[{"type": "output_text", "text": "Earlier clear notice"}],
-                    agent="test-agent",
-                ),
-            )
-        ],
-    )
-
-    resp = await client.post(
-        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
-    )
-
-    assert resp.status_code == 202, resp.text
-    assert message_texts(store, source_id)[0] == "Earlier clear notice"
-    assert store.list_items(resp.json()["session_id"]).data == []
 
 
 async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_session(
@@ -802,8 +782,17 @@ async def test_claude_sdk_clear_tells_an_offline_runner_from_one_on_another_repl
     assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
 
 
-@pytest.mark.parametrize("host", [True, False], ids=["host-bound", "runner-only"])
-@pytest.mark.parametrize("left", ["before_validation", "after_validation", "to_another_replica"])
+@pytest.mark.parametrize(
+    ("left", "host"),
+    [
+        pytest.param("before_validation", True, id="before_validation-host-bound"),
+        pytest.param("before_validation", False, id="before_validation-runner-only"),
+        pytest.param("after_validation", True, id="after_validation-host-bound"),
+        pytest.param("after_validation", False, id="after_validation-runner-only"),
+        # Only a host tells another replica's runner apart from a gone one.
+        pytest.param("to_another_replica", True, id="to_another_replica-host-bound"),
+    ],
+)
 async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -846,7 +835,7 @@ async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
         f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
     )
 
-    if host and left == "to_another_replica":
+    if left == "to_another_replica":
         assert resp.status_code == 400, resp.text
         assert "wrong_replica" in resp.text
     elif host:
