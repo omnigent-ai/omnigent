@@ -110,22 +110,44 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
         }
         assert indexes[_INDEX] == ["workspace_id", "archived", "title_sort_key", "id"]
 
-        # Builds that predate the column still insert; their rows list as untitled.
+        # Builds that predate the column still insert and rename without writing keys.
+        parent_id = parents[(0, child_id)]
+        legacy_child_id = bytes([100]) * 16
         with engine.begin() as connection:
             connection.execute(
                 sa.text(
-                    "INSERT INTO conversations "
-                    "(workspace_id, id, root_conversation_id, created_at, updated_at, title) "
-                    "VALUES (0, :id, :id, 1, 2, 'Legacy')"
+                    "INSERT INTO conversations (workspace_id, id, root_conversation_id, "
+                    "parent_conversation_id, created_at, updated_at, title) "
+                    "VALUES (0, :id, :id, :parent, 1, 2, :title)"
                 ),
-                {"id": legacy_id},
+                [
+                    {"id": legacy_id, "parent": None, "title": "Legacy"},
+                    {"id": legacy_child_id, "parent": parent_id, "title": "Legacy Child"},
+                ],
             )
-        assert _keys(engine)[(0, legacy_id)] == "1"
+            connection.execute(
+                sa.text(
+                    "UPDATE conversations SET title = 'Renamed' "
+                    "WHERE workspace_id = 0 AND id = :id"
+                ),
+                {"id": parent_id},
+            )
+        stale = _keys(engine)
+        assert [stale[(0, row_id)] for row_id in (legacy_id, legacy_child_id, parent_id)] == [
+            "1",
+            "1",
+            "0alpha",
+        ]
 
         # Stamping back and rerunning the revision keeps the column and index and fixes keys.
         _migrate(engine, _PREVIOUS, command.stamp)
         _migrate(engine, _REVISION)
-        assert _keys(engine) == {**expected, (0, legacy_id): "0legacy"}
+        assert _keys(engine) == {
+            **expected,
+            (0, legacy_id): "0legacy",
+            (0, legacy_child_id): "20legacy child",
+            (0, parent_id): "0renamed",
+        }
 
         _migrate(engine, _PREVIOUS, command.downgrade)
         inspector = sa.inspect(engine)
@@ -139,7 +161,10 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
                     {"name": "idx_conversations_parent"},
                 ).scalar_one()
             assert "created_at DESC" in parent_index and "id DESC" in parent_index
-        assert set(_conversation_ids(engine)) == set(original) | {(0, legacy_id)}
+        assert set(_conversation_ids(engine)) == set(original) | {
+            (0, legacy_id),
+            (0, legacy_child_id),
+        }
     finally:
         _migrate(engine, "head")
 
