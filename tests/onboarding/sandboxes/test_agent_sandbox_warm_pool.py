@@ -312,6 +312,48 @@ def test_template_preserves_storage_mount_separation_and_agent_profile(
     assert claim["spec"]["resources"]["requests"]["storage"] == "20Gi"
 
 
+@pytest.mark.parametrize(
+    ("resources", "bootstrap_requests"),
+    [
+        (
+            {
+                "requests": {"cpu": "20m", "memory": "64Mi"},
+                "limits": {"cpu": "40m", "memory": "100Mi"},
+            },
+            {"cpu": "20m", "memory": "64Mi"},
+        ),
+        (
+            {
+                "requests": {"cpu": "0.02", "memory": "100M"},
+                "limits": {"cpu": "1", "memory": "1G"},
+            },
+            {"cpu": "0.02", "memory": "100M"},
+        ),
+        (
+            {"requests": {"cpu": "0.5", "memory": "1e9"}, "limits": {"cpu": "1", "memory": "2e9"}},
+            {"cpu": "50m", "memory": "128Mi"},
+        ),
+    ],
+)
+def test_bootstrap_requests_do_not_exceed_smaller_configured_resources(
+    resources: dict[str, dict[str, str]], bootstrap_requests: dict[str, str]
+) -> None:
+    bootstrap, host = _launcher(resources=resources).template_spec()["podTemplate"]["spec"][
+        "containers"
+    ]
+    assert host["resources"] == resources
+    assert bootstrap["resources"] == {
+        "requests": bootstrap_requests,
+        "limits": resources["limits"],
+    }
+
+
+def test_template_rejects_resource_quantities_kubernetes_cannot_parse() -> None:
+    resources = {"requests": {"memory": "1Gb"}, "limits": {"memory": "2Gi"}}
+    with pytest.raises(click.ClickException, match="'1Gb' is not a valid Kubernetes"):
+        _launcher(resources=resources).template_spec()
+
+
 def test_template_profile_is_deterministic_and_changes_with_configuration() -> None:
     baseline = _launcher().template_spec()
     assert baseline == _launcher().template_spec(host_config={"profile": "oss"})

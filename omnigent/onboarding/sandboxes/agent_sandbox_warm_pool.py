@@ -12,10 +12,12 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -64,6 +66,14 @@ _ACTIVATION_PATH = "/run/omnigent-activation"
 # Bootstrap runs beside the host for the Pod's lifetime, so Kubernetes adds its requests
 # to the host's. It keeps the configured limits for workspace preparation.
 _BOOTSTRAP_REQUESTS = {"cpu": "50m", "memory": "128Mi", "ephemeral-storage": "0"}
+_QUANTITY_SCALE = {
+    "n": Decimal("1e-9"),
+    "u": Decimal("1e-6"),
+    "m": Decimal("1e-3"),
+    "": Decimal(1),
+    **{suffix: Decimal(10) ** (3 * power) for power, suffix in enumerate("kMGTPE", 1)},
+    **{suffix + "i": Decimal(2) ** (10 * power) for power, suffix in enumerate("KMGTPE", 1)},
+}
 _HANDLE_PREFIX = "wp1:"
 _POLL_S = 0.5
 _EXEC_TIMEOUT_S = 15
@@ -119,6 +129,14 @@ def _shared_profile(spec: dict[str, Any]) -> bool:
             "and the omnigent.ai/agent label must be absent."
         )
     return True
+
+
+def _quantity(value: str) -> Decimal:
+    """Parse a Kubernetes quantity without the optional Kubernetes SDK."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)([a-zA-Z]*)", value)
+    if match is None or match[2] not in _QUANTITY_SCALE:
+        raise click.ClickException(f"{value!r} is not a valid Kubernetes resource quantity.")
+    return Decimal(match[1]) * _QUANTITY_SCALE[match[2]]
 
 
 def _contains(expected: Any, actual: Any, *, field: str = "") -> bool:
@@ -229,14 +247,13 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         host["command"] = _bootstrap_command("host")
         if not legacy_bootstrap:
             configured = host["resources"]
-            bootstrap["resources"] = {
-                "requests": {
-                    name: value
-                    for name, value in _BOOTSTRAP_REQUESTS.items()
-                    if name in {*configured["requests"], *configured["limits"]}
-                },
-                "limits": dict(configured["limits"]),
-            }
+            tiers = (configured["requests"], configured["limits"])
+            requests = {}
+            for name, default in _BOOTSTRAP_REQUESTS.items():
+                bounds = [tier[name] for tier in tiers if name in tier]
+                if bounds:
+                    requests[name] = min([default, *bounds], key=_quantity)
+            bootstrap["resources"] = {"requests": requests, "limits": dict(configured["limits"])}
         host["env"] = [
             item
             for item in host["env"]
