@@ -261,7 +261,8 @@ function touch(target: Element, type: string, x: number, time: number, fingers =
 
 function stubMobileLayout(mobile: boolean): void {
   vi.stubGlobal("matchMedia", (query: string) => ({
-    matches: mobile && query.includes("max-width"),
+    // Answer both breakpoint forms: `isMobileViewport` reads the md min-width query.
+    matches: query.includes("min-width") ? !mobile : mobile && query.includes("max-width"),
     media: query,
     addEventListener: () => {},
     removeEventListener: () => {},
