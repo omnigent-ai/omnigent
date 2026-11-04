@@ -5476,8 +5476,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             source holds when the fork commits. A truncation; exclusive with
             both cutoffs.
         :param continue_source: Also copy the source's host, workspace and
-            branch (in the same write that creates the fork) and its routing
-            switches, for a same-owner continuation of the source's work.
+            branch (in the same write that creates the fork, holding the host
+            row lock; a deleted host is not copied) and its routing switches,
+            for a same-owner continuation of the source's work.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -6026,12 +6027,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                 project_id=project_id,
             )
             if continue_source:
-                # Born on the source's current host, so the host is referenced
-                # from the fork's creation and no teardown can miss it.
+                # Born on the source's current host under the host row lock that
+                # host deletion takes, so a teardown either sees this reference
+                # or has already removed the host (and the fork stays unplaced).
                 current = meta_sess.get(
                     SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
                 )
-                if current is not None and current.host_id and current.workspace:
+                host = (
+                    meta_sess.get(
+                        SqlHost,
+                        (current_workspace_id(), current.host_id),
+                        with_for_update=True,
+                    )
+                    if current is not None and current.host_id and current.workspace
+                    else None
+                )
+                if current is not None and host is not None and host.deleted_at is None:
                     fork_meta.host_id = current.host_id
                     fork_meta.workspace = current.workspace
                     fork_meta.git_branch = current.git_branch

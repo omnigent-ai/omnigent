@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -6434,6 +6436,69 @@ def test_fork_conversation_before_item_drops_the_item_and_later_history(
     for cutoff in ({"before_item_id": second_prompt.id}, {"up_to_response_id": "resp_001"}):
         with pytest.raises(ValueError, match="copy_items=False"):
             conversation_store.fork_conversation(source.id, copy_items=False, **cutoff)
+
+
+def test_continuation_fork_and_host_teardown_serialize_on_the_host_row(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """A teardown racing a continuation's fork waits for it, then keeps the host.
+
+    The continuation copies its source's host while holding the host row lock
+    that host deletion takes. Deleting the source and its host while the
+    continuation's metadata is mid-insert must block on that lock and then see
+    the continuation, rather than tear the host down under it. (SQLite already
+    serializes the two writes; the row lock matters on Postgres and MySQL.)
+    """
+    from omnigent.db.utils import now_epoch
+
+    hosts = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="continued-sandbox",
+        user_id=RESERVED_USER_LOCAL,
+        token="launch-token",
+        provider="modal",
+        sandbox_id="sb-continued",
+        token_expires_at=now_epoch() + 3600,
+    )
+    source = conversation_store.create_conversation(host_id=host_id, workspace="/work")
+    torn_down: list[object] = []
+
+    def delete_source_and_host() -> None:
+        asyncio.run(conversation_store.delete_conversation(source.id))
+        torn_down.append(hosts.delete_host(host_id, keep_if_bound=True))
+
+    deleter = threading.Thread(target=delete_source_and_host)
+
+    def race_the_insert(_conn: object, _cursor: object, statement: str, *_args: object) -> None:
+        if (
+            deleter.is_alive()
+            or torn_down
+            or not statement.lstrip()
+            .upper()
+            .startswith("INSERT INTO OMNIGENT_CONVERSATION_METADATA")
+        ):
+            return
+        deleter.start()
+        # A teardown that skipped the host lock would finish in this window.
+        deleter.join(timeout=1.0)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", race_the_insert)
+    try:
+        fork = conversation_store.fork_conversation(
+            source.id, copy_items=False, continue_source=True
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", race_the_insert)
+    deleter.join(timeout=30)
+
+    assert not deleter.is_alive()
+    assert torn_down == [None]
+    assert hosts.get_host(host_id) is not None
+    continuation = conversation_store.get_conversation(fork.id)
+    assert continuation is not None
+    assert (continuation.host_id, continuation.workspace) == (host_id, "/work")
 
 
 def test_fork_clone_agent_is_session_scoped(

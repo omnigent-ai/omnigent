@@ -240,6 +240,19 @@ def resolve_harness_as(monkeypatch: pytest.MonkeyPatch, harness: str) -> None:
     monkeypatch.setattr(sessions_module, "_resolve_harness", lambda *_a, **_k: harness)
 
 
+def bind_to_host(
+    store: SqlAlchemyConversationStore,
+    session_id: str,
+    workspace: str,
+    git_branch: str | None = None,
+) -> None:
+    """Bind *session_id* to ``_HOST_ID``, registering the host if it is new."""
+    host_store = HostStore(store.storage_location)
+    if host_store.get_host(_HOST_ID) is None:
+        host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
+    store.set_host_id(session_id, _HOST_ID, workspace, git_branch)
+
+
 async def create_placed_session(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
@@ -292,7 +305,7 @@ async def create_placed_session(
             ],
         )
     if host:
-        store.set_host_id(session_id, _HOST_ID, "/work/repo", "feature/parser")
+        bind_to_host(store, session_id, "/work/repo", "feature/parser")
     if runner_id is not None:
         store.replace_runner_id(session_id, runner_id)
     return session_id
@@ -814,7 +827,7 @@ async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize
         agent_id=agent["id"],
         inference_snapshot={"runtime_config": {}, "harness": "claude-sdk", "owner_id": "local"},
     )
-    store.set_host_id(source.id, _HOST_ID, "/work/repo")
+    bind_to_host(store, source.id, "/work/repo")
     store.replace_runner_id(source.id, _RUNNER_ID)
     before = len((await client.get("/v1/sessions")).json()["data"])
 

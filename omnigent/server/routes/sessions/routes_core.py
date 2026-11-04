@@ -4687,14 +4687,10 @@ def register_core_routes(
             try:
                 if host_bound:
                     assert source.host_id is not None
-                    # The fork was born on the host, so a delete of the source
-                    # from here on keeps it. One that already tore it down
-                    # (before the fork existed) leaves the fork nothing to use.
-                    host_store = getattr(request.app.state, "host_store", None)
-                    if fork.host_id != source.host_id or (
-                        host_store is not None
-                        and await asyncio.to_thread(host_store.get_host, source.host_id) is None
-                    ):
+                    # The fork was born on the host under its row lock, so a
+                    # delete of the source from here on keeps it; a host torn
+                    # down first was not copied and leaves the fork unplaced.
+                    if fork.host_id != source.host_id:
                         raise OmnigentError(
                             f"This session's host went away during {command}; try again.",
                             code=ErrorCode.CONFLICT,
