@@ -948,19 +948,28 @@ def test_clear_claude_sdk_continues_empty_on_the_same_host(
         _poll_for_assistant_marker(http_client, session_id=source_id, marker="ACK0", timeout=180.0)
         # /clear refuses a running turn.
         _wait_until_idle(http_client, session_id=source_id)
+        # /clear moves the runner to the new session, so capture it first.
+        placed = http_client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
+        assert placed["runner_id"] is not None, placed
 
         cleared = http_client.post(
             f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}, timeout=60.0
         )
         assert cleared.status_code == 202, cleared.text
         cleared_id = str(cleared.json()["session_id"])
-        source = http_client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
         new = http_client.get(f"/v1/sessions/{cleared_id}", timeout=30.0).json()
         assert (new["runner_id"], new["host_id"], new["workspace"], new["model_override"]) == (
-            source["runner_id"],
-            source["host_id"],
-            source["workspace"],
+            placed["runner_id"],
+            placed["host_id"],
+            placed["workspace"],
             "sonnet",
+        )
+        # The original keeps its host and workspace to resume on, but not the runner.
+        source = http_client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
+        assert (source["runner_id"], source["host_id"], source["workspace"]) == (
+            None,
+            placed["host_id"],
+            placed["workspace"],
         )
         items = http_client.get(
             f"/v1/sessions/{source_id}/items", params={"limit": 5, "order": "desc"}, timeout=30.0
