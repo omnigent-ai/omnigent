@@ -226,12 +226,13 @@ def _encode_title_cursor(row: SqlConversation) -> str:
     return _TITLE_CURSOR_PREFIX + encoded.rstrip("=")
 
 
-def _decode_title_cursor(cursor: str) -> tuple[str, str] | None:
+def _decode_title_cursor(cursor: str, dialect: str) -> tuple[str, str] | None:
     """
     Return the ``(title_sort_key, id)`` position a title token carries.
 
     :param cursor: An ``after`` or ``before`` value: a token from
         :func:`_encode_title_cursor` or a conversation id.
+    :param dialect: The conversation database's SQLAlchemy dialect name.
     :returns: The carried position, or ``None`` for a conversation id.
     :raises OmnigentError: ``INVALID_INPUT`` if the token is malformed.
     """
@@ -246,6 +247,12 @@ def _decode_title_cursor(cursor: str) -> tuple[str, str] | None:
             raise ValueError("cursor position must be strings")
         if len(sort_key) > TITLE_SORT_KEY_MAX_CHARS:
             raise ValueError("cursor sort key is too long")
+        if sort_key != "1" and not sort_key.startswith("0"):
+            raise ValueError("cursor sort key was not issued by the store")
+        # Lone surrogates can't be bound, and PostgreSQL text never holds NUL.
+        sort_key.encode("utf-8")
+        if dialect == "postgresql" and "\x00" in sort_key:
+            raise ValueError("cursor sort key contains NUL")
         uuid_to_bytes(conversation_id)
     except (TypeError, ValueError) as exc:
         raise OmnigentError(
@@ -3649,7 +3656,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises OmnigentError: ``INVALID_INPUT`` for a malformed title
             token or one used with another sort.
         """
-        position: tuple[Any, ...] | None = _decode_title_cursor(cursor)
+        dialect = session.bind.dialect.name if session.bind is not None else ""
+        position: tuple[Any, ...] | None = _decode_title_cursor(cursor, dialect)
         if position is not None and not title_sort:
             raise OmnigentError(
                 "This session list cursor requires sort_by=title.",
@@ -3668,17 +3676,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise StaleCursorError(cursor)
             position = tuple(cursor_row)
         sort_val, tiebreaker_val = position
-        # "after" (forward=True) = further in sort direction;
-        # "before" (forward=False) = opposite of sort direction.
-        #
-        # Emitted as a ROW-VALUES comparison — ``(sort, tiebreak) < (:ts, :id)``
-        # — not the equivalent ``sort < :ts OR (sort = :ts AND tiebreak < :id)``.
-        # The two are semantically identical, but PostgreSQL can only turn the
-        # row-values form into an index range condition; the OR form is left as
-        # a residual Filter, so a deep cursor re-reads and discards every row
-        # between the index start and the cursor (cost growing with cursor
-        # depth, not page size). MySQL is the reverse: it range-scans only the
-        # OR form and filters row values after reading from the index start.
+        # "after" continues in the sort direction and "before" against it. PostgreSQL
+        # range-scans only the row-values form, and MySQL only the expanded OR form.
         row = tuple_(sort_col, tiebreaker_col)
         # Bind the tiebreaker with its column's type. Inside ``tuple_`` a bare
         # Python value gets no type context, so the ``Uuid16`` decorator never
@@ -3693,7 +3692,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         cursor_sort = literal(sort_val, sort_col.type)
         descending_scan = is_desc if forward else not is_desc
-        if session.bind is not None and session.bind.dialect.name == "mysql":
+        if dialect == "mysql":
             if descending_scan:
                 beyond_sort, beyond_tiebreaker = (
                     sort_col < cursor_sort,

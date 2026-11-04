@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import string
@@ -3305,7 +3306,22 @@ def test_title_cursor_tokens_are_validated(
     )
     assert [c.id for c in plain.data] == ids[1:]
 
+    def token(sort_key: str) -> str:
+        payload = base64.urlsafe_b64encode(json.dumps([sort_key, ids[0]]).encode("ascii"))
+        return "title." + payload.decode("ascii").rstrip("=")
+
     malformed = ["title.", "title.!!", "title.bm90IGpzb24", "title.WzEsMl0", "title.WyJ4IiwiYiJd"]
+    # Keys the store never issues, and a lone surrogate no driver can bind.
+    malformed += [token(""), token("2a"), token("0a\ud800")]
+    nul_key = token("0a\x00")
+    if conversation_store._conv_engine.dialect.name == "postgresql":
+        malformed.append(nul_key)
+    else:
+        # Titles there can hold NUL, so a stored key can too.
+        nul_page = conversation_store.list_conversations(
+            after=nul_key, sort_by="title", order="asc", kind=None
+        )
+        assert [c.id for c in nul_page.data] == ids
     for cursor in malformed:
         with pytest.raises(OmnigentError) as exc_info:
             conversation_store.list_conversations(
