@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -27,9 +28,11 @@ from fastapi import FastAPI
 
 import omnigent.runtime
 from omnigent.entities import MessageData, NewConversationItem
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.managed_hosts import (
     REQUESTED_HOST_ID_LABEL_KEY,
+    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
     managed_repo_labels,
     read_managed_repo_workspaces,
 )
@@ -40,7 +43,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from tests.server.helpers import create_test_agent, register_test_runner
+from tests.server.helpers import FakeSandboxLauncher, create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
 
@@ -458,6 +461,69 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
         },
     )
     assert resumed.status_code < 300, resumed.text
+
+
+@pytest.mark.parametrize("deleted_first", ["original", "continuation"])
+async def test_deleting_one_side_of_a_clear_keeps_their_shared_sandbox(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    deleted_first: str,
+) -> None:
+    """Both sessions of a ``/clear`` work in one managed sandbox.
+
+    Deleting either leaves the other bound to the host and the sandbox
+    running; deleting the last one still tears the sandbox down.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    host_store = HostStore(db_uri)
+    host_store.register_managed_host(
+        host_id=_HOST_ID,
+        name="managed-clear",
+        user_id=RESERVED_USER_LOCAL,
+        token="managed-clear-token",
+        provider="modal",
+        sandbox_id="sb-clear",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    launcher = FakeSandboxLauncher()
+    monkeypatch.setattr(app.state, "host_store", host_store)
+    monkeypatch.setattr(
+        app.state,
+        "sandbox_config",
+        ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: launcher,
+                token_ttl_s=3600,
+                provider="modal",
+            )
+        ),
+    )
+    source_id = await create_placed_session(client, store)
+    cleared = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+    assert cleared.status_code == 202, cleared.text
+    new_id = cleared.json()["session_id"]
+    first, last = (source_id, new_id) if deleted_first == "original" else (new_id, source_id)
+
+    deleted = await client.delete(f"/v1/sessions/{first}")
+
+    assert deleted.status_code == 200, deleted.text
+    survivor = store.get_conversation(last)
+    assert survivor is not None and survivor.host_id == _HOST_ID
+    assert host_store.get_host(_HOST_ID) is not None
+    assert launcher.terminated == []
+
+    deleted = await client.delete(f"/v1/sessions/{last}")
+
+    assert deleted.status_code == 200, deleted.text
+    assert launcher.terminated == ["sb-clear"]
+    assert host_store.get_host(_HOST_ID) is None
 
 
 async def test_claude_sdk_clear_still_redirects_when_the_notice_is_lost(
