@@ -31,6 +31,7 @@ def test_family_id_migration_preserves_metadata_and_indexes_membership() -> None
         connection.execute(table.insert(), original)
         before = connection.execute(sa.select(table)).all()
         migration.upgrade()
+        migration.upgrade()  # DDL may commit before the revision stamp on an interrupted upgrade.
         columns = {
             column["name"]: column for column in sa.inspect(connection).get_columns(table.name)
         }
@@ -88,8 +89,19 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
     )
     table = "omnigent_conversation_metadata"
     index = "ix_conversation_metadata_family_id"
-    assert "family_id" in {c["name"] for c in sa.inspect(engine).get_columns(table)}
-    assert sa.inspect(engine).has_index(table, index)
+
+    def schema():
+        inspector = sa.inspect(engine)
+        column = next(c for c in inspector.get_columns(table) if c["name"] == "family_id")
+        family_index = next(i for i in inspector.get_indexes(table) if i["name"] == index)
+        return (
+            str(column["type"]),
+            column["nullable"],
+            column["default"],
+            family_index["column_names"],
+        )
+
+    before = schema()
 
     def migrate(operation: Callable[[], None]) -> None:
         with engine.connect() as connection:
@@ -123,9 +135,8 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
                     ),
                     {"name": index},
                 ).scalar_one()
-        assert next(i for i in sa.inspect(engine).get_indexes(table) if i["name"] == index)[
-            "column_names"
-        ] == ["workspace_id", "family_id", "id"]
+        assert schema() == before
+        assert before[1:] == (True, None, ["workspace_id", "family_id", "id"])
     finally:
         if (
             engine.dialect.name == "postgresql"

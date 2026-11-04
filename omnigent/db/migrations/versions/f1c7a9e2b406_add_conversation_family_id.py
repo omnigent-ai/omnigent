@@ -27,7 +27,8 @@ def upgrade() -> None:
     if "family_id" not in {c["name"] for c in sa.inspect(op.get_bind()).get_columns(_TABLE)}:
         op.add_column(_TABLE, sa.Column("family_id", Uuid16(), nullable=True))
     if op.get_bind().dialect.name != "postgresql":
-        op.create_index(_INDEX, _TABLE, _COLUMNS)
+        if not sa.inspect(op.get_bind()).has_index(_TABLE, _INDEX):
+            op.create_index(_INDEX, _TABLE, _COLUMNS)
         return
     with op.get_context().autocommit_block():
         # Rebuild only an invalid index on this table, including after a failed attempt.
