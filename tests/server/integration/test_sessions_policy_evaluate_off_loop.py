@@ -11,7 +11,9 @@ Uses the shared ``auth_client`` / ``db_uri`` fixtures from ``tests/server/confte
 from __future__ import annotations
 
 import asyncio
+import gc
 import threading
+from contextlib import suppress
 from typing import Any
 
 import httpx
@@ -21,6 +23,7 @@ from omnigent.runtime import get_caps
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.routes.sessions import routes_hooks
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import create_test_agent, policy_tool_call_request
 
 pytestmark = pytest.mark.asyncio
@@ -111,13 +114,41 @@ def _allow(event: dict[str, Any]) -> dict[str, Any]:
     return {"result": "ALLOW"}
 
 
-class _GatedBuilds:
-    """Stand-in for ``build_policy_engine`` whose calls each block until the test releases them."""
+class _RecordingLock:
+    """Wraps a session's build lock, counting acquisition requests and grants."""
 
-    def __init__(self, real_build: Any) -> None:
+    def __init__(self, lock: asyncio.Lock, gated: _GatedBuilds) -> None:
+        self._lock = lock
+        self._gated = gated
+
+    async def __aenter__(self) -> None:
+        self._gated.lock_requests += 1
+        await self._lock.acquire()
+        self._gated.lock_grants += 1
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self._lock.release()
+
+
+class _GatedBuilds:
+    """
+    Stand-in for ``build_policy_engine`` whose calls each block until the test releases them.
+
+    It also records requests for the per-session build lock. A free ``asyncio.Lock`` is
+    granted without yielding, so a request counted but not yet granted is blocked behind
+    the lock holder.
+    """
+
+    def __init__(self, real_build: Any, real_lock_factory: Any) -> None:
         self._real_build = real_build
+        self._real_lock_factory = real_lock_factory
         self._entered = threading.Condition()
         self.releases: list[threading.Event] = []
+        self.lock_requests = 0
+        self.lock_grants = 0
+
+    def build_lock(self, session_id: str) -> _RecordingLock:
+        return _RecordingLock(self._real_lock_factory(session_id), self)
 
     def build(self, *args: Any, **kwargs: Any) -> Any:
         release = threading.Event()
@@ -137,10 +168,10 @@ class _GatedBuilds:
 
         assert await asyncio.to_thread(wait), f"expected {count} builds to start"
 
-    async def assert_started_stays(self, count: int) -> None:
-        """Assert no further build starts while the started ones are held."""
-        await asyncio.sleep(0.3)
-        assert len(self.releases) == count
+    async def assert_blocked_behind(self, started: int) -> None:
+        """Wait until a competing request is blocked on the build lock, with ``started`` builds."""
+        await poll_until_async(lambda: self.lock_requests > self.lock_grants, timeout_s=5)
+        assert len(self.releases) == started
 
     def release(self, index: int) -> None:
         self.releases[index].set()
@@ -174,8 +205,9 @@ async def _setup_sessions(
         )
         assert resp.status_code == 201, resp.text
         session_ids.append(resp.json()["id"])
-    gated = _GatedBuilds(routes_hooks.build_policy_engine)
+    gated = _GatedBuilds(routes_hooks.build_policy_engine, routes_hooks._policy_engine_build_lock)
     monkeypatch.setattr(routes_hooks, "build_policy_engine", gated.build)
+    monkeypatch.setattr(routes_hooks, "_policy_engine_build_lock", gated.build_lock)
     return session_ids, gated
 
 
@@ -209,7 +241,7 @@ async def test_same_session_builds_wait_for_each_other(
     first = _evaluate(auth_client, session_id)
     await gated.wait_for_started(1)
     second = _evaluate(auth_client, session_id)
-    await gated.assert_started_stays(1)
+    await gated.assert_blocked_behind(started=1)
     gated.release(0)
     await gated.wait_for_started(2)
     gated.release(1)
@@ -244,7 +276,7 @@ async def test_ask_gate_rebuild_and_a_first_build_wait_for_each_other(
     await gated.wait_for_started(2)
     # While the ASK-gate rebuild is held, a new request's first build must wait.
     other = _evaluate(auth_client, session_id)
-    await gated.assert_started_stays(2)
+    await gated.assert_blocked_behind(started=2)
     gated.release(1)
     await gated.wait_for_started(3)
     gated.release(2)
@@ -263,8 +295,54 @@ async def test_cancelled_build_keeps_the_lock_until_its_worker_finishes(
     await asyncio.gather(cancelled, return_exceptions=True)
     second = _evaluate(auth_client, session_id)
     # The cancelled request's worker thread is still building.
-    await gated.assert_started_stays(1)
+    await gated.assert_blocked_behind(started=1)
     gated.release(0)
     await gated.wait_for_started(2)
     gated.release(1)
     await _assert_allowed(second)
+
+
+async def test_failed_build_raises_to_its_caller_and_releases_the_lock() -> None:
+    def failing_build() -> Any:
+        raise RuntimeError("build failed")
+
+    with pytest.raises(RuntimeError, match="build failed"):
+        await routes_hooks._build_policy_engine_serialized("conv_failed_build", failing_build)
+    assert not routes_hooks._policy_engine_build_lock("conv_failed_build").locked()
+    built = await routes_hooks._build_policy_engine_serialized(
+        "conv_failed_build", lambda: "engine"
+    )
+    assert built == "engine"
+
+
+async def test_failure_after_cancellation_is_retrieved_and_releases_the_lock() -> None:
+    """A build that fails after its caller was cancelled doesn't log an unretrieved exception."""
+    loop = asyncio.get_running_loop()
+    loop_errors: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    started = threading.Event()
+    release = threading.Event()
+
+    def failing_build() -> Any:
+        started.set()
+        release.wait(timeout=5)
+        raise RuntimeError("late failure")
+
+    try:
+        caller = asyncio.create_task(
+            routes_hooks._build_policy_engine_serialized("conv_cancelled_build", failing_build)
+        )
+        assert await asyncio.to_thread(started.wait, 5)
+        lock = routes_hooks._policy_engine_build_lock("conv_cancelled_build")
+        caller.cancel()
+        with suppress(asyncio.CancelledError):
+            await caller
+        assert lock.locked()
+        release.set()
+        await poll_until_async(lambda: not lock.locked(), timeout_s=5)
+        del caller
+        gc.collect()
+        assert loop_errors == []
+    finally:
+        loop.set_exception_handler(previous_handler)
