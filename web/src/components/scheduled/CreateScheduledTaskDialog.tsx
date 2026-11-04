@@ -665,6 +665,20 @@ export function CreateScheduledTaskDialog({
     }
   }
 
+  function getHostHelpText(): string {
+    if (sandboxMode) {
+      return sessionMode === "continue"
+        ? "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration."
+        : "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration.";
+    }
+    if (hostId !== "") {
+      return "Runs on this host. A run fails while the host is offline.";
+    }
+    return isEdit
+      ? "Runs on the connected host you used most recently. Pick a host to pin it."
+      : "Pick the host this automation runs on.";
+  }
+
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
@@ -874,17 +888,7 @@ export function CreateScheduledTaskDialog({
                 ))}
               </SelectContent>
             </Select>
-            <p className="text-sm text-muted-foreground">
-              {sandboxMode
-                ? sessionMode === "continue"
-                  ? "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration."
-                  : "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
-                : hostId === ""
-                  ? isEdit
-                    ? "Runs on the connected host you used most recently. Pick a host to pin it."
-                    : "Pick the host this automation runs on."
-                  : "Runs on this host. A run fails while the host is offline."}
-            </p>
+            <p className="text-sm text-muted-foreground">{getHostHelpText()}</p>
           </div>
 
           <ScheduleFields

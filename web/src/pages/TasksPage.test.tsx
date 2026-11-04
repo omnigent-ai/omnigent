@@ -308,7 +308,9 @@ describe("TasksPage list", () => {
     renderPage();
     expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Suggested Automations" })).toBeVisible();
+    expect(screen.queryByText("Checks every hour")).not.toBeInTheDocument();
     selectView("Templates");
+    expect(screen.queryByText("Checks every hour")).not.toBeInTheDocument();
     expect(screen.queryByTestId("tasks-list")).not.toBeInTheDocument();
     expect(screen.queryByTestId("tasks-search")).not.toBeInTheDocument();
     const suggestions = screen.getByTestId("tasks-suggestions");

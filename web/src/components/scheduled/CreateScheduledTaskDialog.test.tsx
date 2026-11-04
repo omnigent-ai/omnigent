@@ -659,6 +659,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     >);
     const view = renderWithSandboxes();
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Pick a host");
+    expect(screen.getByText("Pick the host this automation runs on.")).toBeInTheDocument();
     hosts.mockReturnValue({
       data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "online" }],
       isPending: false,
@@ -1060,19 +1061,25 @@ describe("CreateScheduledTaskDialog submit", () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
 
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Most recently active host");
+    expect(
+      screen.getByText("Runs on the connected host you used most recently. Pick a host to pin it."),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("hostId");
   });
 
-  it("lays out Host full-width like the other top-level fields", () => {
+  it("lays out Host full-width before Schedule", () => {
     renderDialog();
     const hostField = screen.getByTestId("task-host-field");
     const hostTrigger = screen.getByTestId("task-host-trigger");
     expect(hostField).not.toHaveClass("sm:w-64");
     expect(hostField).toContainElement(hostTrigger);
     expect(hostTrigger).toHaveClass("w-full");
+    expect(hostTrigger.compareDocumentPosition(screen.getByTestId("schedule-preset-trigger"))).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
   });
 
   it("keeps the footer visible by letting only the dialog body scroll", () => {
