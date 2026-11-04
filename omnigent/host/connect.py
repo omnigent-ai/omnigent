@@ -3288,12 +3288,14 @@ class HostProcess:
                 version=harness_cli_version(key)[0],
                 gateway_inference=gateway_inference_map(),
             )
-        installed, reason = try_install_harness_cli(key)
-        if not installed:
+        result = try_install_harness_cli(key)
+        if not result.installed:
             return HostInstallHarnessResultFrame(
                 request_id=frame.request_id,
                 status="failed",
-                error=reason or "install failed",
+                error=result.reason or "install failed",
+                command=result.command,
+                output_tail=result.output_tail,
             )
         _logger.info("Installed harness %s via UI request", frame.harness)
         configured, accounts = self._fresh_harness_state()

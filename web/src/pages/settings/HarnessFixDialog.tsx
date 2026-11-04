@@ -161,6 +161,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const [phase, setPhase] = useState<Phase>(initialPhase);
   const [choice, setChoice] = useState<HarnessCredentialKind>("personal");
   const [error, setError] = useState("");
+  const [installError, setInstallError] = useState<ApiError | null>(null);
   const [stillNotReady, setStillNotReady] = useState(false);
   const [updatedNeedsSetup, setUpdatedNeedsSetup] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -208,12 +209,14 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const fail = useCallback((reason: unknown, id: number) => {
     if (runId.current !== id) return;
     setError(reason instanceof Error ? reason.message : "Something went wrong.");
+    setInstallError(reason instanceof ApiError ? reason : null);
     setPhase("error");
   }, []);
 
   const startDeviceLogin = useCallback(async () => {
     const id = ++runId.current;
     setError("");
+    setInstallError(null);
     setDeviceLogin(null);
     setPhase("progress");
     if (host.harness_login_supported !== true) {
@@ -291,6 +294,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const start = useCallback(async () => {
     if (requiresManualSetup) {
       setError("");
+      setInstallError(null);
       setStillNotReady(false);
       setUpdatedNeedsSetup(false);
       setPhase("setup");
@@ -298,6 +302,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     }
     const id = ++runId.current;
     setError("");
+    setInstallError(null);
     setStillNotReady(false);
     setUpdatedNeedsSetup(false);
     setPhase("progress");
@@ -344,6 +349,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     credentialDefaultSettled.current = false;
     setChoice("personal");
     setError("");
+    setInstallError(null);
     setStillNotReady(false);
     setUpdatedNeedsSetup(false);
     setChecking(false);
@@ -394,6 +400,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const retry = () => {
     runId.current += 1;
     setError("");
+    setInstallError(null);
     setDeviceLogin(null);
     setStillNotReady(false);
     setUpdatedNeedsSetup(false);
@@ -503,6 +510,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const switchAccount = async () => {
     const id = ++runId.current;
     setError("");
+    setInstallError(null);
     setPhase("progress");
     try {
       const result = await logoutHarnessOnHost(hostId, harness);
@@ -642,7 +650,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               onUseCredentialForm={() => setPhase("credentials")}
             />
           ) : phase === "error" ? (
-            <ErrorState error={error} hostName={hostName} />
+            <ErrorState error={error} hostName={hostName} diagnostics={installError} />
           ) : deviceLogin?.kind === "code" ? (
             <DeviceCodeState
               login={deviceLogin.login}
@@ -1257,16 +1265,52 @@ function Steps({ rows }: { rows: [string, "active" | "pending"][] }) {
   );
 }
 
-function ErrorState({ error, hostName }: { error: string; hostName: string }) {
+export function ErrorState({
+  error,
+  hostName,
+  diagnostics,
+}: {
+  error: string;
+  hostName: string;
+  diagnostics?: ApiError | null;
+}) {
+  const command = diagnostics?.command;
+  const manualCommand = command || diagnostics?.setupCommand || "omni setup";
+  const reason = error.replace(/^host install failed: /, "");
+  const displayReason = reason.charAt(0).toUpperCase() + reason.slice(1);
   return (
     <>
       <DialogDescription>
-        Nothing changed on {hostName}. Try again, or run setup in a terminal on that machine.
+        Nothing changed on {hostName}.{" "}
+        {command
+          ? "Fix the problem below and try again."
+          : "Try again, or run setup in a terminal on that machine."}
       </DialogDescription>
       <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-3.5 py-2.5 text-ui text-destructive">
-        {error}
+        {displayReason}
       </div>
-      <CommandRow command="omni setup" label="Copy omni setup" />
+      <div className="space-y-2">
+        <p className="text-ui text-muted-foreground">
+          {command ? `Command run on ${hostName}` : `Run this yourself on ${hostName}`}
+        </p>
+        <CommandRow
+          command={manualCommand}
+          label={command ? "Copy install command" : `Copy ${manualCommand}`}
+        />
+        {command && (
+          <p className="text-sm text-muted-foreground">
+            Run it yourself in a terminal on {hostName} to see the full output.
+          </p>
+        )}
+      </div>
+      {diagnostics?.outputTail && (
+        <details className="rounded-xl border border-border px-3.5 py-2.5 text-ui">
+          <summary className="cursor-pointer text-foreground">Installer output</summary>
+          <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-xs text-muted-foreground">
+            {diagnostics.outputTail}
+          </pre>
+        </details>
+      )}
     </>
   );
 }

@@ -809,11 +809,13 @@ def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) ->
         "run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not shell out")),
     )
-    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+    result = hi.try_install_harness_cli(OPENAI_FAMILY)
+    installed, reason = result.installed, result.reason
     assert installed is False
     assert reason is not None and "npm" in reason
     # Claude's installer is bash-based, so its reason names bash, not npm.
-    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    result = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    installed, reason = result.installed, result.reason
     assert installed is False
     assert reason is not None and "bash" in reason
 
@@ -824,7 +826,8 @@ def test_try_install_harness_cli_manual_only() -> None:
     Cursor installs out-of-band; the reason tells the caller it can't be
     auto-installed so the UI can fall back to showing the install hint.
     """
-    installed, reason = hi.try_install_harness_cli(hi.CURSOR_KEY)
+    result = hi.try_install_harness_cli(hi.CURSOR_KEY)
+    installed, reason = result.installed, result.reason
     assert installed is False
     assert reason is not None and "automatically" in reason
 
@@ -840,7 +843,8 @@ def test_try_install_harness_cli_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(hi.shutil, "which", _which)
     monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1))
-    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+    result = hi.try_install_harness_cli(OPENAI_FAMILY)
+    installed, reason = result.installed, result.reason
     assert installed is False
     assert reason is not None and "code 1" in reason
 
@@ -880,10 +884,13 @@ def test_try_install_names_the_npm_failure_cause(
     monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
     monkeypatch.setattr(hi.subprocess, "Popen", fake_installer(returncode=1, stderr=stderr))
 
-    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+    result = hi.try_install_harness_cli(OPENAI_FAMILY)
+    installed, reason = result.installed, result.reason
 
     assert installed is False
     assert reason is not None and expected in reason
+    assert result.command == "npm install -g @openai/codex"
+    assert result.output_tail == (hi.scrub_installer_output(stderr) or None)
 
 
 @pytest.mark.parametrize(
@@ -919,10 +926,13 @@ def test_try_install_reports_an_upgrade_that_left_the_old_cli(
         hi.subprocess, "Popen", fake_installer(returncode=returncode, stderr=stderr)
     )
 
-    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+    result = hi.try_install_harness_cli(OPENAI_FAMILY)
+    installed, reason = result.installed, result.reason
 
     assert installed is False
     assert reason is not None and expected in reason
+    assert result.command == "npm install -g @openai/codex"
+    assert result.output_tail == (hi.scrub_installer_output(stderr) or None)
 
 
 def test_try_install_falls_back_to_the_exit_code_for_unrecognized_output(
@@ -940,7 +950,8 @@ def test_try_install_falls_back_to_the_exit_code_for_unrecognized_output(
         fake_installer(returncode=2, stderr="curl: (22) The requested URL returned 404\n"),
     )
 
-    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+    result = hi.try_install_harness_cli(OPENAI_FAMILY)
+    installed, reason = result.installed, result.reason
 
     assert installed is False
     assert reason == "installer exited with code 2"
@@ -975,8 +986,9 @@ def test_installer_timeout_kills_children_holding_stderr(
     installer = [sys.executable, "-c", _INSTALLER_LEAVING_A_CHILD]
     installer += [str(pid_file), str(marker), "60", "0"]
 
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(subprocess.TimeoutExpired) as expired:
         hi._run_installer(installer, timeout=3)
+    assert b"npm error code EACCES" in (expired.value.stderr or b"")
 
     assert not marker.exists(), "the timeout waited for the installer's child to finish"
     child_pid = int(pid_file.read_text())
@@ -1026,7 +1038,7 @@ def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> Non
         "Popen",
         fake_installer(on_call=lambda: state.__setitem__("installed", True)),
     )
-    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == hi.HarnessInstallResult(True, None)
 
 
 def test_try_install_harness_cli_success_when_binary_off_path(
@@ -1054,7 +1066,7 @@ def test_try_install_harness_cli_success_when_binary_off_path(
     monkeypatch.setattr(hi.subprocess, "Popen", fake_installer())
 
     # Install verdict agrees with readiness: both see it installed.
-    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == hi.HarnessInstallResult(True, None)
     assert hi.harness_cli_installed(OPENAI_FAMILY) is True
 
 
@@ -1089,7 +1101,7 @@ def test_try_install_prepends_resolved_dir_so_login_can_find_binary(
 
     # Before: a bare PATH lookup (what harness_login uses) can't find codex.
     assert shutil.which("codex") is None
-    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == hi.HarnessInstallResult(True, None)
     # After: the resolving dir was prepended, so the login step's bare lookup
     # now resolves the binary that was just installed.
     assert shutil.which("codex") == str(codex)
@@ -1200,7 +1212,10 @@ def test_try_install_opencode_reports_the_v1_guard_refusal(
     result = hi.try_install_harness_cli(hi.OPENCODE_KEY)
 
     assert result == hi.HarnessInstallResult(
-        False, "OpenCode 1.x (opencode-ai) is installed; run 'npm rm -g opencode-ai'"
+        False,
+        "OpenCode 1.x (opencode-ai) is installed; run 'npm rm -g opencode-ai'",
+        hi.shlex.join(hi.harness_install_command(hi.OPENCODE_KEY)),
+        guard_message.rstrip(),
     )
 
 
@@ -2103,3 +2118,67 @@ def test_missing_harness_cli_flags_outdated_version(
     spec = hi.missing_harness_cli("opencode-native")
     assert spec is not None
     assert spec.binary == "opencode"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "_authToken=secret-value",
+        "//registry.npmjs.org/:_authToken=secret-value",
+        "Authorization: Basic secret-value",
+        "Authorization: Bearer secret-value",
+        "Bearer secret-value",
+        "https://user:secret-value@registry.example/package",
+        "NPM_TOKEN=secret-value",
+        'API_KEY="secret-value with spaces"',
+        "CLIENT_SECRET='secret-value with spaces'",
+    ],
+)
+def test_scrub_installer_output_redacts_credentials(secret: str) -> None:
+    output = hi.scrub_installer_output(f"before\n{secret}\nafter")
+    assert "secret-value" not in output
+    assert "[REDACTED]" in output
+    assert output.startswith("before\n") and output.endswith("\nafter")
+
+
+def test_scrub_installer_output_bounds_lines_and_bytes() -> None:
+    assert len(hi.scrub_installer_output("line\n" * 40).splitlines()) == 20
+    output = hi.scrub_installer_output("é" * 5000)
+    assert len(output.encode("utf-8")) <= 4096
+    assert "secret-value" not in hi.scrub_installer_output("API_KEY=" + "secret-value" * 5000)
+
+
+def test_try_install_timeout_preserves_scrubbed_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/bin/bash")
+
+    def timeout(*args: object, **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired("bash", 300, stderr="API_KEY=secret-value\nwaiting")
+
+    monkeypatch.setattr(hi, "_run_installer", timeout)
+    result = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    assert result.reason == "install timed out after 300s"
+    assert result.command == "bash -c 'curl -fsSL https://claude.ai/install.sh | bash'"
+    assert result.output_tail == "API_KEY=[REDACTED]\nwaiting"
+
+
+@pytest.mark.parametrize("returncode", [0, 2])
+def test_try_install_vendor_failure_preserves_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, returncode: int
+) -> None:
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/bin/bash" if name == "bash" else None)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "Popen",
+        fake_installer(returncode=returncode, stderr="curl: failed\nAPI_KEY=secret-value"),
+    )
+    result = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    assert not result.installed
+    assert result.command == "bash -c 'curl -fsSL https://claude.ai/install.sh | bash'"
+    assert result.output_tail == "curl: failed\nAPI_KEY=[REDACTED]"
+    assert result.reason == (
+        "installer exited with code 2"
+        if returncode
+        else "installer completed but 'claude' could not be found"
+    )

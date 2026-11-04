@@ -1195,6 +1195,11 @@ creating the automation. Record the client configuration with the evidence.
 
 ## Gotchas
 
+- Failed installs from Settings → Harnesses and New Chat setup show the exact
+  command and a collapsed, scrubbed installer stderr tail (up to 20 lines / 4 KB).
+  Expand **Installer output**, copy the command, and retry it on the named host.
+  Older hosts omit diagnostics and retain the setup-command fallback.
+
 - Relay approval waits retain one pending request slot. Vendor clients that do not
   honor MCP progress notifications can still impose their own shorter deadline;
   the relay cancels its pending approval when the client disconnects. A timeout

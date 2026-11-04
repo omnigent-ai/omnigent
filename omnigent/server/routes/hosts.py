@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
     add_audit_attrs,
@@ -665,6 +666,13 @@ async def _proxy_detect_credentials(
             ) from exc
     finally:
         host_conn.pending_credential_detects.pop(request_id, None)
+
+
+class HarnessInstallFailure(BaseModel):
+    detail: str
+    command: str | None = None
+    output_tail: str | None = None
+    setup_command: str
 
 
 class CreateDirectoryRequest(BaseModel):
@@ -2094,12 +2102,16 @@ def create_hosts_router(
         configured, accounts = await apply_harness_snapshot(host.host_id, conn, result)
         return {"configured_harnesses": configured, "harness_accounts": accounts}
 
-    @router.post("/hosts/{host_id}/harnesses/{harness}/install")
+    @router.post(
+        "/hosts/{host_id}/harnesses/{harness}/install",
+        responses={502: {"model": HarnessInstallFailure}},
+        response_model=dict[str, Any],
+    )
     async def install_host_harness(
         request: Request,
         host_id: str,
         harness: str,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | JSONResponse:
         """
         Install a missing, npm-installable harness CLI onto a host.
 
@@ -2186,9 +2198,14 @@ def create_hosts_router(
         result = await asyncio.shield(existing)
 
         if result.get("status") == "failed":
-            raise HTTPException(
+            return JSONResponse(
                 status_code=502,
-                detail=f"host install failed: {result.get('error') or 'unknown error'}",
+                content=HarnessInstallFailure(
+                    detail=f"host install failed: {result.get('error') or 'unknown error'}",
+                    command=result.get("command"),
+                    output_tail=result.get("output_tail"),
+                    setup_command=f"{cli_invocation(name='omni')} setup",
+                ).model_dump(),
             )
 
         # An install can flip gateway backing (a freshly installed CLI now

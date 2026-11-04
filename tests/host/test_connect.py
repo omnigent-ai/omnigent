@@ -103,6 +103,7 @@ from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.onboarding.harness_install import HarnessInstallResult
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
@@ -6229,7 +6230,9 @@ def test_handle_install_harness_success_returns_refreshed_readiness(
 
     # Not yet installed, so the handler runs the installer.
     monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
-    monkeypatch.setattr(connect, "try_install_harness_cli", lambda key: (True, None))
+    monkeypatch.setattr(
+        connect, "try_install_harness_cli", lambda key: HarnessInstallResult(True, None)
+    )
     monkeypatch.setattr(connect, "harness_cli_version", lambda key: ("2.1.295", ">=2.1.161"))
     monkeypatch.setattr(
         connect,
@@ -6292,9 +6295,9 @@ def test_handle_install_harness_upgrades_outdated_cli_in_place(
     installed: list[str] = []
     monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
 
-    def _upgrade(key: str) -> tuple[bool, str | None]:
+    def _upgrade(key: str) -> HarnessInstallResult:
         installed.append(key)
-        return True, None
+        return HarnessInstallResult(True, None)
 
     monkeypatch.setattr(connect, "try_install_harness_cli", _upgrade)
     monkeypatch.setattr(
@@ -6326,7 +6329,12 @@ def test_handle_install_harness_failure_surfaces_reason(
     monkeypatch.setattr(
         connect,
         "try_install_harness_cli",
-        lambda key: (False, "npm is not available on the host"),
+        lambda key: HarnessInstallResult(
+            False,
+            "npm is not available on the host",
+            "npm install -g @openai/codex",
+            "npm: missing",
+        ),
     )
 
     host = _make_host_process()
@@ -6336,6 +6344,8 @@ def test_handle_install_harness_failure_surfaces_reason(
 
     assert result.status == "failed"
     assert result.error == "npm is not available on the host"
+    assert result.command == "npm install -g @openai/codex"
+    assert result.output_tail == "npm: missing"
     assert result.configured_harnesses is None
 
 

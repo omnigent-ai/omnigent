@@ -351,6 +351,8 @@ async def install_setup(
                     harness_accounts=reply.get("harness_accounts"),
                     version=reply.get("version"),
                     error=reply.get("error"),
+                    command=reply.get("command"),
+                    output_tail=reply.get("output_tail"),
                 )
             await comm.send_input(
                 {
@@ -1577,7 +1579,12 @@ async def test_install_harness_allows_npm_key_auth_harnesses(
 # ── Failure surfaces ────────────────────────────────────
 
 
+@pytest.mark.parametrize("with_details", [False, True])
+@pytest.mark.parametrize("wrapper", [None, "isaac omni"])
 async def test_install_harness_failed_status_returns_502(
+    monkeypatch: pytest.MonkeyPatch,
+    with_details: bool,
+    wrapper: str | None,
     install_setup: tuple[
         FastAPI,
         HostRegistry,
@@ -1593,13 +1600,28 @@ async def test_install_harness_failed_status_returns_502(
     failed rather than a silent no-op.
     """
     app, _reg, _comm, replies, _drain = install_setup
-    replies["codex"] = {"status": "failed", "error": "npm registry unreachable"}
+    if wrapper:
+        monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", wrapper)
+    else:
+        monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    replies["codex"] = {
+        "status": "failed",
+        "error": "npm registry unreachable",
+        "command": "npm install -g @openai/codex",
+        "output_tail": "npm error code ENOTFOUND",
+    }
 
+    if not with_details:
+        replies["codex"].pop("command")
+        replies["codex"].pop("output_tail")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/codex/install")
 
     assert resp.status_code == 502
     assert "npm registry unreachable" in resp.json()["detail"]
+    assert resp.json()["command"] == ("npm install -g @openai/codex" if with_details else None)
+    assert resp.json()["output_tail"] == ("npm error code ENOTFOUND" if with_details else None)
+    assert resp.json()["setup_command"] == f"{wrapper or 'omni'} setup"
 
 
 async def test_install_harness_unknown_host_returns_404(

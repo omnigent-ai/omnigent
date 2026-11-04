@@ -3111,6 +3111,46 @@
         "title": "HarnessEnvironment",
         "type": "object"
       },
+      "HarnessInstallFailure": {
+        "properties": {
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "output_tail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Tail"
+          },
+          "setup_command": {
+            "title": "Setup Command",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail",
+          "setup_command"
+        ],
+        "title": "HarnessInstallFailure",
+        "type": "object"
+      },
       "HarnessStartup": {
         "description": "Launch metadata returned through the owner-only host API.",
         "properties": {
@@ -12494,6 +12534,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessInstallFailure"
+                }
+              }
+            },
+            "description": "Bad Gateway"
           }
         },
         "summary": "Install Host Harness",

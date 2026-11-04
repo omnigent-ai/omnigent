@@ -1564,6 +1564,76 @@ describe("HarnessFixDialog", () => {
     expect(props.onFixed).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { withDetails: true, setupCommand: "omni setup" },
+    { withDetails: false, setupCommand: "omni setup" },
+    { withDetails: false, setupCommand: "isaac omni setup" },
+  ])(
+    "shows install failure diagnostics: $withDetails, fallback: $setupCommand",
+    async ({ withDetails, setupCommand }) => {
+      const user = userEvent.setup();
+      const command = "npm install -g @earendil-works/pi-coding-agent";
+      vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === "/v1/harnesses") return json(catalog);
+        if (url.endsWith("/install"))
+          return json(
+            {
+              detail: "host install failed: permission denied (npm EACCES)",
+              setup_command: setupCommand,
+              ...(withDetails
+                ? { command, output_tail: "npm error code EACCES\npermission denied" }
+                : {}),
+            },
+            { status: 502 },
+          );
+        throw new Error(`Unexpected URL: ${url}`);
+      });
+      renderDialog({ mode: "update", harness: "pi-native", harnessLabel: "Pi" });
+      const reason = await screen.findByText("Permission denied (npm EACCES)");
+      expect(reason).toBeVisible();
+      expect(screen.queryByText(/host install failed:/)).toBeNull();
+      if (withDetails) {
+        expect(screen.getByText("Command run on Local laptop")).toBeVisible();
+        expect(screen.getAllByText(command)).toHaveLength(1);
+        expect(screen.getAllByRole("button", { name: /^Copy/ })).toHaveLength(1);
+        expect(
+          screen.getByText("Nothing changed on Local laptop. Fix the problem below and try again."),
+        ).toBeVisible();
+        expect(
+          screen.getByText("Run it yourself in a terminal on Local laptop to see the full output."),
+        ).toBeVisible();
+        expect(
+          reason.compareDocumentPosition(screen.getByText(command)) &
+            Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+        await user.click(screen.getByRole("button", { name: "Copy install command" }));
+        expect(copyText).toHaveBeenCalledWith(command);
+        const summary = screen.getByText("Installer output");
+        expect(summary.closest("details")).not.toHaveAttribute("open");
+        await user.click(summary);
+        expect(summary.closest("details")).toHaveAttribute("open");
+        expect(screen.getByText(/npm error code EACCES/)).toBeVisible();
+        expect(
+          screen.getByText(command).compareDocumentPosition(summary) &
+            Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+        expect(screen.queryByText("Run this yourself on Local laptop")).toBeNull();
+        expect(screen.queryByText("omni setup")).toBeNull();
+      } else {
+        expect(screen.getByRole("button", { name: `Copy ${setupCommand}` })).toBeVisible();
+        expect(screen.getAllByText(setupCommand)).toHaveLength(1);
+        expect(screen.getByText("Run this yourself on Local laptop")).toBeVisible();
+        expect(
+          screen.getByText(
+            "Nothing changed on Local laptop. Try again, or run setup in a terminal on that machine.",
+          ),
+        ).toBeVisible();
+        expect(screen.queryByText("Installer output")).toBeNull();
+      }
+    },
+  );
+
   it("passes the installed version to the ready notice", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = String(input);
