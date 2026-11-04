@@ -2291,10 +2291,10 @@ export function NewChatLandingScreen() {
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
     navigate(
-      { search: remaining.toString(), hash: location.hash },
+      { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [linkedPrompt, searchParams, location.hash, location.state, navigate]);
+  }, [linkedPrompt, searchParams, location.pathname, location.hash, location.state, navigate]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.

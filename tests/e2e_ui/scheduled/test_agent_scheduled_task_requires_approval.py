@@ -26,7 +26,10 @@ from tests.e2e_ui.conftest import (
     configure_mock_llm,
     set_fallback_mock_llm,
 )
-from tests.e2e_ui.scheduled.test_scheduled_tasks_page import _open_automations_page
+from tests.e2e_ui.scheduled.test_scheduled_tasks_page import (
+    _builtin_agent_id,
+    _open_automations_page,
+)
 
 _APPROVAL_CARD = '[data-testid="approval-card"][data-state="pending"]'
 _TASK_ROW = '[data-testid="scheduled-task-row"]'
@@ -52,17 +55,6 @@ executor:
 """
 
 
-def _schedulable_agent_id(base_url: str) -> str:
-    """Prefer Claude Code so task permission overrides are supported."""
-    agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
-    by_name = {agent["name"]: agent["id"] for agent in agents}
-    for name in (CLAUDE_NATIVE_AGENT_NAME, "hello_world", "polly"):
-        if name in by_name:
-            return by_name[name]
-    assert agents, "no agents registered to schedule a task against"
-    return agents[0]["id"]
-
-
 def _tasks_named(base_url: str, name: str) -> list[dict]:
     tasks = httpx.get(f"{base_url}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     return [task for task in tasks if task["name"] == name]
@@ -82,7 +74,7 @@ def _seed_task(base_url: str, name: str) -> str:
             "name": name,
             "prompt": _PROMPT,
             "rrule": _RRULE,
-            "agent_id": _schedulable_agent_id(base_url),
+            "agent_id": _builtin_agent_id(base_url, CLAUDE_NATIVE_AGENT_NAME),
             "timezone": "UTC",
         },
         timeout=10.0,
@@ -223,7 +215,7 @@ def test_agent_scheduled_task_create_requires_approval(
             "prompt": _PROMPT,
             "permission_mode": None,
             "rrule": _RRULE,
-            "agent_id": _schedulable_agent_id(base_url),
+            "agent_id": _builtin_agent_id(base_url, CLAUDE_NATIVE_AGENT_NAME),
             "timezone": "UTC",
         },
         _CREATE_REPLY,
