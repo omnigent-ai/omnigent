@@ -247,6 +247,73 @@ def test_build_codex_native_server_preserves_structured_ucode_auth(
     assert provider["base_url"] == _UCODE_BASE_URL
 
 
+@pytest.mark.parametrize("representation", ["legacy", "direct", "shell"])
+@pytest.mark.parametrize("launcher", ["ug", "ucode", "uvx"])
+def test_build_codex_native_server_recovers_removed_auth_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    representation: str,
+    launcher: str,
+) -> None:
+    """A generated helper survives archive eviction without changing its arguments."""
+    import shlex
+    import subprocess
+
+    from omnigent.onboarding.ucode_setup import _UCODE_UVX_SOURCE
+
+    original = (
+        tmp_path / "cache/archive-v0/removed/bin" / ("ucode" if launcher == "ucode" else "ug")
+    )
+    installed = tmp_path / "tools" / launcher
+    installed.parent.mkdir()
+    installed.write_text(
+        f"#!{sys.executable}\n"
+        "# from ucode.cli import main\n"
+        "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"
+    )
+    installed.chmod(0o755)
+    monkeypatch.setenv("PATH", str(installed.parent))
+    arguments = ["auth-token", "--profile", "gateway #$[prod]", "--host", _UCODE_HOST, "--use-pat"]
+    command = shlex.join([str(original), *arguments])
+    timing = {"timeout_ms": 180000, "refresh_interval_ms": 60000}
+    if representation == "legacy":
+        auth = timing
+    elif representation == "direct":
+        auth = {**timing, "command": str(original), "args": arguments}
+    else:
+        auth = {**timing, "command": "sh", "args": ["-c", command]}
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": command, "auth": auth},
+    )
+    provider = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]
+    emitted = provider["auth"]
+    prefix = [str(installed)]
+    if launcher == "uvx":
+        prefix += ["--from", _UCODE_UVX_SOURCE, "ucode"]
+    if representation == "direct":
+        assert [emitted["command"], *emitted["args"]] == prefix + arguments
+        invocation = [emitted["command"], *emitted["args"]]
+    else:
+        assert emitted["args"] == ["-c", shlex.join(prefix + arguments)]
+        invocation = ["/bin/sh", *emitted["args"]]
+    other_workspace = tmp_path / "other-workspace"
+    other_workspace.mkdir()
+    result = subprocess.run(
+        invocation, cwd=other_workspace, capture_output=True, text=True, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == prefix[1:] + arguments
+    assert emitted["timeout_ms"] == timing["timeout_ms"]
+    assert emitted["refresh_interval_ms"] == timing["refresh_interval_ms"]
+    assert provider["base_url"] == _UCODE_BASE_URL
+    assert tomllib.loads(overrides)["model"] == "test-model"
+    stored = json.loads((tmp_path / "ucode-state.json").read_text())
+    assert stored["workspaces"][_UCODE_HOST]["agents"]["codex"]["auth"] == auth
+    assert stored["workspaces"][_UCODE_HOST]["agents"]["codex"]["auth_command"] == command
+
+
 def test_build_codex_native_server_preserves_legacy_auth_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
