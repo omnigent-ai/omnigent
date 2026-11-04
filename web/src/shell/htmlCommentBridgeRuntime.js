@@ -216,7 +216,7 @@
   // Restore the saved offset after a remount, re-asserting it each frame because
   // late content can clamp it. Only input that scrolls ends it early, not a click
   // or the zoom shortcut; reports stay off so clamps can't overwrite the offset.
-  const USER_SCROLL_EVENTS = ["wheel", "touchstart", "keydown"];
+  const USER_SCROLL_EVENTS = ["wheel", "touchmove", "keydown"];
   const SCROLL_KEYS = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "];
   let scrollRestore = null; // { top, deadline, y, layout, anchoring } while restoring
   let scrollRestoreFrame = 0;

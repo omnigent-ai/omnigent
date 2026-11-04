@@ -546,7 +546,7 @@ describe("bridge runtime scroll position", () => {
 
   it.each<[string, (userScrollTo: (top: number) => void) => void]>([
     ["the wheel", () => dispatchToPage(new Event("wheel", { bubbles: true }))],
-    ["a touch", () => dispatchToPage(new Event("touchstart", { bubbles: true }))],
+    ["a touch drag", () => dispatchToPage(new Event("touchmove", { bubbles: true }))],
     [
       "a scroll key",
       () => dispatchToPage(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true })),
@@ -572,6 +572,7 @@ describe("bridge runtime scroll position", () => {
 
   it.each<[string, () => void]>([
     ["a click", () => dispatchToPage(new Event("pointerdown", { bubbles: true }))],
+    ["a tap", () => dispatchToPage(new Event("touchstart", { bubbles: true }))],
     [
       "a modifier key",
       () => dispatchToPage(new KeyboardEvent("keydown", { key: "Control", bubbles: true })),
