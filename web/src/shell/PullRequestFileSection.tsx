@@ -31,6 +31,7 @@ import {
 import { cn } from "@/lib/utils";
 import { PullRequestCommentForm } from "./PullRequestCommentComposer";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
+import { highlightsSupported } from "./previewSearch";
 
 /** A ghost icon button with a tooltip; the toolbar's shared control element.
  *  No-delay is set by the surrounding TooltipProvider. */
@@ -122,6 +123,71 @@ export type DiffOptions = React.ComponentProps<typeof FileDiff<ReviewAnnotation>
  */
 export const LARGE_DIFF_THRESHOLD = 2000;
 
+/** The active find match on one line, as character offsets into that line's text. */
+export interface FindHighlight {
+  side: "additions" | "deletions";
+  line: number;
+  start: number;
+  end: number;
+}
+
+/** Styled by the `::highlight()` rule in the diff's unsafeCSS. */
+const FIND_HIGHLIGHT = "pr-find-active";
+/** Frames to wait for a diff row that is still rendering. */
+const ROW_RETRY_FRAMES = 30;
+/** How long a centre waits for a late-rendering diff, in milliseconds. */
+const CENTRE_WINDOW_MS = 5000;
+
+/** The diff's rows live in its open shadow root once @pierre/diffs has rendered. */
+// Scoped to the main diff: thread snippets render their own diffs in the same section.
+function diffRoot(section: HTMLElement): ParentNode {
+  const main = section.querySelector<HTMLElement>("[data-main-diff]") ?? section;
+  return main.querySelector(":scope > diffs-container")?.shadowRoot ?? main;
+}
+
+function findDiffRow({ side, line }: FindHighlight, section: HTMLElement): HTMLElement | null {
+  const root = diffRoot(section);
+  // Split views give each side its own column; unified rows use one number per line.
+  const unified =
+    side === "deletions"
+      ? '[data-line-type="change-deletion"]'
+      : ':not([data-line-type="change-deletion"])';
+  return (
+    root.querySelector<HTMLElement>(`[data-${side}] [data-line="${line}"]`) ??
+    root.querySelector<HTMLElement>(`[data-line="${line}"]${unified}`)
+  );
+}
+
+/** A DOM range over `start`..`end` of the row's text, which may span several token spans. */
+function rowRange(row: HTMLElement, start: number, end: number): Range | null {
+  const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+  const range = document.createRange();
+  let offset = 0;
+  let started = false;
+  for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
+    const length = node.data.length;
+    if (!started && start < offset + length) {
+      range.setStart(node, start - offset);
+      started = true;
+    }
+    if (started && end <= offset + length) {
+      range.setEnd(node, end - offset);
+      return range;
+    }
+    offset += length;
+  }
+  return null;
+}
+
+function paintFindMatch(row: HTMLElement, { start, end }: FindHighlight) {
+  const range = rowRange(row, start, end);
+  if (range && highlightsSupported()) CSS.highlights.set(FIND_HIGHLIGHT, new Highlight(range));
+}
+
+function clearFindMatch() {
+  if (highlightsSupported()) CSS.highlights.delete(FIND_HIGHLIGHT);
+}
+
 /**
  * One file's section in the stacked diff: a sticky grey header (chevron + status
  * + path + diffstat) and the file's rendered diff. Clicking the header toggles
@@ -163,14 +229,20 @@ export function PullRequestFileSection({
   forceMount?: boolean;
   /** Render a large diff without waiting for "Show diff". */
   bypassLargeDiffGate?: boolean;
-  /** One line to mark as selected, overriding the reader's selection. */
-  highlight?: { side: "additions" | "deletions"; line: number } | null;
+  /** The active find match; painted and centred, apart from the reader's selection. */
+  highlight?: FindHighlight | null;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  // The force flags latch, so a section stays mounted and ungated after the reader moves on.
+  // Latching during render mounts the diff in the same commit as the reveal.
+  const [forcedMount, setForcedMount] = useState(false);
+  if (forceMount && !forcedMount) setForcedMount(true);
+  const [forcedUngate, setForcedUngate] = useState(false);
+  if (bypassLargeDiffGate && !forcedUngate) setForcedUngate(true);
   const [seenInViewport, setSeen] = useState(false);
-  const seen = seenInViewport || forceMount;
+  const seen = seenInViewport || forcedMount;
   const [showLargeDiffClicked, setShowLargeDiff] = useState(false);
-  const showLargeDiff = showLargeDiffClicked || bypassLargeDiffGate;
+  const showLargeDiff = showLargeDiffClicked || forcedUngate;
   const collapsed = collapsedProp && !forceExpanded;
   const composer = usePullRequestReviewThreadComposer(
     threadContext.conversationId,
@@ -189,9 +261,6 @@ export function PullRequestFileSection({
   const selectedLines = selection?.revision === revision ? selection.range : null;
   const readerLines =
     selectionPreview?.revision === revision ? selectionPreview.range : selectedLines;
-  const shownLines = highlight
-    ? { start: highlight.line, end: highlight.line, side: highlight.side }
-    : readerLines;
   const previewSelection = useCallback(
     (range: SelectedLineRange | null) => setSelectionPreview({ revision, range }),
     [revision],
@@ -274,6 +343,46 @@ export function PullRequestFileSection({
     }
     return { annotations: inlineAnnotations, unplaced: unplacedThreads };
   }, [threads, renderingDiff, fileDiff, matchingRevision, anchor, showDraftInline]);
+
+  // Centre the active find match once its row renders. A large diff can take longer than the
+  // frame budget, so the next onPostRender centres it instead.
+  // Set while a centre is still owed; expires so a much later repaint can't scroll the reader.
+  const pendingCentre = useRef(0);
+  useEffect(() => {
+    const section = ref.current;
+    if (!highlight || !section || collapsed || !renderingDiff) return;
+    let frame = 0;
+    let frames = 0;
+    pendingCentre.current = performance.now() + CENTRE_WINDOW_MS;
+    const centre = () => {
+      const row = findDiffRow(highlight, section);
+      if (!row) {
+        if (frames++ < ROW_RETRY_FRAMES) frame = requestAnimationFrame(centre);
+        return;
+      }
+      paintFindMatch(row, highlight);
+      pendingCentre.current = 0;
+      row.scrollIntoView({ block: "center" });
+    };
+    centre();
+    return () => {
+      cancelAnimationFrame(frame);
+      pendingCentre.current = 0;
+      clearFindMatch();
+    };
+  }, [highlight, collapsed, renderingDiff]);
+  // Stable across selection drags: the diff re-renders when a callback option changes identity.
+  // Diff re-renders replace the rows, so this repaints the range on the new ones.
+  const repaintHighlight = useCallback(() => {
+    const section = ref.current;
+    const row = highlight && section ? findDiffRow(highlight, section) : null;
+    if (!highlight || !row) return;
+    paintFindMatch(row, highlight);
+    if (pendingCentre.current > performance.now()) {
+      pendingCentre.current = 0;
+      row.scrollIntoView({ block: "center" });
+    }
+  }, [highlight]);
   const newConversation = anchor && (
     <section
       aria-label="New review conversation"
@@ -400,6 +509,7 @@ export function PullRequestFileSection({
       ) : fileDiff ? (
         <div className="overflow-x-auto" onPointerCancel={() => setSelectionPreview(undefined)}>
           <div
+            data-main-diff
             style={{
               minWidth: annotations.length && options?.diffStyle === "split" ? 720 : undefined,
             }}
@@ -413,8 +523,9 @@ export function PullRequestFileSection({
                 onLineSelectionStart: previewSelection,
                 onLineSelectionChange: previewSelection,
                 onLineSelectionEnd: commitSelection,
+                onPostRender: repaintHighlight,
               }}
-              selectedLines={shownLines}
+              selectedLines={readerLines}
               disableWorkerPool
               renderGutterUtility={
                 showGutterUtility

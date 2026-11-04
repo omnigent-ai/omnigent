@@ -1,7 +1,7 @@
 // The pull request panel's Changes tab: a toolbar, a jump-to-file sidebar tree
 // and every changed file's diff stacked in one scroll view.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -32,6 +32,7 @@ import {
   type usePullRequestDiff,
 } from "@/hooks/usePullRequests";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { PULL_REQUEST_DIFF_THEME, type ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { cn } from "@/lib/utils";
 import {
@@ -40,10 +41,29 @@ import {
   PullRequestFileSection,
   STATUS_META,
   type DiffOptions,
+  type FindHighlight,
 } from "./PullRequestFileSection";
+import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
-import { selectVisibleFiles } from "./pullRequestReview";
-import { useChangesViewState } from "./useChangesViewState";
+import {
+  buildSearchCorpus,
+  findMatches,
+  firstMatchAtOrBelow,
+  MATCH_LIMIT,
+  refreshedMatchIndex,
+  selectVisibleFiles,
+  type Match,
+} from "./pullRequestReview";
+import { useChangesViewState, type FindState } from "./useChangesViewState";
+
+/** Index of the match a step moves to; with none active, the first or last by direction. */
+function stepTarget(activeIndex: number, direction: 1 | -1, length: number): number {
+  if (activeIndex >= 0) return (activeIndex + direction + length) % length;
+  return direction > 0 ? 0 : length - 1;
+}
+
+/** Frames to wait for a section to mount before a pending jump gives up. */
+const REVEAL_RETRY_FRAMES = 30;
 
 /** Centered muted message filling the panel — the shared loading/transient shell. */
 export function PanelMessage({ children }: { children: React.ReactNode }) {
@@ -240,7 +260,7 @@ function ChangesToolbar({
 }) {
   return (
     <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
-      <div className="flex items-center gap-0.5">
+      <div className="flex min-w-0 flex-1 items-center gap-0.5">
         {showFileControls && (
           <IconButton
             label={sidebarCollapsed ? "Show file list" : "Hide file list"}
@@ -379,7 +399,12 @@ export function PullRequestChangesTab({
   const baseSha = pr.base_sha;
   const mobile = useIsMobileViewport();
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
-  const { revealedPaths, reveal, clearReveal } = view;
+  const { revealedPaths, reveal, clearReveal, find } = view;
+  const findInputRef = useRef<HTMLInputElement>(null);
+  // A jump or thread target: its header scrolls once the file is visible and its section is mounted.
+  const [pendingReveal, setPendingReveal] = useState<{ path: string } | null>(null);
+  // The match the reader navigated to. Null until seeded when the bar opens or its query changes.
+  const [findTarget, setFindTarget] = useState<Match | null>(null);
 
   const themeType = useResolvedThemeMode();
   // Diff layout is the app-global FileViewer preference (unified/split); seed
@@ -404,6 +429,10 @@ export function PullRequestChangesTab({
   // The sidebar groups the flat file list into a compacted folder tree (the
   // diff scroll below stays linear, in file order).
   const fileTree = useMemo(() => buildSidebarTree(visibleFiles), [visibleFiles]);
+  const visiblePaths = useMemo(() => visibleFiles.map((file) => file.path), [visibleFiles]);
+  // The toolbar, and with it the find bar, renders only when there is something to show.
+  const toolbarShown =
+    files.length > 0 || reviews.isFetching || (reviews.page?.data ?? []).some((t) => !t.resolved);
 
   // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
   // drive every section; a path in the set is collapsed unless it is revealed.
@@ -510,6 +539,10 @@ export function PullRequestChangesTab({
           color: var(--sidebar-active-foreground);
           box-shadow: inset -3px 0 var(--sidebar-active-foreground);
         }
+        ::highlight(pr-find-active) {
+          background-color: color-mix(in oklch, var(--warning) 70%, transparent);
+          color: inherit;
+        }
       `,
       // The section renders its own header; the diff body has none.
       disableFileHeader: true,
@@ -563,10 +596,157 @@ export function PullRequestChangesTab({
     (path: string) => {
       setActivePath(path);
       reveal(path);
-      sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
+      setPendingReveal({ path });
     },
     [reveal],
   );
+
+  // A filtered-out target is visible only after the filter clears. With no filter left to
+  // clear it can never show, so drop it rather than scroll to it when a filter changes later.
+  useEffect(() => {
+    if (!pendingReveal) return;
+    if (!visiblePaths.includes(pendingReveal.path)) {
+      if (!view.pathFilter && !view.hideViewed) setPendingReveal(null);
+      return;
+    }
+    let frame = 0;
+    let frames = 0;
+    const scrollToHeader = () => {
+      const section = sectionEls.current.get(pendingReveal.path);
+      if (section) section.scrollIntoView({ block: "start" });
+      if (section || frames++ >= REVEAL_RETRY_FRAMES) setPendingReveal(null);
+      else frame = requestAnimationFrame(scrollToHeader);
+    };
+    scrollToHeader();
+    return () => cancelAnimationFrame(frame);
+  }, [pendingReveal, visiblePaths, view.pathFilter, view.hideViewed]);
+
+  // Find searches the visible files; the hidden count searches the rest, and no filter changes.
+  // Corpora are built only while the bar is open.
+  const { matchCase, regex } = find;
+  const query = find.open ? find.query : "";
+  // Matches follow the query one render later, so typing stays responsive on large patches.
+  const deferredQuery = useDeferredValue(query);
+  const searchCorpus = useMemo(
+    () => (find.open ? buildSearchCorpus(filesByPath, visibleFiles) : []),
+    [find.open, filesByPath, visibleFiles],
+  );
+  const hiddenCorpus = useMemo(() => {
+    if (!find.open) return [];
+    const shown = new Set(visiblePaths);
+    return buildSearchCorpus(
+      filesByPath,
+      files.filter((file) => !shown.has(file.path)),
+    );
+  }, [find.open, filesByPath, files, visiblePaths]);
+  const search = useMemo(
+    () => findMatches(searchCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
+    [searchCorpus, deferredQuery, matchCase, regex],
+  );
+  const hiddenSearch = useMemo(
+    () => findMatches(hiddenCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
+    [hiddenCorpus, deferredQuery, matchCase, regex],
+  );
+  const { matches } = search;
+  // The match shown after the last render. A refresh measures from it, so repeated refreshes
+  // follow the occurrence the reader is on rather than the original target.
+  const shownMatch = useRef<{ target: Match; shown: Match } | null>(null);
+  const activeIndex =
+    findTarget && matches.length
+      ? refreshedMatchIndex(
+          matches,
+          shownMatch.current?.target === findTarget ? shownMatch.current.shown : findTarget,
+        )
+      : -1;
+  const activeMatch = activeIndex >= 0 ? matches[activeIndex] : null;
+  useEffect(() => {
+    shownMatch.current =
+      findTarget && activeMatch ? { target: findTarget, shown: activeMatch } : null;
+  });
+  const activeFilePath = activeMatch?.target.path ?? null;
+  // A line match is painted by its section; split out the primitives so a refresh that
+  // keeps the same match doesn't re-centre the row.
+  const lineMatch = activeMatch?.target.kind === "line" ? activeMatch : null;
+  const highlightSide = lineMatch?.target.side;
+  const highlightLine = lineMatch?.target.line;
+  const highlightStart = lineMatch?.start;
+  const highlightEnd = lineMatch?.end;
+  const highlight = useMemo<FindHighlight | null>(
+    () =>
+      findTarget &&
+      highlightSide &&
+      highlightLine !== undefined &&
+      highlightStart !== undefined &&
+      highlightEnd !== undefined
+        ? { side: highlightSide, line: highlightLine, start: highlightStart, end: highlightEnd }
+        : null,
+    // findTarget is new on each explicit navigation, so a repeat step re-centres the row.
+    [findTarget, highlightSide, highlightLine, highlightStart, highlightEnd],
+  );
+
+  // Seed the match when the bar opens or its query changes: the first at or below the
+  // viewport top. A path match also scrolls its header, as stepping to it does.
+  useEffect(() => {
+    if (!find.open || findTarget || !matches.length || deferredQuery !== query) return;
+    const seeded = matches[firstMatchAtOrBelow(matches, visiblePaths, activePath)];
+    setFindTarget(seeded);
+    if (seeded.target.kind === "path") setPendingReveal({ path: seeded.target.path });
+  }, [find.open, findTarget, matches, visiblePaths, activePath, deferredQuery, query]);
+
+  // The active match's file opens even if the reader collapsed it earlier.
+  useEffect(() => {
+    if (activeFilePath) reveal(activeFilePath);
+  }, [activeFilePath, findTarget, reveal]);
+
+  const stepMatch = (direction: 1 | -1) => {
+    // Matches for a query still being searched would navigate the previous results.
+    if (!matches.length || deferredQuery !== query) return;
+    // With no active match yet, the first step lands on the first or last match by direction.
+    const next = matches[stepTarget(activeIndex, direction, matches.length)];
+    // A fresh object, so stepping to the sole match again is a new reveal request.
+    setFindTarget({ ...next });
+    if (next.target.kind === "path") setPendingReveal({ path: next.target.path });
+  };
+  // Changing the query or an option re-seeds the match from the viewport.
+  const changeFind = (patch: Partial<FindState>) => {
+    setFindTarget(null);
+    view.setFind(patch);
+  };
+  const closeFind = () => {
+    setFindTarget(null);
+    view.setFind({ open: false });
+  };
+  const showHidden = () => {
+    view.setPathFilter("");
+    view.setHideViewed(false);
+  };
+  const onTabKeyDown = (event: React.KeyboardEvent) => {
+    // The platform's command modifier only: Ctrl+F stays the caret-forward key on macOS.
+    // IME composition keys confirm text, not find.
+    if (
+      !toolbarShown ||
+      event.nativeEvent.isComposing ||
+      event.keyCode === 229 ||
+      !hasCommandModifier(event) ||
+      event.altKey ||
+      event.shiftKey ||
+      event.key.toLowerCase() !== "f"
+    ) {
+      return;
+    }
+    event.preventDefault();
+    if (!find.open) view.setFind({ open: true });
+    else findInputRef.current?.select();
+    findInputRef.current?.focus();
+  };
+  const patchFileCount = files.filter((file) => filesByPath.has(file.path)).length;
+  const withoutText = files.length - patchFileCount;
+  // Counts are meaningless until the patch has loaded and parsed.
+  const patchReady = !!prDiff.data?.patch && !parseError && !prDiff.isLoading;
+  const coverageNote =
+    find.open && patchReady && (changes.data?.has_more || withoutText > 0)
+      ? `Search covers the fetched patch: ${patchFileCount} of ${changes.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
+      : null;
 
   const [focusedThread, setFocusedThread] = useState<{ id: string } | null>(null);
   useEffect(() => {
@@ -641,8 +821,12 @@ export function PullRequestChangesTab({
       (entry) => entry.path === next.path || filesByPath.get(entry.path)?.prevName === next.path,
     );
     if (file) {
-      // A thread on a filtered-out file has no mounted section, so show it first.
-      if (!visibleFiles.includes(file)) view.setPathFilter("");
+      // A thread on a filtered-out file has no mounted section, so show it first. Clearing
+      // hide-viewed too keeps a pending reveal from waiting on a filter that stays on.
+      if (!visibleFiles.includes(file)) {
+        view.setPathFilter("");
+        view.setHideViewed(false);
+      }
       jumpTo(file.path);
     }
     setFocusedThread({ id: next.id });
@@ -650,7 +834,7 @@ export function PullRequestChangesTab({
 
   // A controls row, then the sidebar (jump-to-file) + one scroll of all files' diffs.
   return (
-    <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
+    <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col" onKeyDown={onTabKeyDown}>
       {data.capabilities.review_threads &&
         (reviews.page?.has_more ||
           reviews.historyStale ||
@@ -690,7 +874,12 @@ export function PullRequestChangesTab({
           {changes.data.warning || "The changed-file list is incomplete."}
         </p>
       )}
-      {(files.length > 0 || unresolved.length > 0 || reviews.isFetching) && (
+      {coverageNote && (
+        <p className="shrink-0 border-b border-border px-2 py-1 text-xs text-muted-foreground">
+          {coverageNote}
+        </p>
+      )}
+      {toolbarShown && (
         <ChangesToolbar
           showFileControls={files.length > 0}
           sidebarCollapsed={sidebarCollapsed}
@@ -702,6 +891,26 @@ export function PullRequestChangesTab({
           onToggleDiffStyle={toggleDiffStyle}
           allCollapsed={allCollapsed}
           onToggleAll={toggleAll}
+          navigation={
+            <PullRequestFindBar
+              find={find}
+              inputRef={findInputRef}
+              position={activeIndex + 1}
+              total={matches.length}
+              truncated={search.truncated}
+              invalid={search.invalid}
+              hiddenCount={hiddenSearch.matches.length}
+              hiddenTruncated={hiddenSearch.truncated}
+              onOpen={() => view.setFind({ open: true })}
+              onClose={closeFind}
+              onQueryChange={(next) => changeFind({ query: next })}
+              onToggleOption={(option) =>
+                changeFind(option === "matchCase" ? { matchCase: !matchCase } : { regex: !regex })
+              }
+              onStep={stepMatch}
+              onShowHidden={showHidden}
+            />
+          }
         />
       )}
       <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
@@ -781,6 +990,9 @@ export function PullRequestChangesTab({
                 registerRef={registerRef}
                 collapsed={collapsedPaths.has(file.path)}
                 forceExpanded={revealedPaths.has(file.path)}
+                forceMount={pendingReveal?.path === file.path || activeFilePath === file.path}
+                bypassLargeDiffGate={!!highlight && activeFilePath === file.path}
+                highlight={activeFilePath === file.path ? highlight : null}
                 onToggleCollapsed={() => toggleOne(file.path)}
                 threads={threadsByFile.get(file.path) ?? []}
                 threadContext={threadContext}

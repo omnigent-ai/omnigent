@@ -35,8 +35,11 @@ import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import {
+  combineTriggerPrompt,
   emptyTriggerFields,
+  isTriggerPrompt,
   renderTriggerPrompt,
+  splitTriggerPrompt,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
   type TriggerFields,
@@ -102,7 +105,7 @@ export function CreateScheduledTaskDialog({
   editingTask?: ScheduledTask | null;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
-  const { data: hosts } = useHosts({ enabled: open });
+  const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   // Gates the "new sandbox each run" option: only servers that can actually
@@ -130,9 +133,18 @@ export function CreateScheduledTaskDialog({
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
+  // A task saved from a trigger template keeps its one session on edit too; only
+  // the reset below stays, for a session that's broken or stale.
+  const editingTemplateTrigger =
+    editingTask !== null &&
+    editingTask.sessionMode === "continue" &&
+    isTriggerPrompt(editingTask.prompt);
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
+  const [systemPromptOpen, setSystemPromptOpen] = useState(false);
+  const [editingSystemPrompt, setEditingSystemPrompt] = useState(false);
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
 
@@ -297,11 +309,15 @@ export function CreateScheduledTaskDialog({
   useEffect(() => {
     if (open && !wasOpen.current) {
       setAdvancedOpen(true);
+      setSystemPromptOpen(false);
+      setEditingSystemPrompt(false);
+      const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
+      setPrompt(parts.userPrompt);
+      setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
         const parsedSchedule = savedSchedule;
         setName(editingTask.name);
-        setPrompt(editingTask.prompt);
         setPickedAgentId(editingTask.agentId);
         // Prefill the model/effort/permission controls from the loaded task; null → "".
         setPickedModel(editingTask.modelOverride ?? "");
@@ -320,7 +336,6 @@ export function CreateScheduledTaskDialog({
         setTrigger(null);
       } else {
         setName(initialTrigger ? TRIGGER_TEMPLATES[initialTrigger].name : (initialName ?? ""));
-        setPrompt(initialPrompt ?? "");
         setPickedAgentId(null);
         setPickedModel("");
         setPickedEffort("");
@@ -352,13 +367,29 @@ export function CreateScheduledTaskDialog({
     savedWorkspace,
   ]);
 
-  // A new task pins a host, starting on the first online one as New Chat does.
-  const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
+  // A new task starts on a server sandbox when one is offered, so it doesn't
+  // depend on the creator's machine being online at fire time; otherwise it pins
+  // the first online host as New Chat does. The target is chosen once, after
+  // both /v1/info and the host list settle, so it never flips between the two.
+  // With no sandbox and no online host it stays open until a host comes online.
+  const targetChosenRef = useRef(false);
   useEffect(() => {
-    if (open && !isEdit && !sandboxMode && hostId === "" && defaultHostId !== undefined) {
+    if (open) targetChosenRef.current = false;
+  }, [open]);
+  const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
+  const targetInputsLoaded = info !== "loading" && !hostsPending;
+  useEffect(() => {
+    if (!open || isEdit || !targetInputsLoaded || targetChosenRef.current) return;
+    if (managedSandboxesEnabled) {
+      targetChosenRef.current = true;
+      setSandboxMode(true);
+      setHostId("");
+      setWorkspace("");
+    } else if (defaultHostId !== undefined) {
+      targetChosenRef.current = true;
       setHostId(defaultHostId);
     }
-  }, [open, isEdit, sandboxMode, hostId, defaultHostId]);
+  }, [open, isEdit, targetInputsLoaded, managedSandboxesEnabled, defaultHostId]);
 
   const savedProjectId = editingTask?.projectId ?? null;
   const savedProjectName =
@@ -403,6 +434,7 @@ export function CreateScheduledTaskDialog({
   function handleTargetChange(value: string) {
     const nextSandbox = value === SANDBOX_HOST;
     const nextHostId = nextSandbox ? "" : value;
+    targetChosenRef.current = true;
     if (nextSandbox === sandboxMode && nextHostId === hostId) return;
     const originalTarget =
       editingTask?.executionTarget === "managed_sandbox"
@@ -488,13 +520,16 @@ export function CreateScheduledTaskDialog({
           effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
         })
       : "";
-  const effectivePrompt = trigger !== null ? renderedTriggerPrompt : prompt;
+  const effectivePrompt =
+    trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
   const canSubmit =
     name.trim() !== "" &&
     effectivePrompt.trim() !== "" &&
+    (trigger !== null || prompt.trim() !== "") &&
+    (systemPrompt === null || systemPrompt.trim() !== "") &&
     (isEdit || effectiveAgentId !== null) &&
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
@@ -505,6 +540,7 @@ export function CreateScheduledTaskDialog({
   function resetForm() {
     setName("");
     setPrompt("");
+    setSystemPrompt(null);
     setPickedAgentId(null);
     setPickedModel("");
     setPickedEffort("");
@@ -550,7 +586,7 @@ export function CreateScheduledTaskDialog({
       }
       const input = {
         name: name.trim(),
-        prompt: effectivePrompt.trim(),
+        prompt: systemPrompt === null ? effectivePrompt.trim() : effectivePrompt,
         rrule: buildRRule(schedule),
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
@@ -667,53 +703,59 @@ export function CreateScheduledTaskDialog({
             />
           </div>
 
-          {sessionModesSupported && (
-            <div className="flex flex-col gap-1.5" data-testid="task-session-mode-field">
-              <Label htmlFor="task-session-mode">Session</Label>
-              <Select
-                value={sessionMode}
-                componentId="tasks.scheduled.session_mode"
-                disabled={trigger !== null}
-                onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
-                onOpenChange={handleSelectOpenChange}
-              >
-                <SelectTrigger
-                  id="task-session-mode"
-                  data-testid="task-session-mode-trigger"
-                  className="w-full"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  <SelectItem value="new">New session each run</SelectItem>
-                  <SelectItem value="continue" data-testid="task-session-mode-continue">
-                    Continue in the same session
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              <p className="text-sm text-muted-foreground">
-                {trigger !== null
-                  ? "Trigger automations keep one session, which remembers its last check and the sessions it already started."
-                  : sessionMode === "continue"
-                    ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
-                    : "Each run starts a new session."}
-              </p>
-              {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
-                <div className="flex items-center gap-2">
-                  <Checkbox
-                    id="task-start-new-session"
-                    checked={startNewSession}
-                    onCheckedChange={(checked) => setStartNewSession(checked === true)}
-                    data-testid="task-start-new-session"
-                    componentId="tasks.scheduled.start_new_session"
-                  />
-                  <label htmlFor="task-start-new-session" className="cursor-pointer text-sm">
-                    Start a new session on the next run
-                  </label>
-                </div>
-              )}
-            </div>
-          )}
+          {/* A trigger needs its one kept session, so its form leaves the choice out. */}
+          {sessionModesSupported &&
+            trigger === null &&
+            (!editingTemplateTrigger || editingTask?.sessionId) && (
+              <div className="flex flex-col gap-1.5" data-testid="task-session-mode-field">
+                <Label htmlFor={editingTemplateTrigger ? undefined : "task-session-mode"}>
+                  Session
+                </Label>
+                {!editingTemplateTrigger && (
+                  <>
+                    <Select
+                      value={sessionMode}
+                      componentId="tasks.scheduled.session_mode"
+                      onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
+                      onOpenChange={handleSelectOpenChange}
+                    >
+                      <SelectTrigger
+                        id="task-session-mode"
+                        data-testid="task-session-mode-trigger"
+                        className="w-full"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent position="popper" align="start">
+                        <SelectItem value="new">New session each run</SelectItem>
+                        <SelectItem value="continue" data-testid="task-session-mode-continue">
+                          Continue in the same session
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-sm text-muted-foreground">
+                      {sessionMode === "continue"
+                        ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
+                        : "Each run starts a new session."}
+                    </p>
+                  </>
+                )}
+                {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="task-start-new-session"
+                      checked={startNewSession}
+                      onCheckedChange={(checked) => setStartNewSession(checked === true)}
+                      data-testid="task-start-new-session"
+                      componentId="tasks.scheduled.start_new_session"
+                    />
+                    <label htmlFor="task-start-new-session" className="cursor-pointer text-sm">
+                      Start a new session on the next run
+                    </label>
+                  </div>
+                )}
+              </div>
+            )}
 
           {trigger !== null ? (
             <TriggerTemplateFields
@@ -721,15 +763,25 @@ export function CreateScheduledTaskDialog({
               fields={triggerFields}
               onChange={setTriggerFields}
               onSelectOpenChange={handleSelectOpenChange}
+              // Arclet sandboxes start agents with Isaac's MCP servers, Jira and Slack included.
+              toolsProvided={
+                sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
+              }
               renderedPrompt={renderedTriggerPrompt}
               onEditAsPrompt={() => {
-                setPrompt(renderedTriggerPrompt);
+                const parts = splitTriggerPrompt(renderedTriggerPrompt);
+                setPrompt(parts.userPrompt);
+                setSystemPrompt(parts.systemPrompt);
+                setSystemPromptOpen(false);
+                setEditingSystemPrompt(false);
                 setTrigger(null);
               }}
             />
           ) : (
             <div className="flex flex-col gap-1.5">
-              <Label htmlFor="task-prompt">Prompt</Label>
+              <Label htmlFor="task-prompt">
+                {systemPrompt === null ? "Prompt" : "Your prompt"}
+              </Label>
               <Textarea
                 id="task-prompt"
                 value={prompt}
@@ -741,6 +793,57 @@ export function CreateScheduledTaskDialog({
                 className="resize-none text-ui"
                 onChange={(e) => setPrompt(e.target.value)}
               />
+              {systemPrompt !== null &&
+                splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
+                  <p role="status" className="text-sm text-warning">
+                    {systemPrompt.trim() === ""
+                      ? "System prompt can't be empty. Expand System prompt and click Edit system prompt to restore it."
+                      : "These edits change the template structure. After saving, the full text will appear as one prompt."}
+                  </p>
+                )}
+              {systemPrompt !== null && (
+                <Collapsible
+                  open={systemPromptOpen}
+                  onOpenChange={(expanded) => {
+                    setSystemPromptOpen(expanded);
+                    setEditingSystemPrompt(false);
+                  }}
+                  className="mt-2 rounded-md border border-border p-3"
+                >
+                  <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2 rounded-sm text-ui text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+                    <ChevronDownIcon className="size-4 transition-transform group-data-[state=closed]:-rotate-90" />
+                    System prompt
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="space-y-2 pt-3">
+                    <p className="text-sm text-muted-foreground">
+                      Instructions for how the automation runs. Your prompt is added separately.
+                    </p>
+                    {editingSystemPrompt ? (
+                      <Textarea
+                        aria-label="System prompt"
+                        value={systemPrompt}
+                        rows={8}
+                        className="max-h-80 resize-y text-ui"
+                        componentId="tasks.scheduled.system_prompt"
+                        onChange={(event) => setSystemPrompt(event.target.value)}
+                      />
+                    ) : (
+                      <pre className="max-h-56 overflow-y-auto rounded-md bg-muted/40 p-2 font-sans text-sm whitespace-pre-wrap break-words">
+                        {systemPrompt}
+                      </pre>
+                    )}
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      componentId="tasks.scheduled.edit_system_prompt"
+                      onClick={() => setEditingSystemPrompt(!editingSystemPrompt)}
+                    >
+                      {editingSystemPrompt ? "Done editing system prompt" : "Edit system prompt"}
+                    </Button>
+                  </CollapsibleContent>
+                </Collapsible>
+              )}
             </div>
           )}
 
