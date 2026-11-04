@@ -20,7 +20,11 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
 from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, managed_repo_labels
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions.orchestration import _mark_dispatch_in_flight
-from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    FORK_CARRY_HISTORY_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -54,6 +58,8 @@ def item_ids(store: SqlAlchemyConversationStore, session_id: str) -> list[str]:
     [
         ("claude-sdk", 2, "Q2", ["Q1", "A1"]),
         ("claude-native", 2, "Q2", ["Q1", "A1"]),
+        # The session's override, not the agent's declared harness, runs it.
+        ("override:claude-native", 2, "Q2", ["Q1", "A1"]),
         # Nothing precedes the first prompt, so the fork starts like a /clear.
         ("claude-sdk", 0, "Q1", []),
     ],
@@ -68,10 +74,19 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     prompt: str,
     kept: list[str],
 ) -> None:
-    """Rewinding to a prompt forks just before it, on the source's runner and host."""
-    resolve_harness_as(monkeypatch, harness)
+    """Rewinding to a prompt forks just before it, on the source's runner and host.
+
+    A rewound Claude Code native session rebuilds its transcript from the
+    kept items, whether the agent declares that harness or the session
+    overrides it.
+    """
     store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store)
+    if harness.startswith("override:"):
+        source_id = await create_placed_session(client, store)
+        store.update_conversation(source_id, harness_override=harness.removeprefix("override:"))
+    else:
+        resolve_harness_as(monkeypatch, harness)
+        source_id = await create_placed_session(client, store)
     items = item_ids(store, source_id)
     repos = ["https://github.com/acme/api"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
@@ -112,6 +127,8 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     assert (fork.cost_control_mode_override, fork.subagent_routing_override) == ("on", "on")
     assert fork.terminal_launch_args == ["--permission-mode", "acceptEdits"]
     assert fork.labels["team"] == "core"
+    carries = fork.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+    assert carries is harness.endswith("claude-native"), fork.labels
     # A relaunch of the shared sandbox still re-clones the repositories.
     assert {key: fork.labels.get(key) for key in sandbox_labels} == sandbox_labels
     assert fork.title == "Parser work"

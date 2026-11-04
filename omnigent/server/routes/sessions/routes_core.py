@@ -130,6 +130,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
+    _FORK_HISTORY_NATIVE_HARNESSES,
     _logger,
     get_server_runner_router,
     set_server_runner_router,
@@ -4383,6 +4384,13 @@ def register_core_routes(
         carry_history_into_native = target_is_cursor or await asyncio.to_thread(
             _agent_carries_native_fork_history, base_agent
         )
+        if continue_source and not carry_history_into_native:
+            # A continuation runs the source's effective harness, which a
+            # per-session override can make native while the agent declares SDK.
+            effective_harness = await asyncio.to_thread(
+                _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+            )
+            carry_history_into_native = effective_harness in _FORK_HISTORY_NATIVE_HARNESSES
         # The source's native session id is only resumable by a target in the
         # SAME provider family — a Claude target can't clone a Codex rollout.
         # Cross-family, the store must skip the fork-source directive so the
