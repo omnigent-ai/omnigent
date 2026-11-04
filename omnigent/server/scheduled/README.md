@@ -10,6 +10,9 @@ demand. `PersistentTaskScheduler` keeps the schedule in the database, so every
 occurrence runs once even with several server replicas, and an occurrence
 interrupted by a crash is still resolved instead of staying in `starting` forever.
 
+For what automations do from a user's point of view, with worked examples, see
+[EXAMPLES.md](EXAMPLES.md).
+
 The `automations_v2` feature flag turns this scheduler on. It is off by default,
 and the server then uses the older in-memory timers ("legacy timers").
 
