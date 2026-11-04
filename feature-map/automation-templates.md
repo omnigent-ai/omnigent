@@ -15,6 +15,8 @@ to customize.
   filter with no search; searches and Active/Paused filters hide the preview.
 - `create`: a gallery item or suggested automation opens integration setup;
   New automation opens a blank form.
+- `link-posting`: a checkbox below the trigger controls posting the session link
+  back to Jira, Slack, GitHub, or Linear. Sessions start whether it is checked or not.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
   prompt starts collapsed, expands into a read-only preview, and requires Edit
   system prompt to change it. Done editing system prompt returns to the read-only
@@ -126,6 +128,14 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   with New session each run and check that the sessions have distinct worktree
   paths. Disable the option and run again: the new session uses the selected
   directory. With Continue in the same session, later runs reuse its worktree.
+- In any integration template, fill in the scope and session instructions, then
+  expand Preview prompt. Toggle the link checkbox below the trigger and check
+  that only the comment or reply step changes; sessions still start either way.
+  Hover, focus, or tap the warning icon beside Instructions for each session to
+  read the integration requirement;
+  Escape dismisses it without closing the modal. The source and link-posting
+  warnings stay visible in yellow below the instructions. The run limit and posting
+  attribution share one note below the instructions.
 - Manually repeat the three creation entry points at a narrow viewport, use
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the

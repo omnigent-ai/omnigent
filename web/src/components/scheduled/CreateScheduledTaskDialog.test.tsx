@@ -2398,18 +2398,20 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     extraInfo: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
     sessionLink = "https://omni.example.com/c/CONVERSATION_ID",
   ) {
-    return render(
+    const onOpenChange = vi.fn();
+    const result = render(
       <CapabilitiesProvider
         info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true, ...extraInfo }}
       >
         <CreateScheduledTaskDialog
           open
-          onOpenChange={vi.fn()}
+          onOpenChange={onOpenChange}
           initialTrigger={source}
           sessionLink={sessionLink}
         />
       </CapabilitiesProvider>,
     );
+    return { ...result, onOpenChange };
   }
 
   /** Open a builder Select the Radix-in-jsdom way and pick an option. */
@@ -2429,14 +2431,22 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-instructions", "Triage it.");
   }
 
+  function showWarnings() {
+    if (!screen.queryByRole("tooltip")) {
+      fireEvent.click(screen.getByRole("button", { name: "Session instructions warnings" }));
+    }
+    return within(screen.getByRole("tooltip"));
+  }
+
   async function submittedPrompt(): Promise<string> {
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     return mutateAsync.mock.calls[0][0].prompt;
   }
 
-  it("replaces the prompt with a trigger builder, runs hourly and keeps one session", () => {
-    renderTrigger("jira");
+  it("replaces the prompt with a trigger builder, runs hourly and keeps one session", async () => {
+    const user = userEvent.setup();
+    const { onOpenChange } = renderTrigger("jira");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");
@@ -2448,24 +2458,57 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       "Runs your automation on all new tickets that match these conditions. Older tickets are skipped, even if they are edited to match later.",
     );
     expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
-      "Each run handles up to 10 new tickets, oldest first. The rest are picked up on the next run.",
+      'Up to 10 matches per run; remaining matches wait for the next run · Posts include "Sent with Omnigent".',
     );
-    // The form warns the source is untrusted and says link-back writes there.
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toBeVisible();
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveClass("text-warning");
+    const warningsButton = screen.getByRole("button", { name: "Session instructions warnings" });
+    await user.hover(warningsButton);
+    expect(await screen.findByRole("tooltip")).toBeInTheDocument();
+    fireEvent.keyDown(warningsButton, { key: "Escape" });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    // Focus alone opens it; the following touch click must keep it open.
+    fireEvent.focus(warningsButton);
+    expect(screen.getByRole("tooltip")).toBeInTheDocument();
+    fireEvent.click(warningsButton);
+    expect(screen.getByRole("tooltip")).toBeInTheDocument();
+    // The source and account warnings stay visible outside the tooltip.
     expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
-      "Anyone who can create a ticket in this project can add instructions that the agent may follow. The agent runs with your tools and your permissions. Make sure you trust them.",
+      "Anyone who can create a ticket in this project may direct the agent using your tools and permissions. Only use trusted sources.",
     );
     const note = screen.getByTestId("task-trigger-attribution-note");
-    expect(note).toHaveTextContent("Link-back posts to Jira with your account.");
-    expect(note).toHaveTextContent(
-      'Anything posted with your account ends with "Sent with Omnigent".',
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Links are posted with your Jira account.",
     );
+    expect(note).toHaveTextContent('Posts include "Sent with Omnigent".');
     // Runs can only search where the agent has the service's tools.
-    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent(
+    expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
       "This only works if the agent has a Jira MCP server where this task runs. Without one, each run stops and says so in its reply.",
     );
-    pick("task-trigger-then", "task-trigger-then-none");
-    expect(note).not.toHaveTextContent("Link-back posts");
+    expect(screen.getByRole("tooltip")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("button", { name: "Session instructions warnings" }), {
+      key: "Escape",
+    });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(onOpenChange).not.toHaveBeenCalled();
+    const linkBack = screen.getByRole("checkbox", {
+      name: "Comment the session link on the ticket",
+    });
+    expect(linkBack).toBeChecked();
+    expect(screen.getByTestId("task-trigger-builder")).not.toContainElement(linkBack);
+    expect(screen.queryByRole("combobox", { name: "Then" })).toBeNull();
+    fireEvent.click(linkBack);
+    expect(linkBack).not.toBeChecked();
+    expect(screen.getByTestId("task-trigger-untrusted-note")).not.toHaveTextContent(
+      "Links are posted",
+    );
     expect(note).toHaveTextContent("Sent with Omnigent");
+    fireEvent.click(screen.getByText("Comment the session link on the ticket"));
+    expect(linkBack).toBeChecked();
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Links are posted with your Jira account.",
+    );
   });
 
   it.each([
@@ -2482,7 +2525,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     fireEvent.click(host);
     fireEvent.click(screen.getByRole("option", { name: "laptop" }));
     // On a connected host the agent may lack the tools, so the warning shows.
-    expect(screen.getByTestId("task-trigger-tools-note")).toBeInTheDocument();
+    expect(showWarnings().getByTestId("task-trigger-tools-note")).toBeInTheDocument();
     fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(host);
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
@@ -2490,8 +2533,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     if (hidden) {
       expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Arclet Sandbox");
       expect(screen.queryByTestId("task-trigger-tools-note")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Session instructions warnings" })).toBeNull();
     } else {
-      expect(screen.getByTestId("task-trigger-tools-note")).toBeInTheDocument();
+      expect(showWarnings().getByTestId("task-trigger-tools-note")).toBeInTheDocument();
     }
     // The untrusted-source warning is about the source, not the tools, so it stays.
     expect(screen.getByTestId("task-trigger-untrusted-note")).toBeInTheDocument();
@@ -2594,17 +2638,19 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain('placement "managed"');
   });
 
-  it("leaves the link-back step out when then only starts the session", async () => {
+  it("still starts sessions without a link-back when the checkbox is unchecked", async () => {
     renderTrigger("slack");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Message posted");
     expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
-      "Anyone who can post in this channel can add instructions",
+      "Anyone who can post in this channel may direct the agent",
     );
     type("task-trigger-scope", "#eng-support");
     fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
     type("task-trigger-condition-0-value", "error");
     type("task-trigger-instructions", "Reproduce it.");
-    pick("task-trigger-then", "task-trigger-then-none");
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Reply in the thread with the session link" }),
+    );
 
     const prompt = await submittedPrompt();
     expect(mutateAsync.mock.calls[0][0].templateId).toBe("slack");
@@ -2612,6 +2658,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       'Watch: new Slack messages in #eng-support whose text contains "error"',
     );
     expect(prompt).not.toContain("Omnigent session:");
+    expect(prompt).toContain("call sys_session_create");
   });
 
   it("builds a Linear trigger for a team, with an unassigned row and the issue link-back", async () => {
@@ -2620,9 +2667,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue created");
     expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("in team");
     expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
-      "Anyone who can create an issue in this team can add instructions",
+      "Anyone who can create an issue in this team may direct the agent",
     );
-    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent(
+    expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
       "This only works if the agent has a Linear MCP server where this task runs.",
     );
     type("task-trigger-scope", "ENG");
@@ -2642,10 +2689,13 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
-    const warning = screen.getByTestId("task-trigger-untrusted-note");
-    expect(warning).toHaveTextContent("Anyone who can open an issue in this repository can add");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can open an issue in this repository may direct the agent",
+    );
     pick("task-trigger-event", "task-trigger-event-pr");
-    expect(warning).toHaveTextContent("Anyone who can open a pull request in this repository can");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can open a pull request in this repository may direct the agent",
+    );
     type("task-trigger-scope", "acme/app");
     type("task-trigger-instructions", "Fix it.");
     fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
