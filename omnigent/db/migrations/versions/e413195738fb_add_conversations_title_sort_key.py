@@ -73,13 +73,21 @@ def _backfill(bind: sa.Connection) -> None:
         sa.column("parent_conversation_id"),
         sa.column(_COLUMN, _SORT_KEY_TYPE),
     )
+    row_title = sa.bindparam("row_title", type_=sa.Text())
+    if bind.dialect.name == "mysql":
+        # The title's default collation ignores case and accents, so compare its bytes.
+        title_unchanged = sa.cast(table.c.title, sa.LargeBinary) == sa.cast(
+            row_title, sa.LargeBinary
+        )
+    else:
+        title_unchanged = table.c.title == row_title
     # Skip rows renamed since the read; upgraded builds write their key with the title.
     update = (
         table.update()
         .where(
             table.c.workspace_id == sa.bindparam("row_workspace_id"),
             table.c.id == sa.bindparam("row_id"),
-            table.c.title == sa.bindparam("row_title"),
+            title_unchanged,
             table.c[_COLUMN] == sa.bindparam("row_sort_key"),
         )
         .values({_COLUMN: sa.bindparam("sort_key")})

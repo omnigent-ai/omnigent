@@ -184,11 +184,13 @@ def test_title_sort_key_backfill_keeps_a_concurrent_rename(db_uri: str) -> None:
     batch_size = import_module(_MIGRATION)._BATCH_SIZE
     _migrate(engine, _PREVIOUS, command.downgrade)
     conversations = sa.Table("conversations", sa.MetaData(), autoload_with=engine)
-    # A full untitled first batch needs no keys, so the rename lands after the
+    # A full untitled first batch needs no keys, so the renames land after the
     # column is committed and while a later batch is between its read and write.
     renamed_id = batch_size.to_bytes(16, "big")
+    legacy_renamed_id = (batch_size + 1).to_bytes(16, "big")
     titles = {index.to_bytes(16, "big"): "" for index in range(batch_size)}
     titles[renamed_id] = "Before"
+    titles[legacy_renamed_id] = "Eclair"
     renamed = False
 
     def rename_before_backfill_write(conn, cursor, statement, parameters, context, executemany):
@@ -203,6 +205,13 @@ def test_title_sort_key_backfill_keeps_a_concurrent_rename(db_uri: str) -> None:
                     "WHERE workspace_id = 0 AND id = :id"
                 ),
                 {"key": title_sort_key("After"), "id": renamed_id},
+            )
+            # An older build renames without the key; MySQL's default collation equates the titles.
+            writer.execute(
+                sa.text(
+                    "UPDATE conversations SET title = :title WHERE workspace_id = 0 AND id = :id"
+                ),
+                {"title": "Éclair", "id": legacy_renamed_id},
             )
 
     try:
@@ -227,6 +236,9 @@ def test_title_sort_key_backfill_keeps_a_concurrent_rename(db_uri: str) -> None:
         finally:
             sa.event.remove(engine, "before_cursor_execute", rename_before_backfill_write)
         assert renamed
-        assert _keys(engine)[(0, renamed_id)] == "0after"
+        keys = _keys(engine)
+        assert keys[(0, renamed_id)] == "0after"
+        # Left for the rerun rather than keyed by the title it replaced.
+        assert keys[(0, legacy_renamed_id)] == "1"
     finally:
         _migrate(engine, "head")

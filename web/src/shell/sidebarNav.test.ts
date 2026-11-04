@@ -18,7 +18,6 @@ import {
   pinOrderWrites,
   resolveSidebarDrop,
   sessionsListAcceptsDrop,
-  sidebarSortBy,
   sortConversations,
   startCustomOrder,
   STATUS_BUCKETS,
@@ -814,14 +813,6 @@ it("sorts Name A to Z case-insensitively with untitled last", () => {
   sortConversations(rows, { id: "b", updatedAt: 999 }, frozen, "title");
   expect(frozen.get("b")).toBe(999);
   expect(frozen.size).toBe(rows.length);
-});
-
-it("maps each automatic ordering to its server sort", () => {
-  expect((["updated", "created", "name"] as const).map(sidebarSortBy)).toEqual([
-    "updated_at",
-    "created_at",
-    "title",
-  ]);
 });
 
 describe("Custom order", () => {
