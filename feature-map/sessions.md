@@ -1079,8 +1079,9 @@ plain `uv run pytest`, which starts a private server for the test.
   orders them, then expand the folder and click Show more. For the switch, file
   more than 20 sessions (one server page) and turn it off: the open folder lists
   every loaded session with no Show more, and scrolling to its end loads the next
-  page. After three automatic loads (the default budget) it shows Load more.
-  Turn the switch back on for five rows plus Show more.
+  page. Load more stays under the folder while pages remain; after three
+  automatic loads (the default budget), further pages need a click on it. Turn
+  the switch back on for five rows plus Show more.
 
 For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
