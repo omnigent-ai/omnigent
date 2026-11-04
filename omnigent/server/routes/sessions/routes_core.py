@@ -4075,6 +4075,7 @@ def register_core_routes(
         fork_id: str | None = None,
         validate_only: bool = False,
         copied_files: dict[str, str] | None = None,
+        kept_title: str | None = None,
     ) -> SessionResponse | None:
         """Fork *source_id* as :func:`fork_session` documents.
 
@@ -4095,6 +4096,9 @@ def register_core_routes(
             return ``None`` without creating anything.
         :param copied_files: Filled with each source file id and the id of the
             fork's copy, e.g. ``{"file_src": "file_fork"}``.
+        :param kept_title: An already-stored title the fork keeps as is, in
+            place of ``body.title``, which a caller writes and is size-limited;
+            ``""`` leaves the fork untitled.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4563,7 +4567,7 @@ def register_core_routes(
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
                 source_id,
-                title=body.title,
+                title=body.title if kept_title is None else kept_title,
                 agent_id=fork_agent_id,
                 cloned_agent_name=base_agent.name if clone_location else None,
                 cloned_agent_bundle_location=clone_location,
@@ -4882,8 +4886,9 @@ def register_core_routes(
                 )
                 if not runner_online and not host_bound:
                     raise runner_offline
-                fork_request = SessionForkRequest(title=title)
+                fork_request = SessionForkRequest()
                 fork_options: dict[str, Any] = {
+                    "kept_title": title,
                     "before_item_id": before_item_id,
                     "keep_sandbox_labels": True,
                     "copy_history": copy_history,

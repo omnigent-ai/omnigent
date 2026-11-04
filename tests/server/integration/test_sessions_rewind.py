@@ -16,7 +16,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
-from omnigent.entities import MessageData, NewConversationItem
+from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, managed_repo_labels
@@ -31,6 +31,7 @@ from tests.server.integration._session_continuation import (
     _OWNER,
     _RUNNER_ID,
     LiveRunner,
+    bind_to_host,
     create_placed_session,
     message_texts,
     resolve_harness_as,
@@ -51,14 +52,17 @@ def item_ids(store: SqlAlchemyConversationStore, session_id: str) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("harness", "item_index", "prompt", "kept"),
+    ("harness", "item_index", "prompt", "kept", "source"),
     [
-        ("claude-sdk", 2, "Q2", ["Q1", "A1"]),
-        ("claude-native", 2, "Q2", ["Q1", "A1"]),
+        ("claude-sdk", 2, "Q2", ["Q1", "A1"], "placed"),
+        ("claude-native", 2, "Q2", ["Q1", "A1"], "placed"),
         # The session's override, not the agent's declared harness, runs it.
-        ("override:claude-native", 2, "Q2", ["Q1", "A1"]),
+        ("override:claude-native", 2, "Q2", ["Q1", "A1"], "placed"),
         # Nothing precedes the first prompt, so the fork starts like a /clear.
-        ("claude-sdk", 0, "Q1", []),
+        ("claude-sdk", 0, "Q1", [], "placed"),
+        # A fork's stored "Fork of <title>" can run past the limit a caller's
+        # own title has; the rewound chat keeps it all the same.
+        ("claude-sdk", 2, "Q2", ["Q1", "A1"], "fork_of_a_long_title"),
     ],
 )
 async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
@@ -70,12 +74,13 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     item_index: int,
     prompt: str,
     kept: list[str],
+    source: str,
 ) -> None:
     """Rewinding to a prompt forks just before it, on the source's runner and host.
 
     A rewound Claude Code native session rebuilds its transcript from the
     kept items, whether the agent declares that harness or the session
-    overrides it.
+    overrides it. The rewound chat keeps the source's stored title.
     """
     store = SqlAlchemyConversationStore(db_uri)
     if harness.startswith("override:"):
@@ -84,6 +89,18 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     else:
         resolve_harness_as(monkeypatch, harness)
         source_id = await create_placed_session(client, store)
+    title = "Parser work"
+    if source == "fork_of_a_long_title":
+        long_title = "Parser work " + "x" * (USER_SESSION_TITLE_MAX_CHARS - 12)
+        renamed = await client.patch(f"/v1/sessions/{source_id}", json={"title": long_title})
+        assert renamed.status_code == 200, renamed.text
+        forked = await client.post(f"/v1/sessions/{source_id}/fork", json={})
+        assert forked.status_code == 201, forked.text
+        source_id = forked.json()["id"]
+        bind_to_host(store, source_id, "/work/repo", "feature/parser")
+        store.replace_runner_id(source_id, _RUNNER_ID)
+        title = f"Fork of {long_title}"
+        assert len(title) > USER_SESSION_TITLE_MAX_CHARS
     items = item_ids(store, source_id)
     repos = ["https://github.com/acme/api"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
@@ -128,7 +145,7 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     assert carries is harness.endswith("claude-native"), fork.labels
     # A relaunch of the shared sandbox still re-clones the repositories.
     assert {key: fork.labels.get(key) for key in sandbox_labels} == sandbox_labels
-    assert fork.title == "Parser work"
+    assert fork.title == title
     initialized = [(path, body.get("session_id")) for path, body in live_runner.posts]
     assert ("/v1/sessions", new_id) in initialized
     assert message_texts(store, source_id)[:4] == ["Q1", "A1", "Q2", "A2"]
