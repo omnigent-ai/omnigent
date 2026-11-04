@@ -75,3 +75,45 @@ def test_family_id_migration_preserves_metadata_and_indexes_membership() -> None
         assert sa.inspect(connection).get_indexes(table.name) == []
         assert connection.execute(sa.select(table).where(table.c.id != "4" * 32)).all() == before
     engine.dispose()
+
+
+def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
+    from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
+    from omnigent.db.utils import get_or_create_engine
+
+    engine = get_or_create_engine(db_uri)
+    migration = import_module(
+        "omnigent.db.migrations.versions.f1c7a9e2b406_add_conversation_family_id"
+    )
+    table = "omnigent_conversation_metadata"
+    index = "ix_conversation_metadata_family_id"
+    assert "family_id" in {c["name"] for c in sa.inspect(engine).get_columns(table)}
+    assert sa.inspect(engine).has_index(table, index)
+    for operation in (migration.downgrade, migration.upgrade):
+        with engine.connect() as connection:
+            if engine.dialect.name == "cockroachdb":
+                _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+            context = MigrationContext.configure(connection)
+            with Operations.context(context), context.begin_transaction():
+                operation()
+            connection.commit()
+    if engine.dialect.name == "postgresql":
+        with engine.connect() as connection:
+            # Simulate a failed concurrent build after the column was committed.
+            connection.execute(
+                sa.text(
+                    "UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass(:name)"
+                ),
+                {"name": index},
+            )
+            connection.commit()
+            context = MigrationContext.configure(connection)
+            with Operations.context(context), context.begin_transaction():
+                migration.upgrade()
+            assert connection.execute(
+                sa.text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:name)"),
+                {"name": index},
+            ).scalar_one()
+    assert next(i for i in sa.inspect(engine).get_indexes(table) if i["name"] == index)[
+        "column_names"
+    ] == ["workspace_id", "family_id", "id"]
