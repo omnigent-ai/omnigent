@@ -32,6 +32,7 @@ import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { renderTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
 const gitWorkspace = vi.hoisted(() => ({
@@ -2238,6 +2239,43 @@ describe("CreateScheduledTaskDialog session mode", () => {
     expect(input).not.toHaveProperty("sessionMode");
   });
 
+  it("keeps a template automation's one session on edit, offering only a reset", async () => {
+    const prompt = renderTriggerPrompt(
+      "jira",
+      {
+        event: "created",
+        scope: "ES",
+        conditions: [],
+        instructions: "Triage it.",
+        linkBack: true,
+      },
+      { placement: "same_host", sessionLink: "https://omni.example.com/c/CONVERSATION_ID" },
+    );
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1", prompt }));
+    expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.sessionId).toBeNull();
+    expect(input).not.toHaveProperty("sessionMode");
+  });
+
+  it("shows nothing about the session for a template automation that hasn't run", () => {
+    const prompt =
+      "This automation watches Slack and starts one Omnigent session for each newly created message that matches.";
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", prompt }));
+    expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
+  });
+
+  it("keeps the session choice when editing an automation written by hand", () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1" }));
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "Continue in the same session",
+    );
+  });
+
   it("offers no new-session option before the first run creates a session", () => {
     renderWithSessionModes(scheduledTask({ sessionMode: "continue" }));
     expect(screen.queryByTestId("task-start-new-session")).toBeNull();
@@ -2287,17 +2325,15 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     return mutateAsync.mock.calls[0][0].prompt;
   }
 
-  it("replaces the prompt with a trigger builder, runs hourly and locks one kept session", () => {
+  it("replaces the prompt with a trigger builder, runs hourly and keeps one session", () => {
     renderTrigger("jira");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");
     expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("in project");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every hour");
-    expect(screen.getByTestId("task-session-mode-trigger")).toBeDisabled();
-    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
-      "Continue in the same session",
-    );
+    // The trigger always keeps one session, so the form doesn't ask.
+    expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
     expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
       "Runs your automation on all new tickets that match these conditions. Older tickets are skipped, even if they are edited to match later.",
     );
@@ -2320,6 +2356,32 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     pick("task-trigger-then", "task-trigger-then-none");
     expect(note).not.toHaveTextContent("Link-back posts");
     expect(note).toHaveTextContent("Sent with Omnigent");
+  });
+
+  it.each([
+    ["arclet", true],
+    ["modal", false],
+  ])("on a %s sandbox, hides the tools warning: %s", (provider, hidden) => {
+    renderTrigger("jira", {
+      managed_sandboxes_enabled: true,
+      sandbox_provider: provider,
+      sandbox_providers: [provider],
+    });
+    // On a connected host the agent may lack the tools, so the warning shows.
+    expect(screen.getByTestId("task-trigger-tools-note")).toBeInTheDocument();
+    const host = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(host);
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    if (hidden) {
+      expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Arclet Sandbox");
+      expect(screen.queryByTestId("task-trigger-tools-note")).toBeNull();
+    } else {
+      expect(screen.getByTestId("task-trigger-tools-note")).toBeInTheDocument();
+    }
+    // The untrusted-source warning is about the source, not the tools, so it stays.
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toBeInTheDocument();
   });
 
   it("keeps submit disabled until the scope, every condition and the instructions are filled", () => {
@@ -2480,6 +2542,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt.value).toContain("repo:acme/app is:pr created:>=<that time>");
     // The kept session stays, but the user may now change it.
     expect(screen.getByTestId("task-session-mode-trigger")).toBeEnabled();
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "Continue in the same session",
+    );
     const editedPrompt = `${prompt.value}\nOnly act on pull requests labeled ready.`;
     fireEvent.change(prompt, { target: { value: editedPrompt } });
     expect(await submittedPrompt()).toBe(editedPrompt);

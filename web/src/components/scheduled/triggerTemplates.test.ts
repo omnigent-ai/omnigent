@@ -4,6 +4,7 @@ import {
   compileJiraJql,
   describeLinearFilter,
   describeSlackFilter,
+  isTriggerPrompt,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
   splitJqlOrderBy,
@@ -213,6 +214,20 @@ describe("describeLinearFilter", () => {
     );
     expect(assignee("empty")).toBe("that are unassigned");
     expect(assignee("not_empty")).toBe("that are assigned to someone");
+  });
+});
+
+describe("isTriggerPrompt", () => {
+  it.each(["jira", "slack", "github", "linear"] as const)(
+    "recognizes a rendered %s prompt",
+    (source) => {
+      expect(isTriggerPrompt(renderTriggerPrompt(source, fields(), CTX))).toBe(true);
+    },
+  );
+
+  it("doesn't match a prompt written by hand", () => {
+    expect(isTriggerPrompt("Summarize the new Jira tickets.")).toBe(false);
+    expect(isTriggerPrompt(` ${renderTriggerPrompt("jira", fields(), CTX)}`)).toBe(false);
   });
 });
 
