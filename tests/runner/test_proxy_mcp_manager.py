@@ -174,6 +174,8 @@ class _RetainedOperationTransport(httpx.AsyncBaseTransport):
         ``"server"`` runs the tool on the server without a runner entry.
     :param approval_id: When set, requests without ``requestState`` get a policy
         approval prompt with this elicitation id instead of executing.
+    :param hold_execution: When true, the runner's execution waits for
+        ``release_execution``.
     """
 
     def __init__(
@@ -183,6 +185,7 @@ class _RetainedOperationTransport(httpx.AsyncBaseTransport):
         first_reply: str,
         execution: str = "final",
         approval_id: str | None = None,
+        hold_execution: bool = False,
     ) -> None:
         self._registry = registry
         self._first_reply = first_reply
@@ -193,6 +196,10 @@ class _RetainedOperationTransport(httpx.AsyncBaseTransport):
         self.external_invocations = 0
         self.first_request_executed = asyncio.Event()
         self.release_first_reply = asyncio.Event()
+        self.execution_started = asyncio.Event()
+        self.release_execution = asyncio.Event()
+        if not hold_execution:
+            self.release_execution.set()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -208,6 +215,8 @@ class _RetainedOperationTransport(httpx.AsyncBaseTransport):
 
         async def _retained_work() -> McpExecutionResult:
             self.external_invocations += 1
+            self.execution_started.set()
+            await self.release_execution.wait()
             return McpExecutionResult(status_code=200, content=content)
 
         if self._execution == "server":
@@ -624,6 +633,44 @@ async def test_call_tool_reissues_request_left_unanswered_after_server_reconnect
     assert [call.body["id"] for call in transport.calls] == [1, 2]
     first_params, retry_params = [call.body["params"] for call in transport.calls]
     assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reissues_after_execution_running_at_server_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnect during the runner's execution re-issues the call only once it finishes."""
+    from omnigent.runner import proxy_mcp_manager
+
+    monkeypatch.setattr(proxy_mcp_manager, "_SERVER_REPLY_GRACE_S", 0.0)
+    registry = McpExecutionRegistry()
+    transport = _RetainedOperationTransport(registry, first_reply="held", hold_execution=True)
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
+    try:
+        await asyncio.wait_for(transport.execution_started.wait(), timeout=5.0)
+        pending_approvals.notify_server_reconnect()
+        await poll_until_async(
+            lambda: not pending_approvals._server_reconnect_waiters or len(transport.calls) > 1
+        )
+        assert len(transport.calls) == 1
+        transport.release_execution.set()
+
+        assert await asyncio.wait_for(task, timeout=5.0) == "reattached"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.external_invocations == 1
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
 
 
 @pytest.mark.asyncio
