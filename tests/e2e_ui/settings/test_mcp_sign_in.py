@@ -18,7 +18,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.live_server import isolated_process_env
-from tests._helpers.oauth_mcp_server import OAuthMcpServer, oauth_mcp_server
+from tests.e2e_ui.settings._oauth_mcp_server import OAuthMcpServer, oauth_mcp_server
 
 # Older servers show Needs auth without a Sign in button.
 pytestmark = pytest.mark.min_server_version("0.22.0")
