@@ -33,6 +33,10 @@ from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
 
+# Shorter than the client's request timeout, so a slow provider answers 503
+# before the client gives up and provider work does not outlive the request.
+PROVIDER_TIMEOUT_S = 20.0
+
 # Strict types keep pydantic from turning true into 1 or "1" into 1.
 _WireValue = StrictBool | StrictInt | StrictFloat | StrictStr | list[StrictStr]
 
@@ -120,7 +124,9 @@ def create_runtime_flags_router(
             for flag in body.flags
         )
         try:
-            served = await provider.evaluate(queries, caller)
+            served = await asyncio.wait_for(
+                provider.evaluate(queries, caller), timeout=PROVIDER_TIMEOUT_S
+            )
         except Exception as exc:
             _logger.warning("runtime flag evaluation failed: %s", type(exc).__name__)
             raise HTTPException(503, "runtime flag evaluation is unavailable") from exc

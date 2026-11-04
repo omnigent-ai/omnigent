@@ -91,6 +91,40 @@ async def test_refresh_serves_values_and_falls_back_to_defaults() -> None:
     assert delay == 15.0  # suggested delays are clamped to the minimum
 
 
+async def test_every_type_is_served_including_falsey_updates() -> None:
+    flags = {
+        "test.enabled": BoolFeatureFlag("test.enabled", True),
+        "test.limit": IntFeatureFlag("test.limit", 5),
+        "test.big": LongFeatureFlag("test.big", 5),
+        "test.ratio": FloatFeatureFlag("test.ratio", 0.5),
+        "test.mode": StringFeatureFlag("test.mode", "default"),
+        "test.groups": StringListFeatureFlag("test.groups", ["default"]),
+    }
+    first = {
+        "test.enabled": False,
+        "test.limit": 7,
+        "test.big": 2**40,
+        "test.ratio": 2.5,
+        "test.mode": "on",
+        "test.groups": ["a"],
+    }
+    falsey = {
+        "test.enabled": False,
+        "test.limit": 0,
+        "test.big": 0,
+        "test.ratio": 0.0,
+        "test.mode": "",
+        "test.groups": [],
+    }
+    refresher = RuntimeFlagRefresher(_FakeServer(_served(first), _served(falsey)).post)
+
+    await refresher.refresh_once()
+    assert {name: flag.get_current_value() for name, flag in flags.items()} == first
+    # Falsey values are real answers, not "missing": none fall back to the default.
+    await refresher.refresh_once()
+    assert {name: flag.get_current_value() for name, flag in flags.items()} == falsey
+
+
 async def test_failed_refresh_keeps_last_values_and_old_server_backs_off(monkeypatch) -> None:
     enabled = BoolFeatureFlag("test.enabled", False)
     monkeypatch.setattr(runtime_flags, "_REQUEST_TIMEOUT_S", 0.01)

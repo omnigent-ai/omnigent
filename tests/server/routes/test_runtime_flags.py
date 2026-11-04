@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -15,6 +16,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime_flags import MAX_RUNTIME_FLAGS_PER_REQUEST
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.routes import runtime_flags as runtime_flags_route
 from omnigent.server.routes.runtime_flags import RuntimeFlagsRequest, create_runtime_flags_router
 from omnigent.server.runtime_flags import (
     RuntimeFlagCaller,
@@ -189,6 +191,26 @@ async def test_provider_failure_is_503():
             _PATH, headers=_ALICE, json=_request(("a.enabled", "bool", False))
         )
     assert response.status_code == 503
+
+
+async def test_hanging_provider_is_503(monkeypatch):
+    monkeypatch.setattr(runtime_flags_route, "PROVIDER_TIMEOUT_S", 0.01)
+    cancelled = asyncio.Event()
+
+    class _HangingProvider:
+        async def evaluate(self, queries, caller):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    async with _client(_router_app(_HangingProvider())) as client:
+        response = await client.post(
+            _PATH, headers=_ALICE, json=_request(("a.enabled", "bool", False))
+        )
+    assert response.status_code == 503
+    assert cancelled.is_set()
 
 
 async def test_without_provider_serves_no_values(db_uri, tmp_path):
