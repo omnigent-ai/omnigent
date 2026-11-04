@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from omnigent.entities.environment_filesystem import (
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
+    WriteFileResult,
 )
 from omnigent.entities.session_resources import terminal_environment_resource_id
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -1826,6 +1828,57 @@ async def test_changes_drop_a_file_saved_back_to_its_original_content(
 @pytest.mark.parametrize(
     ("method", "body"),
     [
+        ("PUT", {"content": "final\n"}),
+        ("PATCH", {"old_text": "intermediate", "new_text": "final"}),
+    ],
+)
+async def test_a_save_during_another_keeps_the_original_the_first_replaced(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    body: dict[str, str],
+) -> None:
+    """A save started while another is in flight cannot take its result as the original."""
+    first_written = asyncio.Event()
+    release_first = asyncio.Event()
+    write = CallerProcessFilesystem.write
+
+    async def hold_the_first_write_result(
+        self: CallerProcessFilesystem, path: str, content: bytes, *, create_parents: bool = True
+    ) -> WriteFileResult:
+        result = await write(self, path, content, create_parents=create_parents)
+        if content == b"intermediate\n":
+            first_written.set()
+            await release_first.wait()
+        return result
+
+    monkeypatch.setattr(CallerProcessFilesystem, "write", hold_the_first_write_result)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    url = f"{base}/filesystem/hello.txt"
+    first = asyncio.create_task(client.put(url, json={"content": "intermediate\n"}))
+    await first_written.wait()
+    second = asyncio.create_task(client.request(method, url, json=body))
+    try:
+        finished, _ = await asyncio.wait({second}, timeout=1.0)
+        assert not finished
+    finally:
+        release_first.set()
+        saved = await asyncio.gather(first, second)
+
+    assert [response.status_code for response in saved] == [200, 200], [r.text for r in saved]
+    assert (workspace / "hello.txt").read_text() == "final\n"
+    (workspace / "hello.txt").write_text("intermediate\n")
+    listed = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
+    (workspace / "hello.txt").write_text("hello world")
+    assert (await client.get(f"{base}/changes")).json()["data"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "body"),
+    [
         ("PUT", {"content": "AAAAAAAA", "encoding": "utf-8"}),
         ("PATCH", {"old_text": "TAIL", "new_text": ""}),
     ],
@@ -2042,7 +2095,7 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A terminal's edits land under its own root, so the runner's tree cannot confirm a revert."""
+    """A terminal rooted elsewhere or in an overlay keeps edits the runner cannot confirm."""
     terminal_root = tmp_path / "terminal"
     terminal_root.mkdir()
     (terminal_root / "notes.txt").write_text("new")
@@ -2055,8 +2108,17 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     )
     assert terminal_env is not None
     terminals = TerminalRegistry()
+    overlay_env = SimpleNamespace(
+        cwd=str(workspace), sandbox=SimpleNamespace(copy_on_write_roots=[workspace])
+    )
     terminals._by_conversation["conv_test"] = {
-        ("bash", "s1"): make_test_terminal_instance("bash", "s1", tmp_path, os_env=terminal_env)
+        ("bash", "s1"): make_test_terminal_instance("bash", "s1", tmp_path, os_env=terminal_env),
+        ("bash", "s2"): make_test_terminal_instance(
+            "bash",
+            "s2",
+            tmp_path,
+            os_env=overlay_env,  # type: ignore[arg-type]
+        ),
     }
     monkeypatch.setattr(registry, "_terminal_registry", terminals)
     changes = app.state.filesystem_registry
@@ -2075,10 +2137,20 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     listed = await client.get(f"{base}/changes")
     diff = await client.get(f"{base}/diff/notes.txt")
     listed_in_workspace = await client.get(f"{primary}/changes")
+    overlay = terminal_environment_resource_id("bash", "s2")
+    listed_in_overlay = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{overlay}/changes"
+    )
 
     assert (in_terminal.status_code, in_workspace.status_code) == (200, 200)
     assert listed.status_code == 200, listed.text
     assert sorted((e["path"], e["status"]) for e in listed.json()["data"]) == [
+        ("hello.txt", "modified"),
+        ("notes.txt", "created"),
+        ("shared.txt", "modified"),
+    ]
+    assert listed_in_overlay.status_code == 200, listed_in_overlay.text
+    assert sorted((e["path"], e["status"]) for e in listed_in_overlay.json()["data"]) == [
         ("hello.txt", "modified"),
         ("notes.txt", "created"),
         ("shared.txt", "modified"),

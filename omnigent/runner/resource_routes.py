@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -1817,6 +1818,12 @@ def register_resource_routes(
             return None
         return existing.data.decode(existing.encoding, errors="replace")
 
+    def _change_lock(relative_path: str) -> contextlib.AbstractAsyncContextManager[None]:
+        """Return the lock an editor save holds from reading its original to recording it."""
+        if filesystem_registry is None:
+            return contextlib.nullcontext()
+        return filesystem_registry.change_lock(relative_path)
+
     def _record_editor_change(
         session_id: str,
         environment_id: str,
@@ -1862,20 +1869,21 @@ def register_resource_routes(
         encoding = body.get("encoding", "utf-8")
         create_parents = body.get("create_parents", True)
         content_bytes = content_str.encode(encoding)
-        original = await _read_original(fs, relative_path)
-        result = await fs.write(
-            relative_path,
-            content_bytes,
-            create_parents=create_parents,
-        )
-        _record_editor_change(
-            session_id,
-            environment_id,
-            agent_spec,
-            relative_path,
-            original,
-            "created" if result.created else "modified",
-        )
+        async with _change_lock(relative_path):
+            original = await _read_original(fs, relative_path)
+            result = await fs.write(
+                relative_path,
+                content_bytes,
+                create_parents=create_parents,
+            )
+            _record_editor_change(
+                session_id,
+                environment_id,
+                agent_spec,
+                relative_path,
+                original,
+                "created" if result.created else "modified",
+            )
         return JSONResponse(
             status_code=200,
             content={
@@ -1908,17 +1916,18 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
-        original = await _read_original(fs, relative_path)
         body = await request.json()
         edit_req = TextEditRequest(
             old_text=body.get("old_text"),
             new_text=body.get("new_text"),
             replace_all=body.get("replace_all", False),
         )
-        result = await fs.edit_text(relative_path, edit_req)
-        _record_editor_change(
-            session_id, environment_id, agent_spec, relative_path, original, result.operation
-        )
+        async with _change_lock(relative_path):
+            original = await _read_original(fs, relative_path)
+            result = await fs.edit_text(relative_path, edit_req)
+            _record_editor_change(
+                session_id, environment_id, agent_spec, relative_path, original, result.operation
+            )
         return JSONResponse(
             status_code=200,
             content={

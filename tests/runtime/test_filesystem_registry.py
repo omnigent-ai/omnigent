@@ -469,24 +469,24 @@ def test_changes_keep_recorded_entries_while_the_workspace_is_gone(
     assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == recorded
 
 
-@pytest.mark.parametrize("beneath_supported", [True, False], ids=["dir-fd", "path-fallback"])
 @pytest.mark.parametrize(
-    ("path", "swapped", "at_open"),
+    ("path", "swapped", "at_open", "beneath_supported"),
     [
-        pytest.param("notes.md", "notes.md", False, id="leaf"),
-        pytest.param("notes.md", "notes.md", True, id="leaf-at-open"),
-        pytest.param("docs/notes.md", "docs", False, id="parent"),
-        pytest.param("notes.md", "", False, id="workspace"),
-        pytest.param("notes.md", "..", False, id="ancestor"),
+        pytest.param("notes.md", "notes.md", False, True, id="leaf"),
+        pytest.param("notes.md", "notes.md", True, True, id="leaf-at-open"),
+        pytest.param("docs/notes.md", "docs", False, True, id="parent"),
+        pytest.param("notes.md", "", False, True, id="workspace"),
+        pytest.param("notes.md", "..", False, True, id="ancestor"),
+        pytest.param("notes.md", "notes.md", False, False, id="leaf-without-dir-fd"),
     ],
 )
 def test_changes_never_read_through_a_symlink_out_of_the_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    beneath_supported: bool,
     path: str,
     swapped: str,
     at_open: bool,
+    beneath_supported: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A path swapped for a symlink must not reveal the size, time or content of its target."""

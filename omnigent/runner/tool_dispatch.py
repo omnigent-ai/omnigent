@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import functools
 import json
 import logging
 import mimetypes
@@ -7548,28 +7549,42 @@ async def _read_os_env_original(os_env: OSEnvironment, path: str) -> str | None:
     return None
 
 
-def _record_os_env_change(
-    filesystem_registry: FilesystemRegistry,
+async def _run_tracked_os_env_mutation(
+    os_env: OSEnvironment,
     path: str,
-    original: str | None,
-    result: OpResult,
-    operation: str,
-    conversation_id: str,
-) -> None:
-    """Record a successful write or edit, seeding the *original* it replaced first.
+    mutate: Callable[[], Awaitable[OpResult]],
+    filesystem_registry: FilesystemRegistry | None,
+    conversation_id: str | None,
+) -> OpResult:
+    """Run a write or edit of *path*, then record it with the original it replaced.
 
-    :param filesystem_registry: Registry that stores the change and its original.
+    The registry's change lock spans the read, the mutation and the recording,
+    so a concurrent write to *path* cannot record this one's result as its original.
+
+    :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
+        the current tool dispatch.
     :param path: Path argument forwarded from the tool call, e.g. ``"src/foo.py"``.
-    :param original: Text read before the mutation, or ``None`` when unknown.
-    :param result: Result returned by the write or edit.
-    :param operation: ``"created"`` or ``"modified"``.
+    :param mutate: Starts the write or edit.
+    :param filesystem_registry: Registry that stores the change, or ``None``.
     :param conversation_id: Session scope for the change, e.g. ``"conv_abc123"``.
+    :returns: The mutation's result.
     """
-    if isinstance(result, dict) and "error" in result:
-        return
-    if original is not None:
-        filesystem_registry.seed_snapshot(path, original, session_id=conversation_id)
-    filesystem_registry.record_change(path, operation, conversation_id)
+    if filesystem_registry is None or conversation_id is None:
+        return await mutate()
+    async with filesystem_registry.change_lock(path):
+        original = await _read_os_env_original(os_env, path)
+        result = await mutate()
+        if isinstance(result, dict) and "error" in result:
+            return result
+        if original is not None:
+            filesystem_registry.seed_snapshot(path, original, session_id=conversation_id)
+        # _write_impl returns {"created": True} when the file did not
+        # previously exist; edits and overwrites modify it.
+        created = isinstance(result, dict) and result.get("created") is True
+        filesystem_registry.record_change(
+            path, "created" if created else "modified", conversation_id
+        )
+    return result
 
 
 async def _execute_os_env_tool(
@@ -7649,34 +7664,32 @@ async def _execute_os_env_tool(
             )
         elif tool_name == SysOsWriteTool.name():
             _path = cast("str", args.get("path", ""))
-            tracks_changes = filesystem_registry is not None and conversation_id is not None
-            original = await _read_os_env_original(os_env, _path) if tracks_changes else None
-            result = await os_env.write(
-                path=_path,
-                content=cast("str", args.get("content", "")),
+            result = await _run_tracked_os_env_mutation(
+                os_env,
+                _path,
+                functools.partial(
+                    os_env.write,
+                    path=_path,
+                    content=cast("str", args.get("content", "")),
+                ),
+                filesystem_registry,
+                conversation_id,
             )
-            if filesystem_registry is not None and conversation_id is not None:
-                # _write_impl returns {"created": True} when the file did not
-                # previously exist, {"created": False} for an overwrite.
-                was_created = isinstance(result, dict) and result.get("created") is True
-                status = "created" if was_created else "modified"
-                _record_os_env_change(
-                    filesystem_registry, _path, original, result, status, conversation_id
-                )
         elif tool_name == SysOsEditTool.name():
             _path = cast("str", args.get("path", ""))
-            tracks_changes = filesystem_registry is not None and conversation_id is not None
-            original = await _read_os_env_original(os_env, _path) if tracks_changes else None
-            result = await os_env.edit(
-                path=_path,
-                old_text=cast("str | None", args.get("oldText") or args.get("old_string")),
-                new_text=cast("str | None", args.get("newText") or args.get("new_string")),
-                edits=cast("list[dict[str, str]] | None", args.get("edits")),
+            result = await _run_tracked_os_env_mutation(
+                os_env,
+                _path,
+                functools.partial(
+                    os_env.edit,
+                    path=_path,
+                    old_text=cast("str | None", args.get("oldText") or args.get("old_string")),
+                    new_text=cast("str | None", args.get("newText") or args.get("new_string")),
+                    edits=cast("list[dict[str, str]] | None", args.get("edits")),
+                ),
+                filesystem_registry,
+                conversation_id,
             )
-            if filesystem_registry is not None and conversation_id is not None:
-                _record_os_env_change(
-                    filesystem_registry, _path, original, result, "modified", conversation_id
-                )
         elif tool_name == SysOsShellTool.name():
             result = await os_env.shell(
                 command=cast("str", args.get("command", "")),

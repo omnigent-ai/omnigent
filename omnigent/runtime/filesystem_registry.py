@@ -23,6 +23,7 @@ defines the full public interface.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import dataclasses
@@ -32,6 +33,7 @@ import os
 import subprocess
 import threading
 import time
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
@@ -564,6 +566,9 @@ class FilesystemRegistry(ABC):
         :param watch_path: The workspace directory to use as root.
         """
         self._cwd = watch_path.resolve()
+        self._change_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
 
     # ── Concrete: workspace root ───────────────────────────────────
 
@@ -571,6 +576,22 @@ class FilesystemRegistry(ABC):
     def cwd(self) -> Path:
         """The workspace root directory being watched."""
         return self._cwd
+
+    def change_lock(self, path: str) -> asyncio.Lock:
+        """Return the lock a writer of *path* holds from reading its original to recording it.
+
+        Without it, a concurrent write could read this write's result and record
+        that as the original first.
+
+        :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :returns: The lock every writer of *path* shares while any of them uses it.
+        """
+        key = _normalize_path(path, self._cwd) or path
+        lock = self._change_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._change_locks[key] = lock
+        return lock
 
     @property
     def git_root(self) -> Path | None:

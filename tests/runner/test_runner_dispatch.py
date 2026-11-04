@@ -2838,19 +2838,88 @@ async def test_runner_os_env_failed_edit_does_not_choose_the_original(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_runner_os_env_concurrent_writes_keep_the_first_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that starts while another is in flight keeps the original the first replaced."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import CallerProcessOSEnvironment, OpResult
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+    from omnigent.spec.types import AgentSpec
+
+    notes = tmp_path / "notes.txt"
+    notes.write_text("initial\n")
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+    first_written = asyncio.Event()
+    release_first = asyncio.Event()
+    write = CallerProcessOSEnvironment.write
+
+    async def hold_the_first_write_result(
+        self: CallerProcessOSEnvironment, path: str, content: str
+    ) -> OpResult:
+        result = await write(self, path, content)
+        if content == "intermediate\n":
+            first_written.set()
+            await release_first.wait()
+        return result
+
+    monkeypatch.setattr(CallerProcessOSEnvironment, "write", hold_the_first_write_result)
+
+    def write_notes(content: str) -> asyncio.Task[str]:
+        return asyncio.create_task(
+            _execute_os_env_tool(
+                "sys_os_write",
+                {"path": "notes.txt", "content": content},
+                agent_spec=spec,
+                conversation_id="conv_concurrent",
+                filesystem_registry=filesystem_registry,
+            )
+        )
+
+    first = write_notes("intermediate\n")
+    await first_written.wait()
+    second = write_notes("final\n")
+    try:
+        finished, _ = await asyncio.wait({second}, timeout=1.0)
+        assert not finished
+    finally:
+        release_first.set()
+        await asyncio.gather(first, second)
+
+    assert notes.read_text() == "final\n"
+    assert filesystem_registry.get_baseline("notes.txt") == "initial\n"
+    notes.write_text("intermediate\n")
+    listed = filesystem_registry.list_changed_files("conv_concurrent", limit=10, check_disk=True)
+    assert [(r["path"], r["status"]) for r in listed] == [("notes.txt", "modified")]
+    notes.write_text("initial\n")
+    assert (
+        filesystem_registry.list_changed_files("conv_concurrent", limit=10, check_disk=True) == []
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("original", "expected_byte_caps", "baseline"),
+    ("original", "complete_read_fails", "expected_byte_caps", "baseline"),
     [
-        pytest.param(b"\x89PNG\x00\xff", [1], None, id="binary"),
-        pytest.param(b"0123456789\n", [1, 8], None, id="larger-than-the-read-cap"),
-        pytest.param(b"0123456\n", [1, 8], "0123456\n", id="exactly-the-read-cap"),
-        pytest.param(b"a\r\nb\r\n", [1, 8], "a\r\nb\r\n", id="complete-text"),
+        pytest.param(b"\x89PNG\x00\xff", False, [1], None, id="binary"),
+        pytest.param(b"0123456789\n", False, [1, 8], None, id="larger-than-the-read-cap"),
+        pytest.param(b"0123456\n", False, [1, 8], "0123456\n", id="exactly-the-read-cap"),
+        pytest.param(b"a\r\nb\r\n", False, [1, 8], "a\r\nb\r\n", id="complete-text"),
+        pytest.param(b"text\n", True, [1, 8], None, id="complete-read-fails"),
     ],
 )
 async def test_runner_os_env_snapshot_reads_only_a_complete_text_original(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     original: bytes,
+    complete_read_fails: bool,
     expected_byte_caps: list[int],
     baseline: str | None,
 ) -> None:
@@ -2870,6 +2939,8 @@ async def test_runner_os_env_snapshot_reads_only_a_complete_text_original(
             max_bytes: int | None = None,
         ) -> OpResult:
             byte_caps.append(max_bytes)
+            if complete_read_fails and max_bytes != 1:
+                raise OSError("read failed")
             return _read_impl(tmp_path / path, offset, limit, max_bytes)
 
     monkeypatch.setattr(environment_filesystem, "_MAX_READ_BYTES", 8)
