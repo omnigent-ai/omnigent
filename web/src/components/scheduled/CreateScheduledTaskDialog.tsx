@@ -36,6 +36,7 @@ import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import {
   emptyTriggerFields,
+  isTriggerPrompt,
   renderTriggerPrompt,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
@@ -130,6 +131,12 @@ export function CreateScheduledTaskDialog({
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
+  // A task saved from a trigger template keeps its one session on edit too; only
+  // the reset below stays, for a session that's broken or stale.
+  const editingTemplateTrigger =
+    editingTask !== null &&
+    editingTask.sessionMode === "continue" &&
+    isTriggerPrompt(editingTask.prompt);
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -668,50 +675,58 @@ export function CreateScheduledTaskDialog({
           </div>
 
           {/* A trigger needs its one kept session, so its form leaves the choice out. */}
-          {sessionModesSupported && trigger === null && (
-            <div className="flex flex-col gap-1.5" data-testid="task-session-mode-field">
-              <Label htmlFor="task-session-mode">Session</Label>
-              <Select
-                value={sessionMode}
-                componentId="tasks.scheduled.session_mode"
-                onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
-                onOpenChange={handleSelectOpenChange}
-              >
-                <SelectTrigger
-                  id="task-session-mode"
-                  data-testid="task-session-mode-trigger"
-                  className="w-full"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  <SelectItem value="new">New session each run</SelectItem>
-                  <SelectItem value="continue" data-testid="task-session-mode-continue">
-                    Continue in the same session
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              <p className="text-sm text-muted-foreground">
-                {sessionMode === "continue"
-                  ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
-                  : "Each run starts a new session."}
-              </p>
-              {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
-                <div className="flex items-center gap-2">
-                  <Checkbox
-                    id="task-start-new-session"
-                    checked={startNewSession}
-                    onCheckedChange={(checked) => setStartNewSession(checked === true)}
-                    data-testid="task-start-new-session"
-                    componentId="tasks.scheduled.start_new_session"
-                  />
-                  <label htmlFor="task-start-new-session" className="cursor-pointer text-sm">
-                    Start a new session on the next run
-                  </label>
-                </div>
-              )}
-            </div>
-          )}
+          {sessionModesSupported &&
+            trigger === null &&
+            (!editingTemplateTrigger || editingTask?.sessionId) && (
+              <div className="flex flex-col gap-1.5" data-testid="task-session-mode-field">
+                <Label htmlFor={editingTemplateTrigger ? undefined : "task-session-mode"}>
+                  Session
+                </Label>
+                {!editingTemplateTrigger && (
+                  <>
+                    <Select
+                      value={sessionMode}
+                      componentId="tasks.scheduled.session_mode"
+                      onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
+                      onOpenChange={handleSelectOpenChange}
+                    >
+                      <SelectTrigger
+                        id="task-session-mode"
+                        data-testid="task-session-mode-trigger"
+                        className="w-full"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent position="popper" align="start">
+                        <SelectItem value="new">New session each run</SelectItem>
+                        <SelectItem value="continue" data-testid="task-session-mode-continue">
+                          Continue in the same session
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-sm text-muted-foreground">
+                      {sessionMode === "continue"
+                        ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
+                        : "Each run starts a new session."}
+                    </p>
+                  </>
+                )}
+                {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="task-start-new-session"
+                      checked={startNewSession}
+                      onCheckedChange={(checked) => setStartNewSession(checked === true)}
+                      data-testid="task-start-new-session"
+                      componentId="tasks.scheduled.start_new_session"
+                    />
+                    <label htmlFor="task-start-new-session" className="cursor-pointer text-sm">
+                      Start a new session on the next run
+                    </label>
+                  </div>
+                )}
+              </div>
+            )}
 
           {trigger !== null ? (
             <TriggerTemplateFields

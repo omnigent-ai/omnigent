@@ -32,6 +32,7 @@ import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { renderTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
 const gitWorkspace = vi.hoisted(() => ({
@@ -2210,6 +2211,43 @@ describe("CreateScheduledTaskDialog session mode", () => {
     const { input } = updateMutateAsync.mock.calls[0][0];
     expect(input.sessionId).toBeNull();
     expect(input).not.toHaveProperty("sessionMode");
+  });
+
+  it("keeps a template automation's one session on edit, offering only a reset", async () => {
+    const prompt = renderTriggerPrompt(
+      "jira",
+      {
+        event: "created",
+        scope: "ES",
+        conditions: [],
+        instructions: "Triage it.",
+        linkBack: true,
+      },
+      { placement: "same_host", sessionLink: "https://omni.example.com/c/CONVERSATION_ID" },
+    );
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1", prompt }));
+    expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.sessionId).toBeNull();
+    expect(input).not.toHaveProperty("sessionMode");
+  });
+
+  it("shows nothing about the session for a template automation that hasn't run", () => {
+    const prompt =
+      "This automation watches Slack and starts one Omnigent session for each newly created message that matches.";
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", prompt }));
+    expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
+  });
+
+  it("keeps the session choice when editing an automation written by hand", () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1" }));
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "Continue in the same session",
+    );
   });
 
   it("offers no new-session option before the first run creates a session", () => {
