@@ -1,10 +1,16 @@
 # Pull request conversations
 
 Read, reply to and start GitHub review conversations beside the code in a pull
-request's Changes subtab. Top-level comments remain in Comments.
+request's Changes subtab. Top-level comments, commits and force pushes appear
+together in Comments.
 
 ## Sub-features
 
+- `request-selection`: A single PR opens its details directly; multiple PRs open
+  a list with navigation back from details.
+- `commit-history`: Comments interleave commit and force-push entries by time,
+  with short commit links and exact timestamps on hover. Missing history is
+  marked incomplete; the Comments badge counts only comments.
 - `inline-threads`: Published conversations on old/new lines, both diff layouts,
   separate conversations at the same line and multiline range labels.
 - `suggestions`: Fenced suggestions show referenced lines as removals and the
@@ -24,23 +30,42 @@ request's Changes subtab. Top-level comments remain in Comments.
   other subtabs, the PR list and the collapsed rail stop requesting them.
   A compact **Loading review threads** spinner beside the layout toggle indicates
   an in-flight read. Conversation navigation shares the diff toolbar.
+- `render-recovery`: A panel render failure shows **Try again** while chat,
+  Workspace tabs and mobile Close remain usable.
 
 ## How to get to it (user POV)
 
-- `rail`: Open a session, expand Workspace, choose Pull Requests, select a request
-  from the list, then open Changes.
-- `composer-desktop`: Click the desktop composer's PR link, select a request,
-  then open Changes.
-- `composer-mobile`: Tap the composer's PR link, select a request in the drawer,
-  then open Changes.
+- `rail`: Open a session, expand Workspace, choose Pull Requests, then open Changes.
+- `composer-desktop`: Click the desktop composer's PR link, then open Changes.
+- `composer-mobile`: Tap the composer's PR link, then open Changes in the drawer.
 - `canvas`: Open a conversation beside Canvas, click its composer PR link,
-  select a request, then open Changes.
+  then open Changes.
+
+A session with one PR opens its details directly. With multiple PRs, select a
+request from the list first; **All pull requests** returns to that list.
+Choose Comments on any of these surfaces to see commit history.
+
+With a pointer, hovering the composer's PR link previews each PR's status. The
+icon beside each title opens that PR in a new browser tab without opening the
+panel. `tests/e2e_ui/github/test_composer_pr_status.py` covers the preview,
+its links and the touch and keyboard paths.
+
+On each surface, **Try again** retries failed panel content. Switching sessions
+also clears a failed panel. Healthy chat drafts stay mounted; content inside a
+failed panel is recreated on recovery.
 
 ## Driving it with the repro environment
 
 Preconditions: Build this checkout and launch the isolated instance with
 [Verify Omnigent](skills/verify-omnigent/SKILL.md). No live GitHub credentials
 are needed for the browser journeys; their PR responses are stubbed.
+
+`tests/e2e_ui/github/test_github_tab.py::test_github_tab_shows_summary_checks_and_file_tree`
+covers single-PR details through `rail` and `canvas`.
+`tests/e2e_ui/github/test_github_tab.py::test_composer_pr_link_opens_github_tab`
+covers single and multiple PRs through the desktop and mobile composers.
+`tests/e2e_ui/github/test_session_pr_selection.py::test_session_pr_selection_and_unlink`
+covers linking and unlinking across multiple, single and empty PR states.
 
 Run `tests/e2e_ui/github/test_github_tab.py::test_reply_to_inline_review_conversation`
 through the instance with recording enabled. Its four variants cover `rail`,
@@ -58,8 +83,16 @@ cover side/range selection, partial patches and historical coordinates.
 
 The existing
 `tests/e2e_ui/github/test_github_tab.py::test_post_top_level_pr_comment`
-covers the separate Comments composer. Component and runner tests carry the
+covers the separate Comments composer and interleaved commit/force-push history
+through all four entry points. Component and runner tests carry the
 pagination, old-side placement, revision, permission and failure matrices.
+
+Render recovery has component coverage in
+`web/src/components/RenderErrorBoundary.test.tsx` and
+`web/src/shell/AppShell.pullRequestTabVisibility.test.tsx`. Manually inject a
+render exception in the panel and open it through each entry above. Confirm
+chat, Workspace tabs or mobile Close still work; clear the fault and choose
+**Try again**. Also navigate to another session and confirm recovery.
 
 For a live check, use a disposable GitHub PR with current, old-side, resolved
 and outdated threads. Open Changes, compare both layouts to GitHub, focus the
@@ -78,6 +111,10 @@ outdated thread and confirm the suggestion uses its labeled original context.
 
 - Browser stubs prove UI behavior; runner/host tests prove provider transport.
   They do not constitute a live GitHub write test.
+- GitHub exposes commit times, not regular push times. Commit rows use commit
+  time; force-push rows use the event time. The latest 100 activity entries are
+  loaded; an incomplete-history link opens the full GitHub timeline.
+  Timeline-only reads may be cached for 30 seconds; comments still refresh normally.
 - Session file comments addressed to the agent and PR top-level comments are
   separate features. Review replies publish immediately, without a draft review.
 - Older history refreshes on demand; a first-page poll does not refresh every page.

@@ -113,6 +113,15 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Automation failure visibility](./automation-failures.md) covers failed-run card
+  warnings, Inbox surfacing, session deduplication and browser-local dismissal.
+
+- [Automation templates](./automation-templates.md) covers the gallery tabs,
+  suggestions on Your automations, and direct template setup.
+
+- [Automations introduction](./automations-introduction.md) covers the first-visit
+  walkthrough, capability-dependent content, and browser-local dismissal.
+
 - [Pull request conversations](./pull-request-conversations.md) covers inline
   GitHub threads and replies through Workspace, composer, mobile and Canvas.
 
@@ -241,7 +250,19 @@ header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost
 budgets, MCP servers, sandbox provider lifecycle beyond profile configuration,
-and smart routing.
+and smart routing. Smart routing's per-worker model lists, which `sys_list_models`
+also returns, are covered by component tests: `tests/test_model_catalog.py` for
+the worker rows and `tests/host/test_connect.py` for the host's
+`GET /v1/hosts/{id}/harnesses/claude-sdk/model-options` answer. A Claude Code or
+Codex SDK worker on a CLI login lists the host's cached native probe of that
+login; behind a gateway, `apiKeyHelper` or cloud transport, with Codex logged
+out, or when the child launches a different CLI or arguments than the host
+probed, it lists nothing. To check one by hand, give an `openai-agents` brain on
+the mock model a `codex` SDK worker as an agent tool, launch it on a host with a
+Codex subscription, script it to call `sys_list_models`, and open the List models
+result; the host's boot probe writes the catalog, and Codex lists models without
+a login. A host passes `HARNESS_CODEX_*` to its runners only when
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH` names them.
 
 ## Keeping the map current
 
