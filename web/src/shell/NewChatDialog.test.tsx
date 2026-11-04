@@ -5617,17 +5617,23 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("dismisses sibling popovers and restores each trigger's focus on Escape", async () => {
+    const user = userEvent.setup();
     renderLanding();
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
     const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
 
+    await user.hover(workspaceTrigger);
+    expect(await screen.findByRole("tooltip", {}, { timeout: 3000 })).toHaveTextContent(
+      "Working directory: /Users/corey/repo",
+    );
     fireEvent.click(workspaceTrigger);
     expect(screen.getByTestId("new-chat-landing-workspace-open-folder")).toBeVisible();
-    expect(workspaceTrigger).not.toHaveAttribute("title");
+    // An open popover hides its trigger's tooltip.
+    expect(screen.queryByRole("tooltip")).toBeNull();
 
     fireEvent.click(worktreeTrigger);
     expect(await screen.findByTestId("new-chat-landing-branch-input")).toBeVisible();
-    expect(worktreeTrigger).not.toHaveAttribute("title");
+    expect(screen.queryByRole("tooltip")).toBeNull();
     await waitFor(() =>
       expect(screen.queryByTestId("new-chat-landing-workspace-open-folder")).toBeNull(),
     );
@@ -5635,12 +5641,14 @@ describe("NewChatLandingScreen", () => {
     closeMenu();
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
     expect(worktreeTrigger).toHaveFocus();
+    // Focus handed back on close doesn't reopen the tooltip.
+    expect(screen.queryByRole("tooltip")).toBeNull();
 
     fireEvent.click(worktreeTrigger);
     expect(await screen.findByTestId("new-chat-landing-branch-input")).toBeVisible();
     fireEvent.click(workspaceTrigger);
     expect(screen.getByTestId("new-chat-landing-workspace-open-folder")).toBeVisible();
-    expect(workspaceTrigger).not.toHaveAttribute("title");
+    expect(screen.queryByRole("tooltip")).toBeNull();
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
 
     closeMenu();
@@ -5648,6 +5656,7 @@ describe("NewChatLandingScreen", () => {
       expect(screen.queryByTestId("new-chat-landing-workspace-open-folder")).toBeNull(),
     );
     expect(workspaceTrigger).toHaveFocus();
+    expect(screen.queryByRole("tooltip")).toBeNull();
 
     fireEvent.click(worktreeTrigger);
     expect(await screen.findByTestId("new-chat-landing-branch-input")).toBeVisible();

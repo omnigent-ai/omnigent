@@ -1,6 +1,7 @@
 import {
   forwardRef,
   useEffect,
+  useId,
   useRef,
   useState,
   type ComponentPropsWithoutRef,
@@ -67,6 +68,25 @@ export function ComposerWorkspaceBar({
   );
 }
 
+/**
+ * Tooltip text only reaches assistive tech while the tooltip is open, so text
+ * that adds to the accessible name also gets a persistent hidden description.
+ */
+export function useTooltipDescription(name: string | undefined, details: ReactNode) {
+  const id = useId();
+  if (typeof details !== "string" || details === name) {
+    return { describedBy: undefined, description: null };
+  }
+  return {
+    describedBy: id,
+    description: (
+      <span id={id} className="sr-only">
+        {details}
+      </span>
+    ),
+  };
+}
+
 export const ComposerWorkspaceTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
@@ -84,6 +104,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
   ref,
 ) {
   const Icon = kind === "directory" ? FolderIcon : GitForkIcon;
+  const { describedBy, description } = useTooltipDescription(props["aria-label"] ?? label, tooltip);
   return (
     <ComposerMenuTooltip
       menuOpen={menuOpen}
@@ -97,6 +118,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
         type="button"
         // Icon-only while the bar is collapsed, so the label is the name.
         aria-label={label}
+        aria-describedby={describedBy}
         className={cn(
           "relative inline-flex h-6 min-w-10 mobile-touch-target mobile-app:h-auto max-w-full cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
           className,
@@ -114,6 +136,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
         )}
         <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
       </button>
+      {description}
     </ComposerMenuTooltip>
   );
 });

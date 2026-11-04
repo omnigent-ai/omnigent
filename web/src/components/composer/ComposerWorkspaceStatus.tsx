@@ -1,6 +1,7 @@
 import { FolderIcon, GitForkIcon } from "lucide-react";
 
 import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
+import { useTooltipDescription } from "./ComposerControls";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ComposerBranchState } from "@/hooks/useComposerGitStatus";
 import { cn } from "@/lib/utils";
@@ -89,30 +90,35 @@ function WorkspaceStatusItem({
   ariaLabel: string;
   testId: string;
 }) {
+  const { describedBy, description } = useTooltipDescription(ariaLabel, title);
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span
-          className="relative inline-flex h-6 min-w-0 max-w-[calc(50%-0.25rem)] items-center gap-1 px-1 text-xs leading-4 font-normal text-muted-foreground"
-          aria-label={ariaLabel}
-          data-testid={testId}
-        >
-          <Icon className="size-3.5 shrink-0" aria-hidden />
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
           <span
-            data-workspace-collapse-label=""
-            className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+            className="relative inline-flex h-6 min-w-0 max-w-[calc(50%-0.25rem)] items-center gap-1 px-1 text-xs leading-4 font-normal text-muted-foreground"
+            aria-label={ariaLabel}
+            aria-describedby={describedBy}
+            data-testid={testId}
           >
-            {label}
+            <Icon className="size-3.5 shrink-0" aria-hidden />
+            <span
+              data-workspace-collapse-label=""
+              className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+            >
+              {label}
+            </span>
           </span>
-        </span>
-      </TooltipTrigger>
-      <TooltipContent
-        side="top"
-        align="start"
-        className="max-w-[min(36rem,calc(100vw-2rem))] break-all"
-      >
-        {title}
-      </TooltipContent>
-    </Tooltip>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          align="start"
+          className="max-w-[min(36rem,calc(100vw-2rem))] break-all"
+        >
+          {title}
+        </TooltipContent>
+      </Tooltip>
+      {description}
+    </>
   );
 }

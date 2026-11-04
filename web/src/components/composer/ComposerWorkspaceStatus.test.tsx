@@ -59,6 +59,8 @@ describe("ComposerWorkspaceStatus", () => {
     render(<ComposerWorkspaceStatus {...base} workspacePath="/home/alice/projects/repo" />);
     const directory = screen.getByTestId("composer-workspace-dir");
     expect(directory).not.toHaveAttribute("title");
+    // The name already carries the path, so no duplicate description.
+    expect(directory).not.toHaveAttribute("aria-describedby");
     await user.hover(directory);
     expect(await screen.findByRole("tooltip", {}, TOOLTIP_WAIT)).toHaveTextContent(
       "Working directory: /home/alice/projects/repo",
@@ -78,6 +80,10 @@ describe("ComposerWorkspaceStatus", () => {
     const worktree = screen.getByTestId("composer-git-branch");
     expect(worktree).toHaveTextContent("Branch unavailable");
     expect(worktree).not.toHaveAttribute("title");
+    // Screen readers get the history without hovering.
+    expect(worktree).toHaveAccessibleDescription(
+      "Branch unavailable. Created on branch feature/created.",
+    );
     await user.hover(worktree);
     expect(await screen.findByRole("tooltip", {}, TOOLTIP_WAIT)).toHaveTextContent(
       "Branch unavailable. Created on branch feature/created.",

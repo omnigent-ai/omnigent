@@ -100,6 +100,8 @@ describe("shared composer controls", () => {
     );
     const trigger = screen.getByRole("button", { name: "repo" });
     expect(trigger).not.toHaveAttribute("title");
+    // Screen readers get the details without hovering.
+    expect(trigger).toHaveAccessibleDescription("Working directory: /home/alice/repo");
     await user.hover(trigger);
     expect(await screen.findByRole("tooltip", {}, { timeout: 3000 })).toHaveTextContent(
       "Working directory: /home/alice/repo",
