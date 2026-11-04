@@ -62,6 +62,7 @@ class _Sessions:
         self.labels = labels or {}
         self.get_error = get_error
         self.list_calls: list[str | None] = []
+        self.get_flags: list[dict[str, bool]] = []
 
     async def list_items(
         self, session_id: str, *, limit: int, after: str | None, order: str
@@ -72,7 +73,8 @@ class _Sessions:
             raise page
         return PaginatedList.from_dict({"data": page})
 
-    async def get(self, session_id: str) -> SimpleNamespace:
+    async def get(self, session_id: str, **flags: bool) -> SimpleNamespace:
+        self.get_flags.append(flags)
         if self.get_error is not None:
             raise self.get_error
         return SimpleNamespace(labels=self.labels)
@@ -444,6 +446,15 @@ async def test_overview_resolves_conversation_from_response_and_renders_events()
 
     assert "Session ID: conv_root" in text
     assert "Labels: a=1, b=2" in text
+    # Only labels are read from the snapshot, so its expensive parts are skipped.
+    assert sessions.get_flags == [
+        {
+            "include_items": False,
+            "include_liveness": False,
+            "include_live_status": False,
+            "include_usage": False,
+        }
+    ]
     assert "Messages: 2" in text
     assert "[1] type=tool_call_request name=Bash" in text
     # The output row picks its tool name up from the earlier request.
@@ -501,3 +512,87 @@ async def test_overview_reports_item_fetch_failure(monkeypatch: pytest.MonkeyPat
 
     assert "Failed to fetch conversation items: RuntimeError: items down" in text
     assert "Messages:" not in text
+
+
+# ── overview items cache ─────────────────────────────────────
+
+
+class _CursorSessions:
+    """Serves a mutable item list by cursor, like ``GET /v1/sessions/{id}/items``."""
+
+    def __init__(self, count: int) -> None:
+        self.items: list[dict[str, object]] = [
+            {"type": "message", "id": f"it_{i}", "role": "user", "content": []}
+            for i in range(count)
+        ]
+        self.calls: list[str | None] = []
+        self.stale_after: set[str] = set()
+
+    async def list_items(
+        self, session_id: str, *, limit: int, after: str | None, order: str
+    ) -> PaginatedList:
+        self.calls.append(after)
+        if after in self.stale_after:
+            raise StaleCursorError("cursor item deleted")
+        ids = [item["id"] for item in self.items]
+        start = 0 if after is None else ids.index(after) + 1
+        return PaginatedList.from_dict({"data": self.items[start : start + limit]})
+
+
+async def test_overview_items_reread_only_the_newest_page() -> None:
+    sessions = _CursorSessions(250)
+    cache: dict[str, _repl._OverviewItems] = {}
+
+    first = await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
+    assert [item["id"] for item in first] == [f"it_{i}" for i in range(250)]
+    assert sessions.calls == [None, "it_99", "it_199"]
+
+    sessions.calls.clear()
+    again = await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
+    assert again == first
+    # One request: the newest page, re-read from just before it.
+    assert sessions.calls == ["it_150"]
+
+
+async def test_overview_items_pick_up_new_and_changed_tail_items() -> None:
+    sessions = _CursorSessions(250)
+    cache: dict[str, _repl._OverviewItems] = {}
+    await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
+
+    sessions.items[240] = {**sessions.items[240], "status": "completed"}
+    sessions.items.append({"type": "message", "id": "it_250", "role": "assistant", "content": []})
+    items = await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
+
+    assert len(items) == 251
+    assert items[240]["status"] == "completed"
+    assert items[-1]["id"] == "it_250"
+
+
+async def test_overview_items_walk_everything_when_the_cursor_goes_stale() -> None:
+    sessions = _CursorSessions(250)
+    cache: dict[str, _repl._OverviewItems] = {}
+    await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
+
+    del sessions.items[10]
+    sessions.stale_after.add("it_150")
+    sessions.calls.clear()
+    items = await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
+
+    assert len(items) == 249
+    assert sessions.calls[:2] == ["it_150", None]
+
+
+async def test_overview_items_walk_everything_after_the_refresh_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = _CursorSessions(250)
+    cache: dict[str, _repl._OverviewItems] = {}
+    await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
+
+    sessions.items[0] = {**sessions.items[0], "status": "edited"}
+    monkeypatch.setattr(_repl, "_OVERVIEW_FULL_REFRESH_SECONDS", 0.0)
+    sessions.calls.clear()
+    items = await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
+
+    assert sessions.calls == [None, "it_99", "it_199"]
+    assert items[0]["status"] == "edited"
