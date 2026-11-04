@@ -1176,19 +1176,32 @@ export function ErrorState({
 }) {
   const command = diagnostics?.command;
   const manualCommand = command || diagnostics?.setupCommand || "omni setup";
+  const reason = error.replace(/^host install failed: /, "");
+  const displayReason = reason.charAt(0).toUpperCase() + reason.slice(1);
   return (
     <>
       <DialogDescription>
-        Nothing changed on {hostName}. Try again, or run setup in a terminal on that machine.
+        Nothing changed on {hostName}.{" "}
+        {command
+          ? "Fix the problem below and try again."
+          : "Try again, or run setup in a terminal on that machine."}
       </DialogDescription>
-      {command && (
-        <div className="space-y-2">
-          <p className="text-ui text-muted-foreground">Ran on {hostName}</p>
-          <CommandRow command={command} label="Copy install command" />
-        </div>
-      )}
       <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-3.5 py-2.5 text-ui text-destructive">
-        {error}
+        {displayReason}
+      </div>
+      <div className="space-y-2">
+        <p className="text-ui text-muted-foreground">
+          {command ? `Command run on ${hostName}` : `Run this yourself on ${hostName}`}
+        </p>
+        <CommandRow
+          command={manualCommand}
+          label={command ? "Copy install command" : `Copy ${manualCommand}`}
+        />
+        {command && (
+          <p className="text-sm text-muted-foreground">
+            Run it yourself in a terminal on {hostName} to see the full output.
+          </p>
+        )}
       </div>
       {diagnostics?.outputTail && (
         <details className="rounded-xl border border-border px-3.5 py-2.5 text-ui">
@@ -1198,13 +1211,6 @@ export function ErrorState({
           </pre>
         </details>
       )}
-      <div className="space-y-2">
-        <p className="text-ui text-muted-foreground">Run this yourself on {hostName}</p>
-        <CommandRow
-          command={manualCommand}
-          label={command ? "Copy manual install command" : `Copy ${manualCommand}`}
-        />
-      </div>
     </>
   );
 }
