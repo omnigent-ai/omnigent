@@ -23,6 +23,11 @@ describe("isRetryableRequestError", () => {
     }
   });
 
+  it("retries wrong_replica, which clears once routing settles", () => {
+    expect(isRetryableRequestError(new ApiError("moved", 400, "wrong_replica"))).toBe(true);
+    expect(isRetryableRequestError(new ApiError("bad", 400, "invalid_input"))).toBe(false);
+  });
+
   it("keeps retrying network failures and errors without a status", () => {
     expect(isRetryableRequestError(new TypeError("Failed to fetch"))).toBe(true);
     expect(isRetryableRequestError(new Error("500 Internal Server Error"))).toBe(true);

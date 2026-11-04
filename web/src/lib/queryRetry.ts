@@ -1,3 +1,4 @@
+import { WRONG_REPLICA_CODE } from "@/lib/identity";
 import { ApiError } from "@/lib/sessionsApi";
 
 // Pacing for automatic query retries. The delay doubles from 1 s up to 30 s and
@@ -18,11 +19,14 @@ const RETRYABLE_CLIENT_STATUSES = new Set([408, 425, 429]);
  *
  * @param error - The query's error.
  * @returns `false` for a client error the same request will hit again (bad
- *   input, missing session, no access); `true` for 5xx, throttling, network
- *   failures, and errors without a status.
+ *   input, missing session, no access); `true` for 5xx, throttling,
+ *   `wrong_replica`, network failures, and errors without a status.
  */
 export function isRetryableRequestError(error: unknown): boolean {
   if (error instanceof ApiError) {
+    // A 400 `wrong_replica` is routing, not the request: it clears once Dicer
+    // finishes reassigning keys, e.g. while pods roll.
+    if (error.code === WRONG_REPLICA_CODE) return true;
     return error.status >= 500 || RETRYABLE_CLIENT_STATUSES.has(error.status);
   }
   return true;
