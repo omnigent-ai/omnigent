@@ -346,7 +346,12 @@ describe("bridge runtime scroll position", () => {
       .spyOn(window, "scrollTo")
       .mockImplementation((options?: ScrollToOptions | number) => {
         if (typeof options === "object" && typeof options.top === "number") {
+          const previous = scrollY;
           scrollY = clamp(options.top);
+          // Like a browser, deliver the scroll event on the next frame, before its callbacks.
+          if (scrollY !== previous) {
+            requestAnimationFrame(() => window.dispatchEvent(new Event("scroll")));
+          }
         }
       });
     const userScrollTo = (top: number) => {
@@ -478,22 +483,63 @@ describe("bridge runtime scroll position", () => {
     expect(sentScrollOffsets(port)).toEqual([]);
   });
 
-  it("re-asserts the saved offset once when a throttled frame lands past the budget", () => {
-    const { scrollTo, setPageHeight } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
-    const hide = addRestoreHide();
-    const port = startRuntime({ restoreScroll: restoreTo(640) });
-    expect(window.scrollY).toBe(232);
-    // A background tab runs no frames while the page grows and the budget passes.
-    setPageHeight(2_000);
-    vi.spyOn(performance, "now").mockReturnValue(performance.now() + BUDGET_MS);
-    vi.advanceTimersToNextFrame();
-    expect(scrollTo).toHaveBeenCalledTimes(2);
-    expect(window.scrollY).toBe(640);
-    expect(hide.isConnected).toBe(false);
-    vi.advanceTimersToNextFrame();
-    expect(scrollTo).toHaveBeenCalledTimes(2);
-    expect(sentScrollOffsets(port)).toEqual([]);
-  });
+  it.each([
+    ["after the last write's scroll event arrives", false],
+    ["before the last write's scroll event arrives", true],
+  ])(
+    "doesn't report where a spent budget's last write leaves a page that grew partway, but reports a reader scroll %s",
+    (_when, readerScrollsFirst) => {
+      const { userScrollTo, setPageHeight } = fakeScrolling({
+        pageHeight: CLAMPING_PAGE_HEIGHT,
+      });
+      const hide = addRestoreHide();
+      const deadline = performance.now() + BUDGET_MS;
+      const port = startRuntime({ restoreScroll: restoreTo(640) });
+      // Run frames until the next one finds the budget spent.
+      while (performance.now() + 16 < deadline) vi.advanceTimersToNextFrame();
+      expect(hide.isConnected).toBe(true);
+
+      setPageHeight(1_287); // the page can now scroll to 519
+      vi.advanceTimersToNextFrame();
+      expect(window.scrollY).toBe(519);
+      expect(hide.isConnected).toBe(false);
+
+      if (!readerScrollsFirst) {
+        vi.advanceTimersToNextFrame(); // delivers the write's scroll event
+        vi.advanceTimersToNextFrame(); // where its report would go out
+        expect(sentScrollOffsets(port)).toEqual([]);
+      }
+      userScrollTo(300);
+      vi.advanceTimersToNextFrame();
+      vi.advanceTimersToNextFrame();
+      expect(sentScrollOffsets(port)).toEqual([300]);
+    },
+  );
+
+  it.each([
+    [2_000, 640],
+    [1_287, 519],
+  ])(
+    "re-asserts the saved offset once when a throttled frame lands past the budget on a %ipx page",
+    (grownHeight, landedAt) => {
+      const { scrollTo, setPageHeight } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+      const hide = addRestoreHide();
+      const port = startRuntime({ restoreScroll: restoreTo(640) });
+      expect(window.scrollY).toBe(232);
+      // A background tab runs no frames while the page grows and the budget passes.
+      setPageHeight(grownHeight);
+      vi.spyOn(performance, "now").mockReturnValue(performance.now() + BUDGET_MS);
+      vi.advanceTimersToNextFrame();
+      expect(scrollTo).toHaveBeenCalledTimes(2);
+      expect(window.scrollY).toBe(landedAt);
+      expect(hide.isConnected).toBe(false);
+      // The write's scroll event arrives a frame later, and its report would go out the next.
+      vi.advanceTimersToNextFrame();
+      vi.advanceTimersToNextFrame();
+      expect(scrollTo).toHaveBeenCalledTimes(2);
+      expect(sentScrollOffsets(port)).toEqual([]);
+    },
+  );
 
   it("turns scroll anchoring off until the restore settles, then gives the page its own", () => {
     fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });

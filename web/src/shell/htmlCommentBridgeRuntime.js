@@ -221,6 +221,7 @@
   let scrollRestore = null; // { top, deadline, y, layout, anchoring, inputs } while restoring
   let scrollRestoreFrame = 0;
   let restoreHide = null; // the injected style hiding the page until the restore ends
+  let spentRestoreTop = null; // where a spent budget left the page, until its scroll event arrives
 
   function revealPage() {
     if (restoreHide) restoreHide.remove();
@@ -244,6 +245,7 @@
       window.removeEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, true);
     }
     if (report) onScroll();
+    else spentRestoreTop = window.scrollY;
   }
 
   // Keys typed into a form field or editable text move its caret or value, not the page.
@@ -362,6 +364,12 @@
   let scrollReportMissed = false;
   function onScroll() {
     if (scrollRestore && readerMovedDuringRestore()) settleScrollRestore(true);
+    if (spentRestoreTop !== null) {
+      // The browser delivers the spent restore's last write after it ends; that isn't the reader's.
+      const restoreWrite = Math.abs(window.scrollY - spentRestoreTop) < 1;
+      spentRestoreTop = null;
+      if (restoreWrite) return;
+    }
     if (scrollRestore || scrollReportFrame) return;
     scrollReportFrame = requestAnimationFrame(function () {
       scrollReportFrame = 0;
