@@ -1,5 +1,6 @@
 """Family membership is nullable, tenant-scoped, and indexed for bounded reads."""
 
+from collections.abc import Callable
 from importlib import import_module
 
 import sqlalchemy as sa
@@ -89,7 +90,8 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
     index = "ix_conversation_metadata_family_id"
     assert "family_id" in {c["name"] for c in sa.inspect(engine).get_columns(table)}
     assert sa.inspect(engine).has_index(table, index)
-    for operation in (migration.downgrade, migration.upgrade):
+
+    def migrate(operation: Callable[[], None]) -> None:
         with engine.connect() as connection:
             if engine.dialect.name == "cockroachdb":
                 _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
@@ -97,23 +99,37 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
             with Operations.context(context), context.begin_transaction():
                 operation()
             connection.commit()
-    if engine.dialect.name == "postgresql":
-        with engine.connect() as connection:
-            # Simulate a failed concurrent build after the column was committed.
-            connection.execute(
-                sa.text(
-                    "UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass(:name)"
-                ),
-                {"name": index},
-            )
-            connection.commit()
-            context = MigrationContext.configure(connection)
-            with Operations.context(context), context.begin_transaction():
-                migration.upgrade()
-            assert connection.execute(
-                sa.text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:name)"),
-                {"name": index},
-            ).scalar_one()
-    assert next(i for i in sa.inspect(engine).get_indexes(table) if i["name"] == index)[
-        "column_names"
-    ] == ["workspace_id", "family_id", "id"]
+
+    try:
+        migrate(migration.downgrade)
+        migrate(migration.upgrade)
+        if engine.dialect.name == "postgresql":
+            with engine.connect() as connection:
+                # Simulate a failed concurrent build after the column was committed.
+                connection.execute(
+                    sa.text(
+                        "UPDATE pg_index SET indisvalid = false "
+                        "WHERE indexrelid = to_regclass(:name)"
+                    ),
+                    {"name": index},
+                )
+                connection.commit()
+                context = MigrationContext.configure(connection)
+                with Operations.context(context), context.begin_transaction():
+                    migration.upgrade()
+                assert connection.execute(
+                    sa.text(
+                        "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:name)"
+                    ),
+                    {"name": index},
+                ).scalar_one()
+        assert next(i for i in sa.inspect(engine).get_indexes(table) if i["name"] == index)[
+            "column_names"
+        ] == ["workspace_id", "family_id", "id"]
+    finally:
+        if (
+            engine.dialect.name == "postgresql"
+            or "family_id" not in {c["name"] for c in sa.inspect(engine).get_columns(table)}
+            or not sa.inspect(engine).has_index(table, index)
+        ):
+            migrate(migration.upgrade)
