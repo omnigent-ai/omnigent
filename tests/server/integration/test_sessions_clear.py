@@ -34,6 +34,7 @@ from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import HostHelloFrame
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -50,6 +51,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core, routes_events
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.sharing_settings import DefaultPublicSessions
@@ -812,9 +814,31 @@ async def test_claude_sdk_clear_tells_an_offline_runner_from_one_on_another_repl
         assert live_runner.superseded == []
         return
     assert resp.status_code == 202, resp.text
-    fork = store.get_conversation(resp.json()["session_id"])
+    new_id = resp.json()["session_id"]
+    fork = store.get_conversation(new_id)
     assert fork is not None
     assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
+
+    # Its next message asks the original host to launch a runner in the same workspace.
+    app.state.host_registry.register(
+        _HOST_ID,
+        AsyncMock(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="laptop", runners=[]),
+        owner=None,
+    )
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+    launches: list[tuple[str, str | None, str | None]] = []
+
+    async def launch_runner_on_host(conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        launches.append((conv.id, conv.host_id, conv.workspace))
+        return _HostLaunchAttempt(
+            runner_id="runner_relaunched", error_code="harness_not_configured", error="stop here"
+        )
+
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", launch_runner_on_host)
+    sent = await client.post(f"/v1/sessions/{new_id}/events", json=_MESSAGE_INPUT)
+    assert sent.status_code == 202, sent.text
+    assert launches == [(new_id, _HOST_ID, "/work/repo")]
 
 
 @pytest.mark.parametrize(
