@@ -105,7 +105,10 @@ class _FeatureFlag(Generic[T]):
         if not runtime_flag_value_matches(self.value_type, default_value):
             raise ValueError(f"default for {self.value_type} flag {name!r} has the wrong type")
         self.name = name
-        self.default_value = default_value
+        # Copy a list default so later edits to the caller's list cannot change it.
+        self.default_value = (
+            list(default_value) if isinstance(default_value, list) else default_value
+        )  # type: ignore[assignment]
         with _registry_lock:
             existing = _registry.get(name)
             if existing is None:

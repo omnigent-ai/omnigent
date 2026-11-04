@@ -208,9 +208,20 @@ def test_declarations_validate_name_default_and_conflicts() -> None:
         IntFeatureFlag("test.limit", True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="wrong type"):
         IntFeatureFlag("test.limit", 2**31)
+    assert IntFeatureFlag("test.int_min", -(2**31)).default_value == -(2**31)
+    with pytest.raises(ValueError, match="wrong type"):
+        IntFeatureFlag("test.int_under", -(2**31) - 1)
     assert LongFeatureFlag("test.long_max", 2**63 - 1).default_value == 2**63 - 1
+    assert LongFeatureFlag("test.long_min", -(2**63)).default_value == -(2**63)
     with pytest.raises(ValueError, match="wrong type"):
         LongFeatureFlag("test.long_over", 2**63)
+    with pytest.raises(ValueError, match="wrong type"):
+        LongFeatureFlag("test.long_under", -(2**63) - 1)
+    groups = ["a"]
+    declared = StringListFeatureFlag("test.groups", groups)
+    groups.append("b")
+    assert declared.default_value == ["a"]
+    assert declared.get_current_value() == ["a"]
     assert StringFeatureFlag("test.mode", "on").get_current_value() == "on"
     with pytest.raises(ValueError, match="wrong type"):
         StringFeatureFlag("test.mode_number", 1)  # type: ignore[arg-type]
