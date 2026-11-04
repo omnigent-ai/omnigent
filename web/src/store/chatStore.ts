@@ -8130,6 +8130,25 @@ async function listFailedStartupInputs(
 /** Entries that saw their managed launch fail; its later failure report is read again. */
 const failedLaunchEntries = new WeakSet<ConversationEntry>();
 
+/** Per entry, how many failed-input lookups began and the latest begun that read them back. */
+const startupLookups = new WeakMap<ConversationEntry, { begun: number; latestRead: number }>();
+
+/** Begin a failed-input lookup: `read` records it read them back, `superseded` that a later one did. */
+function beginStartupLookup(entry: ConversationEntry): {
+  read: () => void;
+  superseded: () => boolean;
+} {
+  const lookups = startupLookups.get(entry) ?? { begun: 0, latestRead: 0 };
+  startupLookups.set(entry, lookups);
+  const order = ++lookups.begun;
+  return {
+    read: () => {
+      lookups.latestRead = Math.max(lookups.latestRead, order);
+    },
+    superseded: () => lookups.latestRead > order,
+  };
+}
+
 /**
  * Return a failed launch's undelivered startup messages to the composer.
  * A read that fails or times out is tried once more; then a notice offers Retry.
@@ -8140,6 +8159,7 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
   const entry = conversationRegistry.peek(conversationId);
   if (entry === undefined) return;
   failedLaunchEntries.add(entry);
+  const lookup = beginStartupLookup(entry);
   const unacknowledged = unacknowledgedSends(entry.getState().pendingUserMessages);
   const read = (signal: AbortSignal) => listFailedStartupInputs(conversationId, signal);
   const inputs =
@@ -8147,9 +8167,12 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
   // A conversation reopened under the same id during the read is a different entry.
   if (entry.disposed) return;
   if (inputs !== null) {
+    lookup.read();
     handBackFailedStartupInputs(entry, conversationId, inputs, unacknowledged);
     return;
   }
+  // A lookup begun later already read them back, so there's nothing to retry.
+  if (lookup.superseded()) return;
   entrySetter(entry)((state) => {
     if (state.blocks.some(isStartupLookupNotice)) return {};
     const notice: ErrorBlock = {
@@ -8172,12 +8195,14 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
 export async function retryFailedStartupLookup(conversationId: string): Promise<void> {
   const entry = conversationRegistry.peek(conversationId);
   if (entry === undefined || entry.disposed) throw new Error("The session is no longer open");
+  const lookup = beginStartupLookup(entry);
   const unacknowledged = unacknowledgedSends(entry.getState().pendingUserMessages);
   const inputs = await readWithinReconcileTimeout((signal) =>
     listFailedStartupInputs(conversationId, signal),
   );
   if (entry.disposed) return;
   if (inputs === null) throw new Error("The messages couldn't be read");
+  lookup.read();
   handBackFailedStartupInputs(entry, conversationId, inputs, unacknowledged);
 }
 

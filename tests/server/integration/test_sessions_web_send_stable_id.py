@@ -122,14 +122,20 @@ def _stub_runner(
     forwarded: list[dict[str, Any]] | None = None,
     *,
     status: int = 202,
+    skill_text: str | None = None,
 ) -> httpx.AsyncClient:
-    """Answer every forwarded turn with ``status``, recording each body in ``forwarded``."""
+    """Answer every forwarded turn with ``status``, recording each body in ``forwarded``.
+
+    With ``skill_text``, any skill resolves to it.
+    """
 
     def accept(request: httpx.Request) -> httpx.Response:
         if forwarded is not None:
             forwarded.append(json.loads(request.content))
         if status >= 400:
             return httpx.Response(status, json={"error": "no process manager"})
+        if skill_text is not None and request.url.path.endswith("/skills/resolve"):
+            return httpx.Response(200, json={"meta_text": skill_text})
         return httpx.Response(status, json={"queued": True})
 
     fake_runner = httpx.AsyncClient(

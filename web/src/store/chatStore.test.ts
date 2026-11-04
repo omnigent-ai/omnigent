@@ -4299,6 +4299,46 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(lookupNotices()).toEqual([]);
   });
 
+  it("adds no lookup notice when a read fails after a later one handed the inputs back", async () => {
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+    let reads = 0;
+    let failFirstRead: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input) !== "/v1/sessions/conv_real/failed-inputs")
+        return defaultFetchHandler(input, init);
+      reads += 1;
+      const failed = () => mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
+      if (reads === 1)
+        return new Promise<Response>((resolve) => {
+          failFirstRead = () => resolve(failed());
+        });
+      return reads === 2 ? defaultFetchHandler(input, init) : failed();
+    });
+    await useChatStore.getState().switchTo("conv_real");
+    await vi.waitFor(() => expect(failFirstRead).toBeDefined());
+
+    await retryFailedStartupLookup("conv_real");
+    failFirstRead!();
+    await settle();
+
+    expect(reads).toBe(3);
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_real",
+      text: "saved on server",
+      files: [],
+      startupInputIds: ["pending_first"],
+      recovered: true,
+    });
+    expect(
+      useChatStore
+        .getState()
+        .blocks.filter(
+          (block) => block.type === "error" && block.code === STARTUP_INPUT_LOOKUP_FAILED_CODE,
+        ),
+    ).toEqual([]);
+  });
+
   it("drops startup inputs read for a conversation that was reopened during the read", async () => {
     seedSession("conv_real");
     seedSession("conv_other");
