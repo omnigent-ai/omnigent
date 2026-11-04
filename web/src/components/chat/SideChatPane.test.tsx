@@ -1934,6 +1934,51 @@ it.each([false, true])(
   },
 );
 
+it("doesn't hand back a send whose text was deleted from the grid composer before a failed send replaced it", async () => {
+  onTestFinished(clearSessionDrafts);
+  const entry = conversationRegistry.acquire(childId);
+  entry.setState({ sessionStatus: "idle", abortController: new AbortController() });
+  useChatStore.setState({ send: initialStoreState.send });
+  renderPane(<SideChatPane childId={childId} fullSession />);
+  act(() =>
+    entry.setState({
+      failedSendDraft: {
+        conversationId: childId,
+        text: "saved on server",
+        files: [],
+        stableId: "stable_reload",
+        recovered: true,
+      },
+    }),
+  );
+  fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "" } });
+  act(() =>
+    entry.setState({
+      failedSendDraft: {
+        conversationId: childId,
+        text: "Retry",
+        files: [],
+        stableId: "stable_retry",
+      },
+    }),
+  );
+  expect(screen.getByTestId("side-chat-input")).toHaveValue("Retry");
+
+  vi.spyOn(sessionsApi, "listFailedInputs").mockResolvedValue([
+    {
+      pendingId: "pending_first",
+      itemId: "stable_reload",
+      content: [{ type: "input_text", text: "saved on server" }],
+    },
+  ]);
+  await act(() => retryFailedStartupLookup(childId));
+  expect(screen.getByTestId("side-chat-input")).toHaveValue("Retry");
+  const post = vi.spyOn(sessionsApi, "postEvent").mockResolvedValue({ queued: true });
+  fireEvent.click(screen.getByTestId("side-chat-send"));
+  await waitFor(() => expect(post).toHaveBeenCalledOnce());
+  expect(post.mock.calls[0][1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+});
+
 it.each([
   { holder: "the grid composer", sender: "the main composer", gridHolds: true },
   { holder: "the main composer's saved draft", sender: "the grid composer", gridHolds: false },

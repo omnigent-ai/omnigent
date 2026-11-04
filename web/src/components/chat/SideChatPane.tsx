@@ -547,6 +547,8 @@ function SideChatComposer({
       }));
       return;
     }
+    // Text deleted by hand leaves its sends' ids behind; replacing it drops them as clearing does.
+    clearComposer(childId);
     updateComposer(childId, () => ({
       text: failed.text,
       files: accepted,
@@ -561,7 +563,7 @@ function SideChatComposer({
         restoredSendDraft: { ...restored, files: accepted, replyDraft: undefined },
         pendingRetryStableId: errors.length > 0 ? null : entry.getState().pendingRetryStableId,
       });
-  }, [fullSession, childId, failedSendDraft, updateComposer, attachmentPolicy]);
+  }, [fullSession, childId, failedSendDraft, updateComposer, clearComposer, attachmentPolicy]);
   useEffect(() => {
     if (!fullSession || !restoredSendDraft?.delivered) return;
     const entry = conversationRegistry.peek(childId);
