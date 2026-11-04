@@ -1129,9 +1129,6 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
 
 
-@pytest.mark.parametrize(
-    "automations_v2_server", ["automations_v2,automations_subhour"], indirect=True
-)
 def test_ten_minute_host_schedule_round_trip(
     page: Page, automations_v2_server: str, automations_v2_host: Host
 ) -> None:

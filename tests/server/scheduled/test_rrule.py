@@ -429,20 +429,12 @@ def test_legacy_search_horizon_remains_midnight_based() -> None:
 
 @pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox", None])
 @pytest.mark.parametrize("session_mode", ["new", "continue"])
-@pytest.mark.parametrize("allow_subhour", [False, True])
 @pytest.mark.parametrize("minutes", [1, 5, 9, 10, 11, 15, 30, 59, 60])
-def test_minimum_interval_depends_on_execution(
-    execution_target, session_mode, allow_subhour, minutes
-):
-    minimum = (
-        10
-        if allow_subhour and (execution_target == "connected_host" or session_mode == "continue")
-        else 60
-    )
+def test_minimum_interval_depends_on_execution(execution_target, session_mode, minutes):
+    minimum = 10 if execution_target == "connected_host" or session_mode == "continue" else 60
     options = {
         "execution_target": execution_target,
         "session_mode": session_mode,
-        "allow_subhour": allow_subhour,
     }
     rule = f"FREQ=MINUTELY;INTERVAL={minutes}"
     if minutes < minimum:

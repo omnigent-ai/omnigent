@@ -273,7 +273,6 @@ def validate_rrule(
     *,
     session_mode: str = "new",
     execution_target: str | None = None,
-    allow_subhour: bool = True,
 ) -> RRuleTrigger:
     """Parse and validate an RRULE string for use as a recurring trigger.
 
@@ -292,7 +291,6 @@ def validate_rrule(
     :param session_mode: Continued sessions permit the ten-minute minimum.
     :param execution_target: Connected hosts also permit ten-minute new sessions.
         Omit to retain the conservative new-session hourly floor.
-    :param allow_subhour: API rollout gate; schedulers retain support for saved rules.
     :returns: An :class:`RRuleTrigger`.
     :raises RRuleValidationError: On bad syntax, never-fires, fires-once, or a
         sub-minimum interval.
@@ -325,7 +323,7 @@ def validate_rrule(
         raise RRuleValidationError("RRULE fires only once")
     minimum = (
         MIN_SUBHOUR_INTERVAL_SECONDS
-        if allow_subhour and (session_mode == "continue" or execution_target == "connected_host")
+        if session_mode == "continue" or execution_target == "connected_host"
         else MIN_INTERVAL_SECONDS
     )
     if min_gap < minimum:

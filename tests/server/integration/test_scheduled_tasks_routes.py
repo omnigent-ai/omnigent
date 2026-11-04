@@ -3135,26 +3135,19 @@ async def test_random_worktree_requires_pinned_repository(
 
 
 @pytest.mark.parametrize(
-    "execution_target,session_mode,subhour_enabled,minutes,status",
+    "execution_target,session_mode,minutes,status",
     [
-        ("connected_host", "new", True, 10, 200),
-        ("connected_host", "continue", True, 10, 200),
-        ("managed_sandbox", "continue", True, 10, 200),
-        ("managed_sandbox", "new", True, 10, 400),
-        ("managed_sandbox", "new", True, 60, 200),
-        ("connected_host", "new", False, 10, 400),
-        ("managed_sandbox", "continue", False, 10, 400),
+        ("connected_host", "new", 10, 200),
+        ("connected_host", "continue", 10, 200),
+        ("managed_sandbox", "continue", 10, 200),
+        ("managed_sandbox", "new", 10, 400),
+        ("managed_sandbox", "new", 60, 200),
     ],
 )
 async def test_create_interval_policy(
-    auth_client, auth_app, execution_target, session_mode, subhour_enabled, minutes, status
+    auth_client, auth_app, execution_target, session_mode, minutes, status
 ):
-    auth_app.state.feature_flags = resolve_feature_flags(
-        {"OMNIGENT_FEATURES": "automations_subhour" if subhour_enabled else ""}
-    )
     auth_app.state.sandbox_config = _sandbox_deployment()
-    info = await auth_client.get("/v1/info", headers=_headers())
-    assert info.json()["features"]["automations_subhour"] is subhour_enabled
     response = await auth_client.post(
         "/v1/scheduled-tasks",
         json=_create_body(
@@ -3174,9 +3167,6 @@ async def test_create_interval_policy(
 
 
 async def test_update_validates_effective_schedule_and_session_mode(auth_client, auth_app):
-    auth_app.state.feature_flags = resolve_feature_flags(
-        {"OMNIGENT_FEATURES": "automations_subhour"}
-    )
     auth_app.state.sandbox_config = _sandbox_deployment()
     response = await auth_client.post(
         "/v1/scheduled-tasks",
@@ -3198,14 +3188,6 @@ async def test_update_validates_effective_schedule_and_session_mode(auth_client,
     ]:
         response = await auth_client.patch(url, json=patch, headers=_headers())
         assert response.status_code == expected, response.text
-    auth_app.state.feature_flags = resolve_feature_flags({})
-    for patch, expected in [
-        ({"rrule": "FREQ=MINUTELY;INTERVAL=10"}, 400),
-        ({"session_mode": "continue"}, 400),
-        ({"state": "paused"}, 200),
-    ]:
-        response = await auth_client.patch(url, json=patch, headers=_headers())
-        assert response.status_code == expected, response.text
     saved = (await auth_client.get(url, headers=_headers())).json()
     assert (saved["session_mode"], saved["rrule"]) == ("continue", "FREQ=MINUTELY;INTERVAL=15")
     response = await auth_client.patch(
@@ -3220,9 +3202,6 @@ async def test_update_validates_effective_schedule_and_session_mode(auth_client,
 async def test_concurrent_schedule_edits_reject_stale_validation(
     auth_client, auth_app, monkeypatch, policy_field, recurrence_first
 ):
-    auth_app.state.feature_flags = resolve_feature_flags(
-        {"OMNIGENT_FEATURES": "automations_subhour"}
-    )
     auth_app.state.sandbox_config = _sandbox_deployment()
     initial = _create_body(
         execution_target="managed_sandbox" if policy_field == "session_mode" else "connected_host",
@@ -3239,8 +3218,8 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     validated = asyncio.Barrier(2)
     first_saved = asyncio.Event()
 
-    async def validate_together(request, rrule, session_mode, execution_target):
-        await validate(request, rrule, session_mode, execution_target)
+    async def validate_together(rrule, session_mode, execution_target):
+        await validate(rrule, session_mode, execution_target)
         await validated.wait()
         if (rrule == recurrence_patch["rrule"]) != recurrence_first:
             await first_saved.wait()

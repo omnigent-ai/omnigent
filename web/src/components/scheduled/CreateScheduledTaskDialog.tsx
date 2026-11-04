@@ -108,7 +108,7 @@ export function CreateScheduledTaskDialog({
   const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
-  const subhourSupported = isFeatureEnabled(info, "automations_subhour");
+  const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
   // gates on). "loading" → treat as disabled until /v1/info resolves.

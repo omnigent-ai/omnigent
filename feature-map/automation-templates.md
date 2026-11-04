@@ -71,7 +71,7 @@ to customize.
 - **Your automations:** select a suggestion beneath the saved automations or
   empty-state message, with All selected and the search cleared.
 - **Creation modal:** click New automation on either tab to start from scratch.
-  With `automations_v2` and `automations_subhour`, use Custom schedule → Minutes
+  With `automations_v2` on a server supporting sub-hour schedules, use Custom schedule → Minutes
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
@@ -90,7 +90,7 @@ Use the isolated environment and dismiss the first-visit introduction. The
 creation round-trip test supplies its own feature-enabled server and isolated
 host; run it with plain pytest and `--ui-skip-build` after building the SPA.
 No agent turn is needed.
-Minute-schedule checks additionally require `automations_v2,automations_subhour`.
+Minute-schedule checks use the server’s advertised sub-hour capability and `automations_v2`.
 
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`
   covers the preview and Templates tab with reload. It creates

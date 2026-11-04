@@ -37,7 +37,6 @@ class Feature(StrEnum):
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
-    AUTOMATIONS_SUBHOUR = "automations_subhour"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
 
 
@@ -83,12 +82,6 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.20.0",
-    ),
-    FeatureDefinition(
-        feature=Feature.AUTOMATIONS_SUBHOUR,
-        description="Accept sub-hour schedules on connected hosts or continued sandbox sessions",
-        owner="server",
-        review_by_release="0.22.0",
     ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,

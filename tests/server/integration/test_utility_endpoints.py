@@ -99,7 +99,6 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": False,
-        "automations_subhour": False,
         "splittable_terminal_view_ui": False,
         "session_orchestration": True,
         "codex_plan_at_launch": True,
@@ -117,6 +116,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["session_search_scope"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
+    assert data["scheduled_task_subhour"] is True
     assert data["scheduled_task_harness_settings"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True

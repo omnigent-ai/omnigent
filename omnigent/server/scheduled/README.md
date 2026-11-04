@@ -1,6 +1,6 @@
 # Persistent task scheduling
 
-With `automations_subhour` enabled, recurring schedules have a minimum interval
+Recurring schedules have a minimum interval
 of **10 minutes** on connected hosts in either session mode, and in sandboxes
 when continuing the existing session. Starting a new sandbox session each run
 requires **one hour**. Use `FREQ=MINUTELY;INTERVAL=10` for a ten-minute schedule.
@@ -559,18 +559,14 @@ automations.
 
 ## Sub-hour schedule rollout
 
-`automations_subhour` defaults off and controls acceptance on create and
-schedule, session-mode and execution-target updates. It is advertised in `/v1/info` so clients that cannot
-confirm support keep the hourly minimum. Schedulers in this version always
-understand persisted ten-minute host and continued-sandbox schedules, independently
-of the flag.
+API validation and both schedulers always support the target/mode minimums above.
+`/v1/info` reports the fixed `scheduled_task_subhour` capability so newer clients
+retain the hourly floor on older servers. The custom UI also needs `automations_v2`.
 
-1. Deploy this version to every API and scheduler replica sharing the database
-   with `automations_subhour` disabled. Keep the existing scheduler mode unchanged.
-2. Once every replica supports the lower floor, enable `automations_subhour`
-   through `OMNIGENT_FEATURES`; the custom UI also needs `automations_v2`.
-3. To stop accepting new sub-hour schedules, disable `automations_subhour`. Existing
-   schedules keep running and can still be paused, deleted or changed to hourly.
+Upgrade scheduler replicas before API replicas begin accepting sub-hour schedules,
+and avoid routing writes across mixed API versions during the rollout. Older API
+replicas reject short schedules; older schedulers can pause them as invalid.
+Keep the existing scheduler mode unchanged during the version upgrade.
 
 Updates validate the proposed recurrence, session mode and target outside the
 database transaction, then compare their saved values under the task row lock.

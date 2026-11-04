@@ -70,7 +70,6 @@ export type FeatureKey =
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"
-  | "automations_subhour"
   | "splittable_terminal_view_ui"
   | "session_orchestration";
 
@@ -240,6 +239,8 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /** Connected hosts and continued sandboxes accept ten-minute schedules. */
+  scheduled_task_subhour?: boolean;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
@@ -414,6 +415,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   archive_worktree_cleanup: false,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
@@ -574,6 +576,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          scheduled_task_subhour: data.scheduled_task_subhour === true,
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
