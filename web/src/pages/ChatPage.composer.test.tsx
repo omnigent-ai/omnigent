@@ -1247,7 +1247,7 @@ describe("Composer slash-command menu", () => {
     expect(await screen.findByText("Stop the current turn before running /rewind.")).toBeTruthy();
   });
 
-  it.each(["untouched", "typed", "erased-then-left"] as const)(
+  it.each(["untouched", "typed", "sent", "erased-then-left"] as const)(
     "/rewind fills the new session's composer when the redirect lands first (%s)",
     async (edit) => {
       onTestFinished(() => {
@@ -1287,13 +1287,15 @@ describe("Composer slash-command menu", () => {
       act(() =>
         useChatStore.setState({ conversationId: "conv_new", redirectToConversationId: null }),
       );
+      const destination = composerProps();
       render(
         <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, session_rewind: true }}>
-          <Composer {...composerProps()} />
+          <Composer {...destination} />
         </CapabilitiesProvider>,
       );
       expect(textarea()).toHaveValue("");
       if (edit !== "untouched") fireEvent.change(textarea(), { target: { value: "My own words" } });
+      if (edit === "sent") fireEvent.keyDown(textarea(), { key: "Enter" });
       if (edit === "erased-then-left") {
         fireEvent.change(textarea(), { target: { value: "" } });
         act(() => useChatStore.setState({ conversationId: "conv_other" }));
@@ -1316,9 +1318,11 @@ describe("Composer slash-command menu", () => {
       const expected = {
         untouched: "Write the parser",
         typed: "My own words",
+        sent: "",
         "erased-then-left": "",
       };
       expect(textarea()).toHaveValue(expected[edit]);
+      expect(destination.onSend).toHaveBeenCalledTimes(edit === "sent" ? 1 : 0);
       if (edit === "untouched") expect(screen.getByAltText("diagram.png")).toBeTruthy();
       else expect(screen.queryByAltText("diagram.png")).toBeNull();
     },
