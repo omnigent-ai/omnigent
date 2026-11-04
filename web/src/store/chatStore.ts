@@ -2960,20 +2960,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
         const { pendingId } = postResult;
-        setterFor(sessionId)((s) => ({
+        setterFor(sessionId)((s) => {
           // A failed launch's recovery can hand the message back before this answer names it.
-          pendingUserMessages:
-            pendingId !== undefined && s.returnedStartupInputs.includes(pendingId)
-              ? s.pendingUserMessages.filter((p) => p.tempId !== tempId)
-              : s.pendingUserMessages.map((p) =>
-                  p.tempId === tempId
-                    ? { ...p, posted: true, ...(pendingId ? { pendingId } : {}) }
-                    : p,
-                ),
-          settledShellInputs: s.settledShellInputs.map((entry) =>
-            entry.tempId === tempId && pendingId ? { ...entry, pendingId } : entry,
-          ),
-        }));
+          const handedBack = pendingId !== undefined && s.returnedStartupInputs.includes(pendingId);
+          return {
+            pendingUserMessages: s.pendingUserMessages.flatMap((p) => {
+              if (p.tempId !== tempId) return [p];
+              if (handedBack) return [];
+              return [{ ...p, posted: true, ...(pendingId ? { pendingId } : {}) }];
+            }),
+            settledShellInputs: s.settledShellInputs.map((entry) =>
+              entry.tempId === tempId && pendingId ? { ...entry, pendingId } : entry,
+            ),
+          };
+        });
       }
       settleReplacedStartupInputs(
         sessionId,
