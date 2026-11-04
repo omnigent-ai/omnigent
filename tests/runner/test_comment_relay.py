@@ -629,6 +629,16 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
     await observe({**edit, "tool_response": {"filePath": "edited.txt", "originalFile": "after\n"}})
     assert registry.get_changed_file(relay_env.session_id, "edited.txt") is None
 
+    # A truncated or base64 read of these files would equal their original.
+    for path, original, content in (
+        ("grown.txt", "x" * 1_048_576, b"x" * 1_048_577),
+        ("binary.txt", "AAE=", b"\0\1"),
+    ):
+        (tmp_path / path).write_bytes(content)
+        await observe({**edit, "tool_response": {"filePath": path, "originalFile": original}})
+        record = registry.get_changed_file(relay_env.session_id, path)
+        assert record is not None and record["status"] == "modified"
+
 
 @pytest.mark.asyncio
 async def test_terminal_launch_without_bridge_inject_starts_no_relay(
