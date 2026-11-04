@@ -1380,9 +1380,11 @@ async def _auto_create_claude_terminal_for_test(
     )
 
 
+@pytest.mark.parametrize("wrapped_command", ["claude", "isaac"])
 async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    wrapped_command: str,
 ) -> None:
     """
     Terminal auto-create hands the pane's launch env to trust seeding.
@@ -1396,6 +1398,7 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
 
     seeded: list[tuple[Path, dict[str, str] | None]] = []
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface.return_value = "desktop"
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
@@ -1404,6 +1407,7 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
         seeded.append((workspace, env))
 
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "web")
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", record_seed
     )
@@ -1414,7 +1418,7 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
         "omnigent.harness_startup_config.resolve_harness_args",
         lambda _harness, cli_args, cfg=None: [
             "CLAUDE_CONFIG_DIR=/launch/claude",
-            "claude",
+            wrapped_command,
             *cli_args,
         ],
     )
@@ -1430,6 +1434,11 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == "/launch/claude"
     registry.launch_required_terminal.assert_awaited_once()
+    launch = registry.launch_required_terminal.call_args.kwargs["spec"]
+    expected_prefix = ["CLAUDE_CONFIG_DIR=/launch/claude", wrapped_command]
+    if wrapped_command == "isaac":
+        expected_prefix.extend(["--surface", "omnigent", "--surface", "omnigent-desktop"])
+    assert launch.args[: len(expected_prefix)] == expected_prefix
 
 
 @pytest.mark.parametrize(

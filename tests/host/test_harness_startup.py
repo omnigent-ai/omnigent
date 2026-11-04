@@ -11,6 +11,74 @@ from omnigent.host import harness_startup as startup
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="requires /usr/bin/env and sh")
 
 
+@pytest.mark.parametrize(
+    ("surface", "expected"),
+    [
+        ("desktop", ["omnigent", "omnigent-desktop"]),
+        ("web", ["omnigent", "omnigent-web"]),
+        ("ios", ["omnigent", "omnigent-mobile"]),
+        ("android", ["omnigent", "omnigent-mobile"]),
+        ("cli", ["omnigent", "omnigent-cli"]),
+        (None, ["omnigent"]),
+        ("unknown", ["omnigent"]),
+    ],
+)
+@pytest.mark.parametrize(
+    ("command", "prefix"),
+    [
+        ("isaac", []),
+        ("/opt/bin/isaac", []),
+        ("env", ["ISAAC_ENABLE_UG=1", "isaac"]),
+        ("/usr/bin/env", ["-u", "TOKEN", "--chdir=/work", "/opt/bin/isaac"]),
+    ],
+)
+def test_isaac_launch_passes_explicit_surfaces_before_harness_args(
+    monkeypatch, surface, expected, command, prefix
+):
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "web")
+    original = [*prefix, "codex", "--", "--model", "custom", "--surface", "opaque"]
+    result = startup.with_isaac_client_surfaces(command, original, client_surface=surface)
+    assert result == [
+        *prefix,
+        *(arg for value in expected for arg in ("--surface", value)),
+        "codex",
+        "--",
+        "--model",
+        "custom",
+        "--surface",
+        "opaque",
+    ]
+    assert original == [*prefix, "codex", "--", "--model", "custom", "--surface", "opaque"]
+    assert startup.with_isaac_client_surfaces(command, result, client_surface=surface) == result
+
+
+def test_isaac_launch_replaces_stale_interface_and_keeps_other_surfaces():
+    args = ["--surface", "outer", "--surface=omnigent-web", "--surface", "omnigent", "--"]
+    assert startup.with_isaac_client_surfaces("isaac", args, client_surface="desktop") == [
+        "--surface",
+        "omnigent",
+        "--surface",
+        "omnigent-desktop",
+        "--surface",
+        "outer",
+        "--",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "args"),
+    [
+        ("claude", ["--surface", "keep"]),
+        ("env", ["MODE=omni", "codex", "isaac", "--"]),
+        ("env", ["-u", "isaac"]),
+        ("env", ["-S", "isaac codex --"]),
+        ("env", ["-v", "isaac", "--"]),
+    ],
+)
+def test_isaac_attribution_leaves_other_commands_and_opaque_wrappers_unchanged(command, args):
+    assert startup.with_isaac_client_surfaces(command, args, client_surface="desktop") == args
+
+
 @pytest.fixture
 def config(monkeypatch, tmp_path):
     cfg = {"harness": {}}

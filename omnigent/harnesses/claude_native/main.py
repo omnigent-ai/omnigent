@@ -124,6 +124,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.host.harness_startup import with_isaac_client_surfaces
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import (
     await_cleanup_task,
@@ -1055,7 +1056,8 @@ def _claude_model_probe_launch(
     cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
     launch_args = resolve_harness_args("claude-native", tuple(args), cfg=cfg)
-    return resolve_claude_launch(command, launch_args)
+    command, launch_args = resolve_claude_launch(command, launch_args)
+    return command, with_isaac_client_surfaces(command, launch_args)
 
 
 def _claude_model_probe_invocation(
@@ -2534,7 +2536,7 @@ def _fetch_external_session_id_for_redirect(
         if resp.status_code >= 400:
             return None
         payload = resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001 - redirect lookup must not block the session
         _logger.warning(
             "failed to fetch external Claude session id for redirect; session=%s",
             session_id,
@@ -3115,7 +3117,7 @@ def _ucode_config_for_profile(
             live_catalog = discover_databricks_claude_catalog(creds.host, creds.token)
             live_models = live_catalog.families
             routable_models = live_catalog.model_ids
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - model discovery falls back to cached models
             # Recoverable fallback; frames are debug-only so a TTY-mirrored
             # host console stays concise.
             _logger.warning(
@@ -3897,7 +3899,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional spec lookup must not block launch
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -4210,7 +4212,7 @@ async def _attach_direct_tmux(
                 await watcher
             except asyncio.CancelledError:
                 pass
-            except Exception:  # watcher failure is secondary to attach outcome
+            except Exception:  # noqa: BLE001 - watcher failure is secondary to attach outcome
                 _logger.warning(
                     "direct-tmux pane watcher failed during attach cleanup", exc_info=True
                 )
@@ -4333,7 +4335,7 @@ async def _attach_with_transcript_forwarder(
                 await forwarder
             except asyncio.CancelledError:
                 pass
-            except Exception:
+            except Exception:  # noqa: BLE001 - forwarder cleanup must not skip terminal stop
                 # The forwarder is best-effort mirroring. A bug there
                 # (corrupt transcript JSONL, file-system error, anything
                 # uncaught in the parser) must not skip the Omnigent terminal
@@ -4431,7 +4433,7 @@ async def _attach_with_reconnect(
         if not first_attempt and recover is not None:
             try:
                 await recover()
-            except Exception:
+            except Exception:  # noqa: BLE001 - recovery failure must not prevent reattachment
                 _logger.warning(
                     "%s-native reconnect recovery callback raised; retrying attach anyway",
                     session_name.lower(),
@@ -5672,7 +5674,7 @@ def _claude_resume_session_id(external_session_id: str, *, session_id: str) -> s
     """
     try:
         holder = find_background_holder(external_session_id)
-    except Exception:  # A registry probe must not change how a resume launches.
+    except Exception:  # noqa: BLE001 - A registry probe must not change how a resume launches.
         _logger.warning(
             "Could not check Claude's session registry for %s; resuming it in place",
             external_session_id,
@@ -7013,6 +7015,7 @@ def _claude_terminal_request(
     # command/args to wrap the same fully-augmented Claude launch. Identity by
     # default. See omnigent.claude_launcher.
     command, args = resolve_claude_launch(command, args)
+    args = with_isaac_client_surfaces(command, args, client_surface="cli")
     spec: _JsonObject = {
         "command": command,
         "args": args,

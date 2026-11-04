@@ -244,6 +244,12 @@ _ATTRIBUTION_HEADER_KEYS: Final[frozenset[str]] = frozenset(
 )
 
 
+def omnigent_client_surfaces(client_surface: str | None) -> tuple[str, ...]:
+    """Return the gateway surface names for an explicit creating interface."""
+    qualified = _OMNIGENT_CLIENT_SURFACES.get(client_surface or "")
+    return ("omnigent", qualified) if qualified else ("omnigent",)
+
+
 def gateway_attribution_headers(
     coding_agent: str,
     *,
@@ -261,11 +267,9 @@ def gateway_attribution_headers(
     :returns: e.g. ``{"Databricks-Custom-Coding-Agent": "codex",
         "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop, ug"}``.
     """
-    qualified = _OMNIGENT_CLIENT_SURFACES.get(client_surface or "")
     stale = set(_OMNIGENT_CLIENT_SURFACES.values())
     candidates = (
-        "omnigent",
-        *((qualified,) if qualified else ()),
+        *omnigent_client_surfaces(client_surface),
         *(surface for surface in client_surfaces if surface.strip().lower() not in stale),
         *(("ug",) if via_ug else ()),
     )

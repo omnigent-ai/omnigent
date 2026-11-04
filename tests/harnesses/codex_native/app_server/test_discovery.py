@@ -884,8 +884,9 @@ async def test_codex_config_read_preserves_unrelated_errors() -> None:
 
 
 @pytest.mark.parametrize("outcome", ["inherited", "unsupported", "timeout", "cancelled"])
+@pytest.mark.parametrize("isaac_wrapper", [False, True])
 async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, isaac_wrapper: bool
 ) -> None:
     from omnigent.harnesses.codex_native import app_server
 
@@ -931,7 +932,9 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
         cwd=tmp_path,
         env={"PATH": "/test-bin"},
         client_surface="desktop",
-        app_server_command=("/wrapped/codex", "--policy", "custom-policy"),
+        app_server_command=("env", "MODE=omni", "isaac", "codex", "--")
+        if isaac_wrapper
+        else ("/wrapped/codex", "--policy", "custom-policy"),
     )
     if outcome == "cancelled":
         with pytest.raises(asyncio.CancelledError):
@@ -939,12 +942,23 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
     else:
         assert await prepare == overrides[:1]
     started.assert_awaited_once_with(
-        codex_path="/wrapped/codex",
+        codex_path="env" if isaac_wrapper else "/wrapped/codex",
         listen_url="ws://127.0.0.1:12345",
         env={"PATH": "/test-bin", "CODEX_HOME": str(home)},
         cwd=tmp_path,
         config_overrides=overrides[:1],
-        launch_args=["--policy", "custom-policy"],
+        launch_args=[
+            "MODE=omni",
+            "isaac",
+            "--surface",
+            "omnigent",
+            "--surface",
+            "omnigent-desktop",
+            "codex",
+            "--",
+        ]
+        if isaac_wrapper
+        else ["--policy", "custom-policy"],
     )
     client.request.assert_awaited_once_with(
         "config/read", {"includeLayers": False, "cwd": str(tmp_path)}

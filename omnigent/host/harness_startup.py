@@ -1,4 +1,4 @@
-"""Read-only host launch settings for the selected user-owned host."""
+"""Host launch settings and per-launch wrapper arguments."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import getopt
 import os
 import re
 import shutil
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.config import load_global_config
+from omnigent.databricks_ai_gateway import omnigent_client_surfaces
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_startup_config import resolve_harness_config
 
@@ -102,6 +103,58 @@ def describe_harness_startup(harness: str) -> HarnessStartup:
         configured_args=entry.get("args", []),
         environment=environment,
     )
+
+
+def with_isaac_client_surfaces(
+    command: str, args: Sequence[str], *, client_surface: str | None = None
+) -> list[str]:
+    """Pass this launch's attribution to Isaac before its harness separator.
+
+    Recognize direct Isaac launches and env wrappers with a literal command;
+    leave opaque wrappers unchanged. Never infer the interface from ambient env.
+    """
+    args = list(args)
+    offset = 0
+    if Path(command).name == "env":
+        try:
+            normalized = _normalize_env_wrapper_args(args)
+        except ValueError:
+            return list(args)
+        wrapped = _unwrap_env(command, normalized, os.defpath)
+        if wrapped is None:
+            return list(args)
+        command, wrapped_args, _, _ = wrapped
+        offset = len(args) - len(wrapped_args)
+        # A split-string may contain the command or args inside one argv entry.
+        if offset < 1 or args[offset - 1 :] != [command, *wrapped_args]:
+            return list(args)
+    if Path(command).name != "isaac":
+        return list(args)
+
+    owned = {"omnigent"}
+    for surface in ("desktop", "web", "mobile", "cli"):
+        owned.update(omnigent_client_surfaces(surface))
+    remaining: list[str] = []
+    index = offset
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            remaining.extend(args[index:])
+            break
+        if arg == "--surface" and index + 1 < len(args) and args[index + 1] in owned:
+            index += 2
+            continue
+        if arg.startswith("--surface=") and arg.partition("=")[2] in owned:
+            index += 1
+            continue
+        remaining.append(arg)
+        index += 1
+    surface_args = [
+        arg
+        for surface in omnigent_client_surfaces(client_surface)
+        for arg in ("--surface", surface)
+    ]
+    return [*args[:offset], *surface_args, *remaining]
 
 
 def env_wrapper_environment(

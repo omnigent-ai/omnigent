@@ -84,6 +84,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 from omnigent.harnesses.codex_native.timeouts import (
     APP_SERVER_READY_TIMEOUT_SECONDS as _APP_SERVER_READY_TIMEOUT_SECONDS,
 )
+from omnigent.host.harness_startup import with_isaac_client_surfaces
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
@@ -546,7 +547,7 @@ def _sync_codex_developer_instructions(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     try:
         document = tomlkit.parse(existing) if existing else tomlkit.document()
-    except Exception:
+    except Exception:  # noqa: BLE001 - invalid optional config must not block startup
         _logger.warning(
             "Could not synchronize native Codex agent instructions: invalid private config",
             exc_info=True,
@@ -1963,6 +1964,9 @@ async def prepare_codex_provider_config(
     if not _codex_may_inherit_provider(overrides, app_server_command):
         return overrides
     executable, *launch_args = app_server_command or (codex_path,)
+    launch_args = with_isaac_client_surfaces(
+        executable, launch_args, client_surface=client_surface
+    )
     try:
         async with (
             asyncio.timeout(_PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS),
@@ -2088,7 +2092,7 @@ async def _codex_launch_catalog(
     try:
         if launch is None:
             launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
-    except Exception:
+    except Exception:  # noqa: BLE001 - catalog lookup may fall back to stored models
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
     fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
@@ -2467,6 +2471,9 @@ class CodexNativeAppServer:
         """
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         executable, *launch_args = self.app_server_command or (self.codex_path,)
+        launch_args = with_isaac_client_surfaces(
+            executable, launch_args, client_surface=self.env.get(CLIENT_SURFACE_ENV_VAR)
+        )
         argv = _build_native_codex_app_server_argv(
             tagged_argv0=_tagged_codex_argv0(executable, self.process_registry_tag),
             listen_url=resolved_listen,
@@ -2772,7 +2779,7 @@ class CodexNativeAppServer:
                                 ),
                                 timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
                             )
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - startup repairs locally if the RPC fails
                         _logger.warning(
                             "Could not persist supported Codex reasoning effort at startup",
                             exc_info=True,
@@ -2792,7 +2799,7 @@ class CodexNativeAppServer:
             finally:
                 try:
                     await startup_client.close()
-                except Exception:
+                except Exception:  # noqa: BLE001 - client cleanup must not mask startup outcome
                     _logger.warning("Could not close Codex startup client", exc_info=True)
         except BaseException as exc:
             if isinstance(exc, Exception):
@@ -2851,7 +2858,7 @@ class CodexNativeAppServer:
                 client.request("config/read", {"includeLayers": False, "cwd": str(self.cwd)}),
                 timeout=_MODEL_PROVIDER_READ_TIMEOUT_SECONDS,
             )
-        except Exception:  # the launch's own pin is still usable
+        except Exception:  # noqa: BLE001 - the launch's own pin is still usable
             _logger.warning("Could not read Codex's effective model provider", exc_info=True)
             return
         result = response.get("result")
@@ -2914,7 +2921,7 @@ class CodexNativeAppServer:
             if self.router_hooks_registered:
                 try:
                     await trust_codex_router_hooks(client.request, cwd=str(self.cwd))
-                except Exception:
+                except Exception:  # noqa: BLE001 - hook setup is best effort at this boundary
                     _logger.warning(
                         "codex subagent-routing hook trust failed; routing will not be enforced",
                         exc_info=True,
@@ -2938,7 +2945,7 @@ class CodexNativeAppServer:
                             len(still_untrusted),
                             ", ".join(still_untrusted),
                         )
-                except Exception:
+                except Exception:  # noqa: BLE001 - hook trust failure leaves the review screen
                     _logger.warning(
                         "codex hook trust-all failed; the startup hook-review screen "
                         "may appear on resume",
@@ -3941,7 +3948,7 @@ def databricks_profile_codex_models(profile: str) -> DatabricksCodexModelListing
     """
     try:
         host = _databricks_gateway_host(profile)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - host lookup failure leaves discovery unavailable
         _logger.warning(
             "native-codex: could not resolve the workspace host for profile %r (%s)",
             profile,
@@ -3970,7 +3977,7 @@ def _databricks_servable_codex_models(host: str, profile: str) -> DatabricksCode
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         return DatabricksCodexModelListing(discover_databricks_codex_models(host, creds.token))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - model discovery falls back to cached state
         # Recoverable fallback; frames are debug-only so a TTY-mirrored
         # host console stays concise.
         _logger.warning(
@@ -3988,7 +3995,7 @@ def _databricks_servable_codex_models(host: str, profile: str) -> DatabricksCode
                 return DatabricksCodexModelListing(
                     tuple(workspace_state.codex_models), cached=True
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001 - invalid cached state leaves discovery unavailable
             _logger.warning(
                 "native-codex: could not read ucode state for %r", profile, exc_info=True
             )

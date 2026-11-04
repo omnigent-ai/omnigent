@@ -262,6 +262,7 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     entry_point = SimpleNamespace(name="isaac", load=lambda: _IsaacLauncher)
     monkeypatch.setattr(importlib.metadata, "entry_points", lambda *, group: [entry_point])
     monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "web")
     monkeypatch.chdir(tmp_path)
     body = claude_native._claude_terminal_request(
         ("--resume", "s", "--append-system-prompt", "Review like a staff engineer."),
@@ -272,8 +273,8 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     spec = body["spec"]
     assert spec["command"] == "isaac"
     # Claude's argv is now passed through isaac after the ``--`` separator.
-    assert spec["args"][0] == "--"
-    assert spec["args"][1:3] == ["--resume", "s"]
+    assert spec["args"][:5] == ["--surface", "omnigent", "--surface", "omnigent-cli", "--"]
+    assert spec["args"][5:7] == ["--resume", "s"]
     # Omnigent's prompt joins the caller's flag, so the launch carries the caller's prompt once.
     prompt_values = [
         spec["args"][index + 1]

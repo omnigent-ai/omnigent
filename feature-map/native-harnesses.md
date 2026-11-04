@@ -151,6 +151,12 @@ interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Ag
 (`claude-code` or `codex`) and `Databricks-Custom-Client-Surfaces`: `omnigent`
 followed by `omnigent-desktop`, `omnigent-web`, `omnigent-mobile`, or `omnigent-cli`.
 Routes configured by ug retain the additional `ug` surface.
+Configured `isaac` launchers receive the same Omnigent surfaces through repeatable
+`--surface` arguments before the harness separator; Isaac appends `isaac` itself.
+This requires an Isaac version supporting `--surface`. Direct commands and
+`env` wrappers with a literal Isaac command are supported; opaque shell or
+split-string wrappers must pass attribution themselves.
+Model discovery without a session sends only `omnigent`.
 
 **Agent instructions (Pi native):** launch an agent whose spec contains inline
 instructions or references a bundled instruction file. Reopen its terminal and
@@ -334,6 +340,11 @@ managed-policy update. Source persistence and launch isolation are checked by
 `tests/runner/test_app_sessions_native_workflow_init.py::test_create_session_envelope_is_single_flight_and_skips_metadata_callbacks`,
 and `tests/runner/test_resource_registry.py::test_terminal_resource_role_is_private_and_cleared_on_close`.
 These process/configuration checks do not launch the desktop or mobile shells.
+Isaac argument forwarding is covered by `tests/host/test_harness_startup.py`,
+the launcher scenario in `tests/harnesses/claude_native/test_claude_native.py`,
+the model probes in `tests/harnesses/claude_native/test_claude_native_model_catalog.py`,
+and the configured wrapper scenarios in
+`tests/harnesses/codex_native/app_server/test_startup.py` and `test_discovery.py`.
 
 **Pi Smart Routing (own environment):**
 `tests/e2e/test_pi_native_smart_routing.py::test_pi_native_smart_routing_applies_pick`

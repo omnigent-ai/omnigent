@@ -26,9 +26,20 @@ from tests._helpers.providers import isolate_provider_resolution
     ("helper", "subscription_auth"),
     [(None, False), ("", False), ("printf test-token", False), (None, True)],
 )
+@pytest.mark.parametrize("command", ["claude", "isaac"])
 def test_model_probe_uses_configured_auth_helper(
-    monkeypatch: pytest.MonkeyPatch, helper: str | None, subscription_auth: bool
+    monkeypatch: pytest.MonkeyPatch, helper: str | None, subscription_auth: bool, command: str
 ) -> None:
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "web")
+    monkeypatch.setattr(
+        "omnigent.config.load_effective_config",
+        lambda: {
+            "harness": {
+                "claude-native": {"command": command, "args": ["--"] if command == "isaac" else []}
+            }
+        },
+    )
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         monkeypatch.setenv(name, "ambient-credential")
     monkeypatch.setattr(
@@ -43,6 +54,10 @@ def test_model_probe_uses_configured_auth_helper(
     )
 
     _, args, env = claude_native._claude_model_probe_invocation(config)
+    if command == "isaac":
+        assert args[:3] == ["--surface", "omnigent", "--"]
+    else:
+        assert args[0] == "-p"
 
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         if helper or subscription_auth:
