@@ -322,7 +322,7 @@ describe("ChatHeader — workspace pane shortcut", () => {
   });
 });
 
-describe("ChatHeader — shell history navigation", () => {
+describe("ChatHeader — desktop history navigation", () => {
   afterEach(() => {
     const shellWindow = window as { omnigentDesktop?: unknown; navigation?: unknown };
     delete shellWindow.omnigentDesktop;
@@ -341,19 +341,22 @@ describe("ChatHeader — shell history navigation", () => {
     });
   }
 
-  it.each([true, false])("shows Back/Forward in the shell (sidebarOpen=%s)", (sidebarOpen) => {
-    installShellHistory();
-    renderHeader({ sidebarOpen });
+  it.each([true, false])(
+    "shows Back/Forward in the desktop app (sidebarOpen=%s)",
+    (sidebarOpen) => {
+      installShellHistory();
+      renderHeader({ sidebarOpen });
 
-    expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Forward" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "Open sidebar" }) !== null).toBe(!sidebarOpen);
-  });
+      expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Forward" })).toBeDisabled();
+      expect(screen.queryByRole("button", { name: "Open sidebar" }) !== null).toBe(!sidebarOpen);
+    },
+  );
 
   it.each([
     [false, true],
     [true, false],
-  ])("shows Back/Forward in Settings only off phones (mobile=%s)", (mobile, shown) => {
+  ])("shows Back/Forward in Settings only at desktop width (mobile=%s)", (mobile, shown) => {
     installShellHistory();
     isMobileMock.mockReturnValue(mobile);
     renderHeader({ sidebarOpen: false, settingsMode: true });

@@ -4,22 +4,15 @@ import { useSyncExternalStore } from "react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { withBasePath } from "@/lib/basePath";
-import {
-  isAndroidShell,
-  isIOSShell,
-  isNativeShell,
-  supportsNativeServerPicker,
-} from "@/lib/nativeBridge";
+import { isElectronShell } from "@/lib/nativeBridge";
 import { useNavigate, useRebasePath } from "@/lib/routing";
 
 /**
- * The Navigation API inside a native shell, or undefined in a browser tab
- * (which has its own Back/Forward) and in WebViews that predate the API.
+ * The Navigation API inside the desktop app, or undefined elsewhere: a browser
+ * tab has its own Back/Forward, and the phone apps have system back gestures.
  */
 function shellNavigation(): Navigation | undefined {
-  if (!isNativeShell()) return undefined;
-  // Phone shells without the sidebar server picker float a switcher over the header.
-  if ((isIOSShell() || isAndroidShell()) && !supportsNativeServerPicker()) return undefined;
+  if (!isElectronShell()) return undefined;
   const navigation = (window as { navigation?: Navigation }).navigation;
   return typeof navigation?.entries === "function" ? navigation : undefined;
 }
@@ -48,8 +41,7 @@ function canStep(offset: -1 | 1, appRoot: string): boolean {
 }
 
 /**
- * In-app Back / Forward for the desktop and mobile shells, which have no
- * browser toolbar. They step through this window's page history and stop at
+ * In-app Back / Forward for the desktop app, which has no browser toolbar. They step through this window's page history and stop at
  * the first entry outside the app.
  */
 export function HistoryNavigationButtons() {

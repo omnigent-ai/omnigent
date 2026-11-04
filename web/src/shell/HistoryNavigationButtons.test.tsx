@@ -93,28 +93,21 @@ describe("HistoryNavigationButtons", () => {
     expect(screen.queryByRole("button", { name: "Forward" })).toBeNull();
   });
 
-  it("renders nothing in a shell whose WebView lacks the Navigation API", () => {
-    (window as ShellWindow).omnigentNative = phoneShell("ios");
+  it("renders nothing in a desktop app whose WebView lacks the Navigation API", () => {
+    (window as ShellWindow).omnigentDesktop = { kind: "electron" };
     renderButtons();
     expect(screen.queryByTestId("history-navigation")).toBeNull();
   });
 
-  it.each(["ios", "android"] as const)(
-    "renders nothing in an older %s shell whose server switcher floats over the header",
-    (kind) => {
-      (window as ShellWindow).omnigentNative = { kind };
-      installNavigation(["/c/first", "/c/second"]);
-      renderButtons();
-      expect(screen.queryByTestId("history-navigation")).toBeNull();
-    },
-  );
+  it.each(["ios", "android"] as const)("renders nothing in the %s app", (kind) => {
+    (window as ShellWindow).omnigentNative = phoneShell(kind);
+    installNavigation(["/c/first", "/c/second"]);
+    renderButtons();
+    expect(screen.queryByTestId("history-navigation")).toBeNull();
+  });
 
-  it.each([
-    ["Electron", { omnigentDesktop: { kind: "electron" } }],
-    ["iOS", { omnigentNative: phoneShell("ios") }],
-    ["Android", { omnigentNative: phoneShell("android") }],
-  ])("shows both buttons in the %s shell", (_shell, bridge) => {
-    Object.assign(window, bridge);
+  it("shows both buttons in the desktop app", () => {
+    (window as ShellWindow).omnigentDesktop = { kind: "electron" };
     installNavigation(["/c/first", "/c/second"]);
     renderButtons();
     expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
@@ -122,7 +115,7 @@ describe("HistoryNavigationButtons", () => {
   });
 
   it("follows history changes and steps through the router", () => {
-    (window as ShellWindow).omnigentNative = phoneShell("android");
+    (window as ShellWindow).omnigentDesktop = { kind: "electron" };
     const navigation = installNavigation(["/c/first", "/c/second"]);
     renderButtons(["/c/first", "/c/second"]);
 
