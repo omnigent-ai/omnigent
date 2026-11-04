@@ -31,6 +31,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
@@ -253,6 +254,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
   }
 
   const paused = task.state === "paused";
+  const { userPrompt, systemPrompt } = splitTriggerPrompt(task.prompt);
   const permissionOption = nativePermissionOptions(harness).find(
     (option) => option.value === task.permissionMode,
   );
@@ -391,14 +393,36 @@ function TaskDetail({ taskId }: { taskId: string }) {
       </div>
 
       {/* Prompt. */}
-      <Section title="Prompt">
+      <Section title={systemPrompt === null ? "Prompt" : "Your prompt"}>
         <p
           className="whitespace-pre-wrap text-sm text-foreground/90"
           data-testid="task-detail-prompt"
         >
-          {task.prompt}
+          {userPrompt}
         </p>
       </Section>
+
+      {systemPrompt !== null && (
+        <Collapsible className="mt-6">
+          <h2 className="mb-2 text-sm font-medium text-muted-foreground">
+            <CollapsibleTrigger className="group flex cursor-pointer items-center gap-1 rounded-sm text-left transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              <ChevronDownIcon
+                aria-hidden="true"
+                className="size-4 transition-transform group-data-[state=closed]:-rotate-90"
+              />
+              System prompt
+            </CollapsibleTrigger>
+          </h2>
+          <CollapsibleContent>
+            <p
+              className="max-h-80 overflow-y-auto rounded-md border border-border bg-muted/40 p-3 text-sm whitespace-pre-wrap break-words text-foreground/90"
+              data-testid="task-detail-system-prompt"
+            >
+              {systemPrompt}
+            </p>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
 
       {/* Saved configuration for launching sessions. */}
       <Collapsible defaultOpen className="mt-6">

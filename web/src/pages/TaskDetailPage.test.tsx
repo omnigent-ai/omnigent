@@ -14,6 +14,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskDetailPage } from "./TaskDetailPage";
+import {
+  emptyTriggerFields,
+  renderTriggerPrompt,
+  splitTriggerPrompt,
+} from "@/components/scheduled/triggerTemplates";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as hooks from "@/hooks/useScheduledTasks";
 import {
@@ -222,6 +227,30 @@ function renderPage() {
 }
 
 describe("header, prompt, configuration", () => {
+  it("shows the user prompt first and keeps generated instructions collapsed and read-only", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      { ...emptyTriggerFields("slack"), scope: "abc", instructions: "Summarize new messages." },
+      { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
+    );
+    setTask(task({ prompt }));
+    renderPage();
+    expect(screen.getByRole("heading", { name: "Your prompt" })).toBeVisible();
+    expect(screen.getByTestId("task-detail-prompt").textContent).toBe("Summarize new messages.");
+    const toggle = screen.getByRole("button", { name: "System prompt" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(screen.getByTestId("task-detail-system-prompt").textContent).toBe(
+      splitTriggerPrompt(prompt).systemPrompt,
+    );
+    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-detail-prompt")).toBeVisible();
+  });
+
   it("collapses and reopens configuration while keeping run history visible", () => {
     setTask(task({ modelOverride: "opus" }));
     setRuns([run({ sessionCostUsd: 1.23 })]);
@@ -247,6 +276,7 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-prompt")).toHaveTextContent(
       "Triage the inbox and summarize.",
     );
+    expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
     expect(screen.getByTestId("task-detail-schedule").textContent).toContain("Weekdays at 8:00 AM");
     expect(screen.getByTestId("task-detail-agent")).toHaveTextContent("Polly");
     // Null hostId → resolve-at-fire label, not blank.

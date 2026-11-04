@@ -4299,22 +4299,108 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
     assert settings["effortLevel"] == "high"
 
 
+_FRAMEWORK_PROMPT = "Keep framework metadata separate."
+
+
+@pytest.mark.parametrize(
+    ("user_args", "merged_args"),
+    [
+        ((), None),
+        (
+            ("--append-system-prompt", "--- Reviewer profile ---"),
+            ("--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\n--- Reviewer profile ---"),
+        ),
+        (
+            ("--append-system-prompt=Review carefully.",),
+            (f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nReview carefully.",),
+        ),
+        (
+            ("--append-system-prompt", "Earlier.", "--append-system-prompt=Later."),
+            (
+                "--append-system-prompt",
+                "Earlier.",
+                f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nLater.",
+            ),
+        ),
+        (
+            ("--append-system-prompt=Earlier.", "--append-system-prompt", ""),
+            ("--append-system-prompt=Earlier.", "--append-system-prompt", _FRAMEWORK_PROMPT),
+        ),
+        (
+            ("--append-system-prompt=Earlier.", "--append-system-prompt="),
+            ("--append-system-prompt=Earlier.", f"--append-system-prompt={_FRAMEWORK_PROMPT}"),
+        ),
+        (("--append-system-prompt-file", "profile.md"), None),
+        (("--append-system-prompt-file=profile.md",), None),
+        (
+            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
+            (
+                "--append-system-prompt-file",
+                "profile.md",
+                "--append-system-prompt",
+                f"{_FRAMEWORK_PROMPT}\n\nReview.",
+            ),
+        ),
+        (("--", "--append-system-prompt=Positional."), None),
+    ],
+    ids=[
+        "no-user-prompt",
+        "user-prompt-separate-value",
+        "user-prompt-joined-value",
+        "repeated-flags-last-wins",
+        "final-empty-value-clears",
+        "final-empty-joined-value-clears",
+        "caller-file-separate-value",
+        "caller-file-joined-value",
+        "caller-file-and-prompt",
+        "after-end-of-options",
+    ],
+)
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    user_args: tuple[str, ...],
+    merged_args: tuple[str, ...] | None,
 ) -> None:
-    """Claude native appends framework instructions supplied by its launcher."""
-    framework_instruction = "Keep framework metadata separate."
+    """Omnigent's prompt joins the caller's last prompt value, or is added when there is none."""
+    # Claude reads a caller's prompt file itself, so Omnigent must never open it.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
 
-    args = augment_claude_args(
+    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and os.path.basename(file) == "profile.md":
+                raise AssertionError("Omnigent opened the caller's prompt file")
+            return real_open(file, *args, **kwargs)
+
+        return guarded_open
+
+    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
+    omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
-        append_system_prompt=framework_instruction,
+        append_system_prompt=_FRAMEWORK_PROMPT,
     )
 
-    assert args.count("--append-system-prompt") == 1
-    index = args.index("--append-system-prompt")
-    assert args[index + 1] == framework_instruction
+    args = augment_claude_args(
+        user_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+
+    prompt_index = omnigent_args.index("--append-system-prompt")
+    assert omnigent_args.count("--append-system-prompt") == 1
+    assert omnigent_args[prompt_index + 1] == _FRAMEWORK_PROMPT
+    if merged_args is None:
+        assert args == [*user_args, *omnigent_args]
+    else:
+        # The caller's prompt is sent once, so the launch command does not grow by its size.
+        del omnigent_args[prompt_index : prompt_index + 2]
+        assert args == [*merged_args, *omnigent_args]
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
