@@ -8319,8 +8319,8 @@ def _capture_driver_sql(store: SqlAlchemyConversationStore):
 def _explain_driver(store: SqlAlchemyConversationStore, statement: str, parameters: object) -> str:
     """``EXPLAIN`` the exact statement+parameters the store executed.
 
-    Returns the plan as one string: PostgreSQL JSON, or SQLite's
-    ``EXPLAIN QUERY PLAN`` rows joined.
+    Returns the plan as one string: PostgreSQL JSON, MySQL's tree, or
+    SQLite's ``EXPLAIN QUERY PLAN`` rows joined.
     """
     dialect = store._conv_engine.dialect.name
     with store._conv_session("test_setup") as session:
@@ -8332,6 +8332,11 @@ def _explain_driver(store: SqlAlchemyConversationStore, statement: str, paramete
                 "EXPLAIN (ANALYZE, FORMAT JSON) " + statement, parameters
             ).scalar_one()
             return json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+        if dialect == "mysql":
+            conn.exec_driver_sql("ANALYZE TABLE conversations, session_permissions").all()
+            return str(
+                conn.exec_driver_sql("EXPLAIN FORMAT=TREE " + statement, parameters).scalar_one()
+            )
         rows = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
     return " | ".join(str(row) for row in rows)
 
@@ -8636,7 +8641,8 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
        compatible index. The equivalent
        ``ts < :ts OR (ts = :ts AND id < :id)`` form is left as a residual
        filter, so a deep cursor reads and discards every row above it, at a
-       cost that grows with cursor depth.
+       cost that grows with cursor depth. MySQL is the reverse, so it gets the
+       OR form.
 
     The SQL shape is asserted for every sort. The PLAN assertion is limited to
     ``updated_at`` and ``title``, which have compatible indexes; a
@@ -8647,11 +8653,12 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
     first row-values attempt fail only on PostgreSQL.
 
     Plan assertions are dialect-specific by nature (PostgreSQL EXPLAIN JSON,
-    SQLite EXPLAIN QUERY PLAN); other dialects keep the behavioural coverage
-    from the cursor-walk and row-set tests, which run everywhere.
+    MySQL EXPLAIN FORMAT=TREE, SQLite EXPLAIN QUERY PLAN); other dialects keep
+    the behavioural coverage from the cursor-walk and row-set tests, which run
+    everywhere.
     """
-    if conversation_store._conv_engine.dialect.name not in ("postgresql", "sqlite"):
-        pytest.skip("plan-shape assertions are written for PostgreSQL and SQLite EXPLAIN output")
+    if conversation_store._conv_engine.dialect.name not in ("postgresql", "mysql", "sqlite"):
+        pytest.skip("plan-shape assertions are written for PostgreSQL, MySQL and SQLite EXPLAIN")
     _acl_perms(db_uri)
     # Tied timestamps: with one row per timestamp the cursor's tiebreaker term
     # is decorative and dropping it loses nothing, so the walk below could not
@@ -8776,6 +8783,15 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                             cursor_plan,
                         )
                         assert all(r == 0 for r in rows_filtered), (where, cursor_plan)
+                    elif dialect == "mysql":
+                        index = {
+                            "updated_at": "ix_conversations_archived_updated",
+                            "title": "ix_conversations_archived_title",
+                        }[sort_by]
+                        assert f"Index range scan on conversations using {index}" in cursor_plan, (
+                            where,
+                            cursor_plan,
+                        )
                     else:
                         assert "USING INDEX" in cursor_plan, (where, cursor_plan)
                         assert "SCAN conversations" not in cursor_plan, (where, cursor_plan)
@@ -8791,9 +8807,16 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                 )
                 descending_scan = (order == "desc") if direction == "after" else (order == "asc")
                 comparison = "<" if descending_scan else ">"
-                assert f"(conversations.{sort_column}, {tiebreaker}) {comparison}" in " ".join(
-                    str(listing).split()
-                ), (where, tiebreaker, str(listing))
+                spelled = " ".join(str(listing).split())
+                if dialect == "mysql":
+                    terms = [
+                        f"conversations.{sort_column} {comparison} ",
+                        f"{tiebreaker} {comparison} ",
+                    ]
+                else:
+                    terms = [f"(conversations.{sort_column}, {tiebreaker}) {comparison}"]
+                for term in terms:
+                    assert term in spelled, (where, spelled)
 
                 # Keep the descending created_at/after pages for the walk below.
                 if sort_by == "created_at" and order == "desc" and direction == "after":
