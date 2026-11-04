@@ -1382,8 +1382,15 @@ Content-Type: application/json
 
 400 Bad Request — the session's harness is not claude-sdk or
   claude-native, item_id is not one of its user prompts, it is a
-  sub-agent session, or a turn is running
+  sub-agent or side-chat session, a turn is running or a message is
+  still reaching its runner, or the kept history has a file the
+  session's harness cannot open
+400 Bad Request, code `wrong_replica` — its runner is connected to
+  another server replica; retry so the request reaches that replica
 403/404 — the caller does not own the session
+409 Conflict — the session is already moving to a new session (a
+  /clear or /rewind in progress), or its host went away during the
+  rewind; retry once it settles
 503 Service Unavailable — neither its runner nor its host can take
   the new session
 ```
