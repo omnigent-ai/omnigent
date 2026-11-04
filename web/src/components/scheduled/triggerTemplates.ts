@@ -101,7 +101,7 @@ export interface TriggerTemplate {
   scopePlaceholder: string;
   fields: TriggerConditionField[];
   instructionsPlaceholder: string;
-  /** The "then" action that posts the session link. */
+  /** Label for the checkbox that posts the session link. */
   linkBackLabel: string;
   /** What the template watches, in the plural, e.g. "tickets". */
   itemPlural: string;

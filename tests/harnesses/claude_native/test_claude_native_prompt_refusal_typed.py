@@ -157,10 +157,13 @@ def test_an_occupied_input_box_refusal_awaits_no_answer(
     ("pane", "expected"),
     [
         (_SETTINGS_ERROR_DIALOG, True),
+        # The launcher's install question is answered in the same terminal.
+        ("No Claude Code installation found. Would you like to install it? [Y/n]:", True),
+        ("Would you like to install it? [Y/n]: y\nInstalling Claude Code...", False),
         (f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n", False),
         ("", False),
     ],
-    ids=["dialog", "composer", "torn-capture"],
+    ids=["dialog", "install-prompt", "install-answered", "composer", "torn-capture"],
 )
 def test_terminal_dialog_pending_reads_the_pane(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str, expected: bool

@@ -11169,12 +11169,13 @@ def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
 
 
 @pytest.mark.parametrize(
-    ("prompt", "description"),
+    ("prompt", "description", "awaits_answer"),
     [
-        ("Enter password to configure settings.\nPassword:", "a password"),
+        ("Enter password to configure settings.\nPassword:", "a password", False),
         (
             "No Claude Code installation found. Would you like to install it? [Y/n]:",
             "installation confirmation",
+            True,
         ),
     ],
     ids=["password", "install-confirmation"],
@@ -11183,9 +11184,13 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     monkeypatch: pytest.MonkeyPatch,
     prompt: str,
     description: str,
+    awaits_answer: bool,
 ) -> None:
     """
     A launcher waiting for an answer reports its prompt without reaping the pane.
+
+    The install question is answered in the terminal, so its refusal awaits an
+    answer and the delivery holds the message for it.
     """
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captures: list[int] = []
@@ -11209,6 +11214,7 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
         f"Claude Code's launch command is waiting for {description} in its terminal"
     )
     assert prompt in str(raised.value)
+    assert raised.value.awaits_answer is awaits_answer
     assert len(captures) == 2
 
 
