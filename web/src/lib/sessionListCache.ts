@@ -225,10 +225,11 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
  * query membership converges. Title changes reconcile every list variant
  * because a row absent from a search query may now match it.
  *
- * An `updated_at` change never needs one: every list view sorts its loaded
+ * An `updated_at` change doesn't need one: every list view sorts its loaded
  * rows itself, and a bump only moves a row up, so it stays inside the loaded
  * window. Refetching for it re-read every list each tick of every running
- * session.
+ * session. The exception is the row the next page's cursor names; see
+ * {@link mergeItemsIntoPages}.
  *
  * @param changed - Names of wire fields that changed the cached row.
  * @returns `true` when the query should be invalidated after patching.
@@ -274,6 +275,11 @@ export function mergeItemsIntoPages(
   if (!data) return { data, found, needsRefetch: false };
   let anyPageChanged = false;
   let needsRefetch = false;
+  // The row the next page is fetched after. Moving it up leaves a stale cursor
+  // ("load more" would restart near the top) and lifts the sidebar's
+  // completeness watermark, hiding every row below it, so it reconciles.
+  const tail = data.pages.at(-1);
+  const cursorId = tail?.has_more ? tail.last_id : null;
   const pages = data.pages.map((page) => {
     let rowChanged = false;
     const nextData: Conversation[] = [];
@@ -295,7 +301,10 @@ export function mergeItemsIntoPages(
         needsRefetch = true;
         continue;
       }
-      if (changedFieldsNeedRefetch(changed)) {
+      if (
+        changedFieldsNeedRefetch(changed) ||
+        (conv.id === cursorId && changed.has("updated_at"))
+      ) {
         needsRefetch = true;
       }
       rowChanged = true;

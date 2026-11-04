@@ -215,6 +215,40 @@ describe("mergeItemsIntoPages", () => {
     expect(needsRefetch).toBe(true);
   });
 
+  it("reconciles when the next page's cursor row moves", () => {
+    // Bumping the row "load more" fetches after would leave a stale cursor and
+    // lift the sidebar's completeness watermark above every other row.
+    const before: ConversationsInfiniteData = {
+      pages: [
+        {
+          data: [conv("a", { updated_at: 3 }), conv("b", { updated_at: 2 })],
+          first_id: "a",
+          last_id: "b",
+          has_more: true,
+        },
+      ],
+      pageParams: [undefined],
+    };
+    const bump = (id: string) =>
+      mergeItemsIntoPages(
+        before,
+        new Map<string, SessionListWireItem>([[id, { id, updated_at: 9 }]]),
+        DEFAULT_FILTERS,
+      ).needsRefetch;
+
+    expect(bump("b")).toBe(true);
+    expect(bump("a")).toBe(false);
+    // With no further page there is no cursor to protect.
+    const complete = { ...before, pages: [{ ...before.pages[0], has_more: false }] };
+    expect(
+      mergeItemsIntoPages(
+        complete,
+        new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 9 }]]),
+        DEFAULT_FILTERS,
+      ).needsRefetch,
+    ).toBe(false);
+  });
+
   it("patches an updated_at bump in place without a refetch", () => {
     const before = data([conv("a", { updated_at: 1 }), conv("b", { updated_at: 1 })]);
     const items = new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 2 }]]);
