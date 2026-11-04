@@ -18,7 +18,11 @@ from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
-from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
+from omnigent.stores.conversation_store import (
+    RECONNECT_RECOVERY_HELD_LABEL_KEY,
+    ConversationNotFoundError,
+    ConversationStore,
+)
 from omnigent.util.session_lifecycle import is_session_closed
 
 _logger = logging.getLogger(__name__)
@@ -35,10 +39,6 @@ _restoration_tasks: WorkspaceScopedCache[tuple[str, str, int], asyncio.Task[None
 
 
 _wake_only_retries: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
-# A runner a wake-only retry launched can connect after that retry gives up.
-_held_reconnect_recoveries: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache(
-    lambda: cachetools.LRUCache(maxsize=4096)
-)
 # Session -> runner a wake brought up without resuming its interrupted turn.
 _skipped_resumes: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
     lambda: cachetools.LRUCache(maxsize=4096)
@@ -59,19 +59,25 @@ def defer_reconnect_recovery(session_id: str) -> Iterator[None]:
             _wake_only_retries.pop(session_id, None)
 
 
-def hold_reconnect_recovery(session_id: str) -> None:
-    """Keep runner-connect recovery of *session_id*'s tree off until requested work starts."""
-    _held_reconnect_recoveries[session_id] = True
+async def hold_reconnect_recovery(session_id: str, store: ConversationStore) -> None:
+    """Keep runner-connect recovery of *session_id*'s tree off until requested work starts.
+
+    The hold is persisted because the launched runner can connect after this server restarts.
+    """
+    await asyncio.to_thread(
+        store.set_labels, session_id, {RECONNECT_RECOVERY_HELD_LABEL_KEY: "true"}
+    )
 
 
-def end_reconnect_deferral(session_id: str) -> None:
-    """Let runner-connect recovery resume *session_id*'s tree once requested work starts."""
-    _held_reconnect_recoveries.pop(session_id, None)
+async def end_reconnect_deferral(conv: Conversation, store: ConversationStore) -> None:
+    """Let runner-connect recovery resume *conv*'s tree once requested work starts."""
+    if RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels:
+        await asyncio.to_thread(store.delete_label, conv.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
 
 
-def reconnect_recovery_deferred(session_id: str) -> bool:
-    """Whether a wake-only retry of *session_id* is running or launched a runner."""
-    return session_id in _wake_only_retries or session_id in _held_reconnect_recoveries
+def reconnect_recovery_deferred(conv: Conversation) -> bool:
+    """Whether a wake-only retry of *conv* is running or launched a runner."""
+    return conv.id in _wake_only_retries or RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels
 
 
 def note_skipped_resume(session_id: str, runner_id: str) -> None:
@@ -244,8 +250,8 @@ async def restore_active_children(
         _logger.info("Stopped restoring children of %s: runner tunnel changed", parent.id)
         return
     # A woken child no longer holds back recovery of the tree restored here.
-    for session_id in tree:
-        end_reconnect_deferral(session_id)
+    for row in tree.values():
+        await end_reconnect_deferral(row, store)
     active = {row.id for row in tree.values() if row.id != parent.id and _interrupted(row)}
     needed = set(active)
     for row in reversed(list(tree.values())):

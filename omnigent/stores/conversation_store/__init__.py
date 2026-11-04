@@ -185,6 +185,9 @@ SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_sou
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
 
+# Set while a wake-only retry holds runner-connect recovery of the session's tree.
+RECONNECT_RECOVERY_HELD_LABEL_KEY = "omnigent.reconnect_recovery_held"
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -213,6 +216,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
         "omnigent.startup",
+        RECONNECT_RECOVERY_HELD_LABEL_KEY,
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )

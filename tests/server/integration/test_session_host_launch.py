@@ -3893,6 +3893,15 @@ async def test_message_relaunch_recreated_workspace_continues_with_notice(
     assert _WORKSPACE in notice["message"], notice["message"]
 
 
+def _reconnect_recovery_held(db_uri: str, session_id: str) -> bool:
+    """Whether a wake-only retry still holds *session_id*'s reconnect recovery."""
+    from omnigent.server.child_session_recovery import reconnect_recovery_deferred
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    return reconnect_recovery_deferred(conv)
+
+
 @pytest.mark.parametrize("wake_only", [False, True], ids=["resume", "wake-only"])
 async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     client: httpx.AsyncClient,
@@ -3903,7 +3912,6 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
 ) -> None:
     """Retry relaunches one dead runner; a wake-only retry resumes no turn in its tree."""
     from omnigent.runtime import set_runner_client
-    from omnigent.server.child_session_recovery import reconnect_recovery_deferred
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
 
@@ -3919,7 +3927,7 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
 
     async def _initialize(*_args: Any, **_kwargs: Any) -> bool:
         # The relaunched runner's connect hook runs while this retry initializes.
-        connect_recovery_deferred.append(reconnect_recovery_deferred(session_id))
+        connect_recovery_deferred.append(_reconnect_recovery_held(db_uri, session_id))
         return False
 
     initialize = AsyncMock(side_effect=_initialize)
@@ -3947,7 +3955,7 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     assert initialize.await_args.kwargs["restore_children"] is not wake_only
     assert connect_recovery_deferred == [wake_only]
     # A runner connecting after the wake returns still finds the tree's recovery held.
-    assert reconnect_recovery_deferred(session_id) is wake_only
+    assert _reconnect_recovery_held(db_uri, session_id) is wake_only
     relay_ready.assert_awaited_once()
     after = await client.get(f"/v1/sessions/{session_id}/items")
     assert after.json() == before.json()
@@ -4172,7 +4180,7 @@ async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
     await asyncio.wait_for(launched.wait(), timeout=budget(5.0))
     if not resume_during_wake:
         await wake
-        assert child_session_recovery.reconnect_recovery_deferred(session_id)
+        assert _reconnect_recovery_held(db_uri, session_id)
     if failed_marker_lost:
         # The wake leaves the Resume card, and the label outlasts the marker.
         assert _session_status_cache[session_id] == "failed"
@@ -4197,7 +4205,7 @@ async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
         assert runner_client.suppressed_recovery == [False]
         assert runner_client.held_subagent_wakes == [False]
     restore_children.assert_awaited_once()
-    assert not child_session_recovery.reconnect_recovery_deferred(session_id)
+    assert not _reconnect_recovery_held(db_uri, session_id)
     assert child_session_recovery.skipped_resume_runner(session_id) is None
     if failed_marker_lost:
         assert _session_status_cache[session_id] == "idle"
@@ -4255,11 +4263,13 @@ async def test_resume_after_waking_a_connected_runner_releases_its_hold(
     assert runner_client.held_subagent_wakes == [True, False]
 
 
+@pytest.mark.parametrize("marker_lost", [False, True], ids=["marker", "persisted-hold-only"])
 async def test_message_after_wake_only_launch_restores_interrupted_children(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    marker_lost: bool,
 ) -> None:
     """A message after a wake resumes the interrupted child, but not the parent's turn."""
     import dataclasses
@@ -4336,8 +4346,11 @@ async def test_message_after_wake_only_launch_restores_interrupted_children(
         )
         assert wake.status_code == 202, wake.text
         await responder
-        assert child_session_recovery.reconnect_recovery_deferred(session_id)
+        assert _reconnect_recovery_held(db_uri, session_id)
         assert [init[0] for init in inits] == [session_id]
+        if marker_lost:
+            # Eviction drops the process-local marker; the persisted hold still owes the handshake.
+            child_session_recovery.clear_skipped_resume(session_id)
 
         response = await client.post(
             f"/v1/sessions/{session_id}/events",
@@ -4355,7 +4368,7 @@ async def test_message_after_wake_only_launch_restores_interrupted_children(
         (session_id, True, False, False),
         (child.id, False, False, True),
     ]
-    assert not child_session_recovery.reconnect_recovery_deferred(session_id)
+    assert not _reconnect_recovery_held(db_uri, session_id)
     assert child_session_recovery.skipped_resume_runner(session_id) is None
 
 

@@ -694,13 +694,8 @@ async def _recover_retry_session(
     the session's own or a descendant's. The next plain retry on that runner
     resumes them.
     """
-    from omnigent.server.child_session_recovery import (
-        defer_reconnect_recovery,
-        end_reconnect_deferral,
-    )
+    from omnigent.server.child_session_recovery import defer_reconnect_recovery
 
-    if not wake_only:
-        end_reconnect_deferral(session_id)
     deferral = defer_reconnect_recovery(session_id) if wake_only else contextlib.nullcontext()
     with deferral:
         return await _recover_retry_session_once(
@@ -727,6 +722,7 @@ async def _recover_retry_session_once(
     """Run one recovery attempt for :func:`_recover_retry_session`."""
     from omnigent.server.child_session_recovery import (
         clear_skipped_resume,
+        end_reconnect_deferral,
         failed_by_runner_loss,
         hold_reconnect_recovery,
         note_skipped_resume,
@@ -736,6 +732,8 @@ async def _recover_retry_session_once(
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
+    if not wake_only:
+        await end_reconnect_deferral(conv, conversation_store)
 
     original_runner_id = conv.runner_id
     runner_client = await _get_runner_client(session_id, runner_router)
@@ -746,7 +744,7 @@ async def _recover_retry_session_once(
         await _raise_if_runner_on_another_replica(conv, request.app.state, conversation_store)
         if wake_only:
             # The runner this launches can connect after the wake gives up waiting.
-            hold_reconnect_recovery(session_id)
+            await hold_reconnect_recovery(session_id, conversation_store)
         runner_client, conv = await ensure_runner_connected(
             session_id=session_id,
             conv=conv,
@@ -3514,12 +3512,14 @@ def register_events_routes(
         codex_child_turn = body.type == "message" and _codex_side_chat_thread_id(conv) is not None
         from omnigent.server.child_session_recovery import (
             clear_skipped_resume,
+            reconnect_recovery_deferred,
             skipped_resume_runner,
         )
 
         # A wake-only retry left this runner's handshake and child restoration to this input.
-        woken_without_resume = (
-            conv.runner_id is not None and skipped_resume_runner(session_id) == conv.runner_id
+        woken_without_resume = conv.runner_id is not None and (
+            skipped_resume_runner(session_id) == conv.runner_id
+            or reconnect_recovery_deferred(conv)
         )
         if not codex_child_turn and (
             _runner_needs_session_init

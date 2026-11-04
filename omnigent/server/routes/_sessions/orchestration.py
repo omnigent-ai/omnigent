@@ -8153,7 +8153,7 @@ async def _dispatch_session_event_to_runner_impl(
         from omnigent.server.child_session_recovery import end_reconnect_deferral
 
         disconnect_outcome.note_user_turn(conv.id)
-        end_reconnect_deferral(conv.id)
+        await end_reconnect_deferral(conv, conversation_store)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors

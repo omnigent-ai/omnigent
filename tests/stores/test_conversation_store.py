@@ -6045,6 +6045,7 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.codex_native.bridge_id": source.id,
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
+            "omnigent.reconnect_recovery_held": "true",
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
             # Creation origin belongs to the source, not the fork.

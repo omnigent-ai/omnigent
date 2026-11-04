@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urlparse
 
@@ -42,16 +43,24 @@ def _hold_for_viewer(request: pytest.FixtureRequest, page: Page) -> None:
 
 
 @pytest.fixture
-def asleep_session_file(seeded_session: tuple[str, str]) -> tuple[str, str]:
-    """Seed ``_FILE_PATH`` in the session's temporary workspace."""
+def asleep_session_file(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
+    """Seed ``_FILE_PATH`` in the session's workspace."""
     base_url, session_id = seeded_session
+    file_url = (
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/"
+        f"{_FILE_PATH}"
+    )
     response = httpx.put(
-        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{_FILE_PATH}",
+        file_url,
         json={"content": "Notes kept in the sandbox.", "encoding": "utf-8"},
         timeout=10.0,
     )
     response.raise_for_status()
-    return (base_url, session_id)
+    try:
+        yield (base_url, session_id)
+    finally:
+        # Deleting the session keeps its workspace files, so remove the seed here.
+        httpx.delete(file_url, timeout=10.0)
 
 
 class _SandboxWakeRecorder:

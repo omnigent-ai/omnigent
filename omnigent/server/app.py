@@ -4605,7 +4605,7 @@ def create_app(
         wake_only_root_ids: set[str] = set()
         skipped_resume_ids_by_root: dict[str, set[str]] = {}
         for conv in convs:
-            deferred = reconnect_recovery_deferred(conv.id)
+            deferred = reconnect_recovery_deferred(conv)
             if not deferred and skipped_resume_runner(conv.id) is None:
                 continue
             root_id = independent_root_id(conv)

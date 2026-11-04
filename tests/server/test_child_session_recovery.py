@@ -82,7 +82,7 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
     nested = child(owner=idle_ancestor)
     untouched = [child("idle"), child("failed")]
     # A wake of the nested child earlier left its tree's reconnect recovery held.
-    hold_reconnect_recovery(nested.id)
+    await hold_reconnect_recovery(nested.id, store)
     calls = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -112,7 +112,7 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
     assert relay.call_count == 5
     recovered.assert_not_awaited()
     assert all(store.get_conversation(row.id).runner_id == "old" for row in untouched)
-    assert not reconnect_recovery_deferred(nested.id)
+    assert not reconnect_recovery_deferred(store.get_conversation(nested.id))  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

@@ -677,29 +677,53 @@ async def test_root_recovery_failure_is_quiet_only_after_tunnel_replacement(
             assert errors
 
 
+@pytest.mark.parametrize("process_state_lost", [False, True], ids=["same-process", "restarted"])
 async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the_turn(
-    app: FastAPI, agent: Agent, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI,
+    agent: Agent,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    process_state_lost: bool,
 ) -> None:
-    """A runner reconnecting after its wake failed leaves the interrupted turn for Resume."""
+    """A runner reconnecting after its wake failed leaves the interrupted tree for Resume."""
+    from omnigent.db.workspace_cache import WorkspaceScopedCache
+    from omnigent.server import child_session_recovery
     from omnigent.server.child_session_recovery import reconnect_recovery_deferred
     from omnigent.server.routes._sessions import orchestration
     from omnigent.server.routes.sessions import routes_events
+    from tests._helpers.polling import poll_until_async
 
     for module in (routes_events, orchestration):
         monkeypatch.setattr(module, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+    store = app.state.runner_router._conversation_store
     interrupted = _create_session(app, agent.id)
+    child = _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=interrupted.id)
     retry_url = f"/v1/sessions/{interrupted.id}/events"
     wake = await client.post(
         retry_url, json={"type": "retry_session", "data": {"wake_only": True}}
     )
     assert wake.status_code == 503, wake.text
+    if process_state_lost:
+        # A server restart or cache eviction leaves only what the store persisted.
+        for name, value in list(vars(child_session_recovery).items()):
+            if isinstance(value, WorkspaceScopedCache):
+                monkeypatch.setattr(child_session_recovery, name, WorkspaceScopedCache())
+        for session in (interrupted, child):
+            sessions._session_status_cache.pop(session.id, None)
     # Nothing expires the hold, so however late the runner connects it finds the turn left.
-    assert reconnect_recovery_deferred(interrupted.id)
-    inits: list[dict[str, Any]] = []
+    assert reconnect_recovery_deferred(store.get_conversation(interrupted.id))
+    inits: list[tuple[str, bool, bool]] = []
 
     async def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        inits.append(body["session_init"])
+        envelope = body["session_init"]
+        inits.append(
+            (
+                body["session_id"],
+                envelope["suppress_recovery_turn"],
+                envelope["resume_interrupted_turn"],
+            )
+        )
         return httpx.Response(201, json={"id": body["session_id"]})
 
     async with _recover(app, monkeypatch, respond) as (_relays, finished):
@@ -707,6 +731,8 @@ async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the
         assert inits == []
         resume = await client.post(retry_url, json={"type": "retry_session", "data": {}})
         assert resume.status_code == 202, resume.text
+        await poll_until_async(lambda: len(inits) == 2, timeout_s=budget(5))
 
-    assert [init["suppress_recovery_turn"] for init in inits] == [False]
-    assert not reconnect_recovery_deferred(interrupted.id)
+    # Resume runs the parent's recovery turn and continues its interrupted child.
+    assert inits == [(interrupted.id, False, False), (child.id, False, True)]
+    assert not reconnect_recovery_deferred(store.get_conversation(interrupted.id))

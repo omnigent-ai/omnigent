@@ -2805,8 +2805,8 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
         store.set_session_live_status(root_id, "failed")
         _session_status_cache[root_id] = "failed"
     # The wakes that launched this runner have returned; its connect hook runs next.
-    hold_reconnect_recovery(woken_id)
-    hold_reconnect_recovery(woken_child_id)
+    await hold_reconnect_recovery(woken_id, store)
+    await hold_reconnect_recovery(woken_child_id, store)
     # An earlier wake skipped this tree's resume; this connect's recovery runs it.
     note_skipped_resume(other_id, "earlier_runner")
     connection = _attach_live_connection(app, monkeypatch, runner_id)
@@ -2850,8 +2850,8 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
     assert _session_status_cache[other_id] == "idle"
     assert _last_task_error_from_labels(other.labels) is None
     # Only requested work ends the holds, so a later reconnect leaves the trees too.
-    assert reconnect_recovery_deferred(woken_id)
-    assert reconnect_recovery_deferred(woken_child_id)
+    assert reconnect_recovery_deferred(store.get_conversation(woken_id))  # type: ignore[arg-type]
+    assert reconnect_recovery_deferred(store.get_conversation(woken_child_id))  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
