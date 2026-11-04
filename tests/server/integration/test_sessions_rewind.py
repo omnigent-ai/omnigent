@@ -16,12 +16,14 @@ import httpx
 import pytest
 
 from omnigent.entities import MessageData, NewConversationItem
-from omnigent.server.auth import LEVEL_EDIT
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
 from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, managed_repo_labels
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions.orchestration import _mark_dispatch_in_flight
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.integration._session_continuation import (
     _EDITOR,
     _HOST_ID,
@@ -272,6 +274,7 @@ async def test_rewind_still_returns_the_new_session_when_its_attachments_fail(
         # A message still on its way to the runner counts as a running turn.
         ("claude-sdk", 2, "starting", 400, "Stop the current turn"),
         ("claude-sdk", 2, "editor", 403, ""),
+        ("claude-sdk", 0, "side_chat", 400, "isn't available in a side chat"),
     ],
 )
 async def test_rewind_refusals_create_no_session(
@@ -307,6 +310,28 @@ async def test_rewind_refusals_create_no_session(
         )
         assert granted.status_code < 300, granted.text
         caller = _EDITOR
+    elif placement == "side_chat":
+        # A side chat rides its source's runner and has no host of its own.
+        side_chat = store.create_conversation(
+            agent_id=store.get_conversation(source_id).agent_id,
+            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source_id},
+        )
+        store.replace_runner_id(side_chat.id, _RUNNER_ID)
+        SqlAlchemyPermissionStore(db_uri).grant(_OWNER, side_chat.id, LEVEL_OWNER)
+        store.append(
+            side_chat.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_side",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "Side question"}]
+                    ),
+                )
+            ],
+        )
+        source_id = side_chat.id
+        items = item_ids(store, source_id)
     headers = {"X-Forwarded-Email": caller}
     before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
 
