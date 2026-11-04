@@ -1891,6 +1891,67 @@ async def test_a_save_during_another_keeps_the_original_the_first_replaced(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("method", "operation", "body"),
+    [
+        ("PUT", "write", {"content": "B\n"}),
+        ("PATCH", "edit_text", {"old_text": "hello world", "new_text": "B\n"}),
+    ],
+)
+async def test_a_cancelled_save_keeps_its_lock_until_it_is_recorded(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    operation: str,
+    body: dict[str, str],
+) -> None:
+    """A cancelled save holds the lock until it is recorded, keeping the original it replaced."""
+    saved = asyncio.Event()
+    release = asyncio.Event()
+    held_saves: list[asyncio.Task[object]] = []
+    save = getattr(CallerProcessFilesystem, operation)
+
+    async def save_then_hold(
+        self: CallerProcessFilesystem, *args: object, **kwargs: object
+    ) -> object:
+        async def run() -> object:
+            result = await save(self, *args, **kwargs)
+            saved.set()
+            await release.wait()
+            return result
+
+        # Like a helper process, the save runs on after its request is cancelled.
+        held_saves.append(asyncio.create_task(run()))
+        return await asyncio.shield(held_saves[-1])
+
+    monkeypatch.setattr(CallerProcessFilesystem, operation, save_then_hold)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    url = f"{base}/filesystem/hello.txt"
+    request = asyncio.create_task(client.request(method, url, json=body))
+    try:
+        await asyncio.wait_for(saved.wait(), timeout=5)
+        request.cancel()
+        finished, _ = await asyncio.wait({request}, timeout=0.1)
+        assert not finished
+        assert app.state.filesystem_registry.change_lock("hello.txt").locked()
+    finally:
+        release.set()
+        await asyncio.gather(*held_saves)
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    resaved = await client.put(url, json={"content": "C\n"})
+    assert resaved.status_code == 200, resaved.text
+    (workspace / "hello.txt").write_text("B\n")
+    listed = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
+    (workspace / "hello.txt").write_text("hello world")
+    assert (await client.get(f"{base}/changes")).json()["data"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("original", "method", "body", "after"),
     [
         pytest.param(

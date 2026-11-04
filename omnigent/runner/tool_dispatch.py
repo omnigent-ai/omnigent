@@ -57,7 +57,7 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
-from omnigent.inner.async_utils import run_sync_cleanup
+from omnigent.inner.async_utils import finish_before_cancellation, run_sync_cleanup
 from omnigent.inner.executor import ToolCallStatus, classify_tool_result
 from omnigent.models.model_override import (
     harness_supports_model_override,
@@ -7560,6 +7560,7 @@ async def _run_tracked_os_env_mutation(
 
     The registry's change lock spans the read, the mutation and the recording,
     so a concurrent write to *path* cannot record this one's result as its original.
+    A cancelled caller keeps the lock until a started mutation is recorded.
 
     :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
         the current tool dispatch.
@@ -7571,8 +7572,8 @@ async def _run_tracked_os_env_mutation(
     """
     if filesystem_registry is None or conversation_id is None:
         return await mutate()
-    async with filesystem_registry.change_lock(path):
-        original = await _read_os_env_original(os_env, path)
+
+    async def mutate_and_record(original: str | None) -> OpResult:
         result = await mutate()
         if isinstance(result, dict) and "error" in result:
             return result
@@ -7584,7 +7585,11 @@ async def _run_tracked_os_env_mutation(
         filesystem_registry.record_change(
             path, "created" if created else "modified", conversation_id
         )
-    return result
+        return result
+
+    async with filesystem_registry.change_lock(path):
+        original = await _read_os_env_original(os_env, path)
+        return await finish_before_cancellation(mutate_and_record(original))
 
 
 async def _execute_os_env_tool(

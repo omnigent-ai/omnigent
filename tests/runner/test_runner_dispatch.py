@@ -2974,6 +2974,64 @@ async def test_tracked_mutation_that_fails_records_nothing(
 
 
 @pytest.mark.asyncio
+async def test_a_cancelled_tracked_mutation_keeps_its_lock_until_it_is_recorded(
+    tmp_path: Path,
+) -> None:
+    """A cancelled write holds the lock until it is recorded, keeping the original it replaced."""
+    from omnigent.inner.os_env import OpResult, OSEnvironment
+    from omnigent.runner.tool_dispatch import _run_tracked_os_env_mutation
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+
+    notes = tmp_path / "notes.txt"
+    notes.write_text("A\n")
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+    reads = cast(OSEnvironment, _InProcessReads(tmp_path))
+    written = asyncio.Event()
+    release = asyncio.Event()
+    held_writes: list[asyncio.Task[OpResult]] = []
+
+    async def write_then_hold() -> OpResult:
+        async def run() -> OpResult:
+            notes.write_text("B\n")
+            written.set()
+            await release.wait()
+            return {}
+
+        # Like a helper process, the write runs on after its caller is cancelled.
+        held_writes.append(asyncio.create_task(run()))
+        return await asyncio.shield(held_writes[-1])
+
+    mutation = asyncio.create_task(
+        _run_tracked_os_env_mutation(
+            reads, "notes.txt", write_then_hold, filesystem_registry, "conv"
+        )
+    )
+    try:
+        await asyncio.wait_for(written.wait(), timeout=5)
+        mutation.cancel()
+        finished, _ = await asyncio.wait({mutation}, timeout=0.1)
+        assert not finished
+        assert filesystem_registry.change_lock("notes.txt").locked()
+    finally:
+        release.set()
+        await asyncio.gather(*held_writes)
+    with pytest.raises(asyncio.CancelledError):
+        await mutation
+
+    async def write_c() -> OpResult:
+        notes.write_text("C\n")
+        return {}
+
+    await _run_tracked_os_env_mutation(reads, "notes.txt", write_c, filesystem_registry, "conv")
+    assert filesystem_registry.get_baseline("notes.txt") == "A\n"
+    notes.write_text("B\n")
+    listed = filesystem_registry.list_changed_files("conv", limit=10, check_disk=True)
+    assert [(entry["path"], entry["status"]) for entry in listed] == [("notes.txt", "modified")]
+    notes.write_text("A\n")
+    assert filesystem_registry.list_changed_files("conv", limit=10, check_disk=True) == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("original", "complete_read_fails", "expected_byte_caps", "baseline"),
     [

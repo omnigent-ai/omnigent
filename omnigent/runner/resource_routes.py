@@ -33,6 +33,7 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
+from omnigent.inner.async_utils import finish_before_cancellation
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
@@ -1850,6 +1851,36 @@ def register_resource_routes(
             )
         filesystem_registry.record_change(relative_path, operation, session_id)
 
+    async def _save_and_record[SaveResult](
+        session_id: str,
+        environment_id: str,
+        agent_spec: AgentSpec | None,
+        fs: CallerProcessFilesystem,
+        relative_path: str,
+        save: Callable[[], Awaitable[SaveResult]],
+        operation: Callable[[SaveResult], str],
+    ) -> SaveResult:
+        """Run an editor *save* under the change lock and record it with the original it replaced.
+
+        A cancelled request keeps the lock until a started save is recorded.
+        """
+        async with _change_lock(relative_path):
+            original = await _read_original(fs, relative_path)
+
+            async def save_and_record() -> SaveResult:
+                result = await save()
+                _record_editor_change(
+                    session_id,
+                    environment_id,
+                    agent_spec,
+                    relative_path,
+                    original,
+                    operation(result),
+                )
+                return result
+
+            return await finish_before_cancellation(save_and_record())
+
     @app.put(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
@@ -1874,21 +1905,15 @@ def register_resource_routes(
         encoding = body.get("encoding", "utf-8")
         create_parents = body.get("create_parents", True)
         content_bytes = content_str.encode(encoding)
-        async with _change_lock(relative_path):
-            original = await _read_original(fs, relative_path)
-            result = await fs.write(
-                relative_path,
-                content_bytes,
-                create_parents=create_parents,
-            )
-            _record_editor_change(
-                session_id,
-                environment_id,
-                agent_spec,
-                relative_path,
-                original,
-                "created" if result.created else "modified",
-            )
+        result = await _save_and_record(
+            session_id,
+            environment_id,
+            agent_spec,
+            fs,
+            relative_path,
+            lambda: fs.write(relative_path, content_bytes, create_parents=create_parents),
+            lambda written: "created" if written.created else "modified",
+        )
         return JSONResponse(
             status_code=200,
             content={
@@ -1927,12 +1952,15 @@ def register_resource_routes(
             new_text=body.get("new_text"),
             replace_all=body.get("replace_all", False),
         )
-        async with _change_lock(relative_path):
-            original = await _read_original(fs, relative_path)
-            result = await fs.edit_text(relative_path, edit_req)
-            _record_editor_change(
-                session_id, environment_id, agent_spec, relative_path, original, result.operation
-            )
+        result = await _save_and_record(
+            session_id,
+            environment_id,
+            agent_spec,
+            fs,
+            relative_path,
+            lambda: fs.edit_text(relative_path, edit_req),
+            lambda edited: edited.operation,
+        )
         return JSONResponse(
             status_code=200,
             content={
