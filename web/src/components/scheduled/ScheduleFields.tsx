@@ -29,6 +29,7 @@ import {
   buildRRule,
   MAX_MINUTE_INTERVAL,
   minimumScheduleInterval,
+  MIN_SUBHOUR_MINUTE_INTERVAL,
   formatUntil,
   parseUntil,
   validateSchedule,
@@ -78,6 +79,7 @@ export function ScheduleFields({
   model,
   anchoredScheduling,
   sessionMode = "new",
+  executionTarget,
   subhourSupported = false,
   onChange,
   timezone,
@@ -90,6 +92,7 @@ export function ScheduleFields({
   model: ScheduleModel;
   anchoredScheduling: boolean;
   sessionMode?: "new" | "continue";
+  executionTarget?: "connected_host" | "managed_sandbox";
   subhourSupported?: boolean;
   onChange: (next: ScheduleModel) => void;
   timezone: string;
@@ -99,6 +102,9 @@ export function ScheduleFields({
   recurrenceUnsupported?: boolean;
   allowPastEnd?: boolean;
 }) {
+  const minuteSchedulesSupported =
+    minimumScheduleInterval("minutely", sessionMode, subhourSupported, executionTarget) ===
+    MIN_SUBHOUR_MINUTE_INTERVAL;
   const [customOpen, setCustomOpen] = useState(false);
   const [draft, setDraft] = useState(model);
   const [timezoneOpen, setTimezoneOpen] = useState(false);
@@ -129,7 +135,7 @@ export function ScheduleFields({
       : null;
   const error =
     activeDateInput?.error ??
-    validateSchedule(model, { allowPastEnd, sessionMode, subhourSupported });
+    validateSchedule(model, { allowPastEnd, sessionMode, subhourSupported, executionTarget });
   const recurrence = { ...model, end: undefined };
   const recurrenceError = validateSchedule(recurrence, {
     sessionMode: "continue",
@@ -137,7 +143,7 @@ export function ScheduleFields({
   });
   const draftError = validateSchedule(
     { ...draft, end: undefined },
-    { sessionMode, subhourSupported },
+    { sessionMode, subhourSupported, executionTarget },
   );
   const until = model.end?.type === "until" ? parseUntil(model.end.until) : null;
 
@@ -259,7 +265,12 @@ export function ScheduleFields({
                     id="custom-interval"
                     data-testid="custom-interval"
                     type="number"
-                    min={minimumScheduleInterval(draft.customFreq, sessionMode, subhourSupported)}
+                    min={minimumScheduleInterval(
+                      draft.customFreq,
+                      sessionMode,
+                      subhourSupported,
+                      executionTarget,
+                    )}
                     max={draft.customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366}
                     step={1}
                     value={Number.isFinite(draft.interval) ? draft.interval : ""}
@@ -276,13 +287,12 @@ export function ScheduleFields({
                     testId="custom-freq-trigger"
                     value={draft.customFreq}
                     options={[
-                      ...((sessionMode === "continue" && subhourSupported) ||
-                      draft.customFreq === "minutely"
+                      ...(minuteSchedulesSupported || draft.customFreq === "minutely"
                         ? [
                             {
                               value: "minutely",
                               label: "Minutes",
-                              disabled: sessionMode !== "continue" || !subhourSupported,
+                              disabled: !minuteSchedulesSupported,
                             },
                           ]
                         : []),
@@ -295,6 +305,7 @@ export function ScheduleFields({
                           next.customFreq,
                           sessionMode,
                           subhourSupported,
+                          executionTarget,
                         );
                         next.interval = Math.max(minimum, next.interval || minimum);
                       } else if (draft.customFreq === "minutely") {

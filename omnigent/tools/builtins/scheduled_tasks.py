@@ -21,9 +21,11 @@ from omnigent.tools.base import Tool
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
-    "mornings). Must fire at least twice. Minimum interval: 10 minutes when "
-    "session_mode is 'continue' and automations_subhour is enabled on the server "
-    "(e.g. 'FREQ=MINUTELY;INTERVAL=10'), otherwise 1 hour."
+    "mornings). Must fire at least twice. With automations_subhour enabled, "
+    "the minimum is 10 minutes on connected hosts in either session mode, or "
+    "in managed sandboxes with session_mode 'continue' "
+    "(e.g. 'FREQ=MINUTELY;INTERVAL=10'). New sandbox sessions, or servers "
+    "without sub-hour support, require 1 hour."
 )
 
 

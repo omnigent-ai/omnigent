@@ -1,5 +1,6 @@
 // Visual recurrence model shared by the automation form and RRULE serialization.
 import { RRule } from "rrule";
+import type { ScheduledTaskExecutionTarget } from "@/lib/scheduledTasksApi";
 
 /** The frequency dropdown's top-level options. */
 export type SchedulePreset = "hourly" | "daily" | "weekdays" | "weekly" | "custom";
@@ -37,18 +38,19 @@ export interface ScheduleModel {
 }
 
 export const MAX_MINUTE_INTERVAL = 366 * 60;
-export const MIN_CONTINUED_MINUTE_INTERVAL = 10;
-export const MIN_NEW_SESSION_MINUTE_INTERVAL = 60;
+export const MIN_SUBHOUR_MINUTE_INTERVAL = 10;
+export const MIN_HOURLY_MINUTE_INTERVAL = 60;
 
 export function minimumScheduleInterval(
   frequency: CustomFreq,
   sessionMode: "new" | "continue",
   subhourSupported: boolean,
+  executionTarget?: ScheduledTaskExecutionTarget,
 ): number {
   if (frequency !== "minutely") return 1;
-  return sessionMode === "continue" && subhourSupported
-    ? MIN_CONTINUED_MINUTE_INTERVAL
-    : MIN_NEW_SESSION_MINUTE_INTERVAL;
+  return subhourSupported && (sessionMode === "continue" || executionTarget === "connected_host")
+    ? MIN_SUBHOUR_MINUTE_INTERVAL
+    : MIN_HOURLY_MINUTE_INTERVAL;
 }
 
 export const DEFAULT_SCHEDULE_MODEL: ScheduleModel = {
@@ -274,11 +276,13 @@ export function validateSchedule(
     allowPastEnd = false,
     now = new Date(),
     sessionMode = "new",
+    executionTarget,
     subhourSupported = false,
   }: {
     allowPastEnd?: boolean;
     now?: Date;
     sessionMode?: "new" | "continue";
+    executionTarget?: ScheduledTaskExecutionTarget;
     subhourSupported?: boolean;
   } = {},
 ): string | null {
@@ -299,13 +303,18 @@ export function validateSchedule(
     return "Pick at least one day of the week.";
   }
   if (model.preset === "custom") {
-    const minimum = minimumScheduleInterval(model.customFreq, sessionMode, subhourSupported);
+    const minimum = minimumScheduleInterval(
+      model.customFreq,
+      sessionMode,
+      subhourSupported,
+      executionTarget,
+    );
     const maximum = model.customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366;
     if (!Number.isInteger(model.interval) || model.interval < minimum || model.interval > maximum) {
-      if (model.customFreq === "minutely" && model.interval < MIN_NEW_SESSION_MINUTE_INTERVAL) {
+      if (model.customFreq === "minutely" && model.interval < MIN_HOURLY_MINUTE_INTERVAL) {
         if (!subhourSupported) return "This server requires schedules of at least 60 minutes.";
-        if (sessionMode !== "continue")
-          return "Schedules more often than hourly require continuing in the same session.";
+        if (sessionMode !== "continue" && executionTarget !== "connected_host")
+          return "New sandbox sessions require schedules of at least 60 minutes. Continue in the same session or use a connected host for shorter intervals.";
       }
       return `Interval must be a whole number of at least ${minimum} and at most ${maximum}.`;
     }

@@ -1,9 +1,9 @@
 # Persistent task scheduling
 
 With `automations_subhour` enabled, recurring schedules have a minimum interval
-of **10 minutes** when continuing the
-existing session, or **one hour** when starting a new session each run. For a
-ten-minute schedule, use `FREQ=MINUTELY;INTERVAL=10` with `session_mode: "continue"`.
+of **10 minutes** on connected hosts in either session mode, and in sandboxes
+when continuing the existing session. Starting a new sandbox session each run
+requires **one hour**. Use `FREQ=MINUTELY;INTERVAL=10` for a ten-minute schedule.
 
 Scheduled tasks ("automations") run a saved prompt on a recurring schedule or on
 demand. `PersistentTaskScheduler` keeps the schedule in the database, so every
@@ -560,9 +560,10 @@ automations.
 ## Sub-hour schedule rollout
 
 `automations_subhour` defaults off and controls acceptance on create and
-schedule/mode updates. It is advertised in `/v1/info` so clients that cannot
+schedule, session-mode and execution-target updates. It is advertised in `/v1/info` so clients that cannot
 confirm support keep the hourly minimum. Schedulers in this version always
-understand persisted ten-minute continued schedules, independently of the flag.
+understand persisted ten-minute host and continued-sandbox schedules, independently
+of the flag.
 
 1. Deploy this version to every API and scheduler replica sharing the database
    with `automations_subhour` disabled. Keep the existing scheduler mode unchanged.
@@ -570,6 +571,11 @@ understand persisted ten-minute continued schedules, independently of the flag.
    through `OMNIGENT_FEATURES`; the custom UI also needs `automations_v2`.
 3. To stop accepting new sub-hour schedules, disable `automations_subhour`. Existing
    schedules keep running and can still be paused, deleted or changed to hourly.
+
+Updates validate the proposed recurrence, session mode and target outside the
+database transaction, then compare their saved values under the task row lock.
+A concurrent change returns HTTP 409 without applying any fields; reload and
+revalidate before retrying. Metadata-only writes do not revalidate saved cadences.
 
 Before rolling binaries back to a version with the hourly-only parser, stop
 accepting sub-hour schedules, pause them and change their recurrence to hourly

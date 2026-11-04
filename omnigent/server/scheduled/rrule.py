@@ -9,7 +9,7 @@ caller-supplied IANA timezone so a preset such as "Daily at 9:00 AM" fires at
 The rule is anchored at midnight of the reference day (localized to the task
 timezone), so occurrence phase is deterministic: an hourly rule fires on the
 hour, a daily rule at its ``BYHOUR``/``BYMINUTE``. :func:`validate_rrule`
-additionally enforces a minimum interval based on session mode and
+additionally enforces a minimum interval based on execution target and session mode and
 rejects rules that never fire or fire only once within the search window — each
 fire starts or continues real agent work, so a runaway cadence is expensive.
 
@@ -32,9 +32,9 @@ from dateutil.rrule import rrule, rrulestr  # type: ignore[import-untyped]
 
 from omnigent.server.scheduled._bounded_rrule import RRuleSearchLimitError, iter_bounded
 
-# Continuing a session reuses its runner and sandbox instead of provisioning per fire.
+# Connected hosts and continued sessions avoid provisioning a sandbox per fire.
 MIN_INTERVAL_SECONDS = 60 * 60
-MIN_CONTINUED_INTERVAL_SECONDS = 10 * 60
+MIN_SUBHOUR_INTERVAL_SECONDS = 10 * 60
 
 _UTC = ZoneInfo("UTC")
 
@@ -272,14 +272,15 @@ def validate_rrule(
     tz: ZoneInfo | None = None,  # noqa: ARG001
     *,
     session_mode: str = "new",
+    execution_target: str | None = None,
     allow_subhour: bool = True,
 ) -> RRuleTrigger:
     """Parse and validate an RRULE string for use as a recurring trigger.
 
     Beyond syntax, enforces that the rule (a) fires at least twice within the
     search window and (b) has a minimum gap of at least
-    one hour for new sessions or ten minutes for continued sessions between
-    *any* two consecutive fires.
+    ten minutes for connected hosts or continued sessions, and one hour for
+    new sandbox sessions, between sampled consecutive fires.
 
     The interval check samples fires from a fixed UTC anchor, so the verdict is
     deterministic (independent of the wall-clock instant it runs at) and immune
@@ -288,7 +289,9 @@ def validate_rrule(
     :param rule_str: The RFC 5545 recurrence rule string.
     :param tz: Accepted for API compatibility but not used by the interval
         check, which is timezone-agnostic for the cadences we allow.
-    :param session_mode: Only ``"continue"`` permits the ten-minute minimum.
+    :param session_mode: Continued sessions permit the ten-minute minimum.
+    :param execution_target: Connected hosts also permit ten-minute new sessions.
+        Omit to retain the conservative new-session hourly floor.
     :param allow_subhour: API rollout gate; schedulers retain support for saved rules.
     :returns: An :class:`RRuleTrigger`.
     :raises RRuleValidationError: On bad syntax, never-fires, fires-once, or a
@@ -321,8 +324,8 @@ def validate_rrule(
     if count == 1:
         raise RRuleValidationError("RRULE fires only once")
     minimum = (
-        MIN_CONTINUED_INTERVAL_SECONDS
-        if session_mode == "continue" and allow_subhour
+        MIN_SUBHOUR_INTERVAL_SECONDS
+        if allow_subhour and (session_mode == "continue" or execution_target == "connected_host")
         else MIN_INTERVAL_SECONDS
     )
     if min_gap < minimum:

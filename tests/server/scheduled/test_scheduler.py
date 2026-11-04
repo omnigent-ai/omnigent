@@ -26,10 +26,7 @@ from omnigent.server.scheduled.scheduler import (
 class _FakeTask:
     """The slice of ``ScheduledTask`` the scheduler reads.
 
-    The scheduler only touches ``id``, ``workspace_id``, ``rrule``,
-    ``timezone``, ``state``, and ``session_mode``, so the tests drive it with this local stand-in
-    rather than the full persisted entity — keeping the scheduler unit tests
-    independent of the entity's field set.
+    Keep scheduler tests independent of unrelated persisted entity fields.
     """
 
     id: str
@@ -38,6 +35,7 @@ class _FakeTask:
     state: str
     workspace_id: int = 0
     session_mode: str = "new"
+    execution_target: str = "connected_host"
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -446,9 +444,15 @@ async def test_startup_snapshot_preserves_changes_during_load(monkeypatch, mutat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("session_mode,armed", [("new", False), ("continue", True)])
-async def test_ten_minute_timer_requires_continued_session(session_mode, armed):
-    task = replace(_task("ten_minutes", "FREQ=MINUTELY;INTERVAL=10"), session_mode=session_mode)
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("session_mode", ["new", "continue"])
+async def test_ten_minute_timer_by_execution(execution_target, session_mode):
+    armed = execution_target == "connected_host" or session_mode == "continue"
+    task = replace(
+        _task("ten_minutes", "FREQ=MINUTELY;INTERVAL=10"),
+        session_mode=session_mode,
+        execution_target=execution_target,
+    )
     scheduler, clock, seam, fired = _make([task])
     await scheduler.start()
     try:

@@ -2163,12 +2163,14 @@ describe("CreateScheduledTaskDialog session mode", () => {
   function renderWithSessionModes(
     editingTask?: ScheduledTasksApiModule.ScheduledTask,
     features: Record<string, boolean> = {},
+    managedSandboxes = false,
   ) {
     return render(
       <CapabilitiesProvider
         info={{
           ...SERVER_INFO_OFFLINE_FALLBACK,
           scheduled_task_session_modes: true,
+          managed_sandboxes_enabled: managedSandboxes,
           features,
         }}
       >
@@ -2283,10 +2285,17 @@ describe("CreateScheduledTaskDialog session mode", () => {
     );
   });
 
-  it("preserves a minute schedule on edit and blocks switching it to new sessions", async () => {
+  it("preserves a minute schedule while changing target and session mode", async () => {
     renderWithSessionModes(
-      scheduledTask({ sessionMode: "continue", rrule: "FREQ=MINUTELY;INTERVAL=10" }),
+      scheduledTask({
+        sessionMode: "continue",
+        rrule: "FREQ=MINUTELY;INTERVAL=10",
+        executionTarget: "managed_sandbox",
+        hostId: null,
+        workspace: null,
+      }),
       { automations_v2: true, automations_subhour: true },
+      true,
     );
     expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
     fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
@@ -2294,12 +2303,18 @@ describe("CreateScheduledTaskDialog session mode", () => {
     expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
     expect(screen.getByTestId("schedule-error")).toHaveTextContent(
-      "require continuing in the same session",
+      "New sandbox sessions require schedules of at least 60 minutes",
     );
-    chooseContinue();
+    fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      rrule: "FREQ=MINUTELY;INTERVAL=10",
+      sessionMode: "new",
+      executionTarget: "connected_host",
+    });
   });
 
   it.each([undefined, false, true])(
@@ -2341,7 +2356,6 @@ describe("CreateScheduledTaskDialog session mode", () => {
     "offers Minutes on create only with subhour support %s",
     async (supported) => {
       renderWithSessionModes(undefined, { automations_v2: true, automations_subhour: supported });
-      chooseContinue();
       fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
       fireEvent.click(await screen.findByRole("option", { name: "Custom schedule" }));
       fireEvent.keyDown(screen.getByTestId("custom-freq-trigger"), { key: "Enter" });

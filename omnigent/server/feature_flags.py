@@ -86,7 +86,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     ),
     FeatureDefinition(
         feature=Feature.AUTOMATIONS_SUBHOUR,
-        description="Accept sub-hour schedules for continued automation sessions",
+        description="Accept sub-hour schedules on connected hosts or continued sandbox sessions",
         owner="server",
         review_by_release="0.22.0",
     ),

@@ -509,7 +509,8 @@ export function CreateScheduledTaskDialog({
   const scheduleInvalid =
     scheduleUnsupported ||
     unsupportedByScheduler ||
-    validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported }) !== null;
+    validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
+      null;
   const renderedTriggerPrompt =
     trigger !== null && triggerFieldsComplete(triggerFields)
       ? renderTriggerPrompt(trigger, triggerFields, {
@@ -856,6 +857,7 @@ export function CreateScheduledTaskDialog({
             model={schedule}
             anchoredScheduling={anchoredScheduling}
             sessionMode={sessionMode}
+            executionTarget={executionTarget}
             subhourSupported={subhourSupported}
             recurrenceUnsupported={scheduleUnsupported}
             allowPastEnd={allowPastEnd}

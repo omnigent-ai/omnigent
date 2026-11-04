@@ -653,7 +653,12 @@ class PersistentTaskScheduler:
 
     async def _validate_schedule(self, task: ScheduledTask) -> bool:
         try:
-            await asyncio.to_thread(validate_rrule, task.rrule, session_mode=task.session_mode)
+            await asyncio.to_thread(
+                validate_rrule,
+                task.rrule,
+                session_mode=task.session_mode,
+                execution_target=task.execution_target,
+            )
         except RRuleSearchError:
             raise
         except RRuleValidationError:

@@ -2434,9 +2434,15 @@ def test_unusable_poll_interval_waits_poll_seconds(store, caplog, reading) -> No
     assert scheduler._next_poll_delay() == 7.0
 
 
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
 @pytest.mark.parametrize("session_mode", ["new", "continue"])
-async def test_ten_minute_persisted_schedule_requires_continued_session(store, session_mode):
-    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=10", session_mode=session_mode)
+async def test_ten_minute_persisted_schedule_by_execution(store, session_mode, execution_target):
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        session_mode=session_mode,
+        execution_target=execution_target,
+    )
     clock = FakeClock(task.next_run_at)
 
     async def fire(task, lease):
@@ -2449,7 +2455,7 @@ async def test_ten_minute_persisted_schedule_requires_continued_session(store, s
     await scheduler.poll_once()
     await _drain(scheduler)
     saved = store.get(task.id)
-    if session_mode == "continue":
+    if session_mode == "continue" or execution_target == "connected_host":
         executor.assert_awaited_once()
         assert saved.state == "active"
         assert saved.next_run_at == task.next_run_at + 600

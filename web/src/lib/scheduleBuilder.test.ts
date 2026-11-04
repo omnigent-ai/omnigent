@@ -207,9 +207,22 @@ describe("parseTimeOfDayInput", () => {
 
 describe("minute cadence policy", () => {
   it.each([9, 10, 11, 30, 59, 60, 366 * 60, 366 * 60 + 1])(
-    "validates %i minutes by session mode",
+    "validates %i minutes by execution target and session mode",
     (interval) => {
       const schedule = model({ preset: "custom", customFreq: "minutely", interval });
+      for (const executionTarget of ["connected_host", "managed_sandbox"] as const) {
+        for (const sessionMode of ["new", "continue"] as const) {
+          const minimum =
+            executionTarget === "connected_host" || sessionMode === "continue" ? 10 : 60;
+          expect(
+            validateSchedule(schedule, { executionTarget, sessionMode, subhourSupported: true }) ===
+              null,
+          ).toBe(interval >= minimum && interval <= 366 * 60);
+          expect(validateSchedule(schedule, { executionTarget, sessionMode }) === null).toBe(
+            interval >= 60 && interval <= 366 * 60,
+          );
+        }
+      }
       expect(
         validateSchedule(schedule, { sessionMode: "continue", subhourSupported: true }) === null,
       ).toBe(interval >= 10 && interval <= 366 * 60);
@@ -218,7 +231,7 @@ describe("minute cadence policy", () => {
       expect(newSession === null).toBe(interval >= 60 && interval <= 366 * 60);
       if (interval < 60) {
         expect(newSession).toBe(
-          "Schedules more often than hourly require continuing in the same session.",
+          "New sandbox sessions require schedules of at least 60 minutes. Continue in the same session or use a connected host for shorter intervals.",
         );
         for (const sessionMode of ["new", "continue"] as const) {
           expect(validateSchedule(schedule, { sessionMode })).toBe(
