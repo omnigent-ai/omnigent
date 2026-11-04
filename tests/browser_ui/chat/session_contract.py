@@ -153,6 +153,7 @@ class _ChatSseStream:
 
     def __init__(self) -> None:
         self._clients: set[queue.Queue[bytes | None]] = set()
+        self._request_clients: dict[queue.Queue[bytes | None], str] = {}
         self._lock = threading.Lock()
         self._pending: list[bytes] = []
         self._ever_connected = False
@@ -171,12 +172,16 @@ class _ChatSseStream:
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
                 messages: queue.Queue[bytes | None] = queue.Queue()
+                request_generation = parse_qs(urlparse(self.path).query).get(
+                    "request_generation", [""]
+                )[0]
                 with stream._lock:
                     for event in stream._pending:
                         messages.put(event)
                     stream._pending.clear()
                     stream._ever_connected = True
                     stream._clients.add(messages)
+                    stream._request_clients[messages] = request_generation
                     stream._connection_generation += 1
                     stream._connected.set()
                 try:
@@ -197,6 +202,7 @@ class _ChatSseStream:
                 finally:
                     with stream._lock:
                         stream._clients.discard(messages)
+                        stream._request_clients.pop(messages, None)
                         if not stream._clients:
                             stream._connected.clear()
 
@@ -220,6 +226,11 @@ class _ChatSseStream:
     def connection_generation(self) -> int:
         with self._lock:
             return self._connection_generation
+
+    def request_connected(self, generation: int) -> bool:
+        """Whether the named SPA request still has a live server connection."""
+        with self._lock:
+            return str(generation) in self._request_clients.values()
 
     def emit(self, event: Mapping[str, Any]) -> None:
         """Queue pre-connect events once, then broadcast only to live clients."""
@@ -264,6 +275,7 @@ class ChatSessionContract:
     skills: list[dict[str, Any]] = field(default_factory=list)
     skill_requests: list[dict[str, Any]] = field(default_factory=list)
     session_patches: list[dict[str, Any]] = field(default_factory=list)
+    sidebar_sessions: list[dict[str, Any]] = field(default_factory=list)
     _items: list[dict[str, Any]] = field(default_factory=list)
     _session_updates: dict[str, Any] = field(default_factory=dict)
     _health_updates: dict[str, Any] = field(default_factory=dict)
@@ -274,7 +286,8 @@ class ChatSessionContract:
         default_factory=lambda: {"queued": True, "item_id": "browser-queued-item"}
     )
     reject_uploads: bool = True
-    _stream_generation: int = 0
+    _stream_request_generation: int = 0
+    _observed_stream_request_generation: int = 0
 
     @property
     def url(self) -> str:
@@ -289,14 +302,24 @@ class ChatSessionContract:
         """Wait until the SPA has opened its live event stream."""
         deadline = time.monotonic() + timeout
         while (
-            not self.stream.connected
-            or self.stream.connection_generation <= self._stream_generation
+            self._stream_request_generation <= self._observed_stream_request_generation
+            or not self.stream.request_connected(self._stream_request_generation)
         ):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Timed out waiting for the chat event stream")
             self.page.wait_for_timeout(min(10, max(1, remaining * 1000)))
-        self._stream_generation = self.stream.connection_generation
+        self._observed_stream_request_generation = self._stream_request_generation
+
+    def route_stream(self, route: Route) -> None:
+        """Connect a caller-selected session stream to this handle's server."""
+        if route.request.method != "GET":
+            route.fallback()
+            return
+        self._stream_request_generation += 1
+        route.continue_(
+            url=f"{self.stream.url}?request_generation={self._stream_request_generation}"
+        )
 
     def seed_transcript(self, turns: int) -> None:
         """Replace history with ``turns`` user/assistant markdown pairs."""
@@ -307,6 +330,16 @@ class ChatSessionContract:
     def set_items(self, items: Sequence[Mapping[str, Any]]) -> None:
         """Replace history with copies of the supplied wire items."""
         self._items = [dict(item) for item in items]
+
+    def seed_sidebar_sessions(self, titles: Sequence[str]) -> None:
+        """List extra idle sessions after this one in the sidebar, newest first."""
+        for index, title in enumerate(titles, start=len(self.sidebar_sessions) + 1):
+            row = self._session()
+            row.update(id=f"{self.session_id}-row-{index}", title=title)
+            row.update(created_at=row["created_at"] - index, updated_at=row["updated_at"] - index)
+            self.sidebar_sessions.append(row)
+            # Rows fetch their latest item for the preview line.
+            self.contract.json(f"/v1/sessions/{row['id']}/items", list_payload([]))
 
     def update_session(self, **fields: Any) -> None:
         """Merge wire fields into subsequent mocked session snapshots."""
@@ -475,7 +508,10 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
         },
     )
     contract.json("/v1/sessions/projects", [])
-    contract.json("/v1/sessions", lambda _request: list_payload([handle._session()]))
+    contract.json(
+        "/v1/sessions",
+        lambda _request: list_payload([handle._session(), *handle.sidebar_sessions]),
+    )
     session_api = f"/v1/sessions/{handle.session_id}"
     contract.json(session_api, lambda _request: handle._session())
 
@@ -554,6 +590,12 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             {"error": {"message": "No browser-contract environment"}},
             status=404,
         )
+    # This ordinary host has no canonical Arca machine labels.
+    contract.json(
+        f"{session_api}/resources/environments/default/filesystem/etc/metric_proxy/labels/default?base=host",
+        {"detail": "File not found"},
+        status=404,
+    )
     contract.json(
         "/health",
         lambda _request: handle._health(),
@@ -630,13 +672,7 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
 
     contract.route(matcher(f"{session_api}/resources/files"), upload)
 
-    def stream(route: Route) -> None:
-        if route.request.method != "GET":
-            route.fallback()
-            return
-        route.continue_(url=handle.stream.url)
-
-    contract.route(matcher(f"{session_api}/stream"), stream)
+    contract.route(matcher(f"{session_api}/stream"), handle.route_stream)
 
     def updates(socket: WebSocketRoute) -> None:
         socket.on_message(lambda _message: None)
