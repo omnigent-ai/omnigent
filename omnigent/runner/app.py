@@ -44,6 +44,7 @@ from omnigent.debug_logging import (
     runner_primary_session_id,
     set_current_session_id,
 )
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     session_resource_view_to_dict,
@@ -70,7 +71,7 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
-from omnigent.native.failure_telemetry import failure_log_attributes
+from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -90,7 +91,9 @@ from omnigent.runner.app_support import (
     _CommentRelayBinding,
     _require_full_native_lock_coverage,
     _resolve_forwarded_message_content,
+    _shared_scheduled_run,
     _SpecEntry,
+    _TurnMessage,
     _unwrap_spec_entry,
 )
 from omnigent.runner.background_titles import (
@@ -207,6 +210,7 @@ from omnigent.runtime.prompt import (
     build_instructions_nullable,
     raw_author_instructions,
 )
+from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -1336,6 +1340,7 @@ def create_runner_app(
     _session_root_spec_cache: dict[str, _SpecEntry] = {}  # session_id → unresolved root spec
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
+    _turn_occurrences: dict[str, ScheduledRunLogContext | None] = {}
     app.state.live_response_id = _live_response_id
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
@@ -1819,10 +1824,12 @@ def create_runner_app(
         session_id: str,
         status: str,
         blocked_on: str | None = None,
+        *,
+        failure_detail: str | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if status == "failed":
-            # Structured status has no provider detail when its terminal hook is lost.
+            # A lost terminal hook may still leave a cause in the program-status report.
             event["error"] = {
                 "code": "native_failure_detail_unavailable",
                 "message": (
@@ -1830,11 +1837,33 @@ def create_runner_app(
                     "arrive. Open the terminal to inspect the error before retrying."
                 ),
             }
+            if failure_detail:
+                from omnigent.harnesses.claude_native.failure_telemetry import (
+                    claude_failure_context,
+                )
+
+                raw_context: dict[str, object] = {
+                    **claude_failure_context({}, error_text=failure_detail),
+                    "failure_source": "claude_program_status",
+                    "detail_source": "program_status_error",
+                }
+                # An API error envelope decodes to its cause; the raw report is only the fallback.
+                raw_context.setdefault("native_error_message", failure_detail)
+                context = normalize_failure_context(raw_context)
+                detail = context.get("native_error_message")
+                if isinstance(detail, str):
+                    event["error"] = {"code": "native_turn_error", "message": detail}
+                    event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
+    resource_registry.set_session_failure_publisher(
+        lambda session_id, detail: _publish_session_status(
+            session_id, "failed", failure_detail=detail
+        )
+    )
 
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
         if event.command is None:
@@ -2256,7 +2285,7 @@ def create_runner_app(
                     session_id,
                     resp.status_code,
                 )
-        except Exception:  # best-effort, but surface it
+        except Exception:
             _logger.warning(
                 "legacy model_override fallback for %s failed; a model-pinned "
                 "first turn may respawn",
@@ -2514,7 +2543,10 @@ def create_runner_app(
         context = BackgroundTitleContext(
             prompt=body.prompt[:BACKGROUND_TITLE_MAX_PROMPT_CHARS],
             harness=effective_harness,
-            spawn_env=dict(spawn_env or {}),
+            spawn_env={
+                **(spawn_env or {}),
+                **resource_registry.client_surface_env(conversation_id),
+            },
             process_manager=process_manager,
             cwd=resolver_cwd,
             model_override=body.model_override,
@@ -3139,10 +3171,11 @@ def create_runner_app(
                             extra={"session_id": session_id},
                         )
 
-                _relay_task = asyncio.create_task(
-                    _start_claude_relay_early(),
-                    name=f"claude-comment-relay:{session_id}",
-                )
+                with scheduled_run_scope(None, session_id=session_id):
+                    _relay_task = asyncio.create_task(
+                        _start_claude_relay_early(),
+                        name=f"claude-comment-relay:{session_id}",
+                    )
                 _relay_task.add_done_callback(_background_tasks.discard)
                 _background_tasks.add(_relay_task)
 
@@ -3565,6 +3598,7 @@ def create_runner_app(
         await mcp_execution_registry.cancel_session(session_id)
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
+        _turn_occurrences.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
@@ -4027,7 +4061,12 @@ def create_runner_app(
     _start_sign_in_watch = _sign_in_watch.start_sign_in_watch
     _post_sign_in_hold_notice = _sign_in_watch.post_sign_in_hold_notice
 
-    def _begin_turn_slot(conv_id: str, body: Mapping[str, Any] | None = None) -> None:
+    def _begin_turn_slot(
+        conv_id: str,
+        body: Mapping[str, Any] | None = None,
+        *,
+        inputs: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Bind the ``None`` sentinel and stamp a fresh epoch for the new turn.
 
         Must be used instead of a bare ``_active_turns[conv] = None`` so recovery can detect
@@ -4035,8 +4074,11 @@ def create_runner_app(
 
         :param conv_id: Session whose turn slot is bound.
         :param body: Forwarded message that starts the turn, when there is one.
+        :param inputs: Original inputs when the existing queue drain coalesces a batch.
         """
         _active_turns[conv_id] = None
+        turn_inputs = inputs if inputs is not None else [body] if body is not None else []
+        _turn_occurrences[conv_id] = _shared_scheduled_run(turn_inputs)
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
         pending_id = body.get("pending_id") if body is not None else None
         if isinstance(pending_id, str):
@@ -4067,6 +4109,7 @@ def create_runner_app(
         The two stores represent one fact; clearing only one leaves the idle reaper stuck.
         """
         _live_response_id.pop(conv_id, None)
+        _turn_occurrences.pop(conv_id, None)
         if process_manager is not None:
             process_manager.clear_in_flight(conv_id)
 
@@ -4303,7 +4346,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-        except Exception:  # best-effort: harness may have exited
+        except Exception:
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
@@ -4593,7 +4636,8 @@ def create_runner_app(
                 if _claude_prompt_waiters.get(session_id) is asyncio.current_task():
                     _claude_prompt_waiters.pop(session_id, None)
 
-        waiter = asyncio.create_task(_wait_for_prompt(), name=f"claude-prompt-{session_id}")
+        with scheduled_run_scope(None, session_id=session_id):
+            waiter = asyncio.create_task(_wait_for_prompt(), name=f"claude-prompt-{session_id}")
         _claude_prompt_waiters[session_id] = waiter
         _background_tasks.add(waiter)
         waiter.add_done_callback(_background_tasks.discard)
@@ -4720,9 +4764,11 @@ def create_runner_app(
         )
         return False
 
-    async def _check_and_start_next_turn(
-        session_id: str,
-    ) -> None:
+    async def _check_and_start_next_turn(session_id: str) -> None:
+        with scheduled_run_scope(None, session_id=session_id):
+            await _drain_next_turn(session_id)
+
+    async def _drain_next_turn(session_id: str) -> None:
         _seq = _ingest_next_seq.get(session_id, 0)
         _ingest_next_seq[session_id] = _seq + 1
         _cond = _ingest_cond.get(session_id)
@@ -4800,36 +4846,37 @@ def create_runner_app(
                     )
                 next_body = all_bodies[-1]
 
-            if _is_sdk_compact_body(next_body):
-                # This buffered /compact now dispatches as its own turn. Mirror the
-                # idle path: publish the spinner up front AND set the flag, so
-                # (a) the relay swallows the executor's own duplicate in_progress
-                # (single spinner), and (b) _on_proxy_stream_end publishes `failed`
-                # if the turn ends without a `response.compaction.completed` (a real
-                # executor path — the compaction-complete event can be None) rather
-                # than stranding the spinner. The prior turn has ended, so showing
-                # "Compacting…" now is accurate.
-                _publish_event(
-                    session_id,
-                    {"type": "response.compaction.in_progress", "task_id": session_id},
+            with scheduled_run_scope(_shared_scheduled_run(all_bodies), session_id=session_id):
+                if _is_sdk_compact_body(next_body):
+                    # This buffered /compact now dispatches as its own turn. Mirror the
+                    # idle path: publish the spinner up front AND set the flag, so
+                    # (a) the relay swallows the executor's own duplicate in_progress
+                    # (single spinner), and (b) _on_proxy_stream_end publishes `failed`
+                    # if the turn ends without a `response.compaction.completed` (a real
+                    # executor path — the compaction-complete event can be None) rather
+                    # than stranding the spinner. The prior turn has ended, so showing
+                    # "Compacting…" now is accurate.
+                    _publish_event(
+                        session_id,
+                        {"type": "response.compaction.in_progress", "task_id": session_id},
+                    )
+                    _sdk_compact_inprogress.add(session_id)
+                _begin_turn_slot(session_id, next_body, inputs=all_bodies)
+                _turn_pending_ids[session_id] = {
+                    pending_id
+                    for body in all_bodies
+                    if isinstance(pending_id := body.get("pending_id"), str)
+                }
+                _publish_turn_status(session_id, "running")
+                _turn_task = asyncio.create_task(
+                    _run_turn_bg(next_body, session_id),
+                    name=f"turn-cont-{session_id}",
                 )
-                _sdk_compact_inprogress.add(session_id)
-            _begin_turn_slot(session_id, next_body)
-            _turn_pending_ids[session_id] = {
-                pending_id
-                for body in all_bodies
-                if isinstance(pending_id := body.get("pending_id"), str)
-            }
-            _publish_turn_status(session_id, "running")
-            _turn_task = asyncio.create_task(
-                _run_turn_bg(next_body, session_id),
-                name=f"turn-cont-{session_id}",
-            )
-            _active_turns[session_id] = _turn_task
-            _turn_task.add_done_callback(
-                _background_tasks.discard,
-            )
-            _background_tasks.add(_turn_task)
+                _active_turns[session_id] = _turn_task
+                _turn_task.add_done_callback(
+                    _background_tasks.discard,
+                )
+                _background_tasks.add(_turn_task)
         finally:
             async with _cond:
                 _ingest_now_serving[session_id] = _seq + 1
@@ -5245,7 +5292,7 @@ def create_runner_app(
                     _publish_event,
                     now=asyncio.get_running_loop().time(),
                 )
-            except Exception:  # best-effort observer; never fail the hook
+            except Exception:
                 _logger.warning(
                     "native file-change recording failed for session=%s",
                     _captured_session_id,
@@ -5259,15 +5306,16 @@ def create_runner_app(
                 relay = current.relay
                 relay.update_tools(relay_schemas, _relay_tool_executor)
             else:
-                relay = start_tool_relay(
-                    bridge_dir=bridge_dir,
-                    tools=relay_schemas,
-                    tool_executor=_relay_tool_executor,
-                    loop=asyncio.get_running_loop(),
-                    policy_client=server_client,
-                    session_id=session_id,
-                    file_change_observer=_observe_native_file_changes,
-                )
+                with scheduled_run_scope(None, session_id=session_id):
+                    relay = start_tool_relay(
+                        bridge_dir=bridge_dir,
+                        tools=relay_schemas,
+                        tool_executor=_relay_tool_executor,
+                        loop=asyncio.get_running_loop(),
+                        policy_client=server_client,
+                        session_id=session_id,
+                        file_change_observer=_observe_native_file_changes,
+                    )
         except (OSError, RuntimeError):
             _logger.warning(
                 "Failed to start comment relay for session=%s",
@@ -5316,9 +5364,10 @@ def create_runner_app(
         if await_notify:
             await _notify_tools_changed()
         else:
-            _notify_task = asyncio.create_task(
-                _notify_tools_changed(), name=f"tools-changed:{session_id}"
-            )
+            with scheduled_run_scope(None, session_id=session_id):
+                _notify_task = asyncio.create_task(
+                    _notify_tools_changed(), name=f"tools-changed:{session_id}"
+                )
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
@@ -5341,7 +5390,10 @@ def create_runner_app(
         handed_off = [False]
         # Locate any uncoded exception logged below in the turn phase (this task's
         # context carries it for its lifetime). Coded errors keep their own phase.
-        with phase_scope(ErrorPhase.TURN):
+        with (
+            scheduled_run_scope(_turn_occurrences.get(conv), session_id=conv),
+            phase_scope(ErrorPhase.TURN),
+        ):
             try:
                 await _run_turn_bg_setup_and_stream(msg_body, conv, handed_off)
             except _ContextWindowOverflow:
@@ -7083,7 +7135,7 @@ def create_runner_app(
                         "detail": "session message body must be a JSON object",
                     },
                 )
-            message_body = dict(body)
+            message_body = _TurnMessage(body, current_scheduled_run())
             message_body["conversation_id"] = conversation_id
 
             if _is_native_harness(conversation_id):
@@ -7466,6 +7518,7 @@ def create_runner_app(
                     {"effort": effort},
                     # An older server keeps a refused selection for the next turn.
                     legacy_server=not server_rolls_back,
+                    allow_cold_start=body.get("cold_start_settings") is True,
                 )
                 if server_rolls_back and not (
                     200 <= response.status_code < 300 or response.status_code == 504
@@ -7529,6 +7582,7 @@ def create_runner_app(
                         conversation_id,
                         settings,
                         legacy_server=body.get("rollback_on_refusal") is not True,
+                        allow_cold_start=body.get("cold_start_settings") is True,
                     )
                     if "effort" in settings and 200 <= response.status_code < 300:
                         return JSONResponse({"codex_settings_applied": True})
@@ -8312,7 +8366,7 @@ def create_runner_app(
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
-            except Exception:  # best-effort; never block catch-up.
+            except Exception:
                 _logger.warning(
                     "Session status resync failed after reconnect",
                     exc_info=True,

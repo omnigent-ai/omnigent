@@ -30,6 +30,7 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harness_accounts import HarnessAccounts, normalize_harness_accounts
 from omnigent.harness_availability import (
     HARNESS_TMUX_UNAVAILABLE,
@@ -41,6 +42,7 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_FILESYSTEM_ATTACHMENTS,
 )
+from omnigent.scheduled_context import parse_scheduled_run
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -396,6 +398,7 @@ class HostLaunchRunnerFrame:
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    scheduled_run: ScheduledRunLogContext | None = None
 
 
 @dataclass
@@ -1658,6 +1661,8 @@ def encode_host_frame(frame: HostFrame) -> str:
             "harness": frame.harness,
             "inference_config": frame.inference_config,
         }
+        if frame.scheduled_run is not None:
+            payload["scheduled_run"] = frame.scheduled_run.model_dump()
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -2736,6 +2741,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        scheduled_run=parse_scheduled_run(msg.get("scheduled_run")),
         # Absent (an older server) is distinct from an empty list.
         superseded_runner_ids=(
             tuple(_optional_str_list(msg, "superseded_runner_ids"))
