@@ -2458,6 +2458,11 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     const host = screen.getByTestId("task-host-trigger");
     fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(host);
+    fireEvent.click(screen.getByRole("option", { name: "laptop" }));
+    // On a connected host the agent may lack the tools, so the warning shows.
+    expect(screen.getByTestId("task-trigger-tools-note")).toBeInTheDocument();
+    fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(host);
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
 
     if (hidden) {
