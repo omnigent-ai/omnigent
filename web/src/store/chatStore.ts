@@ -123,7 +123,7 @@ import {
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import {
   getSessionDraft,
-  hasSessionDraft,
+  sessionDraftWasWritten,
   setSessionDraft,
   type SessionDraft,
 } from "@/lib/sessionDrafts";
@@ -3676,10 +3676,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const rewound = await rewindSession(conversationId, itemId);
     const files = await rewindAttachmentFiles(rewound.sessionId, rewound.attachments);
     const draft: SessionDraft = { text: rewound.prompt, files };
-    // Text typed in the new session since it opened wins over the prompt.
-    if (!hasSessionDraft(rewound.sessionId)) setSessionDraft(rewound.sessionId, draft);
+    // A draft the user has edited, cleared or sent in the new session since
+    // it opened, here or offscreen, wins over the prompt.
+    const untouched = !sessionDraftWasWritten(rewound.sessionId);
+    if (untouched) setSessionDraft(rewound.sessionId, draft);
     useChatStore.setState((s) => ({
-      rewindPrefill: { ...draft, conversationId: rewound.sessionId },
+      ...(untouched ? { rewindPrefill: { ...draft, conversationId: rewound.sessionId } } : {}),
       ...(s.conversationId === conversationId
         ? { redirectToConversationId: rewound.sessionId }
         : {}),

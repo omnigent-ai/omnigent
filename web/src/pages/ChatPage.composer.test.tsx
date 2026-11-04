@@ -1332,9 +1332,9 @@ describe("Composer slash-command menu", () => {
     expect(await screen.findByText("Stop the current turn before running /rewind.")).toBeTruthy();
   });
 
-  it.each([false, true])(
-    "/rewind fills the new session's composer when the redirect lands first (typed there: %s)",
-    async (typedAfterLanding) => {
+  it.each(["untouched", "typed", "erased-then-left"] as const)(
+    "/rewind fills the new session's composer when the redirect lands first (%s)",
+    async (edit) => {
       onTestFinished(() => {
         clearSessionDrafts();
         useChatStore.setState({ rewindPrefill: null });
@@ -1347,7 +1347,12 @@ describe("Composer slash-command menu", () => {
         }),
       );
       const diagram = new File(["png"], "diagram.png", { type: "image/png" });
-      const download = vi.spyOn(filesApi, "downloadSessionFile").mockResolvedValue(diagram);
+      let downloaded!: (file: File) => void;
+      const download = vi.spyOn(filesApi, "downloadSessionFile").mockReturnValue(
+        new Promise((resolve) => {
+          downloaded = resolve;
+        }),
+      );
       fireEvent.change(textarea(), { target: { value: "/rewind" } });
       fireEvent.keyDown(textarea(), { key: "Enter" });
       fireEvent.click((await screen.findAllByTestId("rewind-prompt"))[1]!);
@@ -1373,7 +1378,11 @@ describe("Composer slash-command menu", () => {
         </CapabilitiesProvider>,
       );
       expect(textarea()).toHaveValue("");
-      if (typedAfterLanding) fireEvent.change(textarea(), { target: { value: "My own words" } });
+      if (edit !== "untouched") fireEvent.change(textarea(), { target: { value: "My own words" } });
+      if (edit === "erased-then-left") {
+        fireEvent.change(textarea(), { target: { value: "" } });
+        act(() => useChatStore.setState({ conversationId: "conv_other" }));
+      }
 
       await act(async () =>
         respond({
@@ -1382,16 +1391,21 @@ describe("Composer slash-command menu", () => {
           attachments: [{ type: "input_image", fileId: "file_new", filename: "diagram.png" }],
         }),
       );
+      // The attachment arrives last, while the user may be in another chat.
+      await act(async () => downloaded(diagram));
+      if (edit === "erased-then-left")
+        act(() => useChatStore.setState({ conversationId: "conv_new" }));
 
       expect(download).toHaveBeenCalledExactlyOnceWith("conv_new", "file_new", "diagram.png");
       await waitFor(() => expect(useChatStore.getState().rewindPrefill).toBeNull());
-      if (typedAfterLanding) {
-        expect(textarea()).toHaveValue("My own words");
-        expect(screen.queryByAltText("diagram.png")).toBeNull();
-      } else {
-        expect(textarea()).toHaveValue("Write the parser");
-        expect(screen.getByAltText("diagram.png")).toBeTruthy();
-      }
+      const expected = {
+        untouched: "Write the parser",
+        typed: "My own words",
+        "erased-then-left": "",
+      };
+      expect(textarea()).toHaveValue(expected[edit]);
+      if (edit === "untouched") expect(screen.getByAltText("diagram.png")).toBeTruthy();
+      else expect(screen.queryByAltText("diagram.png")).toBeNull();
     },
   );
 

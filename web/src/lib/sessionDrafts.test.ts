@@ -76,6 +76,18 @@ describe("session drafts", () => {
     expect(sessionStorage.getItem(key)).toBeNull();
   });
 
+  it("remembers a draft was written even after it is emptied", async () => {
+    const { clearSessionDrafts, sessionDraftWasWritten, setSessionDraft } =
+      await import("./sessionDrafts");
+    expect(sessionDraftWasWritten("conversation")).toBe(false);
+    setSessionDraft("conversation", { text: "typed", files: [] });
+    setSessionDraft("conversation", { text: "", files: [] });
+    expect(sessionDraftWasWritten("conversation")).toBe(true);
+    expect(sessionDraftWasWritten("other")).toBe(false);
+    clearSessionDrafts();
+    expect(sessionDraftWasWritten("conversation")).toBe(false);
+  });
+
   it("recovers a failed temporary draft and ignores its late cleanup write", async () => {
     const { getSessionDraft, recoverFailedSessionDraft, setSessionDraft } =
       await import("./sessionDrafts");
