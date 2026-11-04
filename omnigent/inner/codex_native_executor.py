@@ -698,7 +698,8 @@ async def _wait_for_shell_completion(
                     message="Codex native session changed while waiting for the shell command; "
                     "this message was not delivered.",
                     remediation="Send the message again in the current session.",
-                )
+                ),
+                preserve_session=True,
             )
         if current.pending_shell_command_id is None and current.active_shell_turn_id is None:
             return current
