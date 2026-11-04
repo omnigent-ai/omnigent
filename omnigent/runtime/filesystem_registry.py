@@ -955,10 +955,12 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
                 settled_at = max(file_stat.st_mtime_ns, file_stat.st_ctime_ns)
                 if baseline is not None and time.time_ns() - settled_at > _RACY_NS:
                     with self._snapshots_lock:
-                        self._comparisons.setdefault(session_id, {})[event.path] = (
-                            file_version(file_stat),
-                            matches,
-                        )
+                        # A session unregistered during the comparison must stay gone.
+                        if session_id in self._session_snapshots:
+                            self._comparisons.setdefault(session_id, {})[event.path] = (
+                                file_version(file_stat),
+                                matches,
+                            )
                 if matches:
                     return None
                 if status != "created":

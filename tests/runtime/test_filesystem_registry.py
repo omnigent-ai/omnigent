@@ -568,6 +568,33 @@ def test_changes_read_a_file_again_only_after_it_may_have_changed(
     assert len(opened) == 4
 
 
+def test_a_comparison_finished_after_its_session_ended_is_not_cached(
+    registry: AgentEditFilesystemRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listing that races session cleanup leaves no cached comparison behind."""
+    conv_id = "conv_ended_during_listing"
+    target = registry.cwd / "notes.md"
+    target.write_text("original\n")
+    registry.seed_snapshot("notes.md", "original\n", session_id=conv_id)
+    _inject(registry, "notes.md", "modified", conv_id)
+    written = os.stat(target)
+    settled_at = max(written.st_mtime_ns, written.st_ctime_ns)
+    monkeypatch.setattr(time, "time_ns", lambda: settled_at + 2_000_000_001)
+    compare = environment_filesystem.compare_file_beneath
+
+    def compare_after_the_session_ends(*args: object, **kwargs: object) -> object:
+        registry.unregister_conversation(conv_id)
+        return compare(*args, **kwargs)
+
+    monkeypatch.setattr(
+        environment_filesystem, "compare_file_beneath", compare_after_the_session_ends
+    )
+    registry.list_changed_files(conv_id, limit=10, check_disk=True)
+
+    assert conv_id not in registry._comparisons
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
 @pytest.mark.parametrize("swapped_at_open", [False, True], ids=["before-listing", "at-open"])
 def test_changes_report_a_fifo_without_waiting_for_a_writer(
