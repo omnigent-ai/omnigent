@@ -279,6 +279,9 @@ it("connects Arca in the background after consent and keeps the app usable", tes
     await progress.waitFor({ state: "detached" });
     assert.equal(await composer.inputValue(), "Draft this while Arca starts");
     assert.equal((await windowStates(electronApp)).some(isConsole), false);
+    // The connect's identity reached the page, which remembers its Arca host.
+    assert.equal(await page.evaluate(() => localStorage.getItem("omnigent:arca-host-id")), HOST_ID);
+    assert.equal(await page.getByTestId("new-chat-landing-arca-error").count(), 0);
     await sleep(2000);
   }),
 );

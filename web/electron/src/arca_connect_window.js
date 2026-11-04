@@ -1,12 +1,8 @@
 "use strict";
 
 /**
- * The Arca connect console — SHELL-OWNED windows that replace the bare native
- * consent dialog. A modal consent sheet shows the exact `arca ssh` command
- * that will run. After the user confirms, the sheet closes and the command
- * runs in the background, so the app stays usable while a cold instance
- * starts. Its live stdout/stderr stays available in a non-modal output
- * window, opened on request, for sign-in, and when the connect fails.
+ * Shell-owned modal consent showing the exact `arca ssh` command starts a
+ * background run; a non-modal output window offers replay, Hide, and Stop.
  *
  * Trust model: these windows are created by the main process and load a
  * bundled file:// page with its own narrow preload. The server-served SPA can

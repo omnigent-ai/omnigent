@@ -336,12 +336,8 @@ function databricksInternalFeaturesEnabled() {
 }
 
 /**
- * The Arca connect console: a shell-owned modal that asks consent by showing
- * the exact command, then runs it in the background with its live output in a
- * non-blocking window (replaces the bare native dialog — same trust model,
- * full transparency). The flow also de-duplicates: a repeat connect while one
- * is in flight surfaces the existing console and shares its outcome, so a
- * refreshed SPA can always get back to it.
+ * Shell-owned modal consent starts a background Arca connect; a non-modal
+ * output window offers replay, Hide, and Stop. A repeat connect re-attaches.
  */
 const arcaIdentities = createArcaIdentityStore();
 
