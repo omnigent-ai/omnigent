@@ -1,9 +1,14 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render as renderRaw, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type { ReactElement } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { ComposerWorkspaceStatus } from "./ComposerWorkspaceStatus";
 
 afterEach(cleanup);
+
+const render = (ui: ReactElement) => renderRaw(ui, { wrapper: TooltipProvider });
 
 const base = {
   workspacePath: "/home/alice/repo",
@@ -50,7 +55,17 @@ describe("ComposerWorkspaceStatus", () => {
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("Checking branch…");
   });
 
-  it("keeps creation-time branch history in the read-only title, never the live label", () => {
+  it("shows the full working directory path in a hover tooltip", async () => {
+    const user = userEvent.setup();
+    render(<ComposerWorkspaceStatus {...base} workspacePath="/home/alice/projects/repo" />);
+    await user.hover(screen.getByTestId("composer-workspace-dir"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Working directory: /home/alice/projects/repo",
+    );
+  });
+
+  it("keeps creation-time branch history in the read-only tooltip, never the live label", async () => {
+    const user = userEvent.setup();
     render(
       <ComposerWorkspaceStatus
         {...base}
@@ -61,8 +76,8 @@ describe("ComposerWorkspaceStatus", () => {
     );
     const worktree = screen.getByTestId("composer-git-branch");
     expect(worktree).toHaveTextContent("Branch unavailable");
-    expect(worktree).toHaveAttribute(
-      "title",
+    await user.hover(worktree);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
       "Branch unavailable. Created on branch feature/created.",
     );
   });
