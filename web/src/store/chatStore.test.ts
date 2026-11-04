@@ -22430,6 +22430,27 @@ describe("a send cut off by a reload", () => {
     expect(peekUnsentSend("conv_reload")).toBeNull();
   });
 
+  it("keeps the failed startup inputs a queued resend names for the next load", async () => {
+    seedSession("conv_reload", []);
+    failManagedLaunch("conv_reload", "saved on server");
+    await useChatStore.getState().switchTo("conv_reload");
+    await tick();
+    expect(takeFailedSendDraft("conv_reload", false, true)?.text).toBe("saved on server");
+    useChatStore.setState({ sessionStatus: "running" });
+
+    useChatStore.getState().enqueueMessage("saved on server");
+
+    const [queued] = useChatStore.getState().queuedMessages;
+    expect(peekQueuedSends("conv_reload")).toEqual([
+      {
+        stableId: queued!.stableId,
+        text: "saved on server",
+        authorId: "user_a",
+        startupInputIds: ["pending_first"],
+      },
+    ]);
+  });
+
   it.each([
     {
       unanswered: "an unanswered send",
@@ -22457,15 +22478,24 @@ describe("a send cut off by a reload", () => {
       image: { type: "input_image", file_id: "file_chart", filename: "chart.png" },
       draft: { text: "saved on server" },
     },
+    {
+      unanswered: "a queued resend",
+      send: { text: "saved on server, edited", startupInputIds: ["pending_first"] },
+      savedAs: "item_first",
+      queued: true,
+      draft: { text: "saved on server, edited", stableId: "stable_reload", serverRefused: false },
+    },
   ])(
     "hands back $unanswered on load with the failed launch's first input once",
-    async ({ send, savedAs, image, draft }) => {
+    async ({ send, savedAs, image, queued, draft }) => {
       seedSession("conv_reload", []);
       failManagedLaunch("conv_reload", "saved on server");
       const [input] = sessionFailedInputs.get("conv_reload")!;
       input!.item_id = savedAs;
       if (image) input!.content.push(image);
-      rememberUnsentSend("conv_reload", { stableId: "stable_reload", authorId: "user_a", ...send });
+      const record = { stableId: "stable_reload", authorId: "user_a", ...send };
+      if (queued) rememberQueuedSends("conv_reload", [record]);
+      else rememberUnsentSend("conv_reload", record);
 
       await useChatStore.getState().switchTo("conv_reload");
       await tick();

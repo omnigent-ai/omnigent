@@ -4506,6 +4506,8 @@ useChatStore.subscribe((state, previous) => {
   for (const id of new Set(touched.map((m) => m.conversationId))) {
     // A record this page never queued is an earlier page's, kept for its session's next load.
     const earlier = peekQueuedSends(id).filter((send) => !queuedHere.has(send.stableId));
+    // Like an unanswered send's record, it names the failed startup inputs its send would replace.
+    const { replaces_failed_inputs: startupInputIds } = failedStartupInputsReplacedBy(id)();
     const kept = state.queuedMessages.flatMap((m) =>
       authorId === null ||
       m.conversationId !== id ||
@@ -4514,7 +4516,15 @@ useChatStore.subscribe((state, previous) => {
       m.offScreen ||
       !m.text.trim()
         ? []
-        : [{ stableId: m.stableId, text: m.text, authorId, replyDraft: m.replyDraft }],
+        : [
+            {
+              stableId: m.stableId,
+              text: m.text,
+              authorId,
+              replyDraft: m.replyDraft,
+              ...(startupInputIds ? { startupInputIds } : {}),
+            },
+          ],
     );
     rememberQueuedSends(id, [...earlier, ...kept]);
   }
