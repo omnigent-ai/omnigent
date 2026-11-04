@@ -1726,6 +1726,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            clear_host_binding=lambda _sid, **_kwargs: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
@@ -1801,6 +1802,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            clear_host_binding=lambda _sid, **_kwargs: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
@@ -1870,6 +1872,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            clear_host_binding=lambda _sid, **_kwargs: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]

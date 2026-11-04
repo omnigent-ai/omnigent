@@ -81,9 +81,35 @@ def project_families(
     include_archived: bool = False,
     archived_only: bool = False,
 ) -> tuple[list[Conversation], dict[str, SessionFamily]]:
-    """Hydrate complete owner-visible families without changing pagination cursors."""
+    """Annotate rows; only explicitly opted-in sidebar lists expand their families."""
     candidates = [item for item in sessions if item.family_id is not None]
-    grants = permissions.list_for_sessions([item.id for item in candidates]) if permissions else {}
+    if permissions is not None and user_id is None:
+        return sessions, {}
+    grants = (
+        permissions.list_for_sessions([item.id for item in candidates], user_id=user_id)
+        if permissions
+        else {}
+    )
+    family_ids = list(
+        dict.fromkeys(
+            item.family_id
+            for item in candidates
+            if item.family_id is not None
+            and (
+                permissions is None
+                or any(grant.level == LEVEL_OWNER for grant in grants.get(item.id, []))
+            )
+        )
+    )
+    members_by_family = conversations.get_session_families(family_ids) if family_ids else {}
+    member_grants = (
+        permissions.list_for_sessions(
+            [member.id for members in members_by_family.values() for member in members],
+            user_id=user_id,
+        )
+        if permissions
+        else {}
+    )
     result = {item.id: item for item in sessions}
     families: dict[str, SessionFamily] = {}
     seen: set[str] = set()
@@ -102,10 +128,7 @@ def project_families(
         ):
             continue
         seen.add(family_id)
-        members = conversations.get_session_family(item.id)
-        member_grants = (
-            permissions.list_for_sessions([member.id for member in members]) if permissions else {}
-        )
+        members = members_by_family.get(family_id, [])
         owned = [
             member
             for member in members

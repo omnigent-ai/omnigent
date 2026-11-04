@@ -491,7 +491,8 @@ chat, otherwise it springs back. Settings and desktop widths don't use it.
 sidebar menus, and message actions, and offers the same destinations as any
 other session: connected hosts and each offered sandbox provider. Sessions
 labelled `omnigent.host_type: managed` fork the same way. The source's own
-sandbox host is never listed, since pickers show connected hosts only. A fork
+sandbox host is offered when `sibling_sessions` is advertised; older servers
+keep the fresh-sandbox choices. A fork
 of any sandbox session defaults to a fresh sandbox from the source's provider
 when the server offers it, and otherwise to a connected host.
 **Continue in another directory…** on these sessions continues on a connected
@@ -1186,6 +1187,7 @@ its discoverability.
   Siblings start private even if the source has readers. Edit-shared sources
   cannot create siblings. Shared viewers see flat rows.
 - Families are bounded to 100 retained members, including archived members.
+  Use the row chevron to **Collapse session family** or **Expand session family**.
 - Sandbox expiry and explicit whole-host destruction remain separate from
   deleting one session. Shared compute means a shared filesystem, not history.
 

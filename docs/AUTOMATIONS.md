@@ -218,3 +218,9 @@ All scheduler backends must support `scheduled_task_harness_settings` before usi
 
 - [Agent YAML spec](AGENT_YAML_SPEC.md) -- defining the agent an automation binds to.
 - [Policies](POLICIES.md) -- gates and spend caps that apply to sessions an automation creates.
+
+
+Workers created with `sys_session_create` on the same host or a new sandbox join
+the source session's family. A family holds up to 100 retained sessions, including
+archived workers. Delete completed workers to release slots before a continued
+automation reaches that limit; archiving alone does not release a slot.

@@ -106,6 +106,7 @@ function LocationProbe() {
 
 function menuTree(
   overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {},
+  capability: boolean | "missing" = true,
   // A QueryClientProvider is required: the menu reads useQueryClient() to hand
   // the post-archive Undo toast a client for unarchiving.
   queryClient = new QueryClient(),
@@ -113,7 +114,11 @@ function menuTree(
   return (
     <QueryClientProvider client={queryClient}>
       <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true, sibling_sessions: true }}
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          archive_worktree_cleanup: true,
+          ...(capability === "missing" ? {} : { sibling_sessions: capability }),
+        }}
       >
         <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
           <HeaderConversationMenu
@@ -221,6 +226,15 @@ describe("HeaderConversationMenu", () => {
 
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveFocus();
   });
+
+  it.each([false, "missing"] as const)(
+    "hides nested creation without capability %s",
+    (capability) => {
+      render(menuTree({}, capability));
+      openMenu();
+      expect(screen.queryByRole("menuitem", { name: "Add nested agent" })).toBeNull();
+    },
+  );
 
   it("opens Add nested agent with Ctrl+Alt+A and ignores held, composing, and AltGraph keys", () => {
     renderMenu();

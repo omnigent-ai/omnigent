@@ -3383,7 +3383,10 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     )
 
 
-async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
+@pytest.mark.parametrize("during_provision", [False, True])
+async def test_relaunch_does_not_recreate_deleted_host(
+    db_uri: str, during_provision, monkeypatch
+) -> None:
     """A relaunch that loses to full teardown cleans up its new sandbox."""
     host_store = HostStore(db_uri)
     host = host_store.register_managed_host(
@@ -3395,8 +3398,17 @@ async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
         sandbox_id="sb-deleted-old",
         token_expires_at=now_epoch() + 3600,
     )
-    host_store.delete_host(host.host_id)
     fake = FakeSandboxLauncher()
+    if during_provision:
+        provision = fake.provision
+
+        def delete_during_provision(name):
+            host_store.delete_host(host.host_id)
+            return provision(name)
+
+        monkeypatch.setattr(fake, "provision", delete_during_provision)
+    else:
+        host_store.delete_host(host.host_id)
 
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(
@@ -3406,8 +3418,7 @@ async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
         )
 
     assert exc.value.status_code == 409
-    assert "no longer exists" in exc.value.detail
-    assert fake.terminated == []  # Rejected before provisioning or touching the tombstone.
+    assert fake.terminated == (["sb-deleted-old", "sb-fake-1"] if during_provision else [])
     assert host_store.get_host(host.host_id) is None
 
 

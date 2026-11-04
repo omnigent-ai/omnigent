@@ -9837,6 +9837,13 @@ async def test_sibling_family_lifecycle(tmp_path, split_database):
         later.id,
     }
 
+    another = store.create_conversation()
+    another_sibling = store.create_conversation()
+    store.add_new_sibling(another.id, another_sibling.id, user_id="alice")
+    families = store.get_session_families([source.id, another.id])
+    assert [member.id for member in families[source.id]] == [first.id, second.id, later.id]
+    assert [member.id for member in families[another.id]] == [another.id, another_sibling.id]
+
 
 def test_generic_label_writes_cannot_change_family_pins(conversation_store) -> None:
     from omnigent.errors import OmnigentError

@@ -26,8 +26,9 @@ workers grouped in the left sidebar on its host or a new managed sandbox. This i
   and `managed` placements create independent, initially private sibling sessions.
   Siblings share one sidebar family and do not appear as child agents.
   Managed creation uses the server's configured default sandbox provider. A
-  sibling is filed in its creator's project, if that project still exists; the
-  project's agent and workspace defaults don't apply to it.
+  sibling stays in its creator's project; a different requested project or an
+  unavailable source project is rejected before creation. Project defaults do
+  not override the worker's agent or placement.
 - `sharing`: sharing the sender with edit (or higher) access, including public
   edit, blocks subsequent sends and independent creates. Read-only grants,
   including public read and default-public sessions, do not: viewers cannot add

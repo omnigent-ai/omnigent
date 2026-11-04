@@ -1836,13 +1836,31 @@ class SqlAlchemyConversationStore(ConversationStore):
         family_id = source.family_id
         if family_id is None:
             return [source]
-        with self._session("read_session_family") as session:
-            ids = self._family_member_ids(session, family_id)
-        members = self.get_conversations(ids)
-        return sorted(
-            members.values(),
-            key=lambda member: (member.created_at, member.id != family_id, member.id),
-        )
+        return self.get_session_families([family_id])[family_id]
+
+    def get_session_families(self, family_ids: list[str]) -> dict[str, list[Conversation]]:
+        families: dict[str, list[Conversation]] = {family_id: [] for family_id in family_ids}
+        if not families:
+            return families
+        with self._session("read_session_families") as session:
+            rows = session.execute(
+                select(SqlConversationMetadata.id, SqlConversationMetadata.family_id)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.family_id.in_(families),
+                )
+                .order_by(SqlConversationMetadata.family_id, SqlConversationMetadata.id)
+                .limit(len(families) * MAX_SESSION_FAMILY_MEMBERS + 1)
+            ).all()
+        members = self.get_conversations([row.id for row in rows])
+        for row in rows:
+            if row.id in members:
+                families[row.family_id].append(members[row.id])
+        for family_id, family in families.items():
+            if len(family) > MAX_SESSION_FAMILY_MEMBERS:
+                raise OmnigentError("Session family is too large", code=ErrorCode.CONFLICT)
+            family.sort(key=lambda member: (member.created_at, member.id != family_id, member.id))
+        return families
 
     def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
         source = self.get_conversation(source_id)
@@ -1859,7 +1877,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationMetadata, (current_workspace_id(), session_id)
             )
             if source_meta is None or target_meta is None:
-                raise ConversationNotFoundError(source_id)
+                raise ConversationNotFoundError(source_id if source_meta is None else session_id)
             with self._profile_label_session(session) as labels_session:
                 source_row = labels_session.get(
                     SqlConversation, (current_workspace_id(), source_id), with_for_update=True
@@ -6484,8 +6502,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             # answer: a wrong "free" deletes a directory out from under a
             # running session, while a wrong "in use" only leaves it behind.
             return True
-        if include_archived:
-            return True
         if windows_workspace:
             candidate_ids = []
             prefix = workspace.rstrip("/") + "/"
@@ -6497,6 +6513,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             candidate_ids = [candidate_id for candidate_id, _ in candidates]
         if not candidate_ids:
             return False
+        if include_archived:
+            return True
         with self._conv_session("check_workspace_sharers_are_archived") as conv_sess:
             return (
                 conv_sess.scalar(

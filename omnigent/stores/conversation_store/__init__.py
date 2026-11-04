@@ -1437,6 +1437,10 @@ class ConversationStore(ABC):
         """Return family members in stable creation order, including archived members."""
         raise NotImplementedError
 
+    def get_session_families(self, family_ids: list[str]) -> dict[str, list[Conversation]]:
+        """Batch-load bounded families in stable creation order, including archived members."""
+        raise NotImplementedError
+
     def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
         """Pin a representative's family without changing individual session pins."""
         raise NotImplementedError

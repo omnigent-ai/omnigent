@@ -3694,7 +3694,7 @@ async def _execute_session_create(
     if placement != "child":
         handle: dict[str, object] = {
             "conversation_id": data["id"],
-            "kind": "sibling",
+            "kind": "default",
             "family": data.get("family"),
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,

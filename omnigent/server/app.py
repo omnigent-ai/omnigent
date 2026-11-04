@@ -279,9 +279,10 @@ class ServerInfoResponse(BaseModel):
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
     scheduled_task_sandbox_workspaces: bool = True
+    # Owner-private families and reuse of the source session's sandbox.
+    sibling_sessions: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
-    sibling_sessions: bool = True
     request_managed_sandbox_host_id: bool = True
     # A managed fork accepts ``workspaces``; older servers reject the field.
     session_fork_workspaces: bool = True

@@ -8057,6 +8057,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_online": True,
             "parent_session_id": None,
             "created_by_session_id": "conv_x",
+            "family": None,
         },
         {
             "session_id": "s2",
@@ -8067,6 +8068,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_online": True,
             "parent_session_id": None,
             "created_by_session_id": None,
+            "family": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share

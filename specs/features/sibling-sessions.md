@@ -83,8 +83,8 @@ profile-label transactions support both single and split database deployments.
 As with existing split-store operations, metadata and history cannot commit as a
 single distributed transaction; failures conservatively retain host references.
 
-List pages preserve the existing flat pagination cursor and add complete family
-context for owner-visible hits. Every expanded member is independently checked
+List pages preserve flat filtering and pagination by default. Sidebar lists opt
+into complete family context with `expand_families=true`. Every expanded member is independently checked
 for ownership. Snapshots and WebSocket list updates carry `{id,
 representative_id, pinned, pinned_at}`. Clients deduplicate hydrated rows across pages.
 Pinned lists include member context without charging each member a pin slot.
@@ -92,10 +92,12 @@ Shared viewers receive neither private family context nor protected labels.
 
 The schema-only prerequisite adds the nullable binary UUID column and the index
 `(workspace_id, family_id, id)`. Member lookups read metadata through this index
-with an explicit limit; the application PR adds the ORM mapping and callers.
-Deploy the schema before the application. Existing sessions remain standalone,
-older writers omit the nullable column, and application rollback leaves the
-schema installed. No label backfill is needed for this unreleased feature.
+with an explicit limit; the prerequisite includes the matching ORM mapping
+for fresh database bootstrap. The application PR adds the family callers.
+Deploy the schema before the application. Existing sessions remain standalone.
+The schema-aware prerequisite is the application rollback floor. Pre-migration
+binaries reject the new revision and require a schema downgrade, discarding
+family membership. No label backfill is needed for this unreleased feature.
 Side-chat discovery and its schema changes belong to a separate stack.
 
 ### Creation and compatibility
@@ -122,7 +124,7 @@ and claims last-user teardown in the same transaction; existing tombstone fields
 retain exact resource IDs for provider cleanup and retries. All remaining
 bindings count, regardless of session activity or family membership.
 
-Automatic cleanup uses `only_if_unused` and the expected provider/sandbox ID.
+Automatic cleanup uses `keep_if_bound` and the expected provider/sandbox ID.
 Explicit whole-host deletion retains its separate semantics. Failed launch
 rollback clears only its own binding/generation. Retained automation hosts also
 keep a task ownership reference after their run session is removed.

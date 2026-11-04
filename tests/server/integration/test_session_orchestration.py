@@ -1296,7 +1296,35 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     listing = await auth_client.get(
         "/v1/sessions", params={"limit": 1, "search_query": "Private sibling"}
     )
-    assert {row["id"] for row in listing.json()["data"]} == {source["id"], sibling_id}
+    assert [row["id"] for row in listing.json()["data"]] == [sibling_id]
+    expanded = await auth_client.get(
+        "/v1/sessions",
+        params={"limit": 1, "search_query": "Private sibling", "expand_families": True},
+    )
+    assert {row["id"] for row in expanded.json()["data"]} == {source["id"], sibling_id}
+    ids = []
+    after = None
+    while True:
+        page = (
+            await auth_client.get(
+                "/v1/sessions", params={"limit": 1, **({"after": after} if after else {})}
+            )
+        ).json()
+        assert len(page["data"]) <= 1
+        ids.extend(row["id"] for row in page["data"])
+        if not page["has_more"]:
+            break
+        after = page["last_id"]
+    assert len(ids) == len(set(ids))
+    assert {source["id"], sibling_id} <= set(ids)
+    for pin_request in ({"family_pinned": True}, {"labels": {"omnigent.pinned": "1"}}):
+        refused_pin = await auth_client.patch(
+            f"/v1/sessions/{source['id']}", json={**pin_request, "reasoning_effort": "bogus"}
+        )
+        assert refused_pin.status_code == 400
+        assert not (await auth_client.get(f"/v1/sessions/{source['id']}")).json()["family"][
+            "pinned"
+        ]
     reader = {"X-Forwarded-Email": "reader"}
     snapshot = await auth_client.get(f"/v1/sessions/{source['id']}", headers=reader)
     assert snapshot.status_code == 200

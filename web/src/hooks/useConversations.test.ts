@@ -2298,6 +2298,32 @@ describe("fetchPinnedConversations filter-honored detection", () => {
     expect(result.conversations.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
   });
 
+  it("follows pinned pages when a family fills the page before an older standalone pin", async () => {
+    const family = { id: "family", representative_id: "a", pinned: true };
+    const members = ["a", "b", "c"].map((id) => ({
+      id,
+      title: id,
+      created_at: 0,
+      updated_at: 1,
+      labels: {},
+      family,
+    }));
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ data: members, has_more: true, last_id: "b" }))
+      .mockResolvedValueOnce(
+        mockResponse({ data: [members[2], pinnedRow("old")], has_more: false, last_id: "old" }),
+      );
+
+    const result = await fetchPinnedConversations(false, 2);
+
+    expect(result.conversations.map((row) => row.id)).toEqual(["old"]);
+    expect(result.familyMembers?.map((row) => row.id)).toEqual(["a", "b", "c"]);
+    expect(result.filterHonored).toBe(true);
+    expect(
+      new URL(String(fetchMock.mock.calls[1][0]), "http://test").searchParams.get("after"),
+    ).toBe("b");
+  });
+
   it("fails with the response's status and Retry-After so the retry policy can read them", async () => {
     fetchMock.mockResolvedValueOnce(
       new Response(JSON.stringify({ error: { code: "rate_limited", message: "slow down" } }), {

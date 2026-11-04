@@ -1235,6 +1235,14 @@ def register_core_routes(
                 raise OmnigentError(
                     "Siblings start a fresh conversation", code=ErrorCode.INVALID_INPUT
                 )
+            if (
+                "project_id" in body.model_fields_set
+                and body.project_id != sibling_source.project_id
+            ):
+                raise OmnigentError(
+                    "Nested agents stay in their source session's project",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             body.sibling_source_id = sibling_source.id
             body.project_id = sibling_source.project_id
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
@@ -1481,6 +1489,14 @@ def register_core_routes(
                 parent_id=parsed_metadata.parent_session_id,
                 host_id=parsed_metadata.host_id,
             )
+            if (
+                "project_id" in parsed_metadata.model_fields_set
+                and parsed_metadata.project_id != sibling_source.project_id
+            ):
+                raise OmnigentError(
+                    "Nested agents stay in their source session's project",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             parsed_metadata.sibling_source_id = sibling_source.id
             parsed_metadata.project_id = sibling_source.project_id
         creation_metadata(
@@ -2015,6 +2031,7 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
+        expand_families: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
     ) -> PaginatedList:
         """
@@ -2179,7 +2196,7 @@ def register_core_routes(
             permission_store,
             page.data,
             user_id,
-            expand=True,
+            expand=expand_families,
             include_archived=include_archived_param,
             archived_only=archived_only_param,
         )
@@ -2456,12 +2473,8 @@ def register_core_routes(
         from omnigent.server.session_families import project_families
 
         convs, family_info = await asyncio.to_thread(
-            project_families, conversation_store, permission_store, convs, user_id, expand=True
+            project_families, conversation_store, permission_store, convs, user_id
         )
-        if permission_store is not None:
-            perms_by_conv = await asyncio.to_thread(
-                permission_store.list_for_sessions, [conv.id for conv in convs]
-            )
         conv_ids = [c.id for c in convs]
         (
             agent_metadata,
@@ -3206,6 +3219,7 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_codex_approval_mode = body.approval_mode
+        family_pin_value: str | None = None
         if body.family_pinned is not None:
             from omnigent.server.session_orchestration import require_owned_session
 
@@ -3214,12 +3228,7 @@ def register_core_routes(
             await asyncio.to_thread(
                 require_owned_session, session_id, user_id, conversation_store, permission_store
             )
-            await asyncio.to_thread(
-                conversation_store.set_family_pin,
-                session_id,
-                str(int(time.time() * 1000)) if body.family_pinned else "",
-                user_id=user_id,
-            )
+            family_pin_value = str(int(time.time() * 1000)) if body.family_pinned else ""
         labels_to_set = dict(body.labels or {})
         if PROJECT_LABEL_KEY in labels_to_set and not set_project:
             project_source = await asyncio.to_thread(
@@ -3234,6 +3243,11 @@ def register_core_routes(
             from omnigent.stores.conversation_store import FAMILY_PIN_LABEL_PREFIX
 
             pin_source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            owner_grant = (
+                await asyncio.to_thread(permission_store.get, user_id, session_id)
+                if permission_store is not None and user_id is not None
+                else None
+            )
             if (
                 pin_source is not None
                 and pin_source.family_id is not None
@@ -3241,7 +3255,7 @@ def register_core_routes(
                     permission_store is None
                     or (
                         user_id is not None
-                        and (owner_grant := permission_store.get(user_id, session_id)) is not None
+                        and owner_grant is not None
                         and owner_grant.level == LEVEL_OWNER
                     )
                 )
@@ -3261,12 +3275,7 @@ def register_core_routes(
                         or pinned_label_key(user_id) not in pin_source.labels
                     )
                 ):
-                    await asyncio.to_thread(
-                        conversation_store.set_family_pin,
-                        session_id,
-                        labels_to_set.pop(PINNED_LABEL_KEY),
-                        user_id=user_id,
-                    )
+                    family_pin_value = labels_to_set.pop(PINNED_LABEL_KEY)
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries
@@ -3718,6 +3727,13 @@ def register_core_routes(
                 )
                 if not filed:
                     raise _session_not_found()
+        if family_pin_value is not None:
+            await asyncio.to_thread(
+                conversation_store.set_family_pin,
+                session_id,
+                family_pin_value,
+                user_id=user_id,
+            )
         update_result = await asyncio.to_thread(
             conversation_store.update_conversation_with_changes,
             session_id,

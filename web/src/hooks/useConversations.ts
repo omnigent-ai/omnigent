@@ -549,6 +549,7 @@ export async function fetchConversationsPage({
     sort_by: sortBy,
     limit: String(limit),
     visibility: visibility ?? "all",
+    expand_families: "true",
   });
   if (after) params.set("after", after);
   if (searchQuery) params.set("search_query", searchQuery);
@@ -1727,7 +1728,7 @@ export interface PinnedConversationsResult {
  * window. Pins now live on the server (a session label) so they follow the
  * user across devices; this query is the source of truth for which sessions
  * are pinned and supplies the rows for any pin that sits outside the loaded
- * list. Each enabled scope fetches one page bounded by the configured pin cap.
+ * list. Family members can fill a page, so each scope follows all pinned pages.
  *
  * A pre-upgrade server doesn't know the `pinned` param and silently ignores
  * it (FastAPI drops unknown query params), returning an ordinary session page.
@@ -1746,10 +1747,30 @@ async function fetchPinnedScope(
     limit: String(limit),
     visibility,
     pinned: "true",
+    expand_families: "true",
   });
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
-  if (!res.ok) throw await apiErrorFromResponse(res);
-  const rows = applySessionTombstones((await res.json()) as ConversationsPage, true).data;
+  const byId = new Map<string, Conversation>();
+  let after: string | undefined;
+  for (;;) {
+    if (after) params.set("after", after);
+    // Each page advances the raw session cursor, including members of large families.
+    // eslint-disable-next-line no-await-in-loop
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    // eslint-disable-next-line no-await-in-loop
+    if (!res.ok) throw await apiErrorFromResponse(res);
+    // eslint-disable-next-line no-await-in-loop
+    const page = applySessionTombstones((await res.json()) as ConversationsPage, true);
+    for (const row of page.data) byId.set(row.id, row);
+    if (
+      !page.has_more ||
+      !page.last_id ||
+      page.last_id === after ||
+      page.data.some((row) => row.labels?.[PINNED_LABEL_KEY] == null && !row.family)
+    )
+      break;
+    after = page.last_id;
+  }
+  const rows = [...byId.values()];
   const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
   // Honored iff the server returned nothing, or everything it returned is
   // actually pinned. An old server returns unfiltered rows (none pinned), so a

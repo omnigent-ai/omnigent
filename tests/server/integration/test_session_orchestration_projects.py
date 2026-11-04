@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -149,7 +150,7 @@ async def test_worker_is_filed_in_the_project_of_the_session_that_started_it(
     assert worker.git_branch is None
 
 
-async def test_worker_is_unfiled_when_the_source_project_is_gone(
+async def test_worker_rejects_unavailable_source_project(
     auth_client, auth_app, db_uri, monkeypatch
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
@@ -158,13 +159,18 @@ async def test_worker_is_unfiled_when_the_source_project_is_gone(
     # The source still points at a project the owner can no longer read.
     monkeypatch.setattr(SqlAlchemyProjectStore, "get", lambda self, pid, *, user_id: None)
 
-    worker_id = await _start_worker(auth_client, auth_app, db_uri, monkeypatch, source)
-
-    assert SqlAlchemyConversationStore(db_uri).get_conversation(worker_id).project_id is None
+    auth_client.headers.update(_bind_runner(db_uri, source["id"]))
+    response = await auth_client.post(
+        "/v1/sessions/orchestrated",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"agent_id": source["agent_id"], "host_type": "managed"},
+    )
+    assert response.status_code == 404
+    assert SqlAlchemyConversationStore(db_uri).get_conversation(source["id"]).family_id is None
 
 
 @pytest.mark.parametrize("requested", ["other", "none"])
-async def test_a_project_named_in_the_request_wins_over_the_source_project(
+async def test_nested_worker_cannot_choose_a_different_project(
     auth_client, auth_app, db_uri, monkeypatch, requested
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
@@ -173,10 +179,12 @@ async def test_a_project_named_in_the_request_wins_over_the_source_project(
     other = await _project(auth_client, "Elsewhere")
     project_id = other if requested == "other" else None
 
-    worker_id = await _start_worker(
-        auth_client, auth_app, db_uri, monkeypatch, source, body={"project_id": project_id}
+    auth_client.headers.update(_bind_runner(db_uri, source["id"]))
+    response = await auth_client.post(
+        "/v1/sessions/orchestrated",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"agent_id": source["agent_id"], "host_type": "managed", "project_id": project_id},
     )
-
-    assert SqlAlchemyConversationStore(db_uri).get_conversation(worker_id).project_id == (
-        project_id
-    )
+    assert response.status_code == 400
+    assert "stay in their source session's project" in response.json()["error"]["message"]
+    assert SqlAlchemyConversationStore(db_uri).get_conversation(source["id"]).family_id is None

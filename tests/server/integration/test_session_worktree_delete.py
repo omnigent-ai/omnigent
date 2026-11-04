@@ -746,6 +746,17 @@ async def test_worktree_sharing_includes_descendants(
         include_subdirectories=True,
     )
 
+    assert (
+        store.has_other_live_session_in_workspace(
+            host_id=_HOST_ID,
+            workspace=root,
+            exclude_conversation_id=mine,
+            include_subdirectories=True,
+            include_archived=True,
+        )
+        is in_use
+    )
+
 
 async def test_windows_sharing_limit_preserves_worktree(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
