@@ -11546,7 +11546,7 @@ async def test_host_drives_mcp_login_over_the_tunnel(monkeypatch):
     }
 
 
-async def test_host_pauses_orphan_reaping_during_mcp_status_checks(monkeypatch):
+async def test_host_wires_mcp_status_checks_and_sign_ins(monkeypatch):
     from omnigent.host.mcp_inventory import ConfiguredMcpServer
 
     host = _make_host_process()
@@ -11563,6 +11563,8 @@ async def test_host_pauses_orphan_reaping_during_mcp_status_checks(monkeypatch):
     # A nonzero count is what stops _reap_orphans_once from taking the exit status.
     assert (state, seen, host._owned_subprocess_ops) == ("available", [1], 0)
     assert host._mcp_logins._subprocess_guard == host._host_subprocess_op
+    # A finished sign-in drops the cached needs-auth probe so the row refreshes.
+    assert host._mcp_logins._on_success == host._mcp_tools.clear_cache
 
 
 async def test_host_mcp_login_failure_is_private(monkeypatch, caplog):
