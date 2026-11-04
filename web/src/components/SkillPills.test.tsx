@@ -53,6 +53,7 @@ function bubble(): HTMLElement {
 describe("SkillPills", () => {
   it("renders one pill per skill and hands the bare name to onPick", () => {
     const onPick = renderPills();
+    expect(screen.getByTestId("skill-pills")).toHaveClass("hidden", "md:flex");
     expect(screen.getByTestId("skill-pill-cross-review").textContent).toBe("/cross-review");
     expect(screen.getByTestId("skill-pill-fanout").textContent).toBe("/fanout");
     fireEvent.click(screen.getByTestId("skill-pill-cross-review"));

@@ -5,6 +5,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
  * new-session composer's first line, beside the prompt text. The whole
  * empty-state affordance (prompt + pills) is hidden once the user starts
  * typing, so the pills are only ever shown over an empty draft.
+ * Pills wait until md, where the composer reserves enough height for them.
  *
  * One pill per bundled skill; clicking hands the bare skill name to the
  * caller, which prefills the composer — pills never auto-execute,
@@ -27,7 +28,7 @@ export function SkillPills({
 }) {
   if (skills.length === 0) return null;
   return (
-    <div className="flex flex-wrap items-center gap-1.5" data-testid="skill-pills">
+    <div className="hidden flex-wrap items-center gap-1.5 md:flex" data-testid="skill-pills">
       {skills.map((skill) => (
         <Tooltip key={skill.name}>
           <TooltipTrigger asChild>
