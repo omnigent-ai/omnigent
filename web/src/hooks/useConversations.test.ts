@@ -349,14 +349,20 @@ describe("useConversations search timeout", () => {
   });
 
   it("does not bound an ordinary (non-search) list fetch", async () => {
-    renderSearch("");
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    try {
+      renderSearch("");
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
-    // Plain pagination is indexed/fast; adding a deadline could abort a
-    // legitimately larger page, so no signal is attached.
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).not.toContain("search_query=");
-    expect(init.signal).toBeUndefined();
+      // Plain pagination is indexed/fast; adding a deadline could abort a
+      // legitimately larger page. It carries only the query's cancel signal.
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).not.toContain("search_query=");
+      expect(timeout).not.toHaveBeenCalled();
+      expect(init.signal?.aborted).toBe(false);
+    } finally {
+      timeout.mockRestore();
+    }
   });
 
   it("does not retry a client-side search timeout, but retries other errors", () => {
@@ -437,6 +443,60 @@ describe("useConversations stale cursor", () => {
     // the recovery instead.
     expect(retry(0, new ApiError("gone", 400, "stale_cursor"))).toBe(false);
     expect(retry(0, new ApiError("bad", 400, "invalid_input"))).toBe(true);
+  });
+});
+
+describe("superseded list fetches", () => {
+  // A reconcile round cancels the previous one. Unless each list fetch carries
+  // the query's abort signal, the old request (and an infinite query's walk
+  // through its remaining pages) keeps running and rounds pile up.
+  function pendingFetchSignals(): AbortSignal[] {
+    const signals: AbortSignal[] = [];
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+      if (init?.signal) signals.push(init.signal);
+      return new Promise(() => {});
+    });
+    return signals;
+  }
+
+  function wrapperFor(queryClient: QueryClient) {
+    return ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+  }
+
+  it("aborts a cancelled session-list fetch", async () => {
+    const signals = pendingFetchSignals();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderHook(() => useConversations("", false), { wrapper: wrapperFor(queryClient) });
+    await waitFor(() => expect(signals).toHaveLength(1));
+
+    await act(() => queryClient.cancelQueries({ queryKey: ["conversations"] }));
+
+    expect(signals[0].aborted).toBe(true);
+  });
+
+  it("aborts a cancelled project-folder fetch", async () => {
+    const signals = pendingFetchSignals();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderHook(() => useProjectSessions("Sprint 42", true), {
+      wrapper: wrapperFor(queryClient),
+    });
+    await waitFor(() => expect(signals).toHaveLength(1));
+
+    await act(() => queryClient.cancelQueries({ queryKey: ["project-sessions"] }));
+
+    expect(signals[0].aborted).toBe(true);
+  });
+
+  it("aborts the archived-project-names walk", async () => {
+    const signals = pendingFetchSignals();
+    const controller = new AbortController();
+    void fetchAllArchivedProjectNames(controller.signal).catch(() => {});
+    await waitFor(() => expect(signals).toHaveLength(1));
+
+    controller.abort();
+
+    expect(signals[0].aborted).toBe(true);
   });
 });
 

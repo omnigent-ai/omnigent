@@ -17,7 +17,7 @@ import {
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
-import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -485,6 +485,88 @@ describe("SessionUpdatesProvider list invalidation", () => {
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["archived-project-names"] });
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  // Any refetch of the session lists, as opposed to e.g. a comments refresh.
+  function listInvalidations(invalidate: { mock: { calls: unknown[][] } }) {
+    return invalidate.mock.calls.filter(([filters]: unknown[]) => {
+      const key = (filters as { queryKey?: unknown[] } | undefined)?.queryKey?.[0];
+      return key === "conversations" || key === "project-sessions";
+    });
+  }
+
+  it("patches a background session's updated_at bump without refetching the lists", () => {
+    // Running agents bump updated_at on every tick; each list view sorts its
+    // own rows, so a refetch would only re-read every list for nothing.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ id: "conv_b", updated_at: 5 }] }));
+      act(() => vi.advanceTimersByTime(5_000));
+
+      expect(listInvalidations(invalidate)).toEqual([]);
+      const rows = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+      expect(rows?.pages[0].data.find((row) => row.id === "conv_b")?.updated_at).toBe(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not treat a watched sub-agent child as a new session", () => {
+    // Children are watched for their tree views but never appear in a list,
+    // so their changes must not trigger a list refetch.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("child_1"), parent_session_id: "conv_a", status: "running" }],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(5_000));
+
+      expect(listInvalidations(invalidate)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still reconciles the lists when a watched top-level session is missing from them", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("conv_new"), labels: { omni_project: "Sprint 42" } }],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      expect(invalidate).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: ["conversations"] }),
+      );
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+    } finally {
+      vi.useRealTimers();
+      clearRecentlyCreated();
     }
   });
 });

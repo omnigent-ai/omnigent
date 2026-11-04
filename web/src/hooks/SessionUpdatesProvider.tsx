@@ -9,9 +9,9 @@ import { PINNED_CONVERSATIONS_KEY, type PinnedConversationsResult } from "./useC
 //      and pushes it to the socket, and
 //   3. applies incoming snapshot/changed/removed frames back into that cache
 //      — patching field changes (status, runner, title, …) in place and
-//      falling back to a debounced refetch for structural changes,
-//      membership-affecting filter changes, and updated_at resorting where
-//      the server's list shape can't be reconstructed locally.
+//      falling back to a paced refetch for structural and
+//      membership-affecting filter changes the server's list shape can't
+//      reconstruct locally.
 //
 // This replaces the old 4 s list poll; `useConversations` keeps low-rate
 // HTTP reconciliation so new sessions from other tabs / CLIs are still
@@ -39,13 +39,14 @@ import {
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
 } from "@/lib/sessionListCache";
+import { createListReconcileScheduler } from "@/lib/listReconcileScheduler";
 import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { isTempConvId } from "@/lib/tempConversationId";
 
-// Coalesce bursts of structural changes / watch-set recomputes into one
-// action. 250 ms is short enough to feel live, long enough to batch the
-// flurry of cache writes a single frame can trigger.
+// Coalesce bursts of watch-set recomputes into one push. 250 ms is short
+// enough to feel live, long enough to batch the flurry of cache writes a
+// single frame can trigger.
 const DEBOUNCE_MS = 250;
 
 /**
@@ -53,14 +54,12 @@ const DEBOUNCE_MS = 250;
  *
  * @param queryClient - The app QueryClient.
  * @param items - Wire items from a snapshot/changed frame.
- * @returns Ids not found in any cached page and whether any patched row
- *   needs a server refetch to preserve filtered-query membership or sort
- *   order.
+ * @returns Top-level ids not found in any cached page and whether any
+ *   patched row needs a server refetch to preserve filtered-query membership.
  */
 function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
-  activeId: string | undefined,
   viewerId?: string | null,
 ): { missingIds: string[]; needsRefetch: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
@@ -86,7 +85,7 @@ function applyItemsToCache(
       data: merged,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filters, activeId);
+    } = mergeItemsIntoPages(data, itemsById, filters);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
     // Surface a brand-new watched session (a create here or elsewhere, a share)
@@ -124,7 +123,7 @@ function applyItemsToCache(
       data: next,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key), activeId);
+    } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
     if (next !== data) queryClient.setQueryData(key, next);
@@ -152,7 +151,11 @@ function applyItemsToCache(
     return changed ? { ...previous, conversations } : previous;
   });
   return {
-    missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
+    // Sub-agent children are watched for their tree views, but no session list
+    // ever holds them, so their absence is not a sign of a new session.
+    missingIds: [...itemsById.values()]
+      .filter((item) => item.parent_session_id == null && !foundAnywhere.has(item.id))
+      .map((item) => item.id),
     needsRefetch,
   };
 }
@@ -311,24 +314,25 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       });
     }
 
-    let invalidateTimer: ReturnType<typeof setTimeout> | null = null;
-    const scheduleInvalidate = () => {
-      if (invalidateTimer !== null) return;
-      invalidateTimer = setTimeout(() => {
-        invalidateTimer = null;
-        void queryClient.invalidateQueries({
+    // Reconcile the session lists against the server when a frame shows a
+    // change no local patch can place. Paced so a busy stream can't stack
+    // refetch rounds against a slow server.
+    const reconciler = createListReconcileScheduler(() =>
+      Promise.all([
+        queryClient.invalidateQueries({
           queryKey: ["conversations"],
           predicate: (query) => query.meta?.snapshot !== true,
-        });
+        }),
         // Converge each project folder's own list too (new/archived/relabeled
         // members the local field-patch can't place).
-        void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+        queryClient.invalidateQueries({ queryKey: ["project-sessions"] }),
         // Another client archiving/relabeling/deleting can add or remove a
         // project from the Archived view's picker; only local mutations
         // invalidate this scan otherwise.
-        void queryClient.invalidateQueries({ queryKey: ["archived-project-names"] });
-      }, DEBOUNCE_MS);
-    };
+        queryClient.invalidateQueries({ queryKey: ["archived-project-names"] }),
+      ]),
+    );
+    const scheduleInvalidate = () => reconciler.schedule();
 
     // See commentsFingerprintsRef: invalidate `["comments", id]` (prefix —
     // covers the per-file variants too) when a session's fingerprint moves.
@@ -414,13 +418,12 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
             frame.items,
-            activeIdRef.current,
             getCurrentUserId(),
           );
           // A watched id absent from every page is a new session whose sort
           // position we can't place locally. Membership-affecting deltas
-          // (archive/search/connected filters) and updated_at resorting need
-          // the same server-side reconciliation.
+          // (archive/search/connected filters) need the same server-side
+          // reconciliation.
           //
           // Skip the active session: its updated_at bumps on open before the
           // initial list fetch returns, so it lands in missingIds even though
@@ -467,7 +470,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       unsubscribeFrames();
       unsubscribeMutations();
       unsubscribeCache();
-      if (invalidateTimer !== null) clearTimeout(invalidateTimer);
+      reconciler.dispose();
       if (watchTimer !== null) clearTimeout(watchTimer);
       sessionUpdatesSocket.stop();
     };

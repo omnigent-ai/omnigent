@@ -624,13 +624,49 @@ describe("useCanvasSessions", () => {
     expect(result.current.sessions.map((row) => row.id)).toEqual(["a"]);
     expect(result.current.error).toBeNull();
 
-    await act(async () => {
-      window.dispatchEvent(new Event("focus"));
-      await Promise.resolve();
-    });
-    await waitFor(() => expect(result.current.error).toContain("502"));
+    // Focus refreshes only once a poll interval has passed since the last one.
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + SESSION_POLL_INTERVAL_MS);
+    try {
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(result.current.error).toContain("502"));
+    } finally {
+      now.mockRestore();
+    }
     expect(result.current.sessions.map((row) => row.id)).toEqual(["a"]);
     expect(result.current.loadingMore).toBe(false);
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("skips focus and visibility refreshes within a poll interval of the last one", async () => {
+    // Each refresh walks every session, and focus flips every time the user
+    // switches windows.
+    const client = new QueryClient();
+    vi.mocked(identity.authenticatedFetch).mockResolvedValue(
+      jsonResponse(page([session("a", 1)], null, false)),
+    );
+    const { result } = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(result.current.complete).toBe(true));
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + SESSION_POLL_INTERVAL_MS);
+    try {
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(identity.authenticatedFetch).toHaveBeenCalledTimes(2));
+    } finally {
+      now.mockRestore();
+    }
   });
 });
