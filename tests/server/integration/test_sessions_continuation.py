@@ -12,7 +12,7 @@ import contextlib
 import threading
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -48,6 +48,7 @@ from tests.server.integration._session_continuation import (
     continue_session,
     create_placed_session,
     install_managed_sandbox,
+    message_texts,
     resolve_harness_as,
 )
 from tests.server.integration._session_continuation import (
@@ -229,6 +230,45 @@ async def test_deleting_the_original_during_the_handoff_never_strands_the_contin
     assert continuation is not None and continuation.host_id == _HOST_ID
     assert host_store.get_host(_HOST_ID) is not None
     assert launcher.terminated == []
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+async def test_a_continuation_that_fails_after_runner_setup_leaves_nothing_behind(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """A step failing after the runner set the new session up leaves nothing behind.
+
+    Detaching the original from the runner fails here: the new session is
+    deleted and dropped from the runner, was never listed in the owner's tabs,
+    and the original keeps its history with no notice or redirect.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "clear_runner_id",
+        Mock(side_effect=OmnigentError("detach failed", code=ErrorCode.INTERNAL_ERROR)),
+    )
+    before = len((await client.get("/v1/sessions")).json()["data"])
+
+    resp = await continue_session(client, store, source_id, command)
+
+    assert resp.status_code == 500, resp.text
+    initialized = [
+        body["session_id"] for path, body in live_runner.posts if path == "/v1/sessions"
+    ]
+    [new_id] = [session_id for session_id in initialized if session_id != source_id]
+    assert store.get_conversation(new_id) is None
+    assert (f"/v1/sessions/{new_id}", {}) in live_runner.posts
+    assert new_id not in live_runner.announced
+    assert len((await client.get("/v1/sessions")).json()["data"]) == before
+    assert message_texts(store, source_id) == ["Q1", "A1", "Q2", "A2"]
+    assert live_runner.superseded == []
 
 
 @pytest.mark.parametrize("host_live", [False, True], ids=["offline", "on-another-replica"])
