@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from pydantic.version import version_short
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.native._native_supersession import clear_replacement_create_body
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
@@ -437,6 +438,36 @@ async def test_git_default_fill_with_differing_workspace(db_uri: str) -> None:
     assert resolved.body.git is not None
     assert resolved.body.git.branch_name == "feature/project"
     assert resolved.body.workspace == "/work/other"
+
+
+async def test_native_clear_replacement_body_suppresses_workspace_and_git_defaults(
+    db_uri: str,
+) -> None:
+    project_store = SqlAlchemyProjectStore(db_uri)
+    project = project_store.create(
+        "587b7cb7ac30abf4debfaa578d052ec6",
+        "clear-replacement",
+        ALICE,
+        {
+            "agent_id": CUSTOM_AGENT_ID,
+            "workspace": "/work/project",
+            "git": {"branch_name": "feature/project"},
+        },
+    )
+    body = clear_replacement_create_body(
+        {"title": "Fix login", "project_id": project.id},
+        agent_id=CUSTOM_AGENT_ID,
+        labels={},
+    )
+    resolved = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest.model_validate(body),
+        user_id=ALICE,
+        project_store=project_store,
+    )
+    # Without host_id, a default-filled git block would reject the create with a 400.
+    assert resolved.project_id == project.id
+    assert resolved.body.workspace is None
+    assert resolved.body.git is None
 
 
 async def test_multipart_create_defaults_workspace_and_files_atomically(

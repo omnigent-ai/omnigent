@@ -19,6 +19,10 @@ the header menu), and each place is a separate entry point.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it into that slot.
+- `custom-order`: behind `sidebar_grouping_ui`, drop one of your sessions onto
+  another row of the same list, project or group (or use Move up/down) to switch
+  Ordering to Custom. Positions are saved on this device and new sessions appear
+  above them; a drop on another project's row still files the session there.
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
@@ -92,11 +96,10 @@ the header menu), and each place is a separate entry point.
   source workspaces retain their original selections.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
-- `unsupported-sandbox-actions`: Databricks Sandbox fork controls and
-  Databricks Sandbox and Arclet host-switch controls stay visible but disabled,
-  with hover and keyboard explanations. Their forms cannot submit.
-- `fork-arclet`: an Arclet session forks only onto a new Arclet, the dialog's
-  single host choice. Without one on the server, Fork stays disabled.
+- `unsupported-sandbox-actions`: Databricks Sandbox and Arclet host-switch
+  controls stay visible but disabled, with hover and keyboard explanations.
+  Their forms cannot submit. Fork is not restricted for these sessions.
+
 - `clone`: copy a session into a new workspace, including a typed `~` path.
   Participating sandbox providers require a [profile selection](sandbox-profiles.md)
   before submission, including branch clones.
@@ -156,7 +159,7 @@ the header menu), and each place is a separate entry point.
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
-  (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
+  (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
@@ -181,6 +184,11 @@ the header menu), and each place is a separate entry point.
   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
   a flat Display filter and the tooltip keeps its plain layout.
+- `mobile-drawer-swipe`: on phone layouts, swiping left on the open sidebar
+  drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
+  a third of its width, or after a quick flick, closes it; a shorter drag springs
+  back. List scrolling, row taps, long-press reordering and horizontal scrollers
+  keep their own touch handling.
 
 ## How to get to it (user POV)
 
@@ -258,6 +266,12 @@ sidebar has loaded it.
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot.
 
+**Custom order:** with `sidebar_grouping_ui` on, drag one of your sessions onto
+another row in the same list, project or group and release it; a line like the
+Pinned section's marks where it lands. Move up and Move down in the row menu or
+right-click menu do the same. On mobile, press and hold a row in the sidebar
+drawer, then drag it. Ordering → Custom in the filter menu keeps the order shown.
+
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (mark as read or unread, archive, unarchive, delete).
 
@@ -269,9 +283,12 @@ actions.
 
 **Rename shortcut:** in an owner-managed top-level session on desktop, press
 Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
-The header title becomes an input with its text selected. Enter or blur saves;
-Escape cancels. The shortcut leaves terminals, code editors, and open menus or
-dialogs alone. It is listed in Keyboard shortcuts and Settings.
+With the sidebar open, the session's sidebar row becomes the same inline rename
+field as its Rename menu item, text selected, so you can click the next row and
+rename again. With the sidebar closed, or the row hidden in a collapsed project
+or section, the header title becomes the input instead. Enter or blur
+saves; Escape cancels. The shortcut leaves terminals, code editors, and open
+menus or dialogs alone. It is listed in Keyboard shortcuts and Settings.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
@@ -314,9 +331,12 @@ offers Display only.
 **Offline pull requests:** link PRs to a session, then stop its host. Open the
 Pull Requests tab from the Workspace rail or composer (desktop and mobile).
 On phones, Refresh and Link sit beside Close in the single drawer header;
-in details, the header title becomes the back-to-list button.
-The list retains stored titles and status pills; each row shows **Host offline**
-(or **Sandbox asleep**) instead of checks and Merge. Hover or focus that notice
+with multiple PRs, the details header title becomes the back-to-list button.
+A single PR opens its stored summary directly under **Pull Requests**, with its
+title, status, last sync time and reconnect guidance. Unlink is in the header.
+With multiple PRs, the list retains stored titles and status pills; each row
+shows **Host offline** (or **Sandbox asleep**) instead of checks and Merge.
+Hover or focus that notice
 for the last sync time and reconnect guidance. Click a row for its stored summary,
 then **All pull requests** to return. The row menu can open, copy, or unlink the
 PR while offline; linking needs the host. Reconnect and verify live checks and
@@ -369,9 +389,19 @@ composer open: sending starts the same Arca reconnect, the message waits in the
 queue as **Waiting for host** without reaching the server, and it sends once the
 host is back. In a sandbox session (for example an Arclet) whose host is
 asleep, **Reconnect host** in the composer's host menu has the server wake the
-sandbox and start the agent without sending a message, in the browser too; a
-toast says when it's back online or why the wake failed. Reloading during the
-wake keeps its progress (for example "Provisioning sandbox…") in the chat.
+sandbox and start the agent without sending a message, in the browser too.
+The host status dot in the composer chip and its menu spins while the sandbox
+starts and turns green once it is online. A toast appears only when the wake
+fails or, after the server answers, three regular host health checks still
+find the host offline. Extra checks, such as the one run right after the
+server answers, don't count. The checks count only once the server stops
+reporting launch progress. If the server reports the launch failed or waiting
+on the user, the dot stops and Reconnect host returns. If the server is still
+reporting launch progress 5 minutes later, Reconnect host returns without a
+toast while the dot keeps spinning on the server's stage.
+Reloading during the wake keeps it spinning, with the stage (for example
+"Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
+stays in the menu then, in case that stage never finishes.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -400,24 +430,30 @@ than the main session.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
-**Arclet sessions:** Fork in the header, sidebar menus, or message actions opens
-the clone dialog with a new Arclet sandbox as its only host; connected hosts
-and other sandbox providers are not offered. The repository prefills from the
-source's. Fork stays disabled when the server offers no Arclet, and **Continue
-in another directory…** is disabled because the session can only be cloned onto
-a new sandbox.
+**Closing the mobile drawer by swipe:** at phone width, open the sidebar with
+the header's Open sidebar button or, in the iOS app, a right swipe from the
+left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
+third of the drawer's width or after a quick flick it closes on the current
+chat, otherwise it springs back. Settings and desktop widths don't use it.
 
-**Databricks Sandbox and Arclet sessions:** Fork is disabled for Databricks
-Sandbox sessions in the header, sidebar menus, and message actions. The
-composer's host menu shows a disabled **Switch host…** item for both when you
-have write access. Read-only viewers retain the
-existing host menu without switching controls. Hover or focus a disabled action
-to read why it is unsupported.
+**Databricks Sandbox and Arclet sessions:** Fork is enabled in the header,
+sidebar menus, and message actions, and offers the same destinations as any
+other session: connected hosts and each offered sandbox provider. Sessions
+labelled `omnigent.host_type: managed` fork the same way. The source's own
+sandbox host is never listed, since pickers show connected hosts only. A fork
+of any sandbox session defaults to a fresh sandbox from the source's provider
+when the server offers it, and otherwise to a connected host.
+**Continue in another directory…** on these sessions continues on a connected
+host; like any recovery, it never offers a new sandbox. The composer's host
+menu shows a disabled **Switch host…** item when you have write access.
+Read-only viewers retain the existing host menu without switching controls.
+Hover or focus a disabled action to read why it is unsupported.
 The reconnect dialog also disables Switch host, and Clone wherever Fork is
 disabled; directory selection cannot enable either action.
-While support is being checked, actions stay disabled. If that check fails,
-the explanation asks you to reload. A missing source-host record keeps switching
-disabled while ordinary shared sessions remain forkable. Direct dialogs show a loading status without
+While support is being checked, actions stay disabled: Fork waits only for the
+session snapshot, and Switch host also waits for the source host record. If a
+check fails, the explanation asks you to reload. A missing or failed source-host
+lookup keeps switching disabled while the session stays forkable. Direct dialogs show a loading status without
 an action button until the check finishes; supported forms then receive keyboard focus.
 If the reconnect dialog is already on Clone when an unsupported result arrives,
 it selects Reconnect and explains the restriction.
@@ -440,6 +476,10 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
+In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
+in a visible workspace rail. With no closable visible tab it returns to the
+new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are
+excluded from tab dispatch and retain the window-close behavior.
 With Settings → General → **Open sub-agents in the Workspace panel** on, a
 plain click on a sub-agent (transcript link, composer indicator, Agents row or
 graph node) opens it as a tab in the same strip, marked with a bot icon, and
@@ -547,14 +587,33 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`pin-reorder`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`.
   Dropping an unpinned row onto a pinned row has web unit coverage only.
+- **`custom-order`:**
+  `tests/browser_ui/test_sessions_appearance.py::test_custom_order_keeps_the_list_and_commits_on_drop`
+  (built SPA, mocked backend) covers the menu, the insertion line,
+  committing on drop, reload, new sessions above, per-tab state and the flag-off
+  fallback.
+  `tests/e2e_ui/sessions/test_sidebar_projects.py::test_move_session_into_new_project`
+  files a session dropped on another project's row and releases a row over
+  itself without navigating. Group limits, both Move menus and the click after a
+  drag have web unit coverage in `web/src/shell/Sidebar.pinReorder.test.tsx`. No
+  test drives a touch drag: in a narrow window open the drawer, press and hold a
+  row, drop it on another row of its list, and expect the new order without the
+  session opening.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
   The desktop shortcut, including draft preservation, cancellation, and reload:
+  `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_hotkey_edits_sidebar_rows_in_sequence`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_rename_hotkey_from_composer_persists_and_cancels`.
   The iOS drawer rename under the soft keyboard:
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
+- **`mobile-drawer-swipe`:**
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_close.py::test_swipe_left_closes_open_drawer`,
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_close.py::test_drawer_stays_open_for_scroll_and_short_drag`.
+  These touch-drive the built SPA in desktop Chromium at a phone viewport with
+  mocked APIs and a stubbed iOS bridge. Thresholds, multi-touch and long-press
+  hand-off are covered in `web/src/hooks/useSidebarSwipeToClose.test.tsx`.
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
@@ -686,10 +745,12 @@ plain `uv run pytest`, which starts a private server for the test.
   (`clone outliving its form`). To drive it by hand, delay `POST …/fork` in the
   browser, close the dialog after Clone, and expect a toast whose **Open** opens the clone.
 - **`unsupported-sandbox-actions`:**
-  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_sandbox_fork_and_switch_host_disabled`
-  covers the header, sidebar context menu, message action, and composer host menu
-  at desktop and phone widths, plus the desktop sidebar dropdown. It checks
-  hover, keyboard focus, and ignored activation.
+  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_sandbox_fork_enabled_and_switch_host_disabled`
+  checks that the header, sidebar context menu, and message action offer Fork, and
+  that the composer host menu's Switch host stays disabled, at desktop and phone
+  widths. It checks hover, keyboard focus, and ignored activation for Switch host.
+  The Arclet session forks to connected hosts and a new Arclet:
+  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_arclet_session_forks_onto_connected_hosts_and_a_new_arclet`.
   The server and transcript are real; Databricks Sandbox and Arclet metadata is
   patched at the browser boundary, and no live sandbox is provisioned. Direct form
   and reconnect guards have component coverage in `web/src/shell/ForkSessionDialog.test.tsx`,
@@ -707,15 +768,6 @@ plain `uv run pytest`, which starts a private server for the test.
   Supported host-switch UI coverage:
   `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
   checks the release/launch requests with stubbed host APIs.
-- **`fork-arclet`:**
-  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_arclet_session_forks_only_onto_a_new_arclet`
-  checks that the sidebar dropdown and message action are enabled, drives the
-  header Fork, and checks the dialog's single Arclet choice and the managed fork
-  request. The server advertises Arclet through a stubbed `/v1/info` and the fork
-  is forwarded without its managed fields, so no Arclet is provisioned. The
-  server-unavailable and recovery cases, plus repository prefill, are covered in
-  `web/src/shell/ForkSessionDialog.test.tsx` and
-  `web/src/hooks/useSessionActionRestrictions.test.tsx`.
 - **`reconnect`, spinner (own environment):**
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
   seeds an error item directly into the spawned server's database.
@@ -850,10 +902,13 @@ plain `uv run pytest`, which starts a private server for the test.
   and a message that waits for the host, not live SSH or the desktop's consent
   console.
 - **`reconnect`, asleep sandbox:**
-  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_asks_server_to_wake_asleep_host`
-  drives the real SPA and server with the session patched to an asleep host. It
-  checks that Reconnect host sends `retry_session` and shows the server's answer,
-  not a live sandbox resume.
+  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_wakes_asleep_sandbox_in_status_dot`
+  drives the real SPA and server with the session patched to an asleep Arclet
+  host. It checks that Reconnect host sends `retry_session`, spins the chip and
+  menu dots with no toast, and turns them green once `/health` reports the host
+  online. Sibling tests cover a failed wake's error toast and retry, a
+  session opened mid-wake, and a wake whose stage outlasts its limit. None
+  of them resume a live sandbox.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It
@@ -1015,6 +1070,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
   orders them, then expand the folder and click Show more.
 
+For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
+session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
+siblings stay open. If stopping the side chat fails, its tab, draft and queued
+messages must remain. Narrow the desktop window below 768 pixels and repeat:
+the hidden rail's tabs stay open and the app returns to the new-session page.
+Native accelerator delivery requires an Electron run; component tests cover
+selection, visibility, and stop failure.
+
 ## Gotchas
 
 - Existing side chats on separate runners must still be closed individually.
@@ -1054,13 +1117,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
-- Databricks Sandbox and Arclet restrictions apply to managed sources, including
-  shared sessions. Other sandbox providers support forking. Verify the supported
-  path with
+- Databricks Sandbox, Arclet, and managed sources fork to connected hosts and
+  every offered sandbox provider, including shared sessions. Workspace
+  recovery offers connected hosts only. Verify a managed sandbox fork with
   `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
-- An Arclet source is recognized from its host's provider, so a shared managed
-  Arclet session whose host is not in your host list keeps Fork disabled.
-  Without the managed label, such a session forks like an ordinary one.
 - A custom agent outlives its sessions: forks of your own sessions share it,
   and forking someone else's session gives you your own copy. Appearing in the
   picker does not prove the fork API accepts it; check the bound agent after
@@ -1084,6 +1144,13 @@ plain `uv run pytest`, which starts a private server for the test.
   shows the command instead.
 - Tests marked "own environment" fail under `verify-env run` with an explicit
   message. That is expected; run them with plain `uv run pytest`.
+- Custom positions apply to loaded rows: a session moved up from deep history
+  takes its place again once its page loads. History loaded after Custom started
+  follows Created or Updated until a move below it saves those positions. A move
+  made while Created or Updated is selected starts Custom over from that list. Each
+  tab reads the saved order once, so another tab's change shows after reload and
+  the last tab to save wins. Only your own live sessions can be dragged; shared
+  and archived rows keep their Custom place but can't be moved.
 - Grouping and ordering apply to the loaded pages only: an older session joins
   its group once it is paged in. Grouped views hide Projects, so dragging a
   session onto the list never removes it from its project there.

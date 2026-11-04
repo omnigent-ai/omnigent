@@ -1316,7 +1316,7 @@ class HostStore:
 
         run_write_transaction(self._lifecycle_session, "admit_runner_launch", write)
 
-    def delete_host(self, host_id: str) -> Host | None:
+    def delete_host(self, host_id: str, *, keep_if_bound: bool = False) -> Host | None:
         """
         Logically delete a host and retain pending sandbox cleanup.
 
@@ -1327,7 +1327,9 @@ class HostStore:
         deletion with managed-host generation replacement.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
-        :returns: The latest host snapshot, or ``None`` when already absent.
+        :param keep_if_bound: Preserve the host while any conversation in
+            this workspace remains bound to it, including archived sessions.
+        :returns: The latest host snapshot, or ``None`` when absent or preserved.
         """
 
         def write(session: Session) -> Host | None:
@@ -1341,6 +1343,19 @@ class HostStore:
             ).scalar_one_or_none()
             if row is None:
                 return None
+            # Several sessions can be bound to one host; check inside the
+            # transaction that deletes it.
+            if keep_if_bound:
+                bound_session = session.execute(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                    )
+                    .limit(1)
+                ).first()
+                if bound_session is not None:
+                    return None
             return delete_host_in_session(session, row)
 
         return run_write_transaction(self._lifecycle_session, "delete_host", write)
