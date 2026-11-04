@@ -1188,6 +1188,8 @@ its discoverability.
   cannot create siblings. Shared viewers see flat rows.
 - Families are bounded to 100 retained members, including archived members.
   Use the row chevron to **Collapse session family** or **Expand session family**.
+- Opening a saved **Add nested agent** link on an older server shows an update
+  message instead of a composer that cannot submit.
 - Sandbox expiry and explicit whole-host destruction remain separate from
   deleting one session. Shared compute means a shared filesystem, not history.
 

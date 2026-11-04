@@ -4693,6 +4693,14 @@ async def _run_managed_launch(
         )
         if managed is None:
             return
+        if (
+            relaunch_host is not None
+            and saved_conversation is not None
+            and saved_conversation.host_id == managed.host_id
+            and saved_conversation.workspace is not None
+        ):
+            # Recovery shares compute, while the host restores each session's own cwd.
+            managed.workspace = saved_conversation.workspace
         await _bind_and_launch_managed_runner(
             session_id=session_id,
             managed=managed,

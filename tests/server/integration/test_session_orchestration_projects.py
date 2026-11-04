@@ -123,8 +123,9 @@ async def _file(auth_client, db_uri, session_id: str, project_id: str) -> None:
 
 
 @pytest.mark.parametrize("filed", [True, False])
+@pytest.mark.parametrize("child_sender", [True, False])
 async def test_worker_is_filed_in_the_project_of_the_session_that_started_it(
-    auth_client, auth_app, db_uri, monkeypatch, filed
+    auth_client, auth_app, db_uri, monkeypatch, filed, child_sender
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
@@ -139,10 +140,20 @@ async def test_worker_is_filed_in_the_project_of_the_session_that_started_it(
         )
         await _file(auth_client, db_uri, source["id"], project_id)
 
-    worker_id = await _start_worker(auth_client, auth_app, db_uri, monkeypatch, source)
+    sender = source
+    if child_sender:
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={"agent_id": source["agent_id"], "parent_session_id": source["id"]},
+        )
+        assert response.status_code == 201, response.text
+        sender = response.json()
+    worker_id = await _start_worker(auth_client, auth_app, db_uri, monkeypatch, sender)
 
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
-    assert worker.labels[CREATED_BY_SESSION_LABEL_KEY] == source["id"]
+    assert worker.labels[CREATED_BY_SESSION_LABEL_KEY] == sender["id"]
+    assert worker.family_id == source["id"]
+    assert worker.parent_conversation_id is None
     assert worker.project_id == project_id
     # Only the filing carries over: the worker keeps its own agent and placement.
     assert worker.agent_id == source["agent_id"]

@@ -2163,11 +2163,19 @@ function NewChatWorkspaceControls({
 export function NewChatLandingScreen() {
   const [params] = useSearchParams();
   const siblingSourceId = params.get("sibling");
+  const info = useServerInfo();
+  const supportsNested = info !== "loading" && info.sibling_sessions === true;
   const source = useQuery({
     queryKey: ["sibling-source", siblingSourceId],
     queryFn: () => getSessionSlim(siblingSourceId!),
-    enabled: siblingSourceId !== null,
+    enabled: siblingSourceId !== null && supportsNested,
   });
+  if (siblingSourceId && info !== "loading" && !supportsNested)
+    return (
+      <div role="alert" className="p-6">
+        This server needs an update before you can add a nested agent.
+      </div>
+    );
   if (siblingSourceId && source.isPending)
     return (
       <div role="status" className="p-6">

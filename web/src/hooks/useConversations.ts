@@ -549,7 +549,7 @@ export async function fetchConversationsPage({
     sort_by: sortBy,
     limit: String(limit),
     visibility: visibility ?? "all",
-    expand_families: "true",
+    ...(!searchQuery ? { expand_families: "true" } : {}),
   });
   if (after) params.set("after", after);
   if (searchQuery) params.set("search_query", searchQuery);

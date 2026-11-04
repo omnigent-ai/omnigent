@@ -1443,6 +1443,12 @@ function renderLanding(
   };
 }
 
+it("explains unsupported nested-agent links before showing a composer", () => {
+  renderLanding({ sibling_sessions: false }, "/?sibling=source");
+  expect(screen.getByRole("alert")).toHaveTextContent("This server needs an update");
+  expect(screen.queryByTestId("new-chat-landing-submit")).toBeNull();
+});
+
 function landingInfo(infoOverrides: Partial<ServerInfo>): ServerInfo {
   return {
     accounts_enabled: false,

@@ -6239,6 +6239,32 @@ async def test_siblings_share_one_recovery_across_host_stores(db_uri, monkeypatc
         sandbox_id="old-sandbox",
         token_expires_at=now_epoch() + 3600,
     )
+    from omnigent.server.routes._sessions.orchestration import _run_managed_launch
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    sessions = [conversations.create_conversation() for _ in range(2)]
+    workspaces = ["/root/workspace/repo", "/root/workspace/repo/tests"]
+    for session, workspace in zip(sessions, workspaces, strict=True):
+        conversations.set_host_id(session.id, host.host_id, workspace)
+
+    async def recover(index, host_store):
+        tracker = ManagedLaunchTracker()
+        tracker.begin(sessions[index].id)
+        await _run_managed_launch(
+            session_id=sessions[index].id,
+            owner=_OWNER,
+            sandbox_config=_injected_config(fake),
+            repos=[],
+            tracker=tracker,
+            conversation_store=conversations,
+            host_store=host_store,
+            host_registry=None,
+            tunnel_registry=None,
+            relaunch_host=host,
+        )
+        assert tracker.get(sessions[index].id) is None
+
     gate = threading.Event()
     fake = FakeSandboxLauncher(
         provision_gate=gate,
@@ -6248,13 +6274,7 @@ async def test_siblings_share_one_recovery_across_host_stores(db_uri, monkeypatc
             user_id=_OWNER,
         ),
     )
-    first = asyncio.create_task(
-        relaunch_managed_host(
-            config=_injected_config(fake),
-            host=host,
-            host_store=store,
-        )
-    )
+    first = asyncio.create_task(recover(0, store))
     second_store = HostStore(db_uri)
     joined = asyncio.Event()
     original = second_store.claim_managed_recovery
@@ -6272,19 +6292,15 @@ async def test_siblings_share_one_recovery_across_host_stores(db_uri, monkeypatc
         async with asyncio.timeout(10):
             while not fake.prepared:
                 await asyncio.sleep(0.01)
-            second = asyncio.create_task(
-                relaunch_managed_host(
-                    config=_injected_config(fake),
-                    host=host,
-                    host_store=second_store,
-                )
-            )
+            second = asyncio.create_task(recover(1, second_store))
             await joined.wait()
             await asyncio.sleep(1.1)
             assert not second.done()
             gate.set()
-            results = await asyncio.gather(first, second)
-        assert results[0] == results[1]
+            await asyncio.gather(first, second)
+        restored = [conversations.get_conversation(session.id) for session in sessions]
+        assert [session.workspace for session in restored] == workspaces
+        assert {session.host_id for session in restored} == {host.host_id}
         assert len(fake.provisioned_names) == 1
         assert fake.terminated == ["old-sandbox"]
     finally:

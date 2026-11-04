@@ -9859,6 +9859,29 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id):
     assert [member.id for member in families[another.id]] == [another.id, another_sibling.id]
 
 
+@pytest.mark.asyncio
+async def test_family_limit_counts_archived_members_and_cleans_up_rejected_creation(
+    conversation_store,
+):
+    from omnigent.errors import OmnigentError
+    from omnigent.server.session_families import complete_sibling_creation
+    from omnigent.stores.conversation_store import MAX_SESSION_FAMILY_MEMBERS
+
+    store = conversation_store
+    source = store.create_conversation()
+    for _ in range(MAX_SESSION_FAMILY_MEMBERS - 1):
+        member = store.create_conversation()
+        store.add_new_sibling(source.id, member.id, user_id="alice")
+        store.update_conversation(member.id, archived=True)
+    retained = {member.id for member in store.get_session_family(source.id)}
+    assert len(retained) == MAX_SESSION_FAMILY_MEMBERS
+    rejected = store.create_conversation()
+    with pytest.raises(OmnigentError, match=f"up to {MAX_SESSION_FAMILY_MEMBERS}"):
+        await complete_sibling_creation(store, source.id, rejected.id, user_id="alice")
+    assert store.get_conversation(rejected.id) is None
+    assert {member.id for member in store.get_session_family(source.id)} == retained
+
+
 @pytest.mark.parametrize("split_database", [False, True])
 def test_failed_family_membership_preserves_source_pin(tmp_path, monkeypatch, split_database):
     from omnigent.stores.conversation_store import family_pinned_label_key, pinned_label_key

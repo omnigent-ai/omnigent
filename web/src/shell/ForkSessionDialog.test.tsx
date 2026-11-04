@@ -334,10 +334,13 @@ afterEach(cleanup);
 
 describe("ForkSessionDialog", () => {
   it.each([
-    ["managed snapshot", null],
-    ["Arclet host", "arclet"],
-    ["Databricks Sandbox host", "lakebox"],
-  ])("offers every destination to a %s source", (source, provider) => {
+    ["managed snapshot", null, true],
+    ["Arclet host", "arclet", true],
+    ["Databricks Sandbox host", "lakebox", true],
+    ["managed snapshot", null, false],
+    ["Arclet host", "arclet", false],
+    ["Databricks Sandbox host", "lakebox", false],
+  ])("offers supported destinations to a %s source (%s, reuse: %s)", (source, provider, reuse) => {
     useSessionMock.mockReturnValue({
       session: {
         hostId: "host_1",
@@ -353,7 +356,7 @@ describe("ForkSessionDialog", () => {
       info: {
         managed_sandboxes_enabled: true,
         sandbox_providers: ["lakebox", "arclet"],
-        sibling_sessions: true,
+        sibling_sessions: reuse,
       },
     });
 
@@ -361,7 +364,10 @@ describe("ForkSessionDialog", () => {
     expect(screen.getByTestId("fork-session-connect-host-toggle")).toBeInTheDocument();
     openHostSelect();
     expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
-    expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
+    // Embedded managed markers alone do not identify a core sandbox host.
+    expect(screen.queryByTestId("fork-session-host-option-host_1") !== null).toBe(
+      reuse || provider === null,
+    );
     expect(screen.getByTestId("fork-session-sandbox-option")).toBeInTheDocument();
     expect(screen.getByTestId("fork-session-sandbox-option-arclet")).toBeInTheDocument();
   });

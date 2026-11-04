@@ -314,6 +314,7 @@ describe("useSessionSearch", () => {
       const params = new URL(url, "http://localhost").searchParams;
       expect(params.get("search_query")).toBe("kestrel");
       expect(params.get("search_scope")).toBe(scope);
+      expect(params.has("expand_families")).toBe(false);
       expect(params.get("include_archived")).toBe("true");
       expect(params.get("limit")).toBe("8");
     },
