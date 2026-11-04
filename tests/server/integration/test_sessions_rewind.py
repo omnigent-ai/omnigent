@@ -113,11 +113,11 @@ async def test_rewind_refuses_a_message_sent_while_it_moves_the_session(
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A message sent while the rewound session is being set up is refused.
+    """A message or second /rewind sent while the rewound session is being set up is refused.
 
     Rewind frees no client first, so the window is the new session's setup on
     the runner. The message would otherwise run in the original chat while
-    viewers follow the rewound one.
+    viewers follow the rewound one, and a second rewind would fork it again.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
@@ -135,8 +135,15 @@ async def test_rewind_refuses_a_message_sent_while_it_moves_the_session(
                 },
             )
         )
+        sent.append(
+            await client.post(
+                f"/v1/sessions/{source_id}/rewind",
+                json={"item_id": item_ids(store, source_id)[0]},
+            )
+        )
 
     live_runner.on_session_init = send_from_another_tab
+    before = len((await client.get("/v1/sessions")).json()["data"])
 
     resp = await client.post(
         f"/v1/sessions/{source_id}/rewind", json={"item_id": item_ids(store, source_id)[2]}
@@ -144,8 +151,11 @@ async def test_rewind_refuses_a_message_sent_while_it_moves_the_session(
 
     assert resp.status_code == 200, resp.text
     new_id = resp.json()["session_id"]
-    assert [response.status_code for response in sent] == [409], sent[0].text
+    assert [response.status_code for response in sent] == [409, 409], [r.text for r in sent]
     assert "moving to a new session" in sent[0].text
+    assert "already moving to a new session" in sent[1].text
+    # Only the first rewind made a session.
+    assert len((await client.get("/v1/sessions")).json()["data"]) == before + 1
     assert [body for _path, body in live_runner.posts if body.get("type") == "message"] == []
     assert "Q3" not in message_texts(store, source_id)
     assert live_runner.superseded == [(source_id, new_id, "rewind")]
