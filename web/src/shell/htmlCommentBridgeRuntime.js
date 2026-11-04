@@ -277,12 +277,16 @@
 
   function applyScrollRestore() {
     if (!scrollRestore) return;
-    if (performance.now() >= scrollRestore.deadline || readerMovedDuringRestore()) {
+    const readerMoved = readerMovedDuringRestore();
+    // "instant" overrides an artifact's `scroll-behavior: smooth`. A frame throttled past the
+    // deadline still re-asserts once, since the page may have grown in the meantime.
+    if (!readerMoved) {
+      window.scrollTo({ left: window.scrollX, top: scrollRestore.top, behavior: "instant" });
+    }
+    if (readerMoved || performance.now() >= scrollRestore.deadline) {
       settleScrollRestore();
       return;
     }
-    // "instant" overrides an artifact's `scroll-behavior: smooth`.
-    window.scrollTo({ left: window.scrollX, top: scrollRestore.top, behavior: "instant" });
     scrollRestore.y = window.scrollY;
     if (Math.abs(scrollRestore.y - scrollRestore.top) <= 1) revealPage();
     scrollRestore.layout = layoutSize();

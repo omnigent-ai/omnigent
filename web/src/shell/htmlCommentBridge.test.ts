@@ -473,6 +473,23 @@ describe("bridge runtime scroll position", () => {
     expect(sentScrollOffsets(port)).toEqual([232]);
   });
 
+  it("re-asserts the saved offset once when a throttled frame lands past the budget", () => {
+    const { scrollTo, setPageHeight } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+    const hide = addRestoreHide();
+    const port = startRuntime({ restoreScroll: restoreTo(640) });
+    expect(window.scrollY).toBe(232);
+    // A background tab runs no frames while the page grows and the budget passes.
+    setPageHeight(2_000);
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + BUDGET_MS);
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).toHaveBeenCalledTimes(2);
+    expect(window.scrollY).toBe(640);
+    expect(hide.isConnected).toBe(false);
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).toHaveBeenCalledTimes(2);
+    expect(sentScrollOffsets(port)).toEqual([640]);
+  });
+
   it("turns scroll anchoring off until the restore settles, then gives the page its own", () => {
     fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
     const rootStyle = document.documentElement.style;
