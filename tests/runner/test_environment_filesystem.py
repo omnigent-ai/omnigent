@@ -1578,7 +1578,9 @@ async def test_multi_repo_routes_bind_session_git_and_preserve_repository_metada
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "not_found"
 
-    (workspace / "broken" / ".git").mkdir(parents=True)
+    broken = workspace / "broken"
+    subprocess.run(["git", "init", str(broken)], env=_git_env(), check=True, capture_output=True)
+    (broken / ".git" / "HEAD").write_text("not a ref\n")
     response = await client.get(f"{base}/changes")
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "git_status_failed"
