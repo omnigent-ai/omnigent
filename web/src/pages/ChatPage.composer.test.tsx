@@ -1247,7 +1247,7 @@ describe("Composer slash-command menu", () => {
     expect(await screen.findByText("Stop the current turn before running /rewind.")).toBeTruthy();
   });
 
-  it.each(["untouched", "typed", "sent", "erased-then-left"] as const)(
+  it.each(["untouched", "typed", "sent", "erased-then-left", "edited-while-downloading"] as const)(
     "/rewind fills the new session's composer when the redirect lands first (%s)",
     async (edit) => {
       onTestFinished(() => {
@@ -1294,7 +1294,8 @@ describe("Composer slash-command menu", () => {
         </CapabilitiesProvider>,
       );
       expect(textarea()).toHaveValue("");
-      if (edit !== "untouched") fireEvent.change(textarea(), { target: { value: "My own words" } });
+      const typedBeforeResponse = !["untouched", "edited-while-downloading"].includes(edit);
+      if (typedBeforeResponse) fireEvent.change(textarea(), { target: { value: "My own words" } });
       if (edit === "sent") fireEvent.keyDown(textarea(), { key: "Enter" });
       if (edit === "erased-then-left") {
         fireEvent.change(textarea(), { target: { value: "" } });
@@ -1308,18 +1309,28 @@ describe("Composer slash-command menu", () => {
           attachments: [{ type: "input_image", fileId: "file_new", filename: "diagram.png" }],
         }),
       );
+      // The text comes in while the attachment is still downloading.
+      if (edit === "untouched" || edit === "edited-while-downloading") {
+        await waitFor(() => expect(textarea()).toHaveValue("Write the parser"));
+        expect(screen.queryByAltText("diagram.png")).toBeNull();
+      }
+      if (edit === "edited-while-downloading")
+        fireEvent.change(textarea(), { target: { value: "Write the parser, then test it" } });
       // The attachment arrives last, while the user may be in another chat.
       await act(async () => downloaded(diagram));
       if (edit === "erased-then-left")
         act(() => useChatStore.setState({ conversationId: "conv_new" }));
 
-      expect(download).toHaveBeenCalledExactlyOnceWith("conv_new", "file_new", "diagram.png");
+      // A destination the user already touched gets neither the prompt nor its files.
+      if (typedBeforeResponse) expect(download).not.toHaveBeenCalled();
+      else expect(download).toHaveBeenCalledExactlyOnceWith("conv_new", "file_new", "diagram.png");
       await waitFor(() => expect(useChatStore.getState().rewindPrefill).toBeNull());
       const expected = {
         untouched: "Write the parser",
         typed: "My own words",
         sent: "",
         "erased-then-left": "",
+        "edited-while-downloading": "Write the parser, then test it",
       };
       expect(textarea()).toHaveValue(expected[edit]);
       expect(destination.onSend).toHaveBeenCalledTimes(edit === "sent" ? 1 : 0);

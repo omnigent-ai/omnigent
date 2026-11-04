@@ -2889,17 +2889,18 @@ function ComposerImpl(
     };
   }, [conversationId, replaceText]);
 
-  // A rewind can land here before its response brings the prompt back; take it
-  // then, unless the composer already holds it or the user has started typing.
+  // A rewind can land here before its response brings the prompt back, and its
+  // attachments can follow the text; take each unless the user has started
+  // typing. The store already saved the draft, so taking it leaves it clean.
   const rewindPrefill = useChatStore((s) => s.rewindPrefill);
   useEffect(() => {
     if (rewindPrefill === null || rewindPrefill.conversationId !== conversationId) return;
     if (settledConversationId !== conversationId) return;
     useChatStore.setState({ rewindPrefill: null });
-    if (dirtyRef.current || valueRef.current !== "" || filesRef.current.length > 0) return;
+    if (dirtyRef.current || filesRef.current.length > 0) return;
+    if (valueRef.current !== "" && valueRef.current !== rewindPrefill.text) return;
     replaceText(rewindPrefill.text, rewindPrefill.replyDraft);
     attachmentsRef.current.replaceFiles(rewindPrefill.files);
-    dirtyRef.current = true;
   }, [rewindPrefill, conversationId, settledConversationId, replaceText]);
 
   // An Arca send waits in the queue for the host, so typing reopens; other gates stay.

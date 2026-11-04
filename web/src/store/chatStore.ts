@@ -123,6 +123,7 @@ import {
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import {
   getSessionDraft,
+  sessionDraftRevision,
   sessionDraftWasWritten,
   setSessionDraft,
   type SessionDraft,
@@ -3674,18 +3675,25 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     const rewound = await rewindSession(conversationId, itemId);
-    const files = await rewindAttachmentFiles(rewound.sessionId, rewound.attachments);
-    const draft: SessionDraft = { text: rewound.prompt, files };
+    const target = rewound.sessionId;
     // A draft the user has edited, cleared or sent in the new session since
     // it opened, here or offscreen, wins over the prompt.
-    const untouched = !sessionDraftWasWritten(rewound.sessionId);
-    if (untouched) setSessionDraft(rewound.sessionId, draft);
+    const untouched = !sessionDraftWasWritten(target);
+    const text: SessionDraft = { text: rewound.prompt, files: [] };
+    if (untouched) setSessionDraft(target, text);
     useChatStore.setState((s) => ({
-      ...(untouched ? { rewindPrefill: { ...draft, conversationId: rewound.sessionId } } : {}),
-      ...(s.conversationId === conversationId
-        ? { redirectToConversationId: rewound.sessionId }
-        : {}),
+      ...(untouched ? { rewindPrefill: { ...text, conversationId: target } } : {}),
+      ...(s.conversationId === conversationId ? { redirectToConversationId: target } : {}),
     }));
+    if (!untouched || rewound.attachments.length === 0) return;
+    // The text is in; the attachments follow once they download, unless the
+    // draft has changed since.
+    const revision = sessionDraftRevision(target);
+    const files = await rewindAttachmentFiles(target, rewound.attachments);
+    if (files.length === 0 || sessionDraftRevision(target) !== revision) return;
+    const draft: SessionDraft = { ...text, files };
+    setSessionDraft(target, draft);
+    useChatStore.setState({ rewindPrefill: { ...draft, conversationId: target } });
   },
 
   refreshSessionState: async (conversationId) => {
