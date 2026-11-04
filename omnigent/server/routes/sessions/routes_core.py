@@ -4705,6 +4705,16 @@ def register_core_routes(
                         if not host_bound:
                             raise runner_offline from None
                         runner_bound = False
+                if runner_bound and host_bound:
+                    # As native /clear does: the fork now holds the runner, so
+                    # stopping or archiving the source must not stop it. The
+                    # source keeps its host and resumes on a relaunched runner.
+                    await _update_session(
+                        request,
+                        source.id,
+                        UpdateSessionRequest(runner_id=""),
+                        include_usage=False,
+                    )
             except Exception:
                 # Leave no announced fork for a retry to duplicate.
                 await _delete_unreturned_session(fork.id)
