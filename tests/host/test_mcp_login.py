@@ -547,6 +547,25 @@ async def test_queued_starts_finish_within_the_start_budget(
     assert not fake_cli.exists()
 
 
+async def test_a_spent_start_budget_launches_nothing(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
+) -> None:
+    checks: list[list[str]] = []
+
+    async def run_status_command(argv: list[str], harness: str, timeout: float) -> None:
+        checks.append(argv)
+
+    monkeypatch.setattr(mcp_login, "_run_status_command", run_status_command)
+    logins = host_logins()
+    spent = asyncio.get_running_loop().time()
+    with pytest.raises(LoginError) as refused:
+        await logins._spawn(os.environ["OMNIGENT_CLAUDE_PATH"], "demo", ("claude", "demo"), spent)
+    assert refused.value.status == "busy"
+    # Neither the flag check nor the sign-in CLI ran.
+    assert checks == []
+    assert not fake_cli.exists()
+
+
 async def test_cancel_restart_and_close_stop_the_cli(
     fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
 ) -> None:

@@ -432,14 +432,14 @@ class HostMcpLogins:
         argv = [executable, "mcp", "login", name]
         env = _cli_env(key[0])
         remaining = deadline - asyncio.get_running_loop().time()
-        if await self._supports_no_browser(
-            executable, key[0], max(0.0, min(STATUS_TIMEOUT_SECONDS, remaining))
+        if remaining > 0 and await self._supports_no_browser(
+            executable, key[0], min(STATUS_TIMEOUT_SECONDS, remaining)
         ):
             argv.append("--no-browser")
         else:
             # Older CLIs open a browser on the host; ``true`` stands in for it on Linux.
             env["BROWSER"] = "true"
-        # A CLI launched after the deadline would only be stopped again at once.
+        # A process launched after the deadline would only be stopped again at once.
         if asyncio.get_running_loop().time() >= deadline:
             raise LoginError("busy", "The sign-in took too long to start")
         master_fd, slave_fd = pty.openpty()
