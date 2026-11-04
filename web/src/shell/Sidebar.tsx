@@ -9,12 +9,7 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
-import {
-  useSidebarData,
-  useSidebarMembershipHold,
-  useSidebarView,
-  type SidebarListQuery,
-} from "@/hooks/useSidebarData";
+import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
 import {
@@ -268,7 +263,6 @@ import {
   resolveSidebarDrop,
   type SidebarDropTarget,
   sortConversations,
-  type FrozenSortKey,
   STATUS_BUCKETS,
   type StatusBucket,
   statusBucket,
@@ -1504,7 +1498,7 @@ function ProjectFolder({
   activeOverride: ActiveChatOverride | null;
   /** Pointer-inside sort-key freeze shared with the flat list (see
       ConversationList); null while the pointer is outside the list. */
-  frozenSortKeys: Map<string, FrozenSortKey> | null;
+  frozenSortKeys: Map<string, number> | null;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -2042,7 +2036,7 @@ function ConversationList({
   // map accumulates keys lazily inside sortConversations (a render-time ref
   // write) and is cleared once neither hold is active, when the order snaps
   // back to reality.
-  const frozenKeysRef = useRef<Map<string, FrozenSortKey>>(new Map());
+  const frozenKeysRef = useRef<Map<string, number>>(new Map());
   // Status buckets freeze the same way, so a turn finishing under the cursor
   // doesn't move its row to another group.
   const frozenStatusRef = useRef<Map<string, StatusBucket>>(new Map());
@@ -2058,7 +2052,6 @@ function ConversationList({
     });
   }, []);
   const orderFrozen = pointerInside || editingIds.size > 0;
-  useSidebarMembershipHold(orderFrozen);
   const frozenKeys = orderFrozen ? frozenKeysRef.current : null;
   const frozenStatus = orderFrozen ? frozenStatusRef.current : null;
   useEffect(() => {
@@ -2174,7 +2167,7 @@ function ConversationList({
             : `${GROUPING_LABELS[view.grouping]} ${dateBucket(
                 view.grouping === "created"
                   ? c.created_at
-                  : (frozenKeys?.get(c.id)?.updatedAt ??
+                  : (frozenKeys?.get(c.id) ??
                       (activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at)),
                 now,
               )}`,

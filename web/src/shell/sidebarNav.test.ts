@@ -20,7 +20,6 @@ import {
   STATUS_BUCKETS,
   statusBucket,
   dateBucket,
-  type FrozenSortKey,
 } from "./sidebarNav";
 
 function conversation(
@@ -767,9 +766,9 @@ it("keeps Created stable across updates, active-row overrides, and hover freezes
   const old = { ...conversation("a", "old", new Date(1000)), created_at: 1, updated_at: 300 };
   const newer = { ...conversation("b", "new", new Date(2000)), created_at: 2, updated_at: 100 };
   const sameSecond = { ...newer, id: "c" };
-  const frozen = new Map<string, FrozenSortKey>([
-    [old.id, { updatedAt: 999, title: old.title }],
-    [newer.id, { updatedAt: 1, title: newer.title }],
+  const frozen = new Map([
+    [old.id, 999],
+    [newer.id, 1],
   ]);
   const active = { id: newer.id, updatedAt: 500 };
   const ids = (rows: Conversation[]) =>
@@ -784,7 +783,7 @@ it("orders equal-updated_at rows by id whether or not the order is frozen", () =
   const a = conversation("a", "A", same);
   const b = conversation("b", "B", same);
   const c = conversation("c", "C", same);
-  const frozen = new Map<string, FrozenSortKey>();
+  const frozen = new Map<string, number>();
   const first = sortConversations([a, b, c], null, frozen).map((row) => row.id);
   // A refresh can hand the same rows back in another order while the pointer is inside.
   expect(sortConversations([c, a, b], null, frozen).map((row) => row.id)).toEqual(first);
@@ -793,7 +792,7 @@ it("orders equal-updated_at rows by id whether or not the order is frozen", () =
   expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
 });
 
-it("sorts Name A to Z case-insensitively with untitled last, holding titles while frozen", () => {
+it("sorts Name A to Z case-insensitively with untitled last", () => {
   const at = new Date(2026, 0, 1);
   const rows = [
     conversation("u", null, at),
@@ -802,14 +801,8 @@ it("sorts Name A to Z case-insensitively with untitled last, holding titles whil
     conversation("a1", "alpha", at),
     conversation("c", "Charlie", at),
   ];
-  const ids = (list: Conversation[], frozen?: Map<string, FrozenSortKey>) =>
-    sortConversations(list, null, frozen, "title").map((row) => row.id);
+  const ids = (list: Conversation[]) =>
+    sortConversations(list, null, null, "title").map((row) => row.id);
   // Equal case-folded titles fall back to id ascending, matching the server.
   expect(ids(rows)).toEqual(["a1", "a2", "b", "c", "u"]);
-  const frozen = new Map<string, FrozenSortKey>();
-  ids(rows, frozen);
-  // A rename that lands while the pointer is over the list waits for it to leave.
-  const renamed = rows.map((row) => (row.id === "c" ? { ...row, title: "aardvark" } : row));
-  expect(ids(renamed, frozen)).toEqual(["a1", "a2", "b", "c", "u"]);
-  expect(ids(renamed)).toEqual(["c", "a1", "a2", "b", "u"]);
 });

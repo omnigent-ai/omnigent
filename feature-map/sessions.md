@@ -159,7 +159,7 @@ the header menu), and each place is a separate entry point.
   (Updated / Created / Name (A to Z)) and Show (Updated / Environment / Repo / Branch)
   submenus, saved per device. Created ordering keeps sessions newest-created first as
   messages arrive; Name orders by title A to Z, ignoring case, with untitled
-  sessions (“New session”) last, and holds a hovered or renamed row in place;
+  sessions (“New session”) last;
   requests, pagination, and project folders use that order too. A server that
   can't sort by title lists Name as Updated and keeps the saved choice. Switching order
   clears the cached rows and shows loading while session timestamps refresh,

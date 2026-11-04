@@ -212,31 +212,25 @@ export function filterConversations(
   });
 }
 
-/** The mutable sort fields captured while the list is held still. */
-export interface FrozenSortKey {
-  updatedAt: number;
-  title: string | null;
-}
-
-// Timestamps sort newest first and titles A to Z; ties fall back to id. While
-// the list is hovered or a rename is open, each row's updated time (including
-// the active-chat override) and title stay frozen, so it doesn't move.
+// Newest first; equal timestamps fall back to id, so arrival order never shows.
+// Freeze update timestamps for the active chat and hovered list; creation
+// timestamps stay immutable, including when the selected order changes. Name
+// sorts by the live title, A to Z.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
-  frozenKeys?: Map<string, FrozenSortKey> | null,
+  frozenKeys?: Map<string, number> | null,
   sortBy: SessionSortBy = "updated_at",
 ): Conversation[] {
-  const effective = (c: Conversation): Conversation => {
-    const updatedAt = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
-    const frozen = frozenKeys?.get(c.id) ?? { updatedAt, title: c.title };
-    frozenKeys?.set(c.id, frozen);
-    return { ...c, updated_at: frozen.updatedAt, title: frozen.title };
+  const effective = (c: Conversation): number => {
+    const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const updatedAt = frozenKeys?.get(c.id) ?? live;
+    frozenKeys?.set(c.id, updatedAt);
+    return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return conversations
-    .map((row) => ({ row, key: effective(row) }))
-    .sort((a, b) => compareSessionRows(a.key, b.key, sortBy))
-    .map(({ row }) => row);
+  if (sortBy === "title")
+    return [...conversations].sort((a, b) => compareSessionRows(a, b, sortBy));
+  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */

@@ -167,13 +167,6 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
-  // While the sidebar holds its order, rows it already lists stay listed; the
-  // complete-prefix rule applies again once the hold ends.
-  const [membershipHeld, holdMembership] = useState(false);
-  const [held, setHeld] = useState<{ sortBy: SessionSortBy; ids: ReadonlySet<string> } | null>(
-    null,
-  );
-  const keepIds = membershipHeld && held?.sortBy === sortBy ? held.ids : undefined;
   const merged = useMemo(
     () =>
       mergeScopeRows(
@@ -184,7 +177,6 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
         mineCursor,
         sharedCursor,
         sortBy,
-        keepIds,
       ),
     [
       mineRows,
@@ -195,22 +187,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       mineCursor,
       sharedCursor,
       sortBy,
-      keepIds,
     ],
   );
-  useLayoutEffect(() => {
-    if (!membershipHeld) {
-      setHeld(null);
-      return;
-    }
-    setHeld((previous) => {
-      const current = previous?.sortBy === sortBy ? previous.ids : new Set<string>();
-      if (previous?.sortBy === sortBy && merged.rows.every((row) => current.has(row.id))) {
-        return previous;
-      }
-      return { sortBy, ids: new Set([...current, ...merged.rows.map((row) => row.id)]) };
-    });
-  }, [membershipHeld, merged.rows, sortBy]);
   const hasNextPage = mine.hasNextPage || (sharedActive && shared.hasNextPage);
   const { fetchNextPage: fetchMinePage } = mine;
   const { fetchNextPage: fetchSharedPage } = shared;
@@ -271,7 +249,6 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     watchedIds,
     registerFolder,
     watermark: merged.watermark,
-    holdMembership,
   };
 }
 
@@ -325,19 +302,6 @@ export function useSidebarData() {
 export function useLoadedConversations() {
   const { loadedData: data, all } = useSidebarData();
   return { data, isLoading: data === undefined && all.isLoading };
-}
-
-/**
- * Keep the merged list's rows listed while the sidebar holds its order. Only a
- * rename can move a listed row past the complete prefix, so only Name holds.
- */
-export function useSidebarMembershipHold(held: boolean) {
-  const { holdMembership, sortBy } = useSidebarData();
-  const holds = held && sortBy === "title";
-  useLayoutEffect(() => {
-    holdMembership(holds);
-    return () => holdMembership(false);
-  }, [holds, holdMembership]);
 }
 
 /** Register the mounted sidebar's persisted selection; unmount releases its demand. */
