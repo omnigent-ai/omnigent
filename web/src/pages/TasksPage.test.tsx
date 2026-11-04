@@ -325,10 +325,9 @@ describe("TasksPage list", () => {
     expect(jiraCard).toHaveTextContent("Jira tickets");
     expect(jiraCard).toHaveTextContent("Watch for matching tickets");
     expect(jiraCard).toHaveTextContent("Requires a Jira MCP server.");
-    expect(jiraCard).toHaveTextContent("Checks every hour");
     expect(screen.queryByRole("button", { name: /Show all/ })).not.toBeInTheDocument();
     expect(jiraCard).toHaveAccessibleDescription(
-      "Watch for matching tickets and start a session to investigate or work on each one. Checks every hour Requires a Jira MCP server.",
+      "Watch for matching tickets and start a session to investigate or work on each one. Requires a Jira MCP server.",
     );
   });
 

@@ -58,9 +58,11 @@ to customize.
   except on an Arclet sandbox, which already has them. Neither the template form
   nor editing a task saved from one shows the Session choice; templates always
   keep one session, and editing keeps only the reset to a new session.
-- `responsive`: gallery items have icons, descriptions, hourly polling summaries,
-  access requirements, pointer cursors, and keyboard focus indicators. Desktop
-  uses two columns; narrow screens use one.
+- `responsive`: gallery items have icons, descriptions, access requirements,
+  pointer cursors, and keyboard focus indicators; cadence is chosen in the form.
+  Host occupies a full row above Schedule. Project and Workspace (or Repository)
+  share a row on desktop and stack on narrow screens. Gallery cards use two
+  columns on desktop and one on narrow screens.
 
 ## How to get to it (user POV)
 

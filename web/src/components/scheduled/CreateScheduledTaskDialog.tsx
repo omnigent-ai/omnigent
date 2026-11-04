@@ -849,6 +849,44 @@ export function CreateScheduledTaskDialog({
             </div>
           )}
 
+          {/* Pin a connected host, or provision a sandbox per run (kept for continuing sessions). */}
+          <div className="flex min-w-0 flex-col gap-1.5" data-testid="task-host-field">
+            <Label htmlFor="task-host">Host</Label>
+            <Select
+              value={sandboxMode ? SANDBOX_HOST : hostId}
+              componentId="tasks.scheduled.host"
+              onValueChange={handleTargetChange}
+              onOpenChange={handleSelectOpenChange}
+            >
+              <SelectTrigger id="task-host" data-testid="task-host-trigger" className="w-full">
+                <SelectValue placeholder={isEdit ? UNPINNED_HOST_LABEL : "Pick a host"} />
+              </SelectTrigger>
+              <SelectContent position="popper" align="start">
+                {(managedSandboxesEnabled || sandboxMode) && (
+                  <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
+                    {sandboxLabel}
+                  </SelectItem>
+                )}
+                {hostOptions.map((host) => (
+                  <SelectItem key={host.host_id} value={host.host_id}>
+                    {host.name} {host.status === "offline" ? "(offline)" : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-sm text-muted-foreground">
+              {sandboxMode
+                ? sessionMode === "continue"
+                  ? "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration."
+                  : "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
+                : hostId === ""
+                  ? isEdit
+                    ? "Runs on the connected host you used most recently. Pick a host to pin it."
+                    : "Pick the host this automation runs on."
+                  : "Runs on this host. A run fails while the host is offline."}
+            </p>
+          </div>
+
           <ScheduleFields
             timezone={timezone}
             onTimezoneChange={setTimezone}
@@ -873,47 +911,12 @@ export function CreateScheduledTaskDialog({
             </p>
           )}
 
-          <div className={projectsSupported ? "grid gap-3 sm:grid-cols-2 sm:gap-6" : "grid gap-3"}>
-            {/* Pin a connected host, or provision a sandbox per run (kept for continuing sessions). */}
-            <div className="flex min-w-0 flex-col gap-1.5" data-testid="task-host-field">
-              <Label htmlFor="task-host">Host</Label>
-              <Select
-                value={sandboxMode ? SANDBOX_HOST : hostId}
-                componentId="tasks.scheduled.host"
-                onValueChange={handleTargetChange}
-                onOpenChange={handleSelectOpenChange}
-              >
-                <SelectTrigger id="task-host" data-testid="task-host-trigger" className="w-full">
-                  <SelectValue placeholder={isEdit ? UNPINNED_HOST_LABEL : "Pick a host"} />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  {(managedSandboxesEnabled || sandboxMode) && (
-                    <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
-                      {sandboxLabel}
-                    </SelectItem>
-                  )}
-                  {hostOptions.map((host) => (
-                    <SelectItem key={host.host_id} value={host.host_id}>
-                      {host.name} {host.status === "offline" ? "(offline)" : ""}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="text-sm text-muted-foreground">
-                {sandboxMode
-                  ? sessionMode === "continue"
-                    ? "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration."
-                    : "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
-                  : hostId === ""
-                    ? isEdit
-                      ? "Runs on the connected host you used most recently. Pick a host to pin it."
-                      : "Pick the host this automation runs on."
-                    : "Runs on this host. A run fails while the host is offline."}
-              </p>
-            </div>
-
+          <div className="grid gap-3 empty:hidden sm:grid-cols-2 sm:gap-6">
             {projectsSupported && (
-              <div className="flex min-w-0 flex-col gap-1.5" data-testid="task-project-field">
+              <div
+                className="flex min-w-0 flex-col gap-1.5 sm:only:col-span-2"
+                data-testid="task-project-field"
+              >
                 <Label>Project (optional)</Label>
                 <DropdownMenu onOpenChange={handleSelectOpenChange}>
                   <DropdownMenuTrigger asChild>
@@ -959,106 +962,108 @@ export function CreateScheduledTaskDialog({
                 </p>
               </div>
             )}
-          </div>
 
-          {sandboxMode && sandboxRepoCatalog.length > 0 && (
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="task-sandbox-repository">Repository</Label>
-              <Select
-                value={sandboxWorkspace || PROVIDER_DEFAULT}
-                onValueChange={(value) => setWorkspace(value === PROVIDER_DEFAULT ? "" : value)}
-                onOpenChange={handleSelectOpenChange}
-                componentId="tasks.scheduled.sandbox_repository"
-              >
-                <SelectTrigger id="task-sandbox-repository" className="w-full">
-                  <SelectValue placeholder="Provider default" />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  <SelectItem value={PROVIDER_DEFAULT}>Provider default</SelectItem>
-                  {savedSandboxWorkspace &&
-                    !sandboxRepoCatalog.some((repo) => repo.url === savedSandboxWorkspace) && (
-                      <SelectItem value={savedSandboxWorkspace}>{savedSandboxWorkspace}</SelectItem>
-                    )}
-                  {sandboxRepoCatalog.map((repo) => (
-                    <SelectItem key={repo.url} value={repo.url}>
-                      {repo.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="text-sm text-muted-foreground">
-                Runs in this repository inside the sandbox.
-              </p>
-            </div>
-          )}
+            {sandboxMode && sandboxRepoCatalog.length > 0 && (
+              <div className="flex min-w-0 flex-col gap-1.5 sm:only:col-span-2">
+                <Label htmlFor="task-sandbox-repository">Repository</Label>
+                <Select
+                  value={sandboxWorkspace || PROVIDER_DEFAULT}
+                  onValueChange={(value) => setWorkspace(value === PROVIDER_DEFAULT ? "" : value)}
+                  onOpenChange={handleSelectOpenChange}
+                  componentId="tasks.scheduled.sandbox_repository"
+                >
+                  <SelectTrigger id="task-sandbox-repository" className="w-full">
+                    <SelectValue placeholder="Provider default" />
+                  </SelectTrigger>
+                  <SelectContent position="popper" align="start">
+                    <SelectItem value={PROVIDER_DEFAULT}>Provider default</SelectItem>
+                    {savedSandboxWorkspace &&
+                      !sandboxRepoCatalog.some((repo) => repo.url === savedSandboxWorkspace) && (
+                        <SelectItem value={savedSandboxWorkspace}>
+                          {savedSandboxWorkspace}
+                        </SelectItem>
+                      )}
+                    {sandboxRepoCatalog.map((repo) => (
+                      <SelectItem key={repo.url} value={repo.url}>
+                        {repo.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-sm text-muted-foreground">
+                  Runs in this repository inside the sandbox.
+                </p>
+              </div>
+            )}
 
-          {!sandboxMode && hostId !== "" && (
-            <div className="flex flex-col gap-1.5">
-              <Label>Workspace (optional)</Label>
-              <p id="task-workspace-help" className="text-sm text-muted-foreground">
-                {workspaceHostOffline
-                  ? "Connect your host to select a workspace."
-                  : "Defaults to the host's home directory. Pick a directory to pin it."}
-              </p>
-              <Button
-                type="button"
-                variant="outline"
-                className="w-full justify-start gap-2"
-                disabled={workspaceHostOffline}
-                aria-describedby="task-workspace-help"
-                onClick={() => setWorkspaceBrowserOpen(true)}
-                data-testid="task-workspace-browse"
-              >
-                <FolderOpenIcon className="size-4 text-muted-foreground" />
-                <span className="truncate">{workspace || "Browse folders…"}</span>
-              </Button>
-              <WorkspacePickerDialog
-                open={workspaceBrowserOpen && !workspaceHostOffline}
-                onOpenChange={setWorkspaceBrowserOpen}
-                hostId={hostId}
-                initialPath={workspace}
-                onConfirm={(path) => {
-                  if (path !== workspace) setBaseBranch(null);
-                  setWorkspace(path);
-                }}
-              />
-              {workspace && (
-                <>
-                  <p className="truncate font-mono text-sm text-muted-foreground">{workspace}</p>
-                  {worktreesSupported && !isGitWorkspace && baseBranch !== null && (
-                    <div className="mt-2 text-sm text-muted-foreground">
-                      <p>Random worktree is enabled. {worktreeStatus}</p>
-                      <Button type="button" variant="link" onClick={() => setBaseBranch(null)}>
-                        Turn off random worktree
-                      </Button>
-                    </div>
-                  )}
-                  {worktreesSupported && isGitWorkspace && (
-                    <>
-                      <div className="mt-2 flex items-center gap-2">
-                        <Checkbox
-                          id="task-random-worktree"
-                          checked={baseBranch !== null}
-                          onCheckedChange={(checked) =>
-                            setBaseBranch(checked === true ? RANDOM_WORKTREE_BASE_REF : null)
-                          }
-                          componentId="tasks.scheduled.random_worktree"
-                        />
-                        <label htmlFor="task-random-worktree" className="cursor-pointer text-sm">
-                          Random worktree
-                        </label>
+            {!sandboxMode && hostId !== "" && (
+              <div className="flex min-w-0 flex-col gap-1.5 sm:only:col-span-2">
+                <Label>Workspace (optional)</Label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start gap-2"
+                  disabled={workspaceHostOffline}
+                  aria-describedby="task-workspace-help"
+                  onClick={() => setWorkspaceBrowserOpen(true)}
+                  data-testid="task-workspace-browse"
+                >
+                  <FolderOpenIcon className="size-4 text-muted-foreground" />
+                  <span className="truncate">{workspace || "Browse folders…"}</span>
+                </Button>
+                <p id="task-workspace-help" className="text-sm text-muted-foreground">
+                  {workspaceHostOffline
+                    ? "Connect your host to select a workspace."
+                    : "Defaults to the host's home directory. Pick a directory to pin it."}
+                </p>
+                <WorkspacePickerDialog
+                  open={workspaceBrowserOpen && !workspaceHostOffline}
+                  onOpenChange={setWorkspaceBrowserOpen}
+                  hostId={hostId}
+                  initialPath={workspace}
+                  onConfirm={(path) => {
+                    if (path !== workspace) setBaseBranch(null);
+                    setWorkspace(path);
+                  }}
+                />
+                {workspace && (
+                  <>
+                    <p className="truncate font-mono text-sm text-muted-foreground">{workspace}</p>
+                    {worktreesSupported && !isGitWorkspace && baseBranch !== null && (
+                      <div className="mt-2 text-sm text-muted-foreground">
+                        <p>Random worktree is enabled. {worktreeStatus}</p>
+                        <Button type="button" variant="link" onClick={() => setBaseBranch(null)}>
+                          Turn off random worktree
+                        </Button>
                       </div>
-                      <p className="text-sm text-muted-foreground">
-                        {sessionMode === "continue"
-                          ? "Creates a randomly named worktree from the repository’s current HEAD when starting a session. Later runs reuse it."
-                          : "Creates a fresh randomly named worktree from the repository’s current HEAD for each run."}
-                      </p>
-                    </>
-                  )}
-                </>
-              )}
-            </div>
-          )}
+                    )}
+                    {worktreesSupported && isGitWorkspace && (
+                      <>
+                        <div className="mt-2 flex items-center gap-2">
+                          <Checkbox
+                            id="task-random-worktree"
+                            checked={baseBranch !== null}
+                            onCheckedChange={(checked) =>
+                              setBaseBranch(checked === true ? RANDOM_WORKTREE_BASE_REF : null)
+                            }
+                            componentId="tasks.scheduled.random_worktree"
+                          />
+                          <label htmlFor="task-random-worktree" className="cursor-pointer text-sm">
+                            Random worktree
+                          </label>
+                        </div>
+                        <p className="text-sm text-muted-foreground">
+                          {sessionMode === "continue"
+                            ? "Creates a randomly named worktree from the repository’s current HEAD when starting a session. Later runs reuse it."
+                            : "Creates a fresh randomly named worktree from the repository’s current HEAD for each run."}
+                        </p>
+                      </>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
 
           {workspaceWithoutHost && (
             <p
