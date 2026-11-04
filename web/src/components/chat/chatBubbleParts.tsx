@@ -53,6 +53,7 @@ import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMes
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
+import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
@@ -468,10 +469,22 @@ export function WorkingIndicator() {
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
   const tick = useWorkingLabelTick();
-  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
-  // the state and the shimmer stays off (it would misread as the agent still
-  // thinking). While the turn is active the shimmer shows, with the pill beside it.
-  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
+  // Background shells outliving a finished turn keep the session in progress,
+  // but the agent isn't thinking: show a plain spinner instead of the shimmer.
+  // The composer pill already announces count changes, so no live region here.
+  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
+    const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
+    return (
+      <Message from="assistant" data-testid="background-tasks-indicator">
+        <MessageContent>
+          <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
+            <RunningDot className="size-3.5" />
+            <span className="text-sm font-mono">{label}</span>
+          </div>
+        </MessageContent>
+      </Message>
+    );
+  }
   const label = workingIndicatorLabel(tick, blockedOn, {
     answerableInChat: hasOwnPendingElicitation,
     // The toggle switches to the root session's terminal, not a side chat's.
