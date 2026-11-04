@@ -24,7 +24,7 @@ from omnigent.server.routes._sessions.orchestration import _mark_dispatch_in_fli
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
-from tests.server.integration.test_sessions_clear import (
+from tests.server.integration._session_continuation import (
     _EDITOR,
     _HOST_ID,
     _OWNER,
@@ -34,14 +34,19 @@ from tests.server.integration.test_sessions_clear import (
     message_texts,
     resolve_harness_as,
 )
-from tests.server.integration.test_sessions_clear import (
+from tests.server.integration._session_continuation import (
     auth_live_runner as auth_live_runner,
 )
-from tests.server.integration.test_sessions_clear import (
+from tests.server.integration._session_continuation import (
     live_runner as live_runner,
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+def item_ids(store: SqlAlchemyConversationStore, session_id: str) -> list[str]:
+    """Return *session_id*'s item ids in order (Q1, A1, Q2, A2 when placed)."""
+    return [item.id for item in store.list_items(session_id).data]
 
 
 @pytest.mark.parametrize(
@@ -67,7 +72,7 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     resolve_harness_as(monkeypatch, harness)
     store = SqlAlchemyConversationStore(db_uri)
     source_id = await create_placed_session(client, store)
-    items = [item.id for item in store.list_items(source_id).data]
+    items = item_ids(store, source_id)
     repos = ["https://github.com/acme/api"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
     store.set_labels(source_id, sandbox_labels)
@@ -130,7 +135,7 @@ async def test_rewind_re_addresses_or_cleans_up_when_the_runner_is_elsewhere(
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     source_id = await create_placed_session(client, store, runner_id=runner_id, host=host)
-    items = [item.id for item in store.list_items(source_id).data]
+    items = item_ids(store, source_id)
     host_store = HostStore(db_uri)
     host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
     if not host_live:
@@ -316,7 +321,7 @@ async def test_rewind_refusals_create_no_session(
         host=placement != "none",
         user=_OWNER,
     )
-    items = [item.id for item in store.list_items(source_id).data]
+    items = item_ids(store, source_id)
     caller = _OWNER
     if placement == "running":
         monkeypatch.setitem(sessions_module._session_status_cache, source_id, "running")
