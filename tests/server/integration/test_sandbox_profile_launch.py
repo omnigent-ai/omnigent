@@ -15,6 +15,7 @@ import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient, Response
 
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.host.frames import HostHelloFrame
 from omnigent.onboarding.sandboxes.profiles import (
     SandboxProfileAccessDenied,
@@ -1294,15 +1295,16 @@ class TestProviderManagedProfiles:
         assert (replacement.sandbox_id != host.sandbox_id) is gone
 
     @pytest.mark.parametrize("revoked", [False, True])
+    @pytest.mark.parametrize("command", ["clear", "rewind"])
     async def test_offline_clear_continuation_keeps_the_accepted_profile(
-        self, env: _Env, monkeypatch: pytest.MonkeyPatch, revoked: bool
+        self, env: _Env, monkeypatch: pytest.MonkeyPatch, command: str, revoked: bool
     ) -> None:
-        """A claude-sdk ``/clear`` with no live runner hands on the sandbox profile.
+        """A claude-sdk ``/clear`` or ``/rewind`` with no live runner hands on the profile.
 
         The continuation is bound to the source's host alone, so it must carry
         the accepted reference itself: after the source is deleted it still
         wakes the sandbox. A profile revoked since it was accepted refuses the
-        clear, leaving no continuation and the source where it was.
+        command, leaving no continuation and the source where it was.
         """
         source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
         source = env.conversations.get_conversation(source_id)
@@ -1311,12 +1313,27 @@ class TestProviderManagedProfiles:
         assert snapshot is not None
         monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda *_a, **_k: "claude-sdk")
         monkeypatch.setattr(sessions_routes, "_get_runner_client", AsyncMock(return_value=None))
+        if command == "rewind":
+            [prompt] = env.conversations.append(
+                source_id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id="resp_rewind",
+                        data=MessageData(
+                            role="user", content=[{"type": "input_text", "text": "Q1"}]
+                        ),
+                    )
+                ],
+            )
         sessions_before = env.persisted()[0]
         if revoked:
             env.recording.allowed_users.clear()
 
-        cleared = await env.client.post(
-            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+        cleared = await (
+            env.client.post(f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}})
+            if command == "clear"
+            else env.client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": prompt.id})
         )
 
         if revoked:
@@ -1331,7 +1348,7 @@ class TestProviderManagedProfiles:
             )
             assert env.catalog.get_session_snapshot(source_id) == snapshot
             return
-        assert cleared.status_code == 202, cleared.text
+        assert cleared.is_success, cleared.text
         continuation_id = cleared.json()["session_id"]
         continuation = env.conversations.get_conversation(continuation_id)
         assert continuation is not None
