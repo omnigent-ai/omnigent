@@ -1999,6 +1999,7 @@ export function initChatStore(client: QueryClient): void {
   // in tests, leak into the next case).
   conversationRegistry.clear();
   disposedReturnedStartupInputs.clear();
+  startupInputsNamedOut.clear();
   // Drop this tab's held stream slots; disposed pumps release their own locks,
   // and a boot/reset starts from an empty set.
   heldStreamSlots.clear();
@@ -2550,6 +2551,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // release in finally) serializes every POST to this conversation across
       // both paths through one ordering primitive.
       const { waitForPrior, releaseSend } = enterSendChain(conversationId);
+      const flushOut = Symbol("background_flush");
+      nameStartupInputsOut(conversationId, flushOut, head.startupInputIds);
       // Upload any attachments, then post the message referencing their
       // server-assigned file_ids — the same two-phase sequence send() runs
       // (no combined endpoint exists: /resources/files stores the blob and
@@ -2570,11 +2573,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...fileBlocks,
           ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
         ];
-        await postEvent(conversationId, {
+        const result = await postEvent(conversationId, {
           type: "message",
           data: { role: "user", content, stable_id: head.stableId },
           ...(head.startupInputIds?.length ? { replaces_failed_inputs: head.startupInputIds } : {}),
         });
+        settleReplacedStartupInputs(conversationId, head.startupInputIds, !!result.denied);
       })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
@@ -2595,6 +2599,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         })
         .finally(() => {
           backgroundFlushInFlight.delete(conversationId);
+          nameStartupInputsOut(conversationId, flushOut);
           // Hand the chain to the next POST (foreground or background) so it
           // can start its own network work in submission order.
           releaseSend();

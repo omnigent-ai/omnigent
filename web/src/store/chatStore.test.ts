@@ -4118,6 +4118,64 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
+  it.each([
+    { outcome: "accepted", denied: false },
+    { outcome: "denied", denied: true },
+  ])(
+    "settles the startup inputs a background flush names once it is $outcome",
+    async ({ denied }) => {
+      onTestFinished(clearSessionDrafts);
+      seedSession("conv_real");
+      seedSession("conv_other");
+      failManagedLaunch("conv_real", "saved on server");
+      await useChatStore.getState().switchTo("conv_real");
+      await settle();
+      expect(takeFailedSendDraft("conv_real", false, true)?.text).toBe("saved on server");
+      setSessionDraft("conv_real", { text: "", files: [] });
+      const posts: unknown[] = [];
+      let answerFlush: (() => void) | undefined;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/v1/sessions/conv_real/events") && init?.method === "POST") {
+          posts.push(JSON.parse(String(init.body)));
+          if (posts.length === 1)
+            return new Promise<Response>((resolve) => {
+              answerFlush = () =>
+                resolve(mockResponse(denied ? { queued: false, denied: true } : { queued: true }));
+            });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      useChatStore.setState({ sessionStatus: "running" });
+      await useChatStore.getState().enqueueMessage("saved on server");
+      await useChatStore.getState().switchTo("conv_other");
+      await settle();
+      expect(posts).toHaveLength(0);
+      seedConversationsCache([conv("conv_other", "running"), conv("conv_real", "idle")]);
+      useChatStore.getState().flushBackgroundQueues();
+      await vi.waitFor(() => expect(answerFlush).toBeDefined());
+      await useChatStore.getState().switchTo("conv_real");
+      const later = useChatStore.getState().send("something else", "agent_xyz");
+      answerFlush!();
+      await later;
+      await settle();
+
+      expect(posts).toHaveLength(2);
+      expect(posts[0]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+      expect(posts[1]).not.toHaveProperty("replaces_failed_inputs");
+      const entry = conversationRegistry.peek("conv_real")!.getState();
+      expect(entry.replacedStartupInputs).toEqual(denied ? [] : ["pending_first"]);
+      if (denied)
+        await vi.waitFor(() =>
+          expect(useChatStore.getState().failedSendDraft).toMatchObject({
+            text: "saved on server",
+            startupInputIds: ["pending_first"],
+          }),
+        );
+      else expect(entry.returnedStartupInputs).not.toContain("pending_first");
+    },
+  );
+
   it("names a reloaded draft's startup inputs before they can be read, but not in a send queued behind it", async () => {
     onTestFinished(clearSessionDrafts);
     seedSession("conv_real");
