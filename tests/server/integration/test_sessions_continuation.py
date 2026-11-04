@@ -8,6 +8,7 @@ its happy path and command-specific refusals.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -16,20 +17,31 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from fastapi import FastAPI
+from starlette.datastructures import Headers
 
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame
+from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_events
+from omnigent.server.schemas import SessionEventInput
+from omnigent.server.startup_inputs import ManagedStartupInputs
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.integration._session_continuation import (
+    _COMPACT_INPUT,
     _HOST_ID,
+    _MESSAGE_INPUT,
     _OWNER,
     _RUNNER_ID,
+    _SKILL_INPUT,
     LiveRunner,
+    bind_to_host,
     continue_session,
     create_placed_session,
     install_managed_sandbox,
@@ -413,3 +425,151 @@ async def test_stopping_or_archiving_the_original_leaves_the_continuation_runnin
     original = store.get_conversation(source_id)
     assert original is not None
     assert (original.runner_id, original.host_id) == (None, _HOST_ID)
+
+
+@pytest.mark.parametrize(
+    ("placement", "status", "message"),
+    [
+        ("running", 400, "Stop the current turn"),
+        # An input still on its way to the runner counts as a running turn,
+        # even when the session shows as failed.
+        ("starting", 400, "Stop the current turn"),
+        ("skill_starting", 400, "Stop the current turn"),
+        # A claude-sdk compact runs a turn too.
+        ("compact_starting", 400, "Stop the current turn"),
+        ("failed_starting", 400, "Stop the current turn"),
+        ("startup_pending", 400, "Wait for this session's first message"),
+        ("none", 503, "runner is offline"),
+        ("sub_agent", 400, "only available in a top-level session"),
+        ("side_chat", 400, "isn't available in a side chat"),
+        ("moving", 409, "already moving to a new session"),
+    ],
+)
+@pytest.mark.parametrize("command", COMMANDS)
+async def test_refusals_create_no_session(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    auth_live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    placement: str,
+    status: int,
+    message: str,
+) -> None:
+    """A busy, unplaced, nested or already moving session refuses the command.
+
+    A running turn, an input (or an SDK compact) still reaching the runner or
+    saved for startup, no runner or host, a sub-agent or side chat, or a move
+    already in progress creates, initializes and supersedes nothing, and the
+    session stays open.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(
+        auth_client,
+        store,
+        runner_id=None
+        if placement == "none"
+        else "runner_gone"
+        if placement.endswith("starting")
+        else _RUNNER_ID,
+        host=placement != "none",
+        user=_OWNER,
+    )
+    message_task: asyncio.Task[httpx.Response] | None = None
+    release_message = asyncio.Event()
+    if placement.endswith("starting"):
+        # An input to the offline runner waits on runner recovery; a failed
+        # session still shows "failed" while its recovery input is pending.
+        if placement == "failed_starting":
+            monkeypatch.setitem(sessions_module._session_status_cache, source_id, "failed")
+        recovering = asyncio.Event()
+        resolve_runner = sessions_module._get_runner_client
+
+        async def recover_runner(*args: Any, **kwargs: Any) -> Any:
+            if not recovering.is_set():
+                recovering.set()
+                await release_message.wait()
+            return await resolve_runner(*args, **kwargs)
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", recover_runner)
+        message_task = asyncio.create_task(
+            auth_client.post(
+                f"/v1/sessions/{source_id}/events",
+                json={
+                    "skill_starting": _SKILL_INPUT,
+                    "compact_starting": _COMPACT_INPUT,
+                }.get(placement, _MESSAGE_INPUT),
+                headers={"X-Forwarded-Email": _OWNER},
+            )
+        )
+        await asyncio.wait_for(recovering.wait(), timeout=10)
+    elif placement == "startup_pending":
+        # A saved first message the startup service has yet to deliver.
+        startup = ManagedStartupInputs(store, auth_app.state.host_registry)
+        monkeypatch.setattr(auth_app.state, "startup_inputs", startup)
+        await startup.enqueue(
+            source_id, SessionEventInput(**_MESSAGE_INPUT), user_id=_OWNER, headers=Headers()
+        )
+    elif placement == "running":
+        monkeypatch.setitem(sessions_module._session_status_cache, source_id, "running")
+    elif placement in ("sub_agent", "side_chat"):
+        source = store.get_conversation(source_id)
+        assert source is not None
+        if placement == "sub_agent":
+            nested = store.create_conversation(
+                kind="sub_agent", parent_conversation_id=source_id, agent_id=source.agent_id
+            )
+            bind_to_host(store, nested.id, "/work/repo")
+        else:
+            # A side chat rides its source's runner and has no host of its own.
+            nested = store.create_conversation(
+                agent_id=source.agent_id,
+                labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source_id},
+            )
+        store.replace_runner_id(nested.id, _RUNNER_ID)
+        SqlAlchemyPermissionStore(db_uri).grant(_OWNER, nested.id, LEVEL_OWNER)
+        # /rewind checks its prompt before the session.
+        store.append(
+            nested.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_nested",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "Nested"}]
+                    ),
+                )
+            ],
+        )
+        source_id = nested.id
+    headers = {"X-Forwarded-Email": _OWNER}
+    before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
+    posts_before = len(auth_live_runner.posts)
+
+    try:
+        moving = (
+            orchestration._mark_session_moving(source_id)
+            if placement == "moving"
+            else contextlib.nullcontext()
+        )
+        with moving:
+            resp = await continue_session(auth_client, store, source_id, command, headers)
+    finally:
+        release_message.set()
+        if message_task is not None:
+            await message_task
+
+    assert resp.status_code == status, resp.text
+    assert message in resp.text
+    after = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
+    assert after == before
+    assert auth_live_runner.superseded == []
+    # Nothing reached the runner: no release, no new session initialized.
+    sent = auth_live_runner.posts[posts_before:]
+    assert [body for _path, body in sent if body.get("type") == "clear"] == []
+    assert "/v1/sessions" not in [path for path, _body in sent]
+    if placement != "moving":
+        # A refused command leaves the session open to messages.
+        assert not orchestration._session_is_moving(source_id)

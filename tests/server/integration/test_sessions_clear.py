@@ -23,7 +23,6 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select, update
-from starlette.datastructures import Headers
 
 import omnigent.runtime
 from omnigent.db.db_models import SqlAgent, SqlConversation, current_workspace_id
@@ -32,7 +31,6 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_EDIT,
-    LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
@@ -44,10 +42,7 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import routes_core
-from omnigent.server.schemas import SessionEventInput
 from omnigent.server.sharing_settings import DefaultPublicSessions
-from omnigent.server.startup_inputs import ManagedStartupInputs
-from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
@@ -806,20 +801,10 @@ async def test_claude_sdk_clear_continuation_keeps_the_original_file_sharing(
         (409, "runner", 400, "Stop the current turn"),
         (503, "runner", 500, "Clear failed: runner returned 503"),
         (None, "runner", 503, "Couldn't reach this session's runner"),
-        (200, "running", 400, "Stop the current turn"),
-        (200, "starting", 400, "Stop the current turn"),
-        (200, "skill_starting", 400, "Stop the current turn"),
-        (200, "compact_starting", 400, "Stop the current turn"),
-        (200, "failed_starting", 400, "Stop the current turn"),
-        (200, "startup_pending", 400, "Wait for this session's first message"),
-        (200, "none", 503, "runner is offline"),
         (200, "editor", 403, ""),
-        (200, "sub_agent", 400, "only available in a top-level session"),
-        (200, "side_chat", 400, "isn't available in a side chat"),
     ],
 )
 async def test_claude_sdk_clear_refusals_create_no_session(
-    auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
     db_uri: str,
     auth_live_runner: LiveRunner,
@@ -831,65 +816,17 @@ async def test_claude_sdk_clear_refusals_create_no_session(
 ) -> None:
     """A refused ``clear`` creates, initializes and supersedes nothing.
 
-    A busy, failing or unreachable runner, a running turn, one (or an SDK
-    compact) still reaching its runner or saved for startup, no placement, a
-    non-owner, a sub-agent or a side chat refuses it.
-    The caller and session checks run before the runner frees the client, so
-    only a runner refusal reaches the runner.
+    A busy, failing or unreachable runner, or a non-owner, refuses it. The
+    caller check runs before the runner frees the client, so only a runner
+    refusal reaches the runner. Refusals shared with ``/rewind`` are in
+    ``test_sessions_continuation.py``.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     auth_live_runner.clear_status = clear_status
     store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(
-        auth_client,
-        store,
-        runner_id=None
-        if placement == "none"
-        else "runner_gone"
-        if placement.endswith("starting")
-        else _RUNNER_ID,
-        host=placement != "none",
-        user=_OWNER,
-    )
+    source_id = await create_placed_session(auth_client, store, user=_OWNER)
     caller = _OWNER
-    message_task: asyncio.Task[httpx.Response] | None = None
-    release_message = asyncio.Event()
-    if placement.endswith("starting"):
-        # An input to the offline runner waits on runner recovery; a failed
-        # session still shows "failed" while its recovery input is pending.
-        if placement == "failed_starting":
-            monkeypatch.setitem(sessions_module._session_status_cache, source_id, "failed")
-        recovering = asyncio.Event()
-        resolve_runner = sessions_module._get_runner_client
-
-        async def recover_runner(*args: Any, **kwargs: Any) -> Any:
-            if not recovering.is_set():
-                recovering.set()
-                await release_message.wait()
-            return await resolve_runner(*args, **kwargs)
-
-        monkeypatch.setattr(sessions_module, "_get_runner_client", recover_runner)
-        message_task = asyncio.create_task(
-            auth_client.post(
-                f"/v1/sessions/{source_id}/events",
-                json={
-                    "skill_starting": _SKILL_INPUT,
-                    "compact_starting": _COMPACT_INPUT,
-                }.get(placement, _MESSAGE_INPUT),
-                headers={"X-Forwarded-Email": _OWNER},
-            )
-        )
-        await asyncio.wait_for(recovering.wait(), timeout=10)
-    elif placement == "startup_pending":
-        # A saved first message the startup service has yet to deliver.
-        startup = ManagedStartupInputs(store, auth_app.state.host_registry)
-        monkeypatch.setattr(auth_app.state, "startup_inputs", startup)
-        await startup.enqueue(
-            source_id, SessionEventInput(**_MESSAGE_INPUT), user_id=_OWNER, headers=Headers()
-        )
-    elif placement == "running":
-        monkeypatch.setitem(sessions_module._session_status_cache, source_id, "running")
-    elif placement == "editor":
+    if placement == "editor":
         granted = await auth_client.put(
             f"/v1/sessions/{source_id}/permissions",
             json={"user_id": _EDITOR, "level": LEVEL_EDIT},
@@ -897,39 +834,15 @@ async def test_claude_sdk_clear_refusals_create_no_session(
         )
         assert granted.status_code < 300, granted.text
         caller = _EDITOR
-    elif placement == "sub_agent":
-        source = store.get_conversation(source_id)
-        assert source is not None
-        child = store.create_conversation(
-            kind="sub_agent", parent_conversation_id=source_id, agent_id=source.agent_id
-        )
-        store.set_host_id(child.id, _HOST_ID, "/work/repo")
-        store.replace_runner_id(child.id, _RUNNER_ID)
-        SqlAlchemyPermissionStore(db_uri).grant(_OWNER, child.id, LEVEL_OWNER)
-        source_id = child.id
-    elif placement == "side_chat":
-        # A side chat rides its source's runner and has no host of its own.
-        side_chat = store.create_conversation(
-            agent_id=store.get_conversation(source_id).agent_id,
-            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source_id},
-        )
-        store.replace_runner_id(side_chat.id, _RUNNER_ID)
-        SqlAlchemyPermissionStore(db_uri).grant(_OWNER, side_chat.id, LEVEL_OWNER)
-        source_id = side_chat.id
     headers = {"X-Forwarded-Email": caller}
     before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
     posts_before = len(auth_live_runner.posts)
 
-    try:
-        resp = await auth_client.post(
-            f"/v1/sessions/{source_id}/events",
-            json={"type": "clear", "data": {}},
-            headers=headers,
-        )
-    finally:
-        release_message.set()
-        if message_task is not None:
-            await message_task
+    resp = await auth_client.post(
+        f"/v1/sessions/{source_id}/events",
+        json={"type": "clear", "data": {}},
+        headers=headers,
+    )
 
     assert resp.status_code == status, resp.text
     assert message in resp.text
