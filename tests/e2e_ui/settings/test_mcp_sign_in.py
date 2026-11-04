@@ -227,12 +227,16 @@ def test_codex_mcp_sign_in_by_pasting_the_redirect(
                 if route.request.method != "POST":
                     route.continue_()
                     return
-                response = route.fetch(max_redirects=0)
-                # Raising here would leave the route hanging; the test body checks this.
-                redirects.append(
-                    response.headers.get("location") or f"{response.status}: {response.text()}"
-                )
-                route.abort("connectionrefused")
+                # Record failures instead of raising, which would leave the route hanging.
+                try:
+                    response = route.fetch(max_redirects=0)
+                    redirects.append(
+                        response.headers.get("location") or f"{response.status}: {response.text()}"
+                    )
+                except Exception as error:
+                    redirects.append(f"fetch failed: {error!r}")
+                finally:
+                    route.abort("connectionrefused")
 
             consent = server.url.removesuffix("/mcp") + "/approve*"
             page.context.route(consent, refuse_redirect)
