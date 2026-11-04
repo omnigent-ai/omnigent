@@ -236,6 +236,8 @@ export interface SendOptions {
    * status still settles.
    */
   onError?: (message: string) => void;
+  /** The failed startup inputs a queued message took from the composer, named instead of the composer's. */
+  startupInputIds?: string[];
 }
 
 /**
@@ -671,6 +673,8 @@ export interface QueuedMessage {
    * text back after a reload.
    */
   offScreen?: boolean;
+  /** The failed startup inputs it took from the composer when queued, replaced once it is accepted. */
+  startupInputIds?: string[];
 }
 
 /**
@@ -2255,6 +2259,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
     const offScreen = targetId !== undefined && targetId !== get().conversationId;
+    const { replaces_failed_inputs: startupInputIds } =
+      failedStartupInputsReplacedBy(conversationId)();
     target.write((s) => ({
       // Queueing consumes the composer like a send does: a restored failed
       // send is no longer what the composer holds, and the queued message
@@ -2275,6 +2281,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(replyDraft ? { replyDraft } : {}),
           ...(waitingForHost ? { waitingForHost } : {}),
           ...(offScreen ? { offScreen } : {}),
+          ...(startupInputIds ? { startupInputIds } : {}),
         },
       ],
     }));
@@ -2566,6 +2573,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         await postEvent(conversationId, {
           type: "message",
           data: { role: "user", content, stable_id: head.stableId },
+          ...(head.startupInputIds?.length ? { replaces_failed_inputs: head.startupInputIds } : {}),
         });
       })()
         .catch(() => {
@@ -2820,7 +2828,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
     const sendOut = Symbol("send");
-    const replacedOnTurn = failedStartupInputsReplacedBy(submitConversationId, sendOut);
+    const replacedOnTurn = failedStartupInputsReplacedBy(
+      submitConversationId,
+      sendOut,
+      opts?.startupInputIds,
+    );
     let replacesFailedInputs = replacedOnTurn();
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
@@ -4052,6 +4064,7 @@ function queuedSendOptions(
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,
+    startupInputIds: message.startupInputIds ?? [],
     onError: (error) => {
       setActive((s) => {
         if (s.queuedMessages.some((m) => m.queueId === message.queueId)) return {};
@@ -4510,8 +4523,6 @@ useChatStore.subscribe((state, previous) => {
   for (const id of new Set(touched.map((m) => m.conversationId))) {
     // A record this page never queued is an earlier page's, kept for its session's next load.
     const earlier = peekQueuedSends(id).filter((send) => !queuedHere.has(send.stableId));
-    // Like an unanswered send's record, it names the failed startup inputs its send would replace.
-    const { replaces_failed_inputs: startupInputIds } = failedStartupInputsReplacedBy(id)();
     const kept = state.queuedMessages.flatMap((m) =>
       authorId === null ||
       m.conversationId !== id ||
@@ -4526,7 +4537,7 @@ useChatStore.subscribe((state, previous) => {
               text: m.text,
               authorId,
               replyDraft: m.replyDraft,
-              ...(startupInputIds ? { startupInputIds } : {}),
+              ...(m.startupInputIds ? { startupInputIds: m.startupInputIds } : {}),
             },
           ],
     );
@@ -7857,30 +7868,44 @@ function nameStartupInputsOut(conversationId: string | null, send: symbol, ids?:
 }
 
 /**
- * The failed startup inputs a send replaces: those already handed back to its
- * composer, so the server can drop them. Called before the composer clears its
- * draft. Ids a send still out ahead names stay its own: accepted, it replaces
- * them; otherwise they come back with it. With `send`, each read is recorded.
+ * The failed startup inputs a send replaces: those `taken` when it was queued, else
+ * those its composer holds before clearing. Ids a send still out or a queued message
+ * holds stay theirs; with `send`, each read is recorded.
  */
 function failedStartupInputsReplacedBy(
   conversationId: string | null,
   send?: symbol,
+  taken?: string[],
 ): () => { replaces_failed_inputs?: string[] } {
   if (conversationId === null) return () => ({});
   const returned = setterForState(conversationId)?.returnedStartupInputs ?? [];
   const drafted = getSessionDraft(conversationId)?.startupInputIds ?? [];
-  const ahead = new Set([...(startupInputsNamedOut.get(conversationId)?.values() ?? [])].flat());
+  const ahead = new Set([
+    ...[...(startupInputsNamedOut.get(conversationId)?.values() ?? [])].flat(),
+    ...queuedStartupInputs(conversationId),
+  ]);
   return () => {
     const stillReturned = setterForState(conversationId)?.returnedStartupInputs ?? [];
     const ids = [
-      ...new Set([
-        ...returned.filter((id) => stillReturned.includes(id) && !ahead.has(id)),
-        ...drafted.filter((id) => !ahead.has(id)),
-      ]),
+      ...new Set(
+        taken?.filter((id) => !ahead.has(id)) ?? [
+          ...returned.filter((id) => stillReturned.includes(id) && !ahead.has(id)),
+          ...drafted.filter((id) => !ahead.has(id)),
+        ],
+      ),
     ];
     if (send) nameStartupInputsOut(conversationId, send, ids);
     return ids.length === 0 ? {} : { replaces_failed_inputs: ids };
   };
+}
+
+/** The failed startup inputs a conversation's queued messages took from its composer. */
+function queuedStartupInputs(conversationId: string): string[] {
+  return useChatStore
+    .getState()
+    .queuedMessages.flatMap((m) =>
+      m.conversationId === conversationId ? (m.startupInputIds ?? []) : [],
+    );
 }
 
 /**
@@ -7928,11 +7953,9 @@ function settleReplacedStartupInputs(
 }
 
 /**
- * Hand the viewer's startup messages a failed managed launch left undelivered
- * back to the composer: drop the bubbles still showing them as sending and
- * restore their text after any draft already waiting there. Each is handed back
- * once: this entry remembers it, as does a draft, unanswered or queued send that names it.
- * The composer can't take back uploaded files, so a notice names the attachments.
+ * Return the viewer's startup messages a failed managed launch left undelivered to the
+ * composer once, after any waiting draft, dropping their sending bubbles. Ids a draft or a
+ * saved or queued send holds count as returned; a notice names attachments it can't restore.
  *
  * @param conversationId - The session whose launch failed.
  * @param state - The conversation's state.
@@ -7964,6 +7987,7 @@ function returnFailedStartupInputs(
     ...(state.failedSendDraft?.startupInputIds ?? []),
     ...(peekUnsentSend(conversationId)?.startupInputIds ?? []),
     ...peekQueuedSends(conversationId).flatMap((send) => send.startupInputIds ?? []),
+    ...queuedStartupInputs(conversationId),
     ...(useChatStore.getState().sideChatComposers[conversationId]?.startupInputIds ?? []),
     ...inWaitingDraft,
     ...inComposer,

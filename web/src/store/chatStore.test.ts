@@ -3953,32 +3953,6 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
-  it("names the startup inputs a reloaded draft holds when it is sent before they can be read", async () => {
-    onTestFinished(clearSessionDrafts);
-    seedSession("conv_real");
-    failManagedLaunch("conv_real", "saved on server");
-    setSessionDraft("conv_real", {
-      text: "saved on server",
-      files: [],
-      startupInputIds: ["pending_first"],
-    });
-    fetchMock.mockImplementation((input, init) =>
-      String(input) === "/v1/sessions/conv_real/failed-inputs"
-        ? mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 })
-        : defaultFetchHandler(input, init),
-    );
-    await useChatStore.getState().switchTo("conv_real");
-    await settle();
-
-    await useChatStore.getState().send("saved on server", "agent_xyz");
-    const [, sent] =
-      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_real/events")).at(-1) ??
-      [];
-    expect(JSON.parse(String(sent?.body))).toMatchObject({
-      replaces_failed_inputs: ["pending_first"],
-    });
-  });
-
   it("doesn't name the startup inputs a composer discarded", async () => {
     onTestFinished(clearSessionDrafts);
     seedSession("conv_real");
@@ -4068,13 +4042,27 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
   );
 
   it.each([
-    { outcome: "denied", resend: "resend", command: false, refused: false },
-    { outcome: "denied", resend: "skill-command resend", command: true, refused: false },
-    { outcome: "refused", resend: "resend", command: false, refused: true },
-    { outcome: "refused", resend: "skill-command resend", command: true, refused: true },
+    { outcome: "denied", resend: "resend", command: false, refused: false, via: "send" },
+    {
+      outcome: "denied",
+      resend: "skill-command resend",
+      command: true,
+      refused: false,
+      via: "send",
+    },
+    { outcome: "refused", resend: "resend", command: false, refused: true, via: "send" },
+    {
+      outcome: "refused",
+      resend: "skill-command resend",
+      command: true,
+      refused: true,
+      via: "send",
+    },
+    { outcome: "denied", resend: "resend", command: false, refused: false, via: "message" },
+    { outcome: "refused", resend: "resend", command: false, refused: true, via: "message" },
   ])(
-    "doesn't name the startup inputs a $outcome $resend took back in a send queued behind it",
-    async ({ command, refused }) => {
+    "doesn't name the startup inputs a $outcome $resend took back in a $via queued behind it",
+    async ({ command, refused, via }) => {
       onTestFinished(clearSessionDrafts);
       seedSession("conv_real");
       failManagedLaunch("conv_real", "saved on server");
@@ -4107,10 +4095,18 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
         ? useChatStore.getState().sendSlashCommand("review", "saved on server", "agent_xyz")
         : useChatStore.getState().send("saved on server", "agent_xyz");
       await vi.waitFor(() => expect(denyResend).toBeDefined());
-      const queued = useChatStore.getState().send("something else", "agent_xyz");
+      const queued =
+        via === "send"
+          ? useChatStore.getState().send("something else", "agent_xyz")
+          : useChatStore.getState().enqueueMessage("something else");
       denyResend!();
       await Promise.all([resend, queued]);
       await settle();
+      if (via === "message") {
+        expect(posts).toHaveLength(1);
+        useChatStore.getState().maybeFlushQueuedHead();
+        await settle();
+      }
 
       expect(posts).toHaveLength(2);
       expect(posts[0]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
@@ -4122,7 +4118,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
-  it("doesn't name a reloaded draft's startup inputs in a send queued behind a resend naming them", async () => {
+  it("names a reloaded draft's startup inputs before they can be read, but not in a send queued behind it", async () => {
     onTestFinished(clearSessionDrafts);
     seedSession("conv_real");
     failManagedLaunch("conv_real", "saved on server");
@@ -20895,7 +20891,12 @@ describe("chatStore — background cross-session flush", () => {
     useChatStore.setState({
       conversationId: "conv_active",
       queuedMessages: [
-        { queueId: "q_1", text: "bg-first", conversationId: "conv_bg" },
+        {
+          queueId: "q_1",
+          text: "bg-first",
+          conversationId: "conv_bg",
+          startupInputIds: ["pending_first"],
+        },
         { queueId: "q_2", text: "bg-second", conversationId: "conv_bg" },
       ],
     });
@@ -20905,6 +20906,12 @@ describe("chatStore — background cross-session flush", () => {
 
     // One POST to conv_bg (FIFO head only); its head left the queue, tail stays.
     expect(eventPosts()).toEqual([{ id: "conv_bg", text: "bg-first" }]);
+    const [, posted] = fetchMock.mock.calls.find(([url]) =>
+      String(url).endsWith("/conv_bg/events"),
+    )!;
+    expect(JSON.parse(String(posted?.body))).toMatchObject({
+      replaces_failed_inputs: ["pending_first"],
+    });
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["bg-second"]);
   });
 
@@ -22478,7 +22485,7 @@ describe("a send cut off by a reload", () => {
     expect(peekUnsentSend("conv_reload")).toBeNull();
   });
 
-  it("keeps the failed startup inputs a queued resend names for the next load", async () => {
+  it("names the failed startup inputs a queued resend took in its own send and for the next load", async () => {
     seedSession("conv_reload", []);
     failManagedLaunch("conv_reload", "saved on server");
     await useChatStore.getState().switchTo("conv_reload");
@@ -22497,6 +22504,19 @@ describe("a send cut off by a reload", () => {
         startupInputIds: ["pending_first"],
       },
     ]);
+
+    await useChatStore.getState().send("something else", "agent_xyz");
+    useChatStore.setState({ sessionStatus: "idle", status: "idle" });
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    const posts = fetchMock.mock.calls
+      .filter(
+        ([url, init]) => String(url).endsWith("/conv_reload/events") && init?.method === "POST",
+      )
+      .map(([, init]) => JSON.parse(String(init?.body)));
+    expect(posts).toHaveLength(2);
+    expect(posts[0]).not.toHaveProperty("replaces_failed_inputs");
+    expect(posts[1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
   });
 
   it.each([
