@@ -3111,6 +3111,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
       }
+      // A resend the server refused didn't retry its failed input; one held for the host still will.
+      if (reusableRetryId !== null && answeredWithRefusal && !heldForHost)
+        resentUnderOwnId.delete(reusableRetryId);
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
