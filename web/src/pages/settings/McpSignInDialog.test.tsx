@@ -367,16 +367,23 @@ describe("McpSignInDialog", () => {
       501,
       { detail: "update the host to sign in to MCP servers" },
       "Update my-laptop to sign in to MCP servers from here.",
+      false,
     ],
-    [503, { detail: "Too many sign-ins are in progress" }, "Too many sign-ins are in progress"],
-    [404, { detail: "MCP server not found" }, "MCP server not found"],
-    [502, { detail: "private host text" }, "The sign-in request failed. Try again."],
-    [504, { detail: "private host text" }, "Couldn't reach my-laptop."],
-  ])("explains a %s from the server", async (status, body, message) => {
+    [
+      503,
+      { detail: "Too many sign-ins are in progress" },
+      "Too many sign-ins are in progress",
+      true,
+    ],
+    [404, { detail: "MCP server not found" }, "MCP server not found", true],
+    [502, { detail: "private host text" }, "The sign-in request failed. Try again.", true],
+    [504, { detail: "private host text" }, "Couldn't reach my-laptop.", true],
+  ])("explains a %s from the server", async (status, body, message, retryable) => {
     on("POST", BASE, () => json(body, status));
     await renderDialog();
     expect(screen.getByRole("alert").textContent).toBe(message);
     expect(screen.queryByText("private host text")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Try again" }) !== null).toBe(retryable);
   });
 
   it.each([

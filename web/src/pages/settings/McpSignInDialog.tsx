@@ -123,8 +123,9 @@ export function McpSignInDialog({
     };
     const fail = (error: unknown) => {
       if (!active || controller.signal.aborted) return;
-      const unsupported = isMissingRoute(error);
-      // An older server can't cancel the sign-in either.
+      const unsupported =
+        isMissingRoute(error) || (error instanceof ApiError && error.status === 501);
+      // An older server or host can't cancel the sign-in either.
       if (unsupported) loginId = null;
       const message = requestErrorMessage(error, hostNameRef.current);
       setPhase({ kind: "error", message, unsupported });
