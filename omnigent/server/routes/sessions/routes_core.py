@@ -526,23 +526,35 @@ def register_core_routes(
             await _delete_unreturned_session(session_id)
             raise
 
-    async def _copy_session_grants(source_id: str, target_id: str) -> None:
-        """Give *target_id* every grant on *source_id*, never lowering one it has."""
-        if permission_store is None:
-            return
+    async def _list_session_grants(session_id: str) -> dict[str, int]:
+        """Every grant on *session_id*, as grantee to level."""
+        assert permission_store is not None
+        levels: dict[str, int] = {}
         after: str | None = None
         while True:
             grants, after = await asyncio.to_thread(
-                permission_store.list_for_session, source_id, limit=500, after_user_id=after
+                permission_store.list_for_session, session_id, limit=500, after_user_id=after
             )
-            for grant in grants:
-                current = await asyncio.to_thread(permission_store.get, grant.user_id, target_id)
-                if current is None or current.level < grant.level:
-                    await asyncio.to_thread(
-                        permission_store.grant, grant.user_id, target_id, grant.level
-                    )
+            levels.update((grant.user_id, grant.level) for grant in grants)
             if after is None:
-                return
+                return levels
+
+    async def _mirror_session_grants(source_id: str, target_id: str) -> None:
+        """Make *target_id*'s grants exactly *source_id*'s.
+
+        Nothing is granted that the source lacks, so the target is never
+        more widely readable than the source, even briefly.
+        """
+        if permission_store is None:
+            return
+        wanted = await _list_session_grants(source_id)
+        for user_id, level in (await _list_session_grants(target_id)).items():
+            if user_id not in wanted:
+                await asyncio.to_thread(permission_store.revoke, user_id, target_id)
+            elif level == wanted[user_id]:
+                del wanted[user_id]
+        for user_id, level in wanted.items():
+            await asyncio.to_thread(permission_store.grant, user_id, target_id, level)
 
     async def _release_unreturned_fork_host(request: Request, host_id: str | None) -> None:
         """Tear down a deleted fork's managed sandbox if nothing else uses it.
@@ -3976,7 +3988,8 @@ def register_core_routes(
         :param copy_history: ``False`` copies none of the source's items or
             files, whatever it holds when the fork commits.
         :param continue_source: Create the fork on the source's host and
-            workspace, with its routing switches, as a same-owner continuation.
+            workspace, with its routing switches, as a same-owner continuation;
+            it gets no creation-default sharing.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4568,8 +4581,8 @@ def register_core_routes(
                 _announce_session_added(user_id, new_conv.id)
         # Default-public grant only after the managed launch was accepted (see
         # the create paths). A side chat is a private scratch fork of the
-        # caller's own view.
-        if user_id is not None and not body.side_chat:
+        # caller's own view; a continuation takes its source's sharing instead.
+        if user_id is not None and not body.side_chat and not continue_source:
             await _grant_default_public(
                 request.app.state,
                 permission_store,
@@ -4735,8 +4748,9 @@ def register_core_routes(
             runner_bound = runner_online
             try:
                 # The same conversation continues there, and every live viewer
-                # of the source is redirected to it, so it keeps the sharing.
-                await _copy_session_grants(source.id, fork.id)
+                # of the source is redirected to it, so it shares exactly as
+                # the source does (no creation default was applied).
+                await _mirror_session_grants(source.id, fork.id)
                 if host_bound:
                     assert source.host_id is not None
                     # The fork was born on the host under its row lock, so a
