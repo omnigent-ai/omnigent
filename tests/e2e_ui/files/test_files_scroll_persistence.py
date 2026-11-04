@@ -259,7 +259,7 @@ def _settled_html_scroll(page: Page) -> int:
             return current
         previous = current
         page.wait_for_timeout(150)
-    return previous
+    raise AssertionError(f"preview scroll offset never settled (last {previous})")
 
 
 def _expect_html_scroll(page: Page, expected: int) -> None:
