@@ -239,8 +239,17 @@ export function useSideChats(conversationId: string) {
           selected,
         };
       });
-      // A list fetched before the close must not reopen the tab.
-      void queryClient.invalidateQueries({ queryKey: sideChatsQueryKey(conversationId) });
+      // The cached list must not reopen the tab, even if the refetch below fails.
+      const key = sideChatsQueryKey(conversationId);
+      queryClient.setQueryData<{ open: string[]; closed: string[] }>(key, (listed) =>
+        listed && listed.open.includes(childId)
+          ? {
+              open: listed.open.filter((id) => id !== childId),
+              closed: [...listed.closed, childId],
+            }
+          : listed,
+      );
+      void queryClient.invalidateQueries({ queryKey: key });
     },
     [update, queryClient, conversationId],
   );

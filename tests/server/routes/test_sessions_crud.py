@@ -794,7 +794,7 @@ async def test_patch_rejects_client_supplied_sandbox_labels(
         "omnigent.codex_native.subagent_thread_id",
         # A forged parent marker would list this session in another's side chats.
         "omnigent.side_chat.parent_id",
-        "omnigent.side_chat.history_response_id",
+        "omnigent.side_chat.history_item_ids",
     ],
 )
 async def test_patch_rejects_client_supplied_side_chat_thread_id_label(

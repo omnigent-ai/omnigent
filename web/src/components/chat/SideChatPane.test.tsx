@@ -1250,8 +1250,11 @@ describe("history a side chat copied from its parent", () => {
   }
   const listed = { "omnigent.side_chat": "1", "omnigent.side_chat.parent_id": "conv_main" };
 
-  it("is hidden through the copied response the server recorded, on any device", () => {
-    mockSession.labels = { ...listed, "omnigent.side_chat.history_response_id": "resp_copied" };
+  it("is hidden through the copied items the server recorded, on any device", () => {
+    mockSession.labels = {
+      ...listed,
+      "omnigent.side_chat.history_item_ids": "item_old,item_copied",
+    };
     // This browser's own snapshot would hide nothing; the server's record wins.
     localStorage.setItem(`omnigent.sideChatInherited:${childId}`, "[]");
     conversationRegistry.acquire(childId).setState({
@@ -1271,9 +1274,35 @@ describe("history a side chat copied from its parent", () => {
     expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
   });
 
-  it("is hidden by the fork's time when the copied tail renders nothing", () => {
-    // The last copied response is a hidden input, so no block carries the boundary.
-    mockSession.labels = { ...listed, "omnigent.side_chat.history_response_id": "resp_tail" };
+  it("is hidden through the latest copied item that renders, within the fork's second", () => {
+    // The copy ends on a hidden input; the reply before it, the fork and the side
+    // chat's first question all share one second.
+    mockSession.labels = {
+      ...listed,
+      "omnigent.side_chat.history_item_ids": "item_reply,item_tail",
+    };
+    mockSession.snapshot = { createdAt: 1_000 };
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      loadingConversation: false,
+      blocks: itemsToBlocks([
+        { ...userItem("item_old", "resp_old", "Copied earlier"), created_at: 990 },
+        { ...userItem("item_reply", "resp_reply", "Copied reply"), created_at: 1_000 },
+        { ...userItem("item_tail", "resp_tail", "Hidden input"), created_at: 1_000, is_meta: true },
+        { ...userItem("item_side", "resp_side", "Asked in the side chat"), created_at: 1_000 },
+      ]),
+    });
+
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied earlier")).toBeNull();
+    expect(screen.queryByText("Copied reply")).toBeNull();
+    expect(screen.queryByText("Hidden input")).toBeNull();
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+  });
+
+  it("is hidden by the fork's time when none of the recorded items renders", () => {
+    mockSession.labels = { ...listed, "omnigent.side_chat.history_item_ids": "item_tail" };
     mockSession.snapshot = { createdAt: 1_000 };
     conversationRegistry.acquire(childId).setState({
       sessionHarness: "openai-agents",
@@ -1288,7 +1317,6 @@ describe("history a side chat copied from its parent", () => {
     renderPane(<SideChatPane childId={childId} />);
 
     expect(screen.queryByText("Copied earlier")).toBeNull();
-    expect(screen.queryByText("Hidden input")).toBeNull();
     expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
   });
 

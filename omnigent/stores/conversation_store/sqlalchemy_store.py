@@ -104,6 +104,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SIDE_CHAT_HISTORY_LABEL_KEY,
+    SIDE_CHAT_HISTORY_TAIL,
     SIDE_CHAT_PARENT_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
@@ -5371,9 +5372,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             code can only be mutated by the owner. ``None`` in single-user
             mode, or when the fork binds an existing agent (no clone).
         :param side_chat_listing: A ``side_chat_parent_label_value`` that lists
-            the fork as a side chat. Stamped with the last copied response
-            (``SIDE_CHAT_HISTORY_LABEL_KEY``) in the fork's own transaction, so
-            the side chat is never listed before its copied history is known.
+            the fork as a side chat. Stamped with the ids of the last copied
+            items (``SIDE_CHAT_HISTORY_LABEL_KEY``) in the fork's own
+            transaction, so the side chat is never listed before its copied
+            history is known.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -5838,8 +5840,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 fork_labels.update(extra_labels)
             if side_chat_listing is not None:
                 fork_labels[SIDE_CHAT_PARENT_LABEL_KEY] = side_chat_listing
-                if source_items and source_items[-1].response_id:
-                    fork_labels[SIDE_CHAT_HISTORY_LABEL_KEY] = source_items[-1].response_id
+                if source_items:
+                    fork_labels[SIDE_CHAT_HISTORY_LABEL_KEY] = ",".join(
+                        copied_item_ids[item.id] for item in source_items[-SIDE_CHAT_HISTORY_TAIL:]
+                    )
 
         def insert_ap(session: Session) -> SqlConversation:
             if (

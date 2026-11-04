@@ -139,9 +139,13 @@ SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 # Server-owned parent/user lookup marker for cross-device side-chat tabs.
 SIDE_CHAT_PARENT_LABEL_KEY = "omnigent.side_chat.parent_id"
 
-# Response id of the last item a generic side chat copied from its parent, so
-# every device hides the same inherited history.
-SIDE_CHAT_HISTORY_LABEL_KEY = "omnigent.side_chat.history_response_id"
+# Comma-joined ids of the last items a generic side chat copied from its parent.
+# The pane hides everything through the latest of them it renders, so a hidden
+# copied tail (e.g. a meta input) still marks where the copy ends.
+SIDE_CHAT_HISTORY_LABEL_KEY = "omnigent.side_chat.history_item_ids"
+
+# Seven 32-char ids and their commas fit the 256-char label value.
+SIDE_CHAT_HISTORY_TAIL = 7
 
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
@@ -2268,9 +2272,10 @@ class ConversationStore(ABC):
             cloned session-scoped agent so its code can only be mutated by
             the owner. ``None`` in single-user mode or when no clone is made.
         :param side_chat_listing: A ``side_chat_parent_label_value`` that lists
-            the fork as a side chat. Stamped with the last copied response
-            (``SIDE_CHAT_HISTORY_LABEL_KEY``) in the fork's own transaction, so
-            the side chat is never listed before its copied history is known.
+            the fork as a side chat. Stamped with the ids of the last copied
+            items (``SIDE_CHAT_HISTORY_LABEL_KEY``) in the fork's own
+            transaction, so the side chat is never listed before its copied
+            history is known.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.

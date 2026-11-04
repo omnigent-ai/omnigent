@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { PropsWithChildren } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -394,6 +394,48 @@ describe("side chats opened on another device", () => {
       "/v1/sessions/session-a/side_chats?limit=100",
       "/v1/sessions/session-a/side_chats?limit=100&after=conv_closed",
     ]);
+  });
+
+  it("appear when the window regains focus, despite the app's query defaults", async () => {
+    // The app turns focus refetches off and caches for 30 seconds; this list opts back in.
+    queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false, staleTime: 30_000 } },
+    });
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
+    await waitFor(() =>
+      expect(queryClient.getQueryCache().getAll()[0]?.state.status).toBe("success"),
+    );
+
+    serverSideChats([{ id: "conv_remote", created_at: 1 }]);
+    try {
+      act(() => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await waitFor(() => expect(result.current.tabs).toEqual(["conv_remote"]));
+    } finally {
+      focusManager.setFocused(undefined);
+    }
+  });
+
+  it("stay closed when the refresh after closing fails", async () => {
+    serverSideChats([{ id: "conv_side", created_at: 1 }]);
+    const { result, rerender } = renderHook(({ id }) => useSideChats(id), {
+      initialProps: { id: "session-a" },
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.tabs).toEqual(["conv_side"]));
+
+    serverSideChats(null);
+    act(() => result.current.close("conv_side"));
+    await waitFor(() =>
+      expect(queryClient.getQueryCache().getAll()[0]?.state.fetchStatus).toBe("idle"),
+    );
+    rerender({ id: "session-b" });
+    rerender({ id: "session-a" });
+
+    expect(result.current.tabs).toEqual([]);
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual([]);
   });
 
   it("leave local tabs alone when the server can't list them", async () => {

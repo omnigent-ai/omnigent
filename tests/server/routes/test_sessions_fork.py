@@ -270,6 +270,7 @@ class _ConversationStore:
                 "project_id": project_id,
                 "file_id_map": file_id_map,
                 "created_by": created_by,
+                "side_chat_listing": side_chat_listing,
             }
         )
         src = self._convs.get(source_conversation_id)
@@ -649,12 +650,7 @@ def test_side_chat_records_its_source_without_a_persisted_workspace(
 
 def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
     source = _make_conversation(
-        labels={
-            SIDE_CHAT_LABEL_KEY: "1",
-            SIDE_CHAT_SOURCE_LABEL_KEY: "original",
-            SIDE_CHAT_PARENT_LABEL_KEY: "original",
-            SIDE_CHAT_HISTORY_LABEL_KEY: "resp_original",
-        }
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "original"}
     )
     store = _ConversationStore({source.id: source})
     client = TestClient(_build_app(store))
@@ -662,10 +658,8 @@ def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
     response = client.post(f"/v1/sessions/{source.id}/fork", json={})
 
     assert response.status_code == 201, response.text
-    labels = response.json()["labels"]
-    assert SIDE_CHAT_SOURCE_LABEL_KEY not in labels
-    assert SIDE_CHAT_PARENT_LABEL_KEY not in labels
-    assert SIDE_CHAT_HISTORY_LABEL_KEY not in labels
+    assert SIDE_CHAT_SOURCE_LABEL_KEY not in response.json()["labels"]
+    assert store.fork_calls[-1]["side_chat_listing"] is None
 
 
 async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: Any) -> dict:
@@ -739,8 +733,9 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
     expected = {side_chat["id"]: False, closed_side_chat["id"]: True, codex_side_chat: False}
     assert await _side_chat_ids(client, parent.id) == expected
     assert await _side_chat_ids(client, dashed_parent) == expected
-    # The pane hides history through this response on any device.
-    assert side_chat["labels"][SIDE_CHAT_HISTORY_LABEL_KEY] == "resp_parent"
+    # The pane hides history through these copies on any device.
+    copied = [item.id for item in store.list_items(side_chat["id"]).data]
+    assert side_chat["labels"][SIDE_CHAT_HISTORY_LABEL_KEY] == ",".join(copied)
     assert SIDE_CHAT_HISTORY_LABEL_KEY not in other_side_chat["labels"]
     sidebar = await client.get("/v1/sessions")
     assert sidebar.status_code == 200, sidebar.text

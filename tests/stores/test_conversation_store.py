@@ -211,11 +211,11 @@ def test_side_chats_are_found_by_label_one_page_at_a_time(
     }
 
 
-@pytest.mark.parametrize("copied", [True, False])
+@pytest.mark.parametrize("copied_items", [0, 2, 9])
 def test_fork_lists_a_side_chat_with_its_copied_history(
-    conversation_store: SqlAlchemyConversationStore, copied: bool
+    conversation_store: SqlAlchemyConversationStore, copied_items: int
 ) -> None:
-    """Both listing labels land with the fork, so no reader sees one without the other."""
+    """Both listing labels land with the fork; an ordinary fork of it drops them."""
     from omnigent.stores.conversation_store import (
         SIDE_CHAT_HISTORY_LABEL_KEY,
         SIDE_CHAT_PARENT_LABEL_KEY,
@@ -223,31 +223,32 @@ def test_fork_lists_a_side_chat_with_its_copied_history(
     )
 
     source = conversation_store.create_conversation()
-    if copied:
-        conversation_store.append(
-            source.id,
-            [
-                NewConversationItem(
-                    type="message",
-                    response_id=response_id,
-                    data=MessageData(
-                        role="user", content=[{"type": "input_text", "text": response_id}]
-                    ),
-                )
-                for response_id in ("resp_first", "resp_last")
-            ],
-        )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index}",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            )
+            for index in range(copied_items)
+        ],
+    )
     listing = side_chat_parent_label_value(source.id, "alice")
 
-    fork = conversation_store.fork_conversation(source.id, side_chat_listing=listing)
+    side_chat = conversation_store.fork_conversation(source.id, side_chat_listing=listing)
 
-    expected = {SIDE_CHAT_PARENT_LABEL_KEY: listing}
-    if copied:
-        expected[SIDE_CHAT_HISTORY_LABEL_KEY] = "resp_last"
-    stored = conversation_store.get_conversation(fork.id)
+    stored = conversation_store.get_conversation(side_chat.id)
     assert stored is not None
-    assert {key: stored.labels[key] for key in stored.labels if key in expected} == expected
-    assert (SIDE_CHAT_HISTORY_LABEL_KEY in stored.labels) == copied
+    assert stored.labels[SIDE_CHAT_PARENT_LABEL_KEY] == listing
+    # The newest copies, at most seven, mark where the copied history ends.
+    copied = [item.id for item in conversation_store.list_items(side_chat.id).data]
+    assert stored.labels.get(SIDE_CHAT_HISTORY_LABEL_KEY) == (
+        ",".join(copied[-7:]) if copied else None
+    )
+    ordinary = conversation_store.fork_conversation(side_chat.id)
+    assert SIDE_CHAT_PARENT_LABEL_KEY not in ordinary.labels
+    assert SIDE_CHAT_HISTORY_LABEL_KEY not in ordinary.labels
 
 
 def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None:

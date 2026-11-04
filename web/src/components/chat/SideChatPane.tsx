@@ -95,7 +95,7 @@ import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
 /** The block fields that place it relative to a side chat's copied history. */
 interface CopiedBlock {
-  ctx?: { responseId?: string; createdAtS?: number };
+  ctx?: { itemId?: string | null; createdAtS?: number };
 }
 
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
@@ -207,13 +207,13 @@ export function SideChatPane({
   // already holds only its own turns (context lives in the native thread), so
   // filtering there would wrongly hide the side chat's first question.
   const filterHistory = !fullSession && !usesNativeSideChatFork(sessionHarness);
-  // A newer side chat has its last copied response recorded on the server, so
-  // every device hides the same history; older ones use this browser's snapshot.
-  const serverBoundary =
+  // A newer side chat has the ids of its last copied items recorded on the server,
+  // so every device hides the same history; older ones use this browser's snapshot.
+  const copiedTail =
     session?.labels?.["omnigent.side_chat.parent_id"] !== undefined
-      ? (session.labels["omnigent.side_chat.history_response_id"] ?? null)
+      ? (session.labels["omnigent.side_chat.history_item_ids"] ?? null)
       : undefined;
-  const useLocalBoundary = filterHistory && !pending && serverBoundary === undefined;
+  const useLocalBoundary = filterHistory && !pending && copiedTail === undefined;
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
@@ -253,16 +253,15 @@ export function SideChatPane({
   const inherited = boundaryRef.current.ids;
   const forkedAtS = session?.createdAt;
   const visibleBlocks = useMemo(() => {
-    if (filterHistory && serverBoundary !== undefined) {
-      if (serverBoundary === null) return blocks;
-      // Everything through the last copied response is the parent's.
-      const end = blocks.findLastIndex(
-        (b) => (b as CopiedBlock).ctx?.responseId === serverBoundary,
-      );
+    if (filterHistory && copiedTail !== undefined) {
+      if (copiedTail === null) return blocks;
+      const tail = new Set(copiedTail.split(","));
+      // Everything through the latest copied item that renders is the parent's.
+      const end = blocks.findLastIndex((b) => tail.has((b as CopiedBlock).ctx?.itemId ?? ""));
       if (end !== -1) return blocks.slice(end + 1);
-      // The copied tail renders nothing (e.g. a hidden input), or sits on a page not
-      // loaded yet. Copies keep the parent's timestamps, so hide what predates the fork.
-      // ponytail: a copied item from the fork's own second still shows.
+      // The copied tail sits on a page not loaded yet, or none of it renders. Copies
+      // keep the parent's timestamps, so hide what predates the fork.
+      // ponytail: if all of the tail is hidden, a copy from the fork's own second shows.
       return blocks.filter((b) => {
         const at = (b as CopiedBlock).ctx?.createdAtS;
         return at === undefined || forkedAtS === undefined || at >= forkedAtS;
@@ -274,7 +273,7 @@ export function SideChatPane({
           const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
           return !(typeof id === "string" && inherited.has(id));
         });
-  }, [blocks, inherited, filterHistory, serverBoundary, forkedAtS]);
+  }, [blocks, inherited, filterHistory, copiedTail, forkedAtS]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
