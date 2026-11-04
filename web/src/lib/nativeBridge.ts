@@ -221,6 +221,12 @@ interface ElectronDesktopApi extends NativeShellApi {
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
+  /**
+   * Show the in-flight Arca connect's live output in a non-blocking window;
+   * resolves false when none is running. Absent on shells whose connect
+   * console blocks the window for the whole run.
+   */
+  showArcaConnectOutput?: () => Promise<boolean>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
   connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
   /** Extend this machine's running Arca instance with an approved mode. */
@@ -1189,6 +1195,26 @@ export async function connectArcaHost(): Promise<ArcaConnectResult> {
   } catch (err) {
     console.warn("[nativeBridge] electron connectArcaHost failed:", err);
     return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Whether this desktop shell runs a confirmed Arca connect in the background
+ * and can show its live output on request.
+ */
+export function supportsArcaConnectOutput(): boolean {
+  return typeof electronApi()?.showArcaConnectOutput === "function";
+}
+
+/** Show the in-flight Arca connect's output; resolves false when none is running. */
+export async function showArcaConnectOutput(): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.showArcaConnectOutput) return false;
+  try {
+    return (await electron.showArcaConnectOutput()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron showArcaConnectOutput failed:", err);
+    return false;
   }
 }
 

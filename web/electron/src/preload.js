@@ -185,6 +185,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  /**
+   * Show the live output of this window's in-flight Arca connect in a
+   * non-blocking shell window. Resolves false when no connect is running.
+   * Its presence also marks that the connect runs in the background after
+   * consent, so the page shows the progress itself.
+   */
+  showArcaConnectOutput: () => ipcRenderer.invoke("omnigent:arca-connect-output"),
   // Windows' built-in ssh can't share one connection, so it gets this later.
   ...(process.platform === "win32"
     ? {}

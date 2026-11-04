@@ -69,6 +69,18 @@ be able to write resources without a separate Omnigent account.
   only in the app's own window.
   Hidden where **Run on Arca** is offered (the Databricks-internal flag on a
   Databricks-managed server).
+- `desktop-arca-connect`: in the desktop app, **Run on Arca** (and an Arca
+  **Reconnect host**) asks in a modal consent sheet before running anything.
+  After **Connect** the sheet closes and the connect runs in the background,
+  which keeps the app usable during a cold start that can take minutes. The page shows the
+  progress (the landing's progress line, a chat's spinning host dot and
+  toast) with **Show output**, which opens a non-modal output window. **Hide**
+  closes that window and the connect keeps running; **Stop connecting** stops
+  it. The output window opens by itself for a browser sign-in or a failure.
+  States: consent, running in the background, output shown or hidden,
+  stopped, sign-in, failed, connected (the Arca host selected), and the window
+  that asked for it closed (the connect stops). An older desktop shell keeps
+  its blocking console.
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.
@@ -124,6 +136,8 @@ use the SSH field under the `omni host` command (desktop app only; not yet on
 Windows): **Connect new host** in a new session's host menu, or the clone dialog
 (from the header or the reconnect dialog's Clone tab) when no host is online or
 under **Connect another host from your terminal**. Each selects the new host.
+On a Databricks-managed server with internal features, **Run on Arca** in a
+new session's host menu connects the user's Arca instance.
 
 **iOS:** Connect on the connect screen to an OIDC server; a server picked in the
 native server menu or the sidebar server picker; relaunching the app, deep links,
@@ -197,6 +211,16 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   The SSH field needs the desktop app (`just electron-dev`) on a server that
   serves this web build. A real Databricks sign-in needs a real remote machine
   and workspace.
+- **`desktop-arca-connect`:**
+  `web/electron/e2e/desktop_arca_connect_background.e2e.js` runs the real
+  desktop shell and SPA against a local server with a scripted `arca` that
+  prints a cold start until the test releases or fails it. It checks the
+  modal consent, an enabled app window and a usable composer during the
+  connect, Show output, Hide, Stop connecting, and a failure. Run it under
+  `xvfb-run` with `OMNIGENT_PYTHON` pointing at the repo venv. The window's
+  views render from `web/electron/arca-connect/index.html` in
+  `web/electron/test/arca_connect_window.test.js`. A real connect needs a
+  Databricks-managed server and an Arca instance.
 - **`databricks-credential-kind`:** needs a real workspace and one test
   profile of each kind. No e2e covers the host daemon against a real workspace.
 - **`host-lifecycle`:** run `omnigent host --help` and the management commands

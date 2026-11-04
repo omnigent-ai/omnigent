@@ -337,10 +337,11 @@ function databricksInternalFeaturesEnabled() {
 
 /**
  * The Arca connect console: a shell-owned modal that asks consent by showing
- * the exact command, then streams its live output (replaces the bare native
- * dialog — same trust model, full transparency). The flow also de-duplicates:
- * a repeat connect while one is in flight re-focuses the existing console and
- * shares its outcome, so a refreshed SPA can always get back to it.
+ * the exact command, then runs it in the background with its live output in a
+ * non-blocking window (replaces the bare native dialog — same trust model,
+ * full transparency). The flow also de-duplicates: a repeat connect while one
+ * is in flight surfaces the existing console and shares its outcome, so a
+ * refreshed SPA can always get back to it.
  */
 const arcaIdentities = createArcaIdentityStore();
 
@@ -5131,26 +5132,36 @@ function registerIpc() {
   // shared), never refused; the runner itself enforces CONNECT_TIMEOUT_MS so
   // a wedged command always settles. No local process outlives the connect:
   // the enrolled host keeps its own outbound tunnel from the Arca box.
-  ipcMain.handle("omnigent:arca-connect", async (event) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("arca-connect is only available to a connected server page");
-    }
+  // The window and Arca target an Arca IPC acts for, or the gate's error.
+  const arcaConnectTarget = (event) => {
     if (!databricksInternalFeaturesEnabled()) {
-      return { ok: false, error: "Arca support is not enabled on this machine." };
+      return { error: "Arca support is not enabled on this machine." };
     }
     const serverUrl = senderServerUrl(event);
-    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    if (!serverUrl) return { error: "this window is not connected to a server" };
     // Same scope as get-desktop-features, re-checked here: an Arca box may
     // only be enrolled against a Databricks-managed server.
     if (!isDatabricksManagedServerUrl(serverUrl)) {
-      return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
+      return { error: "Arca hosts can only connect to Databricks-managed servers." };
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const arcaServerUrl = windowArcaServerUrl(win);
     // It can come from a settings label, so it passes the same gate.
     if (!isDatabricksManagedServerUrl(arcaServerUrl)) {
-      return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
+      return { error: "Arca hosts can only connect to Databricks-managed servers." };
     }
+    return { win, arcaServerUrl };
+  };
+
+  // After consent the connect runs in the background and the page shows its
+  // progress, so the console only opens for sign-in, a failure, or on request.
+  ipcMain.handle("omnigent:arca-connect", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("arca-connect is only available to a connected server page");
+    }
+    const target = arcaConnectTarget(event);
+    if (target.error) return { ok: false, error: target.error };
+    const { win, arcaServerUrl } = target;
     // An auto-connect already running shares its outcome instead of racing a
     // second `arca ssh`.
     const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);
@@ -5162,7 +5173,7 @@ function registerIpc() {
         isPinnedOriginSender(event) &&
         !win.isDestroyed()
       ) {
-        return arcaConnectFlow.run(win, arcaServerUrl);
+        return arcaConnectFlow.run(win, arcaServerUrl, { inlineProgress: true });
       }
       return status.state === "online"
         ? { ok: true, alreadyRunning: status.alreadyRunning === true, identity: status.identity }
@@ -5173,7 +5184,19 @@ function registerIpc() {
             authError: status.errorKind === "omni-auth",
           };
     }
-    return arcaConnectFlow.run(win, arcaServerUrl);
+    return arcaConnectFlow.run(win, arcaServerUrl, { inlineProgress: true });
+  });
+
+  // SPA → show the in-flight connect's live output in a non-blocking shell
+  // window. It can only surface a run the user already started; consent and
+  // Stop stay in the shell-owned console.
+  ipcMain.handle("omnigent:arca-connect-output", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("arca-connect-output is only available to a connected server page");
+    }
+    const target = arcaConnectTarget(event);
+    if (target.error) return false;
+    return arcaConnectFlow.showOutput(target.win, target.arcaServerUrl);
   });
 
   let arcaExtendInFlight = false;

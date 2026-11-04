@@ -194,6 +194,7 @@ function loadNavigationHarness({
     dbcertSyncs: 0,
     dbcertPreflights: 0,
     arcaConsentRuns: [],
+    arcaOutputRequests: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
     arcaLogins: [],
@@ -692,6 +693,10 @@ function loadNavigationHarness({
           const connect = deps.startConnect(consentServerUrl, () => {});
           return { ...(await connect.promise), shownInConsole: true };
         },
+        showOutput: (_parentWin, outputServerUrl) => {
+          calls.arcaOutputRequests.push(outputServerUrl);
+          return true;
+        },
       }),
     };
   }
@@ -1130,6 +1135,51 @@ describe("Arca auto-connect wiring", () => {
     assert.deepEqual(h.calls.arcaSetups, []);
   });
 
+  it("runs a page-started connect with inline progress and shows its output on request", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      internalFeatures: true,
+      arcaPath,
+      arcaConsentResult: { ok: true },
+      arcaResult: { ok: true },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: workspace } };
+    await h.ipc.get("omnigent:arca-connect")(event);
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+    assert.equal(h.calls.arcaConsentRuns[0].serverUrl, workspace);
+    assert.equal(h.calls.arcaConsentRuns[0].options.inlineProgress, true);
+    assert.equal(await h.ipc.get("omnigent:arca-connect-output")(event), true);
+    assert.deepEqual(h.calls.arcaOutputRequests, [workspace]);
+    await assert.rejects(
+      h.ipc.get("omnigent:arca-connect-output")({
+        sender: h.webContents,
+        senderFrame: { url: "https://evil.example/" },
+      }),
+      /only available to a connected server page/,
+    );
+    assert.deepEqual(h.calls.arcaOutputRequests, [workspace]);
+  });
+
+  it("has no connect output to show without Arca support", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath,
+      arcaConsentResult: { ok: true },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const shown = await h.ipc.get("omnigent:arca-connect-output")({
+      sender: h.webContents,
+      senderFrame: { url: workspace },
+    });
+    assert.equal(shown, false);
+    assert.deepEqual(h.calls.arcaOutputRequests, []);
+  });
+
   for (const errorKind of ["omni-auth", "timeout"]) {
     it(`preserves existing connect recovery for a passive ${errorKind} without onboarding setup`, async (t) => {
       let finishPassive;
@@ -1164,8 +1214,11 @@ describe("Arca auto-connect wiring", () => {
       const recovered = errorKind === "omni-auth";
       assert.equal((await requested).ok, recovered);
       assert.deepEqual(
-        h.calls.arcaConsentRuns,
-        recovered ? [{ serverUrl: workspace, options: undefined }] : [],
+        h.calls.arcaConsentRuns.map(({ serverUrl, options }) => [
+          serverUrl,
+          options.inlineProgress,
+        ]),
+        recovered ? [[workspace, true]] : [],
       );
       assert.deepEqual(h.calls.arcaSetups, []);
       assert.deepEqual(h.calls.arcaConnects, recovered ? [workspace, workspace] : [workspace]);

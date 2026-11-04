@@ -20,7 +20,9 @@ import {
   setNativeServerSwitcherHidden,
   setThemeSource,
   supportsNativeServerPicker,
+  showArcaConnectOutput,
   supportsArcaConnect,
+  supportsArcaConnectOutput,
   supportsBrowser,
   switchServer,
 } from "./nativeBridge";
@@ -210,6 +212,38 @@ describe("supportsArcaConnect", () => {
       window as unknown as { omnigentDesktop: Record<string, unknown> }
     ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
     expect(supportsArcaConnect()).toBe(true);
+  });
+});
+
+describe("showArcaConnectOutput", () => {
+  it("is supported only when the desktop shell offers it", () => {
+    setElectron(true);
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
+    // A shell whose console blocks the whole run has the connect but not this.
+    expect(supportsArcaConnectOutput()).toBe(false);
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.showArcaConnectOutput = () => Promise.resolve(true);
+    expect(supportsArcaConnectOutput()).toBe(true);
+  });
+
+  it("resolves the shell's answer and false when it is missing or fails", async () => {
+    setElectron(false);
+    expect(await showArcaConnectOutput()).toBe(false);
+    setElectron(true);
+    expect(await showArcaConnectOutput()).toBe(false);
+    const desktop = (window as unknown as { omnigentDesktop: Record<string, unknown> })
+      .omnigentDesktop;
+    desktop.showArcaConnectOutput = vi.fn(() => Promise.resolve(true));
+    expect(await showArcaConnectOutput()).toBe(true);
+    desktop.showArcaConnectOutput = () => Promise.resolve(false);
+    expect(await showArcaConnectOutput()).toBe(false);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    desktop.showArcaConnectOutput = () => Promise.reject(new Error("ipc gone"));
+    expect(await showArcaConnectOutput()).toBe(false);
+    warn.mockRestore();
   });
 });
 

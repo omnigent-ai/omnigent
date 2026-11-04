@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
 from urllib.parse import urlparse
 
 import pytest
@@ -48,6 +47,15 @@ window.omnigentDesktop = {
 };
 """
 
+# A shell that runs the consented connect in the background and shows its output on request.
+_SHOW_OUTPUT_BRIDGE_SCRIPT = """
+window.__showArcaOutputCalls = 0;
+window.omnigentDesktop.showArcaConnectOutput = function () {
+  window.__showArcaOutputCalls += 1;
+  return Promise.resolve(true);
+};
+"""
+
 # Records whether the reconnect dialog ever mounted, not just its final state.
 _DIALOG_WATCH_SCRIPT = """() => {
   window.__reconnectDialogShown = false;
@@ -57,13 +65,6 @@ _DIALOG_WATCH_SCRIPT = """() => {
     }
   }).observe(document.body, { childList: true, subtree: true });
 }"""
-
-
-@pytest.fixture(autouse=True)
-def _drop_routes(page: Page) -> Iterator[None]:
-    yield
-    if not page.is_closed():
-        page.unroute_all(behavior="ignoreErrors")
 
 
 def _patch_offline_arca_host(page: Page, session_id: str, host_name: str) -> dict[str, bool]:
@@ -150,22 +151,36 @@ def _patch_offline_arca_host(page: Page, session_id: str, host_name: str) -> dic
 
 
 def _open_offline_arca_chat(
-    page: Page,
+    request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
     *,
     remembered: bool,
     host_name: str,
-) -> tuple[Locator, dict[str, bool]]:
+    shows_output: bool = False,
+) -> tuple[Page, Locator, dict[str, bool]]:
     """Open the seeded chat bound to an offline Arca host in the desktop shell.
 
-    :param page: Playwright page before navigation.
+    The page is created here, after the session is seeded, so a recording
+    starts at the chat rather than during setup.
+
+    :param request: Pytest request, used to create the page.
     :param seeded_session: ``(base_url, session_id)`` of the seeded chat.
     :param remembered: Whether this browser saved the host via Run on Arca.
     :param host_name: Host name the server reports, e.g. ``"e2e's arca"``.
-    :returns: The composer host picker and the mutable host-online state.
+    :param shows_output: Whether the shell can show a running connect's output.
+    :returns: The page, the composer host picker and the mutable host-online state.
     """
     base_url, session_id = seeded_session
+    page: Page = request.getfixturevalue("page")
+
+    def _drop_routes() -> None:
+        if not page.is_closed():
+            page.unroute_all(behavior="ignoreErrors")
+
+    request.addfinalizer(_drop_routes)
     page.add_init_script(_DESKTOP_BRIDGE_INIT_SCRIPT)
+    if shows_output:
+        page.add_init_script(_SHOW_OUTPUT_BRIDGE_SCRIPT)
     page.add_init_script(
         f"window.localStorage.setItem('omnigent:arca-host-id', {_ARCA_HOST_ID!r});"
         if remembered
@@ -179,7 +194,7 @@ def _open_offline_arca_chat(
     expect(host_picker).to_have_attribute(
         "aria-label", re.compile(rf"{re.escape(host_name)}, offline$")
     )
-    return host_picker, host_state
+    return page, host_picker, host_state
 
 
 @pytest.mark.parametrize(
@@ -188,14 +203,14 @@ def _open_offline_arca_chat(
     ids=["remembered", "seeded"],
 )
 def test_desktop_reconnects_arca_from_current_chat(
-    page: Page,
+    request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
     remembered: bool,
     host_name: str,
 ) -> None:
     """One Reconnect host action starts Arca and reports progress without a dialog."""
-    host_picker, host_state = _open_offline_arca_chat(
-        page, seeded_session, remembered=remembered, host_name=host_name
+    page, host_picker, host_state = _open_offline_arca_chat(
+        request, seeded_session, remembered=remembered, host_name=host_name
     )
     page.evaluate(_DIALOG_WATCH_SCRIPT)
     page.wait_for_timeout(800)
@@ -218,13 +233,66 @@ def test_desktop_reconnects_arca_from_current_chat(
     page.wait_for_timeout(1500)
 
 
+@pytest.mark.browser_context_args(record_video_size={"width": 1280, "height": 720})
+def test_desktop_arca_reconnect_runs_in_background_with_output_on_request(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    """While Arca reconnects the dot spins, the chat stays usable, and its output is one click."""
+    page, host_picker, host_state = _open_offline_arca_chat(
+        request, seeded_session, remembered=True, host_name="arca-devbox", shows_output=True
+    )
+    page.wait_for_timeout(1000)
+
+    host_picker.click()
+    reconnect = page.get_by_role("menuitem", name="Reconnect host", exact=True)
+    reconnect.hover()
+    page.wait_for_timeout(1000)
+    reconnect.click()
+    toast = page.locator("[data-sonner-toast]").filter(has_text="Reconnecting Arca…")
+    expect(toast).to_be_visible()
+    expect(page.get_by_test_id("composer-host-status")).to_have_attribute(
+        "data-status", "starting"
+    )
+    expect(host_picker).to_have_attribute("aria-label", re.compile(r"arca-devbox, Starting$"))
+    page.wait_for_timeout(1500)
+
+    toast.get_by_role("button", name="Show output", exact=True).click()
+    page.wait_for_function("window.__showArcaOutputCalls === 1")
+    # Showing the output doesn't dismiss the progress toast.
+    expect(toast).to_be_visible()
+    page.wait_for_timeout(1500)
+
+    host_picker.click()
+    show_output = page.get_by_role("menuitem", name="Show connection output", exact=True)
+    show_output.hover()
+    page.wait_for_timeout(1200)
+    show_output.click()
+    page.wait_for_function("window.__showArcaOutputCalls === 2")
+    page.wait_for_timeout(800)
+
+    composer = page.get_by_label("Message the agent")
+    composer.click()
+    composer.press_sequentially("Notes while Arca starts", delay=60)
+    expect(composer).to_have_value("Notes while Arca starts")
+    page.wait_for_timeout(1500)
+
+    host_state["online"] = True
+    page.evaluate("window.__finishArcaReconnect({ ok: true })")
+    expect(host_picker).to_have_attribute("aria-label", re.compile(r"arca-devbox, online$"))
+    expect(page.get_by_text("Arca is back online.", exact=True)).to_be_visible()
+    expect(composer).to_have_value("Notes while Arca starts")
+    assert page.evaluate("window.__connectArcaCalls") == 1
+    page.wait_for_timeout(2000)
+
+
 def test_desktop_arca_reconnect_failure_offers_retry(
-    page: Page,
+    request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
     """A failed Arca start opens the dialog, and its retry reconnects the host."""
-    host_picker, host_state = _open_offline_arca_chat(
-        page, seeded_session, remembered=False, host_name="e2e's arca"
+    page, host_picker, host_state = _open_offline_arca_chat(
+        request, seeded_session, remembered=False, host_name="e2e's arca"
     )
     page.wait_for_timeout(800)
 
@@ -256,12 +324,12 @@ def test_desktop_arca_reconnect_failure_offers_retry(
 
 
 def test_desktop_send_reconnects_offline_arca_then_sends(
-    page: Page,
+    request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
     """Sending to an offline Arca reconnects it, through a failed try, and sends once it's back."""
-    host_picker, host_state = _open_offline_arca_chat(
-        page, seeded_session, remembered=True, host_name="arca-devbox"
+    page, host_picker, host_state = _open_offline_arca_chat(
+        request, seeded_session, remembered=True, host_name="arca-devbox"
     )
     events_path = f"/v1/sessions/{seeded_session[1]}/events"
     posts: list[str] = []

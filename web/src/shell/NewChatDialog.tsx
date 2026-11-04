@@ -319,6 +319,8 @@ import {
   hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
+  showArcaConnectOutput,
+  supportsArcaConnectOutput,
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import { SshConnectForm, useSshConnectAvailable } from "./SshConnectForm";
@@ -7569,6 +7571,26 @@ export function NewChatLandingScreen() {
                 data-testid="new-chat-landing-connect-error-retry"
               >
                 Try again
+              </button>
+            </p>
+          )}
+
+          {/* Shells that connect in the background after consent leave the
+              page usable, so its progress and output live here. */}
+          {connectingArca && supportsArcaConnectOutput() && (
+            <p
+              className="flex flex-wrap items-center gap-x-1.5 text-sm text-muted-foreground"
+              role="status"
+              data-testid="new-chat-landing-arca-progress"
+            >
+              <span>Connecting to Arca… A cold instance can take a few minutes to start.</span>
+              <button
+                type="button"
+                className="underline underline-offset-2 hover:no-underline"
+                onClick={() => void showArcaConnectOutput()}
+                data-testid="new-chat-landing-arca-show-output"
+              >
+                Show output
               </button>
             </p>
           )}
