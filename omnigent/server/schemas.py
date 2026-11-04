@@ -1403,7 +1403,8 @@ class SessionEventInput(BaseModel):
     :param replaces_failed_inputs: Pending ids of the sender's failed
         startup inputs that this message or skill command replaces, e.g.
         ``["pending_<32 hex>"]``. The events route discards those inputs
-        once the send succeeds; the ids are never forwarded or saved with it.
+        once the send is accepted, not when it fails or a policy denies it;
+        the ids are never forwarded or saved with it.
     """
 
     type: str

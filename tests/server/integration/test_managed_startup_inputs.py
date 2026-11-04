@@ -1058,6 +1058,14 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     startup = auth_app.state.startup_inputs
     startup.conversations.set_labels(session_id, {STARTUP_LABEL: "pending"})
     startup_permissions.grant("bob", session_id, LEVEL_EDIT)
+    denied = False
+
+    async def evaluate(*_: Any, **__: Any):
+        return {"verdict": "deny", "reason": "Blocked test input"} if denied else None
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._evaluate_input_policy", evaluate
+    )
 
     async def send(sender: str, text: str, replaces: list[str] | None = None) -> httpx.Response:
         auth_client.headers["X-Forwarded-Email"] = sender
@@ -1125,6 +1133,12 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
         )
         assert response.status_code == 202, response.text
         assert await read_all("alice") == (["first", "second"], 3)
+        # A resend a policy denies isn't saved, so the inputs it names stay as well.
+        denied = True
+        response = await send("alice", "first", replaces=[pending_ids["first"]])
+        assert response.status_code == 202 and response.json()["denied"], response.text
+        assert await read_all("alice") == (["first", "second"], 3)
+        denied = False
         # An accepted resend drops only the inputs it names.
         response = await send("alice", "first", replaces=[pending_ids["first"]])
         assert response.status_code == 202, response.text

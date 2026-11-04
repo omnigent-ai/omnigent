@@ -8013,7 +8013,8 @@ export async function retryFailedStartupLookup(conversationId: string): Promise<
  * Settle startup after a failure reported while it was pending. A failed launch
  * ends it and hands its messages back; a failed delivery leaves the startup label
  * pending, and later messages still wait behind it. Startup also ends when the
- * snapshot can't be read in time, so it can't stay open indefinitely.
+ * snapshot can't be read in time, so it can't stay open indefinitely, and the
+ * messages are read anyway: only a failed launch has any to hand back.
  *
  * @param conversationId - The session that reported the failure.
  */
@@ -8025,9 +8026,9 @@ async function settleFailedStartup(conversationId: string): Promise<void> {
   );
   if (entry.disposed) return;
   entrySetter(entry)({ startupPending: session !== null && startupPendingIn(session) });
-  if (session !== null && startupFailedIn(session)) {
+  if (session === null || startupFailedIn(session)) {
     await restoreFailedStartupInputs(conversationId);
-  } else if (session !== null) {
+  } else {
     // A relaunch replaced the failed launch, so its later failures aren't startup's.
     failedLaunchEntries.delete(entry);
   }

@@ -840,9 +840,9 @@ Returns the caller's own startup inputs that a failed managed launch
 snapshot's `pending_inputs`, so clients can offer them back to the composer for
 resending. The list is empty for any other startup state and once a runner is
 bound to the session. A message or skill command from the caller that
-succeeds, including one a policy denies, discards the entries whose
-`pending_id` it lists in `replaces_failed_inputs` (see Post Event), since that
-send carries what the client handed back; failed and other sends leave them.
+is accepted discards the entries whose `pending_id` it lists in
+`replaces_failed_inputs` (see Post Event), since that send carries what the
+client handed back; failed, policy-denied and other sends leave them.
 Pages follow item ids; sort the collected entries by `position` for submission
 order.
 Each page reads at most `limit` (1-100) of the session's saved startup inputs,
@@ -1150,8 +1150,8 @@ Request body matches `SessionEventInput`:
     Up to 1000 `pending_id`s from `GET .../failed-inputs` that this user
     `"message"` or skill `"slash_command"` replaces. If the launch is still
     failed when the send arrives, the server discards those of the sender's
-    failed inputs once the send succeeds, including a policy denial; a send
-    that fails leaves them. Ids the sender doesn't own are ignored. Not
+    failed inputs once the send is accepted; a send that fails or that a
+    policy denies leaves them. Ids the sender doesn't own are ignored. Not
     forwarded or saved with the event.
 
 202 Accepted

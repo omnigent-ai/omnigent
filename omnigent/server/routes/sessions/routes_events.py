@@ -1088,6 +1088,9 @@ def register_events_routes(
         """Submit a session event, then run the steps that wait for its acceptance."""
         on_accepted: list[Callable[[], Awaitable[None]]] = []
         result = await _submit_event(request, session_id, body, in_flight, on_accepted)
+        # A policy denial saves nothing, so nothing it would replace may be dropped.
+        if result.get("denied"):
+            return result
         for step in on_accepted:
             # The event is already accepted, so a failed follow-up mustn't report it refused.
             try:
@@ -1185,7 +1188,8 @@ def register_events_routes(
         :param in_flight: When given, the session is marked as having a
             dispatch in flight once the caller is authorized, for the rest
             of the request.
-        :param on_accepted: Steps the caller runs once this returns without raising.
+        :param on_accepted: Steps the caller runs once this returns without raising,
+            unless a policy denied the event.
         :returns: ``{"queued": True, "item_id": "..."}`` for
             item-typed events, where ``item_id`` is the persisted
             conversation item id also emitted by

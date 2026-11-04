@@ -4084,7 +4084,6 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
 
   it.each([
     { returns: "no input of the viewer's", failing: null },
-    { returns: "an unreadable snapshot", failing: "/v1/sessions/conv_real?" },
     { returns: "no failed-inputs route", failing: "/v1/sessions/conv_real/failed-inputs" },
   ] as const)("ends managed startup when its launch fails with $returns", async ({ failing }) => {
     seedSession("conv_real");
@@ -4094,10 +4093,9 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
 
     sessionLabels.set("conv_real", { "omnigent.startup": "failed" });
     if (failing !== null) {
-      const status = failing.endsWith("/failed-inputs") ? 404 : 500;
       fetchMock.mockImplementation((input, init) =>
         String(input).startsWith(failing)
-          ? mockResponse({ error: { message: "boom" } }, { ok: false, status })
+          ? mockResponse({ error: { message: "boom" } }, { ok: false, status: 404 })
           : defaultFetchHandler(input, init),
       );
     }
@@ -4120,34 +4118,52 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     ).toBe(false);
   });
 
-  it("ends managed startup when its failed launch's snapshot read outlasts the reconcile timeout", async () => {
-    seedSession("conv_real");
-    sessionLabels.set("conv_real", { "omnigent.startup": "pending" });
-    await useChatStore.getState().switchTo("conv_real");
-    fetchMock.mockImplementation((input, init) =>
-      String(input).startsWith("/v1/sessions/conv_real?")
-        ? new Promise<Response>((_resolve, reject) => {
-            init?.signal?.addEventListener(
-              "abort",
-              () => reject(new DOMException("aborted", "AbortError")),
-              { once: true },
-            );
-          })
-        : defaultFetchHandler(input, init),
-    );
-    vi.useFakeTimers();
+  it.each([
+    { snapshot: "is unreadable", hangs: false },
+    { snapshot: "outlasts the reconcile timeout", hangs: true },
+  ])(
+    "ends managed startup and hands back its first input when a failed launch's snapshot $snapshot",
+    async ({ hangs }) => {
+      seedSession("conv_real");
+      sessionLabels.set("conv_real", { "omnigent.startup": "pending" });
+      await useChatStore.getState().switchTo("conv_real");
+      failManagedLaunch("conv_real", "saved on server");
+      fetchMock.mockImplementation((input, init) => {
+        if (!String(input).startsWith("/v1/sessions/conv_real?"))
+          return defaultFetchHandler(input, init);
+        if (!hangs) return mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      });
+      vi.useFakeTimers();
 
-    handleSessionEvent(
-      { type: "session_status", conversationId: "conv_real", status: "failed" },
-      "conv_real",
-    );
-    await vi.advanceTimersByTimeAsync(ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS - 1);
-    expect(useChatStore.getState().startupPending).toBe(true);
-    await vi.advanceTimersByTimeAsync(1);
+      handleSessionEvent(
+        { type: "session_status", conversationId: "conv_real", status: "failed" },
+        "conv_real",
+      );
+      if (hangs) {
+        await vi.advanceTimersByTimeAsync(ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS - 1);
+        expect(useChatStore.getState().startupPending).toBe(true);
+      }
+      await vi.advanceTimersByTimeAsync(1);
+      vi.useRealTimers();
+      await settle();
 
-    expect(useChatStore.getState().startupPending).toBe(false);
-    expect(useChatStore.getState().failedSendDraft).toBeNull();
-  });
+      expect(useChatStore.getState().startupPending).toBe(false);
+      expect(useChatStore.getState().failedSendDraft).toEqual({
+        conversationId: "conv_real",
+        text: "saved on server",
+        files: [],
+        startupInputIds: ["pending_first"],
+        recovered: true,
+      });
+    },
+  );
 
   it("keeps managed startup pending when a failure leaves the launch pending", async () => {
     seedSession("conv_real");
