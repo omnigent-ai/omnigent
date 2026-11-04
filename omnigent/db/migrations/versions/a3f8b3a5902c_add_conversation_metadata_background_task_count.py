@@ -8,9 +8,12 @@ Adds a nullable Integer ``background_task_count`` column to
 running after a session's turn ended, written by the replica holding the
 runner tunnel so any replica's session list can show them.
 
-Additive with no default or backfill; NULL means never reported. Deploy before
-the server that writes it; older servers ignore the column. Downgrade discards
-the counts, which the next turn end reports again.
+Additive with no default or backfill; NULL means never reported. The ORM maps
+the column, so run this migration before starting a server that includes it.
+Servers already running an older binary ignore the column. To roll back to an
+older binary, downgrade to d0a1f879a01d first: an older binary refuses to start
+on a revision it does not know. Downgrade discards the counts, which the next
+turn end reports again.
 """
 
 from __future__ import annotations
