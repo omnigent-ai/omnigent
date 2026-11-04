@@ -563,7 +563,7 @@ class HostMcpLogins:
         return login.status()
 
     async def close(self, owner: object | None = None) -> None:
-        """Stop every login and refuse later starts from *owner*; its web UI is gone."""
+        """Stop sign-ins when their host tunnel closes and refuse later starts from *owner*."""
         # Recorded first so starts queued ahead of the lock launch nothing.
         if owner is not None:
             self._closed_owners.add(owner)
