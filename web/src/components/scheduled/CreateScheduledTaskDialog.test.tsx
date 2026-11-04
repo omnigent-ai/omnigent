@@ -2220,7 +2220,7 @@ describe("CreateScheduledTaskDialog session mode", () => {
 
 describe("CreateScheduledTaskDialog trigger template", () => {
   function renderTrigger(
-    source: "jira" | "slack" | "github",
+    source: "jira" | "slack" | "github" | "linear",
     extraInfo: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
     sessionLink = "https://omni.example.com/c/CONVERSATION_ID",
   ) {
@@ -2411,6 +2411,31 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       'Watch: new Slack messages in #eng-support whose text contains "error"',
     );
     expect(prompt).not.toContain("Omnigent session:");
+  });
+
+  it("builds a Linear trigger for a team, with an unassigned row and the issue link-back", async () => {
+    renderTrigger("linear");
+    expect(screen.getByTestId("task-name-input")).toHaveValue("Linear issues");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue created");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("in team");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can create an issue in this team can add instructions",
+    );
+    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent(
+      "This only works if the agent has a Linear MCP server where this task runs.",
+    );
+    type("task-trigger-scope", "ENG");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    pick("task-trigger-condition-0-field", "task-trigger-condition-0-field-assignee");
+    pick("task-trigger-condition-0-operator", "task-trigger-condition-0-operator-empty");
+    type("task-trigger-instructions", "Triage it.");
+
+    const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("linear");
+    expect(prompt).toContain("Watch: new Linear issues in team ENG that are unassigned");
+    expect(prompt).toContain(
+      'Comment "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" on each issue',
+    );
   });
 
   it("hands the rendered prompt to the plain Prompt field on Edit as prompt", async () => {

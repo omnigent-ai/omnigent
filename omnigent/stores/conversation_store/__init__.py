@@ -1029,8 +1029,11 @@ class ConversationStore(ABC):
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
             conversation no longer exists (e.g. deleted between two page
             fetches) — its sort position is unknowable, and an empty page
-            would be indistinguishable from a completed enumeration.
-            Title tokens carry their position and never go stale.
+            would be indistinguishable from a completed enumeration. Also
+            raised when ``accessible_by``/``owned_by`` is set and that user
+            has no grant on the cursor conversation, so a cursor can't
+            reveal where an ungranted session sorts. Title tokens carry
+            their position and never go stale.
         :raises omnigent.errors.OmnigentError: ``INVALID_INPUT`` for a
             malformed title token or one used with another sort.
         """

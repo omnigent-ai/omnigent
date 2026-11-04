@@ -3146,8 +3146,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             objects. With ``sort_by="title"``, ``first_id`` and
             ``last_id`` are title tokens (see :func:`_encode_title_cursor`).
         :raises ValueError: If ``search_scope`` is not a known scope.
-        :raises StaleCursorError: If a conversation-id cursor's row no
-            longer exists.
+        :raises StaleCursorError: If a conversation-id cursor names a
+            vanished conversation, or one that ``accessible_by``/``owned_by``
+            has no grant on.
         :raises OmnigentError: ``INVALID_INPUT`` for a malformed title
             token or one used with another sort.
         """
@@ -3229,6 +3230,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     qualifying_ids = list(
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
+
+        # A permission-scoped page only lists sessions the viewer has a grant
+        # on, so resolving another session's id would reveal where it sorts.
+        # Title tokens carry their own position and resolve nothing.
+        cursor_viewer = accessible_by if accessible_by is not None else owned_by
+        if cursor_viewer is not None:
+            for cursor_id in (after, before):
+                if cursor_id and not cursor_id.startswith(_TITLE_CURSOR_PREFIX):
+                    self._require_cursor_grant(cursor_id, cursor_viewer)
 
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
@@ -3548,6 +3558,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             last_id=last_cursor,
             has_more=has_more,
         )
+
+    def _require_cursor_grant(self, cursor_id: str, viewer: str) -> None:
+        """
+        Reject a list cursor naming a session the viewer has no grant on.
+
+        Fails the same way as a deleted cursor, so it doesn't reveal whether
+        the session exists.
+
+        :param cursor_id: The ``after`` or ``before`` session ID.
+        :param viewer: The user whose listing the cursor pages.
+        :raises StaleCursorError: If the viewer has no grant on the session.
+        """
+        with self._session("authorize_session_list_cursor") as meta_sess:
+            granted = meta_sess.execute(
+                select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == cursor_id,
+                    SqlSessionPermission.user_id == viewer,
+                )
+            ).first()
+        if granted is None:
+            raise StaleCursorError(cursor_id)
 
     def _resolve_sort_columns(self, sort_by: str) -> tuple[ColumnElement[Any], ColumnElement[Any]]:
         """

@@ -762,9 +762,9 @@ UI events use the host-provided `OmnigentHostConfig.analytics` sink:
 | UI creation attempts, successes, failures, latency | `interactionKind=create_scheduled_task`: `phase=start`, then `phase=complete` with `status=success` or `failure` and duration. `name` is the template ID. |
 | UI / agent / API share | `scheduled_task_created` grouped by `creation_source`. |
 
-Template IDs are bounded: `custom`, `jira`, `slack`, `github`,
+Template IDs are bounded: `custom`, `jira`, `slack`, `github`, `linear`,
 `follow-up-monitor`, `pr-sweep`, `news-digest`, or server-side `unknown` for
-unattributed/older clients. The current gallery offers Jira, Slack, and GitHub;
+unattributed/older clients. The current gallery offers Jira, Slack, GitHub, and Linear;
 the three retired suggestion IDs remain accepted for older clients. Attribution records the selected template even if
 its prompt is edited. No task name, prompt, Jira query, channel, or repository
 text is recorded in these events. Attribution headers are diagnostic client claims;
