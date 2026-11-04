@@ -12,6 +12,7 @@ from alembic import command
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import title_sort_key
 from omnigent.db.utils import _build_alembic_config, get_or_create_engine
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 _PREVIOUS = "d0a1f879a01d"
 _REVISION = "e413195738fb"
@@ -148,6 +149,13 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
             (0, legacy_child_id): "20legacy child",
             (0, parent_id): "0renamed",
         }
+        # Name listings then place those sessions, sub-agent included, by their current titles.
+        store = SqlAlchemyConversationStore(db_uri)
+        listed = store.list_conversations(limit=len(original), sort_by="title", order="asc").data
+        titles = [row.title for row in listed]
+        assert titles.index("Legacy") < titles.index("Renamed") < titles.index("Éclair")
+        sub_agents = store.list_conversations(kind="sub_agent", sort_by="title", order="asc").data
+        assert [row.title for row in sub_agents] == ["Child Task", "Legacy Child"]
 
         _migrate(engine, _PREVIOUS, command.downgrade)
         inspector = sa.inspect(engine)
