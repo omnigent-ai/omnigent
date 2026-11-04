@@ -7,15 +7,25 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Tabs } from "@/components/ui/tabs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
 import type { ReviewThread } from "@/lib/pullRequestReviewThreads";
+import { viewedStorageKey, writeViewed, type PullRequestIdentity } from "@/lib/pullRequestViewed";
+import type * as SonnerModule from "sonner";
 import { PullRequestChangesTab } from "./PullRequestChangesTab";
 import { useChangesViewState } from "./useChangesViewState";
 
+const toast = vi.hoisted(() =>
+  Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() }),
+);
+vi.mock("sonner", async (importOriginal) => ({
+  ...(await importOriginal<typeof SonnerModule>()),
+  toast,
+}));
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   ...(await importOriginal<typeof UsePullRequestsModule>()),
   usePullRequestReviewThreadComposer: () => ({
@@ -479,5 +489,372 @@ describe("PullRequestChangesTab", () => {
         diffOf("b.ts")!.querySelector('[data-review-thread="t1"]'),
       ),
     );
+  });
+});
+
+const PR_URL = "https://github.com/o/r/pull/1";
+const IDENTITY: PullRequestIdentity = {
+  provider: "github",
+  host: "github.com",
+  repository: "o/r",
+  number: 1,
+};
+
+function viewedTab({
+  conversationId,
+  head = "head1",
+  files = [changed("a.ts"), changed("b.ts")],
+  hasMore = false,
+  identity = IDENTITY,
+  threads = [],
+  diffHead = head,
+  listHead = head,
+}: {
+  conversationId: string;
+  head?: string;
+  files?: PullRequestChangedFile[];
+  hasMore?: boolean;
+  identity?: PullRequestIdentity | null;
+  threads?: ReviewThread[];
+  /** The head the loaded patch was fetched for, when it differs from the list's. */
+  diffHead?: string;
+  /** The list's pinned head; null models a provider that doesn't pin revisions. */
+  listHead?: string | null;
+}) {
+  const props = {
+    conversationId,
+    data: {
+      selected_pr_url: PR_URL,
+      base_ref: "main",
+      capabilities: {},
+      auth: { selected_account: null },
+    },
+    pr: { url: PR_URL, number: 1, head_sha: head, base_sha: "base", state: "OPEN" },
+    prUrl: PR_URL,
+    canEdit: false,
+    selected: true,
+    changes: { data: { available: true, data: files, has_more: hasMore, head_sha: listHead } },
+    prDiff: { data: { head_sha: diffHead, base_sha: "base" }, isLoading: false },
+    reviews: {
+      page: { data: threads, head_sha: head, base_sha: "base" },
+      isFetching: false,
+      loadComments: () => {},
+      loadingComments: null,
+    },
+    identity,
+  } as unknown as React.ComponentProps<typeof PullRequestChangesTab>;
+  return (
+    <TooltipProvider>
+      <Tabs value="changes">
+        <PullRequestChangesTab {...props} />
+      </Tabs>
+    </TooltipProvider>
+  );
+}
+
+/** The file's section root; its first button is the header's collapse toggle. */
+function fileSection(path: string): HTMLElement {
+  const section = document.querySelector<HTMLElement>(`[data-github-file="${path}"]`);
+  if (!section) throw new Error(`No section for ${path}`);
+  return section;
+}
+
+function isCollapsed(path: string): boolean {
+  return fileSection(path).querySelector("button")?.getAttribute("aria-expanded") === "false";
+}
+
+/** Whether the file has a section in the diff list (titles also match the sidebar row). */
+function isListed(path: string): boolean {
+  return document.querySelector(`[data-github-file="${path}"]`) !== null;
+}
+
+const viewedBox = (path: string) => screen.getByRole("checkbox", { name: `Viewed ${path}` });
+
+describe("PullRequestChangesTab viewed files", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // A cleared-storage event also drops in-memory fallback values from earlier tests.
+    window.dispatchEvent(new StorageEvent("storage", { key: null }));
+    toast.error.mockClear();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("collapses a file when it is marked viewed and keeps the mark after a reload", () => {
+    const first = render(viewedTab({ conversationId: "viewed-reload" }));
+    fireEvent.click(viewedBox("a.ts"));
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(screen.getByText("Viewed,", { exact: true })).toBeInTheDocument();
+    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Files viewed" })).toHaveAttribute(
+      "aria-valuenow",
+      "50",
+    );
+    first.unmount();
+
+    // A fresh render reads the same localStorage, as a reload would.
+    render(viewedTab({ conversationId: "viewed-reload" }));
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+  });
+
+  it("leaves a file collapsed when its mark is removed", () => {
+    render(viewedTab({ conversationId: "viewed-unmark" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("a.ts"));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(screen.getByText("0 / 2 files viewed")).toBeInTheDocument();
+  });
+
+  it("hides viewed files together with the path filter", () => {
+    const store = renderHook(() => useChangesViewState("viewed-hide", PR_URL));
+    const files = [changed("src/a.ts"), changed("src/b.ts"), changed("docs/a.md")];
+    render(viewedTab({ conversationId: "viewed-hide", files }));
+    fireEvent.click(viewedBox("src/a.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    expect(isListed("src/a.ts")).toBe(false);
+    expect(isListed("src/b.ts")).toBe(true);
+    expect(isListed("docs/a.md")).toBe(true);
+
+    act(() => store.result.current.setPathFilter("src"));
+    expect(isListed("docs/a.md")).toBe(false);
+    expect(isListed("src/b.ts")).toBe(true);
+    expect(isListed("src/a.ts")).toBe(false);
+  });
+
+  it("shows an all-viewed state when hiding viewed files leaves nothing", () => {
+    render(viewedTab({ conversationId: "viewed-all" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    expect(screen.getByText("All 2 files viewed")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show viewed" }));
+
+    expect(screen.getByRole("checkbox", { name: "Hide viewed" })).not.toBeChecked();
+    expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("resets viewed marks on a new head and shows a dismissible notice", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-head", head: "head1" }));
+    fireEvent.click(viewedBox("a.ts"));
+
+    rerender(viewedTab({ conversationId: "viewed-head", head: "head2" }));
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(screen.getByText("0 / 2 files viewed")).toBeInTheDocument();
+    expect(screen.getByText(/viewed marks were reset/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
+    rerender(viewedTab({ conversationId: "viewed-head", head: "head2" }));
+    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
+  });
+
+  it("hides viewed state when the list is not pinned to a head", () => {
+    // A provider that ignores revision pinning can serve a newer patch than the polled head.
+    render(viewedTab({ conversationId: "viewed-unpinned", listHead: null }));
+
+    expect(screen.queryByRole("checkbox", { name: "Viewed a.ts" })).toBeNull();
+    expect(screen.queryByText(/files viewed/)).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+  });
+
+  it("waits for the list and the patch to agree on a head", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-mismatch", head: "head1" }));
+    fireEvent.click(viewedBox("a.ts"));
+
+    // The list moved to head2 while the patch on screen is still head1.
+    rerender(viewedTab({ conversationId: "viewed-mismatch", head: "head2", diffHead: "head1" }));
+    expect(screen.queryByRole("checkbox", { name: "Viewed a.ts" })).toBeNull();
+    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
+
+    rerender(viewedTab({ conversationId: "viewed-mismatch", head: "head2" }));
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(screen.getByText(/viewed marks were reset/)).toBeInTheDocument();
+  });
+
+  it("clears the reset notice once a file is marked on the new head", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-new-mark", head: "head1" }));
+    fireEvent.click(viewedBox("a.ts"));
+    rerender(viewedTab({ conversationId: "viewed-new-mark", head: "head2" }));
+    expect(screen.getByText(/viewed marks were reset/)).toBeInTheDocument();
+
+    fireEvent.click(viewedBox("b.ts"));
+    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
+    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+  });
+
+  it("keeps viewed marks when a poll returns the same head", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-same", head: "head1" }));
+    fireEvent.click(viewedBox("a.ts"));
+
+    rerender(viewedTab({ conversationId: "viewed-same", head: "head1" }));
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
+    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+  });
+
+  it("keeps marks in memory and warns once when storage fails", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("full", "QuotaExceededError");
+    });
+    render(viewedTab({ conversationId: "viewed-storage" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(viewedBox("b.ts")).toBeChecked();
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(toast.error).toHaveBeenCalledWith(
+      "Viewed files can't be saved on this device.",
+      expect.objectContaining({ id: "pr-viewed-persistence" }),
+    );
+  });
+
+  it("hides the viewed controls until the PR identity is known", () => {
+    render(viewedTab({ conversationId: "viewed-unknown", identity: null }));
+
+    expect(screen.queryByRole("checkbox", { name: "Viewed a.ts" })).toBeNull();
+    expect(isListed("a.ts")).toBe(true);
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+    expect(screen.queryByText(/files viewed/)).toBeNull();
+  });
+
+  it("marks the progress as partial when the file list is truncated", () => {
+    render(viewedTab({ conversationId: "viewed-partial", hasMore: true }));
+
+    expect(screen.getByText("0 / 2 files viewed (partial)")).toBeInTheDocument();
+  });
+
+  it("un-hides a viewed file when navigating to its conversation", () => {
+    const store = renderHook(() => useChangesViewState("viewed-thread", PR_URL));
+    const thread = { id: "t1", path: "a.ts", resolved: false } as ReviewThread;
+    render(viewedTab({ conversationId: "viewed-thread", threads: [thread] }));
+    fireEvent.click(viewedBox("a.ts"));
+    act(() => store.result.current.setHideViewed(true));
+    expect(isListed("a.ts")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Next unresolved conversation" }));
+
+    expect(store.result.current.hideViewed).toBe(false);
+    expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("keeps a matching path filter when navigating to a viewed file", () => {
+    const store = renderHook(() => useChangesViewState("viewed-thread-filter", PR_URL));
+    const thread = { id: "t1", path: "a.ts", resolved: false } as ReviewThread;
+    render(viewedTab({ conversationId: "viewed-thread-filter", threads: [thread] }));
+    fireEvent.click(viewedBox("a.ts"));
+    act(() => store.result.current.setPathFilter("a.ts"));
+    act(() => store.result.current.setHideViewed(true));
+    expect(isListed("a.ts")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Next unresolved conversation" }));
+
+    expect(store.result.current.pathFilter).toBe("a.ts");
+    expect(store.result.current.hideViewed).toBe(false);
+    expect(isListed("a.ts")).toBe(true);
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
+  it("keeps files the reader collapsed with Collapse all on a new head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-collapse-all", head: "head1" }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-collapse-all", head: "head2" }));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
+  });
+
+  it("expands files collapsed by old marks on a new head but keeps manual collapses", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-collapse", head: "head1" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(fileSection("b.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
+
+    // H2 has a saved mark on a.ts, as if another tab marked it. Loading H2 keeps a.ts
+    // collapsed, and that collapse still belongs to the mark: a fresh H3 expands it again.
+    writeViewed(viewedStorageKey(window.location.origin, "alice", IDENTITY, "head2"), ["a.ts"]);
+    rerender(viewedTab({ conversationId: "viewed-collapse", head: "head2" }));
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-collapse", head: "head3" }));
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+    expect(isCollapsed("b.ts")).toBe(true);
+  });
+
+  it("expands a mark-collapsed file on a fresh head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-collapse-fresh", head: "head1" }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-collapse-fresh", head: "head4" }));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
+  it("keeps a file the reader collapsed before marking it collapsed on a new head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-manual-first", head: "head1" }),
+    );
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    fireEvent.click(viewedBox("a.ts"));
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-manual-first", head: "head2" }));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps a file collapsed on a new head after the reader expands and recollapses it", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-manual-again", head: "head1" }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-manual-again", head: "head2" }));
+
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps a manual collapse made before identity loads when viewed files seed later", () => {
+    const origin = window.location.origin;
+    writeViewed(viewedStorageKey(origin, "alice", IDENTITY, "head1"), ["a.ts"]);
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-late-identity", identity: null }),
+    );
+    fireEvent.click(fileSection("b.ts").querySelector("button")!);
+    expect(isCollapsed("b.ts")).toBe(true);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    rerender(viewedTab({ conversationId: "viewed-late-identity" }));
+
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
   });
 });
