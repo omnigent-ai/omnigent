@@ -7783,7 +7783,7 @@ function returnFailedStartupInputs(
   const unreturned = failedInputs.filter(
     (input) => !state.returnedStartupInputs.includes(input.pendingId),
   );
-  // Inputs a reloaded draft holds count as returned, so clearing that draft can't bring them back.
+  // Inputs a reloaded draft holds count as returned; clearing it won't bring them back in this tab.
   const inputs = unreturned.filter((input) => !held.has(input.pendingId));
   const blocks = state.blocks.filter((block) => !isStartupLookupNotice(block));
   const patch: Partial<ConversationState> = {
