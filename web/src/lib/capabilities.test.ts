@@ -258,6 +258,7 @@ describe.each([
   "scheduled_task_subhour",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
+  "retry_session_wake_only",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],
@@ -313,18 +314,6 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   ])("parses %s strictly as %s", async (advertised, expected) => {
     const parsed = await probe({ session_fork_workspaces: advertised });
     expect(parsed.session_fork_workspaces).toBe(expected);
-  });
-});
-
-describe("resolveServerInfo retry_session_wake_only", () => {
-  it.each([
-    [true, true],
-    [false, false],
-    [undefined, false],
-    ["true", false],
-  ])("parses %s strictly as %s", async (advertised, expected) => {
-    const parsed = await probe({ retry_session_wake_only: advertised });
-    expect(parsed.retry_session_wake_only).toBe(expected);
   });
 });
 

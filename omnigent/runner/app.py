@@ -1566,7 +1566,7 @@ def create_runner_app(
     # still held a sub-agent result (typically: the server was down when the
     # child finished). The catch-up scan re-attempts these on tunnel reconnect.
     _stranded_wake_parents: set[str] = set()
-    # Parents a passive init brought up; recovered results wait for their next init or turn.
+    # Parents whose recovered sub-agent wakes are held.
     _held_wake_parents: set[str] = set()
     # Single-flight holder for the paced stranded-wake retry loop, so
     # back-to-back reconnects don't stack concurrent retry loops.
@@ -2908,7 +2908,6 @@ def create_runner_app(
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
-        # A passive init queues recovered results; the next init or turn wakes the parent.
         if init_context.envelope is not None and init_context.envelope.hold_subagent_wakes:
             _held_wake_parents.add(session_id)
         elif session_id in _held_wake_parents:

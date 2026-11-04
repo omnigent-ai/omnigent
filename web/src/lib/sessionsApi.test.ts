@@ -1721,6 +1721,7 @@ describe("stopSession", () => {
 
 describe("retrySession", () => {
   it.each([
+    [undefined, {}],
     [{}, {}],
     [{ wakeOnly: true }, { wake_only: true }],
   ])("posts retry_session with options %o", async (options, data) => {

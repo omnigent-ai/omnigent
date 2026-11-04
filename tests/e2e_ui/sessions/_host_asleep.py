@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route
@@ -149,3 +150,38 @@ def force_host_asleep(
     page.route(re.compile(r"/health(\?|$)"), _patch_health)
     page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_snapshot)
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+
+def hold_wake_requests(page: Page, session_id: str) -> list[Route]:
+    """Hold each ``retry_session`` POST until the test releases it.
+
+    :param page: Playwright page, before the wake is requested.
+    :param session_id: Session whose events endpoint to intercept.
+    :returns: Held routes, in arrival order; other events pass through.
+    """
+    held: list[Route] = []
+
+    def _hold(route: Route) -> None:
+        request = route.request
+        if request.method == "POST" and "retry_session" in (request.post_data or ""):
+            held.append(route)
+            return
+        route.continue_()
+
+    page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}/events(\?|$)"), _hold)
+    return held
+
+
+def next_held_wake(page: Page, held: list[Route], timeout_ms: int = 10_000) -> Route:
+    """Wait for the next held wake request and return it.
+
+    :param page: Page whose event loop delivers the route.
+    :param held: List filled by :func:`hold_wake_requests`.
+    :param timeout_ms: How long to wait for the request.
+    :returns: The oldest held route, removed from ``held``.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while not held:
+        assert time.monotonic() < deadline, "the wake request never reached the server"
+        page.wait_for_timeout(50)
+    return held.pop(0)

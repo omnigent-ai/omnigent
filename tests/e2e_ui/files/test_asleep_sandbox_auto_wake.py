@@ -23,7 +23,11 @@ import pytest
 from playwright.sync_api import Page, Request, Response, Route, expect
 
 from tests.e2e_ui.conftest import _recording_requested, open_right_rail
-from tests.e2e_ui.sessions._host_asleep import force_host_asleep
+from tests.e2e_ui.sessions._host_asleep import (
+    force_host_asleep,
+    hold_wake_requests,
+    next_held_wake,
+)
 
 _FILE_PATH = "sandbox_notes.txt"
 _RETRY_SESSION = {"type": "retry_session", "data": {"wake_only": True}}
@@ -122,17 +126,6 @@ def _open_asleep_session(
     return page, recorder
 
 
-def _wait_for_wake_request(page: Page, session_id: str) -> Any:
-    def _is_wake(request: Request) -> bool:
-        return (
-            request.method == "POST"
-            and urlparse(request.url).path == f"/v1/sessions/{session_id}/events"
-            and request.post_data_json == _RETRY_SESSION
-        )
-
-    return page.expect_request(_is_wake, timeout=30_000)
-
-
 def test_opening_files_wakes_asleep_sandbox(
     request: pytest.FixtureRequest,
     asleep_session_file: tuple[str, str],
@@ -140,13 +133,16 @@ def test_opening_files_wakes_asleep_sandbox(
     """Opening the Workspace rail on Files starts the sandbox and lists its files."""
     base_url, session_id = asleep_session_file
     page, recorder = _open_asleep_session(request, base_url, session_id)
+    held = hold_wake_requests(page, session_id)
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
     _hold_for_viewer(request, page)
 
-    with _wait_for_wake_request(page, session_id):
-        open_right_rail(page)
+    open_right_rail(page)
+    wake = next_held_wake(page, held, timeout_ms=30_000)
     rail = page.get_by_role("complementary", name="Workspace")
+    # The wake is held, so the sandbox can't read online before this check.
     expect(rail.get_by_text("Starting sandbox…")).to_be_visible()
+    wake.continue_()
 
     expect(rail.get_by_role("button", name=re.compile(re.escape(_FILE_PATH))).first).to_be_visible(
         timeout=30_000

@@ -22,52 +22,19 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import time
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.sessions._host_asleep import force_host_asleep
+from tests.e2e_ui.sessions._host_asleep import (
+    force_host_asleep,
+    hold_wake_requests,
+    next_held_wake,
+)
 
 _COMPOSER_PLACEHOLDER = "Send a message…"
 # Keeps each status visible long enough to read, only when recording.
 _HOLD_MS = 1_500 if os.environ.get("OMNIGENT_E2E_RECORD_DIR") else 0
-
-
-def _hold_wake_requests(page: Page, session_id: str) -> list[Route]:
-    """Hold each ``retry_session`` POST until the test releases it.
-
-    :param page: Playwright page before navigation.
-    :param session_id: Session whose events endpoint to intercept.
-    :returns: Held routes, in arrival order; other events pass through.
-    """
-    held: list[Route] = []
-
-    def _hold(route: Route) -> None:
-        request = route.request
-        if request.method == "POST" and "retry_session" in (request.post_data or ""):
-            held.append(route)
-            return
-        route.continue_()
-
-    page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}/events(\?|$)"), _hold)
-    return held
-
-
-def _next_held(page: Page, held: list[Route], timeout_ms: int = 10_000) -> Route:
-    """Wait for the next held wake request and return it.
-
-    :param page: Page whose event loop delivers the route.
-    :param held: List filled by :func:`_hold_wake_requests`.
-    :param timeout_ms: How long to wait for the request.
-    :returns: The oldest held route, removed from ``held``.
-    """
-    deadline = time.monotonic() + timeout_ms / 1000
-    while not held:
-        assert time.monotonic() < deadline, "the wake request never reached the server"
-        page.wait_for_timeout(50)
-    return held.pop(0)
 
 
 def _expect_host_status(page: Page, status: str, *, tooltip: str) -> None:
@@ -149,7 +116,7 @@ def test_reconnect_host_wakes_asleep_sandbox_in_status_dot(
     page: Page = request.getfixturevalue("page")
     host_online = {"online": False}
     force_host_asleep(page, session_id, host_online=host_online)
-    held = _hold_wake_requests(page, session_id)
+    held = hold_wake_requests(page, session_id)
     toasts = page.locator("[data-sonner-toast]")
 
     page.goto(f"{base_url}/c/{session_id}")
@@ -157,7 +124,7 @@ def test_reconnect_host_wakes_asleep_sandbox_in_status_dot(
     _expect_host_status(page, "offline", tooltip="Asleep — wakes on next message")
     _open_host_menu(page, "offline")
     page.get_by_role("menuitem", name="Reconnect host").click()
-    wake = _next_held(page, held)
+    wake = next_held_wake(page, held)
     assert wake.request.post_data_json == {"type": "retry_session", "data": {}}
 
     _expect_host_status(page, "starting", tooltip="Starting")
@@ -188,14 +155,14 @@ def test_failed_wake_restores_dot_and_reports_error(
     base_url, session_id = seeded_session
     page: Page = request.getfixturevalue("page")
     force_host_asleep(page, session_id)
-    held = _hold_wake_requests(page, session_id)
+    held = hold_wake_requests(page, session_id)
 
     page.goto(f"{base_url}/c/{session_id}")
 
     _expect_host_status(page, "offline", tooltip="Asleep — wakes on next message")
     _open_host_menu(page, "offline")
     page.get_by_role("menuitem", name="Reconnect host").click()
-    wake = _next_held(page, held)
+    wake = next_held_wake(page, held)
     _expect_host_status(page, "starting", tooltip="Starting")
 
     wake.fulfill(
@@ -275,7 +242,7 @@ def test_wake_stuck_on_stage_brings_reconnect_host_back(
         session_id,
         sandbox_status={"stage": "provisioning", "provider": "arclet", "error": None},
     )
-    held = _hold_wake_requests(page, session_id)
+    held = hold_wake_requests(page, session_id)
     toasts = page.locator("[data-sonner-toast]")
     page.clock.install()
 
@@ -284,7 +251,7 @@ def test_wake_stuck_on_stage_brings_reconnect_host_back(
     _expect_host_status(page, "starting", tooltip="Provisioning sandbox")
     _open_host_menu(page, "starting")
     page.get_by_role("menuitem", name="Reconnect host").click()
-    wake = _next_held(page, held)
+    wake = next_held_wake(page, held)
     _open_host_menu(page, "starting")
     expect(page.get_by_role("menuitem", name="Reconnect host")).to_have_count(0)
     page.keyboard.press("Escape")
