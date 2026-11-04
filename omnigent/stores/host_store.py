@@ -962,6 +962,7 @@ class HostStore:
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param include_deleted: Also return tombstoned hosts awaiting sandbox cleanup.
         :returns: The :class:`Host` if found, otherwise ``None``.
         """
         with self._session("select_host_by_id") as session:
