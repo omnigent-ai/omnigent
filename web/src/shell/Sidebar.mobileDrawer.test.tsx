@@ -254,7 +254,12 @@ function touch(target: Element, type: string, x: number, time: number, fingers =
 
 function stubMobileLayout(mobile: boolean): void {
   vi.stubGlobal("matchMedia", (query: string) => ({
-    matches: mobile && query.includes("max-width") && !query.includes("min-width"),
+    // `isMobileViewport` reads the md min-width query, the inverse of mobile; the
+    // side-by-side query (min and max width) never matches.
+    matches:
+      query.includes("min-width") && !query.includes("max-width")
+        ? !mobile
+        : mobile && query.includes("max-width") && !query.includes("min-width"),
     media: query,
     addEventListener: () => {},
     removeEventListener: () => {},
