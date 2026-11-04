@@ -8068,6 +8068,7 @@ async def _dispatch_session_event_to_runner_impl(
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
     startup_input: StartupInputContext | None = None,
+    keep_reconnect_deferral: bool = False,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -8143,6 +8144,8 @@ async def _dispatch_session_event_to_runner_impl(
         an older host row gets.
     :param agent_revision: The agent's effective bundle and selection revision, stamped on
         both native and non-native forwards to invalidate runner caches.
+    :param keep_reconnect_deferral: Keep a wake-only retry's hold because this
+        message's handshake failed, leaving child restoration to the next input.
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -8153,7 +8156,8 @@ async def _dispatch_session_event_to_runner_impl(
         from omnigent.server.child_session_recovery import end_reconnect_deferral
 
         disconnect_outcome.note_user_turn(conv.id)
-        await end_reconnect_deferral(conv, conversation_store)
+        if not keep_reconnect_deferral:
+            await end_reconnect_deferral(conv, conversation_store)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors

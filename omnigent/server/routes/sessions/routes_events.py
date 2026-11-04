@@ -3521,6 +3521,7 @@ def register_events_routes(
             skipped_resume_runner(session_id) == conv.runner_id
             or reconnect_recovery_deferred(conv)
         )
+        keep_reconnect_deferral = False
         if not codex_child_turn and (
             _runner_needs_session_init
             or woken_without_resume
@@ -3543,7 +3544,13 @@ def register_events_routes(
                 suppress_recovery_turn=True,
                 trigger="web_message",
             )
-            if woken_without_resume:
+            # A best-effort handshake that failed leaves that work owed to the next input.
+            keep_reconnect_deferral = (
+                woken_without_resume
+                and initializer is not None
+                and not initializer.is_initialized(conv, runner_client)
+            )
+            if woken_without_resume and not keep_reconnect_deferral:
                 clear_skipped_resume(session_id)
         await _ensure_runner_relay_ready(
             session_id,
@@ -3670,6 +3677,7 @@ def register_events_routes(
             # one; absent, the dispatch forwards as before.
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
+            keep_reconnect_deferral=keep_reconnect_deferral,
         )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)

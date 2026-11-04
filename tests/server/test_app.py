@@ -2754,15 +2754,20 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retry_in_flight", [False, True], ids=["persisted", "in-flight"])
 async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    retry_in_flight: bool,
 ) -> None:
     """A reconnect after a wake-only retry leaves its session's tree for the next plain retry."""
+    import contextlib
+
     from omnigent.entities import Conversation
     from omnigent.runner.routing import RoutedRunner
     from omnigent.server.child_session_recovery import (
+        defer_reconnect_recovery,
         hold_reconnect_recovery,
         note_skipped_resume,
         reconnect_recovery_deferred,
@@ -2804,8 +2809,9 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
         )
         store.set_session_live_status(root_id, "failed")
         _session_status_cache[root_id] = "failed"
-    # The wakes that launched this runner have returned; its connect hook runs next.
-    await hold_reconnect_recovery(woken_id, store)
+    # The wakes that launched this runner have returned, or the root's is still in flight.
+    if not retry_in_flight:
+        await hold_reconnect_recovery(woken_id, store)
     await hold_reconnect_recovery(woken_child_id, store)
     # An earlier wake skipped this tree's resume; this connect's recovery runs it.
     note_skipped_resume(other_id, "earlier_runner")
@@ -2834,7 +2840,9 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
         orchestration._publish_runner_recovered_status_impl,
     )
 
-    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+    in_flight = defer_reconnect_recovery(woken_id) if retry_in_flight else contextlib.nullcontext()
+    with in_flight:
+        await captured["callback"](runner_id, connection)  # type: ignore[operator]
 
     assert sorted(initialized) == sorted([other_id, children[other_id]])
     assert store.get_conversation(children[woken_id]).runner_id == "offline_runner"  # type: ignore[union-attr]
@@ -2850,7 +2858,8 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
     assert _session_status_cache[other_id] == "idle"
     assert _last_task_error_from_labels(other.labels) is None
     # Only requested work ends the holds, so a later reconnect leaves the trees too.
-    assert reconnect_recovery_deferred(store.get_conversation(woken_id))  # type: ignore[arg-type]
+    if not retry_in_flight:
+        assert reconnect_recovery_deferred(store.get_conversation(woken_id))  # type: ignore[arg-type]
     assert reconnect_recovery_deferred(store.get_conversation(woken_child_id))  # type: ignore[arg-type]
 
 

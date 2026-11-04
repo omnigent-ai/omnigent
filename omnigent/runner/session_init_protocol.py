@@ -56,7 +56,7 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # Resume an interrupted child task in its existing native session.
     resume_interrupted_turn: bool = False
     recovery_id: str | None = None
-    # Queue sub-agent results recovered during init without waking the parent.
+    # Queue recovered sub-agent results without waking the parent until its next init or turn.
     hold_subagent_wakes: bool = False
 
 

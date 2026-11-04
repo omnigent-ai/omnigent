@@ -4263,13 +4263,18 @@ async def test_resume_after_waking_a_connected_runner_releases_its_hold(
     assert runner_client.held_subagent_wakes == [True, False]
 
 
-@pytest.mark.parametrize("marker_lost", [False, True], ids=["marker", "persisted-hold-only"])
+@pytest.mark.parametrize(
+    ("marker_lost", "first_handshake_fails"),
+    [(False, False), (True, False), (False, True)],
+    ids=["marker", "persisted-hold-only", "failed-handshake"],
+)
 async def test_message_after_wake_only_launch_restores_interrupted_children(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     marker_lost: bool,
+    first_handshake_fails: bool,
 ) -> None:
     """A message after a wake resumes the interrupted child, but not the parent's turn."""
     import dataclasses
@@ -4312,6 +4317,8 @@ async def test_message_after_wake_only_launch_restores_interrupted_children(
                 envelope["resume_interrupted_turn"],
             )
         )
+        if first_handshake_fails and len(inits) == 2:
+            raise httpx.ConnectError("runner tunnel dropped", request=request)
         return httpx.Response(201, json={"id": body["session_id"]})
 
     hello = dataclasses.replace(_runner_hello(), capabilities=[CAP_HOLD_SUBAGENT_WAKES])
@@ -4352,20 +4359,25 @@ async def test_message_after_wake_only_launch_restores_interrupted_children(
             # Eviction drops the process-local marker; the persisted hold still owes the handshake.
             child_session_recovery.clear_skipped_resume(session_id)
 
-        response = await client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "message",
-                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
-            },
-        )
+        message = {
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        }
+        response = await client.post(f"/v1/sessions/{session_id}/events", json=message)
         assert response.status_code == 202, response.text
-        await poll_until_async(lambda: len(inits) == 3, timeout_s=budget(5.0))
+        if first_handshake_fails:
+            # The message is still forwarded; the next one owes the handshake and the child.
+            assert len(inits) == 2
+            assert _reconnect_recovery_held(db_uri, session_id)
+            assert child_session_recovery.skipped_resume_runner(session_id) is not None
+            response = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert response.status_code == 202, response.text
+        await poll_until_async(lambda: inits[-1][0] == child.id, timeout_s=budget(5.0))
 
     # The message starts the parent's turn, so its handshake only releases held sub-agent results.
     assert inits == [
         (session_id, True, True, False),
-        (session_id, True, False, False),
+        *[(session_id, True, False, False)] * (2 if first_handshake_fails else 1),
         (child.id, False, False, True),
     ]
     assert not _reconnect_recovery_held(db_uri, session_id)
