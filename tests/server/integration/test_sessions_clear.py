@@ -418,17 +418,27 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A message sent after the release but before the redirect is refused.
+    """A message or a second ``/clear`` sent mid-move, after the release, is refused.
 
-    It would otherwise run in the original chat while viewers follow the new,
-    empty one. The clear itself still completes.
+    The message would otherwise run in the original chat while viewers follow
+    the new, empty one; the second clear would release and fork again. The
+    first clear still completes, and the guard ends with it.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     source_id = await create_placed_session(client, store)
     sent: list[httpx.Response] = []
+    second_clear: list[httpx.Response] = []
 
-    async def send_from_another_tab() -> None:
+    async def act_from_another_tab() -> None:
+        # Only the first release acts; a second clear reaching its own release
+        # (when unguarded) must not recurse.
+        live_runner.on_clear = None
+        second_clear.append(
+            await client.post(
+                f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+            )
+        )
         sent.append(
             await client.post(
                 f"/v1/sessions/{source_id}/events",
@@ -439,7 +449,8 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
             )
         )
 
-    live_runner.on_clear = send_from_another_tab
+    live_runner.on_clear = act_from_another_tab
+    before = len((await client.get("/v1/sessions")).json()["data"])
 
     resp = await client.post(
         f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
@@ -449,6 +460,11 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
     new_id = resp.json()["session_id"]
     assert [response.status_code for response in sent] == [409], sent[0].text
     assert "moving to a new session" in sent[0].text
+    assert [response.status_code for response in second_clear] == [409], second_clear[0].text
+    assert "already moving" in second_clear[0].text
+    assert len(clear_requests(live_runner)) == 1
+    assert len((await client.get("/v1/sessions")).json()["data"]) == before + 1
+    assert not orchestration._session_is_moving(source_id)
     source_messages = [body for path, body in live_runner.posts if body.get("type") == "message"]
     assert source_messages == []
     assert "Q3" not in message_texts(store, source_id)
