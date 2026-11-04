@@ -2787,8 +2787,59 @@ async def test_runner_os_env_edit_of_a_crlf_file_reverted_outside_leaves_changes
 
 
 @pytest.mark.asyncio
+async def test_runner_os_env_failed_edit_does_not_choose_the_original(tmp_path: Path) -> None:
+    """The original is what the first successful write replaced, not what a failed edit saw."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+    from omnigent.spec.types import AgentSpec
+
+    notes = tmp_path / "notes.txt"
+    notes.write_text("before the failed edit\n")
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+
+    failed = await _execute_os_env_tool(
+        "sys_os_edit",
+        {"path": "notes.txt", "oldText": "absent", "newText": "edited"},
+        agent_spec=spec,
+        conversation_id="conv_failed_edit",
+        filesystem_registry=filesystem_registry,
+    )
+    assert "error" in json.loads(failed)
+    assert (
+        filesystem_registry.list_changed_files("conv_failed_edit", limit=10, check_disk=False)
+        == []
+    )
+
+    notes.write_text("changed by a shell\n")
+    await _execute_os_env_tool(
+        "sys_os_write",
+        {"path": "notes.txt", "content": "written\n"},
+        agent_spec=spec,
+        conversation_id="conv_failed_edit",
+        filesystem_registry=filesystem_registry,
+    )
+    assert filesystem_registry.get_baseline("notes.txt") == "changed by a shell\n"
+
+    notes.write_text("before the failed edit\n")
+    listed = filesystem_registry.list_changed_files("conv_failed_edit", limit=10, check_disk=True)
+    assert [(r["path"], r["status"]) for r in listed] == [("notes.txt", "modified")]
+
+    notes.write_text("changed by a shell\n")
+    assert (
+        filesystem_registry.list_changed_files("conv_failed_edit", limit=10, check_disk=True) == []
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("original", "first_seed_byte_caps", "baseline"),
+    ("original", "expected_byte_caps", "baseline"),
     [
         pytest.param(b"\x89PNG\x00\xff", [1], None, id="binary"),
         pytest.param(b"0123456789\n", [1, 8], None, id="larger-than-the-read-cap"),
@@ -2800,14 +2851,13 @@ async def test_runner_os_env_snapshot_reads_only_a_complete_text_original(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     original: bytes,
-    first_seed_byte_caps: list[int],
+    expected_byte_caps: list[int],
     baseline: str | None,
 ) -> None:
-    """Binary files are probed, not read, and a later complete read never becomes the original."""
+    """Binary files are probed, not read, and only complete text becomes an original."""
     from omnigent.inner.os_env import OpResult, OSEnvironment, _read_impl
     from omnigent.runner import environment_filesystem
-    from omnigent.runner.tool_dispatch import _seed_os_env_snapshot
-    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+    from omnigent.runner.tool_dispatch import _read_os_env_original
 
     byte_caps: list[int | None] = []
 
@@ -2825,18 +2875,9 @@ async def test_runner_os_env_snapshot_reads_only_a_complete_text_original(
     monkeypatch.setattr(environment_filesystem, "_MAX_READ_BYTES", 8)
     (tmp_path / "notes").write_bytes(original)
     os_env = cast(OSEnvironment, _InProcessReads())
-    registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
 
-    await _seed_os_env_snapshot(os_env, "notes", registry, "conv_seed")
-    assert byte_caps == first_seed_byte_caps
-    assert registry.get_baseline("notes") == baseline
-
-    (tmp_path / "notes").write_text("short\n")
-    registry.record_change("notes", "modified", "conv_seed")
-    await _seed_os_env_snapshot(os_env, "notes", registry, "conv_seed")
-
-    listed = registry.list_changed_files("conv_seed", limit=10, check_disk=True)
-    assert [(r["path"], r["status"]) for r in listed] == [("notes", "modified")]
+    assert await _read_os_env_original(os_env, "notes") == baseline
+    assert byte_caps == expected_byte_caps
 
 
 @pytest.mark.asyncio

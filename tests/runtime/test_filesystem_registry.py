@@ -2227,10 +2227,9 @@ def test_git_list_tracked_files_is_relative_to_the_requested_subdir(tmp_path: Pa
     assert reg.list_tracked_files("loop") is None
 
 
-def test_agent_edit_registry_has_no_index_to_consult(
-    registry: AgentEditFilesystemRegistry,
-) -> None:
+def test_agent_edit_registry_has_no_index_to_consult(tmp_path: Path) -> None:
     """A non-git workspace offers neither listing, so search keeps walking."""
+    registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
     assert registry.list_tracked_files() is None
     assert registry.last_changed_files() is None
 

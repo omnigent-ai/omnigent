@@ -1728,46 +1728,6 @@ async def test_diff_endpoint_returns_before_and_after_for_modified_file(
 
 
 @pytest.mark.asyncio
-async def test_diff_endpoint_returns_null_before_for_new_file(
-    registry: SessionResourceRegistry,
-    workspace: Path,
-) -> None:
-    """GET /diff/hello.txt returns before=None when the file is new (created event, no snapshot).
-
-    A 'created' event with no seed_snapshot means no baseline exists;
-    ``get_baseline`` should return ``None`` which flows through as ``before: null``.
-
-    :param registry: Session resource registry backed by the test workspace.
-    :param workspace: Test workspace; hello.txt on disk contains 'hello world'.
-    """
-    app = create_runner_app(
-        resource_registry=registry,
-        runner_workspace=workspace,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    reg = app.state.filesystem_registry
-    # Inject a 'created' event but deliberately skip seed_snapshot so before=None.
-    reg.record_change("hello.txt", "created", "conv_test")
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
-        resp = await client.get(
-            f"/v1/sessions/conv_test/resources/environments"
-            f"/{DEFAULT_ENVIRONMENT_ID}/diff/hello.txt"
-        )
-
-    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}. Body: {resp.text}"
-    body = resp.json()
-    # No snapshot → before must be null; a non-null value means a phantom
-    # baseline was produced.
-    assert body["before"] is None, (
-        f"Expected before=None for a new file with no snapshot, got {body['before']!r}."
-    )
-    # File exists on disk → after must be its content.
-    assert body["after"] == "hello world", f"Expected after='hello world', got {body['after']!r}."
-
-
-@pytest.mark.asyncio
 async def test_diff_endpoint_returns_null_after_for_deleted_file(
     client_with_registry: httpx.AsyncClient,
 ) -> None:

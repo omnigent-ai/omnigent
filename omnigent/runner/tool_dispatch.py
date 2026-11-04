@@ -41,7 +41,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
-    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.os_env import OpResult, OSEnvironment
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
@@ -7519,45 +7519,57 @@ def _effective_runner_os_env_spec(
     return OSEnvSpec(type="caller_process", cwd=cwd)
 
 
-async def _seed_os_env_snapshot(
-    os_env: OSEnvironment,
-    path: str,
-    filesystem_registry: FilesystemRegistry,
-    conversation_id: str,
-) -> None:
-    """Seed the diff snapshot with *path*'s current content before a write or edit.
+async def _read_os_env_original(os_env: OSEnvironment, path: str) -> str | None:
+    """Return *path*'s complete text within the read cap, keeping its line endings.
 
-    Reads the file via *os_env* and passes the content to
-    :meth:`~omnigent.runtime.filesystem_registry.FilesystemRegistry.seed_snapshot`
-    so the before/after diff endpoint can show the original content. A one-byte
-    probe skips binary files before their content is read, and the byte-capped
-    read keeps line endings as they are on disk. Silently skips when the file
-    does not yet exist (new-file creates have no baseline), when it is binary or
-    too large to read whole, or when any other read error occurs.
+    A one-byte probe skips binary files before their content is read.
 
     :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
         the current tool dispatch — reused to avoid opening a second connection.
     :param path: Path argument forwarded from the tool call, e.g. ``"src/foo.py"``.
-    :param filesystem_registry: Registry that stores the snapshot.
-    :param conversation_id: Session scope for the snapshot, e.g. ``"conv_abc123"``.
+    :returns: The text, or ``None`` when the file is missing, binary, too large
+        to read whole, or unreadable.
     """
     from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
 
     try:
         probe = await os_env.read(path=path, offset=1, limit=None, max_bytes=1)
         if not isinstance(probe, dict) or probe.get("encoding") != "utf-8":
-            return
+            return None
         existing = await os_env.read(path=path, offset=1, limit=None, max_bytes=_MAX_READ_BYTES)
-        if (
-            isinstance(existing, dict)
-            and existing.get("encoding") == "utf-8"
-            and not existing.get("truncated")
-        ):
-            filesystem_registry.seed_snapshot(
-                path, existing["content"], session_id=conversation_id
-            )
     except Exception:  # noqa: BLE001
-        pass  # file does not exist yet or unreadable — no baseline to capture
+        return None  # file does not exist yet or unreadable — no original to keep
+    if (
+        isinstance(existing, dict)
+        and existing.get("encoding") == "utf-8"
+        and not existing.get("truncated")
+    ):
+        return cast("str", existing["content"])
+    return None
+
+
+def _record_os_env_change(
+    filesystem_registry: FilesystemRegistry,
+    path: str,
+    original: str | None,
+    result: OpResult,
+    operation: str,
+    conversation_id: str,
+) -> None:
+    """Record a successful write or edit, seeding the *original* it replaced first.
+
+    :param filesystem_registry: Registry that stores the change and its original.
+    :param path: Path argument forwarded from the tool call, e.g. ``"src/foo.py"``.
+    :param original: Text read before the mutation, or ``None`` when unknown.
+    :param result: Result returned by the write or edit.
+    :param operation: ``"created"`` or ``"modified"``.
+    :param conversation_id: Session scope for the change, e.g. ``"conv_abc123"``.
+    """
+    if isinstance(result, dict) and "error" in result:
+        return
+    if original is not None:
+        filesystem_registry.seed_snapshot(path, original, session_id=conversation_id)
+    filesystem_registry.record_change(path, operation, conversation_id)
 
 
 async def _execute_os_env_tool(
@@ -7582,7 +7594,7 @@ async def _execute_os_env_tool(
     :param runner_workspace: Optional CLI launch workspace used for
         placeholder cwd values in remote app sessions.
     :param filesystem_registry: Optional registry for tracking agent
-        file modifications. When provided, ``sys_os_write`` and
+        file modifications. When provided, successful ``sys_os_write`` and
         ``sys_os_edit`` calls record changed paths so the
         ``GET …/changes`` endpoint can surface them. ``sys_os_shell``
         is not tracked — shell side-effects cannot be attributed to a
@@ -7637,8 +7649,8 @@ async def _execute_os_env_tool(
             )
         elif tool_name == SysOsWriteTool.name():
             _path = cast("str", args.get("path", ""))
-            if filesystem_registry is not None and conversation_id is not None:
-                await _seed_os_env_snapshot(os_env, _path, filesystem_registry, conversation_id)
+            tracks_changes = filesystem_registry is not None and conversation_id is not None
+            original = await _read_os_env_original(os_env, _path) if tracks_changes else None
             result = await os_env.write(
                 path=_path,
                 content=cast("str", args.get("content", "")),
@@ -7648,11 +7660,13 @@ async def _execute_os_env_tool(
                 # previously exist, {"created": False} for an overwrite.
                 was_created = isinstance(result, dict) and result.get("created") is True
                 status = "created" if was_created else "modified"
-                filesystem_registry.record_change(_path, status, conversation_id)
+                _record_os_env_change(
+                    filesystem_registry, _path, original, result, status, conversation_id
+                )
         elif tool_name == SysOsEditTool.name():
             _path = cast("str", args.get("path", ""))
-            if filesystem_registry is not None and conversation_id is not None:
-                await _seed_os_env_snapshot(os_env, _path, filesystem_registry, conversation_id)
+            tracks_changes = filesystem_registry is not None and conversation_id is not None
+            original = await _read_os_env_original(os_env, _path) if tracks_changes else None
             result = await os_env.edit(
                 path=_path,
                 old_text=cast("str | None", args.get("oldText") or args.get("old_string")),
@@ -7660,7 +7674,9 @@ async def _execute_os_env_tool(
                 edits=cast("list[dict[str, str]] | None", args.get("edits")),
             )
             if filesystem_registry is not None and conversation_id is not None:
-                filesystem_registry.record_change(_path, "modified", conversation_id)
+                _record_os_env_change(
+                    filesystem_registry, _path, original, result, "modified", conversation_id
+                )
         elif tool_name == SysOsShellTool.name():
             result = await os_env.shell(
                 command=cast("str", args.get("command", "")),
