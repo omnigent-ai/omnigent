@@ -2986,14 +2986,14 @@ def register_events_routes(
             # a booting runner connects (or reads "alive") and we forward,
             # while one that was stopped, crashed, or lost to a host restart
             # reads "dead"/"unknown" and cuts the wait short so the relaunch
-            # below runs at once. A host that is offline, too old to answer,
-            # or slow yields no verdict and keeps the ordinary grace. An
-            # explicit pending sign-in retains this runner and the input.
+            # below runs at once. A host still offline skips this redundant
+            # runner wait; one that returned during the liveness lookup gets
+            # the ordinary query/grace. Pending sign-in retains the input.
             from omnigent.server.routes import sessions as _sf
 
             if (
                 conv.runner_id is not None
-                and offline_before_grace is None
+                and (offline_before_grace is None or _grace_host_conn is not None)
                 and _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0
             ):
                 _logger.info(

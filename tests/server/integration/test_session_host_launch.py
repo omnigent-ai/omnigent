@@ -1365,6 +1365,80 @@ async def test_host_reconnect_on_another_replica_redirects_without_failing_input
     assert not [item for item in items if item["type"] in {"message", "error"}]
 
 
+async def test_host_and_runner_reconnect_during_offline_lookup_reuses_original(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale offline read cannot rotate work that reconnected during it."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = await _offline_native_host_session(client, app)
+    store = SqlAlchemyConversationStore(db_uri)
+    original = store.get_conversation(session_id)
+    assert original is not None and original.runner_id is not None
+    original_runner_id = original.runner_id
+    set_runner_client(None)
+    classified_offline = asyncio.Event()
+    release_classification = asyncio.Event()
+    classify = routes_events._session_offline_host_id
+
+    async def stale_offline_result(*args: Any, **kwargs: Any) -> str | None:
+        result = await classify(*args, **kwargs)
+        classified_offline.set()
+        await release_classification.wait()
+        return result
+
+    monkeypatch.setattr(routes_events, "_session_offline_host_id", stale_offline_result)
+    requests: list[httpx.Request] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(accept), base_url="http://runner"
+    ) as runner:
+        wait_for_runner = AsyncMock(return_value=runner)
+        monkeypatch.setattr(
+            routes_events,
+            "_wait_for_host_bound_runner_client",
+            wait_for_runner,
+        )
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+        pending = asyncio.create_task(_post_hello(client, session_id))
+        try:
+            await asyncio.wait_for(classified_offline.wait(), timeout=budget(5.0))
+            reconnected = await _connect_host(app)
+            app.state.tunnel_registry.register(
+                original_runner_id,
+                _NoopRunnerWS(),
+                _runner_hello(),
+            )
+            release_classification.set()
+            response = await asyncio.wait_for(pending, timeout=budget(5.0))
+        finally:
+            release_classification.set()
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+    assert response.status_code == 202, response.text
+    wait_for_runner.assert_awaited_once()
+    assert wait_for_runner.await_args.kwargs["runner_id"] == original_runner_id
+    assert wait_for_runner.await_args.kwargs["host_conn"] is app.state.host_registry.get(_HOST_ID)
+    assert store.get_conversation(session_id).runner_id == original_runner_id
+    assert not await _expect_no_launch(reconnected, budget_s=budget(0.2))
+    forwarded = [
+        request
+        for request in requests
+        if request.method == "POST" and request.url.path.endswith("/events")
+    ]
+    assert len(forwarded) == 1
+
+
 async def test_concurrent_sends_after_host_reconnect_share_one_launch(
     client: httpx.AsyncClient,
     app: FastAPI,
