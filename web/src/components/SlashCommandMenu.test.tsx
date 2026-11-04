@@ -207,9 +207,7 @@ describe("full skill descriptions", () => {
     advanceTimers(399);
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
     advanceTimers(1);
-    const tooltip = screen.getByTestId("slash-menu-tooltip-triage");
-    expect(tooltip).toHaveTextContent(triage);
-    expect(tooltip).toHaveClass("max-h-64", "overflow-y-auto", "items-start");
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
   });
 
   it("keeps the full hover delay on a cut-off row after resting on a row that fits", () => {

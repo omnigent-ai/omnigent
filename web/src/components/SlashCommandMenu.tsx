@@ -468,6 +468,24 @@ function MenuRowButton({
       setTooltipOpen(false);
     };
   }, [active, activeIndex]);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
+  useEffect(() => {
+    if (!tooltipOpen) return;
+    function pageDescription(event: KeyboardEvent) {
+      const tooltip = tooltipRef.current;
+      const direction = event.key === "PageDown" ? 1 : event.key === "PageUp" ? -1 : 0;
+      if (!tooltip || direction === 0 || event.defaultPrevented) return;
+      if (event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (tooltip.scrollHeight <= tooltip.clientHeight) return;
+      event.preventDefault();
+      // Stepping two lines short of the box keeps the line cut at its edge in view.
+      const lineHeight = parseFloat(getComputedStyle(tooltip).lineHeight);
+      tooltip.scrollBy({ top: direction * (tooltip.clientHeight - 2 * lineHeight) });
+    }
+    document.addEventListener("keydown", pageDescription);
+    return () => document.removeEventListener("keydown", pageDescription);
+  }, [tooltipOpen]);
   // Wand in pink for skills (per design feedback — distinct from the
   // info-blue slash-command tint, and from plain Sparkles which marks
   // thinking/reasoning blocks), the ⌘ glyph in slate for built-ins.
@@ -521,11 +539,14 @@ function MenuRowButton({
       </TooltipTrigger>
       {row.description && (
         <TooltipContent
+          ref={tooltipRef}
           side="top"
           align="end"
           data-testid={`slash-menu-tooltip-${row.name.slice(1)}`}
           // Top-aligned so a description taller than the cap scrolls from its first line.
           className="max-h-64 max-w-md items-start overflow-y-auto break-words text-xs leading-4"
+          // Pressing inside the tooltip keeps the textarea focused, so the menu stays open.
+          onMouseDown={(e) => e.preventDefault()}
         >
           {row.description}
         </TooltipContent>

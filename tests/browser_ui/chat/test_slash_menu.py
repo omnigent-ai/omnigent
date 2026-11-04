@@ -437,6 +437,13 @@ _SPRAWLING_SKILL_DESCRIPTION = " ".join(
 )
 _LINE_HEIGHT = "element => parseFloat(getComputedStyle(element).lineHeight)"
 _OVERFLOWS_VERTICALLY = "element => element.scrollHeight > element.clientHeight"
+_SCROLLED_TO_END = (
+    "element => element.scrollTop + element.clientHeight >= element.scrollHeight - 1"
+)
+_TEXT_BOX_HEIGHT = """element => {
+    const style = getComputedStyle(element);
+    return element.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+}"""
 _FIRST_LINE_OFFSET = """element => {
     const range = document.createRange();
     range.selectNodeContents(element);
@@ -475,7 +482,25 @@ def test_slash_menu_bounds_a_very_long_skill_description(
     assert tooltip_box["height"] <= 256 + 1
     assert tooltip.evaluate(_OVERFLOWS_VERTICALLY)
     assert 0 <= tooltip.evaluate(_FIRST_LINE_OFFSET) < line_height
-    tooltip.hover()
+
+    # From the composer, PageDown pages to the last line without skipping text, and PageUp returns.
+    text_height = tooltip.evaluate(_TEXT_BOX_HEIGHT)
+    scroll_tops = [0]
+    while not tooltip.evaluate(_SCROLLED_TO_END):
+        composer.press("PageDown")
+        scroll_tops.append(tooltip.evaluate("element => element.scrollTop"))
+        assert 0 < scroll_tops[-1] - scroll_tops[-2] < text_height
+    for _ in scroll_tops[1:]:
+        composer.press("PageUp")
+    assert tooltip.evaluate("element => element.scrollTop") == 0
+    expect(composer).to_be_focused()
+    expect(composer).to_have_value("/")
+    expect(sprawl).to_have_attribute("data-active", "true")
+
+    # Pressing inside the tooltip keeps the composer focused and the menu open.
+    tooltip.click()
+    expect(composer).to_be_focused()
+    expect(tooltip).to_be_visible()
     page.mouse.wheel(0, 200)
     page.wait_for_function("element => element.scrollTop > 0", arg=tooltip.element_handle())
     expect(tooltip).to_be_visible()

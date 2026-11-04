@@ -121,7 +121,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
   Rows show a one-line description. When the pointer or keyboard highlight rests
-  on a cut-off row for 400 ms, a scrollable tooltip shows the full text.
+  on a cut-off row for 400 ms, a scrollable tooltip shows the full text;
+  PageUp/PageDown page through a tall one while the composer keeps focus.
   The main composer lists its full built-in set and the session's skills; a live
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
