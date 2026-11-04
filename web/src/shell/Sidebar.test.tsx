@@ -308,6 +308,30 @@ function closeProjectsMenu() {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 }
 
+/** Replace the no-op IntersectionObserver with one that exposes its callback and options. */
+function stubIntersectionObserver() {
+  const observer = {
+    callback: undefined as IntersectionObserverCallback | undefined,
+    options: undefined as IntersectionObserverInit | undefined,
+    observe: vi.fn(),
+  };
+  class TestObserver {
+    constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+      observer.callback = callback;
+      observer.options = options;
+    }
+    observe = observer.observe;
+    unobserve = vi.fn();
+    disconnect = vi.fn();
+    takeRecords = () => [];
+    root = null;
+    rootMargin = "";
+    thresholds = [];
+  }
+  vi.stubGlobal("IntersectionObserver", TestObserver);
+  return observer;
+}
+
 beforeEach(() => {
   useConvMock.mockReset();
   useHostsMock.mockReset();
@@ -2087,20 +2111,10 @@ describe("Sidebar tabs", () => {
     // so page 1 can be all-owned while shared sessions live on a later page.
     // The Shared tab must keep its pagination sentinel mounted rather than
     // stranding the user on a false "empty" state.
-    let observerCallback: IntersectionObserverCallback | undefined;
-    class TestObserver {
-      constructor(cb: IntersectionObserverCallback) {
-        observerCallback = cb;
-      }
-      observe = vi.fn();
-      unobserve = vi.fn();
-      disconnect = vi.fn();
-      takeRecords = () => [];
-      root = null;
-      rootMargin = "";
-      thresholds = [];
-    }
-    vi.stubGlobal("IntersectionObserver", TestObserver);
+    const observer = stubIntersectionObserver();
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
 
     const fetchNextPage = vi.fn();
     const rows = [conv("conv_mine", "Claude Code")]; // owned only on this page
@@ -2124,7 +2138,7 @@ describe("Sidebar tabs", () => {
     showSharedTab();
     // False-empty on the loaded window, but the sentinel is still mounted.
     expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
-    observerCallback?.(
+    observer.callback?.(
       [{ isIntersecting: true } as IntersectionObserverEntry],
       {} as IntersectionObserver,
     );
@@ -2198,22 +2212,10 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
 
     // Capture the IntersectionObserver callback so the test can simulate the
     // sentinel entering the scroll viewport.
-    let observerCallback: IntersectionObserverCallback | undefined;
-    const observe = vi.fn();
-    const disconnect = vi.fn();
-    class TestObserver {
-      constructor(cb: IntersectionObserverCallback) {
-        observerCallback = cb;
-      }
-      observe = observe;
-      unobserve = vi.fn();
-      disconnect = disconnect;
-      takeRecords = () => [];
-      root = null;
-      rootMargin = "";
-      thresholds = [];
-    }
-    vi.stubGlobal("IntersectionObserver", TestObserver);
+    const observer = stubIntersectionObserver();
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
 
     const fetchNextPage = vi.fn();
     const rows = [conv("conv_mine", "Claude Code")];
@@ -2235,16 +2237,14 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     renderSidebar();
 
     // The sentinel is observed, and nothing is fetched until it intersects.
-    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observer.observe).toHaveBeenCalledTimes(1);
     expect(fetchNextPage).not.toHaveBeenCalled();
 
     // Simulate the sentinel leaving view, then entering it.
-    observerCallback!([{ isIntersecting: false } as IntersectionObserverEntry], {} as never);
+    observer.callback!([{ isIntersecting: false } as IntersectionObserverEntry], {} as never);
     expect(fetchNextPage).not.toHaveBeenCalled();
-    observerCallback!([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
+    observer.callback!([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
     expect(fetchNextPage).toHaveBeenCalledTimes(2);
-
-    vi.unstubAllGlobals();
   });
 });
 
@@ -2875,22 +2875,7 @@ describe("Sidebar project Show more", () => {
   });
 
   it("lists every session and auto-loads more pages when pagination is turned off", async () => {
-    let observerCallback: IntersectionObserverCallback | undefined;
-    let observerOptions: IntersectionObserverInit | undefined;
-    class TestObserver {
-      constructor(cb: IntersectionObserverCallback, options?: IntersectionObserverInit) {
-        observerCallback = cb;
-        observerOptions = options;
-      }
-      observe = vi.fn();
-      unobserve = vi.fn();
-      disconnect = vi.fn();
-      takeRecords = () => [];
-      root = null;
-      rootMargin = "";
-      thresholds = [];
-    }
-    vi.stubGlobal("IntersectionObserver", TestObserver);
+    const observer = stubIntersectionObserver();
     onTestFinished(() => {
       vi.unstubAllGlobals();
     });
@@ -2912,11 +2897,11 @@ describe("Sidebar project Show more", () => {
     // The folder's end is watched within the sidebar's own scroll container.
     const scrollContainer = screen.getByText("Customer X").closest("nav");
     expect(scrollContainer).not.toBeNull();
-    expect(observerOptions?.root).toBe(scrollContainer);
+    expect(observer.options?.root).toBe(scrollContainer);
     // Scrolling the folder's end into view fetches its next server page.
     // Await the settled fetch so the sentinel's follow-up render stays inside act.
     await act(async () => {
-      observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
+      observer.callback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
     });
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
     refresh();

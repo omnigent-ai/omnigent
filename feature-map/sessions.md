@@ -263,7 +263,8 @@ choose Rename project. Start typing as soon as the dialog opens.
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
 the ⌘K / Ctrl+K palette or a link also lists down to that session, once the
-sidebar has loaded it.
+sidebar has loaded it. To list every session instead, turn off Settings →
+Appearance → Sidebar → "Show project sessions 5 at a time".
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
