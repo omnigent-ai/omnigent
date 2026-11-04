@@ -31,6 +31,8 @@ _NOTE_TOOL = f"mcp__{_USER_SERVER}__read_note"
 _SESSION_TOOL = "mcp__omnigent__sys_session_get_info"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
+# The CLI and host inventory would read an inherited config dir instead of the seeded HOME.
+_HOST_ENV = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "CLAUDE_CONFIG_DIR": None}
 
 
 def _host_config(mock_url: str) -> dict[str, object]:
@@ -135,7 +137,7 @@ def test_claude_sdk_mcp_panel_lists_host_managed_server_sign_in_state(
         isolated_host(
             tmp_path / "host",
             live_server,
-            env={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+            env=_HOST_ENV,
             config=_host_config(mock_llm_server_url),
             command=_host_command(live_server, managed),
             ready=lambda started: started.wait_online(client, timeout=120),
@@ -293,7 +295,7 @@ def test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session(
             isolated_host(
                 tmp_path / "host",
                 live_server,
-                env={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+                env=_HOST_ENV,
                 config=_host_config(mock_llm_server_url),
                 command=_host_command(live_server, managed),
                 ready=lambda started: started.wait_online(client, timeout=120),
