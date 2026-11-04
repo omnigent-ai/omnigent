@@ -1,4 +1,4 @@
-"""Real Pi connects to MCP servers that only Claude Code and Cursor configure.
+"""Real Pi connects to MCP servers that only Claude Code, Codex and Cursor configure.
 
 Run with ``pytest tests/e2e/test_pi_native_host_mcp_e2e.py -v``. Needs a Pi CLI
 with built-in MCP (0.99 or newer) on ``PATH`` or in ``OMNIGENT_PI_PATH``. The
@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import click
@@ -19,8 +22,11 @@ import pytest
 from omnigent.harnesses.pi_native.credentials import PiProviderConfig, pi_native_provider_launch
 from omnigent.harnesses.pi_native.main import pi_version, resolve_pi_executable
 from omnigent.host import mcp_inventory
+from tests._helpers.live_server import find_free_port, terminate_process
 
-_ECHO_SERVER = Path(__file__).parents[1] / "tools" / "fixtures" / "echo_stdio_mcp_server.py"
+_FIXTURES = Path(__file__).parents[1] / "tools" / "fixtures"
+_ECHO_SERVER = _FIXTURES / "echo_stdio_mcp_server.py"
+_ECHO_HTTP_SERVER = _FIXTURES / "echo_http_mcp_server.py"
 _FIRST_PI_WITH_MCP = (0, 99)
 
 
@@ -61,15 +67,40 @@ def _echo_server_recording(variable: str, record: Path, value: str) -> dict[str,
     }
 
 
+@pytest.fixture
+def echo_http_port() -> Iterator[int]:
+    """A local streamable-HTTP MCP server serving ``/mcp`` on the yielded port."""
+    port = find_free_port()
+    server = subprocess.Popen(
+        [sys.executable, str(_ECHO_HTTP_SERVER), str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                break
+            except OSError:
+                if time.monotonic() > deadline or server.poll() is not None:
+                    raise
+                time.sleep(0.2)
+        yield port
+    finally:
+        terminate_process(server)
+
+
 def test_managed_pi_session_connects_to_host_servers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pi_host_mcp_servers: None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pi_host_mcp_servers: None, echo_http_port: int
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(home / "codex"))
+    monkeypatch.setenv("ECHO_HTTP_PORT", str(echo_http_port))
     monkeypatch.setattr(mcp_inventory, "_managed_mcp_paths", tuple)
     (home / ".claude.json").write_text(
         json.dumps(
@@ -78,10 +109,25 @@ def test_managed_pi_session_connects_to_host_servers(
                     "claude-echo": _echo_server_recording(
                         "ECHO_TOKEN", tmp_path / "claude-env", "${ECHO_TOKEN}"
                     ),
+                    "claude-http": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:${ECHO_HTTP_PORT}/mcp",
+                        "headers": {"X-Echo-Token": "${ECHO_TOKEN}"},
+                    },
                     "shared": {"command": "/nonexistent/host-version"},
                 }
             }
         ),
+        encoding="utf-8",
+    )
+    # Codex values are literal, so Pi must not interpolate this one.
+    codex = _echo_server_recording("LITERAL", tmp_path / "codex-env", "${ECHO_TOKEN} $5")
+    (home / "codex").mkdir()
+    (home / "codex" / "config.toml").write_text(
+        "[mcp_servers.codex-echo]\n"
+        f"command = {json.dumps(codex['command'])}\n"
+        f"args = {json.dumps(codex['args'])}\n"
+        f"env = {{ LITERAL = {json.dumps(codex['env']['LITERAL'])} }}\n",
         encoding="utf-8",
     )
     (home / ".cursor").mkdir()
@@ -133,10 +179,13 @@ def test_managed_pi_session_connects_to_host_servers(
     states = {server["name"]: (server["state"], server["tools"]) for server in report["servers"]}
     assert states == {
         "claude-echo": ("connected", ["echo"]),
+        "claude-http": ("connected", ["echo", "slow_echo"]),
+        "codex-echo": ("connected", ["echo"]),
         "cursor-echo": ("connected", ["echo"]),
         "shared": ("connected", ["echo"]),
     }
     assert (tmp_path / "claude-env").read_text(encoding="utf-8") == "synthetic-token"
+    assert (tmp_path / "codex-env").read_text(encoding="utf-8") == "${ECHO_TOKEN} $5"
     assert (tmp_path / "cursor-env").read_text(encoding="utf-8") == "$5"
     assert (pi_agent / "mcp.json").read_text(encoding="utf-8") == user_config
     assert sorted(path.name for path in pi_agent.iterdir()) == ["mcp.json"]

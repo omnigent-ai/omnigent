@@ -84,7 +84,7 @@ def _pi_template(
             parts.append(inline[name].replace("$", "$$"))
         elif not _ENV_NAME.match(name):
             raise ValueError("unsupported substitution")
-        elif separator and not pi_env.get(name):
+        elif separator and name not in pi_env:
             parts.append(default.replace("$", "$$"))
         else:
             parts.append("${" + name + "}")

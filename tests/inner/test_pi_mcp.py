@@ -100,11 +100,15 @@ def test_claude_stdio_keeps_secrets_as_pi_variables(monkeypatch: pytest.MonkeyPa
     }
 
 
-def test_claude_default_yields_to_a_set_variable(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LEVEL", "debug")
-    servers = pi_mcp_servers_from_host(
-        [_server("tool", "claude", {"command": "tool", "env": {"LEVEL": "${LEVEL:-info}"}})]
-    )
+@pytest.mark.parametrize("level", ["debug", ""])
+def test_claude_default_yields_to_a_set_variable(
+    monkeypatch: pytest.MonkeyPatch, level: str
+) -> None:
+    """A set variable, even an empty one, wins over its default in args and env alike."""
+    monkeypatch.setenv("LEVEL", level)
+    config = {"command": "tool", "args": ["${LEVEL:-info}"], "env": {"LEVEL": "${LEVEL:-info}"}}
+    servers = pi_mcp_servers_from_host([_server("tool", "claude", config)])
+    assert servers["tool"]["args"] == [level]
     assert servers["tool"]["env"] == {"LEVEL": "${LEVEL}"}
 
 
@@ -424,6 +428,14 @@ def test_reused_dir_regenerates_and_relinks(home: Path, pi_agent: Path) -> None:
     _prepare(home, pi_agent)
     assert (managed / "mcp.json").resolve() == (pi_agent / "mcp.json").resolve()
 
+    # Replacing the link with a copy must never write through it to the user's file.
+    user_bytes = (pi_agent / "mcp.json").read_bytes()
+    _write_json(claude, {"mcpServers": {"github": {"command": "v2"}, "docs": {"command": "d"}}})
+    _prepare(home, pi_agent)
+    assert not (managed / "mcp.json").is_symlink()
+    assert _managed_servers(managed) == {"github": {"command": "mine"}, "docs": {"command": "d"}}
+    assert (pi_agent / "mcp.json").read_bytes() == user_bytes
+
     (pi_agent / "mcp.json").unlink()
     claude.unlink()
     _prepare(home, pi_agent)
@@ -520,15 +532,3 @@ def test_failed_refresh_does_not_block_launch_or_keep_a_stale_copy(
     assert (managed / "mcp.json").resolve() == user_file.resolve()
     assert user_file.read_text(encoding="utf-8") == user_config
     assert not list(managed.glob(".mcp.json.*"))
-
-
-def test_generated_copy_never_writes_through_a_link(home: Path, pi_agent: Path) -> None:
-    _write_json(pi_agent / "mcp.json", {"mcpServers": {}})
-    managed = _prepare(home, pi_agent)
-    assert (managed / "mcp.json").is_symlink()
-
-    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
-    _prepare(home, pi_agent)
-
-    assert not (managed / "mcp.json").is_symlink()
-    assert json.loads((pi_agent / "mcp.json").read_text(encoding="utf-8")) == {"mcpServers": {}}
