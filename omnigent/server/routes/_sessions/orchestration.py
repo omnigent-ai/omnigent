@@ -441,6 +441,7 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
 
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
@@ -10800,6 +10801,24 @@ def _installed_native_harnesses(host: Host | None) -> list[str]:
     ]
 
 
+def _no_native_candidate_error(host: Host | None) -> str:
+    """Explain why *host* offers Smart Routing no native candidate.
+
+    :param host: The session's target host, or ``None``.
+    :returns: The tmux remedy when an installed CLI is blocked only by tmux,
+        else the generic "no native CLI" message.
+    """
+    from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
+
+    readiness = (getattr(host, "configured_harnesses", None) if host is not None else None) or {}
+    if any(readiness.get(h) == HARNESS_TMUX_UNAVAILABLE for h in AUTO_NATIVE_ROUTING_HARNESSES):
+        return (
+            f"Native CLIs on this host need tmux {MIN_TMUX_VERSION_HINT} or newer. "
+            "Install or upgrade tmux on the host, then check the harness again."
+        )
+    return "No native CLI is installed on this host."
+
+
 def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -> list[str]:
     """Which of *harnesses* this host does not back with the workspace Unity Gateway.
 
@@ -11414,7 +11433,7 @@ async def _resolve_native_smart_routing(
     backed = not ungatewayed
     installed = _installed_native_harnesses(host)
     if not installed:
-        return None, None, None, "No native CLI is installed on this host."
+        return None, None, None, _no_native_candidate_error(host)
 
     # Choosing BETWEEN native panes belongs to the workspace router: its menu is
     # what ranks two CLIs against one task, and the pick is baked into the

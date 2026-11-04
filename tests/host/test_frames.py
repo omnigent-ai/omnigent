@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Callable
 
 import pytest
 
+from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
@@ -1204,22 +1206,63 @@ def test_tmux_unavailable_readiness_survives_hello_and_live_refresh() -> None:
     assert refresh.configured_harnesses == configured
 
 
+_ReadinessFrame = (
+    HostHelloFrame
+    | HostHarnessReadinessFrame
+    | HostInstallHarnessResultFrame
+    | HostRefreshHarnessesResultFrame
+    | HostHarnessLoginCompletedFrame
+    | HostHarnessLogoutResultFrame
+    | HostStoreSecretResultFrame
+)
+# Every frame class frame_for_server rewrites, built around one readiness map.
+_READINESS_FRAME_FACTORIES: dict[
+    str, Callable[[dict[str, HarnessAvailability]], _ReadinessFrame]
+] = {
+    "hello": lambda configured: HostHelloFrame(
+        version="0.1.0", frame_protocol_version=1, name="laptop", configured_harnesses=configured
+    ),
+    "readiness": lambda configured: HostHarnessReadinessFrame(configured_harnesses=configured),
+    "install_result": lambda configured: HostInstallHarnessResultFrame(
+        request_id="req_1", status="ok", configured_harnesses=configured
+    ),
+    "refresh_result": lambda configured: HostRefreshHarnessesResultFrame(
+        request_id="req_1", status="ok", configured_harnesses=configured
+    ),
+    "login_completed": lambda configured: HostHarnessLoginCompletedFrame(
+        login_id="login_1", success=True, configured_harnesses=configured
+    ),
+    "logout_result": lambda configured: HostHarnessLogoutResultFrame(
+        request_id="req_1", status="ok", configured_harnesses=configured
+    ),
+    "store_secret_result": lambda configured: HostStoreSecretResultFrame(
+        request_id="req_1", status="ok", configured_harnesses=configured
+    ),
+}
+
+
+@pytest.mark.parametrize("frame_kind", sorted(_READINESS_FRAME_FACTORIES))
 @pytest.mark.parametrize(
     ("server_capabilities", "expected_native"),
     [(frozenset(), True), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
+    ids=["older-server", "tmux-aware-server"],
 )
 def test_frame_for_server_down_maps_tmux_for_older_servers(
-    server_capabilities: frozenset[str], expected_native: bool | str
+    frame_kind: str, server_capabilities: frozenset[str], expected_native: bool | str
 ) -> None:
     """An older server gets the pre-tmux-check ``True``; a tmux-aware server gets the new state."""
-    frame = HostHarnessReadinessFrame(
-        configured_harnesses={"claude-native": "tmux-unavailable", "codex": True}
+    frame = _READINESS_FRAME_FACTORIES[frame_kind](
+        {"claude-native": "tmux-unavailable", "codex": True}
     )
 
     sent = frame_for_server(frame, server_capabilities)
 
+    assert type(sent) is type(frame)
+    assert isinstance(sent, _ReadinessFrame)
     assert sent.configured_harnesses == {"claude-native": expected_native, "codex": True}
     assert frame.configured_harnesses == {"claude-native": "tmux-unavailable", "codex": True}
+    # The rewritten frame must still encode for the wire.
+    encode_host_frame(sent)
 
 
 def test_parse_server_capabilities_tolerates_spacing_and_absence() -> None:

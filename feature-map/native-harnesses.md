@@ -242,6 +242,17 @@ only when the server enables the `import_review` release feature.
 Settings. Activate either the credential card or its Reconfigure affordance;
 both open the same repair flow.
 
+**Native tmux repair:** use a host whose tmux is missing, older than 3.3, or
+prints no readable version. Ready native harnesses then show **needs tmux** in
+the New Chat picker and Settings → Harnesses (CLI install, update and sign-in
+problems still show first). Open **Set up tmux** in Settings, or the picker's
+setup action, to reach the tmux step: copy `brew install tmux` (on Linux, use
+the package manager), then press **Check again**. Without Check again, the host
+picks tmux up on its next periodic readiness refresh, about a minute later.
+The desktop app keeps the PATH it started with, so if tmux went into a new PATH
+directory, quit and reopen the app. Signing in or saving a credential on a host
+without tmux continues to the same tmux step.
+
 **Harness account sign-in and switching:** Settings → Harnesses → Codex or
 Claude. Use **Sign in again** on an expired Codex card, or open the configured
 harness and choose **Switch account**. For Codex, open or copy the HTTPS device

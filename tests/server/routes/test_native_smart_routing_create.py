@@ -37,6 +37,7 @@ from omnigent.server.routes._sessions.common import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     _installed_native_harnesses,
+    _no_native_candidate_error,
     _pre_session_model_catalog,
 )
 from omnigent.server.smart_routing import (
@@ -1049,6 +1050,35 @@ def test_installed_native_harnesses_follows_host_readiness(
     host: Host | None, expected: list[str]
 ) -> None:
     assert _installed_native_harnesses(host) == expected
+
+
+_NO_NATIVE_CLI = "No native CLI is installed on this host."
+_TMUX_REMEDY = (
+    "Native CLIs on this host need tmux 3.3 or newer. "
+    "Install or upgrade tmux on the host, then check the harness again."
+)
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        (
+            _host({"claude-native": "tmux-unavailable", "codex-native": "tmux-unavailable"}),
+            _TMUX_REMEDY,
+        ),
+        # The installed CLI is blocked by tmux, so tmux is still the remedy.
+        (
+            _host({"claude-native": "tmux-unavailable", "codex-native": "binary-missing"}),
+            _TMUX_REMEDY,
+        ),
+        (_host({"claude-native": "binary-missing", "codex-native": False}), _NO_NATIVE_CLI),
+        (None, _NO_NATIVE_CLI),
+    ],
+)
+def test_no_native_candidate_error_names_tmux_when_it_is_the_blocker(
+    host: Host | None, expected: str
+) -> None:
+    assert _no_native_candidate_error(host) == expected
 
 
 # ── Credential-provider gating ──────────────────────────────────────────────

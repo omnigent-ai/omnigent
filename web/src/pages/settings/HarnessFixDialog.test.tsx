@@ -1629,6 +1629,38 @@ describe("HarnessFixDialog", () => {
     ).toBe(true);
   });
 
+  it("continues from a saved credential to tmux repair when tmux is the remaining blocker", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/credentials/detected")) return json({ credentials: [] });
+      if (url.endsWith("/credential")) {
+        expect(init?.method).toBe("POST");
+        return json({
+          object: "harness_credential",
+          harness: "codex-native",
+          configured_harnesses: { "codex-native": "tmux-unavailable" },
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
+    await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
+    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+
+    expect(
+      await screen.findByRole("heading", { name: "Set up tmux on Local laptop" }),
+    ).toBeVisible();
+    expect(screen.getByText("brew install tmux")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Check again" })).toBeVisible();
+    expect(props.onFixed).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith(
+      "Saved. Codex still needs tmux 3.3 or newer on Local laptop.",
+    );
+  });
+
   it("disables Check again while the readiness request is in flight", async () => {
     let resolveRefresh: ((response: Response) => void) | undefined;
     const refresh = new Promise<Response>((resolve) => {
