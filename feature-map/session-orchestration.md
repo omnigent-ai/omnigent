@@ -24,7 +24,9 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
-  Managed creation uses the server's configured default sandbox provider.
+  Managed creation uses the server's configured default sandbox provider. An
+  independent session is filed in its creator's project, if that project still
+  exists; the project's agent and workspace defaults don't apply to it.
 - `sharing`: sharing the sender with edit (or higher) access, including public
   edit, blocks subsequent sends and independent creates. Read-only grants,
   including public read and default-public sessions, do not: viewers cannot add
