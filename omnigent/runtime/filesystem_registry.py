@@ -1508,9 +1508,8 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
                         raise GitStatusUnavailable("Repository discovery limit exceeded")
                     if entry.name in _SKIP_DIRS or not entry.is_dir(follow_symlinks=False):
                         continue
-                    root = Path(entry.path)
-                    if _is_git_repo(root):
-                        roots[entry.name] = root
+                    if self._is_repository(Path(entry.name)):
+                        roots[entry.name] = Path(entry.path)
                         if len(roots) > 32:
                             raise GitStatusUnavailable("Workspace exceeds 32 repositories")
             # Deeper repositories are found only from files this session changed.
@@ -1569,17 +1568,25 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
             if deadline is not None and time.monotonic() > deadline:
                 raise TimeoutError("Repository discovery deadline passed")
             visited.append(prefix)
-            root = self._cwd / prefix
-            # A symlinked component can lead outside the workspace, where Git cannot run.
-            if (
-                (root / ".git").exists()
-                and _normalize_path(str(prefix), self._cwd) == str(prefix)
-                and _is_git_repo(root)
-            ):
-                owner = "/".join(parts[:depth]), root
+            if self._is_repository(prefix):
+                owner = "/".join(parts[:depth]), self._cwd / prefix
                 break
         checked.update(dict.fromkeys(visited, owner))
         return owner
+
+    def _is_repository(self, prefix: Path) -> bool:
+        """Return whether workspace-relative *prefix* is a repository Git can run in."""
+        root = self._cwd / prefix
+        try:
+            return (
+                (root / ".git").exists()
+                # A symlinked component can lead outside the workspace, where Git cannot run.
+                and _normalize_path(str(prefix), self._cwd) == str(prefix)
+                and _is_git_repo(root)
+            )
+        except (OSError, UnicodeDecodeError):
+            # Unsearchable folders and undecodable markers are not repositories.
+            return False
 
     def _reader(self, root: Path) -> GitFilesystemRegistry:
         if self._run_repository_git is None:

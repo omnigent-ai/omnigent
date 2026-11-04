@@ -1655,20 +1655,57 @@ def test_nested_discovery_skips_repositories_reached_through_symlinked_directori
 
 def test_directories_with_invalid_git_entries_keep_recorded_changes(tmp_path: Path) -> None:
     registry = MultiRepositoryFilesystemRegistry(tmp_path)
-    paths = ["group/vendor/x.txt", "notes.txt", "vendor/y.txt"]
+    paths = [
+        "binary/w.txt",
+        "group/binary/z.txt",
+        "group/vendor/x.txt",
+        "notes.txt",
+        "vendor/y.txt",
+    ]
     for path in paths:
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / path).write_text("edited\n")
         registry.record_change(path, "modified", "session")
     (tmp_path / "group" / "vendor" / ".git").mkdir()
     (tmp_path / "vendor" / ".git").mkdir()
+    (tmp_path / "group" / "binary" / ".git").write_bytes(b"\xff")
+    (tmp_path / "binary" / ".git").write_bytes(b"\xff")
     reader = registry.with_git_runner(lambda *_args: pytest.fail("ran Git outside a repository"))
     changes = reader.list_changed_files("session", limit=100)
     assert sorted((r["path"], r.get("repository_root")) for r in changes) == [
         (path, None) for path in paths
     ]
-    record = reader.get_changed_file("session", "group/vendor/x.txt")
-    assert record is not None and "repository_root" not in record
+    for path in ("group/binary/z.txt", "group/vendor/x.txt"):
+        record = reader.get_changed_file("session", path)
+        assert record is not None and "repository_root" not in record
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses permission checks"
+)
+def test_unsearchable_folders_keep_recorded_changes(tmp_path: Path) -> None:
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    paths = ["locked/x.txt", "loose/locked/sub/y.txt", "notes.txt"]
+    for path in paths:
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text("edited\n")
+        registry.record_change(path, "modified", "session")
+    locked = [tmp_path / "locked", tmp_path / "loose" / "locked"]
+    for directory in locked:
+        directory.chmod(0o600)
+    try:
+        reader = registry.with_git_runner(
+            lambda *_args: pytest.fail("ran Git outside a repository")
+        )
+        changes = reader.list_changed_files("session", limit=100)
+        records = [reader.get_changed_file("session", path) for path in paths[:2]]
+    finally:
+        for directory in locked:
+            directory.chmod(0o700)
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == [
+        (path, None) for path in paths
+    ]
+    assert all(record is not None and "repository_root" not in record for record in records)
 
 
 def test_overlapping_repositories_list_each_path_under_its_nearest_repository(
