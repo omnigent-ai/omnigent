@@ -1991,7 +1991,10 @@ function AppShellImpl() {
     // Phones hide the rail, so the side chat opens in its drawer instead.
     if (isMobileViewport()) openSideChatsPanel();
   }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
-  const showSideChats = supportsSideChat(useChatStore((s) => s.sessionHarness));
+  const showSideChats = supportsSideChat(
+    useChatStore((s) => s.sessionHarness),
+    permissionLevel,
+  );
   // With the panel setting on, sub-agent links open a rail tab beside this chat,
   // revealing the rail if another panel covers it. Ancestors still navigate.
   const parentSessionId = activeSession?.parentSessionId;

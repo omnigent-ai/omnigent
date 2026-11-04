@@ -1637,8 +1637,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .exists()
                 )
 
-            # ponytail: reads the parent's side chats of every user to find the
-            # caller's; fine while a parent has a handful.
+            # Only the parent's owner starts its side chats (the routes check), so
+            # for that owner every row this reads is returned.
             stmt = stmt.where(
                 or_(
                     owns(meta.id),

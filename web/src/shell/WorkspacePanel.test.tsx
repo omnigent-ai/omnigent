@@ -1572,6 +1572,25 @@ describe("WorkspacePanel mobile side chats", () => {
     },
   );
 
+  it.each([
+    [4, true],
+    [3, false],
+  ])("offers a new side chat at permission level %i: %s", (permissionLevel, offered) => {
+    isMobileMock.mockReturnValue(true);
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    try {
+      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true, permissionLevel });
+
+      const drawer = screen.getByTestId("side-chats-panel-drawer");
+      expect(within(drawer).queryByRole("button", { name: "New side chat" }) !== null).toBe(
+        offered,
+      );
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+
   it("shows the selected side chat in the drawer, not the hidden rail", () => {
     isMobileMock.mockReturnValue(true);
     openTabs();

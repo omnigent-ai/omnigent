@@ -22,6 +22,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
 )
@@ -330,9 +331,9 @@ def register_items_routes(
         """
         List the side chats shown as tabs in a session's Workspace rail.
 
-        Lists only the side chats the caller owns, in id order, so a reader of
-        a shared session learns nothing about anyone else's. Closed side chats
-        are included, so other devices can close their tabs.
+        Only the session's owner starts side chats, so only the owner gets any,
+        in id order; a reader of a shared session gets an empty page. Closed
+        side chats are included, so other devices can close their tabs.
 
         :param request: Inbound HTTP request; carries the caller identity.
         :param session_id: Parent session id, e.g. ``"conv_abc123"``.
@@ -350,8 +351,10 @@ def register_items_routes(
             await asyncio.to_thread(conversation_store.get_conversation, session_id) is None
         ):
             raise _session_not_found()
-        if auth_provider is not None and user_id is None:
-            # A signed-out reader of a public session owns no side chats.
+        # Only a session's owner starts its side chats, so no one else has any here.
+        if (auth_provider is not None and user_id is None) or (
+            access.level is not None and access.level < LEVEL_OWNER
+        ):
             return PaginatedList(data=[], has_more=False)
         ids = await asyncio.to_thread(
             conversation_store.list_side_chat_ids,

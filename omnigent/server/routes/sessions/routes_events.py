@@ -269,6 +269,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
     _native_pane_harness,
+    _opens_codex_side_chat,
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
@@ -1261,6 +1262,15 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        if (
+            body.type == "message"
+            and isinstance(request, Request)
+            and _opens_codex_side_chat(conv, body)
+        ):
+            # Only a session's owner can start its side chats.
+            await _require_access_and_level(
+                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
         start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"
         if peer_message:

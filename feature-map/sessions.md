@@ -41,8 +41,9 @@ the header menu), and each place is a separate entry point.
   closing one stops only that chat. Starting one from a stopped generic hosted
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
-  message or Resume. A side chat started on one device appears on the user's
-  other devices, and closing it closes it everywhere.
+  message or Resume. Only the session's owner can start side chats. A side
+  chat started on one device appears on the owner's other devices, and closing
+  it closes it everywhere.
 - `side-chat-settings`: choose a supported model or effort in the side-chat composer;
   selections apply to that chat's next turn independently of its parent, in the
   desktop panel and mobile drawer. Generic side chats allow selection before or
@@ -474,10 +475,11 @@ choose Stop session while a side chat or sub-agent is working. On mobile, open
 the sidebar drawer and long-press the row. The current-turn interrupt control is
 a separate action that leaves the session connected.
 
-**Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
-parent composer, or choose **Start a new side chat** from the composer's add
-tray. Selecting assistant text also offers **Ask in side chat** unless the
-composer is read-only. On mobile,
+**Side-chat lifecycle:** as the session's owner, use **Workspace → + → Side
+chat**, type `/side` in the parent composer, or choose **Start a new side chat**
+from the composer's add tray. Selecting assistant text also offers **Ask in side
+chat** unless the composer is read-only. Viewers and editors of a shared session
+see none of these. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
 chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Sending to

@@ -27,6 +27,7 @@ from omnigent.entities import (
 )
 from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
@@ -746,52 +747,62 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
 
 
 @pytest.mark.asyncio
-async def test_side_chats_are_listed_only_for_the_user_who_started_them(
+async def test_only_the_owner_starts_and_lists_side_chats(
     auth_client: httpx.AsyncClient, client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """Each user of a shared parent lists only their own side chats."""
-    owner, reader = "owner@example.com", "reader@example.com"
-    owner_headers = {"X-Forwarded-Email": owner}
-    reader_headers = {"X-Forwarded-Email": reader}
+    """Editors and readers of a shared parent can't start side chats or see the owner's."""
+    owner, editor, reader = "owner@example.com", "editor@example.com", "reader@example.com"
+    headers = {user: {"X-Forwarded-Email": user} for user in (owner, editor, reader)}
     store = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
     agent = await create_test_agent(client, name="side-chat-privacy")
-    parent = store.create_conversation(agent_id=agent["id"])
-    for user in (owner, reader, RESERVED_USER_PUBLIC):
+    parent = store.create_conversation(agent_id=agent["id"], harness_override="codex-native")
+    for user in (owner, editor, reader, RESERVED_USER_PUBLIC):
         permissions.ensure_user(user)
     permissions.grant(owner, parent.id, LEVEL_OWNER)
+    permissions.grant(editor, parent.id, LEVEL_EDIT)
     permissions.grant(reader, parent.id, LEVEL_READ)
     permissions.grant(RESERVED_USER_PUBLIC, parent.id, LEVEL_READ)
 
-    async def side_chat(headers: dict[str, str]) -> str:
-        response = await auth_client.post(
-            f"/v1/sessions/{parent.id}/fork", json={"side_chat": True}, headers=headers
+    async def fork(user: str, body: dict[str, Any]) -> httpx.Response:
+        return await auth_client.post(
+            f"/v1/sessions/{parent.id}/fork", json=body, headers=headers[user]
         )
-        assert response.status_code == 201, response.text
-        return response.json()["id"]
 
-    owner_side_id = await side_chat(owner_headers)
-    reader_side_id = await side_chat(reader_headers)
+    for user in (editor, reader):
+        refused = await fork(user, {"side_chat": True})
+        assert refused.status_code == 403, refused.text
+    # A Codex /side typed in the web composer starts a side chat too.
+    side_command = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "/side why?"}]},
+        },
+        headers=headers[editor],
+    )
+    assert side_command.status_code == 403, side_command.text
+    # Ordinary forks still need only read access.
+    assert (await fork(reader, {})).status_code == 201
+    started = await fork(owner, {"side_chat": True})
+    assert started.status_code == 201, started.text
     registered = await auth_client.post(
         f"/v1/sessions/{parent.id}/events",
         json={
             "type": "external_codex_subagent_start",
             "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
         },
-        headers=owner_headers,
+        headers=headers[owner],
     )
     assert registered.status_code == 202, registered.text
-    # A Codex /side fork belongs to the parent's owner, who runs its runner.
-    codex_side_id = registered.json()["child_session_id"]
 
-    assert await _side_chat_ids(auth_client, parent.id, headers=owner_headers) == {
-        owner_side_id: False,
-        codex_side_id: False,
+    assert await _side_chat_ids(auth_client, parent.id, headers=headers[owner]) == {
+        started.json()["id"]: False,
+        registered.json()["child_session_id"]: False,
     }
-    assert await _side_chat_ids(auth_client, parent.id, headers=reader_headers) == {
-        reader_side_id: False
-    }
-    # A signed-out viewer of the public parent owns no side chats.
+    for user in (editor, reader):
+        assert await _side_chat_ids(auth_client, parent.id, headers=headers[user]) == {}
+    # A signed-out viewer of the public parent gets none either.
     assert await _side_chat_ids(auth_client, parent.id) == {}
 
 

@@ -1874,7 +1874,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
               containerRef={conversationRef}
               onReply={(text) => composerRef.current?.appendReplyQuote(text)}
               onAskInSideChat={
-                supportsSideChat(selectionSessionHarness)
+                supportsSideChat(selectionSessionHarness, permissionLevel)
                   ? (text) => composerRef.current?.startSideChat(text)
                   : undefined
               }
@@ -2948,7 +2948,7 @@ function ComposerImpl(
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
-  const showSide = supportsSideChat(sessionHarness);
+  const showSide = supportsSideChat(sessionHarness, permissionLevel);
   const slashCommands = useMemo(
     () =>
       buildSlashCommandMap(
@@ -4285,7 +4285,9 @@ function ComposerImpl(
                 planActive={codexPlanMode}
                 planLabel={codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
                 onSideChat={
-                  composerSessionId && !isReadOnly && supportsSideChat(sessionHarness)
+                  composerSessionId &&
+                  !isReadOnly &&
+                  supportsSideChat(sessionHarness, permissionLevel)
                     ? () => {
                         if (usesNativeSideChatFork(sessionHarness)) {
                           // Codex forks in-process from a typed /side; prefill so

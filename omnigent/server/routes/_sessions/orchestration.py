@@ -6995,6 +6995,15 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
 
 
+def _opens_codex_side_chat(conv: Conversation, body: SessionEventInput) -> bool:
+    """Whether a message to *conv* is a Codex ``/side`` command, which forks a side chat."""
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
+
+    return _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
+        _extract_user_text_for_routing(body)
+    )
+
+
 def _native_pane_harness(
     conv: Conversation,
     *,
@@ -8262,11 +8271,7 @@ async def _dispatch_session_event_to_runner_impl(
         # A codex /side command never reaches the main thread — the executor
         # forks it into a side chat — so the transcript forwarder never mirrors
         # it back and this bubble would sit in the parent chat forever.
-        from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
-
-        opens_side_chat = _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
-            _extract_user_text_for_routing(body)
-        )
+        opens_side_chat = _opens_codex_side_chat(conv, body)
         # An older host forwards `/side` to Codex as a plain prompt (no fork), so
         # the web side chat opens and hangs and the question lands on the main
         # thread. Refuse here — before the forward — with a clear reason instead.

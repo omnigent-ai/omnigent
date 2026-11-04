@@ -960,7 +960,7 @@ function WorkspacePanelImpl({
   // that supports side chat.
   const activeAgentId = useChatStore((s) => s.boundAgentId);
   const parentAgentId = agentId === undefined ? activeAgentId : agentId;
-  const onNewSideChat = supportsSideChat(sideChatHarness)
+  const onNewSideChat = supportsSideChat(sideChatHarness, permissionLevel)
     ? () => {
         useChatStore.getState().requestSideChatFocus(sideChats.openPending());
         onRightRailTabChange("sidechat");
