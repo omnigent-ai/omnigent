@@ -3154,8 +3154,13 @@ _CLAUDE_VALUE_FLAGS = frozenset(
 )
 
 
-def _last_claude_option_value(args: list[str], flag: str) -> str | None:
-    """Return the last value Claude Code parses for ``flag``, or ``None`` when absent.
+# Boolean short options of Claude Code 2.1.278-2.1.317 (``-n`` requires a value;
+# ``-d``, ``-r`` and ``-w`` take an optional one).
+_CLAUDE_SHORT_BOOLEAN_FLAGS = frozenset({"-c", "-h", "-p", "-v"})
+
+
+def _locate_claude_option_value(args: list[str], flag: str) -> tuple[int, int] | None:
+    """Locate the last value Claude Code parses for ``flag``.
 
     Tokens owned by another required-value option are skipped, e.g. the
     literal ``--append-system-prompt`` in ``--system-prompt --append-system-prompt``.
@@ -3163,41 +3168,50 @@ def _last_claude_option_value(args: list[str], flag: str) -> str | None:
 
     :param args: Claude CLI arguments, e.g. ``["--append-system-prompt=Be brief."]``.
     :param flag: Required-value option to read, e.g. ``"--append-system-prompt"``.
-    :returns: The flag's last value, which may be empty.
+    :returns: ``(index, offset)`` where ``args[index][offset:]`` is the value, which may
+        be empty, or ``None`` when Claude parses no value for ``flag``.
     """
-    value: str | None = None
+    location: tuple[int, int] | None = None
     idx = 0
     while idx < len(args):
         arg = args[idx]
+        # Claude reads ``-pn`` as ``-p -n``; a value-taking letter keeps the rest as its value.
+        while len(arg) > 2 and arg[:2] in _CLAUDE_SHORT_BOOLEAN_FLAGS:
+            arg = f"-{arg[2:]}"
         if arg == "--":
             break
         name, joined, joined_value = arg.partition("=")
         if joined and name == flag:
-            value = joined_value
+            location = (idx, len(args[idx]) - len(joined_value))
         elif arg in _CLAUDE_VALUE_FLAGS:
             if arg == flag and idx + 1 < len(args):
-                value = args[idx + 1]
+                location = (idx + 1, 0)
             idx += 1
         idx += 1
-    return value
+    return location
 
 
 def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
-    """Append an ``--append-system-prompt`` that puts ``extra`` before the caller's.
+    """Put ``extra`` before the caller's ``--append-system-prompt`` value.
 
-    Claude Code keeps only the last value of the flag, so Omnigent's flag
-    repeats the caller's value after ``extra``. Caller tokens, including an
-    ``--append-system-prompt-file``, are never rewritten. Claude Code 2.1.295+
+    Claude Code keeps only the last value of the flag, so ``extra`` joins that
+    value in place, or a new flag carries it. Other caller tokens, including an
+    ``--append-system-prompt-file``, are left as they are. Claude Code 2.1.295+
     applies such a file before the inline prompt; 2.1.278 refuses to start with both.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
-    :returns: ``args`` ending with a prompt flag whose value carries both prompts.
+    :returns: ``args`` whose last prompt value carries both prompts.
     """
     if not extra:
         return args
-    existing = _last_claude_option_value(args, "--append-system-prompt")
-    args.extend(["--append-system-prompt", f"{extra}\n\n{existing}" if existing else extra])
+    location = _locate_claude_option_value(args, "--append-system-prompt")
+    if location is None:
+        args.extend(["--append-system-prompt", extra])
+        return args
+    idx, offset = location
+    existing = args[idx][offset:]
+    args[idx] = args[idx][:offset] + (f"{extra}\n\n{existing}" if existing else extra)
     return args
 
 

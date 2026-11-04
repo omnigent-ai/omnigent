@@ -4299,57 +4299,82 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
     assert settings["effortLevel"] == "high"
 
 
+_FRAMEWORK_PROMPT = "Keep framework metadata separate."
+
+
 @pytest.mark.parametrize(
-    ("user_args", "expected_prompt"),
+    ("user_args", "merged_args"),
     [
-        ((), "Keep framework metadata separate."),
+        ((), None),
         (
             ("--append-system-prompt", "--- Reviewer profile ---"),
-            "Keep framework metadata separate.\n\n--- Reviewer profile ---",
+            ("--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\n--- Reviewer profile ---"),
         ),
         (
             ("--append-system-prompt=Review carefully.",),
-            "Keep framework metadata separate.\n\nReview carefully.",
+            (f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nReview carefully.",),
         ),
         (
             ("--append-system-prompt", "Earlier.", "--append-system-prompt=Later."),
-            "Keep framework metadata separate.\n\nLater.",
+            (
+                "--append-system-prompt",
+                "Earlier.",
+                f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nLater.",
+            ),
         ),
         (
             ("--append-system-prompt=Earlier.", "--append-system-prompt", ""),
-            "Keep framework metadata separate.",
+            ("--append-system-prompt=Earlier.", "--append-system-prompt", _FRAMEWORK_PROMPT),
         ),
         (
             ("--append-system-prompt=Earlier.", "--append-system-prompt="),
-            "Keep framework metadata separate.",
+            ("--append-system-prompt=Earlier.", f"--append-system-prompt={_FRAMEWORK_PROMPT}"),
         ),
-        (
-            ("--system-prompt", "--append-system-prompt", "--model", "sonnet"),
-            "Keep framework metadata separate.",
-        ),
-        (("--system-prompt", "--append-system-prompt"), "Keep framework metadata separate."),
-        (
-            ("--system-prompt", "--append-system-prompt=literal"),
-            "Keep framework metadata separate.",
-        ),
-        (
-            ("--plan-mode-instructions", "--append-system-prompt", "--model", "sonnet"),
-            "Keep framework metadata separate.",
-        ),
+        (("--system-prompt", "--append-system-prompt", "--model", "sonnet"), None),
+        (("--system-prompt", "--append-system-prompt"), None),
+        (("--system-prompt", "--append-system-prompt=literal"), None),
+        (("--plan-mode-instructions", "--append-system-prompt", "--model", "sonnet"), None),
         (
             ("--append-system-prompt", "Review.", "--agent-name", "--append-system-prompt=Name."),
-            "Keep framework metadata separate.\n\nReview.",
+            (
+                "--append-system-prompt",
+                f"{_FRAMEWORK_PROMPT}\n\nReview.",
+                "--agent-name",
+                "--append-system-prompt=Name.",
+            ),
         ),
-        (("--append-system-prompt-file", "profile.md"), "Keep framework metadata separate."),
-        (("--append-system-prompt-file=profile.md",), "Keep framework metadata separate."),
+        (
+            ("-pn", "--append-system-prompt", "--append-system-prompt", "Review."),
+            (
+                "-pn",
+                "--append-system-prompt",
+                "--append-system-prompt",
+                f"{_FRAMEWORK_PROMPT}\n\nReview.",
+            ),
+        ),
+        (
+            ("-pnReviewer", "--append-system-prompt", "Review."),
+            ("-pnReviewer", "--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\nReview."),
+        ),
+        (("--append-system-prompt-file", "profile.md"), None),
+        (("--append-system-prompt-file=profile.md",), None),
         (
             ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
-            "Keep framework metadata separate.\n\nReview.",
+            (
+                "--append-system-prompt-file",
+                "profile.md",
+                "--append-system-prompt",
+                f"{_FRAMEWORK_PROMPT}\n\nReview.",
+            ),
         ),
-        (("--", "--append-system-prompt=Positional."), "Keep framework metadata separate."),
+        (("--", "--append-system-prompt=Positional."), None),
         (
             ("--system-prompt", "--", "--append-system-prompt", "Review."),
-            "Keep framework metadata separate.\n\nReview.",
+            ("--system-prompt", "--", "--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\nReview."),
+        ),
+        (
+            ("-pn", "--", "--append-system-prompt", "Review."),
+            ("-pn", "--", "--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\nReview."),
         ),
     ],
     ids=[
@@ -4364,20 +4389,23 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
         "owned-joined-literal",
         "owned-by-newer-claude-option",
         "owned-by-teammate-option",
+        "owned-by-bundled-short-option",
+        "value-inside-bundled-short-option",
         "caller-file-separate-value",
         "caller-file-joined-value",
         "caller-file-and-prompt",
         "after-end-of-options",
         "end-of-options-owned-by-option",
+        "end-of-options-owned-by-bundled-short-option",
     ],
 )
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     user_args: tuple[str, ...],
-    expected_prompt: str,
+    merged_args: tuple[str, ...] | None,
 ) -> None:
-    """Caller tokens stay intact; Omnigent's later prompt flag carries the caller's prompt."""
+    """Omnigent's prompt joins the caller's last prompt value, or is added when there is none."""
     # A readable caller prompt file is still left for Claude to read.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
@@ -4385,19 +4413,23 @@ def test_augment_claude_args_appends_caller_system_prompt(
         (),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
-        append_system_prompt="Keep framework metadata separate.",
+        append_system_prompt=_FRAMEWORK_PROMPT,
     )
 
     args = augment_claude_args(
         user_args,
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
-        append_system_prompt="Keep framework metadata separate.",
+        append_system_prompt=_FRAMEWORK_PROMPT,
     )
 
-    assert omnigent_args.count("--append-system-prompt") == 1
-    omnigent_args[omnigent_args.index("--append-system-prompt") + 1] = expected_prompt
-    assert args == [*user_args, *omnigent_args]
+    if merged_args is None:
+        assert args == [*user_args, *omnigent_args]
+    else:
+        # The caller's prompt is sent once, so the launch command does not grow by its size.
+        prompt_index = omnigent_args.index("--append-system-prompt")
+        del omnigent_args[prompt_index : prompt_index + 2]
+        assert args == [*merged_args, *omnigent_args]
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
