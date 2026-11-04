@@ -1034,11 +1034,26 @@ def test_run_outcome_migration_keeps_existing_runs_and_round_trips(
     assert "ix_scheduled_task_runs_conversation_status_scheduled" not in _conversation_indexes(
         engine
     )
+    # Both runs survive the downgrade with their own fields; only the outcome is gone.
     with engine.begin() as conn:
-        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2
+        kept = conn.execute(
+            sa.select(before.c.id, before.c.scheduled_task_id, before.c.status).order_by(
+                before.c.id
+            )
+        ).all()
+    assert [(bytes(r.id), bytes(r.scheduled_task_id), r.status) for r in kept] == [
+        (b"a" * 16, b"t" * 16, 3),
+        (b"b" * 16, b"t" * 16, 3),
+    ]
     with engine.begin() as conn:
         config.attributes["connection"] = conn
         command.upgrade(config, _RUN_OUTCOME_REVISION)
     assert _conversation_indexes(engine)[
         "ix_scheduled_task_runs_conversation_status_scheduled"
     ] == ["workspace_id", "conversation_id", "status", "scheduled_at", "id"]
+    # Re-upgrading does not bring the dropped outcome back.
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        assert conn.execute(
+            sa.select(*(runs.c[name] for name in sorted(_RUN_OUTCOME_COLUMNS))).order_by(runs.c.id)
+        ).all() == [(None, None, None), (None, None, None)]
