@@ -290,6 +290,8 @@ def test_merge_is_unneeded_when_the_user_defines_every_host_server() -> None:
     user = {"mcpServers": {"search_docs": {"command": "mine"}}}
     assert merge_pi_mcp_config(user, {"search-docs": {"command": "host"}}) is None
     assert merge_pi_mcp_config({}, {}) is None
+    with pytest.raises(ValueError, match="mcpServers"):
+        merge_pi_mcp_config({"mcpServers": []}, {"docs": {"command": "host"}})
 
 
 # --- Managed agent dir -------------------------------------------------------
@@ -402,6 +404,17 @@ def test_session_owned_config_in_the_managed_dir_is_kept(
     assert not (pi_agent / "mcp.json").exists()
 
 
+def test_undecodable_digest_keeps_the_managed_config(home: Path, pi_agent: Path) -> None:
+    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
+    managed = _prepare(home, pi_agent)
+    generated = (managed / "mcp.json").read_bytes()
+    (managed / pi_mcp._GENERATED_DIGEST_NAME).write_bytes(b"\xff\xfe")
+
+    _prepare(home, pi_agent)
+
+    assert (managed / "mcp.json").read_bytes() == generated
+
+
 def test_unreadable_user_config_is_linked_not_replaced(
     home: Path, pi_agent: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -418,7 +431,7 @@ def test_unreadable_user_config_is_linked_not_replaced(
     assert "unreadable" in caplog.text
 
 
-@pytest.mark.parametrize("failure", ["inventory", "write"])
+@pytest.mark.parametrize("failure", ["inventory", "write", "digest"])
 def test_failed_refresh_does_not_block_launch_or_keep_a_stale_copy(
     home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -430,7 +443,13 @@ def test_failed_refresh_does_not_block_launch_or_keep_a_stale_copy(
     user_config = '{"mcpServers": {"github": {"enabled": false}}}'
     user_file.write_text(user_config, encoding="utf-8")
 
-    def fail(*_args: object) -> None:
+    write_private_file = pi_mcp._write_private_file
+
+    def fail(path: Path | None = None, content: bytes = b"") -> None:
+        if failure == "digest" and path != managed / pi_mcp._GENERATED_DIGEST_NAME:
+            assert path is not None
+            write_private_file(path, content)
+            return
         raise OSError(f"{failure} failed")
 
     monkeypatch.setattr(
