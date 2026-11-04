@@ -225,6 +225,7 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
 import {
   finishActiveRowGesture,
+  ROW_GESTURE_HOLD_MS,
   ROW_MENU_SYNTHETIC,
   ROW_SWIPE_COMMIT_PX,
   RowGesturePointerSensor,
@@ -232,7 +233,7 @@ import {
 } from "@/hooks/useRowGesture";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
-import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
+import { OWNS_LEFT_SWIPE_ATTRIBUTE, useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
@@ -990,17 +991,19 @@ function SidebarImpl({
   const { width: sidebarWidth, resizing, handleProps: resizeHandleProps } = useResizableSidebar();
 
   // On the open mobile drawer, a leftward swipe slides it shut under the
-  // finger, reusing the open swipe's progress rendering below.
+  // finger, reusing the open swipe's progress rendering below. The Android
+  // shell closes the drawer with the system back gesture instead.
   const drawerRef = useRef<HTMLElement>(null);
   const scrimRef = useRef<HTMLButtonElement>(null);
   const [closeSwipeProgress, setCloseSwipeProgress] = useState<number | null>(null);
   const mobileLayout = useIsMobileViewport();
-  const closeSwipeEnabled = open && mobileLayout && !inSettings && dragProgress == null;
+  const closeSwipeEnabled =
+    open && mobileLayout && !inSettings && dragProgress == null && !isAndroidShell();
   useSidebarSwipeToClose({
     enabled: closeSwipeEnabled,
     drawerRef,
     scrimRef,
-    holdMs: TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
+    holdMs: ROW_GESTURE_HOLD_MS,
     onDragProgress: setCloseSwipeProgress,
     onSettle: (close) => {
       if (close) onClose();
@@ -2019,7 +2022,6 @@ const KEYBOARD_SENSOR_OPTIONS: KeyboardSensorOptions = {
   keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
 };
 const MOUSE_SENSOR_OPTIONS: MouseSensorOptions = { activationConstraint: { distance: 5 } };
-const TOUCH_SENSOR_OPTIONS = { activationConstraint: { delay: 250, tolerance: 8 } };
 // Always-measure so the transient "remove from project" zone (mounted at drag
 // start) is registered as a drop target without a stale layout cache.
 const DND_MEASURING: MeasuringConfiguration = {
@@ -5904,6 +5906,8 @@ function ConversationRowImpl({
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
       data-testid="conversation-swipe-frame"
+      // A leftward swipe here runs the row's action, not the drawer's swipe-to-close.
+      {...{ [OWNS_LEFT_SWIPE_ATTRIBUTE]: swipeEnabled && hasSwipeLeft ? "" : undefined }}
       {...rowGestureListeners}
       onContextMenuCapture={(e) => {
         if (!(ROW_MENU_SYNTHETIC in e.nativeEvent)) touchContextMenuRef.current = false;
