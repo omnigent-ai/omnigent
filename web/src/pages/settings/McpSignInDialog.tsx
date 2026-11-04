@@ -140,7 +140,7 @@ export function McpSignInDialog({
         setPhase({ kind: "error", message: "This sign-in ended on the host." });
         return;
       }
-      // The sign-in keeps running on the host, so ride out a brief outage.
+      // Retry brief request failures; a host reconnect ends the sign-in instead.
       pollFailures += 1;
       if (pollFailures < MAX_POLL_FAILURES) timer = window.setTimeout(poll, MCP_LOGIN_POLL_MS);
       else fail(error);

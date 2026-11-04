@@ -21,6 +21,8 @@ from mcp.shared.auth import OAuthToken
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from tests._helpers.polling import poll_until
+
 
 @dataclass
 class _Provider:
@@ -149,11 +151,11 @@ def oauth_mcp_server(title: str = "Demo Issues") -> Iterator[OAuthMcpServer]:
         thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
         thread.start()
         try:
-            deadline = time.monotonic() + 10
-            while not server.started:
-                if time.monotonic() > deadline or not thread.is_alive():
-                    raise RuntimeError("OAuth MCP server did not start")
-                time.sleep(0.05)
+            poll_until(
+                lambda: server.started or not thread.is_alive(), timeout_s=10, interval_s=0.05
+            )
+            if not server.started:
+                raise RuntimeError("OAuth MCP server did not start")
             yield OAuthMcpServer(f"{base}/mcp", provider)
         finally:
             server.should_exit = True
