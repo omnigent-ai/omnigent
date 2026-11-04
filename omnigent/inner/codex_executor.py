@@ -1990,6 +1990,31 @@ def write_codex_model_catalog(
     return path
 
 
+def _write_codex_config(config_path: Path, text: str) -> bool:
+    """Publish a complete private config, retaining the prior file on failure."""
+    temporary_path: Path | None = None
+    try:
+        config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f"{config_path.name}.",
+            dir=config_path.parent,
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(text)
+        os.replace(temporary_path, config_path)
+    except OSError as exc:
+        logger.warning("could not write %s (%s)", config_path, exc)
+        return False
+    finally:
+        if temporary_path is not None:
+            with suppress(FileNotFoundError):
+                temporary_path.unlink()
+    return True
+
+
 def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     """
     Point the session's private ``config.toml`` at *catalog_path*.
@@ -2011,21 +2036,7 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     if "model_catalog_json" in document:
         return False
     document["model_catalog_json"] = str(catalog_path)
-    config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(config_path.parent))
-    try:
-        os.chmod(tmp_name, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(tomlkit.dumps(document))
-        os.replace(tmp_name, config_path)
-        os.chmod(config_path, 0o600)
-    except OSError as exc:
-        logger.warning("could not write %s (%s)", config_path, exc)
-        return False
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(tmp_name)
-    return True
+    return _write_codex_config(config_path, tomlkit.dumps(document))
 
 
 def write_required_brokered_model_catalog(
@@ -2119,10 +2130,7 @@ def _normalize_copied_codex_catalog_paths(config_path: Path, source_home: Path) 
                 layer["model_catalog_json"] = resolved
                 changed = True
     if changed:
-        try:
-            config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
-        except OSError:
-            logger.warning("could not normalize model_catalog_json in %s", config_path)
+        _write_codex_config(config_path, tomlkit.dumps(document))
 
 
 def _normalize_copied_codex_effort(

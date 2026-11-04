@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import errno
+import io
 import json
 import os
 import stat
@@ -4028,6 +4029,67 @@ def test_populate_codex_home_config_config_toml_copy_is_isolated(
 
     # Source must be untouched.
     assert (source / "config.toml").read_text() == original
+
+
+@pytest.mark.parametrize("failure_stage", ["create", "write", "close", "replace"])
+def test_catalog_normalization_failure_preserves_complete_private_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    from omnigent.inner.codex_executor import _normalize_copied_codex_catalog_paths
+
+    source = tmp_path / "source"
+    source.mkdir()
+    original = 'model_catalog_json = "models.json" # keep my catalog\nmodel_provider = "custom"\n'
+    (source / "config.toml").write_text(original)
+    private = tmp_path / "private"
+    private.mkdir()
+    copied = private / "config.toml"
+    copied.write_text(original)
+    copied.chmod(0o600)
+    failures: list[str] = []
+    real_open = io.open
+
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        failures.append(failure_stage)
+        raise OSError(errno.ENOSPC, "injected config publication failure")
+
+    def failing_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        stream = real_open(file, mode, *args, **kwargs)
+        if mode.startswith("w"):
+            real_write, real_close = stream.write, stream.close
+
+            def write(text: str) -> int:
+                real_write(text[:8])
+                stream.flush()
+                fail()
+                return 0
+
+            def close() -> None:
+                if stream.closed:
+                    return
+                real_close()
+                fail()
+
+            if failure_stage == "write":
+                stream.write = write
+            elif failure_stage == "close":
+                stream.close = close
+        return stream
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(io, "open", failing_open)
+        if failure_stage == "create":
+            scoped.setattr(tempfile, "NamedTemporaryFile", fail)
+        elif failure_stage == "replace":
+            scoped.setattr(os, "replace", fail)
+        _normalize_copied_codex_catalog_paths(copied, source)
+
+    assert failures, "the injected publication failure must be exercised"
+    assert copied.read_text() == original
+    assert (source / "config.toml").read_text() == original
+    if os.name != "nt":
+        assert stat.S_IMODE(copied.stat().st_mode) == 0o600
+    assert sorted(path.name for path in private.iterdir()) == ["config.toml"]
 
 
 def test_populate_codex_home_config_normalizes_deprecated_effort(tmp_path: Path) -> None:
