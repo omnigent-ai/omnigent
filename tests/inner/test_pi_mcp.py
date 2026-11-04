@@ -14,6 +14,7 @@ from omnigent.host.mcp_inventory import ConfiguredMcpServer
 from omnigent.inner import pi_mcp
 from omnigent.inner.pi_mcp import merge_pi_mcp_config, pi_mcp_servers_from_host
 from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
+from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
 
 def _server(
@@ -105,6 +106,42 @@ def test_claude_default_yields_to_a_set_variable(monkeypatch: pytest.MonkeyPatch
         [_server("tool", "claude", {"command": "tool", "env": {"LEVEL": "${LEVEL:-info}"}})]
     )
     assert servers["tool"]["env"] == {"LEVEL": "${LEVEL}"}
+
+
+@pytest.mark.parametrize("secret", sorted(RUNNER_AUTH_SECRET_ENV_VARS))
+def test_runner_auth_secrets_are_never_resolved_into_the_config(
+    monkeypatch: pytest.MonkeyPatch, secret: str
+) -> None:
+    """A server that reads a runner auth secret is dropped; other variables still resolve."""
+    monkeypatch.setenv(secret, "sentinel-runner-secret")
+    monkeypatch.setenv("TOOL_HOME", "/opt/tool")
+    servers = pi_mcp_servers_from_host(
+        [
+            _server("leaky-args", "claude", {"command": "tool", "args": ["${" + secret + "}"]}),
+            _server("leaky-url", "claude", {"type": "http", "url": "https://h/${" + secret + "}"}),
+            _server("leaky-default", "claude", {"command": "${" + secret + ":-tool}"}),
+            _server("ok", "claude", {"command": "${TOOL_HOME}/tool"}),
+        ]
+    )
+    assert servers == {"leaky-default": {"command": "tool"}, "ok": {"command": "/opt/tool/tool"}}
+    assert "sentinel-runner-secret" not in json.dumps(servers)
+
+
+def test_placeholders_resolve_against_the_pi_process_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Variables the Pi process will not receive are not resolved from the runner's env."""
+    monkeypatch.setenv("RUNNER_ONLY", "runner-value")
+    servers = pi_mcp_servers_from_host(
+        [
+            _server("runner-only", "claude", {"command": "tool", "args": ["${RUNNER_ONLY}"]}),
+            _server(
+                "passed",
+                "claude",
+                {"command": "${TOOL_HOME}/tool", "env": {"LEVEL": "${RUNNER_ONLY:-info}"}},
+            ),
+        ],
+        {"TOOL_HOME": "/opt/tool"},
+    )
+    assert servers == {"passed": {"command": "/opt/tool/tool", "env": {"LEVEL": "info"}}}
 
 
 def test_claude_http_resolves_url_and_templates_headers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -298,10 +335,15 @@ def test_merge_is_unneeded_when_the_user_defines_every_host_server() -> None:
 
 
 def test_missing_pi_config_gets_host_servers_from_every_harness(
-    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch
+    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(home / "codex"))
-    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "gh-mcp"}}})
+    monkeypatch.setenv("GITHUB_TOKEN", "sentinel-github-token")
+    caplog.set_level(logging.DEBUG)
+    _write_json(
+        home / ".claude.json",
+        {"mcpServers": {"github": {"command": "gh-mcp", "env": {"TOKEN": "${GITHUB_TOKEN}"}}}},
+    )
     (home / "codex").mkdir()
     (home / "codex" / "config.toml").write_text(
         '[mcp_servers.docs]\ncommand = "docs-mcp"\n\n'
@@ -319,10 +361,12 @@ def test_missing_pi_config_gets_host_servers_from_every_harness(
     assert not target.is_symlink()
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert _managed_servers(managed) == {
-        "github": {"command": "gh-mcp"},
+        "github": {"command": "gh-mcp", "env": {"TOKEN": "${GITHUB_TOKEN}"}},
         "docs": {"command": "docs-mcp"},
         "linear": {"url": "https://mcp.linear.app/mcp"},
     }
+    assert "sentinel-github-token" not in target.read_text(encoding="utf-8")
+    assert "sentinel-github-token" not in caplog.text
     assert not (pi_agent / "mcp.json").exists()
 
 
@@ -431,7 +475,7 @@ def test_unreadable_user_config_is_linked_not_replaced(
     assert "unreadable" in caplog.text
 
 
-@pytest.mark.parametrize("failure", ["inventory", "write", "digest"])
+@pytest.mark.parametrize("failure", ["inventory", "write", "digest", "replace"])
 def test_failed_refresh_does_not_block_launch_or_keep_a_stale_copy(
     home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -452,14 +496,25 @@ def test_failed_refresh_does_not_block_launch_or_keep_a_stale_copy(
             return
         raise OSError(f"{failure} failed")
 
-    monkeypatch.setattr(
-        pi_mcp, "_host_mcp_servers" if failure == "inventory" else "_write_private_file", fail
-    )
+    replace = pi_mcp.os.replace
+
+    def fail_replace(source: str, destination: Path) -> None:
+        if Path(destination) == managed / "mcp.json":
+            raise OSError("replace failed")
+        replace(source, destination)
+
+    if failure == "replace":
+        monkeypatch.setattr(pi_mcp.os, "replace", fail_replace)
+    else:
+        monkeypatch.setattr(
+            pi_mcp, "_host_mcp_servers" if failure == "inventory" else "_write_private_file", fail
+        )
     _prepare(home, pi_agent)
 
     assert (managed / "settings.json").exists()
     assert (managed / "mcp.json").resolve() == user_file.resolve()
     assert user_file.read_text(encoding="utf-8") == user_config
+    assert not list(managed.glob(".mcp.json.*"))
 
 
 def test_generated_copy_never_writes_through_a_link(home: Path, pi_agent: Path) -> None:

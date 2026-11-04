@@ -2156,10 +2156,18 @@ def test_gateway_managed_dir_adds_host_mcp_servers(
     global_agent = tmp_path / "pi-agent"
     global_agent.mkdir()
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(global_agent))
-    host_server = ConfiguredMcpServer(
-        summary={"name": "docs", "harness": "codex"}, config={"command": "docs-mcp"}
-    )
-    monkeypatch.setattr(pi_mcp, "_host_mcp_servers", lambda: [host_server])
+    # Pi's filtered env drops this variable, so a server needing it is skipped.
+    monkeypatch.setenv("RUNNER_ONLY_SECRET", "sentinel-runner-only")
+    host_servers = [
+        ConfiguredMcpServer(
+            summary={"name": "docs", "harness": "codex"}, config={"command": "docs-mcp"}
+        ),
+        ConfiguredMcpServer(
+            summary={"name": "leaky", "harness": "claude"},
+            config={"command": "tool", "args": ["${RUNNER_ONLY_SECRET}"]},
+        ),
+    ]
+    monkeypatch.setattr(pi_mcp, "_host_mcp_servers", lambda: host_servers)
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
@@ -2174,6 +2182,7 @@ def test_gateway_managed_dir_adds_host_mcp_servers(
         [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
     )
     try:
+        assert "RUNNER_ONLY_SECRET" not in config.env
         managed_config = Path(config.env["PI_CODING_AGENT_DIR"]) / "mcp.json"
         assert json.loads(managed_config.read_text(encoding="utf-8")) == {
             "mcpServers": {"docs": {"command": "docs-mcp"}}

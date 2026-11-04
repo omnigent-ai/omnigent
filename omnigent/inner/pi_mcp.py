@@ -57,7 +57,9 @@ def _pi_literal(value: str) -> str:
     return "$" + escaped if escaped.startswith("!") else escaped
 
 
-def _pi_template(value: str, harness: str, inline: Mapping[str, str]) -> str:
+def _pi_template(
+    value: str, harness: str, inline: Mapping[str, str], pi_env: Mapping[str, str]
+) -> str:
     """Rewrite an ``env``/``headers`` value as a Pi template that keeps variables unresolved.
 
     Variables in *inline* (non-secret paths such as a plugin root) are written as
@@ -82,7 +84,7 @@ def _pi_template(value: str, harness: str, inline: Mapping[str, str]) -> str:
             parts.append(inline[name].replace("$", "$$"))
         elif not _ENV_NAME.match(name):
             raise ValueError("unsupported substitution")
-        elif separator and not os.environ.get(name):
+        elif separator and not pi_env.get(name):
             parts.append(default.replace("$", "$$"))
         else:
             parts.append("${" + name + "}")
@@ -98,7 +100,7 @@ def _string_list(value: object) -> list[str]:
 
 
 def _from_json_config(
-    raw: Mapping[str, object], harness: str, plugin_root: Path | None
+    raw: Mapping[str, object], harness: str, plugin_root: Path | None, pi_env: Mapping[str, str]
 ) -> PiMcpServer:
     """Translate a Claude Code or Cursor ``mcpServers`` entry into Pi's shape."""
     from omnigent.host.mcp_tools import _expand, _strings
@@ -106,7 +108,7 @@ def _from_json_config(
     if raw.get("type") == "sse":
         raise ValueError("Pi does not support the SSE transport")
     inline = {"CLAUDE_PLUGIN_ROOT": str(plugin_root)} if plugin_root is not None else {}
-    env = {**os.environ, **inline}
+    env = {**pi_env, **inline}
     entry: PiMcpServer = {}
     url = raw.get("url")
     if isinstance(url, str) and url:
@@ -114,7 +116,9 @@ def _from_json_config(
         entry["url"] = _expand(url, harness, env)
         headers = _strings(raw.get("headers", {}))
         if headers:
-            entry["headers"] = {k: _pi_template(v, harness, inline) for k, v in headers.items()}
+            entry["headers"] = {
+                k: _pi_template(v, harness, inline, pi_env) for k, v in headers.items()
+            }
         oauth = raw.get("oauth")
         if isinstance(oauth, Mapping):
             settings = {key: oauth[key] for key in _PI_OAUTH_KEYS if key in oauth}
@@ -130,7 +134,7 @@ def _from_json_config(
         entry["args"] = [_expand(arg, harness, env) for arg in args]
     variables = _strings(raw.get("env", {}))
     if variables:
-        entry["env"] = {k: _pi_template(v, harness, inline) for k, v in variables.items()}
+        entry["env"] = {k: _pi_template(v, harness, inline, pi_env) for k, v in variables.items()}
     return entry
 
 
@@ -190,12 +194,19 @@ def _from_codex_config(raw: Mapping[str, object]) -> PiMcpServer:
     return entry
 
 
-def pi_mcp_servers_from_host(servers: Iterable[ConfiguredMcpServer]) -> dict[str, PiMcpServer]:
+def pi_mcp_servers_from_host(
+    servers: Iterable[ConfiguredMcpServer], pi_env: Mapping[str, str] | None = None
+) -> dict[str, PiMcpServer]:
     """Translate host-inventory servers into Pi ``mcpServers`` entries.
 
     The first server for a Pi name wins, in inventory order (Claude Code, then
     Codex, then Cursor). Servers Pi cannot load are left out and logged.
+    Placeholders resolve against *pi_env*, the environment Pi will run with
+    (default ``os.environ``), never against runner auth secrets.
     """
+    from omnigent.runner.identity import strip_runner_auth_secrets
+
+    resolvable = strip_runner_auth_secrets(os.environ if pi_env is None else pi_env)
     translated: dict[str, PiMcpServer] = {}
     taken: set[str] = set()
     for server in servers:
@@ -207,7 +218,7 @@ def pi_mcp_servers_from_host(servers: Iterable[ConfiguredMcpServer]) -> dict[str
             if harness == "codex":
                 entry = _from_codex_config(server.config)
             else:
-                entry = _from_json_config(server.config, harness, server.plugin_root)
+                entry = _from_json_config(server.config, harness, server.plugin_root, resolvable)
         except (ValueError, TypeError) as exc:
             _logger.info("Not adding %s MCP server %r to Pi sessions: %s", harness, name, exc)
             continue
@@ -319,7 +330,9 @@ def _restore_user_link(target: Path, source: Path, digest: Path) -> None:
         target.symlink_to(source)
 
 
-def sync_managed_pi_mcp_config(managed_dir: Path, agent_root: Path) -> None:
+def sync_managed_pi_mcp_config(
+    managed_dir: Path, agent_root: Path, pi_env: Mapping[str, str] | None = None
+) -> None:
     """Give a managed Pi agent dir the host's MCP servers alongside the user's own.
 
     An ``mcp.json`` that Pi or the user wrote in the managed dir is kept as is.
@@ -336,7 +349,9 @@ def sync_managed_pi_mcp_config(managed_dir: Path, agent_root: Path) -> None:
         merged = (
             None
             if user_config is None
-            else merge_pi_mcp_config(user_config, pi_mcp_servers_from_host(_host_mcp_servers()))
+            else merge_pi_mcp_config(
+                user_config, pi_mcp_servers_from_host(_host_mcp_servers(), pi_env)
+            )
         )
         if merged is None:
             _restore_user_link(target, source, digest)

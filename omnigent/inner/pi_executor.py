@@ -2687,6 +2687,7 @@ class PiExecutor(Executor):
                 global_agent_dir=global_pi_agent_dir(
                     env=self._env, workspace=pathlib.Path(self._cwd) if self._cwd else None
                 ),
+                pi_env=env,
             )
             from omnigent.inner.pi_gateway import pi_gateway_extension_args
 

@@ -135,6 +135,7 @@ def prepare_managed_pi_agent_dir(
     *,
     overlay: Mapping[str, object] | None = None,
     global_agent_dir: Path | None = None,
+    pi_env: Mapping[str, str] | None = None,
 ) -> None:
     """
     Seed a managed ``PI_CODING_AGENT_DIR`` with the user's global Pi settings.
@@ -157,6 +158,8 @@ def prepare_managed_pi_agent_dir(
     :param overlay: Settings merged on top of the copied global file.
     :param global_agent_dir: Caller-resolved source root; defaults to
         :data:`DEFAULT_PI_AGENT_DIR`.
+    :param pi_env: Environment the Pi process will receive, used to resolve host
+        MCP placeholders; defaults to ``os.environ``.
     """
     agent_root = global_agent_dir if global_agent_dir is not None else DEFAULT_PI_AGENT_DIR
     agent_root = Path(os.path.abspath(agent_root.expanduser()))
@@ -184,4 +187,4 @@ def prepare_managed_pi_agent_dir(
     _symlink_agent_resources(managed_dir, agent_root)
     from omnigent.inner.pi_mcp import sync_managed_pi_mcp_config
 
-    sync_managed_pi_mcp_config(managed_dir, agent_root)
+    sync_managed_pi_mcp_config(managed_dir, agent_root, pi_env)
