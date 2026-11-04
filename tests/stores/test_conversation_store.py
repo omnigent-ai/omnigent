@@ -18,7 +18,7 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from omnigent.db.utils import get_or_create_engine
+from omnigent.db.utils import get_or_create_engine, is_postgresql_family
 from omnigent.entities import (
     CompactionData,
     Conversation,
@@ -3314,7 +3314,7 @@ def test_title_cursor_tokens_are_validated(
     # Keys the store never issues, and a lone surrogate no driver can bind.
     malformed += [token(""), token("2a"), token("0a\ud800")]
     nul_key = token("0a\x00")
-    if conversation_store._conv_engine.dialect.name == "postgresql":
+    if is_postgresql_family(conversation_store._conv_engine.dialect.name):
         malformed.append(nul_key)
     else:
         # Titles there can hold NUL, so a stored key can too.

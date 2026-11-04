@@ -249,9 +249,9 @@ def _decode_title_cursor(cursor: str, dialect: str) -> tuple[str, str] | None:
             raise ValueError("cursor sort key is too long")
         if sort_key != "1" and not sort_key.startswith("0"):
             raise ValueError("cursor sort key was not issued by the store")
-        # Lone surrogates can't be bound, and PostgreSQL text never holds NUL.
+        # Lone surrogates can't be bound, and PostgreSQL-family text never holds NUL.
         sort_key.encode("utf-8")
-        if dialect == "postgresql" and "\x00" in sort_key:
+        if is_postgresql_family(dialect) and "\x00" in sort_key:
             raise ValueError("cursor sort key contains NUL")
         uuid_to_bytes(conversation_id)
     except (TypeError, ValueError) as exc:
