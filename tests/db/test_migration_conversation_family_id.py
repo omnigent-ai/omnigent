@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from importlib import import_module
+from uuid import uuid4
 
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
@@ -28,6 +29,7 @@ def test_family_id_migration_preserves_metadata_and_indexes_membership() -> None
             {"workspace_id": workspace, "id": identifier * 32, "project_id": "f" * 32}
             for workspace, identifier in ((0, "1"), (0, "2"), (0, "3"), (1, "1"))
         ]
+        original.append({"workspace_id": 1, "id": "1f" * 16, "project_id": "f" * 32})
         connection.execute(table.insert(), original)
         before = connection.execute(sa.select(table)).all()
         migration.upgrade()
@@ -81,7 +83,7 @@ def test_family_id_migration_preserves_metadata_and_indexes_membership() -> None
 
 def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
     from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
-    from omnigent.db.utils import get_or_create_engine
+    from omnigent.db.utils import _run_migrations, get_or_create_engine
 
     engine = get_or_create_engine(db_uri)
     migration = import_module(
@@ -125,6 +127,13 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
                 operation()
             connection.commit()
 
+    identifier = uuid4().hex
+    row_query = sa.select(orm_table).where(orm_table.c.id == identifier)
+    with engine.begin() as connection:
+        connection.execute(
+            orm_table.insert(), {"id": identifier, "project_id": "f" * 32, "task_summary": "kept"}
+        )
+        original = connection.execute(row_query).one()
     try:
         migrate(migration.downgrade)
         migrate(migration.upgrade)
@@ -148,8 +157,39 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
                     ),
                     {"name": index},
                 ).scalar_one()
+            for missing_index in (True, False):
+                # Committed DDL can survive without the Alembic revision stamp.
+                with engine.begin() as connection:
+                    if missing_index:
+                        connection.exec_driver_sql(f"DROP INDEX {index}")
+                    connection.execute(
+                        sa.text("UPDATE alembic_version SET version_num = :revision"),
+                        {"revision": migration.down_revision},
+                    )
+                restarted = sa.create_engine(db_uri)
+                try:
+                    _run_migrations(restarted, db_uri)
+                    with restarted.connect() as connection:
+                        assert (
+                            connection.exec_driver_sql(
+                                "SELECT version_num FROM alembic_version"
+                            ).scalar_one()
+                            == migration.revision
+                        )
+                        assert connection.execute(
+                            sa.text(
+                                "SELECT indisvalid FROM pg_index "
+                                "WHERE indexrelid = to_regclass(:name)"
+                            ),
+                            {"name": index},
+                        ).scalar_one()
+                        assert connection.execute(row_query).one() == original
+                finally:
+                    restarted.dispose()
         assert schema() == before
         assert before[2:] == (True, None, ["workspace_id", "family_id", "id"], False)
+        with engine.connect() as connection:
+            assert connection.execute(row_query).one() == original
     finally:
         if (
             engine.dialect.name == "postgresql"
@@ -157,3 +197,7 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
             or not sa.inspect(engine).has_index(table, index)
         ):
             migrate(migration.upgrade)
+        if engine.dialect.name == "postgresql":
+            _run_migrations(engine, db_uri)
+        with engine.begin() as connection:
+            connection.execute(orm_table.delete().where(orm_table.c.id == identifier))
