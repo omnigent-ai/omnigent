@@ -56,7 +56,7 @@ def test_subagent_notices_link_to_child_and_reveal_agents(
     try:
         notices = page.get_by_test_id("subagent-activity")
         expect(notices).to_have_count(1, timeout=30_000)
-        expect(notices.first).to_contain_text(f"{_CHILD_TITLE} started working")
+        expect(notices.first).to_contain_text(f"Started {_CHILD_TITLE}")
 
         # Native Codex owns this child's execution; the test runner must not wake the parent.
         unbound = httpx.patch(
@@ -74,7 +74,7 @@ def test_subagent_notices_link_to_child_and_reveal_agents(
         )
         finished.raise_for_status()
         expect(notices).to_have_count(2, timeout=30_000)
-        expect(notices.last).to_contain_text(f"{_CHILD_TITLE} finished working")
+        expect(notices.last).to_contain_text(f"Completed {_CHILD_TITLE}")
 
         page.reload()
         expect(notices).to_have_count(2, timeout=30_000)

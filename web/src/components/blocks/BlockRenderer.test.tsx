@@ -1479,7 +1479,7 @@ describe("BlockRenderer dispatch", () => {
         expect(noticeLabels()).toEqual([]);
 
         fireEvent.click(screen.getByRole("button", { name: "Worked" }));
-        expect(noticeLabels()).toEqual(["Peirce started working", "Peirce finished working"]);
+        expect(noticeLabels()).toEqual(["Started Peirce", "Completed Peirce"]);
       });
 
       it.each([false, true])(
@@ -1490,7 +1490,7 @@ describe("BlockRenderer dispatch", () => {
             continued,
           );
           expect(screen.getAllByRole("button", { name: "Worked" })).toHaveLength(1);
-          expect(noticeLabels()).toEqual(continued ? [] : ["Peirce started working"]);
+          expect(noticeLabels()).toEqual(continued ? [] : ["Started Peirce"]);
         },
       );
 
@@ -1504,7 +1504,7 @@ describe("BlockRenderer dispatch", () => {
             notice("n1", "returned"),
             text("m2", "Peirce finished."),
           ],
-          labels: ["Peirce finished working"],
+          labels: ["Completed Peirce"],
         },
         {
           shape: "before a wake marker",
@@ -1521,7 +1521,7 @@ describe("BlockRenderer dispatch", () => {
               duration: 2,
             } satisfies RenderItem,
           ],
-          labels: ["Peirce started working", "Peirce finished working"],
+          labels: ["Started Peirce", "Completed Peirce"],
         },
         {
           shape: "opening a woken response",
@@ -1532,7 +1532,7 @@ describe("BlockRenderer dispatch", () => {
             tool(1, "Bash"),
             text("m2", "The clip checks out."),
           ],
-          labels: ["Peirce finished working"],
+          labels: ["Completed Peirce"],
         },
       ])("folds a notice run into the nearest work, $shape", ({ continued, items, labels }) => {
         render(
@@ -1558,7 +1558,7 @@ describe("BlockRenderer dispatch", () => {
           text("m2", "Peirce finished."),
         ]);
         expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
-        expect(noticeLabels()).toEqual(["Peirce finished working"]);
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
       });
 
       it("keeps a terminal error unfolded when a notice lands after it", () => {
@@ -1569,7 +1569,7 @@ describe("BlockRenderer dispatch", () => {
           notice("n1", "returned"),
         ]);
         expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
-        expect(noticeLabels()).toEqual(["Peirce finished working"]);
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
       });
 
       it("streams a woken lead's unnamed output after its settled fold", () => {
@@ -1599,7 +1599,7 @@ describe("BlockRenderer dispatch", () => {
           "aria-expanded",
           "false",
         );
-        expect(noticeLabels()).toEqual(["Peirce finished working"]);
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
         expect(screen.getByText("Reading Peirce's result.")).toBeDefined();
       });
     });
