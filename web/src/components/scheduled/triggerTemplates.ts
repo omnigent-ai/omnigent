@@ -177,10 +177,10 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     source: "github",
     icon: CircleDotIcon,
     iconClassName: "text-emerald-600 dark:text-emerald-500",
-    title: "GitHub issues",
+    title: "GitHub",
     description:
       "Watch for new issues or pull requests and start a session to work on matching items.",
-    name: "GitHub issues",
+    name: "GitHub",
     events: [
       { id: "issue", label: "Issue opened", authorAction: "open an issue in this repository" },
       {

@@ -299,7 +299,7 @@ describe("TasksPage list", () => {
     ]);
     expect(within(suggestions).getByText("Jira tickets")).toBeInTheDocument();
     expect(within(suggestions).getByText("Slack messages")).toBeInTheDocument();
-    expect(within(suggestions).getByText("GitHub issues")).toBeInTheDocument();
+    expect(within(suggestions).getByText("GitHub")).toBeInTheDocument();
     expect(within(suggestions).getByText("Linear issues")).toBeInTheDocument();
   });
 
