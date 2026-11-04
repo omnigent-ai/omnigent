@@ -4,7 +4,7 @@ import { BotIcon, PlusIcon, SearchIcon, TrashIcon } from "lucide-react";
 import { Link, useNavigate } from "@/lib/routing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { customAgentsSettingsEnabled } from "@/lib/capabilities";
-import { useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
+import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent } from "@/lib/agentGrouping";
 import { Button } from "@/components/ui/button";
@@ -191,7 +191,7 @@ export function SettingsCustomAgentsSection() {
             >
               <span className="flex items-center gap-3 font-medium">
                 <BotIcon className="size-5 shrink-0" aria-hidden />
-                {agent.name}
+                {capitalizeAgentName(agent.name)}
               </span>
               <span className="text-ui text-muted-foreground">
                 {agent.description || "Server-provided agent"}
