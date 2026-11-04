@@ -244,6 +244,8 @@ def _open_html_artifact(page: Page, base_url: str, session_id: str) -> int:
             break
         page.mouse.wheel(0, 300)
         page.wait_for_timeout(100)
+    else:
+        raise AssertionError("wheel scrolling never brought Step 25 into view")
     return _settled_html_scroll(page)
 
 

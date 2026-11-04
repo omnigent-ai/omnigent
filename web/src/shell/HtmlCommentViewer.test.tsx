@@ -222,23 +222,34 @@ describe("HtmlCommentViewer scroll position", () => {
     expect(requestedScrollRestore()).toMatchObject({ top: 760 });
   });
 
-  it("returns to the saved offset when the agent rewrites the file", () => {
+  it("returns to the saved offset when the agent rewrites the file", async () => {
     const key = "html-preview:conv_1:live.html";
     saveScrollTop(key, 300);
     const { rerender } = renderViewer("<body><p>v1</p></body>", false, false, key);
+    const rewrite = (content: string) =>
+      rerender(
+        <HtmlCommentViewer
+          conversationId="conv_1"
+          scrollKey={key}
+          content={content}
+          truncated={false}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+        />,
+      );
     saveScrollTop(key, 512);
-    rerender(
-      <HtmlCommentViewer
-        conversationId="conv_1"
-        scrollKey={key}
-        content="<body><p>v2</p></body>"
-        truncated={false}
-        comments={[]}
-        activeSelection={null}
-        onSetActiveSelection={() => {}}
-      />,
-    );
+    rewrite("<body><p>v2</p></body>");
     expect(requestedScrollRestore()).toMatchObject({ top: 512 });
+
+    // The rewritten frame reports its own offset, which the next rewrite restores.
+    const { send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.scroll, top: 140 });
+    await waitFor(() => expect(getSavedScrollTop(key)).toBe(140));
+    rewrite("<body><p>v3</p></body>");
+    expect(requestedScrollRestore()).toMatchObject({ top: 140 });
   });
 });
 

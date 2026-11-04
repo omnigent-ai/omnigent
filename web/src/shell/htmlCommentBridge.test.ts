@@ -450,22 +450,27 @@ describe("bridge runtime scroll position", () => {
     const writes = scrollTo.mock.calls.length;
     vi.advanceTimersToNextFrame();
     expect(scrollTo).toHaveBeenCalledTimes(writes);
+    expect(sentScrollOffsets(port)).toEqual([640]);
 
     // After the restore settles, the reader's own scrolling is reported again.
     userScrollTo(700);
     vi.advanceTimersToNextFrame();
-    expect(sentScrollOffsets(port)).toEqual([700]);
+    expect(sentScrollOffsets(port)).toEqual([640, 700]);
   });
 
   it("shows the page short of the saved offset once the budget runs out", () => {
     fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
     const hide = addRestoreHide();
-    startRuntime({ restoreScroll: restoreTo(640) });
+    const port = startRuntime({ restoreScroll: restoreTo(640) });
     vi.advanceTimersByTime(BUDGET_MS - 20);
     expect(hide.isConnected).toBe(true);
+    expect(sentScrollOffsets(port)).toEqual([]);
     vi.advanceTimersByTime(40);
     expect(hide.isConnected).toBe(false);
     expect(window.scrollY).toBe(232);
+    // Saving the offset the page reached keeps the next remount from hiding it for a full budget.
+    vi.advanceTimersToNextFrame();
+    expect(sentScrollOffsets(port)).toEqual([232]);
   });
 
   it("turns scroll anchoring off until the restore settles, then gives the page its own", () => {

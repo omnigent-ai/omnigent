@@ -277,6 +277,8 @@
     if (!scrollRestore) return;
     if (performance.now() >= scrollRestore.deadline || readerMovedDuringRestore()) {
       settleScrollRestore();
+      // Save where the page ended up, so an offset a shorter rewrite can't reach isn't retried.
+      onScroll();
       return;
     }
     // "instant" overrides an artifact's `scroll-behavior: smooth`.
