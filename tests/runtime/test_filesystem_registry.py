@@ -463,6 +463,7 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
     beneath_supported: bool,
     path: str,
     swapped: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A path swapped for a symlink must not reveal the size, time or content of its target."""
     monkeypatch.setattr(
@@ -493,10 +494,12 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
             swapped_path.rename(tmp_path / "moved")
         swapped_path.symlink_to(outside, target_is_directory=True)
 
-    listed = registry.list_changed_files(conv_id, limit=10, check_disk=True)
+    with caplog.at_level(logging.DEBUG, logger=filesystem_registry.__name__):
+        listed = registry.list_changed_files(conv_id, limit=10, check_disk=True)
 
     if swapped != "notes.md" or not environment_filesystem._BENEATH_SUPPORTED:
         assert listed == recorded
+        assert caplog.messages == [f"could not compare {path} with its original"]
     else:
         link = os.lstat(swapped_path)
         assert listed == [

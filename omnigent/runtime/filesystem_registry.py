@@ -950,7 +950,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
                     return None
                 status, size, modified_at = "deleted", None, None
             except OSError:
-                pass
+                _logger.debug("could not compare %s with its original", event.path, exc_info=True)
             else:
                 settled_at = max(file_stat.st_mtime_ns, file_stat.st_ctime_ns)
                 if baseline is not None and time.time_ns() - settled_at > _RACY_NS:
