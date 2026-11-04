@@ -15,7 +15,7 @@ import pytest
 from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
 from tests._helpers.live_server import reserve_port
-from tests._helpers.polling import poll_until, poll_until_async
+from tests._helpers.polling import poll_until
 from tests.e2e.conftest import configure_mock_llm
 
 pytestmark = pytest.mark.skipif(shutil.which("claude") is None, reason="needs the claude CLI")
@@ -31,7 +31,6 @@ class _HangsAfterSignIn:
 
     def __init__(self) -> None:
         self.signed_in = False
-        self.requests = 0
         self.requests_after_sign_in = 0
         self.port = 0
         self._release = threading.Event()
@@ -44,7 +43,6 @@ class _HangsAfterSignIn:
     async def _app(self, scope, receive, send) -> None:
         if scope["type"] != "http":
             return
-        self.requests += 1
         status = 401
         if self.signed_in:
             self.requests_after_sign_in += 1
@@ -151,13 +149,21 @@ async def test_turn_after_hung_mcp_reconnect_is_not_held_by_the_cli(
 
         try:
             await turn(tokens[0])
-            # The CLI tried each server at startup and found it needed sign-in.
-            await poll_until_async(lambda: all(gate.requests for gate in gates), timeout_s=30)
+            # Initial HTTP traffic can occur while the CLI still reports a server as pending.
+            client_before_reconnect = executor._clients[uid].client
+            async with asyncio.timeout(30):
+                while True:
+                    status = await client_before_reconnect.get_mcp_status()
+                    states = {server["name"]: server["status"] for server in status["mcpServers"]}
+                    if all(states.get(name) in ("failed", "needs-auth") for name in names):
+                        break
+                    await asyncio.sleep(0.05)
 
             for gate in gates:
                 gate.signed_in = True
             _report_auth(status_file, names, "connected")
             await turn(tokens[1])
+            assert executor._clients[uid].client is not client_before_reconnect
             assert alpha.requests_after_sign_in, "the reconnect never reached the server"
 
             await turn(tokens[2])
