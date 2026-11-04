@@ -320,24 +320,34 @@ def test_get_conversations_empty_input_skips_query(
     assert conversation_store.get_conversations([]) == {}
 
 
+@pytest.mark.parametrize("cost", [None, 0.0, 1.234])
 def test_get_session_activity(
     conversation_store: SqlAlchemyConversationStore,
+    cost: float | None,
 ) -> None:
     """Each known id maps to its update time and live status; unknown ids are omitted."""
     a = conversation_store.create_conversation(title="alpha")
     b = conversation_store.create_conversation(title="beta")
     conversation_store.set_session_live_status(a.id, "waiting")
     conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
+    conversation_store.set_session_usage(a.id, {"total_cost_usd": cost})
+    child = conversation_store.create_conversation(
+        kind="sub_agent", title="child", parent_conversation_id=a.id
+    )
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 5.0})
 
     result = conversation_store.get_session_activity(
-        [a.id, b.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+        [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
     )
 
-    assert set(result) == {a.id, b.id}
+    assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
     assert result[a.id].live_status == "waiting"
+    assert result[a.id].total_cost_usd == cost
+    assert result[child.id].total_cost_usd == 5.0
     # A session that never reported a status has none recorded.
     assert result[b.id].live_status is None
+    assert result[b.id].total_cost_usd is None
     assert conversation_store.get_session_activity([]) == {}
 
 
@@ -8282,8 +8292,8 @@ def test_list_conversations_acl_with_cursor_pagination(
 ) -> None:
     """Cursor pagination composes with the ACL filter: walking every page
     yields exactly the granted rows (no leak, no overlap, none lost), and a
-    NON-granted conversation used as the cursor still returns the granted
-    rows that follow it — an empty page would not satisfy this.
+    NON-granted conversation used as the cursor is rejected as stale, since
+    paging from it would compare its sort key against the caller's rows.
 
     Owns the ACL-vs-cursor COMPOSITION: removing the filter (``needs_meta_filter
     = False``) fails here, because the ungranted rows appear. It deliberately
@@ -8315,13 +8325,57 @@ def test_list_conversations_acl_with_cursor_pagination(
     assert set(seen) == granted
     assert seen == [convs[0].id, convs[1].id, convs[4].id, convs[5].id]
 
-    # A non-granted conversation (c2, positioned between granted rows) as
-    # the cursor: position filter only, ACL still applied — so the result is
-    # exactly the granted rows after it, not an empty page.
-    page3 = conversation_store.list_conversations(
-        accessible_by="alice@example.com", limit=10, after=convs[2].id
-    )
-    assert [c.id for c in page3.data] == [convs[4].id, convs[5].id]
+    # A non-granted conversation (c2, positioned between granted rows) as the
+    # cursor fails like a deleted one rather than positioning the page.
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_conversations(
+            accessible_by="alice@example.com", limit=10, after=convs[2].id
+        )
+
+
+@pytest.mark.parametrize("sort_by", ["updated_at", "created_at"])
+@pytest.mark.parametrize("direction", ["after", "before"])
+@pytest.mark.parametrize("scope", ["accessible_by", "owned_by"])
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
+def test_list_cursor_on_ungranted_session_reveals_nothing(
+    request: pytest.FixtureRequest, store_fixture: str, scope: str, direction: str, sort_by: str
+) -> None:
+    """A cursor naming another user's private session can't position a page.
+
+    Otherwise which of the caller's own sessions come back would reveal how the
+    private session's sort key compares with theirs.
+    """
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
+    perms = _acl_perms(store._engine.url.render_as_string(hide_password=False))
+    # A read grant is enough to page an accessible listing; owned listings need ownership.
+    caller_level = LEVEL_READ if scope == "accessible_by" else LEVEL_OWNER
+    probes = [store.create_conversation(title=title) for title in ("first probe", "second probe")]
+    for probe in probes:
+        perms.grant("alice@example.com", probe.id, caller_level)
+    secret = store.create_conversation(title="secret")
+    perms.grant("bob@example.com", secret.id, LEVEL_OWNER)
+
+    def _page(**cursor: str) -> list[str]:
+        return [
+            c.id
+            for c in store.list_conversations(
+                **{scope: "alice@example.com"},  # type: ignore[arg-type]
+                **cursor,  # type: ignore[arg-type]
+                sort_by=sort_by,
+                order="asc",
+            ).data
+        ]
+
+    with pytest.raises(StaleCursorError):
+        _page(**{direction: secret.id})
+    # The caller's own cursors still page.
+    first, second = _page()
+    if direction == "after":
+        assert _page(after=first) == [second]
+    else:
+        assert _page(before=second) == [first]
 
 
 def test_list_projects_single_db_uses_exists_pushdown(

@@ -44,6 +44,7 @@ def _poller(
     *,
     turn_is_active: Callable[[], bool] | None = None,
     turn_activity_epoch: Callable[[], int] | None = None,
+    failures: list[str] | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> ClaudeProgramStatusPoller:
     def on_status(status: str, _reason: str | None) -> None:
@@ -60,6 +61,7 @@ def _poller(
         on_status,
         turn_is_active=turn_is_active,
         turn_activity_epoch=turn_activity_epoch,
+        on_failure=failures.append if failures is not None else None,
         clock=clock,
     )
 
@@ -82,6 +84,27 @@ def test_error_report_without_a_hook_edge_fails_the_turn_once(tmp_path: Path) ->
     assert published == ["failed"]
 
 
+@pytest.mark.parametrize("message", [None, "", "  ", "API Error: 499"])
+def test_error_fallback_preserves_available_detail(tmp_path: Path, message: str | None) -> None:
+    """A missing hook does not discard the reason already in the OSC report."""
+    path = tmp_path / "program-status.json"
+    _write_report(path, {**_ERROR_REPORT, "message": message})
+    clock = _FakeClock()
+    published: list[str] = []
+    failures: list[str] = []
+    poller = _poller(
+        tmp_path, path, published, turn_is_active=lambda: True, failures=failures, clock=clock
+    )
+    poller.tick()
+    assert published == failures == []
+    clock.now = _GRACE_S
+    poller.tick()
+    poller.resync()
+    poller.tick()
+    assert failures == ([message] if message and message.strip() else [])
+    assert published == ([] if failures else ["failed"])
+
+
 def test_forwarded_hook_edge_cancels_the_grace_period(tmp_path: Path) -> None:
     """Once the hook's terminal edge clears the turn, the standing error report fails nothing."""
     path = tmp_path / "program-status.json"
@@ -89,12 +112,21 @@ def test_forwarded_hook_edge_cancels_the_grace_period(tmp_path: Path) -> None:
     clock = _FakeClock()
     turn_active = [True]
     published: list[str] = []
-    poller = _poller(tmp_path, path, published, turn_is_active=lambda: turn_active[0], clock=clock)
+    failures: list[str] = []
+    poller = _poller(
+        tmp_path,
+        path,
+        published,
+        turn_is_active=lambda: turn_active[0],
+        failures=failures,
+        clock=clock,
+    )
     poller.tick()
     turn_active[0] = False
     clock.now = _GRACE_S * 6
     poller.tick()
     assert published == []
+    assert failures == []
 
 
 @pytest.mark.parametrize("poll_between_turns", [True, False])
@@ -205,8 +237,14 @@ def test_error_report_leaves_the_failed_edge_to_the_stop_failure_hook(
     )
 
 
-def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypatch) -> None:
-    """A forwarded idle edge cannot lose its resync to an in-flight OSC read."""
+@pytest.mark.parametrize(
+    ("operation", "transition"),
+    [("tick", "resync"), ("tick", "retire"), ("active", "retire"), ("blocked_on", "retire")],
+)
+def test_lifecycle_change_during_snapshot_read(
+    tmp_path: Path, monkeypatch, operation: str, transition: str
+) -> None:
+    """Reconnect survives an in-flight read; retirement prevents its publication."""
     path = tmp_path / "program-status.json"
     path.write_text(json.dumps({"relay_pid": os.getpid(), "status": {"state": "idle"}}))
     published: list[str] = []
@@ -227,7 +265,7 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
     poller.tick()
     assert published == ["idle"]
 
-    path.write_text(json.dumps({"relay_pid": os.getpid(), "status": {"state": "working"}}))
+    _write_report(path, {"state": "blocked", "kind": "question", "message": "input needed"})
     entered = threading.Event()
     release = threading.Event()
     original_read = Path.read_text
@@ -241,14 +279,24 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(Path, "read_text", pause_read)
     with ThreadPoolExecutor(max_workers=1) as executor:
-        pending = executor.submit(poller.tick)
+        pending = executor.submit(
+            lambda: poller.tick() if operation == "tick" else getattr(poller, operation)
+        )
         try:
             assert entered.wait(5), "poller did not reach the snapshot read"
-            poller.resync()
+            getattr(poller, transition)()
         finally:
             release.set()
-        pending.result(timeout=5)
+        result = pending.result(timeout=5)
 
+    if transition == "retire":
+        assert result is (False if operation == "active" else None)
+        poller.resync()
+        poller.tick()
+        assert poller.active is False
+        assert poller.blocked_on is None
+        assert published == ["idle"]
+        return
     assert published == ["idle", "running"]
     poller.tick()
     assert published == ["idle", "running", "running"]

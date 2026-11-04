@@ -28,10 +28,12 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   ALT_KEY,
   ARIA_MOD_KEY,
@@ -708,6 +710,11 @@ interface WorkspacePanelProps {
   /** Unpinned built-in pages opened as closable tabs for this session. */
   openPanels: DefaultWorkspaceTab[];
   onClosePanel: (tab: DefaultWorkspaceTab) => void;
+  /**
+   * Filled with a function that closes the selected rail tab (the desktop
+   * Close Tab shortcut); it returns false when no closable tab is selected.
+   */
+  closeSelectedTabRef?: RefObject<(() => boolean) | null>;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
   showContentSearch?: boolean;
@@ -833,6 +840,7 @@ function WorkspacePanelImpl({
   onRightRailTabChange,
   openPanels,
   onClosePanel,
+  closeSelectedTabRef,
   showFilesPanel,
   showContentSearch = false,
   showGithubTab,
@@ -1152,6 +1160,7 @@ function WorkspacePanelImpl({
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
+  const closeFileTabRef = useRef<(() => void) | null>(null);
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) onCloseFile(selectedFilePath);
   }, [onCloseFile, selectedFilePath]);
@@ -1180,6 +1189,47 @@ function WorkspacePanelImpl({
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
+  // Mirrors the tab strip's own `active` rules, so Close Tab closes exactly
+  // the tab drawn as selected.
+  const closeSelectedTab = (): boolean => {
+    if (pending || !open || (!contained && isMobile) || (!maximized && width <= 0)) return false;
+    if (selectedFilePath !== null) {
+      closeFileTabRef.current?.();
+      return true;
+    }
+    if (terminalShown && selectedTerminalKey !== null) {
+      // A viewer can't close terminals; still swallow the shortcut so it
+      // doesn't fall through to leaving the session.
+      if (isEditorLevel(permissionLevel) && closingTerminalKey !== selectedTerminalKey) {
+        onCloseTerminal(selectedTerminalKey);
+      }
+      return true;
+    }
+    if (browserSelected && browsers.selected !== null) {
+      void closeBrowserTab(browsers.selected);
+      return true;
+    }
+    if (sideChatSelected && sideChats.selected !== null) {
+      void closeSideChat(sideChats.selected);
+      return true;
+    }
+    const panel =
+      selectedTerminalKey === null
+        ? visibleOpenPanels.find((tab) => tab === rightRailTab)
+        : undefined;
+    if (panel !== undefined) {
+      onClosePanel(panel);
+      return true;
+    }
+    return false;
+  };
+  useLayoutEffect(() => {
+    if (!closeSelectedTabRef) return;
+    closeSelectedTabRef.current = closeSelectedTab;
+    return () => {
+      if (closeSelectedTabRef.current === closeSelectedTab) closeSelectedTabRef.current = null;
+    };
+  });
   const activePanelRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
     activePanelRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -1771,7 +1821,8 @@ function WorkspacePanelImpl({
           data-workspace-panel-content
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
         >
-          {showContentSearch && showFilesPanel && !pending && (
+          {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
+          {showContentSearch && showFilesPanel && !pending && !isMobile && (
             <div
               className={cn(
                 "min-h-0 flex-1 flex-col",
@@ -1839,6 +1890,7 @@ function WorkspacePanelImpl({
                 position={filePosition}
                 onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
                 onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                closeTabRef={closeFileTabRef}
                 onNavigateTo={openFileViewer}
                 permissionLevel={permissionLevel}
                 onCommentsOpenChange={onCommentsOpenChange}
@@ -1861,7 +1913,9 @@ function WorkspacePanelImpl({
               className="min-h-0 flex-1"
             />
           ) : scopeView === "github" ? (
-            <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+            <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+              <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+            </RenderErrorBoundary>
           ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
               <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />

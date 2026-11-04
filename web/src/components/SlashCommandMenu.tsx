@@ -29,6 +29,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
   "/mcp": "Show MCP servers enabled for this session",
+  "/permissions": "Change the approval mode for this session",
   "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
@@ -384,7 +385,7 @@ function McpServerMenu({
     <div
       data-testid="mcp-server-menu"
       onMouseDown={(event) => event.preventDefault()}
-      className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+      className="menu-surface absolute bottom-full left-0 z-30 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
     >
       <div className="px-2 py-1">
         <div className="font-medium text-ui text-foreground">MCP servers</div>
