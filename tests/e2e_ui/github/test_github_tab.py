@@ -1363,3 +1363,116 @@ def test_changes_viewed_progress_persists_and_resets(
     panel.get_by_role("button", name="Show viewed", exact=True).click()
     expect(panel.get_by_role("checkbox", name="Hide viewed")).not_to_be_checked()
     expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
+def test_changes_filter_copy_open(page: Page, seeded_session: tuple[str, str], entry: str) -> None:
+    """Filter changed files, copy a path, and open a file at the pinned head revision.
+
+    The rail covers the desktop sidebar and icon copy. The mobile composer covers the
+    collapsed sidebar's inline filter and every file action in the overflow menu.
+    """
+    base_url, session_id = seeded_session
+    is_mobile = entry == "composer-mobile"
+    pr_url = _INFO["pr"]["url"]
+    _stub_github(page)
+    # The list reports the revisions it was fetched for, which Open links use.
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda route: route.fulfill(json={**_CHANGES, "head_sha": "head", "base_sha": "base"}),
+    )
+    # Supply fork metadata and revisions for the Open-link assertion.
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_INFO,
+                "tracking_available": True,
+                "selected_pr_url": pr_url,
+                "prs": [
+                    {
+                        "url": pr_url,
+                        "host": "example.com",
+                        "repository": "acme/app",
+                        "number": _PR_NUMBER,
+                        "relationship": "created",
+                    }
+                ],
+                "pr": {
+                    **_INFO["pr"],
+                    "head_sha": "head",
+                    "base_sha": "base",
+                    "head_repository_url": "https://example.com/fork/app",
+                },
+            }
+        ),
+    )
+    if is_mobile:
+        workspace = "/workspace/demo-app"
+
+        def session_details(route: Route) -> None:
+            response = fetch_with_retry(route)
+            snapshot = response.json()
+            snapshot.update(
+                workspace=workspace, git_branch="feature/github-tab", host_id="composer-pr-host"
+            )
+            route.fulfill(response=response, json=snapshot)
+
+        page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
+        page.route(
+            "**/v1/hosts/composer-pr-host/worktrees?*",
+            lambda route: route.fulfill(
+                json={
+                    "data": [
+                        {
+                            "path": workspace,
+                            "branch": "feature/github-tab",
+                            "is_main": False,
+                            "detached": False,
+                        }
+                    ]
+                }
+            ),
+        )
+        page.set_viewport_size({"width": 390, "height": 844})
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
+    page.goto(f"{base_url}/c/{session_id}")
+    if is_mobile:
+        page.get_by_test_id("composer-pr-link").click()
+        panel = page.get_by_test_id("github-panel-drawer")
+        expect(panel).to_have_attribute("data-state", "open")
+    else:
+        open_right_rail(page)
+        panel = page.get_by_role("complementary", name="Workspace")
+        panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+
+    files = panel.locator("[data-github-file]")
+    expect(files).to_have_count(2, timeout=30_000)
+    if is_mobile:
+        # The sidebar starts collapsed on mobile, so the filter opens above the list.
+        panel.get_by_role("button", name="Show file filter").click()
+    filter_box = panel.get_by_role("searchbox", name="Filter changed files")
+    filter_box.fill("readme")
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    filter_box.fill("no-such-file")
+    expect(panel.get_by_text('No changed files match "no-such-file"')).to_be_visible()
+    panel.get_by_role("button", name="Clear filter").click()
+    expect(files).to_have_count(2)
+    filter_box.fill("readme")
+    filter_box.press("Escape")
+    expect(filter_box).to_have_value("")
+    expect(files).to_have_count(2)
+
+    if is_mobile:
+        panel.get_by_role("button", name="More actions for src/app/main.py").click()
+        page.get_by_role("menuitem", name="Copy path", exact=True).click()
+    else:
+        panel.get_by_role("button", name="Copy path src/app/main.py").click()
+    expect(page.get_by_text("Copied path", exact=True)).to_be_visible()
+    assert page.evaluate("navigator.clipboard.readText()") == "src/app/main.py"
+
+    panel.get_by_role("button", name="More actions for README.md").click()
+    expect(page.get_by_role("menuitem", name="Open in GitHub")).to_have_attribute(
+        "href", "https://example.com/fork/app/blob/head/README.md"
+    )
