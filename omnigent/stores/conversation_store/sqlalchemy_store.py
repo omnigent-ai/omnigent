@@ -109,7 +109,6 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
-    SESSION_FAMILY_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
@@ -344,6 +343,7 @@ def _to_conversation(
         blocked_on=meta.blocked_on if meta else None,
         project_id=meta.project_id if meta else None,
         side_chat_parent_id=meta.side_chat_parent_id if meta else None,
+        family_id=meta.family_id if meta else None,
     )
 
 
@@ -516,10 +516,7 @@ def _created_session_from_rows(
 def _prepare_label_updates(updates: dict[str, str]) -> dict[str, str]:
     """Return the exact label values accepted by the persistence schema."""
     reject_profile_labels(updates)
-    if any(
-        key == SESSION_FAMILY_LABEL_KEY or key.startswith(FAMILY_PIN_LABEL_PREFIX)
-        for key in updates
-    ):
+    if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in updates):
         raise OmnigentError("Session family labels are server-owned", code=ErrorCode.INVALID_INPUT)
     # Clamp by characters, matching PostgreSQL ``VARCHAR(n)`` semantics.
     return {key: value[:LABEL_VALUE_MAX_LEN] for key, value in updates.items()}
@@ -1819,13 +1816,12 @@ class SqlAlchemyConversationStore(ConversationStore):
     def _family_member_ids(self, session: Session, family_id: str) -> list[str]:
         ids = list(
             session.scalars(
-                select(SqlConversationLabel.conversation_id)
+                select(SqlConversationMetadata.id)
                 .where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.key == SESSION_FAMILY_LABEL_KEY,
-                    SqlConversationLabel.value == family_id,
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.family_id == family_id,
                 )
-                .order_by(SqlConversationLabel.conversation_id)
+                .order_by(SqlConversationMetadata.id)
                 .limit(MAX_SESSION_FAMILY_MEMBERS + 1)
             )
         )
@@ -1837,10 +1833,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         source = self.get_conversation(session_id)
         if source is None:
             return []
-        family_id = source.labels.get(SESSION_FAMILY_LABEL_KEY)
+        family_id = source.family_id
         if family_id is None:
             return [source]
-        with self._conv_session("read_session_family") as session:
+        with self._session("read_session_family") as session:
             ids = self._family_member_ids(session, family_id)
         members = self.get_conversations(ids)
         return sorted(
@@ -1852,7 +1848,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         source = self.get_conversation(source_id)
         if source is None:
             raise ConversationNotFoundError(source_id)
-        family_id = source.labels.get(SESSION_FAMILY_LABEL_KEY, source.id)
+        family_id = source.family_id or source.id
         pin_key = pinned_label_key(user_id)
         family_pin_key = FAMILY_PIN_LABEL_PREFIX + pin_key.removeprefix(PINNED_LABEL_KEY + ".")
 
@@ -1872,28 +1868,27 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation, (current_workspace_id(), session_id), with_for_update=True
                 )
                 source_labels = _fetch_labels(labels_session, source_id)
-                target_labels = _fetch_labels(labels_session, session_id)
                 if (
                     source_row is None
                     or target_row is None
                     or source_row.archived
                     or source_row.parent_conversation_id is not None
                     or target_row.parent_conversation_id is not None
-                    or SESSION_FAMILY_LABEL_KEY in target_labels
-                    or source_labels.get(SESSION_FAMILY_LABEL_KEY, source_id) != family_id
+                    or target_meta.family_id is not None
+                    or (source_meta.family_id or source_id) != family_id
                 ):
                     raise OmnigentError(
                         "Sibling source is no longer available", code=ErrorCode.CONFLICT
                     )
-                members = self._family_member_ids(labels_session, family_id)
+                members = self._family_member_ids(session, family_id)
                 if len(set(members) | {source_id, session_id}) > MAX_SESSION_FAMILY_MEMBERS:
                     raise OmnigentError(
                         "A family supports up to 100 sessions", code=ErrorCode.INVALID_INPUT
                     )
-                updates = {SESSION_FAMILY_LABEL_KEY: family_id}
+                updates: dict[str, str] = {}
                 if source_meta.project_id is None and PROJECT_LABEL_KEY in source_labels:
                     updates[PROJECT_LABEL_KEY] = source_labels[PROJECT_LABEL_KEY]
-                if SESSION_FAMILY_LABEL_KEY not in source_labels and pin_key in source_labels:
+                if source_meta.family_id is None and pin_key in source_labels:
                     updates[family_pin_key] = source_labels[pin_key]
                     labels_session.execute(
                         delete(SqlConversationLabel).where(
@@ -1904,26 +1899,29 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 elif family_pin_key in source_labels:
                     updates[family_pin_key] = source_labels[family_pin_key]
-                _upsert_prepared_labels(labels_session, source_id, updates, now_epoch())
-                _upsert_prepared_labels(labels_session, session_id, updates, now_epoch())
+                if updates:
+                    _upsert_prepared_labels(labels_session, source_id, updates, now_epoch())
+                    _upsert_prepared_labels(labels_session, session_id, updates, now_epoch())
             target_meta.project_id = source_meta.project_id
+            source_meta.family_id = family_id
+            target_meta.family_id = family_id
 
         run_write_transaction(self._session_immediate, "create_sibling_membership", write)
 
     def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
         source = self.get_conversation(session_id)
-        if source is None or SESSION_FAMILY_LABEL_KEY not in source.labels:
+        if source is None or source.family_id is None:
             raise OmnigentError("Session has no family", code=ErrorCode.INVALID_INPUT)
-        family_id = source.labels[SESSION_FAMILY_LABEL_KEY]
+        family_id = source.family_id
         key = FAMILY_PIN_LABEL_PREFIX + pinned_label_key(user_id).removeprefix(
             PINNED_LABEL_KEY + "."
         )
 
         def write(session: Session) -> None:
             self._lock_session_family(session, family_id)
+            ids = self._family_member_ids(session, family_id)
             with self._profile_label_session(session) as labels_session:
-                ids = self._family_member_ids(labels_session, family_id)
-                self._require_family_representative(labels_session, ids, session_id)
+                self._require_family_representative(labels_session, ids, session_id, family_id)
                 if value:
                     for member_id in ids:
                         _upsert_prepared_labels(
@@ -1941,9 +1939,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         run_write_transaction(self._session_immediate, "pin_session_family", write)
 
     def _require_family_representative(
-        self, session: Session, ids: list[str], source_id: str
+        self, session: Session, ids: list[str], source_id: str, family_id: str
     ) -> None:
-        family_id = _fetch_labels(session, source_id).get(SESSION_FAMILY_LABEL_KEY)
         representative = session.scalar(
             select(SqlConversation.id)
             .where(
@@ -1986,14 +1983,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         source = self.get_conversation(conversation_id)
         if source is None:
             return False
-        family_id = source.labels.get(SESSION_FAMILY_LABEL_KEY, source.id)
+        family_id = source.family_id or source.id
 
         def write(session: Session) -> bool:
             self._lock_session_family(session, family_id)
+            ids = self._family_member_ids(session, family_id)
             with self._profile_label_session(session) as labels_session:
-                ids = self._family_member_ids(labels_session, family_id)
                 if ids:
-                    self._require_family_representative(labels_session, ids, conversation_id)
+                    self._require_family_representative(
+                        labels_session, ids, conversation_id, family_id
+                    )
                     labels_session.execute(
                         delete(SqlConversationLabel).where(
                             SqlConversationLabel.workspace_id == current_workspace_id(),

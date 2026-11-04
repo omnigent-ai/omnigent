@@ -1257,7 +1257,6 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     auth_client, auth_app, peers, db_uri, bundled
 ):
     from omnigent.server.sharing_settings import DefaultPublicSessions
-    from omnigent.stores.conversation_store import SESSION_FAMILY_LABEL_KEY
     from tests.server.integration.test_sessions_permissions import build_agent_bundle
 
     source, _, _ = peers
@@ -1288,7 +1287,8 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     store = SqlAlchemyConversationStore(db_uri)
     sibling = store.get_conversation(sibling_id)
     assert sibling.parent_conversation_id is None and sibling.root_conversation_id == sibling.id
-    assert sibling.labels[SESSION_FAMILY_LABEL_KEY] == source["id"]
+    assert sibling.family_id == source["id"]
+    assert "omnigent.session_family_id" not in sibling.labels
     assert [grant.user_id for grant in permissions.list_for_session(sibling_id)[0]] == ["alice"]
     assert store.list_child_conversation_ids_by_parent([source["id"]])[source["id"]] == []
     snapshot = await auth_client.get(f"/v1/sessions/{sibling_id}")
@@ -1301,11 +1301,14 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     snapshot = await auth_client.get(f"/v1/sessions/{source['id']}", headers=reader)
     assert snapshot.status_code == 200
     assert not snapshot.json().get("family")
-    assert SESSION_FAMILY_LABEL_KEY not in snapshot.json()["labels"]
-    for endpoint, body in [
-        (f"/v1/sessions/{source['id']}", {"labels": {SESSION_FAMILY_LABEL_KEY: sibling_id}})
-    ]:
-        assert (await auth_client.patch(endpoint, json=body)).status_code == 400
+    assert "family_id" not in snapshot.json()
+    assert "omnigent.session_family_id" not in snapshot.json()["labels"]
+    response = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"family_id": sibling_id}
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"][0]["loc"] == ["body", "family_id"]
+    assert store.get_conversation(source["id"]).family_id == source["id"]
     permissions.grant("reader", source["id"], LEVEL_EDIT)
     response = await auth_client.post(
         "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
@@ -1325,7 +1328,7 @@ async def test_read_only_shared_source_can_orchestrate_after_many_readers(
     assert (await _send(auth_client, source, target)).get("queued") is True
     permissions.ensure_user("z-editor")
     permissions.grant("z-editor", source["id"], LEVEL_EDIT)
-    assert "shared for editing" in (await _send(auth_client, source, target))["detail"]
+    assert "shared with edit access cannot" in (await _send(auth_client, source, target))["detail"]
 
 
 async def test_family_project_removal_precedes_archive(auth_client, peers, db_uri):

@@ -200,8 +200,8 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   [why the messaging tools remain separate](../docs/session-messaging-tool-boundary.md).
 - The server enforces the flag even though tool schemas are discoverable while
   it is disabled. Peer messaging has no additional per-agent opt-in; creation
-  retains its existing `spawn` advertisement gate. No schema migration or
-  per-owner settings page is needed.
+  retains its existing `spawn` advertisement gate. Deploy the sibling-session
+  schema before the application; peer messaging needs no schema migration.
   V1 treats eligible private agents as delegates across the owner's sessions.
   Unlike sharing, messaging does not grant another user access, but untrusted
   content can still influence an agent to steer other owned sessions. Enabling

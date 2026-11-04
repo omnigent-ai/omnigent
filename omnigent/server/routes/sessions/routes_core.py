@@ -3222,26 +3222,21 @@ def register_core_routes(
             )
         labels_to_set = dict(body.labels or {})
         if PROJECT_LABEL_KEY in labels_to_set and not set_project:
-            from omnigent.stores.conversation_store import SESSION_FAMILY_LABEL_KEY
-
             project_source = await asyncio.to_thread(
                 conversation_store.get_conversation, session_id
             )
-            if project_source and SESSION_FAMILY_LABEL_KEY in project_source.labels:
+            if project_source and project_source.family_id is not None:
                 raise OmnigentError(
                     "Move a session family through its representative's project action",
                     code=ErrorCode.INVALID_INPUT,
                 )
         if PINNED_LABEL_KEY in labels_to_set:
-            from omnigent.stores.conversation_store import (
-                FAMILY_PIN_LABEL_PREFIX,
-                SESSION_FAMILY_LABEL_KEY,
-            )
+            from omnigent.stores.conversation_store import FAMILY_PIN_LABEL_PREFIX
 
             pin_source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if (
                 pin_source is not None
-                and SESSION_FAMILY_LABEL_KEY in pin_source.labels
+                and pin_source.family_id is not None
                 and (
                     permission_store is None
                     or (

@@ -9757,10 +9757,10 @@ def test_spawn_tree_read_examines_rows_through_the_root_index(
 async def test_sibling_family_lifecycle(tmp_path, split_database):
     from concurrent.futures import ThreadPoolExecutor
 
+    from omnigent.db.db_models import workspace_scope
     from omnigent.errors import OmnigentError
     from omnigent.stores.conversation_store import (
         FAMILY_PIN_LABEL_PREFIX,
-        SESSION_FAMILY_LABEL_KEY,
         pinned_label_key,
     )
 
@@ -9781,13 +9781,34 @@ async def test_sibling_family_lifecycle(tmp_path, split_database):
             future.result()
     family = store.get_session_family(first.id)
     assert [member.id for member in family] == [source.id, first.id, second.id]
-    assert all(member.labels[SESSION_FAMILY_LABEL_KEY] == source.id for member in family)
+    assert all(member.family_id == source.id for member in family)
+    assert all("omnigent.session_family_id" not in member.labels for member in family)
+    with workspace_scope(424242):
+        other_source = store.create_conversation(conversation_id=source.id)
+        other_sibling = store.create_conversation(conversation_id="6" * 32)
+        store.add_new_sibling(other_source.id, other_sibling.id, user_id="alice")
+        assert {member.id for member in store.get_session_family(other_source.id)} == {
+            other_source.id,
+            other_sibling.id,
+        }
+    assert {member.id for member in store.get_session_family(source.id)} == {
+        source.id,
+        first.id,
+        second.id,
+    }
     assert all(
         member.parent_conversation_id is None and member.root_conversation_id == member.id
         for member in family
     )
     assert all(FAMILY_PIN_LABEL_PREFIX + "alice" in member.labels for member in family)
     assert pinned_label_key("alice") not in family[0].labels
+    fork = store.fork_conversation(source.id)
+    assert fork.family_id is None
+    assert [member.id for member in store.get_session_family(fork.id)] == [fork.id]
+    assert not any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in fork.labels)
+    for parent in (source, fork):
+        with pytest.raises(OmnigentError, match="no longer available"):
+            store.add_new_sibling(parent.id, first.id, user_id="alice")
     store.set_labels(first.id, {pinned_label_key("alice"): "234"})
     store.set_family_pin(source.id, "", user_id="alice")
     assert store.get_conversation(first.id).labels[pinned_label_key("alice")] == "234"
@@ -9801,14 +9822,28 @@ async def test_sibling_family_lifecycle(tmp_path, split_database):
     assert await store.delete_conversation(source.id)
     assert [member.id for member in store.get_session_family(second.id)] == [first.id, second.id]
     assert store.get_conversation(second.id).labels[FAMILY_PIN_LABEL_PREFIX + "alice"] == "345"
+    later = store.create_conversation(conversation_id="5" * 32, title="Follow-up")
+    store.add_new_sibling(second.id, later.id, user_id="alice")
+    assert store.get_conversation(later.id).family_id == source.id
+    assert store.get_conversation(later.id).project_id == project_id
+    assert store.get_conversation(later.id).labels[FAMILY_PIN_LABEL_PREFIX + "alice"] == "345"
+    reopened = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    assert {member.id for member in reopened.get_session_family(later.id)} == {
+        first.id,
+        second.id,
+        later.id,
+    }
 
 
-@pytest.mark.parametrize("key", ["omnigent.session_family_id", "omnigent.family_pinned.alice"])
-def test_generic_label_writes_cannot_reassign_family(conversation_store, key: str) -> None:
+def test_generic_label_writes_cannot_change_family_pins(conversation_store) -> None:
     from omnigent.errors import OmnigentError
 
     store = conversation_store
     source = store.create_conversation()
+    key = "omnigent.family_pinned.alice"
     for operation in (
         lambda: store.create_conversation(labels={key: source.id}),
         lambda: store.set_labels(source.id, {key: source.id}),
@@ -9817,3 +9852,21 @@ def test_generic_label_writes_cannot_reassign_family(conversation_store, key: st
     ):
         with pytest.raises(OmnigentError, match="server-owned"):
             operation()
+
+
+def test_family_membership_is_independent_of_labels(conversation_store) -> None:
+    store = conversation_store
+    source = store.create_conversation()
+    sibling = store.create_conversation()
+    key = "omnigent.session_family_id"
+    standalone = store.create_conversation(labels={key: source.id})
+    assert standalone.family_id is None
+    assert [member.id for member in store.get_session_family(standalone.id)] == [standalone.id]
+    store.add_new_sibling(source.id, sibling.id, user_id="alice")
+    store.set_labels(sibling.id, {key: standalone.id})
+    assert store.get_conversation(sibling.id).family_id == source.id
+    store.delete_label(sibling.id, key)
+    assert {member.id for member in store.get_session_family(sibling.id)} == {
+        source.id,
+        sibling.id,
+    }

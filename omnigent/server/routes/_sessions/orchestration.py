@@ -1178,10 +1178,7 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
     :returns: A copy with the pin and sandbox-repo families collapsed to their
         canonical bare keys.
     """
-    from omnigent.stores.conversation_store import (
-        FAMILY_PIN_LABEL_PREFIX,
-        SESSION_FAMILY_LABEL_KEY,
-    )
+    from omnigent.stores.conversation_store import FAMILY_PIN_LABEL_PREFIX
 
     my_key = pinned_label_key(user_id)
     my_pin = labels.get(my_key)
@@ -1189,8 +1186,7 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
     cleaned = {
         k: v
         for k, v in labels.items()
-        if k != SESSION_FAMILY_LABEL_KEY
-        and not k.startswith(FAMILY_PIN_LABEL_PREFIX)
+        if not k.startswith(FAMILY_PIN_LABEL_PREFIX)
         and not k.startswith(PROFILE_LABEL_PREFIX)
         and k != PINNED_LABEL_KEY
         and not k.startswith(f"{PINNED_LABEL_KEY}.")

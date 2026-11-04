@@ -14,7 +14,6 @@ from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores.conversation_store import (
     FAMILY_PIN_LABEL_PREFIX,
     PINNED_LABEL_KEY,
-    SESSION_FAMILY_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationStore,
@@ -83,7 +82,7 @@ def project_families(
     archived_only: bool = False,
 ) -> tuple[list[Conversation], dict[str, SessionFamily]]:
     """Hydrate complete owner-visible families without changing pagination cursors."""
-    candidates = [item for item in sessions if SESSION_FAMILY_LABEL_KEY in item.labels]
+    candidates = [item for item in sessions if item.family_id is not None]
     grants = permissions.list_for_sessions([item.id for item in candidates]) if permissions else {}
     result = {item.id: item for item in sessions}
     families: dict[str, SessionFamily] = {}
@@ -92,7 +91,8 @@ def project_families(
         PINNED_LABEL_KEY + "."
     )
     for item in candidates:
-        family_id = item.labels[SESSION_FAMILY_LABEL_KEY]
+        family_id = item.family_id
+        assert family_id is not None
         if family_id in seen or (
             permissions is not None
             and not any(

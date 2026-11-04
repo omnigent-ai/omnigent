@@ -68,10 +68,12 @@ Additional requirements:
 
 ### Storage and list contracts
 
-Reuse `omnigent.session_family_id` labels with the original source session ID
-as the durable family ID. Execution parent/root links remain unchanged.
-Server-owned family and per-user family-pin label keys cannot be written through
-creation labels, PATCH, generic store label methods or policies. Forks drop them.
+Store membership in nullable `omnigent_conversation_metadata.family_id`, using
+the original source session ID as the durable family ID. A standalone session
+has no family ID, and execution parent/root links remain unchanged. Only sibling
+creation assigns membership; client labels and PATCH cannot change it. Ordinary
+forks start standalone. Per-user family pins retain their server-owned labels,
+which generic label writers cannot change and forks do not inherit.
 
 A family supports up to 100 retained members, including archived members. This
 bounds hydration and family-wide mutations. A persistent preference row keyed by
@@ -88,10 +90,13 @@ representative_id, pinned, pinned_at}`. Clients deduplicate hydrated rows across
 Pinned lists include member context without charging each member a pin slot.
 Shared viewers receive neither private family context nor protected labels.
 
-The only schema change is the covering label index
-`(workspace_id, key, value, conversation_id)`, in a separate prerequisite PR.
-A 100,000-label SQLite measurement reduced the representative lookup from
-approximately 6.352 ms to 0.002 ms. No new tables or columns are required.
+The schema-only prerequisite adds the nullable binary UUID column and the index
+`(workspace_id, family_id, id)`. Member lookups read metadata through this index
+with an explicit limit; the application PR adds the ORM mapping and callers.
+Deploy the schema before the application. Existing sessions remain standalone,
+older writers omit the nullable column, and application rollback leaves the
+schema installed. No label backfill is needed for this unreleased feature.
+Side-chat discovery and its schema changes belong to a separate stack.
 
 ### Creation and compatibility
 

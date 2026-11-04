@@ -189,7 +189,6 @@ SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_sou
 
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
-SESSION_FAMILY_LABEL_KEY = "omnigent.session_family_id"
 FAMILY_PIN_LABEL_PREFIX = "omnigent.family_pinned."
 MAX_SESSION_FAMILY_MEMBERS = 100
 
@@ -245,7 +244,6 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # ``REQUESTED_HOST_ID_LABEL_KEY`` (cross-checked by a store test).
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
-    SESSION_FAMILY_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
