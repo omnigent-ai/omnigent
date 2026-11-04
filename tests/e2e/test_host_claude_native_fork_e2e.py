@@ -46,7 +46,9 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -950,43 +952,44 @@ def _recall_code_words(client: httpx.Client, *, session_id: str, expected: str) 
     )
 
 
-def _rewind_and_check_placement(
-    client: httpx.Client, *, source_id: str, item_id: str, prompt_fragment: str
-) -> str:
-    """
-    Rewind *source_id* to *item_id* and check the fork's placement and notice.
+@dataclass(frozen=True)
+class _Rewound:
+    """What a ``/rewind`` changed, observed through the API."""
 
-    The fork takes the source's runner, host and workspace; the source keeps
-    its host and workspace to resume on, but not the runner.
+    rewound_id: str
+    prompt: str
+    # The source before the rewind, the rewound session, and the source after it.
+    placed: dict[str, Any]
+    rewound: dict[str, Any]
+    source: dict[str, Any]
+    source_notices: list[str]
 
-    :returns: The rewound session's id.
-    """
+
+def _rewind(client: httpx.Client, *, source_id: str, item_id: str) -> _Rewound:
+    """Rewind *source_id* to *item_id* once its turn ends, recording placements around it."""
     # /rewind refuses a running turn.
     _wait_until_idle(client, session_id=source_id)
     # /rewind moves the runner to the new session, so capture it first.
     placed = client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
-    assert placed["runner_id"] is not None, placed
     resp = client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": item_id}, timeout=60.0)
     assert resp.status_code == 200, resp.text
     rewound_id = str(resp.json()["session_id"])
-    assert prompt_fragment in resp.json()["prompt"]
-    rewound = client.get(f"/v1/sessions/{rewound_id}", timeout=30.0).json()
-    assert (rewound["runner_id"], rewound["host_id"], rewound["workspace"]) == (
-        placed["runner_id"],
-        placed["host_id"],
-        placed["workspace"],
-    )
-    source = client.get(f"/v1/sessions/{source_id}", timeout=30.0).json()
-    assert (source["runner_id"], source["host_id"], source["workspace"]) == (
-        None,
-        placed["host_id"],
-        placed["workspace"],
-    )
     items = client.get(
         f"/v1/sessions/{source_id}/items", params={"limit": 5, "order": "desc"}, timeout=30.0
     ).json()["data"]
-    assert any(f"/c/{rewound_id}" in _assistant_text(item) for item in items), items
-    return rewound_id
+    return _Rewound(
+        rewound_id=rewound_id,
+        prompt=str(resp.json()["prompt"]),
+        placed=placed,
+        rewound=client.get(f"/v1/sessions/{rewound_id}", timeout=30.0).json(),
+        source=client.get(f"/v1/sessions/{source_id}", timeout=30.0).json(),
+        source_notices=[_assistant_text(item) for item in items],
+    )
+
+
+def _placement(session: dict[str, Any]) -> tuple[Any, Any, Any]:
+    """A session's runner, host and workspace."""
+    return (session["runner_id"], session["host_id"], session["workspace"])
 
 
 def test_rewind_claude_native_resumes_only_the_earlier_history(
@@ -1017,12 +1020,19 @@ def test_rewind_claude_native_resumes_only_the_earlier_history(
             _plant_code_words(http_client, session_id=source_id, words=[kept, dropped])
             _wait_for_external_session_id(http_client, session_id=source_id, timeout=60.0)
 
-            rewound_id = _rewind_and_check_placement(
+            rewind = _rewind(
                 http_client,
                 source_id=source_id,
                 item_id=_prompt_item_id(http_client, session_id=source_id, fragment=dropped),
-                prompt_fragment=dropped,
             )
+            assert dropped in rewind.prompt
+            # The fork takes the source's placement; the source keeps its host
+            # and workspace to resume on, but not the runner.
+            assert rewind.placed["runner_id"] is not None, rewind.placed
+            assert _placement(rewind.rewound) == _placement(rewind.placed)
+            assert _placement(rewind.source) == (None, *_placement(rewind.placed)[1:])
+            assert any(f"/c/{rewind.rewound_id}" in text for text in rewind.source_notices)
+            rewound_id = rewind.rewound_id
 
             reply = _recall_code_words(http_client, session_id=rewound_id, expected=kept)
             assert dropped not in reply, (
