@@ -1497,10 +1497,11 @@ function AppShellImpl() {
   // its result committed; any other file navigation clears it.
   const contentSearchFileRef = useRef<string | null>(null);
   const openFileViewer = useCallback(
-    (path: string, options?: OpenFileOptions) => {
-      contentSearchFileRef.current = null;
-      guardFileNavigation(path, options, () => commitFileNavigation(path, options));
-    },
+    (path: string, options?: OpenFileOptions) =>
+      guardFileNavigation(path, options, () => {
+        contentSearchFileRef.current = null;
+        commitFileNavigation(path, options);
+      }),
     [guardFileNavigation, commitFileNavigation],
   );
   const openContentSearchResult = useCallback(
