@@ -11,7 +11,9 @@ index builds ``CONCURRENTLY``, so sessions stay writable during the upgrade.
 Builds from before this revision ignore the column; until the rollout finishes,
 sessions they title keep the ``"1"`` default or their earlier key, so Name
 ordering lists them as untitled or under their old name until the next rename.
-A rerun recomputes every key. Downgrade drops the index and the column.
+After the last older build stops, rerun this revision's upgrade to recompute
+those keys; the backfill skips rows renamed while it runs. Downgrade drops the
+index and the column.
 """
 
 from __future__ import annotations

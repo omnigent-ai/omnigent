@@ -273,7 +273,8 @@ that slot.
 another row in the same list, project or group and release it; a line like the
 Pinned section's marks where it lands. Move up and Move down in the row menu or
 right-click menu do the same. On mobile, press and hold a row in the sidebar
-drawer, then drag it. Ordering → Custom in the filter menu keeps the order shown.
+drawer, then drag it. Ordering → Custom in the filter menu keeps the order shown,
+except from Name, where it starts from Updated.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (mark as read or unread, archive, unarchive, delete).
