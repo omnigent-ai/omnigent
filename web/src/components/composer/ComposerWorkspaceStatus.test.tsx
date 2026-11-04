@@ -6,6 +6,9 @@ import { ComposerWorkspaceStatus } from "./ComposerWorkspaceStatus";
 
 afterEach(cleanup);
 
+// The chips' own provider opens tooltips after 600ms; leave room on slow runners.
+const TOOLTIP_WAIT = { timeout: 3000 };
+
 const base = {
   workspacePath: "/home/alice/repo",
   worktreePath: "/home/alice/repo",
@@ -55,7 +58,7 @@ describe("ComposerWorkspaceStatus", () => {
     const user = userEvent.setup();
     render(<ComposerWorkspaceStatus {...base} workspacePath="/home/alice/projects/repo" />);
     await user.hover(screen.getByTestId("composer-workspace-dir"));
-    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+    expect(await screen.findByRole("tooltip", {}, TOOLTIP_WAIT)).toHaveTextContent(
       "Working directory: /home/alice/projects/repo",
     );
   });
@@ -73,7 +76,7 @@ describe("ComposerWorkspaceStatus", () => {
     const worktree = screen.getByTestId("composer-git-branch");
     expect(worktree).toHaveTextContent("Branch unavailable");
     await user.hover(worktree);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+    expect(await screen.findByRole("tooltip", {}, TOOLTIP_WAIT)).toHaveTextContent(
       "Branch unavailable. Created on branch feature/created.",
     );
   });
