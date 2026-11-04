@@ -75,35 +75,46 @@ export const ComposerWorkspaceTrigger = forwardRef<
     icon?: ReactNode;
     /** Hide the visible label; it stays the accessible name. */
     iconOnly?: boolean;
+    /** Hover details, e.g. the full path; hidden while its menu is open. */
+    tooltip: ReactNode;
+    menuOpen: boolean;
   }
 >(function ComposerWorkspaceTrigger(
-  { kind, label, icon, iconOnly = false, className, ...props },
+  { kind, label, icon, iconOnly = false, tooltip, menuOpen, className, ...props },
   ref,
 ) {
   const Icon = kind === "directory" ? FolderIcon : GitForkIcon;
   return (
-    <button
-      ref={ref}
-      type="button"
-      // Icon-only while the bar is collapsed, so the label is the name.
-      aria-label={label}
-      className={cn(
-        "relative inline-flex h-6 min-w-10 mobile-touch-target mobile-app:h-auto max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
-        className,
-      )}
-      {...props}
+    <ComposerMenuTooltip
+      menuOpen={menuOpen}
+      content={tooltip}
+      // The wrapper is the bar's flex item, so it carries the width cap.
+      className="max-w-[calc(50%-0.25rem)]"
+      contentClassName="max-w-[min(36rem,calc(100vw-2rem))] break-all"
     >
-      {icon ?? <Icon className="size-3.5 shrink-0" />}
-      {!iconOnly && (
-        <span
-          data-workspace-collapse-label=""
-          className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
-        >
-          {label}
-        </span>
-      )}
-      <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
-    </button>
+      <button
+        ref={ref}
+        type="button"
+        // Icon-only while the bar is collapsed, so the label is the name.
+        aria-label={label}
+        className={cn(
+          "relative inline-flex h-6 min-w-10 mobile-touch-target mobile-app:h-auto max-w-full cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
+          className,
+        )}
+        {...props}
+      >
+        {icon ?? <Icon className="size-3.5 shrink-0" />}
+        {!iconOnly && (
+          <span
+            data-workspace-collapse-label=""
+            className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+          >
+            {label}
+          </span>
+        )}
+        <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
+      </button>
+    </ComposerMenuTooltip>
   );
 });
 
