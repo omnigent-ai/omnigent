@@ -1413,6 +1413,23 @@ describe("PullRequestPanel", () => {
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
   });
 
+  it("collapses a jumped-to file from its header and keeps collapse across tabs", async () => {
+    renderChanges();
+    await screen.findAllByTestId("diff");
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    fireEvent.click(screen.getAllByRole("button", { name: /app\.ts/ })[0]);
+    expect(screen.getAllByTestId("diff")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Collapse all diffs" })).toBeInTheDocument();
+    // The jump expanded the file only temporarily; one header click closes it again.
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    expect(screen.getByRole("button", { name: /app\.ts/, expanded: false })).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+    await screen.findAllByTestId("diff");
+    expect(screen.getByRole("button", { name: /app\.ts/, expanded: false })).toBeInTheDocument();
+  });
+
   it("collapses a file's diff when its section header is clicked", async () => {
     renderChanges();
     expect(await screen.findAllByTestId("diff")).toHaveLength(2);
@@ -1432,6 +1449,14 @@ describe("PullRequestPanel", () => {
     // The same button now offers the inverse action.
     fireEvent.click(screen.getByRole("button", { name: "Expand all diffs" }));
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
+
+    // A file revealed by a jump counts as expanded, and collapse all closes it.
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /app\.ts/ })[0]);
+    expect(screen.getAllByTestId("diff")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    expect(screen.queryAllByTestId("diff")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Expand all diffs" })).toBeInTheDocument();
   });
 
   it("hides and shows the file sidebar from the toolbar", async () => {
