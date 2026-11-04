@@ -16,7 +16,12 @@ import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sess
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
-import { retryFailedStartupLookup, useChatStore, type ChatState } from "@/store/chatStore";
+import {
+  initChatStore,
+  retryFailedStartupLookup,
+  useChatStore,
+  type ChatState,
+} from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { SideChatPane } from "./SideChatPane";
@@ -78,7 +83,7 @@ beforeEach(() => {
   mockSession.labels = {};
   mockSession.snapshot = {};
   loadingSession.id = null;
-  conversationRegistry.clear();
+  initChatStore(queryClient);
   send.mockReset().mockResolvedValue(undefined);
   sendSlashCommand.mockReset().mockResolvedValue(undefined);
   skillsFixture.current = { skills: [], skillsStatus: null };
@@ -1850,7 +1855,7 @@ it.each([
     holder: "the grid composer, told its id by a later read,",
     sender: "the main composer's saved draft",
     gridHolds: true,
-    readAs: "pending_late_with_main_draft",
+    readAs: "pending_late",
     mainDraft: { text: "unrelated", files: [] },
   },
 ])(
@@ -1883,7 +1888,6 @@ it.each([
     else setSessionDraft(childId, recovered);
     if (mainDraft) setSessionDraft(childId, mainDraft);
     if (late) {
-      // A new id per row: this tab still counts earlier tests' inputs as returned, and sends name them.
       vi.spyOn(sessionsApi, "listFailedInputs").mockResolvedValue([
         {
           pendingId: readAs,

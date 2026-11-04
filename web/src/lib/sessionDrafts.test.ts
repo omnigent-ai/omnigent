@@ -103,6 +103,26 @@ describe("session drafts", () => {
     expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ conversation: "new" });
   });
 
+  it("replaces the startup inputs a draft holds without changing its text", async () => {
+    const { getSessionDraft, replaceSessionDraftStartupInputs, setSessionDraft } =
+      await import("./sessionDrafts");
+    setSessionDraft("conversation", { text: "held", files: [], startupInputIds: ["pending_held"] });
+    replaceSessionDraftStartupInputs("conversation", "recalled", ["pending_first"]);
+    expect(getSessionDraft("conversation")).toEqual({
+      text: "held",
+      files: [],
+      startupInputIds: ["pending_first"],
+    });
+    replaceSessionDraftStartupInputs("conversation", "recalled", []);
+    expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ conversation: "held" });
+    replaceSessionDraftStartupInputs("another", "recalled", ["pending_other"]);
+    expect(getSessionDraft("another")).toEqual({
+      text: "recalled",
+      files: [],
+      startupInputIds: ["pending_other"],
+    });
+  });
+
   it("recovers a failed temporary draft and ignores its late cleanup write", async () => {
     const { getSessionDraft, recoverFailedSessionDraft, setSessionDraft } =
       await import("./sessionDrafts");

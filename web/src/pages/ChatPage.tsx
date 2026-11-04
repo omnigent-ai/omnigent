@@ -136,6 +136,7 @@ import {
   addSessionDraftStartupInputs,
   getSessionDraft,
   promoteSessionDraft,
+  replaceSessionDraftStartupInputs,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
 import {
@@ -3826,19 +3827,19 @@ function ComposerImpl(
     submit({ resetNativeInputSession: true });
   };
 
-  // The draft keeps the recalled message's failed startup inputs, so its resend replaces them
-  // and a reload doesn't offer them again.
+  // The recalled message replaces the composer's content, so the draft holds only its failed
+  // startup inputs: its resend replaces them, and a reload doesn't offer them again.
   const takeBackQueued = (message: {
     queueId: string;
     text: string;
     files?: File[];
     startupInputIds?: string[];
   }) => {
-    if (conversationId && message.startupInputIds?.length)
-      addSessionDraftStartupInputs(
+    if (conversationId)
+      replaceSessionDraftStartupInputs(
         conversationId,
         message.text,
-        message.startupInputIds,
+        message.startupInputIds ?? [],
         message.files,
       );
     dequeueMessage(message.queueId);

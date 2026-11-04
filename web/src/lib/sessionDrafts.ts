@@ -110,6 +110,31 @@ export function addSessionDraftStartupInputs(
   });
 }
 
+/**
+ * Record the failed startup inputs a recalled message brings back, in place of those the draft held.
+ *
+ * @param conversationId - The session the inputs belong to.
+ * @param text - Their text, saved only when the session has no draft yet; an existing draft keeps its text.
+ * @param ids - Their pending ids, which replace the draft's.
+ * @param files - Their files, saved with the text when the session has no draft yet.
+ */
+export function replaceSessionDraftStartupInputs(
+  conversationId: string,
+  text: string,
+  ids: string[],
+  files: File[] = [],
+): void {
+  const draft = sessionDrafts.get(conversationId) ?? { text, files };
+  // Without the old entry, setSessionDraft has no held ids to carry over.
+  sessionDrafts.delete(conversationId);
+  setSessionDraft(conversationId, {
+    text: draft.text,
+    files: draft.files,
+    ...(draft.replyDraft ? { replyDraft: draft.replyDraft } : {}),
+    ...(ids.length > 0 ? { startupInputIds: ids } : {}),
+  });
+}
+
 /** Remove a draft and ignore any late cleanup write for the retired id. */
 export function retireSessionDraft(conversationId: string): SessionDraft | undefined {
   const draft = sessionDrafts.get(conversationId);

@@ -6598,6 +6598,44 @@ describe("Composer — editing queued messages", () => {
     },
   );
 
+  it.each<[string, string[] | undefined]>([
+    ["its own startup inputs", ["pending_first"]],
+    ["no startup inputs", undefined],
+  ])(
+    "keeps only the startup inputs of a queued message with %s when Edit replaces a recovered draft",
+    (_, startupInputIds) => {
+      setSessionDraft(CONV, {
+        text: "saved on server",
+        files: [],
+        startupInputIds: ["pending_held"],
+      });
+      useChatStore.setState({
+        queuedMessages: [
+          {
+            queueId: "q_1",
+            text: QUEUED_TEXT,
+            conversationId: CONV,
+            ...(startupInputIds ? { startupInputIds } : {}),
+          },
+        ],
+      });
+      const props = composerProps();
+      renderWithTooltips(<Composer {...props} />);
+      expect(textarea()).toHaveValue("saved on server");
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+
+      expect(textarea()).toHaveValue(QUEUED_TEXT);
+      expect(getSessionDraft(CONV)?.startupInputIds).toEqual(startupInputIds);
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(
+        QUEUED_TEXT,
+        undefined,
+        ...(startupInputIds ? [undefined, startupInputIds] : []),
+      );
+    },
+  );
+
   it.each([
     ["", "screenshot.png"],
     ["Look at this", "screenshot.png"],
