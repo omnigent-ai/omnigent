@@ -29,7 +29,10 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.harnesses.codex_native.app_server import client_for_transport
+from omnigent.harnesses.codex_native.app_server import (
+    CodexAppServerResponseError,
+    client_for_transport,
+)
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
 from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
@@ -194,7 +197,22 @@ def test_oversized_input_survives_real_codex_transport(codex_effort_rig: _Rig) -
             finally:
                 await client.close()
 
-        thread = asyncio.run(read_thread())
+        deadline = time.monotonic() + 30
+        last_read_error: CodexAppServerResponseError | None = None
+        while time.monotonic() < deadline:
+            try:
+                thread = asyncio.run(read_thread())
+                break
+            except CodexAppServerResponseError as exc:
+                if "is not materialized yet" not in str(exc):
+                    raise
+                last_read_error = exc
+                time.sleep(0.2)
+        else:
+            pytest.fail(
+                "Codex thread did not materialize after the oversized input: "
+                f"{last_read_error}\n{rig.stack.log_tail()}"
+            )
         native_user_items = [
             item
             for turn in thread["turns"]
