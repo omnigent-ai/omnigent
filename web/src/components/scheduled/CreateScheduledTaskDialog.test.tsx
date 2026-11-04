@@ -2475,41 +2475,37 @@ describe("editing template prompts", () => {
     { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
   );
 
-  it.each(["Include the agenda.", "", "  \n"])(
-    "keeps a hand-written heading editable for unrelated changes (%j)",
-    async (instructions) => {
-      const prompt = `Write a training document.\n\nInstructions for each session:\n${instructions}`;
-      render(
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          editingTask={scheduledTask({ prompt })}
-        />,
-      );
-      expect(screen.getByLabelText("Prompt", { exact: true })).toHaveValue(prompt);
-      expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
-      fireEvent.change(screen.getByTestId("task-name-input"), {
-        target: { value: "Updated name" },
-      });
-      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
-        name: "Updated name",
-        prompt: prompt.trim(),
-      });
-    },
-  );
+  it("keeps a hand-written heading editable for unrelated changes", async () => {
+    const prompt = "Write a training document.\n\nInstructions for each session:\n";
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ prompt })}
+      />,
+    );
+    expect(screen.getByLabelText("Prompt", { exact: true })).toHaveValue(prompt);
+    expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("task-name-input"), {
+      target: { value: "Updated name" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      name: "Updated name",
+      prompt: prompt.trim(),
+    });
+  });
 
-  it.each(["Your prompt", "System prompt"])(
-    "explains a format-changing edit to %s before saving",
-    (field) => {
-      render(
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          editingTask={scheduledTask({ prompt: original })}
-        />,
-      );
+  it.each([
+    ["Your prompt", false],
+    ["System prompt", false],
+    ["System prompt", true],
+  ] as const)(
+    "saves and reopens a format-changing edit to %s (remove signature: %s)",
+    async (field, removeSignature) => {
+      const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
+      const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
       expect(
         screen.queryByText(/These edits change the template structure/),
       ).not.toBeInTheDocument();
@@ -2519,9 +2515,10 @@ describe("editing template prompts", () => {
       }
       const editor = screen.getByRole("textbox", { name: field }) as HTMLTextAreaElement;
       const savedValue = editor.value;
-      fireEvent.change(editor, {
-        target: { value: `${savedValue}\n\nInstructions for each session:\nExtra heading.` },
-      });
+      const changedValue = removeSignature
+        ? savedValue.replace("This automation watches Jira ", "Custom Jira automation ")
+        : `${savedValue}\n\nInstructions for each session:\nExtra heading.`;
+      fireEvent.change(editor, { target: { value: changedValue } });
       expect(
         screen.getByText(/After saving, the full text will appear as one prompt/),
       ).toBeVisible();
@@ -2530,6 +2527,22 @@ describe("editing template prompts", () => {
       expect(
         screen.queryByText(/These edits change the template structure/),
       ).not.toBeInTheDocument();
+      fireEvent.change(editor, { target: { value: changedValue } });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const saved = updateMutateAsync.mock.calls[0][0].input.prompt;
+      expect(saved).toContain(removeSignature ? "Custom Jira automation " : "Extra heading.");
+      expect(saved).toContain("Triage the ticket.");
+      rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+      rerender(
+        <CreateScheduledTaskDialog
+          open
+          {...props}
+          editingTask={scheduledTask({ prompt: saved })}
+        />,
+      );
+      expect(screen.getByRole("textbox", { name: "Prompt" })).toHaveValue(saved);
+      expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
     },
   );
 
@@ -2571,8 +2584,20 @@ describe("editing template prompts", () => {
       'project = "OPS"',
     );
     fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
+      target: { value: "  \n" },
+    });
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Done editing system prompt" }));
+    expect(screen.getByText(/System prompt can't be empty/)).toBeVisible();
+    fireEvent.click(toggle);
+    expect(screen.getByText(/System prompt can't be empty/)).toBeVisible();
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
       target: { value: systemPrompt },
     });
+    expect(screen.queryByText(/System prompt can't be empty/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.change(screen.getByLabelText("Your prompt"), { target: { value: "Fix it." } });
     fireEvent.click(toggle);
     fireEvent.click(toggle);

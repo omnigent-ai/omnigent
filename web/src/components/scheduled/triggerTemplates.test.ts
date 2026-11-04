@@ -50,8 +50,8 @@ describe("saved trigger prompts", () => {
     );
   });
 
-  it("reopens edits to both the system instructions and posting instructions", () => {
-    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields(), CTX));
+  it.each([true, false])("reopens edited attribution with link-back %s", (linkBack) => {
+    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields({ linkBack }), CTX));
     const systemPrompt = parts.systemPrompt!.replace("Sent with Omnigent", "Automated reply");
     expect(splitTriggerPrompt(combineTriggerPrompt("New user prompt.", systemPrompt))).toEqual({
       userPrompt: "New user prompt.",

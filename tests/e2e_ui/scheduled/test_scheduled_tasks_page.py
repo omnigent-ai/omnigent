@@ -1107,7 +1107,10 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     system_editor = page.get_by_role("textbox", name="System prompt", exact=True)
     expect(system_editor).to_have_count(0)
     page.get_by_role("button", name="Edit system prompt", exact=True).click()
-    system_editor.fill(system_editor.input_value().replace('project = "ES"', 'project = "OPS"'))
+    updated_system_prompt = system_editor.input_value().replace(
+        'project = "ES"', 'project = "OPS"'
+    )
+    system_editor.fill(updated_system_prompt)
     page.get_by_test_id("create-scheduled-task-submit").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
     updated = httpx.get(f"{live_server}/v1/scheduled-tasks/{created['id']}", timeout=10).json()
@@ -1118,7 +1121,7 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     system_toggle.click()
     expect(system_editor).to_have_count(0)
     page.get_by_role("button", name="Edit system prompt", exact=True).click()
-    expect(system_editor).to_contain_text('project = "OPS"')
+    expect(system_editor).to_have_value(updated_system_prompt)
     page.get_by_role("button", name="Cancel", exact=True).click()
     page.goto(f"{live_server}/tasks")
     page.get_by_test_id("suggestion-trigger-slack").click()

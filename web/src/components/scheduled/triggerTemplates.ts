@@ -308,7 +308,7 @@ export function splitTriggerPrompt(prompt: string): {
     return unsplit;
   }
   const sections = prompt.split(SESSION_INSTRUCTIONS);
-  if (sections.length !== 2 || sections[0].trim() === "") {
+  if (sections.length !== 2) {
     return unsplit;
   }
   const [systemPrompt, instructions] = sections;

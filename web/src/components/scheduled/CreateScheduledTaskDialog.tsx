@@ -762,8 +762,9 @@ export function CreateScheduledTaskDialog({
               {systemPrompt !== null &&
                 splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
                   <p role="status" className="text-sm text-warning">
-                    These edits change the template structure. After saving, the full text will
-                    appear as one prompt.
+                    {systemPrompt.trim() === ""
+                      ? "System prompt can't be empty. Expand System prompt and click Edit system prompt to restore it."
+                      : "These edits change the template structure. After saving, the full text will appear as one prompt."}
                   </p>
                 )}
               {systemPrompt !== null && (
