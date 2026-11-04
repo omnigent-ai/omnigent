@@ -1691,9 +1691,7 @@ def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     assert calls == [("status", tmp_path / "repo-0"), ("show", tmp_path / "repo-0")]
 
 
-@pytest.mark.parametrize(
-    "boundary", ["repositories", "nested_repositories", "entries", "time", "nested_time"]
-)
+@pytest.mark.parametrize("boundary", ["repositories", "nested_repositories", "entries", "time"])
 def test_multi_repo_discovery_bounds_fail_without_partial_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
 ) -> None:
@@ -1704,11 +1702,8 @@ def test_multi_repo_discovery_bounds_fail_without_partial_results(
         if boundary == "nested_repositories":
             (tmp_path / "group" / str(index) / ".git").mkdir(parents=True)
             reader.record_change(f"group/{index}/file.txt", "modified", "session")
-        elif boundary != "nested_time":
+        else:
             (tmp_path / str(index) / ".git").mkdir(parents=True)
-    if boundary == "nested_time":
-        (tmp_path / "group" / "a" / "b").mkdir(parents=True)
-        reader.record_change("group/a/b/file.txt", "modified", "session")
     with monkeypatch.context() as patches:
         patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: 0)
         if boundary == "entries":
@@ -1722,14 +1717,32 @@ def test_multi_repo_discovery_bounds_fail_without_partial_results(
             patches.setattr(
                 "omnigent.runtime.filesystem_registry.time.monotonic", lambda: next(clock)
             )
-        elif boundary == "nested_time":
-            # The deadline passes after the first ancestor probe of one recorded directory.
-            nested_clock = itertools.chain([0, 0, 0], itertools.repeat(0.251))
-            patches.setattr(
-                "omnigent.runtime.filesystem_registry.time.monotonic", lambda: next(nested_clock)
-            )
         with pytest.raises(GitStatusUnavailable, match=r"discovery limit|32 repositories"):
             reader.list_changed_files("session", limit=100)
+
+
+def test_nested_discovery_deadline_keeps_recorded_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "group" / "repo"
+    (repo / "src").mkdir(parents=True)
+    _init_git_with_commit(repo, "src/file.txt", "original\n")
+    (repo / "src" / "file.txt").write_text("edited\n")
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    registry.record_change("group/repo/src/file.txt", "modified", "session")
+    reader = registry.with_git_runner(lambda *_args: pytest.fail("discovery should have stopped"))
+    # The deadline passes after the first ancestor probe of the recorded directory.
+    clock = itertools.chain([0, 0, 0], itertools.repeat(0.251))
+    with monkeypatch.context() as patches:
+        patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: next(clock))
+        changes = reader.list_changed_files("session", limit=100)
+    assert [(r["path"], r["status"], r.get("repository_root")) for r in changes] == [
+        ("group/repo/src/file.txt", "modified", None)
+    ]
+    changes = registry.with_git_runner(_trusted_test_git).list_changed_files("session", limit=100)
+    assert [(r["path"], r.get("repository_root")) for r in changes] == [
+        ("group/repo/src/file.txt", "group/repo")
+    ]
 
 
 def test_large_parent_preserves_loose_files_and_discovers_late_repositories(

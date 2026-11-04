@@ -1519,7 +1519,10 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
                 events = list(self._session_events.get(conversation_id, []))
             checked: dict[Path, tuple[str, Path] | None] = {}
             for directory in sorted({Path(event.path).parent for event in events}):
-                owner = self._nearest_repository(directory, checked, deadline)
+                try:
+                    owner = self._nearest_repository(directory, checked, deadline)
+                except TimeoutError:
+                    break  # Repositories not yet found keep their recorded changes.
                 if owner is not None and owner[0] not in roots:
                     roots[owner[0]] = owner[1]
                     if len(roots) > 32:
@@ -1553,7 +1556,7 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
                 owner = checked[prefix]
                 break
             if deadline is not None and time.monotonic() > deadline:
-                raise GitStatusUnavailable("Repository discovery limit exceeded")
+                raise TimeoutError("Repository discovery deadline passed")
             visited.append(prefix)
             root = self._cwd / prefix
             # A symlinked component can lead outside the workspace, where Git cannot run.
