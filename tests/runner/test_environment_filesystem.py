@@ -1891,31 +1891,43 @@ async def test_a_save_during_another_keeps_the_original_the_first_replaced(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("method", "body"),
+    ("original", "method", "body", "after"),
     [
-        ("PUT", {"content": "AAAAAAAA", "encoding": "utf-8"}),
-        ("PATCH", {"old_text": "TAIL", "new_text": ""}),
+        pytest.param(
+            b"AAAAAAAATAIL", "PUT", {"content": "AAAAAAAA"}, "AAAAAAAA", id="prefix-saved"
+        ),
+        pytest.param(
+            b"AAAAAAAATAIL",
+            "PATCH",
+            {"old_text": "TAIL", "new_text": ""},
+            "AAAAAAAA",
+            id="prefix-edited",
+        ),
+        pytest.param(b"\x89PNG\x00\xff", "PUT", {"content": "text\n"}, "text\n", id="binary"),
+        pytest.param(b"\x89PNG\x00\xff", "PUT", {"content": ""}, "", id="binary-emptied"),
     ],
 )
-async def test_changes_keep_a_file_saved_as_the_readable_prefix_of_its_original(
+async def test_changes_keep_a_save_over_an_original_the_editor_cannot_read_whole(
     client: httpx.AsyncClient,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
+    original: bytes,
     method: str,
     body: dict[str, str],
+    after: str,
 ) -> None:
-    """A capped read is not the whole original, so saving it is still a change."""
+    """A capped or binary read is not the whole original, so saving over it is still a change."""
     monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 8)
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    (workspace / "big.txt").write_text("AAAAAAAATAIL")
+    (workspace / "saved").write_bytes(original)
 
-    saved = await client.request(method, f"{base}/filesystem/big.txt", json=body)
+    saved = await client.request(method, f"{base}/filesystem/saved", json=body)
     assert saved.status_code == 200, saved.text
 
     listed = (await client.get(f"{base}/changes")).json()["data"]
-    assert [(e["path"], e["status"]) for e in listed] == [("big.txt", "modified")]
-    diff = (await client.get(f"{base}/diff/big.txt")).json()
-    assert (diff["before"], diff["after"], diff["baseline_state"]) == (None, "AAAAAAAA", "unknown")
+    assert [(e["path"], e["status"]) for e in listed] == [("saved", "modified")]
+    diff = (await client.get(f"{base}/diff/saved")).json()
+    assert (diff["before"], diff["after"], diff["baseline_state"]) == (None, after, "unknown")
 
 
 @pytest.mark.asyncio

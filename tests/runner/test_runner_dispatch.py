@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, cast
+from unittest.mock import DEFAULT, AsyncMock
 
 import httpx
 import pytest
@@ -2915,6 +2916,20 @@ async def test_runner_os_env_concurrent_writes_keep_the_first_original(
     )
 
 
+class _InProcessReads:
+    """Answer ``OSEnvironment.read`` from the files under *root* without a helper process."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    async def read(
+        self, path: str, offset: int = 1, limit: int | None = None, max_bytes: int | None = None
+    ) -> dict[str, Any]:
+        from omnigent.inner.os_env import _read_impl
+
+        return _read_impl(self.root / path, offset, limit, max_bytes)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
@@ -2927,19 +2942,9 @@ async def test_tracked_mutation_that_fails_records_nothing(
     tmp_path: Path, failure: dict[str, str] | OSError
 ) -> None:
     """A write that returns an error or raises neither sets an original nor records a change."""
-    from omnigent.inner.os_env import OpResult, OSEnvironment, _read_impl
+    from omnigent.inner.os_env import OpResult, OSEnvironment
     from omnigent.runner.tool_dispatch import _run_tracked_os_env_mutation
     from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
-
-    class _InProcessReads:
-        async def read(
-            self,
-            path: str,
-            offset: int = 1,
-            limit: int | None = None,
-            max_bytes: int | None = None,
-        ) -> OpResult:
-            return _read_impl(tmp_path / path, offset, limit, max_bytes)
 
     async def failing_write() -> OpResult:
         if isinstance(failure, OSError):
@@ -2949,7 +2954,7 @@ async def test_tracked_mutation_that_fails_records_nothing(
     (tmp_path / "notes.txt").write_text("original\n")
     filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
     mutation = _run_tracked_os_env_mutation(
-        cast(OSEnvironment, _InProcessReads()),
+        cast(OSEnvironment, _InProcessReads(tmp_path)),
         "notes.txt",
         failing_write,
         filesystem_registry,
@@ -2988,31 +2993,20 @@ async def test_runner_os_env_snapshot_reads_only_a_complete_text_original(
     baseline: str | None,
 ) -> None:
     """Binary files are probed, not read, and only complete text becomes an original."""
-    from omnigent.inner.os_env import OpResult, OSEnvironment, _read_impl
+    from omnigent.inner.os_env import OSEnvironment
     from omnigent.runner import environment_filesystem
     from omnigent.runner.tool_dispatch import _read_os_env_original
 
-    byte_caps: list[int | None] = []
-
-    class _InProcessReads:
-        async def read(
-            self,
-            path: str,
-            offset: int = 1,
-            limit: int | None = None,
-            max_bytes: int | None = None,
-        ) -> OpResult:
-            byte_caps.append(max_bytes)
-            if complete_read_fails and max_bytes != 1:
-                raise OSError("read failed")
-            return _read_impl(tmp_path / path, offset, limit, max_bytes)
-
+    reads = _InProcessReads(tmp_path)
+    read = AsyncMock(wraps=reads.read)
+    if complete_read_fails:
+        read.side_effect = [DEFAULT, OSError("read failed")]
+    monkeypatch.setattr(reads, "read", read)
     monkeypatch.setattr(environment_filesystem, "_MAX_READ_BYTES", 8)
     (tmp_path / "notes").write_bytes(original)
-    os_env = cast(OSEnvironment, _InProcessReads())
 
-    assert await _read_os_env_original(os_env, "notes") == baseline
-    assert byte_caps == expected_byte_caps
+    assert await _read_os_env_original(cast(OSEnvironment, reads), "notes") == baseline
+    assert [call.kwargs["max_bytes"] for call in read.await_args_list] == expected_byte_caps
 
 
 @pytest.mark.asyncio

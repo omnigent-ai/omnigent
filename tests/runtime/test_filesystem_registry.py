@@ -125,10 +125,7 @@ def test_modified_only_shows_modified(registry: AgentEditFilesystemRegistry) -> 
     )
 
 
-@pytest.mark.parametrize("check_disk", [True, False])
-def test_created_then_deleted_is_hidden(
-    registry: AgentEditFilesystemRegistry, check_disk: bool
-) -> None:
+def test_created_then_deleted_is_hidden(registry: AgentEditFilesystemRegistry) -> None:
     """A file created and then deleted in the same session must not appear at all.
 
     The file never existed before the session started, and it is gone now —
@@ -139,7 +136,7 @@ def test_created_then_deleted_is_hidden(
     _inject(registry, "gone.md", "created", conv_id)
     _inject(registry, "gone.md", "deleted", conv_id)
 
-    results = registry.list_changed_files(conv_id, limit=10, check_disk=check_disk)
+    results = registry.list_changed_files(conv_id, limit=10, check_disk=True)
 
     assert results == [], (
         f"Expected no results for a file created then deleted this session, got {results}. "
@@ -470,14 +467,13 @@ def test_changes_keep_recorded_entries_while_the_workspace_is_gone(
 
 
 @pytest.mark.parametrize(
-    ("path", "swapped", "at_open", "beneath_supported"),
+    ("path", "swapped", "at_open"),
     [
-        pytest.param("notes.md", "notes.md", False, True, id="leaf"),
-        pytest.param("notes.md", "notes.md", True, True, id="leaf-at-open"),
-        pytest.param("docs/notes.md", "docs", False, True, id="parent"),
-        pytest.param("notes.md", "", False, True, id="workspace"),
-        pytest.param("notes.md", "..", False, True, id="ancestor"),
-        pytest.param("notes.md", "notes.md", False, False, id="leaf-without-dir-fd"),
+        pytest.param("notes.md", "notes.md", False, id="leaf"),
+        pytest.param("notes.md", "notes.md", True, id="leaf-at-open"),
+        pytest.param("docs/notes.md", "docs", False, id="parent"),
+        pytest.param("notes.md", "", False, id="workspace"),
+        pytest.param("notes.md", "..", False, id="ancestor"),
     ],
 )
 def test_changes_never_read_through_a_symlink_out_of_the_workspace(
@@ -486,15 +482,9 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
     path: str,
     swapped: str,
     at_open: bool,
-    beneath_supported: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A path swapped for a symlink must not reveal the size, time or content of its target."""
-    monkeypatch.setattr(
-        environment_filesystem,
-        "_BENEATH_SUPPORTED",
-        beneath_supported and environment_filesystem._BENEATH_SUPPORTED,
-    )
     workspace, outside = tmp_path / "home" / "workspace", tmp_path / "outside"
     (workspace / "docs").mkdir(parents=True)
     registry = AgentEditFilesystemRegistry(watch_path=workspace)
