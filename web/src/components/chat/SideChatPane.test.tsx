@@ -1784,9 +1784,18 @@ it.each([
     refused: false,
     unanswered: true,
   },
+  {
+    into: "to an empty grid composer as a reload's unanswered send",
+    sent: "before the reopened session reads its inputs",
+    newer: false,
+    readFirst: false,
+    refused: false,
+    unanswered: true,
+  },
 ])(
   "adds a failed launch's recovered message $into and names it in a send $sent",
   async ({ newer, readFirst, refused, unanswered }) => {
+    onTestFinished(clearSessionDrafts);
     const entry = conversationRegistry.acquire(childId);
     entry.setState({
       sessionStatus: "idle",
@@ -1822,7 +1831,8 @@ it.each([
     // Evicted while the composer holds the input, the reopened session doesn't add it again.
     const { sessionHarness, boundAgentId } = entry.getState();
     act(() => conversationRegistry.release(childId));
-    conversationRegistry.acquire(childId).setState({
+    const reopened = conversationRegistry.acquire(childId);
+    reopened.setState({
       sessionHarness,
       boundAgentId,
       sessionStatus: "idle",
@@ -1846,11 +1856,81 @@ it.each([
     else post.mockResolvedValue({ queued: true });
     fireEvent.click(screen.getByTestId("side-chat-send"));
     await waitFor(() => expect(post).toHaveBeenCalledOnce());
-    expect(post.mock.calls[0][1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+    // Until a read names the unanswered send's input, the send can't name it.
+    const named = !unanswered || readFirst;
+    if (named)
+      expect(post.mock.calls[0][1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+    else expect(post.mock.calls[0][1]).not.toHaveProperty("replaces_failed_inputs");
     const left = refused ? "> New quote\n\nnewer\n\nsaved on server" : "";
     await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveValue(left));
     await act(() => retryFailedStartupLookup(childId));
     expect(screen.getByTestId("side-chat-input")).toHaveValue(left);
+    if (named) return;
+    act(() => reopened.setState({ status: "idle", sessionStatus: "idle" }));
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "next" } });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    expect(post.mock.calls[1][1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+  },
+);
+
+it.each([false, true])(
+  "keeps the ids of a grid composer's sends a read didn't list for a later read, evicted: %s",
+  async (evicted) => {
+    onTestFinished(clearSessionDrafts);
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionStatus: "idle", abortController: new AbortController() });
+    useChatStore.setState({ send: initialStoreState.send });
+    renderPane(<SideChatPane childId={childId} fullSession />);
+    const text = "first\n\nsecond";
+    act(() =>
+      entry.setState({
+        failedSendDraft: {
+          conversationId: childId,
+          text,
+          files: [],
+          sentAs: ["stable_first", "stable_second"],
+          recovered: true,
+        },
+      }),
+    );
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(text);
+    if (evicted) {
+      const { sessionHarness, boundAgentId } = entry.getState();
+      act(() => conversationRegistry.release(childId));
+      conversationRegistry.acquire(childId).setState({
+        sessionHarness,
+        boundAgentId,
+        sessionStatus: "idle",
+        loadingConversation: false,
+        abortController: new AbortController(),
+      });
+    }
+    const listed = [
+      {
+        pendingId: "pending_first",
+        itemId: "stable_first",
+        content: [{ type: "input_text" as const, text: "first" }],
+      },
+    ];
+    vi.spyOn(sessionsApi, "listFailedInputs").mockImplementation(async () => [...listed]);
+    await act(() => retryFailedStartupLookup(childId));
+    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
+      startupInputIds: ["pending_first"],
+      sentAs: ["stable_second"],
+    });
+
+    listed.push({
+      pendingId: "pending_second",
+      itemId: "stable_second",
+      content: [{ type: "input_text", text: "second" }],
+    });
+    await act(() => retryFailedStartupLookup(childId));
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(text);
+    expect(useChatStore.getState().sideChatComposers[childId]?.startupInputIds).toEqual([
+      "pending_first",
+      "pending_second",
+    ]);
   },
 );
 
@@ -1870,9 +1950,17 @@ it.each([
     readAs: "pending_late",
     mainDraft: { text: "unrelated", files: [] },
   },
+  {
+    holder: "the grid composer, told its id by a later read,",
+    sender: "the main composer, which took back its own send first",
+    gridHolds: true,
+    readAs: "pending_late",
+    mainDraft: { text: "unrelated", files: [], sentAs: ["stable_main"] },
+    mainTook: true,
+  },
 ])(
   "doesn't name a failed startup input $holder holds in an unrelated send from $sender",
-  async ({ gridHolds, readAs, mainDraft }) => {
+  async ({ gridHolds, readAs, mainDraft, mainTook }) => {
     const late = readAs !== undefined;
     onTestFinished(clearSessionDrafts);
     const entry = conversationRegistry.acquire(childId);
@@ -1880,6 +1968,8 @@ it.each([
       sessionStatus: "idle",
       abortController: new AbortController(),
       returnedStartupInputs: late ? [] : ["pending_first"],
+      // The main composer added its own unanswered send after its draft before the grid took one.
+      ...(mainTook ? { composerSentAs: ["stable_main"] } : {}),
     });
     useChatStore.setState({ send: initialStoreState.send });
     renderPane(<SideChatPane childId={childId} fullSession />);
@@ -1906,6 +1996,15 @@ it.each([
           itemId: "stable_reload",
           content: [{ type: "input_text", text: "saved on server" }],
         },
+        ...(mainTook
+          ? [
+              {
+                pendingId: "pending_main",
+                itemId: "stable_main",
+                content: [{ type: "input_text" as const, text: "unrelated" }],
+              },
+            ]
+          : []),
       ]);
       await act(() => retryFailedStartupLookup(childId));
     }
@@ -1936,7 +2035,9 @@ it.each([
       expect(useChatStore.getState().sideChatComposers[childId]?.startupInputIds).toEqual([
         readAs ?? "pending_first",
       ]);
-      expect(getSessionDraft(childId)).toEqual(mainDraft);
+      expect(getSessionDraft(childId)).toEqual(
+        mainTook ? { text: "unrelated", files: [], startupInputIds: ["pending_main"] } : mainDraft,
+      );
     } else expect(getSessionDraft(childId)).toEqual(recovered);
   },
 );

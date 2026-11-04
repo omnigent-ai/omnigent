@@ -3836,6 +3836,42 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
+  it("keeps a files-only input out of the text draft it joins, so a reload names its attachments again", async () => {
+    onTestFinished(clearSessionDrafts);
+    seedSession("conv_real");
+    seedSession("conv_other");
+    failManagedLaunch("conv_real", "saved on server");
+    sessionFailedInputs.get("conv_real")!.push({
+      pending_id: "pending_image",
+      content: [{ type: "input_image", file_id: "file_chart", filename: "chart.png" }],
+    });
+    const notices = () =>
+      useChatStore
+        .getState()
+        .blocks.filter((block) => block.type === "error" && block.level === "info");
+    const reminder = expect.objectContaining({
+      message: "Attach chart.png again before you resend.",
+    });
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    expect(notices()).toEqual([reminder]);
+    const taken = takeFailedSendDraft("conv_real", false, true);
+    expect(taken?.startupInputIds).toEqual(["pending_first"]);
+    setSessionDraft("conv_real", {
+      text: taken!.text,
+      files: [],
+      startupInputIds: taken!.startupInputIds,
+    });
+
+    // After a reload the saved draft holds the text input alone.
+    await useChatStore.getState().switchTo("conv_other");
+    initChatStore(client);
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(notices()).toEqual([reminder]);
+  });
+
   it("reopening a session whose managed launch failed offers its first input for resending", async () => {
     seedSession("conv_real");
     failManagedLaunch("conv_real", "saved on server");
@@ -22960,7 +22996,14 @@ describe("a send cut off by a reload", () => {
       setSessionDraft("conv_reload", { text, files: [], sentAs });
 
       answer!();
-      const saved = { text, files: [], startupInputIds: ["pending_first"] };
+      // The read lists only the first send; the draft keeps the follow-up's id for a later read.
+      const unlisted = sentAs.filter((id) => id !== "stable_reload");
+      const saved = {
+        text,
+        files: [],
+        startupInputIds: ["pending_first"],
+        ...(unlisted.length > 0 ? { sentAs: unlisted } : {}),
+      };
       if (failsFirst) {
         await vi.waitFor(() =>
           expect(useChatStore.getState().blocks).toContainEqual(
@@ -22990,6 +23033,18 @@ describe("a send cut off by a reload", () => {
       await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
       expect(useChatStore.getState().failedSendDraft).toBeNull();
       expect(getSessionDraft("conv_reload")).toEqual(saved);
+      const named = ["pending_first"];
+      if (followUp) {
+        sessionFailedInputs.get("conv_reload")!.push({
+          pending_id: "pending_queued",
+          item_id: "stable_queued",
+          content: [{ type: "input_text", text: followUp }],
+        });
+        await retryFailedStartupLookup("conv_reload");
+        named.push("pending_queued");
+        expect(useChatStore.getState().failedSendDraft).toBeNull();
+        expect(getSessionDraft("conv_reload")).toEqual({ text, files: [], startupInputIds: named });
+      }
       await useChatStore.getState().send(text, "agent_xyz", undefined, {
         startupInputIds: getSessionDraft("conv_reload")?.startupInputIds,
       });
@@ -23001,8 +23056,63 @@ describe("a send cut off by a reload", () => {
         data: { stable_id: string };
         replaces_failed_inputs?: string[];
       };
-      expect(body.replaces_failed_inputs).toEqual(["pending_first"]);
+      expect(body.replaces_failed_inputs).toEqual(named);
       expect(body.data.stable_id).not.toBe("stable_reload");
+    },
+  );
+
+  it.each([
+    { resent: "edited", text: "saved on server, edited", handedBack: false },
+    // The server takes an untouched resend under the input's id as a retry of the failed input.
+    { resent: "untouched under its own id", text: "saved on server", handedBack: true },
+  ])(
+    "after the composer sends a reload's unanswered send $resent before the failed launch's inputs are read, hands it back: $handedBack",
+    async ({ text, handedBack }) => {
+      onTestFinished(clearSessionDrafts);
+      seedSession("conv_reload", []);
+      failManagedLaunch("conv_reload", "saved on server");
+      sessionFailedInputs.get("conv_reload")![0]!.item_id = "stable_reload";
+      rememberUnsentSend("conv_reload", {
+        stableId: "stable_reload",
+        text: "saved on server",
+        authorId: "user_a",
+      });
+      let answer: (() => void) | undefined;
+      fetchMock.mockImplementation((input, init) => {
+        const response = defaultFetchHandler(input, init);
+        if (String(input) !== "/v1/sessions/conv_reload/failed-inputs" || answer !== undefined)
+          return response;
+        return new Promise<Response>((resolve) => {
+          answer = () => resolve(response);
+        });
+      });
+      await useChatStore.getState().switchTo("conv_reload");
+      await vi.waitFor(() => expect(answer).toBeDefined());
+      expect(takeFailedSendDraft("conv_reload", false, true)?.text).toBe("saved on server");
+      setSessionDraft("conv_reload", {
+        text: "saved on server",
+        files: [],
+        sentAs: ["stable_reload"],
+      });
+      // The main composer sends, then clears its draft.
+      await useChatStore.getState().send(text, "agent_xyz");
+      setSessionDraft("conv_reload", { text: "", files: [] });
+
+      answer!();
+      await vi.waitFor(() =>
+        expect(useChatStore.getState().returnedStartupInputs).toEqual(["pending_first"]),
+      );
+      expect(useChatStore.getState().failedSendDraft?.text ?? null).toBe(
+        handedBack ? "saved on server" : null,
+      );
+      if (handedBack) return;
+      await useChatStore.getState().send("next", "agent_xyz");
+      const [, sent] =
+        fetchMock.mock.calls
+          .filter(([url]) => String(url).endsWith("/conv_reload/events"))
+          .at(-1) ?? [];
+      const body = JSON.parse(String(sent?.body)) as { replaces_failed_inputs?: string[] };
+      expect(body.replaces_failed_inputs).toEqual(["pending_first"]);
     },
   );
 

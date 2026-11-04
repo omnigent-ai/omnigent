@@ -14,6 +14,20 @@ type StoredSessionDraft = ComposerDraft & Pick<SessionDraft, "startupInputIds" |
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
 const listeners = new Set<() => void>();
 const retiredDraftIds = new Set<string>();
+const droppedDraftSends = new Map<string, Set<string>>();
+
+/** Remember the sends whose text a sent or cleared draft held before a read named their inputs. */
+export function rememberDroppedDraftSends(conversationId: string, sentAs: string[] = []): void {
+  if (sentAs.length === 0) return;
+  const dropped = droppedDraftSends.get(conversationId) ?? new Set<string>();
+  for (const id of sentAs) dropped.add(id);
+  droppedDraftSends.set(conversationId, dropped);
+}
+
+/** Stable ids of the sends whose text a draft held when this tab sent or cleared it, for its reads. */
+export function getDroppedDraftSends(conversationId: string): string[] {
+  return [...(droppedDraftSends.get(conversationId) ?? [])];
+}
 
 function loadDraftsFromStorage(): Map<string, SessionDraft> {
   if (typeof window === "undefined") return new Map();
@@ -85,6 +99,7 @@ export function getSessionDraft(conversationId: string): SessionDraft | undefine
 export function setSessionDraft(conversationId: string, draft: SessionDraft): void {
   if (retiredDraftIds.has(conversationId)) return;
   if (draft.text === "" && draft.files.length === 0) {
+    rememberDroppedDraftSends(conversationId, sessionDrafts.get(conversationId)?.sentAs);
     sessionDrafts.delete(conversationId);
   } else {
     const held = sessionDrafts.get(conversationId);
@@ -134,12 +149,14 @@ export function addSessionDraftStartupInputs(
  * @param text - Their text, saved only when the session has no draft yet; an existing draft keeps its text.
  * @param ids - Their pending ids, which replace the draft's.
  * @param files - Their files, saved with the text when the session has no draft yet.
+ * @param sentAs - Stable ids of the draft's sends that no read has listed yet, which it keeps.
  */
 export function replaceSessionDraftStartupInputs(
   conversationId: string,
   text: string,
   ids: string[],
   files: File[] = [],
+  sentAs: string[] = [],
 ): void {
   const draft = sessionDrafts.get(conversationId) ?? { text, files };
   // Without the old entry, setSessionDraft has no held ids to carry over.
@@ -149,6 +166,7 @@ export function replaceSessionDraftStartupInputs(
     files: draft.files,
     ...(draft.replyDraft ? { replyDraft: draft.replyDraft } : {}),
     ...(ids.length > 0 ? { startupInputIds: ids } : {}),
+    ...(sentAs.length > 0 ? { sentAs } : {}),
   });
 }
 
@@ -230,6 +248,7 @@ export function useSessionDraftIds(enabled = true): string {
 export function clearSessionDrafts(): void {
   sessionDrafts.clear();
   retiredDraftIds.clear();
+  droppedDraftSends.clear();
   saveDraftsToStorage();
   notifyListeners();
 }

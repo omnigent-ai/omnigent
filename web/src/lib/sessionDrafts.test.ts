@@ -100,13 +100,21 @@ describe("session drafts", () => {
     const reloaded = await import("./sessionDrafts");
     expect(reloaded.getSessionDraft("conversation")).toEqual(held);
     reloaded.setSessionDraft("conversation", { text: "", files: [] });
+    // Later reads in this tab still learn which sends the cleared draft held.
+    expect(reloaded.getDroppedDraftSends("conversation")).toEqual(["stable_first"]);
     reloaded.setSessionDraft("conversation", { text: "new", files: [] });
     expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ conversation: "new" });
+    reloaded.clearSessionDrafts();
+    expect(reloaded.getDroppedDraftSends("conversation")).toEqual([]);
   });
 
   it("replaces the startup inputs and sends a draft holds without changing its text", async () => {
-    const { getSessionDraft, replaceSessionDraftStartupInputs, setSessionDraft } =
-      await import("./sessionDrafts");
+    const {
+      getDroppedDraftSends,
+      getSessionDraft,
+      replaceSessionDraftStartupInputs,
+      setSessionDraft,
+    } = await import("./sessionDrafts");
     setSessionDraft("conversation", {
       text: "held",
       files: [],
@@ -119,6 +127,8 @@ describe("session drafts", () => {
       files: [],
       startupInputIds: ["pending_first"],
     });
+    // The read that named the inputs replaces the sends; a denied send's re-read must offer them again.
+    expect(getDroppedDraftSends("conversation")).toEqual([]);
     replaceSessionDraftStartupInputs("conversation", "recalled", []);
     expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ conversation: "held" });
     replaceSessionDraftStartupInputs("another", "recalled", ["pending_other"]);
