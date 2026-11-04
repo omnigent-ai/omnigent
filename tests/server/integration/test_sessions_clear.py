@@ -558,7 +558,14 @@ def install_managed_sandbox(
     return host_store, launcher
 
 
-@pytest.mark.parametrize("deleted_first", ["original", "continuation"])
+@pytest.mark.parametrize(
+    ("deleted_first", "survivor_archived"),
+    [
+        pytest.param("original", False, id="original"),
+        pytest.param("continuation", False, id="continuation"),
+        pytest.param("original", True, id="original-archived-survivor"),
+    ],
+)
 async def test_deleting_one_side_of_a_clear_keeps_their_shared_sandbox(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -566,11 +573,13 @@ async def test_deleting_one_side_of_a_clear_keeps_their_shared_sandbox(
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
     deleted_first: str,
+    survivor_archived: bool,
 ) -> None:
     """Both sessions of a ``/clear`` work in one managed sandbox.
 
     Deleting either leaves the other bound to the host and the sandbox
-    running; deleting the last one still tears the sandbox down.
+    running, even when the survivor is archived; deleting the last one still
+    tears the sandbox down.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
@@ -582,6 +591,11 @@ async def test_deleting_one_side_of_a_clear_keeps_their_shared_sandbox(
     assert cleared.status_code == 202, cleared.text
     new_id = cleared.json()["session_id"]
     first, last = (source_id, new_id) if deleted_first == "original" else (new_id, source_id)
+    if survivor_archived:
+        monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+        archived = await client.patch(f"/v1/sessions/{last}", json={"archived": True})
+        assert archived.status_code == 200, archived.text
+        await asyncio.gather(*list(orchestration._detached_stop_tasks), return_exceptions=True)
 
     deleted = await client.delete(f"/v1/sessions/{first}")
 
