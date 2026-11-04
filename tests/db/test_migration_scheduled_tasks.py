@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from uuid import uuid4
@@ -463,16 +464,25 @@ def test_scheduled_task_runs_outcome_payload_size_check(db_engine: Engine) -> No
             ).scalar_one()
             == 2048
         )
-    with pytest.raises(IntegrityError):
-        with db_engine.begin() as conn:
-            conn.execute(runs.insert().values(id=b"3" * 16, outcome_payload=b"x" * 2049, **row))
-    with pytest.raises(IntegrityError):
-        with db_engine.begin() as conn:
-            conn.execute(
-                runs.update()
-                .where(runs.c.id == b"2" * 16)
-                .values(outcome_payload="é".encode() * 1025)
-            )
+    with _rejected_by_check(), db_engine.begin() as conn:
+        conn.execute(runs.insert().values(id=b"3" * 16, outcome_payload=b"x" * 2049, **row))
+    with _rejected_by_check(), db_engine.begin() as conn:
+        conn.execute(
+            runs.update().where(runs.c.id == b"2" * 16).values(outcome_payload="é".encode() * 1025)
+        )
+
+
+# MySQL reports a CHECK violation as OperationalError 3819 rather than IntegrityError.
+_MYSQL_CHECK_CONSTRAINT_VIOLATED = 3819
+
+
+@contextmanager
+def _rejected_by_check() -> Iterator[None]:
+    """Expect a CHECK violation, accepting MySQL's 3819 but no other operational error."""
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)) as raised:
+        yield
+    if isinstance(raised.value, sa.exc.OperationalError):
+        assert raised.value.orig.args[0] == _MYSQL_CHECK_CONSTRAINT_VIOLATED, raised.value
 
 
 @pytest.mark.parametrize("status_code", [5, 6])
@@ -1005,6 +1015,8 @@ def test_run_outcome_migration_keeps_existing_runs_and_round_trips(
             )
         )
         row = conn.execute(sa.select(*outcome_columns).where(runs.c.id == b"b" * 16)).one()
+        # A recorded failure must not read back as "nothing recorded".
+        assert row.outcome_success is not None
         assert (
             bool(row.outcome_success),
             bytes(row.outcome_payload),
