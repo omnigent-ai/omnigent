@@ -71,6 +71,23 @@ describe("scope merge", () => {
     );
     expect(appended.boundary).toMatchObject({ id: "c", updated_at: 10 });
   });
+  it("keeps the older boundary when a capped refresh overlaps the loaded window", () => {
+    const loaded = refreshScopeWindow(
+      undefined,
+      sessionRowsPage([row("a", 50), row("b", 40), row("old", 10)], true),
+      100,
+    );
+    const capped = { ...loaded, windowSize: 240 };
+    // The refresh returns only the newest rows and ends inside the loaded window,
+    // so the older cursor (and its fetched position) still marks completeness.
+    const next = refreshScopeWindow(
+      capped,
+      sessionRowsPage([row("a", 60), row("b", 40)], true),
+      100,
+    );
+    expect(next.pages[0].last_id).toBe("old");
+    expect(next.boundary).toMatchObject({ id: "old", updated_at: 10 });
+  });
   it("falls back to the last loaded row when the cursor row was filtered out", () => {
     const page = { ...sessionRowsPage([row("a", 30), row("b", 20)], true), last_id: "side_chat" };
     const window = refreshScopeWindow(undefined, page, 30);

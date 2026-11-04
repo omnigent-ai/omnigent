@@ -69,6 +69,8 @@ export interface ConversationListFilters {
    * only archived sessions. ``undefined`` is the default all-sessions list.
    */
   visibility?: "mine" | "shared" | "archived";
+  /** Sort order, present only when it isn't the default `updated_at`. */
+  sortBy?: SessionSortBy;
 }
 
 /**
@@ -181,6 +183,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
     // Treat null (visibility-scoped key) the same as undefined (no project filter).
     project: project ?? undefined,
     visibility: visibility as ConversationListFilters["visibility"],
+    ...(key[5] === "created_at" ? { sortBy: "created_at" as const } : {}),
   };
 }
 
@@ -228,8 +231,7 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
  *
  * An `updated_at` change doesn't need one: every list view sorts its loaded
  * rows itself, and a bump only moves a row up, so it stays inside the loaded
- * window. Refetching for it re-read every list each tick of every running
- * session. The exception is the row the next page's cursor names; see
+ * window. The exception is the row the next page's cursor names; see
  * {@link mergeItemsIntoPages}.
  *
  * @param changed - Names of wire fields that changed the cached row.
@@ -304,7 +306,7 @@ export function mergeItemsIntoPages(
       }
       if (
         changedFieldsNeedRefetch(changed) ||
-        (conv.id === cursorId && changed.has("updated_at"))
+        (conv.id === cursorId && changed.has(filters.sortBy ?? "updated_at"))
       ) {
         needsRefetch = true;
       }
@@ -477,11 +479,12 @@ export function parseProjectSessionsQueryKey(key: readonly unknown[]): {
 
 /** Membership filters for an unsearched project-folder query. */
 export function filtersFromProjectQueryKey(key: readonly unknown[]): ConversationListFilters {
-  const { archived } = parseProjectSessionsQueryKey(key);
+  const { archived, sortBy } = parseProjectSessionsQueryKey(key);
   return {
     searchQuery: "",
     includeArchived: archived,
     visibility: archived ? "archived" : "mine",
+    ...(sortBy === "created_at" ? { sortBy } : {}),
   };
 }
 

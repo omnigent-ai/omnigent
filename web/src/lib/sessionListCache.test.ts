@@ -248,6 +248,14 @@ describe("mergeItemsIntoPages", () => {
         DEFAULT_FILTERS,
       ).needsRefetch,
     ).toBe(true);
+    // In a created_at-ordered list an updated_at bump can't move the cursor.
+    expect(
+      mergeItemsIntoPages(
+        before,
+        new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 9 }]]),
+        { ...DEFAULT_FILTERS, sortBy: "created_at" },
+      ).needsRefetch,
+    ).toBe(false);
     // With no further page there is no cursor to protect.
     const complete = { ...before, pages: [{ ...before.pages[0], has_more: false }] };
     expect(
@@ -385,7 +393,14 @@ describe("filtersFromConversationQueryKey", () => {
   it("accepts creation-order caches for live updates and optimistic mutations", () => {
     expect(
       filtersFromConversationQueryKey(["conversations", "", false, null, "mine", "created_at"]),
-    ).toEqual({ searchQuery: "", includeArchived: false, project: undefined, visibility: "mine" });
+    ).toEqual({
+      searchQuery: "",
+      includeArchived: false,
+      project: undefined,
+      visibility: "mine",
+      // The sort order decides which field can move the pagination cursor.
+      sortBy: "created_at",
+    });
   });
 
   it("rejects non-canonical conversation query keys", () => {

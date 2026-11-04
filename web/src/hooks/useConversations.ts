@@ -684,7 +684,8 @@ export function useConversations(
           : ["conversations", searchQuery, includeArchived];
   const query = useInfiniteQuery({
     queryKey,
-    // `signal` aborts a superseded or unmounted fetch and its remaining page walk.
+    // `signal` aborts a superseded or unmounted list fetch and its remaining page
+    // walk. Searches keep their own timeout signal instead (fetchConversationsPage).
     queryFn: async ({ pageParam, signal }) => {
       const fetchPage = () =>
         fetchConversationsPage({

@@ -115,7 +115,9 @@ describe("createListReconcileScheduler", () => {
     scheduler.schedule();
     await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
     scheduler.schedule();
-    await vi.advanceTimersByTimeAsync(RECONCILE_ROUND_TIMEOUT_MS + RECONCILE_MAX_GAP_MS);
+    await vi.advanceTimersByTimeAsync(RECONCILE_ROUND_TIMEOUT_MS + RECONCILE_MAX_GAP_MS - 1);
+    expect(run).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
     expect(run).toHaveBeenCalledTimes(2);
   });
 

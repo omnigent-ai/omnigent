@@ -18,6 +18,7 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -492,7 +493,9 @@ describe("SessionUpdatesProvider list invalidation", () => {
   function listInvalidations(invalidate: { mock: { calls: unknown[][] } }) {
     return invalidate.mock.calls.filter(([filters]: unknown[]) => {
       const key = (filters as { queryKey?: unknown[] } | undefined)?.queryKey?.[0];
-      return key === "conversations" || key === "project-sessions";
+      return (
+        key === "conversations" || key === "project-sessions" || key === "archived-project-names"
+      );
     });
   }
 
@@ -538,6 +541,8 @@ describe("SessionUpdatesProvider list invalidation", () => {
       act(() => vi.advanceTimersByTime(5_000));
 
       expect(listInvalidations(invalidate)).toEqual([]);
+      // Its tree view still refreshes.
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_a") });
     } finally {
       vi.useRealTimers();
     }
