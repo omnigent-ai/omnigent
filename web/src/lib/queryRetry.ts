@@ -52,3 +52,13 @@ export function queryRetryDelay(failureCount: number, error: unknown): number {
   const base = Math.min(QUERY_RETRY_BASE_MS * 2 ** failureCount, QUERY_RETRY_MAX_MS);
   return base / 2 + Math.random() * base;
 }
+
+/**
+ * Default query options shared by the standalone app and the embed. Chat-tuned:
+ * 30 s fresh, no window-focus refetch (noisy for chat), paced retries.
+ */
+export const APP_QUERY_DEFAULTS = {
+  staleTime: 30_000,
+  refetchOnWindowFocus: false,
+  retryDelay: queryRetryDelay,
+} as const;

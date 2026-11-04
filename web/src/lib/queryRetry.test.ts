@@ -1,14 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "./sessionsApi";
-import {
-  isRetryableRequestError,
-  QUERY_RETRY_AFTER_MAX_MS,
-  QUERY_RETRY_BASE_MS,
-  QUERY_RETRY_MAX_MS,
-  queryRetryDelay,
-  RETRY_AFTER_JITTER,
-} from "./queryRetry";
+import { APP_QUERY_DEFAULTS, isRetryableRequestError, queryRetryDelay } from "./queryRetry";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -36,34 +29,42 @@ describe("isRetryableRequestError", () => {
 });
 
 describe("queryRetryDelay", () => {
-  it("doubles from the base and jitters to 50–150% of it", () => {
-    vi.spyOn(Math, "random").mockReturnValue(0);
-    expect(queryRetryDelay(0, new Error("x"))).toBe(QUERY_RETRY_BASE_MS / 2);
-    expect(queryRetryDelay(2, new Error("x"))).toBe((QUERY_RETRY_BASE_MS * 4) / 2);
-    vi.spyOn(Math, "random").mockReturnValue(1);
-    expect(queryRetryDelay(0, new Error("x"))).toBe(QUERY_RETRY_BASE_MS * 1.5);
+  it("doubles from 1 s and jitters to 50–150% of it", () => {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+    expect([0, 1, 2].map((n) => queryRetryDelay(n, new Error("x")))).toEqual([1_000, 2_000, 4_000]);
+    random.mockReturnValue(0);
+    expect(queryRetryDelay(0, new Error("x"))).toBe(500);
+    random.mockReturnValue(1);
+    expect(queryRetryDelay(0, new Error("x"))).toBe(1_500);
   });
 
-  it("caps the base before jittering it", () => {
-    const random = vi.spyOn(Math, "random").mockReturnValue(0);
-    expect(queryRetryDelay(20, new Error("x"))).toBe(QUERY_RETRY_MAX_MS / 2);
+  it("caps the base at 30 s before jittering it", () => {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+    expect(queryRetryDelay(20, new Error("x"))).toBe(30_000);
+    random.mockReturnValue(0);
+    expect(queryRetryDelay(20, new Error("x"))).toBe(15_000);
     random.mockReturnValue(1);
-    expect(queryRetryDelay(20, new Error("x"))).toBe(QUERY_RETRY_MAX_MS * 1.5);
+    expect(queryRetryDelay(20, new Error("x"))).toBe(45_000);
   });
 
   it("waits the server's Retry-After, bounded, stretched by up to a quarter", () => {
     const random = vi.spyOn(Math, "random").mockReturnValue(0);
     expect(queryRetryDelay(0, new ApiError("slow down", 429, null, 12_000))).toBe(12_000);
-    expect(queryRetryDelay(0, new ApiError("slow down", 429, null, 10 * 60_000))).toBe(
-      QUERY_RETRY_AFTER_MAX_MS,
-    );
+    expect(queryRetryDelay(0, new ApiError("slow down", 429, null, 10 * 60_000))).toBe(60_000);
     random.mockReturnValue(1);
-    expect(queryRetryDelay(0, new ApiError("slow down", 429, null, 12_000))).toBe(
-      12_000 * (1 + RETRY_AFTER_JITTER),
-    );
+    expect(queryRetryDelay(0, new ApiError("slow down", 429, null, 12_000))).toBe(15_000);
+    // An oversized hint is capped at 60 s, then stretched to at most 75 s.
+    expect(queryRetryDelay(0, new ApiError("slow down", 429, null, 10 * 60_000))).toBe(75_000);
     // A zero hint means "now"; an absent one falls back to the jittered backoff.
     expect(queryRetryDelay(0, new ApiError("now", 503, null, 0))).toBe(0);
     random.mockReturnValue(0);
-    expect(queryRetryDelay(0, new ApiError("plain", 503, null))).toBe(QUERY_RETRY_BASE_MS / 2);
+    expect(queryRetryDelay(0, new ApiError("plain", 503, null))).toBe(500);
+  });
+});
+
+describe("APP_QUERY_DEFAULTS", () => {
+  it("paces retries for every query in both app roots, without changing retry counts", () => {
+    expect(APP_QUERY_DEFAULTS.retryDelay).toBe(queryRetryDelay);
+    expect(APP_QUERY_DEFAULTS).not.toHaveProperty("retry");
   });
 });

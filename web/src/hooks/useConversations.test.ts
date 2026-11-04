@@ -448,6 +448,16 @@ describe("useConversations stale cursor", () => {
 });
 
 describe("session-list retry policy", () => {
+  it("allows exactly three retries of a retryable failure", () => {
+    const failure = new ApiError("unavailable", 503, null);
+    expect([0, 1, 2, 3].map((count) => retryListFetch(count, failure))).toEqual([
+      true,
+      true,
+      true,
+      false,
+    ]);
+  });
+
   it("is shared by the list, search, and project-folder queries", () => {
     fetchMock.mockResolvedValue(
       mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
