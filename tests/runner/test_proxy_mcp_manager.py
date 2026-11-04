@@ -34,6 +34,7 @@ from omnigent.runner.mcp_execution_registry import (
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
+from tests._helpers.polling import poll_until_async
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -125,6 +126,62 @@ def _make_manager(transport: _StubTransport) -> ProxyMcpManager:
     """
     client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
     return ProxyMcpManager(session_id="conv_test", ap_client=client)
+
+
+class _RetainedOperationTransport(httpx.AsyncBaseTransport):
+    """Proxy whose every request delivers its operation through the runner registry.
+
+    :param registry: Registry that deduplicates the operation across requests.
+    :param first_reply: ``"detached"`` answers the first request with the detach
+        error; ``"held"`` leaves it unanswered until ``release_first_reply`` is set.
+    """
+
+    def __init__(self, registry: McpExecutionRegistry, *, first_reply: str) -> None:
+        self._registry = registry
+        self._first_reply = first_reply
+        self.calls: list[_Call] = []
+        self.external_invocations = 0
+        self.first_request_executed = asyncio.Event()
+        self.release_first_reply = asyncio.Event()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.calls.append(_Call(url=str(request.url), body=body))
+        is_first = len(self.calls) == 1
+
+        async def _retained_work() -> McpExecutionResult:
+            self.external_invocations += 1
+            return McpExecutionResult(status_code=200, content={"result": {"output": "retained"}})
+
+        await self._registry.execute(
+            session_id="conv_test",
+            operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+            step="initial",
+            params={"name": body["params"]["name"], "arguments": {}},
+            run=_retained_work,
+        )
+        if is_first:
+            self.first_request_executed.set()
+            if self._first_reply == "detached":
+                return _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": {
+                            "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                            "message": "Runner MCP execution detached.",
+                        },
+                    }
+                )
+            await self.release_first_reply.wait()
+        text = "first reply" if is_first else "reattached"
+        return _json_resp(
+            {
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {"content": [{"type": "text", "text": text}], "isError": False},
+            }
+        )
 
 
 # ── schemas_for ────────────────────────────────────────────────────────────
@@ -463,54 +520,7 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     monkeypatch.setattr(mcp_execution_registry_mod, "_COMPLETED_TTL_S", 1.0)
     monkeypatch.setattr(mcp_execution_registry_mod, "monotonic", lambda: clock)
     registry = McpExecutionRegistry()
-
-    class _DetachThenSucceedTransport(httpx.AsyncBaseTransport):
-        def __init__(self) -> None:
-            self.calls: list[_Call] = []
-            self.external_invocations = 0
-
-        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            body = json.loads(request.content)
-            self.calls.append(_Call(url=str(request.url), body=body))
-            operation_id = body["params"][MCP_OPERATION_ID_PARAM]
-
-            async def _retained_work() -> McpExecutionResult:
-                self.external_invocations += 1
-                return McpExecutionResult(
-                    status_code=200,
-                    content={"result": {"output": "retained"}},
-                )
-
-            await registry.execute(
-                session_id="conv_test",
-                operation_id=operation_id,
-                step="initial",
-                params={"name": "github__deploy", "arguments": {}},
-                run=_retained_work,
-            )
-            if len(self.calls) == 1:
-                return _json_resp(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": body["id"],
-                        "error": {
-                            "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
-                            "message": "Runner MCP execution detached.",
-                        },
-                    }
-                )
-            return _json_resp(
-                {
-                    "jsonrpc": "2.0",
-                    "id": body["id"],
-                    "result": {
-                        "content": [{"type": "text", "text": "reattached"}],
-                        "isError": False,
-                    },
-                }
-            )
-
-    transport = _DetachThenSucceedTransport()
+    transport = _RetainedOperationTransport(registry, first_reply="detached")
     client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
     manager = ProxyMcpManager(
         session_id="conv_test",
@@ -540,6 +550,78 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     first_params, retry_params = [call.body["params"] for call in transport.calls]
     assert retry_params == first_params
     assert first_params[MCP_OPERATION_ID_PARAM].startswith("mcpop_")
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reissues_request_left_unanswered_after_server_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request the old server never answers reattaches to the reconnected one.
+
+    The held request stands in for an app front door that keeps the POST open
+    across a server restart.
+    """
+    from omnigent.runner import proxy_mcp_manager
+
+    clock = 0.0
+    monkeypatch.setattr(mcp_execution_registry_mod, "_COMPLETED_TTL_S", 1.0)
+    monkeypatch.setattr(mcp_execution_registry_mod, "monotonic", lambda: clock)
+    monkeypatch.setattr(proxy_mcp_manager, "_SERVER_REPLY_GRACE_S", 0.0)
+    registry = McpExecutionRegistry()
+    transport = _RetainedOperationTransport(registry, first_reply="held")
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
+    try:
+        await asyncio.wait_for(transport.first_request_executed.wait(), timeout=5.0)
+        clock = 2.0
+        pending_approvals.notify_server_reconnect()
+
+        assert await asyncio.wait_for(task, timeout=5.0) == "reattached"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.external_invocations == 1
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+async def test_call_tool_keeps_reply_that_arrives_after_server_reconnect() -> None:
+    """A server that survives a tunnel reconnect still answers without a re-issue."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedOperationTransport(registry, first_reply="held")
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
+    try:
+        await asyncio.wait_for(transport.first_request_executed.wait(), timeout=5.0)
+        pending_approvals.notify_server_reconnect()
+        await poll_until_async(lambda: not pending_approvals._server_reconnect_waiters)
+        transport.release_first_reply.set()
+
+        assert await asyncio.wait_for(task, timeout=5.0) == "first reply"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert len(transport.calls) == 1
 
 
 @pytest.mark.asyncio

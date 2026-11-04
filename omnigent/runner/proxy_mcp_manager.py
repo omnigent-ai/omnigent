@@ -22,10 +22,11 @@ When to use each implementation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from time import monotonic
 from typing import cast
@@ -48,6 +49,7 @@ _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
+_SERVER_REPLY_GRACE_S = 30.0
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -55,6 +57,41 @@ def _json_object(value: object) -> _JsonObject | None:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         return None
     return cast("_JsonObject", value)
+
+
+async def _reply_unless_server_replaced(
+    request: Awaitable[httpx.Response],
+    after_generation: int,
+) -> httpx.Response | None:
+    """
+    Await a proxy reply, or return ``None`` if it is still missing after a reconnect.
+
+    A front door can hold the old server's request open across a restart, so the
+    reconnect alone never ends it. A server that survived the reconnect answers
+    within the grace period, so its reply is kept instead of being re-requested.
+
+    :param request: The pending proxy POST.
+    :param after_generation: Server generation the request was sent to.
+    :returns: The reply, or ``None`` when the caller should re-issue the request.
+    """
+
+    async def _reconnected_without_reply() -> None:
+        await pending_approvals.wait_for_server_reconnect(
+            after_generation, timeout_seconds=MCP_PROXY_CALL_TIMEOUT_S
+        )
+        await asyncio.sleep(_SERVER_REPLY_GRACE_S)
+
+    reply = asyncio.ensure_future(request)
+    replaced = asyncio.ensure_future(_reconnected_without_reply())
+    try:
+        await asyncio.wait({reply, replaced}, return_when=asyncio.FIRST_COMPLETED)
+        if reply.done() or replaced.exception() is not None:
+            return await reply
+        return None
+    finally:
+        reply.cancel()
+        replaced.cancel()
+        await asyncio.gather(reply, replaced, return_exceptions=True)
 
 
 def _response_json_object(response: httpx.Response) -> _JsonObject:
@@ -468,7 +505,7 @@ class ProxyMcpManager:
             failure_phase = "transport"
             resp: httpx.Response | None = None
             try:
-                resp = await self._omnigent_client.post(
+                request = self._omnigent_client.post(
                     url,
                     json=payload,
                     headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
@@ -483,6 +520,26 @@ class ProxyMcpManager:
                         pool=10.0,
                     ),
                 )
+                registry = self._execution_registry
+                if (
+                    managed
+                    or registry is None
+                    or not registry.has_operation(self._session_id, operation_id)
+                ):
+                    resp = await request
+                else:
+                    resp = await _reply_unless_server_replaced(request, request_generation)
+                    if resp is None:
+                        _record_failure(
+                            None,
+                            phase=failure_phase,
+                            request_generation=request_generation,
+                            started=started,
+                            reattach_trigger="server_reconnect",
+                        )
+                        request_id += 1
+                        payload = cast("_JsonObject", {**payload, "id": request_id})
+                        continue
                 failure_phase = "http_status"
                 resp.raise_for_status()
                 failure_phase = "response_decode"
