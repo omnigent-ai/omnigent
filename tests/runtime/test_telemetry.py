@@ -9,6 +9,7 @@ and deterministic. Integration with the full workflow lives in
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterator
 
@@ -24,6 +25,7 @@ from opentelemetry.trace import (
     StatusCode,
 )
 
+from omnigent.host.frames import HostMcpLoginFrame, decode_host_frame, encode_host_frame
 from omnigent.runtime import telemetry
 
 _RESP_HEX = "d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3"
@@ -1253,6 +1255,32 @@ def test_consume_frame_span_records_redacted_payload_when_capture_on(
     assert "[redacted]" in payload
     assert "traceparent" not in payload
     assert "/tmp/ws" in payload
+
+
+def test_pasted_sign_in_redirect_stays_off_captured_spans(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pasted MCP sign-in redirect's code and state stay off sent and received spans."""
+    monkeypatch.setattr(telemetry, "_capture_content", True)
+    frame = HostMcpLoginFrame(
+        request_id="req_login_1",
+        action="submit",
+        login_id="login_1",
+        callback_url="http://localhost:3118/callback?code=CODE_MARKER&state=STATE_MARKER",
+    )
+    with telemetry.span("server.send"):
+        wire = encode_host_frame(frame)
+    with telemetry.consume_frame_span("host.mcp_login", json.loads(wire)):
+        pass
+
+    assert decode_host_frame(wire) == frame
+    sent, received = in_memory_exporter.get_finished_spans()[-2:]
+    for span in (sent, received):
+        payload = (span.attributes or {})["omnigent.message.payload"]
+        assert "CODE_MARKER" not in payload
+        assert "STATE_MARKER" not in payload
+        assert "login_1" in payload
 
 
 def test_record_message_payload_truncates(
