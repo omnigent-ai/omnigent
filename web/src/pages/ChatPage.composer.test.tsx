@@ -1085,9 +1085,10 @@ describe("Composer slash-command menu", () => {
     return { clearContext, onSend: props.onSend };
   }
 
+  // Which harness and server combinations offer /clear is unit-tested on
+  // composerOffersClear (ChatPage.test.ts); these cover the composer's entry points.
   it.each([
     ["claude-native", "the menu", { session_event_types: ["message", "clear"] }],
-    ["codex-native", "the menu", { session_event_types: ["message", "clear"] }],
     [
       "claude-sdk",
       "the menu",
@@ -1114,10 +1115,6 @@ describe("Composer slash-command menu", () => {
   );
 
   it.each([
-    ["claude-native", {}],
-    ["claude-native", { session_event_types: ["message"] }],
-    ["codex-native", {}],
-    ["claude-sdk", { session_event_types: ["message"] }],
     // An older server lists "clear" for native sessions but can't clear claude-sdk.
     ["claude-sdk", { session_event_types: ["message", "clear"] }],
     ["claude-native", "loading"],
