@@ -1686,6 +1686,14 @@ describe("postEvent", () => {
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
   });
 
+  it("reads the session a claude-sdk clear continued in", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, session_id: "conv_new" }));
+
+    const out = await postEvent("conv_abc", { type: "clear", data: {} });
+
+    expect(out.sessionId).toBe("conv_new");
+  });
+
   it("surfaces 4xx as a thrown error (does not silently swallow)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 422 }));
     await expect(postEvent("conv_abc", { type: "bogus", data: {} })).rejects.toThrow(/422/);
