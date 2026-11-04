@@ -246,6 +246,22 @@ describe("full skill descriptions", () => {
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
   });
 
+  it("rechecks the highlighted row when its description changes", () => {
+    const fitting = { ...commands, "/triage": "File a ticket" };
+    const { rerender } = render(<SlashCommandMenu {...props} commands={fitting} activeIndex={1} />);
+    overflowDescription("triage", 200);
+    advanceTimers(400);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    overflowDescription("triage", 900);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    advanceTimers(400);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
+    overflowDescription("triage", 200);
+    rerender(<SlashCommandMenu {...props} commands={fitting} activeIndex={1} />);
+    advanceTimers(400);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+  });
+
   it("drops a pending tooltip when the highlight moves on before the delay ends", () => {
     const { rerender } = render(
       <SlashCommandMenu {...props} commands={commands} activeIndex={1} />,

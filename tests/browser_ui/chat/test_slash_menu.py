@@ -502,6 +502,8 @@ def test_slash_menu_bounds_a_very_long_skill_description(
     tooltip_box = tooltip.bounding_box()
     assert tooltip_box is not None
     assert_within_viewport(tooltip_box, viewport["width"])
+    assert tooltip_box["y"] >= 0
+    assert tooltip_box["y"] + tooltip_box["height"] <= viewport["height"]
     assert tooltip_box["height"] <= 256 + 1
     assert tooltip.evaluate(_OVERFLOWS_VERTICALLY)
     assert 0 <= tooltip.evaluate(_FIRST_LINE_OFFSET) < line_height

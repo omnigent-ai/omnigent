@@ -464,7 +464,7 @@ function MenuRowButton({
   const hoverTimerRef = useRef<number | undefined>(undefined);
   const coarsePointer = useIsCoarsePointer();
   // A highlight resting on a cut-off row opens its tooltip, except on touch screens where most
-  // rows are cut off; moving the highlight closes it and drops a pending hover.
+  // rows are cut off; a highlight move or new description closes it and drops a pending hover.
   useEffect(() => {
     const timer =
       active && !coarsePointer
@@ -479,7 +479,7 @@ function MenuRowButton({
       hoverTimerRef.current = undefined;
       onTooltipOpenChange(name, false);
     };
-  }, [active, activeIndex, coarsePointer, name, onTooltipOpenChange]);
+  }, [active, activeIndex, coarsePointer, name, onTooltipOpenChange, row.description]);
   const tooltipRef = useRef<HTMLDivElement>(null);
   // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
   useEffect(() => {
