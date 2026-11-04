@@ -1474,10 +1474,14 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "pr_changed_files",
+            head_sha=head_sha,
+            base_sha=base_sha,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,

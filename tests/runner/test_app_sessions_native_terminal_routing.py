@@ -18,6 +18,7 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.process_logging import display_log_path
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _auto_create_repl_terminal,
@@ -276,7 +277,8 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     int(error_id.removeprefix("err_"), 16)
     assert error["message"] == (
         "Native Claude terminal failed to start (ImportError); "
-        f"see the runner log for details: {pinned_runner_log} Error ID: {error_id}."
+        f"see the runner log for details: {display_log_path(pinned_runner_log)} "
+        f"Error ID: {error_id}."
     )
     assert "requires the 'claude' CLI" not in error["message"]
     # The structured, non-sensitive cause (exception type only, here) still
@@ -658,7 +660,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
 
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched REPL terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -801,7 +803,7 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
 
     captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Captures the launched REPL terminal spec and parent os_env."""
 
         async def launch_auxiliary_terminal(

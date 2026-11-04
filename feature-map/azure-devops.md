@@ -20,6 +20,8 @@ CLI sign-in reads the request. The panel identifies Azure requests with `!`.
 
 - `desktop-rail`: open Workspace and choose Pull Requests.
 - `desktop-composer`: click the request number beside the session composer.
+  Hover it to open a request in a new tab from the status preview; see
+  [pull-request-conversations.md](pull-request-conversations.md).
 - `mobile-composer`: tap the request number to open the full-screen panel.
 - `canvas`: when Canvas is enabled, follow a request link on a session card.
 - `agent-tool`: create or update a request through the session's agent tools.

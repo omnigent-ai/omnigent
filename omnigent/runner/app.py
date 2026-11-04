@@ -71,7 +71,7 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
-from omnigent.native.failure_telemetry import failure_log_attributes
+from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -1824,10 +1824,12 @@ def create_runner_app(
         session_id: str,
         status: str,
         blocked_on: str | None = None,
+        *,
+        failure_detail: str | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if status == "failed":
-            # Structured status has no provider detail when its terminal hook is lost.
+            # A lost terminal hook may still leave a cause in the program-status report.
             event["error"] = {
                 "code": "native_failure_detail_unavailable",
                 "message": (
@@ -1835,11 +1837,33 @@ def create_runner_app(
                     "arrive. Open the terminal to inspect the error before retrying."
                 ),
             }
+            if failure_detail:
+                from omnigent.harnesses.claude_native.failure_telemetry import (
+                    claude_failure_context,
+                )
+
+                raw_context: dict[str, object] = {
+                    **claude_failure_context({}, error_text=failure_detail),
+                    "failure_source": "claude_program_status",
+                    "detail_source": "program_status_error",
+                }
+                # An API error envelope decodes to its cause; the raw report is only the fallback.
+                raw_context.setdefault("native_error_message", failure_detail)
+                context = normalize_failure_context(raw_context)
+                detail = context.get("native_error_message")
+                if isinstance(detail, str):
+                    event["error"] = {"code": "native_turn_error", "message": detail}
+                    event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
+    resource_registry.set_session_failure_publisher(
+        lambda session_id, detail: _publish_session_status(
+            session_id, "failed", failure_detail=detail
+        )
+    )
 
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
         if event.command is None:
@@ -2261,7 +2285,7 @@ def create_runner_app(
                     session_id,
                     resp.status_code,
                 )
-        except Exception:  # best-effort, but surface it
+        except Exception:
             _logger.warning(
                 "legacy model_override fallback for %s failed; a model-pinned "
                 "first turn may respawn",
@@ -2519,7 +2543,10 @@ def create_runner_app(
         context = BackgroundTitleContext(
             prompt=body.prompt[:BACKGROUND_TITLE_MAX_PROMPT_CHARS],
             harness=effective_harness,
-            spawn_env=dict(spawn_env or {}),
+            spawn_env={
+                **(spawn_env or {}),
+                **resource_registry.client_surface_env(conversation_id),
+            },
             process_manager=process_manager,
             cwd=resolver_cwd,
             model_override=body.model_override,
@@ -4319,7 +4346,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-        except Exception:  # best-effort: harness may have exited
+        except Exception:
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
@@ -5265,7 +5292,7 @@ def create_runner_app(
                     _publish_event,
                     now=asyncio.get_running_loop().time(),
                 )
-            except Exception:  # best-effort observer; never fail the hook
+            except Exception:
                 _logger.warning(
                     "native file-change recording failed for session=%s",
                     _captured_session_id,
@@ -7508,6 +7535,7 @@ def create_runner_app(
                     {"effort": effort},
                     # An older server keeps a refused selection for the next turn.
                     legacy_server=not server_rolls_back,
+                    allow_cold_start=body.get("cold_start_settings") is True,
                 )
                 if server_rolls_back and not (
                     200 <= response.status_code < 300 or response.status_code == 504
@@ -7571,6 +7599,7 @@ def create_runner_app(
                         conversation_id,
                         settings,
                         legacy_server=body.get("rollback_on_refusal") is not True,
+                        allow_cold_start=body.get("cold_start_settings") is True,
                     )
                     if "effort" in settings and 200 <= response.status_code < 300:
                         return JSONResponse({"codex_settings_applied": True})
@@ -8354,7 +8383,7 @@ def create_runner_app(
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
-            except Exception:  # best-effort; never block catch-up.
+            except Exception:
                 _logger.warning(
                     "Session status resync failed after reconnect",
                     exc_info=True,
