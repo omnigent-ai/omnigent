@@ -2962,13 +2962,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         const { pendingId } = postResult;
         setterFor(sessionId)((s) => ({
           // A failed launch's recovery can hand the message back before this answer names it.
-          pendingUserMessages: s.returnedStartupInputs.includes(pendingId ?? "")
-            ? s.pendingUserMessages.filter((p) => p.tempId !== tempId)
-            : s.pendingUserMessages.map((p) =>
-                p.tempId === tempId
-                  ? { ...p, posted: true, ...(pendingId ? { pendingId } : {}) }
-                  : p,
-              ),
+          pendingUserMessages:
+            pendingId !== undefined && s.returnedStartupInputs.includes(pendingId)
+              ? s.pendingUserMessages.filter((p) => p.tempId !== tempId)
+              : s.pendingUserMessages.map((p) =>
+                  p.tempId === tempId
+                    ? { ...p, posted: true, ...(pendingId ? { pendingId } : {}) }
+                    : p,
+                ),
           settledShellInputs: s.settledShellInputs.map((entry) =>
             entry.tempId === tempId && pendingId ? { ...entry, pendingId } : entry,
           ),
@@ -3068,19 +3069,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
-        setterFor(draftSessionId)({
-          failedSendDraft: {
-            conversationId: draftSessionId,
-            text,
-            files: files ?? [],
-            stableId,
-            serverRefused,
-            ...(unsettled ? { unsettled: true } : {}),
-            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
-            ...(replacesFailedInputs.replaces_failed_inputs
-              ? { startupInputIds: replacesFailedInputs.replaces_failed_inputs }
-              : {}),
-          },
+        const failed = {
+          conversationId: draftSessionId,
+          text,
+          files: files ?? [],
+          stableId,
+          serverRefused,
+          ...(unsettled ? { unsettled: true } : {}),
+          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          ...(replacesFailedInputs.replaces_failed_inputs
+            ? { startupInputIds: replacesFailedInputs.replaces_failed_inputs }
+            : {}),
+        };
+        setterFor(draftSessionId)((s) => {
+          const waiting = s.failedSendDraft;
+          // Messages a failed launch handed back meanwhile may still wait for the composer.
+          const handedBack = waiting?.recovered === true && waiting.stableId === undefined;
+          return { failedSendDraft: handedBack ? joinFailedSendDrafts(waiting, failed) : failed };
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:
@@ -7805,7 +7810,7 @@ function joinFailedSendDrafts(
   return {
     conversationId: waiting.conversationId,
     text: serializeReplyDraft(joined),
-    files: waiting.files,
+    files: [...waiting.files, ...later.files],
     ...(replyDraft ? { replyDraft } : {}),
     ...(startupInputIds.length > 0 ? { startupInputIds } : {}),
     recovered: true,

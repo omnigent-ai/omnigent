@@ -87,7 +87,9 @@ export function readStartupInputIds(entry: unknown): string[] | undefined {
   if (typeof entry !== "object" || entry === null || !("startupInputIds" in entry))
     return undefined;
   const ids = entry.startupInputIds;
-  return Array.isArray(ids) && ids.length > 0 && ids.every((id) => typeof id === "string")
+  return Array.isArray(ids) &&
+    ids.length > 0 &&
+    ids.every((id: unknown): id is string => typeof id === "string")
     ? ids
     : undefined;
 }

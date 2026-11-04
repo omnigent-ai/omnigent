@@ -4113,10 +4113,27 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
   );
 
   it.each([
-    { waiting: "messages a failed launch handed back", handedBack: true },
-    { waiting: "another failed send's draft", handedBack: false },
-  ])("adds a refused skill-command resend after $waiting meanwhile", async ({ handedBack }) => {
+    {
+      resend: "skill-command resend",
+      waiting: "messages a failed launch handed back",
+      handedBack: true,
+      command: true,
+    },
+    {
+      resend: "skill-command resend",
+      waiting: "another failed send's draft",
+      handedBack: false,
+      command: true,
+    },
+    {
+      resend: "resend with a file",
+      waiting: "messages a failed launch handed back",
+      handedBack: true,
+      command: false,
+    },
+  ])("adds a refused $resend after $waiting meanwhile", async ({ handedBack, command }) => {
     onTestFinished(clearSessionDrafts);
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
     seedSession("conv_real");
     failManagedLaunch("conv_real", "saved on server");
     await useChatStore.getState().switchTo("conv_real");
@@ -4135,12 +4152,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
               ),
             );
         });
+      if (String(input).endsWith("/resources/files")) return mockResponse({ id: "file_uploaded" });
       return defaultFetchHandler(input, init);
     });
 
-    const resend = useChatStore
-      .getState()
-      .sendSlashCommand("review", "saved on server", "agent_xyz");
+    const resend = command
+      ? useChatStore.getState().sendSlashCommand("review", "saved on server", "agent_xyz")
+      : useChatStore.getState().send("saved on server", "agent_xyz", [file]);
     await vi.waitFor(() => expect(refuseResend).toBeDefined());
     if (handedBack) {
       sessionFailedInputs.get("conv_real")!.push({
@@ -4163,8 +4181,8 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
 
     expect(useChatStore.getState().failedSendDraft).toEqual({
       conversationId: "conv_real",
-      text: "and the second\n\n/review saved on server",
-      files: [],
+      text: `and the second\n\n${command ? "/review " : ""}saved on server`,
+      files: command ? [] : [file],
       startupInputIds: handedBack ? ["pending_second", "pending_first"] : ["pending_first"],
       recovered: true,
     });
