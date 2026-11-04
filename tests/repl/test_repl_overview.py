@@ -526,15 +526,14 @@ class _CursorSessions:
             for i in range(count)
         ]
         self.calls: list[str | None] = []
-        self.stale_after: set[str] = set()
 
     async def list_items(
         self, session_id: str, *, limit: int, after: str | None, order: str
     ) -> PaginatedList:
         self.calls.append(after)
-        if after in self.stale_after:
-            raise StaleCursorError("cursor item deleted")
         ids = [item["id"] for item in self.items]
+        if after is not None and after not in ids:
+            raise StaleCursorError("cursor item deleted")
         start = 0 if after is None else ids.index(after) + 1
         return PaginatedList.from_dict({"data": self.items[start : start + limit]})
 
@@ -573,26 +572,35 @@ async def test_overview_items_walk_everything_when_the_cursor_goes_stale() -> No
     cache: dict[str, _repl._OverviewItems] = {}
     await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
 
-    del sessions.items[10]
-    sessions.stale_after.add("it_150")
+    # Deleting the anchor itself makes the tail read's cursor stale.
+    del sessions.items[150]
     sessions.calls.clear()
     items = await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
 
-    assert len(items) == 249
-    assert sessions.calls[:2] == ["it_150", None]
+    assert [item["id"] for item in items] == [f"it_{i}" for i in range(250) if i != 150]
+    assert sessions.calls == ["it_150", None, "it_99", "it_200"]
 
 
 async def test_overview_items_walk_everything_after_the_refresh_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(_repl.time, "monotonic", lambda: now[0])
     sessions = _CursorSessions(250)
     cache: dict[str, _repl._OverviewItems] = {}
     await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
-
     sessions.items[0] = {**sessions.items[0], "status": "edited"}
-    monkeypatch.setattr(_repl, "_OVERVIEW_FULL_REFRESH_SECONDS", 0.0)
+
+    # Just inside the window: only the newest page, so the old edit is unseen.
+    now[0] += _repl._OVERVIEW_FULL_REFRESH_SECONDS - 0.1
     sessions.calls.clear()
     items = await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
+    assert sessions.calls == ["it_150"]
+    assert "status" not in items[0]
 
+    # At the deadline: every page again, which picks the edit up.
+    now[0] += 0.1
+    sessions.calls.clear()
+    items = await _repl._list_overview_items(SimpleNamespace(sessions=sessions), "conv_a", cache)  # type: ignore[arg-type]
     assert sessions.calls == [None, "it_99", "it_199"]
     assert items[0]["status"] == "edited"

@@ -256,12 +256,11 @@ _MAX_SUBAGENT_TREE_DEPTH = 3
 _SUBAGENT_POLL_SECONDS = 2.0
 # The poll doubles its wait after each fetch that changed nothing (or failed),
 # up to this cap, and snaps back to _SUBAGENT_POLL_SECONDS on any change, any
-# child-session event, or user input, so an active tree stays as fresh as
-# before while a quiet one costs a fraction of the requests.
+# child-session event, or user input.
 _SUBAGENT_POLL_MAX_SECONDS = 10.0
-# Fetches skip the children of subtrees that have settled; a periodic full
-# walk still catches a settled grandchild that resumed without an event the
-# REPL can see.
+# Fetches skip the children of subtrees that have settled. While the poll runs
+# (see _should_discover_subagents), a periodic full walk still catches a
+# settled grandchild that resumed without an event the REPL can see.
 _SUBAGENT_FULL_SWEEP_SECONDS = 60.0
 
 
@@ -2565,8 +2564,6 @@ class _SessionsChatReplAdapter:
             # flush streaming body chunks eagerly, so the pump's
             # SSE subscription may not be active when the workflow
             # publishes its terminal event (no-replay pub-sub).
-            # We poll the snapshot as a backstop: first after a second, then
-            # less often, since a missed event is caught by the first checks.
             await self._wait_for_turn_done(session_id)
             # Yield a terminal event so callers iterating send()
             # observe completion. Rendering already happened via
