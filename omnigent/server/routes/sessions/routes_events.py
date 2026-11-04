@@ -2954,6 +2954,7 @@ def register_events_routes(
                         host_conn=_grace_host_conn,
                         host_registry=_grace_host_reg,
                         conversation_store=conversation_store,
+                        retain_startup=isinstance(request, StartupInputContext),
                     )
                 else:
                     # Host tunnel absent: no one to query, so this is the
@@ -3095,6 +3096,7 @@ def register_events_routes(
                     host_conn=_host_conn,
                     host_registry=_host_reg,
                     conversation_store=conversation_store,
+                    retain_startup=isinstance(request, StartupInputContext),
                 )
             if runner_client is None:
                 _runner_needs_session_init = False

@@ -426,6 +426,52 @@ async def _answer_runner_status_then_wait_for_launch(
     return None
 
 
+@pytest.mark.parametrize("age", [None, 17.5])
+async def test_host_status_tunnel_preserves_optional_launch_age(
+    app: FastAPI, age: float | None
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _query_host_runner_status
+
+    comm = await _connect_host(app)
+    registry = app.state.host_registry
+    connection = registry.get(_HOST_ID)
+    assert connection is not None
+    observed: list[float] = []
+    query = asyncio.create_task(
+        _query_host_runner_status(
+            connection, registry, "runner-owned", on_launch_age=observed.append
+        )
+    )
+    try:
+        while True:
+            output = await comm.receive_output(timeout=budget(5))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostRunnerStatusFrame):
+                assert frame.runner_id == "runner-owned"
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostRunnerStatusResultFrame(
+                                request_id=frame.request_id,
+                                status="alive",
+                                launch_age_s=age,
+                            )
+                        ),
+                    }
+                )
+                break
+        assert await asyncio.wait_for(query, budget(5)) == "alive"
+        assert observed == ([] if age is None else [age])
+    finally:
+        query.cancel()
+        await asyncio.gather(query, return_exceptions=True)
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5))
+
+
 async def test_inline_launch_binds_runner_and_returns_host(
     client: httpx.AsyncClient,
     app: FastAPI,

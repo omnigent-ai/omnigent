@@ -458,6 +458,8 @@ class HostRunnerStatusResultFrame:
 
     :param request_id: Correlates to the :class:`HostRunnerStatusFrame`,
         e.g. ``"req_rs_1"``.
+    :param launch_age_s: Optional monotonic seconds since the exact process's spawn
+        began; absent when the host cannot verify launch and process ownership.
     :param status: One of:
 
         * ``"alive"`` — the host has this runner and its process is
@@ -473,6 +475,7 @@ class HostRunnerStatusResultFrame:
 
     request_id: str
     status: str
+    launch_age_s: float | None = None
 
 
 @dataclass
@@ -1657,6 +1660,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_STATUS_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
+                **({"launch_age_s": frame.launch_age_s} if frame.launch_age_s is not None else {}),
             }
         )
     if isinstance(frame, HostStatFrame):
@@ -2773,7 +2777,19 @@ def _decode_runner_status_result(
     return HostRunnerStatusResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
+        launch_age_s=parse_runner_launch_age(msg.get("launch_age_s")),
     )
+
+
+def parse_runner_launch_age(value: object) -> float | None:
+    """Ignore absent or invalid optional launch-age capability metadata."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        age = float(value)
+    except OverflowError:
+        return None
+    return age if math.isfinite(age) and age >= 0 else None
 
 
 def _decode_stat(msg: _JsonObject) -> HostStatFrame:

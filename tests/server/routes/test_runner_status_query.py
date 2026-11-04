@@ -48,10 +48,11 @@ class _ReplyingRegistry:
         ``"unknown"``).
     """
 
-    def __init__(self, conn: _FakeHostConn, reply: str) -> None:
+    def __init__(self, conn: _FakeHostConn, reply: str, age: float | None = None) -> None:
         """Record the connection to resolve against and the canned reply."""
         self._conn = conn
         self._reply = reply
+        self._age = age
         self.sent: list[str] = []
 
     def send_text(self, conn: _FakeHostConn, data: str) -> None:
@@ -65,7 +66,7 @@ class _ReplyingRegistry:
         assert isinstance(frame, HostRunnerStatusFrame)
         future = conn.pending_runner_status.get(frame.request_id)
         if future is not None and not future.done():
-            future.set_result({"status": self._reply})
+            future.set_result({"status": self._reply, "launch_age_s": self._age})
 
 
 class _SilentRegistry:
@@ -106,7 +107,8 @@ class _FaultingRegistry:
 
 
 @pytest.mark.parametrize("verdict", ["alive", "dead", "unknown"])
-async def test_query_returns_host_verdict(verdict: str) -> None:
+@pytest.mark.parametrize("age", [None, 17.5])
+async def test_query_returns_host_verdict(verdict: str, age: float | None) -> None:
     """Each host verdict is returned verbatim to the caller.
 
     ``alive`` drives "wait for the connect", ``dead`` / ``unknown`` drive
@@ -114,11 +116,18 @@ async def test_query_returns_host_verdict(verdict: str) -> None:
     unchanged.
     """
     conn = _FakeHostConn()
-    registry = _ReplyingRegistry(conn, verdict)
+    registry = _ReplyingRegistry(conn, verdict, age)
+    observed: list[float] = []
 
-    result = await _query_host_runner_status(conn, registry, "runner_x")  # type: ignore[arg-type]
+    result = await _query_host_runner_status(
+        conn,
+        registry,
+        "runner_x",
+        on_launch_age=observed.append,  # type: ignore[arg-type]
+    )
 
     assert result == verdict
+    assert observed == ([age] if verdict == "alive" and age is not None else [])
     # The outbound frame targeted the queried runner.
     assert len(registry.sent) == 1
     frame = decode_host_frame(registry.sent[0])
