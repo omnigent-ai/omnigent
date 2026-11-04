@@ -1246,6 +1246,7 @@ describe("Composer slash-command menu", () => {
         prompts: [{ itemId: "msg_recent", text: "Add parser tests" }],
         olderCursor: "msg_cursor",
       })
+      .mockRejectedValueOnce(new Error("Network down"))
       .mockResolvedValueOnce({
         prompts: [{ itemId: "msg_oldest", text: "Set up the repo" }],
         olderCursor: null,
@@ -1254,16 +1255,71 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
     const picker = await screen.findByTestId("rewind-picker");
     await within(picker).findAllByTestId("rewind-prompt");
+    const search = within(picker).getByRole("combobox");
 
-    fireEvent.change(within(picker).getByRole("combobox"), { target: { value: "repo" } });
+    fireEvent.change(search, { target: { value: "repo" } });
     expect(within(picker).queryAllByTestId("rewind-prompt")).toEqual([]);
     fireEvent.click(within(picker).getByTestId("rewind-load-older"));
 
+    // A failed older page keeps the search, the loaded rows and the cursor.
+    const loadOlder = await within(picker).findByText("Network down — try again");
+    expect(search).toHaveValue("repo");
+    fireEvent.change(search, { target: { value: "" } });
+    expect(
+      within(picker)
+        .getAllByTestId("rewind-prompt")
+        .map((row) => row.textContent),
+    ).toEqual(["Add parser tests"]);
+    fireEvent.change(search, { target: { value: "repo" } });
+    fireEvent.click(loadOlder);
+
     const older = await within(picker).findByText("Set up the repo");
-    expect(prompts).toHaveBeenLastCalledWith("conv_test", expect.any(AbortSignal), "msg_cursor");
+    expect(prompts.mock.calls.slice(1)).toEqual([
+      ["conv_test", expect.any(AbortSignal), "msg_cursor"],
+      ["conv_test", expect.any(AbortSignal), "msg_cursor"],
+    ]);
     expect(within(picker).queryByTestId("rewind-load-older")).toBeNull();
     fireEvent.click(older);
     expect(rewindToPrompt).toHaveBeenCalledExactlyOnceWith("msg_oldest");
+  });
+
+  it("/rewind ignores prompts that arrive after the picker was closed", async () => {
+    const { prompts } = renderRewindComposer("claude-sdk", { session_rewind: true });
+    let answerFirstOpen!: (page: sessionsApi.RewindPromptsPage) => void;
+    prompts
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          answerFirstOpen = resolve;
+        }),
+      )
+      .mockResolvedValueOnce({
+        prompts: [{ itemId: "msg_current", text: "Current prompt" }],
+        olderCursor: null,
+      });
+    const openPicker = () => {
+      fireEvent.change(textarea(), { target: { value: "/rewind" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+    };
+
+    openPicker();
+    fireEvent.keyDown(await screen.findByTestId("rewind-picker"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("rewind-picker")).toBeNull());
+    openPicker();
+    const picker = await screen.findByTestId("rewind-picker");
+    await within(picker).findByText("Current prompt");
+    await act(async () =>
+      answerFirstOpen({
+        prompts: [{ itemId: "msg_stale", text: "Stale prompt" }],
+        olderCursor: "msg_stale",
+      }),
+    );
+
+    expect(
+      within(picker)
+        .getAllByTestId("rewind-prompt")
+        .map((row) => row.textContent),
+    ).toEqual(["Current prompt"]);
+    expect(within(picker).queryByTestId("rewind-load-older")).toBeNull();
   });
 
   it("/rewind shows a failed rewind under the composer", async () => {

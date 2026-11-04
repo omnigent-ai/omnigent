@@ -48,8 +48,11 @@ export function RewindPicker({ sessionId, open, onOpenChange, onPick }: RewindPi
     controllerRef.current = controller;
     setState({ status: "loading" });
     fetchRewindPrompts(sessionId, controller.signal).then(
-      ({ prompts, olderCursor }) =>
-        setState({ status: "ready", prompts, olderCursor, older: "idle" }),
+      ({ prompts, olderCursor }) => {
+        // A closed or switched picker drops replies meant for its earlier opening.
+        if (controller.signal.aborted) return;
+        setState({ status: "ready", prompts, olderCursor, older: "idle" });
+      },
       (err: unknown) => {
         if (controller.signal.aborted) return;
         setState({ status: "error", message: loadErrorMessage(err) });
@@ -64,7 +67,8 @@ export function RewindPicker({ sessionId, open, onOpenChange, onPick }: RewindPi
     if (controller === null) return;
     setState({ ...state, older: "loading" });
     fetchRewindPrompts(sessionId, controller.signal, state.olderCursor).then(
-      (page) =>
+      (page) => {
+        if (controller.signal.aborted) return;
         setState((current) =>
           current.status === "ready"
             ? {
@@ -74,7 +78,8 @@ export function RewindPicker({ sessionId, open, onOpenChange, onPick }: RewindPi
                 older: "idle",
               }
             : current,
-        ),
+        );
+      },
       (err: unknown) => {
         if (controller.signal.aborted) return;
         setState((current) =>
