@@ -1016,11 +1016,13 @@ Request body matches `SessionEventInput`:
                                   caller owns the top-level session, asks
                                   the runner to drop its live SDK client
                                   with `continue_in_new_session: true`
-                                  (409 while a turn runs; an older
-                                  runner's 204 is accepted), and
+                                  (an older runner's 204 is accepted), and
                                   continues the work in an empty session
                                   on the same host, workspace and runner,
                                   returning its id as `session_id`. A
+                                  running or starting turn is a 400; a
+                                  clear already moving the session is a
+                                  409, as is a message sent meanwhile. A
                                   runner leaves an unmarked claude-sdk
                                   clear unsupported (204). Other harnesses
                                   get a 400. Payload: `{}`.
