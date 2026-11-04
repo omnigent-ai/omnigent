@@ -51,6 +51,7 @@ from omnigent.debug_logging import (
     publish_origin_identity,
     runner_log_scope,
 )
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.errors import (
     ErrorCategory,
     ErrorImpact,
@@ -197,6 +198,7 @@ from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
+    RUNNER_FINISH_WORK_SIGNAL,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
@@ -228,6 +230,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -597,6 +600,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "REQUESTS_CA_BUNDLE",
         "CURL_CA_BUNDLE",
         "NODE_EXTRA_CA_CERTS",
+        # git's own CA paths: git built on libcurl-gnutls ignores SSL_CERT_FILE,
+        # so sandboxes that terminate TLS (e.g. OpenShell) inject these instead.
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
         # Force UTF-8 I/O on Windows. Without this, Python on Windows defaults
         # to the system ANSI code page (e.g. cp1252), causing UnicodeEncodeError
         # when the host daemon / runner prints Unicode characters such as "✓" or
@@ -1195,6 +1202,8 @@ class _RunnerHandle:
         ``None`` disables the watchdog.
     :param stop_requested: Suppress diagnostics for intentional stops
         or superseded launches, even after the exit watcher pops them.
+    :param create_time: Process start time recorded while the runner was
+        alive, used to reject a reused PID before signalling a forked runner.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
@@ -1202,6 +1211,7 @@ class _RunnerHandle:
     session_id: str | None = None
     connect_marker: Path | None = None
     stop_requested: bool = False
+    create_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1274,6 +1284,7 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        server_still_ours: Callable[[], bool] | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1284,9 +1295,13 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param server_still_ours: For a local-mode host, reports whether the
+            local server it started is still the one on ``server_url``; while
+            it is ``False`` each attempt is treated as refused instead of dialing.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        self._server_still_ours = server_still_ours
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
         # files). Each entry remembers the repository root it was built for.
@@ -1482,6 +1497,34 @@ class HostProcess:
             if (pid := active.session.pid) is not None
         )
         return pids
+
+    def signal_runners_finish_work(self, kill: Callable[[int, int], None] = os.kill) -> None:
+        """Tell live runners to finish in-flight work once this host exits.
+
+        Runs on the hangup signal-exit thread, so it only reads process state
+        and sends signals; the zygote is not a runner and is never signalled.
+        A direct child is filtered by a non-blocking poll(), which keeps its
+        PID reserved while the host remains its parent. A zygote-forked runner,
+        which the host does not reap, is validated against the start identity
+        recorded at launch so a reused PID is never signalled.
+
+        :param kill: Signal sender, defaults to :func:`os.kill`; injectable for tests.
+        """
+        if RUNNER_FINISH_WORK_SIGNAL is None:
+            return
+        zygote_pid = self._zygote.unreaped_pid if self._zygote is not None else None
+        for handle in list(self._runners.values()):
+            proc = handle.proc
+            pid = proc.pid
+            code = proc.returncode if isinstance(proc, ZygoteRunnerProc) else proc.poll()
+            if code is not None or pid == zygote_pid:
+                continue
+            if isinstance(proc, ZygoteRunnerProc) and (
+                handle.create_time is None or _proc.process_create_time(pid) != handle.create_time
+            ):
+                continue
+            with contextlib.suppress(OSError):
+                kill(pid, RUNNER_FINISH_WORK_SIGNAL)
 
     @staticmethod
     def _orphan_child_pids() -> list[int]:
@@ -1968,7 +2011,10 @@ class HostProcess:
         log_runner_id = (
             token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
         )
-        with runner_log_scope(frame.session_id, log_runner_id):
+        with (
+            runner_log_scope(frame.session_id, log_runner_id),
+            scheduled_run_scope(frame.scheduled_run, session_id=frame.session_id),
+        ):
             _logger.info(
                 "Runner launch requested",
                 extra=debug_event(
@@ -2219,8 +2265,13 @@ class HostProcess:
             log_path=log_path,
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
+            create_time=_proc.process_create_time(proc.pid),
         )
-        watcher = asyncio.create_task(self._watch_runner(runner_id))
+        launch_context = current_scheduled_run()
+        with scheduled_run_scope(None, session_id=frame.session_id):
+            watcher = asyncio.create_task(
+                self._watch_runner(runner_id, launch_context=launch_context)
+            )
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
         connect_watchdog = asyncio.create_task(
@@ -2382,6 +2433,9 @@ class HostProcess:
                     stdin=subprocess.DEVNULL,
                     stdout=log_fh,
                     stderr=log_fh,
+                    # Own session: a hangup of the daemon's terminal reaches only
+                    # the daemon, which asks its runners to finish in-flight work.
+                    **_proc.spawn_kwargs(),
                     **logging_kwargs,
                 )
             return proc, log_path
@@ -2414,6 +2468,9 @@ class HostProcess:
         )
         try:
             await self._stop_runner_and_trigger(proc, "runner_spawn_abandoned")
+            if isinstance(proc, ZygoteRunnerProc):
+                # No watcher owns an abandoned spawn's retained exit status.
+                await asyncio.to_thread(proc.wait, timeout=5.0)
         except Exception:  # detached cleanup must be observed
             _logger.warning(
                 "Failed to stop abandoned runner pid=%s",
@@ -2516,12 +2573,14 @@ class HostProcess:
     def _stop_runner_proc(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> None:
         """Terminate a runner: SIGTERM, brief wait, then SIGKILL. Blocking.
 
-        Runs on a worker thread (see :meth:`_handle_stop`) because for a
-        zygote-forked runner these are blocking control-socket round-trips, not
-        lock-free waitpid calls.
+        Runs on a worker thread (see :meth:`_handle_stop`). Forked runners
+        use OS liveness so a stalled control exchange cannot postpone a stop.
 
         :param proc: The runner process handle (Popen or zygote shim).
         """
+        if isinstance(proc, ZygoteRunnerProc):
+            proc.stop()
+            return
         if proc.poll() is not None:
             return
         proc.terminate()
@@ -2598,7 +2657,9 @@ class HostProcess:
             status=status,
         )
 
-    async def _watch_runner(self, runner_id: str) -> None:
+    async def _watch_runner(
+        self, runner_id: str, *, launch_context: ScheduledRunLogContext | None = None
+    ) -> None:
         """Watch a spawned runner and report an unexpected exit.
 
         Polls the runner subprocess until it exits. An exit while the
@@ -2613,6 +2674,7 @@ class HostProcess:
 
         :param runner_id: The runner to watch, e.g.
             ``"runner_abc123..."``.
+        :param launch_context: Occurrence retained only for confirmed pre-connect failures.
         :returns: None. Returns silently for intentional stops and clean
             (exit-code-0) shutdowns.
         """
@@ -2637,50 +2699,56 @@ class HostProcess:
                 had_connected = await asyncio.to_thread(handle.connect_marker.exists)
             except OSError:
                 _logger.warning("Could not read connect marker for %s", runner_id, exc_info=True)
-        if handle.proc.returncode == 0:
-            if had_connected is not False:
-                # Post-connect code 0 includes graceful idle-reaper exits.
-                _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+        # Only a confirmed pre-connect exit belongs to the launching occurrence.
+        with scheduled_run_scope(
+            launch_context if had_connected is False else None, session_id=handle.session_id
+        ):
+            if handle.proc.returncode == 0:
+                if had_connected is not False:
+                    # Post-connect code 0 includes graceful idle-reaper exits.
+                    _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+                    return
+                # Pre-connect code 0 is a failed launch; send its cause to the server.
+                error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+                _logger.info(
+                    "Runner %s exited cleanly (code 0) before connecting; reporting exit",
+                    runner_id,
+                )
+                await self._report_runner_exit(runner_id, error, had_connected=had_connected)
                 return
-            # Pre-connect code 0 is a failed launch; send its cause to the server.
             error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-            _logger.info(
-                "Runner %s exited cleanly (code 0) before connecting; reporting exit",
+            # A credential refusal before connecting needs renewed sign-in.
+            # Other exits remain runner faults; the log tail carries the cause.
+            auth_rejected = (
+                handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE
+                and had_connected is not True
+            )
+            if auth_rejected:
+                error = (
+                    "The server rejected this host's credentials, so the runner could not "
+                    f"connect. Sign in again with `{cli_invocation()} login "
+                    f"{self._login_hint_url()}` "
+                    f"on this host, then retry. Details: {error}"
+                )
+            _logger.warning(
+                "Runner %s died unexpectedly: %s",
                 runner_id,
+                error,
+                extra=debug_event(
+                    "runner_died",
+                    session_id=handle.session_id,
+                    stage="runner_process",
+                    runner_id=runner_id,
+                    error_category=(
+                        ErrorCategory.CONFIG if auth_rejected else ErrorCategory.RUNNER
+                    ).value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=(
+                        ErrorPhase.RUNNER_LAUNCH if auth_rejected else ErrorPhase.UNKNOWN
+                    ).value,
+                ),
             )
             await self._report_runner_exit(runner_id, error, had_connected=had_connected)
-            return
-        error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        # A credential refusal before connecting needs renewed sign-in.
-        # Other exits remain runner faults; the log tail carries the cause.
-        auth_rejected = (
-            handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE and had_connected is not True
-        )
-        if auth_rejected:
-            error = (
-                "The server rejected this host's credentials, so the runner could not "
-                f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
-                f"on this host, then retry. Details: {error}"
-            )
-        _logger.warning(
-            "Runner %s died unexpectedly: %s",
-            runner_id,
-            error,
-            extra=debug_event(
-                "runner_died",
-                session_id=handle.session_id,
-                stage="runner_process",
-                runner_id=runner_id,
-                error_category=(
-                    ErrorCategory.CONFIG if auth_rejected else ErrorCategory.RUNNER
-                ).value,
-                error_impact=ErrorImpact.BLOCKING.value,
-                error_phase=(
-                    ErrorPhase.RUNNER_LAUNCH if auth_rejected else ErrorPhase.UNKNOWN
-                ).value,
-            ),
-        )
-        await self._report_runner_exit(runner_id, error, had_connected=had_connected)
 
     async def _watch_runner_connect(
         self, runner_id: str, *, exit_watcher: asyncio.Task[None]
@@ -3696,7 +3764,11 @@ class HostProcess:
         from pathlib import Path
 
         from omnigent.runtime.filesystem_registry import detect_git_root
-        from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+        from omnigent.workspace_fs import (
+            WorkspaceReader,
+            WorkspaceReaderError,
+            read_repository_branches,
+        )
 
         try:
             expanded = os.path.expanduser(frame.workspace)
@@ -3722,25 +3794,29 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
 
-        # Re-detect the repository every time: a workspace that gains or loses
-        # a .git after its first request needs a reader of the matching kind.
-        repo_root = detect_git_root(Path(expanded))
-        with self._fs_readers_lock:
-            cached = self._fs_readers.get(expanded)
-            if cached is None or cached[0] != repo_root:
-                cached = (repo_root, WorkspaceReader(Path(expanded)))
-                self._fs_readers[expanded] = cached
-                while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
-                    self._fs_readers.popitem(last=False)
-            self._fs_readers.move_to_end(expanded)
-            reader = cached[1]
         from omnigent.runner import pr_resource
 
         try:
-            with pr_resource.server_tracking(
-                params.get("server_tracked"), params.get("default_pr_url")
-            ):
-                payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
+            if frame.op == "repository_branches":
+                payload = read_repository_branches(
+                    Path(expanded), cast("list[dict[str, str]]", params["repositories"])
+                )
+            else:
+                # A workspace can gain or lose its .git while the host is running.
+                repo_root = detect_git_root(Path(expanded))
+                with self._fs_readers_lock:
+                    cached = self._fs_readers.get(expanded)
+                    if cached is None or cached[0] != repo_root:
+                        cached = (repo_root, WorkspaceReader(Path(expanded)))
+                        self._fs_readers[expanded] = cached
+                        while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
+                            self._fs_readers.popitem(last=False)
+                    self._fs_readers.move_to_end(expanded)
+                    reader = cached[1]
+                with pr_resource.server_tracking(
+                    params.get("server_tracked"), params.get("default_pr_url")
+                ):
+                    payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
         except WorkspaceReaderError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -4116,6 +4192,20 @@ class HostProcess:
                     status="failed",
                     error="failed to resolve Claude SDK model options",
                 )
+            if listing.source == "cli":
+                # A CLI-login listing replays the CLI-login catalog's wire ids; serve
+                # its rows (display names, aliases, default) from the same launch, which
+                # also refreshes a stale catalog in the background.
+                from omnigent.harnesses.claude_native.main import claude_launch_catalog
+
+                rows = await claude_launch_catalog(None)
+                if rows:
+                    return HostModelOptionsResultFrame(
+                        request_id=frame.request_id,
+                        status="ok",
+                        models=with_source(rows),
+                        routable_models=[model.id for model in listing.models],
+                    )
             if not listing.models:
                 # Subscription / CLI-login providers list nothing endpoint-side.
                 # The SDK drives the claude CLI, so the CLI's own probed rows
@@ -4196,8 +4286,28 @@ class HostProcess:
             )
         if op == "github_info":
             return r.github_info(session_id, cast("str | None", params.get("pr_url")))
+        if op == "github_review_threads":
+            return r.github_review_threads(
+                session_id,
+                str(params.get("pr_url", "")),
+                str(params.get("after", "")),
+                str(params.get("head_sha", "")),
+                str(params.get("base_sha", "")),
+            )
+        if op == "github_review_thread_comments":
+            return r.github_review_thread_comments(
+                session_id,
+                str(params.get("pr_url", "")),
+                str(params.get("thread_id", "")),
+                str(params.get("after", "")),
+            )
         if op == "github_changes":
-            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_changes(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
+            )
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
@@ -4209,7 +4319,12 @@ class HostProcess:
                 base_sha=cast("str | None", params.get("base_sha")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_pr_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
+            )
         if op == "github_labels":
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_merge_options":
@@ -4335,6 +4450,22 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
                 add=params.get("add", []),
                 remove=params.get("remove", []),
+            )
+        if op == "github_review_thread_create":
+            return pr_resource.create_pr_review_thread(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                body=params.get("body"),
+                anchor=params.get("anchor"),
+            )
+        if op == "github_review_thread_reply":
+            return pr_resource.reply_to_pr_review_thread(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                thread_id=str(params.get("thread_id", "")),
+                body=params.get("body"),
             )
         if op == "github_comment_create":
             return pr_resource.create_pr_comment(
@@ -5097,6 +5228,12 @@ class HostProcess:
         # Fresh per-connection markers for the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
+        if self._server_still_ours is not None and not self._server_still_ours():
+            # Our local server exited; another data dir's server may now own the
+            # port, and registering there steals that host's same-name row.
+            raise ConnectionRefusedError(
+                errno.ECONNREFUSED, f"the local server at {self._server_url} is no longer running"
+            )
         url = self._tunnel_url()
         # Credential discovery may invoke the Databricks CLI. Keep it off the
         # event loop so startup capability discovery can make progress at the
@@ -5742,14 +5879,17 @@ class HostProcess:
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
+            # Even a single metadata lookup can block on a mounted filesystem.
+            stat_result = await asyncio.to_thread(self._handle_stat, frame)
+            await self._send_text(ws, encode_host_frame(stat_result))
         elif isinstance(frame, HostListDirFrame):
             # Stat-ing every entry can be slow on large or network-backed
             # directories; keep the tunnel's event loop free meanwhile.
             list_result = await asyncio.to_thread(self._handle_list_dir, frame)
             await self._send_text(ws, encode_host_frame(list_result))
         elif isinstance(frame, HostCreateDirFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_create_dir(frame)))
+            create_dir_result = await asyncio.to_thread(self._handle_create_dir, frame)
+            await self._send_text(ws, encode_host_frame(create_dir_result))
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
@@ -5946,6 +6086,7 @@ def run_host_process(
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
     interactive_shells: list[str] | None = None,
+    server_still_ours: Callable[[], bool] | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -5965,11 +6106,19 @@ def run_host_process(
         for the host process lifetime instead of acquiring another handle.
     :param interactive_shells: Optional shell inventory override for tests.
         By default the host discovers its installed shells once at startup.
+    :param server_still_ours: Local-mode ownership check; see :class:`HostProcess`.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
         to stderr first.
     """
+    from omnigent.cli_auth import pin_databricks_org_id
+    from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
+
+    if is_workspace_hosted_url(server_url):
+        # Foreground hosts need the same snapshot as auto-launched daemons.
+        # Pinning absence prevents later login metadata retargeting runners.
+        pin_databricks_org_id(server_url, ServerUrl.from_api_base(server_url).org_id)
     # Before any startup work logs, so its earliest debug-log rows are attributed.
     publish_origin_identity(server_url)
     # The loop prints and logs to the terminal; one that stops reading must not stall it.
@@ -5999,6 +6148,7 @@ def run_host_process(
             daemon_target=daemon_target,
             lifecycle_lock=lifecycle_lock,
             interactive_shells=interactive_shells,
+            server_still_ours=server_still_ours,
         )
     except BaseException as exc:
         # A stop signal already being handled owns the exit: never returns then.
@@ -6048,6 +6198,7 @@ def _serve_host_until_exit(
     daemon_target: str | None,
     lifecycle_lock: DaemonLifecycleLock | None,
     interactive_shells: list[str] | None,
+    server_still_ours: Callable[[], bool] | None = None,
 ) -> bool:
     """Run the host until it exits; see :func:`run_host_process`.
 
@@ -6139,7 +6290,9 @@ def _serve_host_until_exit(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        server_still_ours=server_still_ours,
     )
+    crash_reporting.set_hangup_callback(host.signal_runners_finish_work)
     try:
         asyncio.run(host.run())
     except HostConnectError as exc:
@@ -6156,4 +6309,8 @@ def _serve_host_until_exit(
             stderr=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    finally:
+        # Serving is over: drop the callback so a hangup during the exit-drain
+        # window cannot signal runners through a torn-down host.
+        crash_reporting.set_hangup_callback(None)
     return host.lifecycle_lost

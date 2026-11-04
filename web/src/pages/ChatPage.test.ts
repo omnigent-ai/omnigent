@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
@@ -18,6 +19,8 @@ import {
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
+  hasSentNativeInputPending,
+  useWorkingSignals,
   containsMarkdownTable,
   dispatchInitialPrompt,
   failedSessionLastError,
@@ -980,6 +983,53 @@ describe("computeShowsWorking", () => {
     );
   });
 
+  it("counts only input this tab sent to a native terminal as awaiting pickup", () => {
+    // A claude-native send's response completes once the message reaches the terminal,
+    // ~200ms before the agent reports running; the indicator must not drop in between.
+    const sent = { tempId: "pend_1", content: [], createdAtS: 1_700_000_000 };
+    const replayed = { tempId: "pi_1", content: [] };
+    expect(hasSentNativeInputPending(true, [sent])).toBe(true);
+    expect(hasSentNativeInputPending(false, [sent])).toBe(false);
+    // Snapshot-replayed input may wait on an offline runner; it doesn't count.
+    expect(hasSentNativeInputPending(true, [replayed])).toBe(false);
+    expect(
+      hasSentNativeInputPending(true, [{ ...sent, initialDraft: { text: "hi", files: [] } }]),
+    ).toBe(false);
+  });
+
+  describe("useWorkingSignals", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const signals = (overrides: Partial<Parameters<typeof useWorkingSignals>[0]> = {}) => ({
+      status: "idle" as const,
+      sessionStatus: "idle" as const,
+      hasPendingInitialMessage: false,
+      nativeInputPending: false,
+      conversationId: "conv-a",
+      ...overrides,
+    });
+
+    it("keeps Working lit for a first message held past the terminal's ready idle", () => {
+      const { result } = renderHook(() =>
+        useWorkingSignals(signals({ hasPendingInitialMessage: true })),
+      );
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+
+    it("lights Working, not Stop, while a native agent picks up input, for at most 3s", () => {
+      const { result, rerender } = renderHook((props) => useWorkingSignals(props), {
+        initialProps: signals({ nativeInputPending: true }),
+      });
+      expect(result.current).toEqual({ isWorking: false, indicatorSendInFlight: true });
+      act(() => vi.advanceTimersByTime(3_000));
+      expect(result.current.indicatorSendInFlight).toBe(false);
+
+      // Another session's pickup gets its own window.
+      rerender(signals({ nativeInputPending: true, conversationId: "conv-b" }));
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+  });
+
   it("an in-flight local send lights the indicator before any server edge", () => {
     // Pressing Enter sets chatStore.status = "streaming" synchronously, while
     // `sessionStatus` stays `idle` until the server publishes `running` (for
@@ -1398,17 +1448,26 @@ describe("collectBubbleMarkdown", () => {
 // ── Slash command map (skills + built-ins) ────────────────────────────
 
 describe("buildSlashCommandMap", () => {
+  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];
+
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
     // Session- and harness-specific commands are gated off by default.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter(
-        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
-      ),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => !gatedOffByDefault.includes(name)),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /permissions only when showPermissions is true (codex-native)", () => {
+    expect(buildSlashCommandMap([], true, true)["/permissions"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/permissions"
+      ],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/permissions"]);
   });
 
   it("includes /side only when showSide is true (codex-native)", () => {
@@ -1494,9 +1553,7 @@ describe("buildSlashCommandMap", () => {
     // Built-ins first, then skills in their input order — the menu
     // surfaces built-ins above user skills. Session- and harness-specific commands are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter(
-        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
-      ),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => !gatedOffByDefault.includes(name)),
       "/triage-issues",
       "/mlflow-bug",
     ]);
