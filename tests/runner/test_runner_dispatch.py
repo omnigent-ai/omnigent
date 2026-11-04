@@ -6826,8 +6826,10 @@ def _session_query_client(
 async def test_session_list_maps_children_and_skips_closed() -> None:
     """
     ``sys_session_list`` maps ``child_sessions`` rows to
-    ``{agent, title, conversation_id}`` and drops closed and
-    colonless rows, matching ``SysSessionListTool``.
+    ``{agent, title, conversation_id}`` and drops closed rows.
+
+    A ``sys_session_create`` child keeps its verbatim title (or none), so
+    it is listed under that title with the row's ``agent_name``.
     """
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
@@ -6876,6 +6878,27 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "tool": "legacy-untyped",
                         "session_name": None,
                     },
+                    {
+                        "id": "c6",
+                        "title": "LeakRepro",
+                        "tool": "LeakRepro",
+                        "session_name": None,
+                        "agent_name": "codex-native-ui",
+                    },
+                    {
+                        "id": "c7",
+                        "title": None,
+                        "tool": None,
+                        "session_name": None,
+                        "agent_name": "codex-native-ui",
+                    },
+                    {
+                        "id": "c8",
+                        "title": "LeakRepro:closed:c8",
+                        "tool": "LeakRepro",
+                        "session_name": "closed:c8",
+                        "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                    },
                 ],
             },
         )
@@ -6886,13 +6909,15 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed despite its mixed-type label map), c5
-    # (legacy title tombstone), and c4
-    # (no colon) dropped; the ui:-added child surfaces under its bound
-    # agent + label.
+    # c3 (explicitly closed despite its mixed-type label map), c5 (legacy
+    # title tombstone) and c8 (closed sys_session_create child) dropped; the
+    # ui:-added child surfaces under its bound agent + label.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
+        {"agent": None, "title": "legacy-untyped", "conversation_id": "c4"},
+        {"agent": "codex-native-ui", "title": "LeakRepro", "conversation_id": "c6"},
+        {"agent": "codex-native-ui", "title": None, "conversation_id": "c7"},
     ]
 
 
@@ -7465,14 +7490,55 @@ async def test_session_peek_maps_access_errors(status: int, expected_error: str)
 
 
 @pytest.mark.asyncio
-async def test_session_close_patches_tombstoned_title() -> None:
+@pytest.mark.parametrize(
+    ("target_fields", "expected_title", "expected_agent", "expected_instance_title"),
+    [
+        pytest.param(
+            {"title": "researcher:auth"},
+            "researcher:auth:closed:conv_target",
+            "researcher",
+            "auth",
+            id="agent-title",
+        ),
+        pytest.param(
+            {"title": "LeakRepro", "agent_name": "codex-native-ui"},
+            "LeakRepro:closed:conv_target",
+            "codex-native-ui",
+            "LeakRepro",
+            id="verbatim-title",
+        ),
+        pytest.param(
+            {"title": None, "agent_name": "codex-native-ui"},
+            None,
+            "codex-native-ui",
+            "",
+            id="untitled",
+        ),
+        pytest.param(
+            {"title": "L" * 200, "agent_name": "codex-native-ui"},
+            "L" * 181 + ":closed:conv_target",
+            "codex-native-ui",
+            "L" * 200,
+            id="max-length-title",
+        ),
+    ],
+)
+async def test_session_close_patches_tombstoned_title(
+    target_fields: dict[str, Any],
+    expected_title: str | None,
+    expected_agent: str,
+    expected_instance_title: str,
+) -> None:
     """
-    ``sys_session_close`` PATCHes a closed label and internal tombstone.
+    ``sys_session_close`` PATCHes a closed label, archive, and tombstone.
 
     The title tombstone frees the DB unique slot so future
     ``sys_session_send`` of the same ``(agent, title)`` creates a
     fresh child. The ``omnigent.closed=true`` label is the
     behavioral marker that direct write paths and clients consume.
+    A ``sys_session_create`` child keeps its verbatim title (or none),
+    trimmed so the tombstone fits the title limit, and its agent comes
+    from the snapshot's ``agent_name``.
 
     The caller (``conv_caller``) and target (``conv_target``) share the
     same ``root_conversation_id`` and the target is a sub-agent, so the
@@ -7493,7 +7559,7 @@ async def test_session_close_patches_tombstoned_title() -> None:
                 200,
                 json={
                     "id": "conv_target",
-                    "title": "researcher:auth",
+                    **target_fields,
                     "root_conversation_id": "conv_root",
                     "parent_session_id": "conv_caller",
                 },
@@ -7520,13 +7586,14 @@ async def test_session_close_patches_tombstoned_title() -> None:
     # Tombstone embeds the conv id so repeated closes stay unique, and
     # the explicit label makes the closed state observable without
     # exposing the suffix as UI text.
-    assert patched["title"] == "researcher:auth:closed:conv_target"
+    assert patched.get("title") == expected_title
     assert patched["labels"] == {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+    assert patched["archived"] is True
     assert out == {
         "closed": True,
         "conversation_id": "conv_target",
-        "agent": "researcher",
-        "title": "auth",
+        "agent": expected_agent,
+        "title": expected_instance_title,
     }
 
 

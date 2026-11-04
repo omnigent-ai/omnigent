@@ -22,12 +22,14 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
@@ -405,6 +407,113 @@ async def test_archive_idle_session(
     assert resp.status_code == 200
     assert resp.json()["archived"] is True
     mock_stop.assert_not_awaited()
+
+
+_HOST_ID = "a1b2c3d4e5f61234567890abcdef0123"
+_PARENT_RUNNER_ID = "b1b2c3d4e5f61234567890abcdef0123"
+_CHILD_RUNNER_ID = "c1b2c3d4e5f61234567890abcdef0123"
+
+
+@pytest.mark.parametrize(
+    (
+        "closed",
+        "child_runner_id",
+        "stop_acknowledged",
+        "runner_reply",
+        "expect_stop",
+        "expect_release",
+    ),
+    [
+        pytest.param(True, None, True, None, False, False, id="closed-unbound"),
+        pytest.param(True, _PARENT_RUNNER_ID, True, 200, False, True, id="closed-shared-runner"),
+        pytest.param(True, _PARENT_RUNNER_ID, True, 500, False, True, id="closed-release-fails"),
+        pytest.param(
+            True, _CHILD_RUNNER_ID, True, 200, True, False, id="closed-owned-runner-stopped"
+        ),
+        pytest.param(
+            True, _CHILD_RUNNER_ID, False, 200, True, True, id="closed-owned-stop-failed"
+        ),
+        pytest.param(False, _PARENT_RUNNER_ID, True, 200, False, False, id="archived-only"),
+    ],
+)
+async def test_archive_idle_closed_child_releases_runner_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+    closed: bool,
+    child_runner_id: str | None,
+    stop_acknowledged: bool,
+    runner_reply: int | None,
+    expect_stop: bool,
+    expect_release: bool,
+) -> None:
+    """Closing an idle child releases its routed runner session, unless its runner was stopped."""
+    session = await create_test_session(client, name="archive-closed-child")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_host_id(session["id"], _HOST_ID, workspace="/tmp/archive-ws")
+    conv_store.set_runner_id(session["id"], _PARENT_RUNNER_ID)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="LeakRepro",
+        parent_conversation_id=session["id"],
+        agent_id=session["agent_id"],
+        host_id=_HOST_ID if child_runner_id else None,
+        workspace="/tmp/archive-ws" if child_runner_id else None,
+        runner_id=child_runner_id,
+    )
+    conv_store.append(
+        child.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="seed",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "keep me"}]),
+            )
+        ],
+    )
+    runner_requests: list[tuple[str, str]] = []
+
+    def _runner(request: httpx.Request) -> httpx.Response:
+        runner_requests.append((request.method, request.url.path))
+        return httpx.Response(runner_reply or 200, json={})
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner), base_url="http://runner"
+    )
+    # No reply: no runner client resolves, as for an unbound session.
+    get_runner_client = AsyncMock(return_value=runner_client if runner_reply else None)
+    host_stop = AsyncMock(return_value=stop_acknowledged)
+    patch_body: dict[str, object] = {"archived": True}
+    if closed:
+        patch_body["title"] = f"LeakRepro:closed:{child.id}"
+        patch_body["labels"] = {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+    try:
+        with (
+            patch.object(_sessions_facade, "_get_runner_client", get_runner_client),
+            patch.object(_sessions_facade, "_stop_session_host_runner", host_stop),
+        ):
+            resp = await client.patch(f"/v1/sessions/{child.id}", json=patch_body)
+            await _drain_detached_stops()
+    finally:
+        await runner_client.aclose()
+        _sessions_common._intentional_stop_sessions.pop(child.id, None)
+    assert resp.status_code == 200
+    assert resp.json()["archived"] is True
+    assert host_stop.await_count == (1 if expect_stop else 0)
+    release = ("DELETE", f"/v1/sessions/{child.id}")
+    assert (release in runner_requests) is expect_release
+    if expect_release:
+        routed = [
+            call.kwargs["conversation"]
+            for call in get_runner_client.await_args_list
+            if call.args[0] == child.id and call.kwargs.get("conversation") is not None
+        ]
+        assert [conv.runner_id for conv in routed] == [child_runner_id]
+    assert ("Archive resource release failed" in caplog.text) is (runner_reply == 500)
+    stored = conv_store.get_conversation(child.id)
+    assert stored is not None and stored.archived
+    items = conv_store.list_items(child.id).data
+    assert [item.data.content[0]["text"] for item in items] == ["keep me"]
 
 
 async def test_unarchive_skips_stop(
