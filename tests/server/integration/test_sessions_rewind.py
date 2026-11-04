@@ -133,6 +133,8 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     notice = message_texts(store, source_id)[-1]
     assert "/rewind" in notice and f"(/c/{new_id})" in notice
     assert live_runner.superseded == [(source_id, new_id, "rewind")]
+    # Listed in the owner's other tabs once placed.
+    assert new_id in live_runner.announced
 
 
 async def test_rewind_refuses_a_message_sent_while_it_moves_the_session(
