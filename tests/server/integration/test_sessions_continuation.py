@@ -366,6 +366,7 @@ async def test_survives_the_runner_leaving_before_it_is_bound(
         monkeypatch.setattr(app.state, "host_store", host_store)
     before = len((await client.get("/v1/sessions")).json()["data"])
 
+    announced_before = list(live_runner.announced)
     resp = await continue_session(client, store, source_id, command)
 
     if left == "to_another_replica":
@@ -385,6 +386,8 @@ async def test_survives_the_runner_leaving_before_it_is_bound(
         assert "runner is offline" in resp.text
     assert len((await client.get("/v1/sessions")).json()["data"]) == before
     assert live_runner.superseded == []
+    # A continuation that was never placed was never listed in the owner's tabs.
+    assert live_runner.announced == announced_before
 
 
 @pytest.mark.parametrize("command", COMMANDS)
