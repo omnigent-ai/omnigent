@@ -3836,15 +3836,30 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
-  it("keeps a files-only input out of the text draft it joins, so a reload names its attachments again", async () => {
+  const chart = { type: "input_image", file_id: "file_chart", filename: "chart.png" };
+  it.each([
+    {
+      attached: "to a files-only input the text draft leaves out",
+      inputs: [
+        { pending_id: "pending_first", content: [{ type: "input_text", text: "saved on server" }] },
+        { pending_id: "pending_image", content: [chart] },
+      ],
+    },
+    {
+      attached: "with the text the draft holds",
+      inputs: [
+        {
+          pending_id: "pending_first",
+          content: [{ type: "input_text", text: "saved on server" }, chart],
+        },
+      ],
+    },
+  ])("names a failed startup input's file $attached again after a reload", async ({ inputs }) => {
     onTestFinished(clearSessionDrafts);
     seedSession("conv_real");
     seedSession("conv_other");
     failManagedLaunch("conv_real", "saved on server");
-    sessionFailedInputs.get("conv_real")!.push({
-      pending_id: "pending_image",
-      content: [{ type: "input_image", file_id: "file_chart", filename: "chart.png" }],
-    });
+    sessionFailedInputs.set("conv_real", inputs);
     const notices = () =>
       useChatStore
         .getState()
@@ -3863,9 +3878,20 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       startupInputIds: taken!.startupInputIds,
     });
 
-    // After a reload the saved draft holds the text input alone.
+    // A reload keeps the draft's text and ids, not its files or the notice naming them.
     await useChatStore.getState().switchTo("conv_other");
     initChatStore(client);
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(notices()).toEqual([reminder]);
+    await retryFailedStartupLookup("conv_real");
+    expect(notices()).toEqual([reminder]);
+
+    // So does the session evicted and reopened in the same tab.
+    await useChatStore.getState().switchTo("conv_other");
+    await settle();
+    expect(conversationRegistry.evictLruEvictable()).toBe("conv_real");
     await useChatStore.getState().switchTo("conv_real");
     await settle();
     expect(useChatStore.getState().failedSendDraft).toBeNull();

@@ -8007,6 +8007,7 @@ function settleReplacedStartupInputs(
  * @param failedInputs - The viewer's inputs the server holds as failed.
  * @param unacknowledged - Bubbles of the viewer's sends no server receipt named
  *   when the read began, the only ones matched by text.
+ * @param adopted - Inputs the entry took as returned from a reload's draft or an evicted entry.
  * @returns The state patch, empty when nothing is left to hand back.
  */
 function returnFailedStartupInputs(
@@ -8024,6 +8025,7 @@ function returnFailedStartupInputs(
   >,
   failedInputs: FailedInput[],
   unacknowledged: ReadonlySet<string>,
+  adopted: ReadonlySet<string> = new Set(),
 ): Partial<ConversationState> {
   const unreturned = unreturnedStartupInputs(state, failedInputs);
   const inWaitingDraft = inputsSentAs(unreturned, [
@@ -8062,9 +8064,18 @@ function returnFailedStartupInputs(
     ...(saved?.files.length ? [] : inSavedDraft),
     ...(sideChat?.files.length ? [] : inSideChat),
   ]);
-  const attachments = startupAttachmentsNotice(
-    unreturned.filter((input) => !held.has(input.pendingId) || withoutFiles.has(input.pendingId)),
-  );
+  // An adopted input's notice didn't survive, so name the files no draft holds alongside it.
+  const adoptedWithoutFiles = new Set([
+    ...(saved?.files.length ? [] : (saved?.startupInputIds ?? [])),
+    ...(sideChat?.files.length ? [] : (sideChat?.startupInputIds ?? [])),
+  ]);
+  const lacksFiles = (input: FailedInput) =>
+    unreturned.includes(input)
+      ? !held.has(input.pendingId) || withoutFiles.has(input.pendingId)
+      : adopted.has(input.pendingId) &&
+        !state.replacedStartupInputs.includes(input.pendingId) &&
+        (adoptedWithoutFiles.has(input.pendingId) || startupInputText(input).trim() === "");
+  const attachments = startupAttachmentsNotice(failedInputs.filter(lacksFiles));
   const kept = state.blocks.filter((block) => !isStartupLookupNotice(block));
   const blocks = attachments ? [...kept, attachments] : kept;
   const waiting = handedBackDraft(
@@ -8131,8 +8142,10 @@ function handBackFailedStartupInputs(
   const bySideChat = state.failedSendTakenBy === "sideChat";
   const inSideChat = [...(bySideChat ? unclaimed : []), ...sideChatSends];
   const inSavedDraft = [...(bySideChat ? [] : unclaimed), ...savedDraftSends];
+  const adopted = adoptedStartupInputs.get(entry);
+  adoptedStartupInputs.delete(entry);
   entrySetter(entry)((current) =>
-    returnFailedStartupInputs(conversationId, current, failedInputs, unacknowledged),
+    returnFailedStartupInputs(conversationId, current, failedInputs, unacknowledged, adopted),
   );
   // The composer holding a send's text names its inputs, and a reload knows its saved draft's as returned.
   if (sideChat && inSideChat.length > 0)
@@ -8334,6 +8347,9 @@ conversationRegistry.subscribeDisposed((id, state) => {
   if (returned.length > 0) disposedReturnedStartupInputs.set(id, returned);
 });
 
+/** Startup inputs each entry adopted as returned, until a read names the files they lack. */
+const adoptedStartupInputs = new WeakMap<ConversationEntry, Set<string>>();
+
 /**
  * Count as returned on this entry the startup inputs an earlier entry for this session handed
  * back and those its saved draft holds, which a reload keeps and the user may clear mid-read.
@@ -8345,6 +8361,10 @@ function adoptReturnedStartupInputs(entry: ConversationEntry): void {
     (id) => !entry.getState().returnedStartupInputs.includes(id),
   );
   if (adopted.length === 0) return;
+  adoptedStartupInputs.set(
+    entry,
+    new Set([...(adoptedStartupInputs.get(entry) ?? []), ...adopted]),
+  );
   entrySetter(entry)((state) => ({
     returnedStartupInputs: [...new Set([...state.returnedStartupInputs, ...adopted])],
   }));
