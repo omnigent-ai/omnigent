@@ -442,6 +442,27 @@ describe("McpSignInDialog", () => {
     expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(0);
   });
 
+  it("waits for a slow status reply before polling again", async () => {
+    on("POST", BASE, () => json(login()));
+    on("GET", `${BASE}/L1`, () => json(login()));
+    await renderDialog();
+    let respond: (response: Response) => void = () => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          respond = resolve;
+        }),
+    );
+    await tick();
+    await tick();
+    await tick();
+    expect(calls("GET", `${BASE}/L1`)).toHaveLength(1);
+
+    await act(async () => respond(json(login())));
+    await tick();
+    expect(calls("GET", `${BASE}/L1`)).toHaveLength(2);
+  });
+
   it("keeps polling through a brief outage and gives up after repeated failures", async () => {
     on(
       "POST",
