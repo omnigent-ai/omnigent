@@ -67,6 +67,7 @@ checks, or changes when its API failed:
 | `pr.checks.partial: true`         | Qualify check counts as incomplete; keep any loaded checks.                                                                            |
 | `pr.checks_supported: false`      | The token cannot read check runs (GitHub refuses them to fine-grained PATs); say so in the Checks area instead of showing counts.      |
 | `pr.comments_partial: true`       | Mark comments incomplete; retain loaded comments and display a `+` with their count.                                                   |
+| `pr.timeline_partial: true`       | Retain loaded commit/force-push events and show an incomplete-history message with a provider link.                                    |
 | Changed files `has_more: true`    | Mark the file list incomplete.                                                                                                         |
 | Changed files `warning: string`   | Show the provider's explanation, including a failed file-list lookup.                                                                  |
 | Diff `unavailable_reason: string` | Show an unavailable state instead of rendering an empty patch.                                                                         |
@@ -141,6 +142,21 @@ that store requests report `session_pull_requests` in `/v1/info`; against older
 servers the web reads only the live host.
 
 ## Verification
+
+### Commit and push history
+
+GitHub PR info includes optional `timeline_events`, interleaved with comments
+in the Comments tab. Entries contain `id`, `kind` (`commit` or `force_push`),
+`author`, `created_at`, `url`, `sha`, and optional `previous_sha` and `message`.
+The host fetches the latest 100 commit/force-push timeline entries and reports
+`timeline_partial` when older entries exist or the read fails. Older hosts and
+other providers can omit these fields.
+
+GitHub does not expose supported timestamps for regular pushes, so commits use
+their commit time and are labeled “committed.” Force pushes use the event time.
+Timeline-only reads use GitHub CLI's 30-second response cache. PRs with at least
+100 comments keep the existing uncached latest-comment refresh and fetch activity
+in that request. Incomplete history does not extend normal metadata polling.
 
 ### Inline GitHub conversations
 

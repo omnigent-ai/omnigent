@@ -139,6 +139,9 @@ _MAX_ENTRIES_PER_CONVERSATION = 64
 _ONE_LEADING_ATTACHMENT_MARKER_RE = re.compile(rf"^\s*(?:{ATTACHMENT_MARKER_STRIP_PATTERN})\s*")
 _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
 
+# Words Claude Code's composer treats as /exit when sent on their own.
+_CLAUDE_EXIT_WORDS = frozenset({"exit", "quit", ":q", ":q!", ":wq", ":wq!"})
+
 NativeInputCauseClass = Literal[
     "rejected_before_handoff",
     "rejected_by_native",
@@ -821,7 +824,12 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
 
 
 def resolve_matching_text(
-    conversation_id: str, text: str, *, hold: bool = False, shell_command: bool = False
+    conversation_id: str,
+    text: str,
+    *,
+    hold: bool = False,
+    shell_command: bool = False,
+    claude_commands: bool = False,
 ) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
@@ -843,6 +851,9 @@ def resolve_matching_text(
     :param text: User-message text mirrored from the native transcript.
     :param shell_command: Match a command without its ``!`` prefix and leave
         all older inputs queued; shell mirrors cannot establish prompt loss.
+    :param claude_commands: The session runs Claude Code, so its own commands
+        (``!`` shell commands and bare exit words) are not known lost either
+        when a later match jumps over them; see :func:`_is_command_entry`.
     :param hold: Keep the matched and skipped entries in place, marked held,
         instead of removing them; the caller settles each with
         :func:`release` or :func:`restore`. Entries already held are skipped.
@@ -914,13 +925,10 @@ def resolve_matching_text(
         lost: list[DrainedInput] = []
         uncertain: list[DrainedInput] = []
         for _pending_id, entry in skipped_entries:
-            # Claude folds a plain prompt queued behind a "/"-led one at the next
-            # tool call but keeps the "/"-led prompt until the turn ends, so the
-            # older entry may still be recorded later.
             if (
                 entry.uncertain
                 or entry.interrupted
-                or _collapse_whitespace(_content_text(entry.content)).startswith("/")
+                or _is_command_entry(entry, claude_commands=claude_commands)
             ):
                 uncertain.append(_drained_input(entry))
             else:
@@ -1074,6 +1082,27 @@ def _prefer_live(candidates: list[int], interrupted: list[bool]) -> int | None:
 def _collapse_whitespace(text: str) -> str:
     """Collapse whitespace runs so paste and mirror spacing differences cancel out."""
     return " ".join(text.split())
+
+
+def _is_command_entry(entry: _Entry, *, claude_commands: bool) -> bool:
+    """
+    Whether a queued entry is a command the agent runs itself, not a prompt.
+
+    Claude folds a plain prompt queued behind a turn in at the next tool call,
+    but holds a ``/`` command or a ``!`` shell command until the turn ends, so
+    the older command is recorded after the later prompt. A bare exit word
+    quits Claude without recording a prompt at all. Either way, a later match
+    jumping over the entry does not show it was lost.
+
+    :param entry: Queued web entry, e.g. one holding ``"!git status"``.
+    :param claude_commands: Also count Claude Code's ``!`` shell commands and
+        exit words; ``/``-led text counts for every harness.
+    :returns: Whether the entry is such a command.
+    """
+    text = _collapse_whitespace(_content_text(entry.content))
+    if text.startswith("/"):
+        return True
+    return claude_commands and (text.startswith("!") or text.lower() in _CLAUDE_EXIT_WORDS)
 
 
 def _attachment_count(content: list[dict[str, Any]]) -> int:

@@ -532,6 +532,7 @@ class SessionResourceRegistry:
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
         self._session_status_publisher: Callable[[str, str, str | None], None] | None = None
+        self._session_failure_publisher: Callable[[str, str], None] | None = None
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
@@ -567,10 +568,14 @@ class SessionResourceRegistry:
                 surface if surface is not None and surface in CLIENT_SURFACES else "unknown"
             )
 
+    def client_surface(self, session_id: str) -> str:
+        """Return the session's creating interface, e.g. ``"web"``, or ``"unknown"``."""
+        with self._lock:
+            return self._client_surfaces.get(session_id, "unknown")
+
     def client_surface_env(self, session_id: str) -> dict[str, str]:
         """Build launch metadata without inheriting another session's client identity."""
-        with self._lock:
-            return {CLIENT_SURFACE_ENV_VAR: self._client_surfaces.get(session_id, "unknown")}
+        return {CLIENT_SURFACE_ENV_VAR: self.client_surface(session_id)}
 
     def set_terminal_activity_publisher(
         self,
@@ -608,6 +613,10 @@ class SessionResourceRegistry:
             (e.g. ``"permission prompt"``), or ``None``.
         """
         self._session_status_publisher = publisher
+
+    def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
+        """Publish a native status failure with its available error detail on the event loop."""
+        self._session_failure_publisher = publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -647,14 +656,19 @@ class SessionResourceRegistry:
     ) -> None:
         """Record the session's latest PTY status for exit classification."""
         with self._lock:
-            if record_activity and status in {"running", "waiting"}:
-                self._active_session_turns.add(session_id)
-                self._session_activity_epoch[session_id] = (
-                    self._session_activity_epoch.get(session_id, 0) + 1
-                )
-            if status in {"idle", "failed"}:
-                self._active_session_turns.discard(session_id)
-            self._last_session_status[session_id] = status
+            self._set_session_status_memo_locked(session_id, status, record_activity)
+
+    def _set_session_status_memo_locked(
+        self, session_id: str, status: str, record_activity: bool
+    ) -> None:
+        if record_activity and status in {"running", "waiting"}:
+            self._active_session_turns.add(session_id)
+            self._session_activity_epoch[session_id] = (
+                self._session_activity_epoch.get(session_id, 0) + 1
+            )
+        if status in {"idle", "failed"}:
+            self._active_session_turns.discard(session_id)
+        self._last_session_status[session_id] = status
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
         """Pop and return the session's recorded PTY status (or ``None``)."""
@@ -664,7 +678,15 @@ class SessionResourceRegistry:
             self._status_pollers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
 
-    def _claim_status_edge(self, session_id: str, status: str, blocked_on: str | None) -> bool:
+    def _claim_status_edge(
+        self,
+        session_id: str,
+        status: str,
+        blocked_on: str | None,
+        *,
+        explicit_activity: bool = False,
+        replay_activity_epoch: int | None = None,
+    ) -> bool:
         """Record an edge as published, reporting whether it was a change.
 
         Keyed on the ``(status, blocked_on)`` pair so a session that stays
@@ -673,23 +695,35 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: Status about to be published, e.g. ``"running"``.
         :param blocked_on: Reason the agent is parked, or ``None``.
+        :param explicit_activity: Record native working state, even if deduplicated.
+        :param replay_activity_epoch: Activity at an unchanged native read; a replay
+            cannot clear failure or overwrite work that started after that read.
         :returns: ``True`` when this differs from the last published edge
             (so the caller should publish), ``False`` when it is a duplicate.
         """
         with self._lock:
-            if self._published_session_status.get(session_id) == (status, blocked_on):
+            published = self._published_session_status.get(session_id)
+            if replay_activity_epoch is not None and (
+                self._session_activity_epoch.get(session_id, 0) != replay_activity_epoch
+                or (published is not None and published[0] == "failed")
+            ):
+                return False
+            if explicit_activity:
+                self._set_session_status_memo_locked(session_id, status, True)
+            if published == (status, blocked_on):
                 return False
             self._published_session_status[session_id] = (status, blocked_on)
+            if not explicit_activity:
+                self._set_session_status_memo_locked(session_id, status, False)
             return True
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
-        """Adopt an external status and re-arm its file poller after idle."""
+        """Adopt an external status and let native state reconcile a missing edge."""
         with self._lock:
             self._published_session_status[session_id] = (status, None)
             poller = self._status_pollers.get(session_id)
-        # A queued turn can hide the idle file edge. Re-arm only for idle so a
-        # stale busy file cannot clear a forwarded failure.
-        if status == "idle" and poller is not None:
+        # Replayed native state is guarded separately from genuine transitions.
+        if status != "failed" and poller is not None:
             poller.resync()
 
     def resync_session_statuses(self) -> None:
@@ -762,9 +796,8 @@ class SessionResourceRegistry:
         exit as mid-turn.
 
         Also adopts *status* as the watcher's dedup baseline and re-arms its
-        status-file poller after ``idle``. The forwarder publishes directly
-        to the server, so both caches must catch up or they can swallow the
-        next turn's ``running`` as a duplicate, leaving it on the hook's ``idle``.
+        native poller after nonfailure edges. Unchanged reads reconcile a lost
+        edge, but cannot clear a failure or overwrite newer activity.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
@@ -1500,6 +1533,7 @@ class SessionResourceRegistry:
         """
         activity_publisher = self._terminal_activity_publisher
         status_publisher = self._session_status_publisher
+        failure_publisher = self._session_failure_publisher
         exit_publisher = self._terminal_exit_publisher
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
@@ -1511,6 +1545,16 @@ class SessionResourceRegistry:
         resource_id = terminal_resource_id(terminal_name, session_key)
         loop = asyncio.get_running_loop()
 
+        def _owns_terminal() -> bool:
+            return (
+                self._terminal_registry is not None
+                and self._terminal_registry.get(session_id, terminal_name, session_key) is instance
+            )
+
+        def _publish_activity() -> None:
+            if activity_publisher is not None and _owns_terminal():
+                activity_publisher(session_id, resource_id)
+
         # Monotonic time of the last activity pulse published for this
         # terminal, mutated only on the watcher daemon thread (so no lock),
         # used to throttle emissions to at most one per
@@ -1518,20 +1562,25 @@ class SessionResourceRegistry:
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
 
+        def _publish_status_if_current(
+            status: str, blocked_on: str | None, failure_detail: str | None = None
+        ) -> None:
+            if not _owns_terminal():
+                return
+            if status == "failed" and failure_detail is not None and failure_publisher is not None:
+                failure_publisher(session_id, failure_detail)
+            elif status_publisher is not None:
+                status_publisher(session_id, status, blocked_on)
+
         def _publish_status(
             status: str,
             blocked_on: str | None = None,
             *,
             record_activity: bool = False,
             failure_activity_epoch: int | None = None,
+            failure_detail: str | None = None,
+            replay_activity_epoch: int | None = None,
         ) -> None:
-            # Publish one running/idle edge: dedup against the last value,
-            # memo for exit classification, and hop to the loop (publishers
-            # are loop-only). Shared by the PTY edges and the claude-native
-            # structured-state poller so both go through the same dedup/memo. The
-            # dedup baseline lives on the registry, not this closure, so a
-            # forwarder's hook-derived edge resyncs it (see
-            # :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
             if status == "failed":
@@ -1543,6 +1592,7 @@ class SessionResourceRegistry:
                             blocked_on,
                             record_activity=record_activity,
                             failure_activity_epoch=epoch,
+                            failure_detail=failure_detail,
                         )
                     )
                     return
@@ -1552,10 +1602,16 @@ class SessionResourceRegistry:
                     or self.session_activity_epoch(session_id) != failure_activity_epoch
                 ):
                     return
+            if not _owns_terminal():
+                return
             explicit_activity = record_activity and status in {"running", "waiting"}
-            if explicit_activity:
-                self._set_session_status_memo(session_id, status)
-            if not self._claim_status_edge(session_id, status, blocked_on):
+            if not self._claim_status_edge(
+                session_id,
+                status,
+                blocked_on,
+                explicit_activity=explicit_activity,
+                replay_activity_epoch=replay_activity_epoch,
+            ):
                 return
             with contextlib.suppress(Exception):
                 reader = getattr(instance, "program_status", None)
@@ -1567,13 +1623,26 @@ class SessionResourceRegistry:
                     if record_activity
                     else "pane_activity",
                 )
-            # Pane repaints can be startup output, not a new agent turn.
-            if not explicit_activity:
-                self._set_session_status_memo(session_id, status, record_activity=False)
-            if status == "failed":
-                status_publisher(session_id, status, blocked_on)
+            if status == "failed" or replay_activity_epoch is not None:
+                _publish_status_if_current(status, blocked_on, failure_detail)
             else:
-                loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
+                loop.call_soon_threadsafe(_publish_status_if_current, status, blocked_on, None)
+
+        def _publish_replayed_status(status: str, blocked_on: str | None) -> None:
+            if status_poller is None:
+                return
+            observation_version = status_poller.observation_version
+            epoch = self.session_activity_epoch(session_id)
+
+            def publish() -> None:
+                # Compare and publish on the loop, without yielding to a newer turn.
+                if status_poller.observation_version != observation_version:
+                    return
+                _publish_status(
+                    status, blocked_on, record_activity=True, replay_activity_epoch=epoch
+                )
+
+            loop.call_soon_threadsafe(publish)
 
         def _structured_status_active() -> bool:
             # Explicit Claude state owns the indicator; pane changes still drive
@@ -1589,6 +1658,10 @@ class SessionResourceRegistry:
                 on_status=lambda status, blocked_on=None: _publish_status(
                     status, blocked_on, record_activity=True
                 ),
+                on_replay=_publish_replayed_status,
+                on_failure=lambda detail: _publish_status(
+                    "failed", record_activity=True, failure_detail=detail
+                ),
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
@@ -1602,8 +1675,12 @@ class SessionResourceRegistry:
 
         def _on_tick() -> None:
             nonlocal native_input_ready
+            if not _owns_terminal():
+                return
             if status_poller is not None:
                 status_poller.tick()
+                if not _owns_terminal():
+                    return
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
                 try:
                     from omnigent.harnesses.claude_native.bridge import (
@@ -1646,6 +1723,8 @@ class SessionResourceRegistry:
                         )
 
         def _on_activity() -> None:
+            if not _owns_terminal():
+                return
             with contextlib.suppress(Exception):
                 instance.lifecycle_trace.note_activity()
             # Runs on the watcher daemon thread; hop to the loop so the
@@ -1664,7 +1743,7 @@ class SessionResourceRegistry:
                     or now - previous >= _TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS
                 ):
                     last_activity_emit["value"] = now
-                    loop.call_soon_threadsafe(activity_publisher, session_id, resource_id)
+                    loop.call_soon_threadsafe(_publish_activity)
             # Pane changed → the agent is working. Coalesce to the
             # idle→running edge so a continuously-redrawing pane doesn't
             # re-emit ``running`` every poll. Skipped once the status file owns
@@ -1691,6 +1770,7 @@ class SessionResourceRegistry:
                         session_key=session_key,
                         lifecycle=lifecycle,
                         instance=instance,
+                        resource_role=resource_role,
                         reached_input_ready=(
                             native_input_ready if input_ready_probe is not None else None
                         ),
@@ -1771,6 +1851,8 @@ class SessionResourceRegistry:
         session_id: str,
         instance: TerminalInstance,
         on_status: Callable[[str, str | None], None],
+        on_failure: Callable[[str], None],
+        on_replay: Callable[[str, str | None], None],
     ) -> SessionStatusPoller | ClaudeProgramStatusPoller:
         """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity."""
         from omnigent.harnesses.claude_native.bridge import (
@@ -1794,6 +1876,7 @@ class SessionResourceRegistry:
         reader = getattr(instance, "program_status", None)
         fallback = SessionStatusPoller(
             on_status=on_status,
+            on_replay=on_replay,
             pane_pid_getter=(
                 (lambda: reader.child_pid) if reader is not None else instance.pane_pid_sync
             ),
@@ -1807,11 +1890,13 @@ class SessionResourceRegistry:
                 reader,
                 fallback,
                 on_status,
+                on_replay=on_replay,
                 omnigent_session_id=session_id,
                 terminal_instance_id=instance.diagnostic_id,
                 terminal_launch_id=instance.lifecycle_trace.launch_id,
                 turn_is_active=lambda: self.session_turn_is_active(session_id),
                 turn_activity_epoch=lambda: self.session_activity_epoch(session_id),
+                on_failure=on_failure,
             )
         return fallback
 
@@ -1823,6 +1908,7 @@ class SessionResourceRegistry:
         session_key: str,
         lifecycle: TerminalLifecycle,
         instance: TerminalInstance | None = None,
+        resource_role: str | None = None,
         reached_input_ready: bool | None = None,
     ) -> None:
         """Clean up and publish lifecycle events for an unexpected terminal exit.
@@ -1832,8 +1918,16 @@ class SessionResourceRegistry:
         """
         terminal_id = terminal_resource_id(terminal_name, session_key)
         with self._lock:
-            observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
-            observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
+            current = (
+                self._terminal_registry.get(session_id, terminal_name, session_key)
+                if self._terminal_registry is not None
+                else None
+            )
+            if instance is not None and current is not None and current is not instance:
+                observed, observed_role = lifecycle, resource_role
+            else:
+                observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
+                observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
         if observed is None:
             return
         if observed != lifecycle:

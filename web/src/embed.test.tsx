@@ -109,6 +109,13 @@ describe("macOS Electron embed", () => {
       expect(scope.querySelector(`.${className}`)!.matches(selector), className).toBe(expected);
     }
 
+    let smoothingSelector = "";
+    css.walkDecls("-webkit-font-smoothing", (declaration) => {
+      smoothingSelector = (declaration.parent as Rule).selector;
+    });
+    expect(smoothingSelector).not.toBe("");
+    expect(scope.matches(smoothingSelector)).toBe(expected);
+
     const controlsSelector = selectorFor(":is(");
     expect(controlsSelector).not.toContain(":has(");
     expect(getByRole("button", { name: "Header action" }).matches(controlsSelector)).toBe(expected);
@@ -229,4 +236,30 @@ describe("embedded theme selection", () => {
     expect(getEmbedRoot()).not.toHaveClass("dark");
     expect(setColorScheme).toHaveBeenLastCalledWith("system");
   });
+});
+
+describe("mobile app embed target scope", () => {
+  it.each(["ios", "android", "electron", "browser"])(
+    "contains portaled controls without marking the host in %s",
+    (kind) => {
+      vi.stubGlobal("omnigentNative", kind === "ios" || kind === "android" ? { kind } : undefined);
+      vi.stubGlobal("omnigentDesktop", kind === "electron" ? { kind } : undefined);
+      const { getByRole } = render(
+        <MemoryRouter>
+          <OmnigentApp fetcher={fetcher} />
+        </MemoryRouter>,
+      );
+      const root = getEmbedRoot()!;
+      render(createPortal(<button type="button">Portaled choice</button>, root));
+      const expected = kind === "ios" || kind === "android";
+      expect(
+        getByRole("button", { name: "Portaled choice" }).closest('[data-mobile-app="true"]') !==
+          null,
+      ).toBe(expected);
+      expect(
+        getByRole("button", { name: "Header action" }).closest('[data-mobile-app="true"]') !== null,
+      ).toBe(expected);
+      expect(document.documentElement).not.toHaveAttribute("data-mobile-app");
+    },
+  );
 });

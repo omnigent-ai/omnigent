@@ -29,6 +29,8 @@ implements them separately, so a fix for one harness does not reach the others.
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
+- `gateway-attribution`: Unity Gateway requests name the coding agent and the
+  interface that created its session: desktop app, web UI, mobile, or CLI.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
   repair conflicting defaults, and keep the connection across tool turns.
 - `needs-auth`: a harness without usable credentials is shown as needing
@@ -70,7 +72,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `smart-routing`: Pi applies the chosen route before inference from the
   composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
-  the answer reaches the harness.
+  the answer reaches the harness. Shared relay calls exclude their own human
+  approval waits from the five-minute execution budget. A pending approval
+  stays pending past five minutes; rejection or expiry does not run the tool.
+  Cancellation or a disconnected caller releases that call's pending approval.
 - `devin-questions`: Devin's native question picker appears in Chat and Inbox;
   selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
@@ -138,6 +143,15 @@ implements them separately, so a fix for one harness does not reach the others.
 **Web:** start a new session, choose the harness in the harness picker, open its
 configuration for model and effort, and send. Approval cards and the Terminal
 view appear in the session.
+
+**Gateway attribution:** start a fresh Claude Code or Codex session from the
+desktop app, browser, iOS/Android app, and CLI. The session keeps that creating
+interface across resumes; backend children inherit it, and a fork records the
+interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Agent`
+(`claude-code` or `codex`) and `Databricks-Custom-Client-Surfaces`: `omnigent-desktop`,
+`omnigent-web`, `omnigent-mobile`, or `omnigent-cli`. Sessions with no known
+creating interface use `omnigent` as a fallback.
+Routes configured by ug retain the additional `ug` surface.
 
 **Agent instructions (Pi native):** launch an agent whose spec contains inline
 instructions or references a bundled instruction file. Reopen its terminal and
@@ -228,6 +242,17 @@ only when the server enables the `import_review` release feature.
 Settings. Activate either the credential card or its Reconfigure affordance;
 both open the same repair flow.
 
+**Native tmux repair:** use a host whose tmux is missing, older than 3.3, or
+prints no readable version. Ready native harnesses then show **needs tmux** in
+the New Chat picker and Settings → Harnesses (CLI install, update and sign-in
+problems still show first). Open **Set up tmux** in Settings, or the picker's
+setup action, to reach the tmux step: copy `brew install tmux` (on Linux, use
+the package manager), then press **Check again**. Without Check again, the host
+picks tmux up on its next periodic readiness refresh, about a minute later.
+The desktop app keeps the PATH it started with, so if tmux went into a new PATH
+directory, quit and reopen the app. Signing in or saving a credential on a host
+without tmux continues to the same tmux step.
+
 **Harness account sign-in and switching:** Settings → Harnesses → Codex or
 Claude. Use **Sign in again** on an expired Codex card, or open the configured
 harness and choose **Switch account**. For Codex, open or copy the HTTPS device
@@ -269,7 +294,7 @@ columns name one journey test per harness; "—" means none exists yet.
 | `hermes-native` | `omnigent hermes` | no | tests/e2e_ui/messages/test_native_hermes_render_parity.py::test_native_hermes_message_render_parity | tests/e2e/test_hermes_native_policy_hook_path_e2e.py::test_hermes_native_policy_hook_path_lets_the_tool_run | — |
 | `kimi-native` | `omnigent kimi` | no | — | tests/e2e/test_kimi_native_steering_e2e.py::test_midturn_steer_is_applied_not_queued | — |
 | `kiro-native` | `omnigent kiro` | no | tests/e2e_ui/messages/test_native_kiro_render_parity.py::test_native_kiro_message_render_parity | tests/e2e/test_kiro_native_cli_e2e.py::test_kiro_native_cli_smoke | — |
-| `opencode-native` | `omnigent opencode` | no | — | tests/e2e/test_opencode_native_startup_cancel_leak_e2e.py::test_opencode_native_startup_cancel_reaps_serve | — |
+| `opencode-native` | `omnigent opencode` | no | — | tests/e2e/test_host_opencode_native_mock_e2e.py::test_reply_reaches_the_bound_mock_and_renders_once | — |
 | `pi-native` | `omnigent pi` | no | — | tests/e2e/test_pi_native_send_now_steer_e2e.py::test_pi_native_send_now_steers_into_active_turn | [pi-native-e2e-dev](../.claude/skills/pi-native-e2e-dev/SKILL.md) |
 | `qwen-native` | `omnigent qwen` | no | — | tests/e2e/test_qwen_native_subagent_wake_e2e.py::test_qwen_native_subagent_completion_wakes_parent | — |
 
@@ -305,6 +330,23 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"
 ```
 
+**`gateway-attribution` (own environment):** run
+`uv run --no-sync pytest tests/e2e/test_gateway_attribution_headers_e2e.py --reruns 0 -v`.
+The recorder requires real CLIs, uses synthetic credentials and scripted local
+model responses, and checks one copy of each header on actual prompt requests.
+It covers Codex and native Claude Code for desktop, web, iOS, Android and CLI
+launch metadata, plus Claude SDK and the Pi/OpenCode writers. Missing binaries
+or machine policy that would redirect requests are explicit skips. On Linux,
+use a disposable mount namespace with empty `/etc/codex` and `/etc/claude-code`
+to test ordinary configuration without changing the host's mandatory policy.
+Claude mandatory settings can still replace its header block or destination;
+that policy case requires gateway support for `x-client-app: omnigent` or a
+managed-policy update. Source persistence and launch isolation are checked by
+`tests/server/routes/test_sessions_crud.py::test_creating_client_surface_survives_create_child_and_fork`,
+`tests/runner/test_app_sessions_native_workflow_init.py::test_create_session_envelope_is_single_flight_and_skips_metadata_callbacks`,
+and `tests/runner/test_resource_registry.py::test_terminal_resource_role_is_private_and_cleared_on_close`.
+These process/configuration checks do not launch the desktop or mobile shells.
+
 **Pi Smart Routing (own environment):**
 `tests/e2e/test_pi_native_smart_routing.py::test_pi_native_smart_routing_applies_pick`
 starts the real CLI/server/runner/Pi with scripted routing and model replies.
@@ -314,6 +356,18 @@ Each composer/TUI prompt must appear exactly once in persisted user history.
 Run with a real Pi CLI on PATH and retries disabled. Composer API evidence
 does not cover browser clicks; scripted routing does not establish live judge
 quality. Broader Smart Routing journeys remain outside this Pi-specific recipe.
+
+**Claude subscription authentication (`launch-cli`, `launch-web`):** with a
+valid Claude login and an explicit subscription provider, start `omnigent claude`
+and a new Claude session from the web picker. Even when the host inherits
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, `/status` should show the login.
+Restart existing hosts and terminals to pick up the change. Claude-configured
+gateways and cloud transports continue to own their authentication.
+`tests/harnesses/claude_native/test_claude_native.py::test_resolve_native_claude_config_subscription_uses_cli_login`
+checks CLI child-process credentials;
+`tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_claude_terminal_subscription_ignores_inherited_api_credentials`
+checks the hosted launch specification. These use synthetic credentials and do
+not prove live sign-in or artifact publishing.
 
 **Launch settings (own environment):** connect a host with Claude/Codex
 configured, and put a command and two args under
@@ -804,6 +858,16 @@ Cross-harness journeys:
   retain their endpoint; history, model, effort and permissions survive.
   `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_resumes_with_launch_provider`
   covers the CLI resume call site with configured and unpinned launches.
+  A machine-managed provider (`/etc/codex/managed_config.toml`) outranks the
+  launch's provider, and Codex 0.166+ refuses the resume with
+  `modelProviderMismatch`; the same test and
+  `tests/runner/test_app_sessions_native_wake_forwarders.py::test_auto_create_codex_terminal_retries_refused_resume_on_same_thread`
+  check the rollout restamp and retry under Codex's provider. Fresh launches
+  read Codex's effective provider at app-server start and hand it to the TUI,
+  whose thread Codex would otherwise refuse to run;
+  `tests/harnesses/codex_native/app_server/test_startup.py::test_start_pins_the_terminal_to_codex_effective_model_provider`
+  covers that. A real managed host check needs a private mount namespace for
+  `/etc/codex`.
 - **`resume`, Codex `/new` followed by Stop session and a new message:**
   `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
   (own environment, real server, host, runner, Codex and tmux; local model replies)
@@ -930,17 +994,37 @@ Cross-harness journeys:
   interrupts through the runner's real event route, and the next idle settles
   a sub-agent dispatch as cancelled with its output.
   `tests/runner/test_native_interrupt_runner.py::test_opencode_interrupt_fallbacks`
-  covers missing native session state and a failed abort. Neither runs
-  OpenCode. With the CLI on `PATH`,
-  `tests/e2e/test_opencode_native_wire_contract_e2e.py::test_opencode_native_wire_contract_against_real_server`
-  (opt-in `OMNIGENT_E2E_OPENCODE_NATIVE=1`) checks the abort call against a
-  real server, and the matrix test covers cancelling during startup. No test
-  interrupts a running OpenCode turn: configure an OpenAI-compatible loopback
-  provider that holds the reply open, interrupt once the request arrives, then
-  confirm the session goes idle without turning busy again, a reply released
-  afterwards never appears, and a follow-up in the same session completes. The
-  harness bench does not register opencode-native, so its interrupt probe does
-  not apply.
+  covers missing native session state and a failed interrupt. Neither runs
+  OpenCode. With OpenCode 2.0.x on `PATH`,
+  `tests/e2e/test_host_opencode_native_mock_e2e.py::test_interrupt_settles_a_held_reply_and_the_next_turn_works`
+  interrupts a running turn while the scripted model holds its reply, checks
+  the session stays idle and the released reply never appears, then completes
+  a follow-up. The harness bench does not register opencode-native, so its
+  interrupt probe does not apply.
+- **opencode-native journeys (own environment, scripted model):** needs
+  `@opencode/cli` 2.0.18–2.0.x and tmux on `PATH`, in e2e mock mode:
+  `uv run --no-sync pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v`.
+  An isolated host binds `opencode-native` to a chat-wire provider on the mock
+  model server, so each test scripts its replies and checks the request the
+  mock received: reply and routing (`launch-web`), shell approval allow with the
+  tool output in the next request and deny (`approvals`), interrupt, model
+  switch (`model-and-effort`), fork, and `/compact`. For `cleanup`,
+  `tests/e2e/test_opencode_native_startup_cancel_leak_e2e.py::test_opencode_native_startup_cancel_reaps_serve`
+  (Linux only) cancels a session during startup and checks its `opencode serve`
+  is reaped. CI runs these, the wire-contract test and the OpenCode import e2e in
+  the `E2E Harness (opencode)` job, which installs the pinned CLI and sets
+  `OMNIGENT_E2E_OPENCODE_REQUIRED=1` so a missing or unsupported CLI fails rather
+  than skips; the sharded E2E lane skips them. The wire-contract test,
+  `tests/e2e/test_opencode_native_wire_contract_e2e.py::test_opencode_native_wire_contract_against_real_server`,
+  checks the API contract without credentials. Live-model checks remain opt-in
+  (`OMNIGENT_E2E_OPENCODE_NATIVE=1`): `tests/e2e/test_host_opencode_native_e2e.py`
+  on OpenCode's free model for multi-delta streaming and import from the user's
+  store. The browser question form
+  (`interactive-input`) is
+  `tests/e2e_ui/approvals/test_opencode_question.py::test_opencode_question_round_trips_through_web`,
+  which feeds the forwarder a form event without running OpenCode. Not covered
+  by any of these: catch-up after the server's event stream drops (component
+  tests replay captured events), images, and steering into a running turn.
 - **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
   `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
   a web message through the public bridge into a real retained dead tmux pane.
@@ -1079,7 +1163,42 @@ local files are reused unchanged. For Gemini, fork tool-containing history and
 send a follow-up; expect no empty `function_response.name` error. These automated
 checks do not prove live providers, browser rendering or thought-signature parity.
 
+For the shared native tool relay's approval deadline, run
+`tests/harnesses/claude_native/test_claude_native_bridge.py::test_relay_approval_outlives_execution_and_http_timeouts`
+and `::test_relay_mcp_cancellation_releases_pending_approval`. These use the real
+HTTP relay and stdio helper with a harmless callback and short test deadlines;
+they do not launch a vendor CLI. The same module checks concurrent calls,
+approval expiry, and uncertain completion after a write. Execution-budget
+accounting is covered by `tests/runtime/test_tool_call_deadline.py`.
+
+For a human check in an isolated instance, use a native session in Chat to ask
+for an automation named "Approval deadline check" with harmless instructions
+and a first run well after the test. Leave its create approval pending for
+more than five minutes:
+the agent must not report a tool failure or claim creation, and the automation
+must not exist yet. Approve and confirm exactly one automation appears.
+Repeat with Reject and with cancelling the turn: no automation should appear,
+and cancelled approvals must no longer be actionable. Repeat the request from
+the native terminal and answer the same approval in Chat or Inbox. Remove the
+throwaway automation afterward. The 30-second save-request timeout is unchanged.
+
+The native client's own deadline must exceed the wait being tested. Codex 0.166.0
+has a separate 300-second MCP deadline that does not extend with relay progress.
+For a bounded before/after demo, set the isolated instance's
+`harness.codex-native.app_server` command to `codex` and its args to
+`["-c", "mcp_servers.omnigent.tool_timeout_sec=600"]`, then leave approval pending
+for 345 seconds. A TUI-only launch argument does not configure the separate
+app-server's MCP client. This isolates the relay's unchanged 300-second execution
+budget; it does not prove the default client can wait for a full approval day.
+With the default client deadline, cancellation must clear the approval without
+creating the automation. Record the client configuration with the evidence.
+
 ## Gotchas
+
+- Relay approval waits retain one pending request slot. Vendor clients that do not
+  honor MCP progress notifications can still impose their own shorter deadline;
+  the relay cancels its pending approval when the client disconnects. A timeout
+  after execution starts has an unknown outcome and cannot undo a committed write.
 
 - For user/project defaults and startup-argument precedence, use
   [Preferences and config defaults](./preferences.md). The read-only Startup
@@ -1115,6 +1234,13 @@ checks do not prove live providers, browser rendering or thought-signature parit
   above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.
-- OpenCode accepts an abort even when nothing is running, so an accepted
-  interrupt does not prove a turn was stopped. Check the session state and the
-  model request instead.
+- OpenCode answers an interrupt even when nothing is running, and Stop returns
+  success either way, so an accepted interrupt does not prove a turn was
+  stopped. Check the session state and the model request instead.
+- OpenCode's scripted journeys bind the harness to the mock in their own
+  host's config. Do not add that binding to the shared verification instance:
+  any inference binding changes how the runner builds every harness's spec,
+  so Claude and Codex runs there would no longer match production defaults.
+- Script OpenCode replies to require the turn's tools, as the mock suite does.
+  A tool-less request to the same model (for example a session title) could
+  otherwise consume the turn's reply.
