@@ -37,6 +37,15 @@ describe.each([false, true])("createStoredBooleanPreference defaulting to %s", (
     expect(preference.read()).toBe(defaultValue);
   });
 
+  it("keeps the stored value when removing it fails", () => {
+    localStorage.setItem(STORAGE_KEY, String(otherValue));
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("access denied");
+    });
+    expect(() => preference.write(defaultValue)).not.toThrow();
+    expect(preference.read()).toBe(otherValue);
+  });
+
   it("updates mounted readers on a local write and on another window's write", () => {
     const { result } = renderHook(() => preference.use());
     expect(result.current).toBe(defaultValue);

@@ -1075,7 +1075,11 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/lib/settingsPortability.test.ts` (export/import). By hand: create a
   project (`POST /v1/projects`), file six or more sessions into it with
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
-  orders them, then expand the folder and click Show more.
+  orders them, then expand the folder and click Show more. For the switch, file
+  more than 20 sessions (one server page) and turn it off: the open folder lists
+  every loaded session with no Show more, and scrolling to its end loads the next
+  page. After three automatic loads (the default budget) it shows Load more.
+  Turn the switch back on for five rows plus Show more.
 
 For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and

@@ -2292,8 +2292,8 @@ function ConversationList({
   ]);
 
   const config = useContext(SidebarConfigContext);
-  // Read here, not in ProjectFolder: React drops a store subscriber's snapshot
-  // update when that render also resets state (the folder's page window).
+  // Read here, not in ProjectFolder: in React 18, a store change whose render also
+  // resets state (the folder's page window) leaves the next change unnoticed.
   const projectFolderPaginated = useProjectFolderPagination();
   // Shared renders above Sessions, so the display window pages through both in that order.
   const listRows = useMemo(
