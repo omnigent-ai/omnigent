@@ -7,6 +7,9 @@ description: >-
   after this action returns — the only secret here is the model key.
 
 inputs:
+  pipeline:
+    description: Stable identity of the calling model workflow.
+    required: true
   model:
     description: Provider-configured model id.
     required: true
@@ -70,7 +73,9 @@ runs:
 
     - name: Write Omnigent provider config
       shell: bash
+      working-directory: ${{ inputs.workdir }}
       env:
+        OMNIGENT_CI_PIPELINE: ${{ inputs.pipeline }}
         GATEWAY_BASE_URL: ${{ inputs.gateway-base-url }}
         OMNIGENT_AGENT_MODEL: ${{ inputs.model }}
       run: |
@@ -79,11 +84,14 @@ runs:
         mkdir -p "$HOME/.omnigent"
         python3 -c "
         import pathlib, os, json
+        from omnigent.databricks_ai_gateway import ci_gateway_base_url, ci_request_tags
+        if not ci_request_tags(strict=True).get('pipeline'):
+            raise ValueError('pipeline input is required')
         gw = os.environ['GATEWAY_BASE_URL']
         cfg = {'providers': {'databricks-gateway': {
             'kind': 'gateway', 'default': ['anthropic'],
             'anthropic': {
-                'base_url': gw + '/anthropic',
+                'base_url': ci_gateway_base_url(gw, 'anthropic'),
                 'api_key_ref': 'env:LLM_API_KEY',
                 'models': {'default': os.environ['OMNIGENT_AGENT_MODEL']},
             }}}}
@@ -93,6 +101,7 @@ runs:
     - name: Run the agent
       shell: bash
       env:
+        OMNIGENT_CI_PIPELINE: ${{ inputs.pipeline }}
         LLM_API_KEY: ${{ inputs.llm-api-key }}
         WORKDIR: ${{ inputs.workdir }}
         AGENT: ${{ inputs.agent }}

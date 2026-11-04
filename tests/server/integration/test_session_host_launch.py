@@ -35,6 +35,7 @@ from fastapi import FastAPI
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.entities import Conversation
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -56,6 +57,7 @@ from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.scheduled_context import scheduled_run_scope
 from omnigent.server.app import create_app
 from omnigent.server.host_registry import HostConnection
 from omnigent.server.routes._host_launch import (
@@ -2128,11 +2130,13 @@ def _runner_client_wait_events(caplog: pytest.LogCaptureFixture) -> list[logging
     return [r for r in caplog.records if r.__dict__.get("event_name") == "runner_client_wait"]
 
 
+@pytest.mark.parametrize("replace_host_during_launch", [False, True])
 async def test_message_relaunch_resolves_runner_client_that_misses_after_connect(
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    replace_host_during_launch: bool,
 ) -> None:
     """A relaunched runner that connected is used even when its first lookups miss.
 
@@ -2145,6 +2149,7 @@ async def test_message_relaunch_resolves_runner_client_that_misses_after_connect
     """
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
+    from tests._helpers.polling import poll_until_async
 
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
     monkeypatch.setattr(sessions_module, "_RUNNER_CLIENT_RESOLVE_RETRY_S", 0.05)
@@ -2154,10 +2159,31 @@ async def test_message_relaunch_resolves_runner_client_that_misses_after_connect
     session = await _inline_launch_session(client, comm)
     session_id = session["id"]
     forwarded: list[str] = []
+    forwarded_events: list[dict[str, Any]] = []
+    host_replaced = asyncio.Event()
+    real_admit = app.state.host_registry.admit_launch
+    admissions: list[HostConnection] = []
+
+    async def reconnect_after_admission(conn: HostConnection, sid: str) -> None:
+        nonlocal comm
+        await real_admit(conn, sid)
+        admissions.append(conn)
+        if len(admissions) == 1:
+            comm = await _connect_host(app)
+            await poll_until_async(
+                lambda: app.state.host_registry.get(_HOST_ID) is not conn,
+                timeout_s=budget(5.0),
+            )
+            host_replaced.set()
+
+    if replace_host_during_launch:
+        monkeypatch.setattr(app.state.host_registry, "admit_launch", reconnect_after_admission)
 
     def _runner_request(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             forwarded.append(request.url.path)
+        if request.url.path.endswith("/events"):
+            forwarded_events.append(json.loads(request.content))
         return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
 
     fake_runner = httpx.AsyncClient(
@@ -2178,6 +2204,8 @@ async def test_message_relaunch_resolves_runner_client_that_misses_after_connect
     set_runner_client(None)
     post = asyncio.create_task(_post_hello(client, session_id))
     try:
+        if replace_host_during_launch:
+            await asyncio.wait_for(host_replaced.wait(), timeout=budget(5.0))
         launch = await _serve_one_launch(comm, launch_status="launched")
         runner_id = token_bound_runner_id(launch.binding_token)
         relaunched.append(runner_id)
@@ -2192,6 +2220,10 @@ async def test_message_relaunch_resolves_runner_client_that_misses_after_connect
     assert response.status_code == 202, response.text
     assert lookups_after_connect == 3
     assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
+    assert forwarded_events[0]["content"] == [{"type": "input_text", "text": "hello"}]
+    if replace_host_during_launch:
+        assert len(admissions) == 2 and admissions[0] is not admissions[1]
+        assert not await _expect_no_launch(comm, budget_s=budget(0.2))
     [event] = _runner_client_wait_events(caplog)
     assert (event.attributes["outcome"], event.attributes["attempts"]) == ("resolved", 3)
 
@@ -2553,11 +2585,13 @@ async def test_host_reports_runner_unknown_skips_connect_grace(
     assert launch_frame.binding_token, "relaunch frame should carry a fresh binding token"
 
 
+@pytest.mark.parametrize("scheduled", [False, True], ids=["interactive", "scheduled"])
 async def test_host_session_message_relaunches_offline_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    scheduled: bool,
 ) -> None:
     """A message to a host session whose runner is offline (but NOT
     deliberately stopped) asks the host to launch a fresh runner.
@@ -2589,19 +2623,33 @@ async def test_host_session_message_relaunches_offline_runner(
 
     # Runner offline (no runner client resolves) and the session was never
     # stopped: the message path must take the host-relaunch branch.
-    set_runner_client(None)
-    post_task = asyncio.create_task(
-        client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                },
-            },
+    occurrence = (
+        ScheduledRunLogContext(
+            task_id="task",
+            run_id="run",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            trigger_key="cron:1000",
+            target="connected_host",
+            session_mode="continue",
         )
+        if scheduled
+        else None
     )
+    set_runner_client(None)
+    with scheduled_run_scope(occurrence):
+        post_task = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    },
+                },
+            )
+        )
     try:
         # The launch frame is sent (and the runner_id rotated) before the
         # route's 30s wait-for-runner loop, so a small budget suffices;
@@ -2621,6 +2669,7 @@ async def test_host_session_message_relaunches_offline_runner(
         "trigger host.launch_runner so the host can re-spawn a runner; none "
         "arrived — the relaunch branch in post_event did not fire"
     )
+    assert launch_frame.scheduled_run == occurrence
     # Relaunch forwards the session's canonical workspace (not garbage),
     # proving it read the persisted workspace off the conversation row.
     assert launch_frame.workspace == _WORKSPACE, (
@@ -4152,11 +4201,15 @@ async def test_relaunch_stops_the_superseded_runner(
     )
 
 
+@pytest.mark.parametrize(
+    "snapshot_after_rotation", [False, True], ids=["old-binding", "new-binding"]
+)
 async def test_concurrent_relaunches_are_single_flight(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    snapshot_after_rotation: bool,
 ) -> None:
     """Two racing messages to an offline-runner session launch ONE runner.
 
@@ -4188,11 +4241,11 @@ async def test_concurrent_relaunches_are_single_flight(
         observed_bindings.append(args[0].runner_id)
         if len(observed_bindings) == 2:
             both_callers_ready.set()
-        await both_callers_ready.wait()
+        if not snapshot_after_rotation:
+            await both_callers_ready.wait()
         return await launch_runner(*args, **kwargs)
 
-    # Both requests must snapshot the offline binding before either rotates it.
-    # With startup grace disabled, a later snapshot would request another launch.
+    # Race both old snapshots, or let the second caller read the in-flight binding.
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _race_launch)
 
     def _post() -> Any:
@@ -4207,11 +4260,14 @@ async def test_concurrent_relaunches_are_single_flight(
             },
         )
 
-    tasks = [asyncio.create_task(_post()), asyncio.create_task(_post())]
+    tasks = [asyncio.create_task(_post())]
+    if not snapshot_after_rotation:
+        tasks.append(asyncio.create_task(_post()))
     launches: list[HostLaunchRunnerFrame] = []
     try:
-        await asyncio.wait_for(both_callers_ready.wait(), timeout=10.0)
-        assert observed_bindings == [session["runner_id"], session["runner_id"]]
+        if not snapshot_after_rotation:
+            await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+            assert observed_bindings == [session["runner_id"], session["runner_id"]]
         # Collect every frame the host sees inside a bounded window; a
         # second launch frame (the double-spawn) would arrive well within
         # it since both requests are already in flight.
@@ -4224,6 +4280,13 @@ async def test_concurrent_relaunches_are_single_flight(
                 frame = decode_host_frame(output["text"])
                 if isinstance(frame, HostLaunchRunnerFrame):
                     launches.append(frame)
+                    if snapshot_after_rotation and len(launches) == 1:
+                        tasks.append(asyncio.create_task(_post()))
+                        await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+                        assert observed_bindings == [
+                            session["runner_id"],
+                            token_bound_runner_id(frame.binding_token),
+                        ]
                     # Answer "launched" so the first flight's result wait
                     # returns and releases the relaunch lock — the second
                     # flight must then SHORT-CIRCUIT on the rotated binding
@@ -4278,6 +4341,113 @@ async def test_concurrent_relaunches_are_single_flight(
         f"concurrent relaunches must leave exactly one workspace-recreated notice; "
         f"got {len(recreated)}"
     )
+
+
+@pytest.mark.parametrize(
+    "scenario", ["replaced", "gone", "denied", "replaced_again", "ack_timeout", "cancelled"]
+)
+async def test_relaunch_recovers_only_a_rejected_enqueue(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """A replacement gets one identical launch, only before enqueue succeeds."""
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    store.set_host_id(conv.id, _HOST_ID, workspace=_WORKSPACE)
+    conv = store.get_conversation(conv.id)
+    assert conv is not None
+    registry = HostRegistry()
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
+    registry.launch_authorizer = host_store.admit_launch
+    hello = HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+    original = registry.register(_HOST_ID, _NoopRunnerWS(), hello, owner=None)
+    connections = [original]
+    admissions: list[HostConnection] = []
+    attempted_frames: list[str] = []
+    accepted_frames: list[HostLaunchRunnerFrame] = []
+    pending_futures: list[asyncio.Future[Any]] = []
+    real_admit = registry.admit_launch
+    real_send = registry.send_text
+    real_replace = store.replace_runner_id
+    bound_runner_ids: list[str] = []
+
+    def record_binding(session_id: str, runner_id: str) -> Conversation:
+        bound_runner_ids.append(runner_id)
+        return real_replace(session_id, runner_id)
+
+    async def replace_during_admission(conn: HostConnection, session_id: str) -> None:
+        admissions.append(conn)
+        await real_admit(conn, session_id)
+        if len(admissions) == 1:
+            if scenario == "gone":
+                registry.deregister(_HOST_ID, conn=original)
+            else:
+                connections.append(
+                    registry.register(
+                        _HOST_ID,
+                        _NoopRunnerWS(),
+                        hello,
+                        owner="different-owner@example.test" if scenario == "denied" else None,
+                    )
+                )
+        elif scenario == "replaced_again":
+            connections.append(registry.register(_HOST_ID, _NoopRunnerWS(), hello, owner=None))
+
+    def send_and_acknowledge(conn: HostConnection, payload: str) -> None:
+        frame = decode_host_frame(payload)
+        assert isinstance(frame, HostLaunchRunnerFrame)
+        attempted_frames.append(payload)
+        pending_futures.append(conn.pending_launches[frame.request_id])
+        real_send(conn, payload)
+        accepted_frames.append(frame)
+        if scenario == "cancelled":
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+        elif scenario != "ack_timeout":
+            conn.pending_launches.pop(frame.request_id).set_result(
+                {"status": "launched", "runner_id": token_bound_runner_id(frame.binding_token)}
+            )
+
+    monkeypatch.setattr(store, "replace_runner_id", record_binding)
+    monkeypatch.setattr(registry, "admit_launch", replace_during_admission)
+    monkeypatch.setattr(registry, "send_text", send_and_acknowledge)
+    monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.01)
+
+    async def launch() -> Any:
+        return await sessions_module._launch_runner_on_host(conv, store, registry, original)
+
+    if scenario == "denied":
+        with pytest.raises(OmnigentError) as rejected:
+            await launch()
+        assert rejected.value.code == ErrorCode.UNAUTHORIZED
+    elif scenario == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.create_task(launch())
+    else:
+        attempt = await launch()
+        assert attempt.acknowledged is (scenario == "replaced")
+        assert attempt.runner_id == bound_runner_ids[0]
+
+    assert len(bound_runner_ids) == 1
+    assert store.get_conversation(conv.id).runner_id == bound_runner_ids[0]
+    expected_attempts = 1 if scenario in ("gone", "denied") else 2
+    assert len(attempted_frames) == expected_attempts
+    assert len(set(attempted_frames)) == 1
+    assert len(admissions) == (1 if scenario == "gone" else 2)
+    assert admissions == connections[: len(admissions)]
+    assert len(accepted_frames) == (scenario in ("replaced", "ack_timeout", "cancelled"))
+    if accepted_frames:
+        assert token_bound_runner_id(accepted_frames[0].binding_token) == bound_runner_ids[0]
+        assert accepted_frames[0].workspace == _WORKSPACE
+        assert accepted_frames[0].session_id == conv.id
+    assert all(not conn.pending_launches for conn in connections)
+    assert all(future.done() for future in pending_futures)
 
 
 async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
