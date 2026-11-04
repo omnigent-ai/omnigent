@@ -1463,9 +1463,14 @@ def register_events_routes(
                 or (body.type == _SLASH_COMMAND_TYPE and body.data.get("kind") == "skill")
             )
         )
-        if startup_input and not peer_message and conv.labels.get(STARTUP_LABEL) == "failed":
+        if (
+            startup_input
+            and not peer_message
+            and body.replaces_failed_inputs
+            and conv.labels.get(STARTUP_LABEL) == "failed"
+        ):
             # The sender resends what the failed launch handed back to their composer.
-            await startup.discard_failed(session_id, user_id)
+            await startup.discard_failed(session_id, user_id, set(body.replaces_failed_inputs))
         if startup_input and await startup.accepts(conv, request.app):
             if peer_message:
                 await asyncio.to_thread(

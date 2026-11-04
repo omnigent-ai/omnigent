@@ -797,8 +797,8 @@ describe("ErrorBanner", () => {
     );
     render(
       <ErrorBanner
-        message="Messages sent while the session was starting weren't delivered."
-        title="Couldn't return your unsent messages"
+        message="If you sent messages while the session was starting, they weren't delivered."
+        title="Couldn't check for your unsent messages"
         source="client"
         code={STARTUP_INPUT_LOOKUP_FAILED_CODE}
         onRetry={onRetry}
@@ -812,7 +812,7 @@ describe("ErrorBanner", () => {
 
     await act(async () => rejectRetry?.(new Error("Server unavailable")));
     expect(screen.getByTestId("error-headline")).toHaveTextContent(
-      "Couldn't return your unsent messages",
+      "Couldn't check for your unsent messages",
     );
     expect(screen.getByRole("status")).toHaveTextContent("Retry failed: Server unavailable");
     expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();

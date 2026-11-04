@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { STARTUP_INPUT_LOOKUP_FAILED_CODE, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -484,6 +484,7 @@ describe("AssistantBubble error retry", () => {
 
   it("reads unreturned startup inputs again instead of resuming the session", async () => {
     const entry = conversationRegistry.acquire("conv_retry");
+    onTestFinished(() => conversationRegistry.release("conv_retry"));
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
         data: [
@@ -504,7 +505,6 @@ describe("AssistantBubble error retry", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/sessions/conv_retry/failed-inputs");
     expect(entry.getState().failedSendDraft).toMatchObject({ text: "explain this chart" });
-    conversationRegistry.release("conv_retry");
   });
 });
 

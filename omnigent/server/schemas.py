@@ -1400,6 +1400,10 @@ class SessionEventInput(BaseModel):
         tools are fixed at start time.
     :param created_by: Optional internal attribution actor for runner-
         originated events that are triggered by a prior human turn.
+    :param replaces_failed_inputs: Pending ids of the sender's failed
+        startup inputs that this message or skill command replaces, e.g.
+        ``["pending_<32 hex>"]``. The events route discards those inputs;
+        the ids are never forwarded or saved with the event.
     """
 
     type: str
@@ -1410,6 +1414,9 @@ class SessionEventInput(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
+    replaces_failed_inputs: (
+        list[Annotated[str, Field(pattern=r"^pending_[0-9a-f]{32}$")]] | None
+    ) = Field(default=None, max_length=1000, exclude=True)
 
     @field_validator("data")
     @classmethod

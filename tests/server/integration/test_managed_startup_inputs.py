@@ -1058,9 +1058,9 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     startup.conversations.set_labels(session_id, {STARTUP_LABEL: "pending"})
     startup_permissions.grant("bob", session_id, LEVEL_EDIT)
 
-    async def send(sender: str, text: str) -> httpx.Response:
+    async def send(sender: str, text: str, replaces: list[str] | None = None) -> httpx.Response:
         auth_client.headers["X-Forwarded-Email"] = sender
-        event = {
+        event: dict[str, Any] = {
             "type": "message",
             "data": {
                 "role": "user",
@@ -1068,6 +1068,8 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
                 "stable_id": uuid4().hex,
             },
         }
+        if replaces is not None:
+            event["replaces_failed_inputs"] = replaces
         return await auth_client.post(f"/v1/sessions/{session_id}/events", json=event)
 
     for sender, text in (("alice", "first"), ("bob", "from bob"), ("alice", "second")):
@@ -1077,6 +1079,8 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     auth_client.headers["X-Forwarded-Email"] = "alice"
     assert (await auth_client.get(url)).json() == {"data": [], "next_cursor": None}
     await startup.record_launch_failure(session_id, "sandbox never came online")
+
+    pending_ids: dict[str, str] = {}
 
     async def read_all(sender: str) -> tuple[list[str], int]:
         auth_client.headers["X-Forwarded-Email"] = sender
@@ -1091,7 +1095,11 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
             entries.extend(page["data"])
             if page["next_cursor"] is None:
                 entries.sort(key=lambda entry: entry["position"])
-                return [entry["content"][0]["text"] for entry in entries], pages
+                texts = [entry["content"][0]["text"] for entry in entries]
+                pending_ids.update(
+                    {entry["content"][0]["text"]: entry["pending_id"] for entry in entries}
+                )
+                return texts, pages
             params["after"] = page["next_cursor"]
 
     # One saved input per page, so another sender's leaves an empty page.
@@ -1100,9 +1108,20 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     for cursor in ("-1", "x", "A" * 32, "0" * 31):
         response = await auth_client.get(url, params={"after": cursor})
         assert response.status_code == 422, response.text
-    # A resend carries the handed-back text, so only the sender's inputs are
-    # dropped, even when the resend itself fails and returns to the composer.
-    response = await send("alice", "first\n\nsecond")
+    response = await send("alice", "first", replaces=["pending_first"])
+    assert response.status_code == 422, response.text
+    # A send that names no inputs, or names another sender's, leaves them to return.
+    response = await send("alice", "unrelated")
+    assert response.status_code == 503, response.text
+    response = await send("bob", "again", replaces=[pending_ids["first"], pending_ids["second"]])
+    assert response.status_code == 503, response.text
+    assert await read_all("alice") == (["first", "second"], 3)
+    # A resend names the handed-back inputs it carries, so only those are dropped,
+    # even when the resend itself fails and returns to the composer.
+    response = await send("alice", "first", replaces=[pending_ids["first"]])
+    assert response.status_code == 503, response.text
+    assert await read_all("alice") == (["second"], 2)
+    response = await send("alice", "second", replaces=[pending_ids["second"]])
     assert response.status_code == 503, response.text
     assert await read_all("alice") == ([], 1)
     assert await read_all("bob") == (["from bob"], 1)

@@ -832,15 +832,17 @@ GET /v1/sessions/{session_id}/failed-inputs[?limit=100&after=<next_cursor>]
 
 200 OK — {"data": [{pending_id, content, position}], "next_cursor": string|null}
 404 Not Found — no session with that id is visible to the caller
-422 Unprocessable Entity — `after` is not a cursor this route returned
+422 Unprocessable Entity — `after` is not a valid cursor (32 lowercase hex characters)
 ```
 
 Returns the caller's own startup inputs that a failed managed launch
 (`omnigent.startup` label `failed`) could not deliver, shaped like the
 snapshot's `pending_inputs`, so clients can offer them back to the composer for
 resending. The list is empty for any other startup state and once a runner is
-bound to the session. The caller's next message or skill command to the session
-discards them, since that resend carries what the client handed back. Pages
+bound to the session. A message or skill command from the caller discards the
+entries whose `pending_id` it lists in `replaces_failed_inputs` (see Post
+Event), since that send carries what the client handed back; other sends leave
+them. Pages
 follow item ids; sort the collected entries by `position` for submission order.
 Each page reads at most `limit` (1-100) of the session's saved startup inputs,
 so a page can hold fewer than `limit` entries while `next_cursor` is set; pass
@@ -1142,6 +1144,13 @@ Request body matches `SessionEventInput`:
     For `"interrupt"`, typically `{}`. The route also validates `data`
     against the item-type's Pydantic data class for non-interrupt
     types (400 on schema mismatch).
+
+  replaces_failed_inputs (array of string, optional)
+    Up to 1000 `pending_id`s from `GET .../failed-inputs` that this user
+    `"message"` or skill `"slash_command"` replaces. While the launch is
+    still failed, the server discards those of the sender's failed inputs
+    before handling the send, even if the send is then refused. Ids the
+    sender doesn't own are ignored. Not forwarded or saved with the event.
 
 202 Accepted
 {"queued": true}                            # regular queued item events

@@ -3860,6 +3860,12 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       startupInputIds: ["pending_second"],
       recovered: true,
     });
+
+    // Clearing the reloaded draft forgets its ids; the open session still remembers both inputs.
+    expect(takeFailedSendDraft("conv_real", true, true)?.text).toBe("and this");
+    setSessionDraft("conv_real", { text: "", files: [] });
+    await retryFailedStartupLookup("conv_real");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
   it("keeps only the resend in the composer when it is refused after the failed launch", async () => {
@@ -3876,10 +3882,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       startupInputIds: ["pending_first"],
     });
 
-    // Sending empties the composer; the server drops the failed input, and no runner takes the resend.
+    // Sending empties the composer; the server drops the failed input the resend names,
+    // and no runner takes the resend.
     setSessionDraft("conv_real", { text: "", files: [] });
+    let resend: unknown;
     fetchMock.mockImplementation((input, init) => {
       if (String(input).endsWith("/v1/sessions/conv_real/events") && init?.method === "POST") {
+        resend = JSON.parse(String(init.body));
         sessionFailedInputs.delete("conv_real");
         return mockResponse(
           { error: { code: "runner_unavailable", message: "No runner bound for session" } },
@@ -3890,21 +3899,56 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     });
     await useChatStore.getState().send("saved on server, edited", "agent_xyz");
 
+    expect(resend).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
     const failed = useChatStore.getState().failedSendDraft;
     expect(failed).toMatchObject({ text: "saved on server, edited", serverRefused: true });
     expect(failed?.startupInputIds).toBeUndefined();
     expect(getSessionDraft("conv_real")).toBeUndefined();
   });
 
-  it("offers Retry when a failed launch's startup inputs can't be read back", async () => {
+  it("names the startup inputs a reloaded draft holds when it is sent before they can be read", async () => {
+    onTestFinished(clearSessionDrafts);
     seedSession("conv_real");
     failManagedLaunch("conv_real", "saved on server");
-    let unreadable = true;
+    setSessionDraft("conv_real", {
+      text: "saved on server",
+      files: [],
+      startupInputIds: ["pending_first"],
+    });
     fetchMock.mockImplementation((input, init) =>
-      unreadable && String(input) === "/v1/sessions/conv_real/failed-inputs"
+      String(input) === "/v1/sessions/conv_real/failed-inputs"
         ? mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 })
         : defaultFetchHandler(input, init),
     );
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+
+    await useChatStore.getState().send("saved on server", "agent_xyz");
+    const [, sent] =
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_real/events")).at(-1) ??
+      [];
+    expect(JSON.parse(String(sent?.body))).toMatchObject({
+      replaces_failed_inputs: ["pending_first"],
+    });
+  });
+
+  it("offers Retry when a failed launch's startup inputs can't be read back", async () => {
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+    let read: "fails" | "hangs" | "works" = "fails";
+    fetchMock.mockImplementation((input, init) => {
+      if (read === "works" || String(input) !== "/v1/sessions/conv_real/failed-inputs")
+        return defaultFetchHandler(input, init);
+      if (read === "fails")
+        return mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("aborted", "AbortError")),
+          { once: true },
+        );
+      });
+    });
     const lookupNotices = () =>
       useChatStore
         .getState()
@@ -3919,13 +3963,33 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(reads).toHaveLength(2);
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(lookupNotices()).toEqual([
-      expect.objectContaining({ title: "Couldn't return your unsent messages" }),
+      expect.objectContaining({ title: "Couldn't check for your unsent messages" }),
     ]);
 
-    await expect(retryFailedStartupLookup("conv_real")).rejects.toThrow();
+    await expect(retryFailedStartupLookup("conv_real")).rejects.toThrow(
+      "The messages couldn't be read",
+    );
     expect(lookupNotices()).toHaveLength(1);
 
-    unreadable = false;
+    // A send made meanwhile doesn't name the input it never saw, so the server keeps it.
+    await useChatStore.getState().send("something else", "agent_xyz");
+    const [, sent] =
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_real/events")).at(-1) ??
+      [];
+    expect(JSON.parse(String(sent?.body))).not.toHaveProperty("replaces_failed_inputs");
+
+    // A read that hangs is abandoned, so the notice's Retry can be used again.
+    read = "hangs";
+    vi.useFakeTimers();
+    const hung = expect(retryFailedStartupLookup("conv_real")).rejects.toThrow(
+      "The messages couldn't be read",
+    );
+    await vi.advanceTimersByTimeAsync(ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS);
+    await hung;
+    vi.useRealTimers();
+    expect(lookupNotices()).toHaveLength(1);
+
+    read = "works";
     await retryFailedStartupLookup("conv_real");
     expect(useChatStore.getState().failedSendDraft).toEqual({
       conversationId: "conv_real",

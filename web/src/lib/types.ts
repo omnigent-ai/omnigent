@@ -187,13 +187,21 @@ export type SessionStatus = "idle" | "launching" | "running" | "waiting" | "fail
  * Mirrors `omnigent.server.schemas.SessionEventInput`.
  */
 export type SessionEventInput =
-  | { type: "message"; data: { role: "user"; content: ContentBlock[] } }
+  | {
+      type: "message";
+      data: { role: "user"; content: ContentBlock[] };
+      replaces_failed_inputs?: string[];
+    }
   | { type: "function_call_output"; data: Record<string, unknown> }
   | { type: "approval"; data: Record<string, unknown> }
   | { type: "interrupt"; data?: Record<string, unknown> }
   | { type: "stop_session"; data?: Record<string, unknown> }
   | { type: "retry_session"; data?: Record<string, unknown> }
-  | { type: "slash_command"; data: { kind: "skill"; name: string; arguments: string } }
+  | {
+      type: "slash_command";
+      data: { kind: "skill"; name: string; arguments: string };
+      replaces_failed_inputs?: string[];
+    }
   | { type: string; data: Record<string, unknown> };
 
 /**

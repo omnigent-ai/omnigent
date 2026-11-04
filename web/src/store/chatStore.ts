@@ -2811,6 +2811,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const replacesFailedInputs = failedStartupInputsReplacedBy(submitConversationId);
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
     const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
@@ -2913,6 +2914,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             content: serverContent,
             stable_id: stableId,
           },
+          ...replacesFailedInputs,
         },
         { holdWhenHostOffline: true },
       );
@@ -3173,6 +3175,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const replacesFailedInputs = failedStartupInputsReplacedBy(submitConversationId);
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -3197,6 +3200,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             ? { stable_id: randomUUID().replace(/-/g, "") }
             : {}),
         },
+        ...replacesFailedInputs,
       });
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
@@ -7737,6 +7741,21 @@ const STARTUP_ATTACHMENTS_NOT_RESTORED_CODE = "startup_attachments_not_restored"
 const ATTACHMENT_LIST = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 
 /**
+ * The failed startup inputs a send replaces: those already handed back to its
+ * composer, so the server can drop them. Read before the composer clears its draft.
+ */
+function failedStartupInputsReplacedBy(conversationId: string | null): {
+  replaces_failed_inputs?: string[];
+} {
+  if (conversationId === null) return {};
+  const ids = new Set([
+    ...(setterForState(conversationId)?.returnedStartupInputs ?? []),
+    ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
+  ]);
+  return ids.size === 0 ? {} : { replaces_failed_inputs: [...ids] };
+}
+
+/**
  * Hand the viewer's startup messages a failed managed launch left undelivered
  * back to the composer: drop the bubbles still showing them as sending and
  * restore their text after any draft already waiting there. Each is handed back
@@ -7759,27 +7778,35 @@ function returnFailedStartupInputs(
   failedInputs: PendingInput[],
   unacknowledged: ReadonlySet<string>,
 ): Partial<ConversationState> {
-  const returned = new Set([
-    ...state.returnedStartupInputs,
-    ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
-  ]);
-  const inputs = failedInputs.filter((input) => !returned.has(input.pendingId));
+  const held = new Set(getSessionDraft(conversationId)?.startupInputIds);
+  const unreturned = failedInputs.filter(
+    (input) => !state.returnedStartupInputs.includes(input.pendingId),
+  );
+  // Inputs a reloaded draft holds count as returned, so clearing that draft can't bring them back.
+  const inputs = unreturned.filter((input) => !held.has(input.pendingId));
   const blocks = state.blocks.filter((block) => !isStartupLookupNotice(block));
-  const patch = blocks.length === state.blocks.length ? {} : { blocks };
+  const patch: Partial<ConversationState> = {
+    ...(blocks.length === state.blocks.length ? {} : { blocks }),
+    ...(unreturned.length === 0
+      ? {}
+      : {
+          returnedStartupInputs: [
+            ...state.returnedStartupInputs,
+            ...unreturned.map((input) => input.pendingId),
+          ],
+        }),
+  };
   if (inputs.length === 0) return patch;
   const attachments = startupAttachmentsNotice(inputs);
   return {
+    ...patch,
     pendingUserMessages: withoutFailedStartupBubbles(
       state.pendingUserMessages,
       inputs,
       unacknowledged,
     ),
-    returnedStartupInputs: [
-      ...state.returnedStartupInputs,
-      ...inputs.map((input) => input.pendingId),
-    ],
     failedSendDraft: failedStartupDraft(conversationId, state.failedSendDraft, inputs),
-    ...(attachments ? { blocks: [...blocks, attachments] } : patch),
+    ...(attachments ? { blocks: [...blocks, attachments] } : {}),
   };
 }
 
@@ -7927,10 +7954,10 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
     if (state.blocks.some(isStartupLookupNotice)) return {};
     const notice: ErrorBlock = {
       ...makeClientErrorBlock(
-        "Messages sent while the session was starting weren't delivered. Retry to move them back to the composer.",
+        "If you sent messages while the session was starting, they weren't delivered. Retry to move them back to the composer.",
         STARTUP_INPUT_LOOKUP_FAILED_CODE,
       ),
-      title: "Couldn't return your unsent messages",
+      title: "Couldn't check for your unsent messages",
     };
     return { blocks: [...state.blocks, notice] };
   });
@@ -7940,14 +7967,17 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
  * Read a failed launch's startup messages again from the lookup-failure notice.
  *
  * @param conversationId - The session whose launch failed.
- * @throws When the session is gone or its messages still can't be read.
+ * @throws When the session is gone or its messages still can't be read in time.
  */
 export async function retryFailedStartupLookup(conversationId: string): Promise<void> {
   const entry = conversationRegistry.peek(conversationId);
   if (entry === undefined || entry.disposed) throw new Error("The session is no longer open");
   const unacknowledged = unacknowledgedSends(entry.getState().pendingUserMessages);
-  const inputs = await listFailedStartupInputs(conversationId);
+  const inputs = await readWithinReconcileTimeout((signal) =>
+    listFailedStartupInputs(conversationId, signal),
+  );
   if (entry.disposed) return;
+  if (inputs === null) throw new Error("The messages couldn't be read");
   entrySetter(entry)((state) =>
     returnFailedStartupInputs(conversationId, state, inputs, unacknowledged),
   );

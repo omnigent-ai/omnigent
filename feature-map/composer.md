@@ -205,7 +205,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `managed-first-input`: submitting a new managed session saves its first input
   and attachments before provisioning. Follow-ups sent during startup are saved
   in order too. They run even if the creating browser closes; reopening shows
-  each message once.
+  each message once. If the launch fails, each sender's undelivered messages
+  return to their composer once, after any draft, and a notice names attachments
+  it can't restore. When they can't be read back, the notice's Retry reads them
+  again; it does not relaunch the sandbox.
 - `arclet-dbcert`: desktop Arclet launches check laptop credentials first. A
   missing or expired dbcert preserves the draft and shows a yellow refresh
   banner instead of provisioning. Skip continues the current launch without
@@ -764,6 +767,8 @@ Other connection providers alone do not enable the managed MCP picker.
   cloud allocation and model output are local substitutes. Backend coverage in
   `tests/server/integration/test_managed_startup_inputs.py` checks native
   transcript ownership, bundle uploads, recovery, access revocation and deletion.
+  It also checks that a failed launch keeps each sender's inputs until a send names
+  them; `web/src/store/chatStore.test.ts` covers returning them and the Retry notice.
 - **`arclet-dbcert`, desktop new-session composer (own environment):**
   `web/electron/e2e/desktop_dbcert_preflight.e2e.js` exercises the real desktop,
   native bridge, CLI process, and local server with a fake dbcert executable and

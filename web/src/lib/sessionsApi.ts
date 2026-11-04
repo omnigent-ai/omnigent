@@ -1280,7 +1280,7 @@ export async function listFailedInputs(
 ): Promise<PendingInput[]> {
   const entries: FailedInputWire[] = [];
   let after: string | null = null;
-  // Each page provides the cursor for the next request.
+  // Sequential: each request needs the previous page's cursor.
   /* oxlint-disable no-await-in-loop */
   for (let pages = 1; ; pages += 1) {
     const query: string = after !== null ? `?after=${encodeURIComponent(after)}` : "";

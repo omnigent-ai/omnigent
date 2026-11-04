@@ -7,7 +7,7 @@ import contextlib
 import logging
 import re
 import weakref
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Collection, Coroutine
 from dataclasses import dataclass
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -308,15 +308,21 @@ class ManagedStartupInputs:
             if item.status == "failed" and item.created_by == viewer_id
         ], cursor
 
-    async def discard_failed(self, session_id: str, viewer_id: str | None) -> None:
-        """Drop the viewer's undelivered inputs when they send again, so none returns twice."""
+    async def discard_failed(
+        self, session_id: str, viewer_id: str | None, pending_ids: Collection[str]
+    ) -> None:
+        """Drop the viewer's undelivered inputs that a send replaces, so none returns twice."""
         after: str | None = None
         while True:
             items, after = await asyncio.to_thread(
                 self.conversations.list_pending_inputs_by_id, session_id, after=after
             )
             for item, _position in items:
-                if item.status == "failed" and item.created_by == viewer_id:
+                if (
+                    item.status == "failed"
+                    and item.created_by == viewer_id
+                    and pending_inputs.make_pending_id(session_id, item.id) in pending_ids
+                ):
                     await asyncio.to_thread(
                         self.conversations.transition_pending_input,
                         session_id,
