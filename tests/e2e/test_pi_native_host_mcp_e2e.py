@@ -9,14 +9,15 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import click
 import pytest
 
 from omnigent.harnesses.pi_native.credentials import PiProviderConfig, pi_native_provider_launch
+from omnigent.harnesses.pi_native.main import pi_version, resolve_pi_executable
 from omnigent.host import mcp_inventory
 
 _ECHO_SERVER = Path(__file__).parents[1] / "tools" / "fixtures" / "echo_stdio_mcp_server.py"
@@ -24,17 +25,12 @@ _FIRST_PI_WITH_MCP = (0, 99)
 
 
 def _pi_with_mcp() -> str | None:
-    executable = os.environ.get("OMNIGENT_PI_PATH") or shutil.which("pi")
-    if executable is None:
-        return None
     try:
-        version = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, timeout=30, check=True
-        ).stdout.strip()
-        parsed = tuple(int(part) for part in version.split(".")[:2])
-    except (OSError, subprocess.SubprocessError, ValueError):
+        executable = resolve_pi_executable()
+    except click.ClickException:
         return None
-    return executable if parsed >= _FIRST_PI_WITH_MCP else None
+    version = pi_version(executable)
+    return executable if version is not None and version[:2] >= _FIRST_PI_WITH_MCP else None
 
 
 _PI = _pi_with_mcp()
@@ -45,8 +41,24 @@ pytestmark = [
 ]
 
 
+# Writes one environment variable to a file, then runs the echo server.
+_RECORD_ENV_THEN_SERVE = (
+    "import os, runpy, sys; "
+    "open(sys.argv[1], 'w').write(os.environ.get(sys.argv[2], '<unset>')); "
+    "runpy.run_path(sys.argv[3], run_name='__main__')"
+)
+
+
 def _echo_server(**extra: object) -> dict[str, object]:
     return {"command": sys.executable, "args": [str(_ECHO_SERVER)], **extra}
+
+
+def _echo_server_recording(variable: str, record: Path, value: str) -> dict[str, object]:
+    return {
+        "command": sys.executable,
+        "args": ["-c", _RECORD_ENV_THEN_SERVE, str(record), variable, str(_ECHO_SERVER)],
+        "env": {variable: value},
+    }
 
 
 def test_managed_pi_session_connects_to_host_servers(
@@ -63,7 +75,9 @@ def test_managed_pi_session_connects_to_host_servers(
         json.dumps(
             {
                 "mcpServers": {
-                    "claude-echo": _echo_server(env={"ECHO_TOKEN": "${ECHO_TOKEN}"}),
+                    "claude-echo": _echo_server_recording(
+                        "ECHO_TOKEN", tmp_path / "claude-env", "${ECHO_TOKEN}"
+                    ),
                     "shared": {"command": "/nonexistent/host-version"},
                 }
             }
@@ -72,7 +86,13 @@ def test_managed_pi_session_connects_to_host_servers(
     )
     (home / ".cursor").mkdir()
     (home / ".cursor" / "mcp.json").write_text(
-        json.dumps({"mcpServers": {"cursor-echo": _echo_server(env={"PRICE": "$5"})}}),
+        json.dumps(
+            {
+                "mcpServers": {
+                    "cursor-echo": _echo_server_recording("PRICE", tmp_path / "cursor-env", "$5")
+                }
+            }
+        ),
         encoding="utf-8",
     )
     pi_agent = home / ".pi" / "agent"
@@ -116,5 +136,7 @@ def test_managed_pi_session_connects_to_host_servers(
         "cursor-echo": ("connected", ["echo"]),
         "shared": ("connected", ["echo"]),
     }
+    assert (tmp_path / "claude-env").read_text(encoding="utf-8") == "synthetic-token"
+    assert (tmp_path / "cursor-env").read_text(encoding="utf-8") == "$5"
     assert (pi_agent / "mcp.json").read_text(encoding="utf-8") == user_config
     assert sorted(path.name for path in pi_agent.iterdir()) == ["mcp.json"]

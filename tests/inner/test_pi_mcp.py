@@ -259,13 +259,14 @@ def test_user_definition_wins_and_override_adjusts_host_server() -> None:
         "mcpServers": {
             "github": {"command": "my-github"},
             "linear": {"enabled": False},
+            "docs": {"exposure": "direct", "toolExposure": {"delete_*": "hidden"}},
             "mine": {"url": "https://mine.example.com"},
         },
     }
     host = {
         "github": {"command": "host-github"},
         "linear": {"command": "host-linear"},
-        "docs": {"command": "host-docs"},
+        "docs": {"command": "host-docs", "toolExposure": {"*": "codemode"}},
     }
 
     merged = merge_pi_mcp_config(user, host)
@@ -274,7 +275,11 @@ def test_user_definition_wins_and_override_adjusts_host_server() -> None:
         "settings": {"toolPrefix": "short"},
         "mcpServers": {
             "linear": {"command": "host-linear", "enabled": False},
-            "docs": {"command": "host-docs"},
+            "docs": {
+                "command": "host-docs",
+                "exposure": "direct",
+                "toolExposure": {"delete_*": "hidden"},
+            },
             "github": {"command": "my-github"},
             "mine": {"url": "https://mine.example.com"},
         },
@@ -375,6 +380,28 @@ def test_reused_dir_regenerates_and_relinks(home: Path, pi_agent: Path) -> None:
     assert not (managed / "mcp.json").is_symlink()
 
 
+@pytest.mark.parametrize("host_has_servers", [False, True])
+def test_session_owned_config_in_the_managed_dir_is_kept(
+    home: Path, pi_agent: Path, host_has_servers: bool
+) -> None:
+    """A file Pi created there, or a generated copy edited in a session, survives a relaunch."""
+    if host_has_servers:
+        _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
+    managed = _prepare(home, pi_agent)
+    target = managed / "mcp.json"
+    if host_has_servers:
+        assert _managed_servers(managed) == {"github": {"command": "host"}}
+    else:
+        assert not target.exists()
+    session_config = '{"mcpServers": {"added-in-pi": {"command": "mine"}}}'
+    target.write_text(session_config, encoding="utf-8")
+
+    _prepare(home, pi_agent)
+
+    assert target.read_text(encoding="utf-8") == session_config
+    assert not (pi_agent / "mcp.json").exists()
+
+
 def test_unreadable_user_config_is_linked_not_replaced(
     home: Path, pi_agent: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -391,19 +418,29 @@ def test_unreadable_user_config_is_linked_not_replaced(
     assert "unreadable" in caplog.text
 
 
-def test_inventory_failure_does_not_block_the_launch(
-    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failure", ["inventory", "write"])
+def test_failed_refresh_does_not_block_launch_or_keep_a_stale_copy(
+    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    def broken_inventory() -> list[ConfiguredMcpServer]:
-        raise RuntimeError("inventory exploded")
-
-    monkeypatch.setattr(pi_mcp, "_host_mcp_servers", broken_inventory)
-    _write_json(pi_agent / "mcp.json", {"mcpServers": {}})
-
+    """A refresh that fails falls back to the user's file, so a server they disabled stays off."""
+    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
     managed = _prepare(home, pi_agent)
+    assert _managed_servers(managed) == {"github": {"command": "host"}}
+    user_file = pi_agent / "mcp.json"
+    user_config = '{"mcpServers": {"github": {"enabled": false}}}'
+    user_file.write_text(user_config, encoding="utf-8")
+
+    def fail(*_args: object) -> None:
+        raise OSError(f"{failure} failed")
+
+    monkeypatch.setattr(
+        pi_mcp, "_host_mcp_servers" if failure == "inventory" else "_write_private_file", fail
+    )
+    _prepare(home, pi_agent)
 
     assert (managed / "settings.json").exists()
-    assert (managed / "mcp.json").resolve() == (pi_agent / "mcp.json").resolve()
+    assert (managed / "mcp.json").resolve() == user_file.resolve()
+    assert user_file.read_text(encoding="utf-8") == user_config
 
 
 def test_generated_copy_never_writes_through_a_link(home: Path, pi_agent: Path) -> None:
