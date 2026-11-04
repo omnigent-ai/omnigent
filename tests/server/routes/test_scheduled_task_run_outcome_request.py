@@ -57,8 +57,10 @@ def test_one_emoji_is_accepted(emoji: str) -> None:
         "✅\ufe0f\ufe0f",
         "👍\U0001f3fd\U0001f3fd",
         "🚀\U000e0067",
-        # A flag cannot be joined into a sequence.
+        # A flag or a keycap cannot be joined into a sequence.
         "🇺🇸\u200d🚀",
+        "1\ufe0f\u20e3\u200d1\ufe0f\u20e3",
+        "\U0001f680\u200d1\ufe0f\u20e3",
         # Symbols that are not emoji.
         "∑",
         "±",

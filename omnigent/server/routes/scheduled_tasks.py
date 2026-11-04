@@ -55,6 +55,10 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_support,
 )
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.run_outcome import (
+    RunStillStartingError,
+    record_outcome_once_delivered,
+)
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_orchestration import require_owned_session
@@ -958,8 +962,9 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Record an owned session's latest delivered-run outcome.
 
-        A runner-marked call must come from the session's bound runner. Returns
-        404 when the session has no eligible run.
+        A runner-marked call must come from the session's bound runner. Waits for
+        a fire still recording the session's run; 409 if it does not finish in
+        time. Returns 404 when the session has no eligible run.
         """
         owner = _owner(request)
         source_id = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
@@ -976,14 +981,20 @@ def create_scheduled_tasks_router(
             permission_store=permission_store,
         )
         session = await asyncio.to_thread(_outcome_session, owner, body.session_id)
-        run = await asyncio.to_thread(
-            store.record_run_outcome,
-            session.id,
-            success=body.success,
-            emoji=body.emoji,
-            text=body.text,
-            recorded_at=int(datetime.now(UTC).timestamp()),
-        )
+        try:
+            run = await record_outcome_once_delivered(
+                store,
+                session.id,
+                success=body.success,
+                emoji=body.emoji,
+                text=body.text,
+                recorded_at=int(datetime.now(UTC).timestamp()),
+            )
+        except RunStillStartingError as exc:
+            raise OmnigentError(
+                "The automation run that sent this prompt is still starting; retry shortly",
+                code=ErrorCode.CONFLICT,
+            ) from exc
         if run is None:
             raise OmnigentError(
                 "This session was not started by a scheduled task",

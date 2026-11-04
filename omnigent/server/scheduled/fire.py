@@ -104,6 +104,7 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
+from omnigent.server.scheduled.run_outcome import PROMPTS_IN_FLIGHT
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.scheduled.telemetry import (
     current_fire_stage,
@@ -743,31 +744,34 @@ async def _run_fire_for_task(
         )
 
     await recorder.check()
-    try:
-        start_fire_stage("sandbox_create" if managed else "runner_start", session_id=conv.id)
-        await dispatch(conv, effective)
-    except Exception:
-        # The session + grant are already persisted and owner-visible, so a
-        # launch/dispatch failure still records a run — just a failed one.
-        _logger.exception(
-            "scheduled fire: launch/dispatch failed for task %s (session %s)",
-            task.id,
-            conv.id,
-        )
-        await recorder.finish(
-            "failed",
-            conversation_id=conv.id,
-            error="runner launch/dispatch failed",
-            error_code="launch_failed",
-        )
-        return
+    # The agent can record its outcome as soon as the prompt is accepted, before
+    # the run below exists; the mark lets that recording wait for it.
+    with PROMPTS_IN_FLIGHT.track(conv.id):
+        try:
+            start_fire_stage("sandbox_create" if managed else "runner_start", session_id=conv.id)
+            await dispatch(conv, effective)
+        except Exception:
+            # The session + grant are already persisted and owner-visible, so a
+            # launch/dispatch failure still records a run — just a failed one.
+            _logger.exception(
+                "scheduled fire: launch/dispatch failed for task %s (session %s)",
+                task.id,
+                conv.id,
+            )
+            await recorder.finish(
+                "failed",
+                conversation_id=conv.id,
+                error="runner launch/dispatch failed",
+                error_code="launch_failed",
+            )
+            return
 
-    if hand_off:
-        await recorder.hand_off_managed(
-            conv, replace(effective, workspace=task.workspace), fire_dispatch.managed_start
-        )
-    else:
-        await recorder.finish("running", conversation_id=conv.id)
+        if hand_off:
+            await recorder.hand_off_managed(
+                conv, replace(effective, workspace=task.workspace), fire_dispatch.managed_start
+            )
+        else:
+            await recorder.finish("running", conversation_id=conv.id)
     _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
 
 
@@ -849,23 +853,26 @@ async def _continue_session(
             error_code="continued_session_budget_conflict",
         )
         return
-    try:
-        start_fire_stage("runner_start", session_id=session_id)
-        await dispatch(conv, task)
-    except Exception:
-        _logger.exception(
-            "scheduled fire: dispatch into continued session %s failed for task %s",
-            session_id,
-            task.id,
-        )
-        await recorder.finish(
-            "failed",
-            conversation_id=session_id,
-            error="runner launch/dispatch failed",
-            error_code="launch_failed",
-        )
-        return
-    await recorder.finish("succeeded", conversation_id=session_id)
+    # Until the run below is recorded, an outcome would land on the session's
+    # previous run; the mark lets that recording wait for this one.
+    with PROMPTS_IN_FLIGHT.track(session_id):
+        try:
+            start_fire_stage("runner_start", session_id=session_id)
+            await dispatch(conv, task)
+        except Exception:
+            _logger.exception(
+                "scheduled fire: dispatch into continued session %s failed for task %s",
+                session_id,
+                task.id,
+            )
+            await recorder.finish(
+                "failed",
+                conversation_id=session_id,
+                error="runner launch/dispatch failed",
+                error_code="launch_failed",
+            )
+            return
+        await recorder.finish("succeeded", conversation_id=session_id)
     _logger.info("scheduled fire: task %s continued session %s", task.id, session_id)
 
 

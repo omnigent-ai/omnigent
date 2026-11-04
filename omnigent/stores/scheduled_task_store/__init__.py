@@ -395,9 +395,11 @@ class ScheduledTaskStore(ABC):
         continued session's run once its prompt is delivered). Of those, the
         newest by ``scheduled_at`` gets the outcome, so a later firing that is
         still starting, or that failed or was skipped before delivering its
-        prompt, does not take an earlier turn's outcome. If a continued
-        session receives the next firing's prompt while still working on the
-        previous one, the outcome lands on the newer run. A later call
+        prompt, does not take an earlier turn's outcome; nor does a run that
+        failed after delivery. If a continued session receives the next
+        firing's prompt while still working on the previous one, the outcome
+        lands on the newer run. The endpoint waits for a fire still recording
+        its run before calling this (see ``server/scheduled/run_outcome.py``). A later call
         overwrites the earlier outcome. ``status`` is left alone, so a run that
         finished but missed its goal stays ``succeeded`` with
         ``outcome_success`` ``False``. Workspace-scoped like every other store

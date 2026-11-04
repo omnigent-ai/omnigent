@@ -3334,6 +3334,25 @@ async def test_run_outcome_is_recorded_from_the_runner_and_listed(
     assert runs[0]["outcome"]["text"] == "Shipped"
 
 
+async def test_run_outcome_waits_for_a_fire_still_recording_its_run(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While a fire for the session is in flight, recording waits, then gives up with 409."""
+    from omnigent.server.scheduled import run_outcome
+
+    run_id, session_id, headers = await _seed_fired_session(auth_client, db_uri)
+    monkeypatch.setattr(run_outcome, "PROMPT_SETTLE_TIMEOUT_S", 0.2)
+    body = {"session_id": session_id, "success": True, "emoji": "✅", "text": "Done"}
+    with run_outcome.PROMPTS_IN_FLIGHT.track(session_id):
+        resp = await auth_client.put("/v1/scheduled-tasks/run-outcome", json=body, headers=headers)
+    assert resp.status_code == 409, resp.text
+    run = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(session_id)
+    assert run is not None and run.id == run_id and run.outcome_success is None
+    # Once the fire is done, the same call records.
+    resp = await auth_client.put("/v1/scheduled-tasks/run-outcome", json=body, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+
 async def test_run_outcome_with_invalid_unicode_is_422_and_keeps_the_earlier_outcome(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

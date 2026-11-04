@@ -3101,6 +3101,37 @@ async def test_continue_records_the_run_once_the_prompt_is_delivered() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("continued", [False, True])
+async def test_the_session_is_in_flight_until_its_run_is_recorded(continued: bool) -> None:
+    """An outcome recorded right after the prompt is accepted waits for the run row.
+
+    Legacy timers insert the run only after dispatch, so the session stays marked
+    from dispatch until the run exists; then the mark is gone.
+    """
+    from omnigent.server.scheduled.run_outcome import PROMPTS_IN_FLIGHT
+
+    if continued:
+        conv_store: Any = _ExistingConversationStore(_continued_session())
+        store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+    else:
+        conv_store = FakeConversationStore()
+        store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    in_flight_at_dispatch: list[tuple[bool, int]] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        in_flight_at_dispatch.append((PROMPTS_IN_FLIGHT.in_flight(conv.id), len(store.runs)))
+
+    await build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)(
+        0, "task_1"
+    )
+    await _drain()
+
+    assert in_flight_at_dispatch == [(True, 0)]
+    [run] = store.runs
+    assert not PROMPTS_IN_FLIGHT.in_flight(run["conversation_id"])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("live_status", ["running", "waiting"])
 async def test_continue_sends_while_an_earlier_turn_is_still_going(live_status: str) -> None:
     """The prompt joins the busy session; the earlier run is left to its own turn end."""

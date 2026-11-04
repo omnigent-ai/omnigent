@@ -641,6 +641,7 @@ async def test_record_outcome_puts_for_the_calling_session() -> None:
     [
         (404, "not started by a scheduled task"),
         (405, "does not record run outcomes"),
+        (409, "still starting"),
         (422, "server returned 422"),
     ],
 )

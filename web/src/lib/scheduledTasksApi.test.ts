@@ -144,7 +144,7 @@ describe("listScheduledTaskRuns", () => {
     });
   });
 
-  it("maps a run's session read state when the server sends it", async () => {
+  it("maps a run's outcome and session read state when the server sends them", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         runs: [
@@ -162,33 +162,6 @@ describe("listScheduledTaskRuns", () => {
             viewer_last_seen: 1_700_000_055,
             viewer_unread: false,
             session_cost_usd: 0,
-          },
-        ],
-      }),
-    );
-    const [run] = await listScheduledTaskRuns("st_1");
-    expect(run).toMatchObject({
-      conversationUpdatedAt: 1_700_000_060,
-      conversationStatus: "idle",
-      viewerLastSeen: 1_700_000_055,
-      viewerUnread: false,
-      sessionCostUsd: 0,
-    });
-  });
-
-  it("maps the outcome the agent recorded", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        runs: [
-          {
-            id: "run_1",
-            scheduled_task_id: "st_1",
-            status: "succeeded",
-            scheduled_at: 1_700_000_000,
-            conversation_id: "conv_1",
-            fired_at: 1_700_000_005,
-            finished_at: 1_700_000_050,
-            error_code: null,
             outcome: {
               success: false,
               emoji: "🚧",
@@ -200,11 +173,19 @@ describe("listScheduledTaskRuns", () => {
       }),
     );
     const [run] = await listScheduledTaskRuns("st_1");
+    // `success: false` must survive the mapping rather than read as "no outcome".
     expect(run.outcome).toEqual({
       success: false,
       emoji: "🚧",
       text: "Blocked: CI is down",
       recordedAt: 1_700_000_040,
+    });
+    expect(run).toMatchObject({
+      conversationUpdatedAt: 1_700_000_060,
+      conversationStatus: "idle",
+      viewerLastSeen: 1_700_000_055,
+      viewerUnread: false,
+      sessionCostUsd: 0,
     });
   });
 });

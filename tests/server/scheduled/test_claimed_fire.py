@@ -454,6 +454,59 @@ async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
     assert store.get(claimed.task.id).session_id == _CONV_ID
 
 
+async def test_an_outcome_recorded_during_continued_dispatch_lands_on_the_claimed_run(
+    store,
+) -> None:
+    """While the prompt is being delivered, recording waits for this firing's run.
+
+    Before the fire records it, the session's newest delivered run is the earlier
+    firing's, which must not take this turn's outcome.
+    """
+    from omnigent.server.scheduled.run_outcome import (
+        PROMPTS_IN_FLIGHT,
+        record_outcome_once_delivered,
+    )
+
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    earlier_id = uuid.uuid4().hex
+    store.create_run(
+        run_id=earlier_id,
+        scheduled_task_id=claimed.task.id,
+        status="succeeded",
+        scheduled_at=1,
+        conversation_id=_CONV_ID,
+        fired_at=1,
+        finished_at=2,
+    )
+    conversations = _ExistingConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
+    )
+    recording: list[asyncio.Task[ScheduledTaskRun | None]] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        assert PROMPTS_IN_FLIGHT.in_flight(_CONV_ID)
+        recording.append(
+            asyncio.create_task(
+                record_outcome_once_delivered(
+                    store, _CONV_ID, success=True, emoji="✅", text="Done", recorded_at=5
+                )
+            )
+        )
+        await asyncio.sleep(0.2)
+        assert not recording[0].done()
+
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=dispatch
+    )
+    await executor.fire(claimed.task, claimed.lease)
+    recorded = await recording[0]
+
+    assert not PROMPTS_IN_FLIGHT.in_flight(_CONV_ID)
+    assert recorded is not None and recorded.id == claimed.lease.run.id
+    outcomes = {run.id: run.outcome_success for run in _runs(store, claimed.task)}
+    assert outcomes == {claimed.lease.run.id: True, earlier_id: None}
+
+
 async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> None:
     claimed = _claim(store, session_mode="continue")
     conversations = _ConversationStore()

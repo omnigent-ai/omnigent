@@ -4919,6 +4919,13 @@ async def _record_scheduled_task_run_outcome(
                 "started by a scheduled task, or automations are off"
             }
         )
+    if resp.status_code == 409:
+        return json.dumps(
+            {
+                "error": f"{tool_name}: the automation run that sent this prompt is still "
+                "starting; wait a few seconds and call the tool again"
+            }
+        )
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}

@@ -352,8 +352,14 @@ the agent to call it once, before its final reply.
 - It goes on the calling session's newest delivered run: `running` or
   `succeeded`, newest by `scheduled_at`. A new-session task has one such run;
   a continued session has one per delivered firing. A firing still starting,
-  or failed or skipped before delivery, never takes the outcome. A later call
-  replaces the earlier outcome.
+  or failed or skipped before delivery, never takes the outcome, and neither
+  does a run that failed after delivery. A later call replaces the earlier
+  outcome.
+- A fire sends the prompt before it records its run, so the agent can call the
+  tool first. The fire marks the session in flight for that span
+  (`run_outcome.PROMPTS_IN_FLIGHT`), and recording waits up to 10 seconds for
+  it, then answers 409. The mark is per process; a fire on another replica
+  leaves the gap of one run-row write.
 - The runner always sends its own session, so an agent cannot record on
   another session's run. Like task changes from an agent, the server checks
   that the session's bound runner sent the call. The owner can also set it

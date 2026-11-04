@@ -21,10 +21,15 @@ a session's runs of one status by ``scheduled_at`` (then ``id``). Read
 backward, it returns that run without scanning a continued session's history.
 
 Deployment: apply this migration before a server that reads the columns.
-Servers that migrate at startup do so on their own. The columns are nullable
-and the index is new, so servers without the change keep working on the
-migrated schema. Downgrade drops the index, the columns and every recorded
-outcome; downgrade only after rolling back the servers that read them.
+Servers that migrate at startup do so on their own. Processes already running
+an older build keep working on the migrated schema, since the columns are
+nullable and the index is new. An older build does not start on it, though:
+startup refuses a schema revision the build does not know.
+
+Rollback: stop the servers, downgrade with a build that includes this
+migration (``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini
+downgrade d0a1f879a01d``), then start the older build. Downgrade drops the
+index, the size check, the columns and every recorded outcome; runs are kept.
 """
 
 from __future__ import annotations

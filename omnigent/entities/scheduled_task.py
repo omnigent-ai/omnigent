@@ -75,7 +75,8 @@ def is_single_emoji(value: str) -> bool:
     Each part of the sequence is an Extended_Pictographic character, a keycap
     base followed by its keycap mark, or a regional-indicator pair, optionally
     followed by one variation selector and one skin tone; tag characters may
-    follow only the black flag. Parts are joined by single ZWJs.
+    follow only the black flag. Parts are joined by single ZWJs, but a flag or
+    a keycap is never part of a joined sequence.
     Extended_Pictographic also contains a few symbols that rarely render as
     emoji (for example ``☉`` and ``🂠``); they are accepted, since the value is
     only shown, never interpreted.
@@ -85,13 +86,18 @@ def is_single_emoji(value: str) -> bool:
     parts = value.split(_EMOJI_ZWJ)
     if len(parts) > 1 and any(not part for part in parts):
         return False
-    return all(_is_emoji_part(part) for part in parts) and (
-        len(parts) == 1 or not any(_is_flag(part) for part in parts)
-    )
+    if not all(_is_emoji_part(part) for part in parts):
+        return False
+    # A ZWJ does not join a flag or a keycap to another emoji: that is two emoji.
+    return len(parts) == 1 or not any(_is_flag(part) or _is_keycap(part) for part in parts)
 
 
 def _is_flag(part: str) -> bool:
     return len(part) == 2 and all(0x1F1E6 <= ord(ch) <= 0x1F1FF for ch in part)
+
+
+def _is_keycap(part: str) -> bool:
+    return part[:1] in _EMOJI_KEYCAP_BASES
 
 
 def _is_emoji_part(part: str) -> bool:
