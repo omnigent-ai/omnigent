@@ -1732,3 +1732,39 @@ it.each([false, true])(
     }
   },
 );
+
+it("adds a failed launch's recovered message after the grid composer's newer draft", async () => {
+  const entry = conversationRegistry.acquire(childId);
+  entry.setState({
+    sessionStatus: "idle",
+    abortController: new AbortController(),
+    returnedStartupInputs: ["pending_first"],
+  });
+  useChatStore.setState({ send: initialStoreState.send });
+  renderPane(<SideChatPane childId={childId} fullSession />);
+  act(() =>
+    useChatStore.getState().updateSideChatComposer(childId, () => ({
+      text: "newer",
+      files: [],
+      quotes: [{ id: "new", before: "", text: "New quote" }],
+    })),
+  );
+  act(() =>
+    entry.setState({
+      failedSendDraft: {
+        conversationId: childId,
+        text: "saved on server",
+        files: [],
+        startupInputIds: ["pending_first"],
+        recovered: true,
+      },
+    }),
+  );
+
+  expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
+  expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("New quote");
+  const post = vi.spyOn(sessionsApi, "postEvent").mockResolvedValue({ queued: true });
+  fireEvent.click(screen.getByTestId("side-chat-send"));
+  await waitFor(() => expect(post).toHaveBeenCalledOnce());
+  expect(post.mock.calls[0][1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+});

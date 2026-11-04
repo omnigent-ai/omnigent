@@ -85,6 +85,7 @@ import { sideChatSettingsMutationKey, usesNativeSideChatFork } from "@/lib/sideC
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import {
   appendReplyQuote,
+  joinParagraphs,
   removeReplyQuote,
   restoreReplyDraft,
   serializeReplyDraft,
@@ -523,13 +524,19 @@ function SideChatComposer({
   useEffect(() => {
     if (!fullSession || !failedSendDraft) return;
     const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
-    const failed = takeFailedSendDraft(
-      childId,
-      !!(current.text.trim() || current.files.length || current.quotes?.length),
-    );
+    const hasNewerInput = !!(current.text.trim() || current.files.length || current.quotes?.length);
+    const failed = takeFailedSendDraft(childId, hasNewerInput, true);
     if (!failed) return;
     const { accepted, errors } = validateAttachments(failed.files, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
+    if (hasNewerInput) {
+      updateComposer(childId, (draft) => ({
+        ...draft,
+        text: joinParagraphs([draft.text, failed.text]),
+        files: [...draft.files, ...accepted],
+      }));
+      return;
+    }
     updateComposer(childId, () => ({ text: failed.text, files: accepted }));
     // Track the displayed draft for delivery; filtered files require a fresh send ID.
     const entry = conversationRegistry.peek(childId)!;

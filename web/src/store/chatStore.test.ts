@@ -3966,14 +3966,14 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     });
   });
 
-  it("doesn't name the startup inputs a side chat's composer discarded", async () => {
+  it("doesn't name the startup inputs a composer discarded", async () => {
     onTestFinished(clearSessionDrafts);
     seedSession("conv_real");
     failManagedLaunch("conv_real", "saved on server");
     await useChatStore.getState().switchTo("conv_real");
     await settle();
 
-    // A side chat already holding text discards the recovered draft.
+    // A composer holding text that doesn't add recovered text after it discards the draft.
     expect(takeFailedSendDraft("conv_real", true)).toBeNull();
     await useChatStore.getState().send("something else", "agent_xyz");
     const [, sent] =
@@ -3997,9 +3997,17 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       answered: false,
       ran: false,
     },
+    { resend: "is denied by policy", command: false, answered: true, ran: false, denied: true },
+    {
+      resend: "is denied by policy as a skill command",
+      command: true,
+      answered: true,
+      ran: false,
+      denied: true,
+    },
   ])(
     "stops naming the startup inputs a resend replaced once it $resend",
-    async ({ command, answered, ran }) => {
+    async ({ command, answered, ran, denied }) => {
       onTestFinished(clearSessionDrafts);
       seedSession("conv_real");
       failManagedLaunch("conv_real", "saved on server");
@@ -4013,6 +4021,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
           posts.push(JSON.parse(String(init.body)));
           if (ran) sessionFailedInputs.delete("conv_real");
           if (!answered) return Promise.reject(new TypeError("Failed to fetch"));
+          if (denied) return mockResponse({ queued: false, denied: true });
         }
         return defaultFetchHandler(input, init);
       });
@@ -4025,7 +4034,8 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       expect(posts).toEqual([
         expect.objectContaining({ replaces_failed_inputs: ["pending_first"] }),
       ]);
-      // A command with no answer may have run, so it comes back only as the input the server kept.
+      // A denied resend, or a command with no answer that may have run, comes back as the input the
+      // server kept.
       expect(useChatStore.getState().failedSendDraft).toEqual(
         ran
           ? null
@@ -4044,41 +4054,92 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
-  it("drops a startup message's bubble when its send is answered after the launch failed", async () => {
+  it("doesn't hand back startup inputs an accepted resend replaced while they were read", async () => {
     seedSession("conv_real");
-    const native = { "omnigent.wrapper": "claude-code-native-ui" };
-    sessionLabels.set("conv_real", { "omnigent.startup": "pending", ...native });
+    failManagedLaunch("conv_real", "saved on server");
     await useChatStore.getState().switchTo("conv_real");
     await settle();
-    // Another participant sent the same text; only the viewer's input failed.
-    const content = [{ type: "input_text" as const, text: "follow up" }];
-    seedPendingInputs("conv_real", [{ pending_id: "pending_bob", content, created_by: "bob" }]);
-    const othersBubble: PendingUserMessage = { tempId: "pending_bob", content, author: "bob" };
-    useChatStore.setState({ pendingUserMessages: [othersBubble] });
-    let answer: (() => void) | undefined;
+    expect(takeFailedSendDraft("conv_real", false, true)?.text).toBe("saved on server");
+    let release: (() => void) | undefined;
     fetchMock.mockImplementation((input, init) => {
-      if (!String(input).endsWith("/v1/sessions/conv_real/events"))
+      if (release !== undefined || String(input) !== "/v1/sessions/conv_real/failed-inputs")
         return defaultFetchHandler(input, init);
+      // The read finds the input before the resend drops it, and answers after.
+      const found = defaultFetchHandler(input, init);
       return new Promise<Response>((resolve) => {
-        answer = () => resolve(mockResponse({ queued: true, pending_id: "pending_follow" }));
+        release = () => resolve(found);
       });
     });
-    const sending = useChatStore.getState().send("follow up", "agent_xyz");
-    await vi.waitFor(() => expect(answer).toBeDefined());
+    const staleRead = retryFailedStartupLookup("conv_real");
+    await vi.waitFor(() => expect(release).toBeDefined());
 
-    sessionLabels.set("conv_real", { "omnigent.startup": "failed", ...native });
-    sessionFailedInputs.set("conv_real", [{ pending_id: "pending_follow", content }]);
-    handleSessionEvent(
-      { type: "session_status", conversationId: "conv_real", status: "failed" },
-      "conv_real",
-    );
-    await settle();
-    expect(useChatStore.getState().failedSendDraft?.text).toBe("follow up");
-    answer!();
-    await sending;
+    sessionFailedInputs.delete("conv_real");
+    await useChatStore.getState().send("saved on server", "agent_xyz");
+    release!();
+    await staleRead;
 
-    expect(useChatStore.getState().pendingUserMessages).toEqual([othersBubble]);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().returnedStartupInputs).toEqual([]);
   });
+
+  it.each([
+    { outcome: "is answered", answered: true },
+    { outcome: "fails in transit", answered: false },
+  ])(
+    "leaves a startup message to its recovery when its send $outcome after the launch failed",
+    async ({ answered }) => {
+      seedSession("conv_real");
+      const native = { "omnigent.wrapper": "claude-code-native-ui" };
+      sessionLabels.set("conv_real", { "omnigent.startup": "pending", ...native });
+      await useChatStore.getState().switchTo("conv_real");
+      await settle();
+      // Another participant sent the same text; only the viewer's input failed.
+      const content = [{ type: "input_text" as const, text: "follow up" }];
+      seedPendingInputs("conv_real", [{ pending_id: "pending_bob", content, created_by: "bob" }]);
+      const othersBubble: PendingUserMessage = { tempId: "pending_bob", content, author: "bob" };
+      useChatStore.setState({ pendingUserMessages: [othersBubble] });
+      let stableId: string | undefined;
+      let answer: (() => void) | undefined;
+      fetchMock.mockImplementation((input, init) => {
+        if (!String(input).endsWith("/v1/sessions/conv_real/events"))
+          return defaultFetchHandler(input, init);
+        stableId = JSON.parse(String(init?.body)).data.stable_id;
+        return new Promise<Response>((resolve, reject) => {
+          answer = () =>
+            answered
+              ? resolve(mockResponse({ queued: true, pending_id: "pending_follow" }))
+              : reject(new TypeError("Failed to fetch"));
+        });
+      });
+      const sending = useChatStore.getState().send("follow up", "agent_xyz");
+      await vi.waitFor(() => expect(answer).toBeDefined());
+
+      sessionLabels.set("conv_real", { "omnigent.startup": "failed", ...native });
+      sessionFailedInputs.set("conv_real", [
+        { pending_id: "pending_first", content: [{ type: "input_text", text: "saved on server" }] },
+        { pending_id: "pending_follow", content, item_id: stableId },
+      ]);
+      handleSessionEvent(
+        { type: "session_status", conversationId: "conv_real", status: "failed" },
+        "conv_real",
+      );
+      await settle();
+      const recovered = {
+        conversationId: "conv_real",
+        text: "saved on server\n\nfollow up",
+        files: [],
+        startupInputIds: ["pending_first", "pending_follow"],
+        recovered: true,
+      };
+      expect(useChatStore.getState().failedSendDraft).toEqual(recovered);
+      answer!();
+      await sending;
+
+      expect(useChatStore.getState().failedSendDraft).toEqual(recovered);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([othersBubble]);
+      expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
+    },
+  );
 
   it("offers Retry when a failed launch's startup inputs can't be read back", async () => {
     seedSession("conv_real");

@@ -1098,6 +1098,8 @@ export interface ConversationState {
   startupPending: boolean;
   /** Pending ids of failed startup inputs already handed back to the composer. */
   returnedStartupInputs: string[];
+  /** Pending ids of failed startup inputs an accepted send replaced, so a stale read can't return them. */
+  replacedStartupInputs: string[];
   /**
    * Native MCP startup progress, cleared when startup settles or live
    * assistant text arrives. Failures/cancellations stay in host diagnostics,
@@ -1744,9 +1746,10 @@ const sendChains = new Map<string | symbol, SendChain>();
 
 /**
  * Sends whose POST has not settled, by stable id, flagged `true` once a live
- * `session_input_consumed` named the id. Read by `send()`'s failure path: that
- * acknowledgement proves THIS attempt was taken even when the POST's answer is
- * lost and an earlier refused attempt's item already sits in the transcript.
+ * `session_input_consumed` named the id or a failed launch's recovery read it back.
+ * Read by `send()`'s failure path: either proves THIS attempt was taken even when
+ * the POST's answer is lost and an earlier refused attempt's item already sits in
+ * the transcript.
  */
 const inFlightSends = new Map<string, boolean>();
 
@@ -2217,6 +2220,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sandboxActionDismissed: null,
   startupPending: false,
   returnedStartupInputs: [],
+  replacedStartupInputs: [],
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
   abortController: null,
@@ -2961,9 +2965,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
         }));
       }
-      // Accepted, the server dropped the inputs this send named; denied, a later read offers them.
-      setterFor(sessionId)((s) =>
-        forgetReturnedStartupInputs(s, replacesFailedInputs.replaces_failed_inputs),
+      settleReplacedStartupInputs(
+        sessionId,
+        replacesFailedInputs.replaces_failed_inputs,
+        !!postResult.denied,
       );
       // Note: native-terminal messages return a `pending_id`, but the
       // optimistic bubble deliberately keeps its client temp id as its
@@ -3238,8 +3243,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
         }));
       }
-      setterFor(sessionId)((s) =>
-        forgetReturnedStartupInputs(s, replacesFailedInputs.replaces_failed_inputs),
+      settleReplacedStartupInputs(
+        sessionId,
+        replacesFailedInputs.replaces_failed_inputs,
+        !!postResult.denied,
       );
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
@@ -7827,6 +7834,23 @@ function forgetReturnedStartupInputs(
 }
 
 /**
+ * Settle the failed startup inputs a send named once the server answered it:
+ * accepted, it dropped them; denied, it kept them, so they come back now.
+ */
+function settleReplacedStartupInputs(
+  sessionId: string,
+  ids: string[] | undefined,
+  denied: boolean,
+): void {
+  if (!ids?.length) return;
+  setterFor(sessionId)((s) => ({
+    ...forgetReturnedStartupInputs(s, ids),
+    ...(denied ? {} : { replacedStartupInputs: [...s.replacedStartupInputs, ...ids] }),
+  }));
+  if (denied) void restoreFailedStartupInputs(sessionId);
+}
+
+/**
  * Hand the viewer's startup messages a failed managed launch left undelivered
  * back to the composer: drop the bubbles still showing them as sending and
  * restore their text after any draft already waiting there. Each is handed back
@@ -7847,6 +7871,7 @@ function returnFailedStartupInputs(
     | "pendingUserMessages"
     | "failedSendDraft"
     | "returnedStartupInputs"
+    | "replacedStartupInputs"
     | "blocks"
     | "pendingRetryStableId"
     | "restoredSendDraft"
@@ -7854,8 +7879,11 @@ function returnFailedStartupInputs(
   failedInputs: FailedInput[],
   unacknowledged: ReadonlySet<string>,
 ): Partial<ConversationState> {
+  // A read that began before an accepted resend can still list the inputs it replaced.
   const unreturned = failedInputs.filter(
-    (input) => !state.returnedStartupInputs.includes(input.pendingId),
+    (input) =>
+      !state.returnedStartupInputs.includes(input.pendingId) &&
+      !state.replacedStartupInputs.includes(input.pendingId),
   );
   // A send already handed back under its stable id, e.g. from the unanswered-send journal.
   const sentAs = (stableId: string | null | undefined) =>
@@ -8029,6 +8057,9 @@ async function listFailedStartupInputs(
   try {
     const inputs = await listFailedInputs(conversationId, { signal });
     forgetUnsentSendSavedAsFailed(conversationId, inputs);
+    // A send awaiting its answer that the server saved is handed back here, so its failure isn't.
+    for (const { itemId } of inputs)
+      if (itemId !== undefined && inFlightSends.has(itemId)) inFlightSends.set(itemId, true);
     return inputs;
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) return [];

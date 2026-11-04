@@ -22,7 +22,7 @@ export interface ComposerDraft {
   replyDraft?: StoredReplyDraft;
 }
 
-function joinParagraphs(parts: string[]): string {
+export function joinParagraphs(parts: string[]): string {
   return parts.reduce((joined, part) => {
     if (!joined || !part) return joined + part;
     const trailing = joined.match(/(?:\r?\n){1,2}$/)?.[0].match(/\n/g)?.length ?? 0;
