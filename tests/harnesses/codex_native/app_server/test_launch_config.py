@@ -1109,3 +1109,200 @@ async def test_codex_native_launch_config_reads_reasoning_effort(
         config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
 
     assert config.reasoning_effort == expected
+
+
+@pytest.mark.parametrize(
+    ("overrides", "copied_model", "pinned_model", "expected_model"),
+    [
+        (['model_provider="openai"'], "system.ai.gateway-model", None, None),
+        (["model_provider = 'openai'"], "system.ai.gateway-model", None, None),
+        (["'model_provider' = \"openai\""], "system.ai.gateway-model", None, None),
+        (
+            ['model_provider="openai"', 'model_provider = "gateway"'],
+            "system.ai.gateway-model",
+            None,
+            "system.ai.gateway-model",
+        ),
+        (
+            ['model_provider="openai"', 'model = "gpt-picked"'],
+            "system.ai.gateway-model",
+            None,
+            "system.ai.gateway-model",
+        ),
+        (['model_provider="openai"'], "databricks-gpt-example", None, None),
+        (['model_provider="openai"'], "databricks/custom", None, None),
+        (['model_provider="openai"'], "gpt-account-model", None, "gpt-account-model"),
+        (['model_provider="gateway"'], "system.ai.gateway-model", None, "system.ai.gateway-model"),
+        ([], "system.ai.gateway-model", None, "system.ai.gateway-model"),
+        (
+            ['model_provider="openai"', 'model_provider="gateway"'],
+            "system.ai.gateway-model",
+            None,
+            "system.ai.gateway-model",
+        ),
+        (
+            ['model_provider="gateway"', 'model_provider="openai"'],
+            "system.ai.gateway-model",
+            None,
+            None,
+        ),
+        (
+            ['model_provider="openai"'],
+            "system.ai.gateway-model",
+            "gpt-chosen-model",
+            "gpt-chosen-model",
+        ),
+        (
+            ['model_provider="openai"'],
+            "system.ai.gateway-model",
+            "system.ai.explicit-model",
+            "system.ai.explicit-model",
+        ),
+    ],
+)
+async def test_unpinned_account_launch_drops_inherited_gateway_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: list[str],
+    copied_model: str,
+    pinned_model: str | None,
+    expected_model: str | None,
+) -> None:
+    """Private account launches must not inherit a model from an unrelated gateway."""
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    original = f'model = "{copied_model}"\n[profiles.other]\nmodel = "keep-profile-model"\n'
+    (source_home / "config.toml").write_text(original, encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
+    server.config_overrides = overrides
+    server.pinned_model = pinned_model
+    try:
+        await server.start()
+        private_config = tomllib.loads((server.codex_home / "config.toml").read_text())
+        assert private_config.get("model") == expected_model
+        assert private_config["profiles"]["other"]["model"] == "keep-profile-model"
+        assert (source_home / "config.toml").read_text() == original
+        if expected_model is None:
+            await server.close()
+            server.config_overrides = ['model_provider="gateway"']
+            await server.start()
+            restored = tomllib.loads((server.codex_home / "config.toml").read_text())
+            assert restored["model"] == copied_model
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        '"model" = "system.ai.gateway-model" # inherited model\n',
+        '  model = "system.ai.gateway-model"\n',
+        'developer_instructions = """\nmodel = "keep instructions"\n[keep brackets]\n"""\n'
+        'model = "system.ai.gateway-model"\n',
+        'model = "system.ai.gateway-model"\n  [profiles.other]\nmodel = "keep-profile-model"\n',
+    ],
+)
+def test_drop_inherited_gateway_model_preserves_private_config_values(
+    tmp_path: Path, original: str
+) -> None:
+    from omnigent.harnesses.codex_native.launch_args import materialize_codex_config_profile
+
+    source = tmp_path / "source.toml"
+    source.write_text(original)
+    private_home = tmp_path / "private"
+    private_home.mkdir()
+    config = private_home / "config.toml"
+    config.symlink_to(source)
+    expected = tomllib.loads(original)
+    del expected["model"]
+
+    materialize_codex_config_profile(
+        private_home,
+        tmp_path / "source-home",
+        None,
+        codex_version=None,
+        discard_gateway_model=True,
+    )
+
+    assert tomllib.loads(config.read_text()) == expected
+    assert not config.is_symlink()
+    assert source.read_text() == original
+
+
+def test_drop_inherited_gateway_model_preserves_config_when_publish_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native.launch_args import materialize_codex_config_profile
+
+    config = tmp_path / "config.toml"
+    original = 'model = "system.ai.gateway-model"\n'
+    config.write_text(original)
+
+    def fail_replace(*args: object) -> None:
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr("omnigent.harnesses.codex_native.launch_args.os.replace", fail_replace)
+    with pytest.raises(OSError, match="storage unavailable"):
+        materialize_codex_config_profile(
+            tmp_path,
+            tmp_path / "source-home",
+            None,
+            codex_version=None,
+            discard_gateway_model=True,
+        )
+
+    assert config.read_text() == original
+    assert list(tmp_path.iterdir()) == [config]
+
+
+@pytest.mark.parametrize("private_model", [None, "gpt-edited-model"])
+@pytest.mark.parametrize("config_profile", ["file", "inline"])
+async def test_unpinned_account_launch_drops_gateway_model_from_selected_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_profile: str, private_model: str | None
+) -> None:
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    base = source_home / "config.toml"
+    base.write_text('model = "gpt-base-model"\n')
+    profile = 'model = "system.ai.gateway-model"\n'
+    if config_profile == "file":
+        (source_home / "work.config.toml").write_text(profile)
+    else:
+        base.write_text(base.read_text() + "[profiles.work]\n" + profile)
+    originals = {path: path.read_text() for path in source_home.iterdir()}
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    if config_profile == "inline":
+
+        async def legacy_codex_version(_path: str) -> tuple[int, int, int]:
+            return (0, 133, 0)
+
+        monkeypatch.setattr(
+            "omnigent.harnesses.codex_native.app_server._codex_cli_version", legacy_codex_version
+        )
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
+    server.config_profile = "work"
+    server.config_overrides = ['model_provider="openai"']
+    try:
+        await server.start()
+        private_config = tomllib.loads((server.codex_home / "config.toml").read_text())
+        assert "model" not in private_config
+        await server.close()
+        await server.start()
+        assert "model" not in tomllib.loads((server.codex_home / "config.toml").read_text())
+        await server.close()
+        if private_model is not None:
+            config_path = server.codex_home / "config.toml"
+            config = tomlkit.parse(config_path.read_text())
+            config["model"] = private_model
+            config_path.write_text(tomlkit.dumps(config))
+        server.config_profile = None
+        await server.start()
+        assert tomllib.loads((server.codex_home / "config.toml").read_text())["model"] == (
+            private_model or "gpt-base-model"
+        )
+        assert all(path.read_text() == original for path, original in originals.items())
+    finally:
+        await server.close()

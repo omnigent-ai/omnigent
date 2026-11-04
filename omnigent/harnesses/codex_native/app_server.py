@@ -385,6 +385,23 @@ def _codex_mcp_server_config_section(
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
+def _discard_inherited_gateway_model(model: str | None, overrides: Sequence[str]) -> bool:
+    """Only unpinned launches explicitly selecting the account route drop gateway defaults."""
+    if model is not None:
+        return False
+    provider: object = None
+    for override in overrides:
+        key = override.partition("=")[0].strip().strip("\"'")
+        if key == "model":
+            return False
+        if key == "model_provider":
+            try:
+                provider = tomlkit.parse(override).get("model_provider")
+            except tomlkit.exceptions.TOMLKitError:
+                return False
+    return provider == "openai"
+
+
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     """
     Write *model* as the top-level ``model`` key in the session config.toml.
@@ -722,6 +739,7 @@ def _materialize_codex_profile_for_start(
     *,
     codex_version: tuple[int, int, int] | None,
     agent_instructions: str | None = None,
+    discard_gateway_model: bool = False,
 ) -> bool:
     """Materialize one profile after restoring the prior instruction base.
 
@@ -777,6 +795,7 @@ def _materialize_codex_profile_for_start(
         source_home,
         profile,
         codex_version=codex_version,
+        discard_gateway_model=discard_gateway_model,
     )
     return compose_profile_instructions
 
@@ -2605,6 +2624,9 @@ class CodexNativeAppServer:
             self.config_profile,
             codex_version=codex_version,
             agent_instructions=self.developer_instructions,
+            discard_gateway_model=_discard_inherited_gateway_model(
+                self.pinned_model, self.config_overrides
+            ),
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)

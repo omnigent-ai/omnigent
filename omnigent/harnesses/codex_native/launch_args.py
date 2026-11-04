@@ -16,6 +16,7 @@ from ftfy.fixes import fix_surrogates
 from tomlkit.exceptions import ParseError, TOMLKitError
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.models.model_override import is_databricks_model_id
 
 _CODEX_CONFIG_PATHS = (
     "agents.*.config_file",
@@ -455,6 +456,7 @@ def materialize_codex_config_profile(
     profile: str | None,
     *,
     codex_version: tuple[int, int, int] | None,
+    discard_gateway_model: bool = False,
 ) -> None:
     """Fold the selected user profile into the private user layer, below project/CLI.
 
@@ -462,10 +464,11 @@ def materialize_codex_config_profile(
     so switching/removing a profile on restart is reversible. Private TUI edits
     survive profile removal; selected profiles still take precedence over them.
     Journal atomic file replacements so interrupted updates can be retried.
-    Never modify the source home.
+    Never modify the source home. Account launches can omit an inherited gateway
+    model from the applied layer while retaining its base for later route changes.
     """
     state_path = codex_home / ".omnigent-config-profile.toml"
-    if profile is None and not state_path.exists():
+    if profile is None and not state_path.exists() and not discard_gateway_model:
         return
     if codex_home.resolve() == source_home.resolve():
         raise ValueError("Codex profiles require a private CODEX_HOME")
@@ -494,6 +497,12 @@ def materialize_codex_config_profile(
             merged.pop("default_permissions", None)
     else:
         profile_instructions = _MISSING
+    if discard_gateway_model:
+        model = merged.get("model")
+        if isinstance(model, str) and is_databricks_model_id(model):
+            merged.pop("model")
+        elif profile is None and not state_path.exists():
+            return
     rendered_config = copy.deepcopy(merged)
     effective_instructions = (
         profile_instructions if profile_instructions is not _MISSING else current_instructions
