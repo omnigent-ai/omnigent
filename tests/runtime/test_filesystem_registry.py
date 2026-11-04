@@ -535,30 +535,31 @@ def test_changes_read_a_file_again_only_after_it_may_have_changed(
 
     monkeypatch.setattr(os, "open", counting_open)
 
-    # A file written just now could change again without a new timestamp.
-    monkeypatch.setattr(filesystem_registry, "_RACY_NS", float("inf"))
+    written = os.stat(target)
+    settled_at = max(written.st_mtime_ns, written.st_ctime_ns)
+    # A file written within two seconds could change again without a new timestamp.
+    monkeypatch.setattr(time, "time_ns", lambda: settled_at + 2_000_000_000)
     for _ in range(2):
         assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == []
     assert len(opened) == 2
 
-    monkeypatch.setattr(filesystem_registry, "_RACY_NS", float("-inf"))
+    monkeypatch.setattr(time, "time_ns", lambda: settled_at + 2_000_000_001)
     for _ in range(2):
         assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == []
     assert len(opened) == 3
 
-    compared = os.stat(target)
     # Both keep the size and modification time; only ctime or the inode shows the change.
     if change == "rewritten-in-place":
         # Coarse timestamps can repeat within a clock tick, so rewrite until ctime moves.
         deadline = time.monotonic() + 10
-        while os.stat(target).st_ctime_ns == compared.st_ctime_ns:
-            assert time.monotonic() < deadline, f"ctime stayed at {compared.st_ctime_ns}"
+        while os.stat(target).st_ctime_ns == written.st_ctime_ns:
+            assert time.monotonic() < deadline, f"ctime stayed at {written.st_ctime_ns}"
             target.write_text("changed!\n")
-            os.utime(target, ns=(compared.st_atime_ns, compared.st_mtime_ns))
+            os.utime(target, ns=(written.st_atime_ns, written.st_mtime_ns))
     else:
         replacement = registry.cwd / "replacement"
         replacement.write_text("changed!\n")
-        os.utime(replacement, ns=(compared.st_atime_ns, compared.st_mtime_ns))
+        os.utime(replacement, ns=(written.st_atime_ns, written.st_mtime_ns))
         os.replace(replacement, target)
 
     listed = registry.list_changed_files(conv_id, limit=10, check_disk=True)
