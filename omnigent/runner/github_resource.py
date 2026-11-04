@@ -685,6 +685,22 @@ def _commit_lookup_repo(root: str) -> str | None:
     return _remote_nwo(root, "origin")
 
 
+def _contained_in_base_branch(root: str, sha: str, base_repo: str, base_ref: str) -> bool:
+    """Whether a local tracking ref of ``base_repo``'s ``base_ref`` contains ``sha``."""
+    rc, out, _ = _git(["remote"], cwd=root)
+    if rc != 0:
+        return False
+    for remote in out.split():
+        nwo = _remote_nwo(root, remote)
+        if nwo is None or nwo.lower() != base_repo.lower():
+            continue
+        tracking_ref = f"refs/remotes/{remote}/{base_ref}"
+        rc, _, _ = _git(["merge-base", "--is-ancestor", sha, tracking_ref], cwd=root)
+        if rc == 0:
+            return True
+    return False
+
+
 def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int, str] | None:
     """Resolve ``(PR number, base owner/repo)`` by pushed-commit identity, or ``None``.
 
@@ -699,12 +715,32 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     Only **open** PRs are accepted. For a commit already on the default branch
     (master/main, or any merged tip) the endpoint returns the *merged* PR that
     introduced it, which is a false positive — never the branch's own outgoing
-    PR — so a closed/merged row is skipped rather than surfaced.
+    PR — so a closed/merged row is skipped rather than surfaced. Open rows are
+    false positives too when the queried fork's default branch lags the base:
+    GitHub then lists every open PR that merges the base past the commit. So an
+    open row is skipped when the commit is already on that PR's base branch
+    locally (:func:`_contained_in_base_branch`).
     """
     shas = _head_commit_shas(root)
     repo = _commit_lookup_repo(root)
     if not shas or not repo:
         return None
+    on_base_branch: dict[tuple[str, str, str], bool] = {}
+
+    def _is_candidate(row: Any, sha: str) -> bool:
+        if not isinstance(row, dict) or str(row.get("state", "")).lower() != "open":
+            return False
+        base = row.get("base")
+        base_ref = base.get("ref") if isinstance(base, dict) else None
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        base_full = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+        if not isinstance(base_ref, str) or not isinstance(base_full, str):
+            return True
+        key = (sha, base_full.lower(), base_ref)
+        if key not in on_base_branch:
+            on_base_branch[key] = _contained_in_base_branch(root, sha, base_full, base_ref)
+        return not on_base_branch[key]
+
     for sha in shas:
         rc, out, _ = _gh(["api", f"repos/{repo}/commits/{sha}/pulls"], cwd=root, token=token)
         if rc != 0:
@@ -716,16 +752,10 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
         if not isinstance(rows, list) or not rows:
             continue
 
-        def _is_open(row: Any) -> bool:
-            return isinstance(row, dict) and str(row.get("state", "")).lower() == "open"
-
-        # Accept only an OPEN PR. On the default branch (and any branch whose tip
-        # is already merged) this endpoint returns the *merged* PR that introduced
-        # the commit — a false positive, since it's not the branch's own outgoing
-        # PR. A genuine fallback hit (a fork / renamed branch gh can't name) is
-        # always open, so a closed row is never the PR we want; skip it rather
-        # than falling back to the first row.
-        chosen = next((r for r in rows if _is_open(r)), None)
+        # Accept only an OPEN PR that adds the commit beyond its base branch. Merged
+        # rows, and others' PRs listed because the fork's default branch lags, aren't
+        # this branch's own PR; skip them rather than falling back to the first row.
+        chosen = next((r for r in rows if _is_candidate(r, sha)), None)
         if chosen is None:
             continue
         number = chosen.get("number")

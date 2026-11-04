@@ -333,6 +333,35 @@ def test_resolve_pr_via_commit_rejects_closed_only(
     assert github_resource._resolve_pr_via_commit(str(repo)) is None
 
 
+def test_resolve_pr_via_commit_skips_checkout_on_up_to_date_base(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fork whose default branch lags lists others' open PRs for the base tip.
+
+    Only a branch with commits beyond the base branch has a PR of its own.
+    """
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    _run(["git", "update-ref", "refs/remotes/upstream/main", "main"], repo)
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if argv[0] == "api" and argv[1].startswith("repos/acme-dev/repo/commits/"):
+            row = {
+                "number": 270,
+                "state": "open",
+                "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+            }
+            return (0, json.dumps([row]), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+    _run(["git", "checkout", "-q", "main"], repo)
+    assert github_resource._resolve_pr_via_commit(str(repo)) is None
+
+
 def test_resolve_pr_via_commit_none_without_repo(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
