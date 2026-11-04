@@ -187,9 +187,21 @@ records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
 never finds a recorded session it cannot continue. Of two first runs, the one that records
 second deletes its unused session and records `skipped`.
+Sandbox tasks accept an optional repository URL in `workspace`, validated with
+the same repository grammar as a new sandbox session. The selected repository is
+passed to sandbox launch and recorded in the session's repository labels for
+relaunch. `host_id` remains forbidden. The API advertises this support as
+`scheduled_task_sandbox_workspaces`; older servers reject sandbox workspaces.
+Selecting Provider default clears a repository pin with `workspace: null`.
+Edits also clear legacy directory pins without resetting an unchanged continued
+session, since those pins already use the provider default.
+Switching execution targets clears the old workspace unless the request supplies
+a replacement, since connected-host paths and repository URLs are different inputs.
+
 A sandbox task's first run starts its sandbox under the task's host ID. If that
 host already exists, left by a reset session, the new session joins it in that
-session's workspace, or replaces its sandbox when that session is unknown.
+session's workspace, or replaces its sandbox when that session is unknown or
+the selected repository changed.
 
 Known failures record `failed` with the same `error_code` as legacy fires, such as
 `host_offline` or `launch_failed`. A managed launch records where it failed instead:
@@ -750,9 +762,9 @@ UI events use the host-provided `OmnigentHostConfig.analytics` sink:
 | UI creation attempts, successes, failures, latency | `interactionKind=create_scheduled_task`: `phase=start`, then `phase=complete` with `status=success` or `failure` and duration. `name` is the template ID. |
 | UI / agent / API share | `scheduled_task_created` grouped by `creation_source`. |
 
-Template IDs are bounded: `custom`, `jira`, `slack`, `github`,
+Template IDs are bounded: `custom`, `jira`, `slack`, `github`, `linear`,
 `follow-up-monitor`, `pr-sweep`, `news-digest`, or server-side `unknown` for
-unattributed/older clients. The current gallery offers Jira, Slack, and GitHub;
+unattributed/older clients. The current gallery offers Jira, Slack, GitHub, and Linear;
 the three retired suggestion IDs remain accepted for older clients. Attribution records the selected template even if
 its prompt is edited. No task name, prompt, Jira query, channel, or repository
 text is recorded in these events. Attribution headers are diagnostic client claims;

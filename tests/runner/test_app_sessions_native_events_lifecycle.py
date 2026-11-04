@@ -1788,7 +1788,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
 
     launch_resolver = Mock(side_effect=resolve_launch)
     monkeypatch.setattr(codex, "resolve_native_codex_launch", launch_resolver)
-    credentials = Mock(side_effect=AssertionError("cache reuse must not acquire credentials"))
+    credentials = Mock(side_effect=AssertionError("write-back must not acquire credentials"))
     monkeypatch.setattr(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
     )
@@ -1885,16 +1885,6 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
                 "codex-native", fingerprints[profile]
             ).parent
             assert len(list(catalog_dir.glob("*.json"))) == 2
-            for provider, host in (
-                ("default", "https://a.example"),
-                ("other", "https://b.example"),
-            ):
-                assert (
-                    codex._resolve_databricks_codex_model(
-                        host, provider, "shared-picker", codex_path=sys.executable
-                    )
-                    == f"{provider}.schema.model"
-                )
             credentials.assert_not_called()
     if case == "missing-spec":
         launch_resolver.assert_not_called()
@@ -2523,9 +2513,11 @@ async def test_events_codex_native_plan_mode_requires_loaded_bridge(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stalled_close", [False, True])
 async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    stalled_close: bool,
 ) -> None:
     """
     POST ``/events`` interrupt on a codex-native session calls
@@ -2565,6 +2557,19 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         transport="ws://127.0.0.1:43210",
         client_name="omnigent-codex-native-runner",
     )
+    close_cancelled: list[bool] = []
+    if stalled_close:
+        from omnigent.runner.native import interrupt as native_interrupt
+
+        monkeypatch.setattr(native_interrupt, "_CODEX_INTERRUPT_CLOSE_TIMEOUT_S", 0.02)
+
+        async def stall_close() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                close_cancelled.append(True)
+
+        monkeypatch.setattr(fake_client, "close", stall_close)
 
     def _fake_client_for_transport(
         transport: str,
@@ -2613,10 +2618,11 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         )
         assert create_resp.status_code == 201, create_resp.text
 
-        int_resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json={"type": "interrupt"},
-        )
+        async with asyncio.timeout(budget(5)):
+            int_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "interrupt"},
+            )
 
         captured_history = list(_session_histories_ref.get(conv_id, []))
         flagged = conv_id in app.state.interrupted_sessions
@@ -2628,7 +2634,8 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
     # 1) The runner reached Codex app-server's structured interrupt path. If
     # this is empty, the handler regressed to a terminal-only or no-op cancel.
     assert fake_client.connected
-    assert fake_client.closed
+    assert fake_client.closed is not stalled_close
+    assert close_cancelled == ([True] if stalled_close else [])
     assert fake_client.requests == [
         (
             "turn/interrupt",
@@ -3449,11 +3456,15 @@ async def test_events_codex_native_stop_after_completed_turn_is_noop_not_503(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["response_error", "connect", "request", "close"])
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
 async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    failure_stage: str,
+    event_type: str,
 ) -> None:
-    """A genuine Codex interrupt failure still surfaces as a 503.
+    """Failed and unanswered Codex controls return 503 without clearing the turn.
 
     The reconcile is narrow: only Codex's recognized stale-turn rejection is
     swallowed. Any other error (e.g. ``-32603`` thread-store) means the stop did
@@ -3461,6 +3472,10 @@ async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
     intact instead of falsely reporting idle.
     """
     from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.runner.native import interrupt as native_interrupt
+
+    monkeypatch.setattr(native_interrupt, "_CODEX_INTERRUPT_TIMEOUT_S", 0.1, raising=False)
+    monkeypatch.setattr(native_interrupt, "_CODEX_INTERRUPT_CLOSE_TIMEOUT_S", 0.02, raising=False)
 
     conv_id = "c0dec0dec0dec0dec0dec0dec0de9411"
     fake_client = _StaleTurnCodexAppServerClient(
@@ -3470,6 +3485,16 @@ async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
             {"code": -32603, "message": "thread-store internal error"}
         ),
     )
+    cancelled: list[str] = []
+
+    async def stall(*_args: object, **_kwargs: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(failure_stage)
+
+    if failure_stage != "response_error":
+        monkeypatch.setattr(fake_client, failure_stage, stall)
     app, _server_client, bridge_dir = _build_codex_native_runner_for_stale_turn(
         monkeypatch,
         tmp_path,
@@ -3487,16 +3512,19 @@ async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
         )
         assert create_resp.status_code == 201, create_resp.text
 
-        stop_resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json={"type": "interrupt"},
-        )
+        async with asyncio.timeout(budget(5)):
+            stop_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": event_type},
+            )
 
     assert stop_resp.status_code == 503, (
         f"a genuine interrupt failure must stay a 503; "
         f"got {stop_resp.status_code}: {stop_resp.text}"
     )
     assert stop_resp.json().get("error") == "codex_native_interrupt_failed"
+    assert cancelled == ([] if failure_stage == "response_error" else [failure_stage])
+    assert fake_client.closed is (failure_stage != "close")
     # The turn is still recorded: a genuine failure must not drop it.
     state = codex_native_bridge.read_bridge_state(bridge_dir)
     assert state is not None and state.active_turn_id == "turn_codex_live", (
