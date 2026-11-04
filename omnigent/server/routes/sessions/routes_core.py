@@ -3680,52 +3680,38 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        # Unknown and foreign projects both return 404 to avoid leaking existence.
-        if set_project:
+        if set_project or family_pin_value is not None:
             members = await asyncio.to_thread(conversation_store.get_session_family, session_id)
-            for member in members:
-                await _require_access(
-                    user_id, member.id, LEVEL_OWNER, permission_store, conversation_store
-                )
-            # Reject explicit null; omitting the field leaves membership unchanged.
-            if body.project_id is None:
+            if family_pin_value is not None and (conv is None or conv.family_id is None):
+                raise OmnigentError("Session has no family", code=ErrorCode.INVALID_INPUT)
+            active = [member for member in members if not member.archived]
+            if members and (active or members)[0].id != session_id:
                 raise OmnigentError(
-                    'project_id must be a project id or "" to unfile; '
-                    "omit the field to leave membership unchanged",
-                    code=ErrorCode.INVALID_INPUT,
+                    "Only the family representative can move or pin the family",
+                    code=ErrorCode.CONFLICT,
                 )
-            target_project_id = body.project_id
-            if target_project_id == "":
-                unfiled = await asyncio.to_thread(
-                    conversation_store.set_conversation_project, session_id, None
-                )
-                if not unfiled:
-                    raise _session_not_found()
-            else:
-                if project_store is None:
+            if set_project:
+                for member in members:
+                    await _require_access(
+                        user_id, member.id, LEVEL_OWNER, permission_store, conversation_store
+                    )
+                if body.project_id is None:
                     raise OmnigentError(
-                        "Filing a session into a project is not supported by this server",
+                        'project_id must be a project id or "" to unfile; '
+                        "omit the field to leave membership unchanged",
                         code=ErrorCode.INVALID_INPUT,
                     )
-                owned = await asyncio.to_thread(
-                    project_store.get, target_project_id, user_id=user_id
-                )
-                if owned is None:
-                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-                filed = await asyncio.to_thread(
-                    conversation_store.set_conversation_project,
-                    session_id,
-                    target_project_id,
-                )
-                if not filed:
-                    raise _session_not_found()
-        if family_pin_value is not None:
-            await asyncio.to_thread(
-                conversation_store.set_family_pin,
-                session_id,
-                family_pin_value,
-                user_id=user_id,
-            )
+                if body.project_id:
+                    if project_store is None:
+                        raise OmnigentError(
+                            "Filing a session into a project is not supported by this server",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
+                    owned = await asyncio.to_thread(
+                        project_store.get, body.project_id, user_id=user_id
+                    )
+                    if owned is None:
+                        raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         update_result = await asyncio.to_thread(
             conversation_store.update_conversation_with_changes,
             session_id,
@@ -3744,7 +3730,6 @@ def register_core_routes(
             # an omitted field leaves it unchanged; True/False set or clear it.
             share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
-            archived=body.archived,
             label_updates=(
                 {EFFORT_RESET_LABEL: "true" if clear_effort else "false"}
                 if defer_side_settings and (clear_effort or effort is not None)
@@ -3766,34 +3751,6 @@ def register_core_routes(
                     if key in body.model_fields_set
                 },
             )
-        # Archiving hides the session from the default view (and its unread
-        # dot), so drop its per-user read-state to bound in-memory growth.
-        # Only on archive→true; unarchiving leaves it pruned (reads as seen).
-        if body.archived is True:
-            _prune_session_read_state(session_id)
-            # Defer the stop now that the flag is committed, so a request
-            # rejected after this point can't leave a live runner on a session
-            # that ends up archived. Detached, not awaited: the response must
-            # not wait out the stop's per-runner timeouts (seconds against a
-            # wedged or asleep runner). The teardown sleeps past the Undo
-            # window, then re-reads the archived flag and skips if undone, so
-            # undoing keeps the runner alive. Archive has no client-side stop,
-            # so this also carries the host-runner teardown.
-            _spawn_archive_stop(
-                session_id,
-                conversation_store,
-                runner_router,
-                getattr(request.app.state, "host_registry", None),
-                delete_worktree=body.delete_worktree,
-                host_store=getattr(request.app.state, "host_store", None),
-            )
-        elif body.archived is False:
-            # Unarchive (including Undo, which re-PATCHes archived=false within
-            # the pill's window): cancel a still-pending archive stop so the
-            # runner is kept alive instead of torn down for a session the user
-            # decided to keep. Same-replica fast path; the deferred stop's
-            # archived-flag re-check covers a cross-replica Undo.
-            _cancel_pending_archive_stop(session_id)
         # The runner applies native settings live. Silent startup metadata
         # writes skip both recovery and forwarding to avoid recursive launches.
         live_forward = not body.silent and not defer_side_settings
@@ -4042,6 +3999,48 @@ def register_core_routes(
                 _approval_result,
             )
             labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
+        if family_pin_value is not None:
+            await asyncio.to_thread(
+                conversation_store.set_family_pin, session_id, family_pin_value, user_id=user_id
+            )
+        if set_project:
+            filed = await asyncio.to_thread(
+                conversation_store.set_conversation_project, session_id, body.project_id or None
+            )
+            if not filed:
+                raise _session_not_found()
+        if body.archived is not None:
+            await asyncio.to_thread(
+                conversation_store.update_conversation, session_id, archived=body.archived
+            )
+        # Archiving hides the session from the default view (and its unread
+        # dot), so drop its per-user read-state to bound in-memory growth.
+        # Only on archive→true; unarchiving leaves it pruned (reads as seen).
+        if body.archived is True:
+            _prune_session_read_state(session_id)
+            # Defer the stop now that the flag is committed, so a request
+            # rejected after this point can't leave a live runner on a session
+            # that ends up archived. Detached, not awaited: the response must
+            # not wait out the stop's per-runner timeouts (seconds against a
+            # wedged or asleep runner). The teardown sleeps past the Undo
+            # window, then re-reads the archived flag and skips if undone, so
+            # undoing keeps the runner alive. Archive has no client-side stop,
+            # so this also carries the host-runner teardown.
+            _spawn_archive_stop(
+                session_id,
+                conversation_store,
+                runner_router,
+                getattr(request.app.state, "host_registry", None),
+                delete_worktree=body.delete_worktree,
+                host_store=getattr(request.app.state, "host_store", None),
+            )
+        elif body.archived is False:
+            # Unarchive (including Undo, which re-PATCHes archived=false within
+            # the pill's window): cancel a still-pending archive stop so the
+            # runner is kept alive instead of torn down for a session the user
+            # decided to keep. Same-replica fast path; the deferred stop's
+            # archived-flag re-check covers a cross-replica Undo.
+            _cancel_pending_archive_stop(session_id)
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before

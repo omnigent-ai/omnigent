@@ -1260,6 +1260,12 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     from tests.server.integration.test_sessions_permissions import build_agent_bundle
 
     source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    invalid = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"project_id": "", "family_pinned": True}
+    )
+    assert invalid.status_code == 400
+    assert store.get_conversation(source["id"]).family_id is None
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("reader")
     permissions.grant("reader", source["id"], LEVEL_READ)

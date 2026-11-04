@@ -1929,7 +1929,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 members = self._family_member_ids(session, family_id)
                 if len(set(members) | {source_id, session_id}) > MAX_SESSION_FAMILY_MEMBERS:
                     raise OmnigentError(
-                        "A family supports up to 100 sessions", code=ErrorCode.INVALID_INPUT
+                        f"A family supports up to {MAX_SESSION_FAMILY_MEMBERS} sessions",
+                        code=ErrorCode.INVALID_INPUT,
                     )
                 if self._conv_engine is self._engine:
                     copy_labels(
