@@ -2893,7 +2893,7 @@ def test_reattach_auth_rejection_without_renewal(
     seen_auth: list[str] = []
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del timeout
             self._headers = headers
 
@@ -2960,7 +2960,7 @@ def test_reattach_auth_lapse_retry_stops_at_deadline(
     attempts = {"n": 0}
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _Client:

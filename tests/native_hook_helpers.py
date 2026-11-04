@@ -57,7 +57,7 @@ def make_verdict_client(verdict: dict[str, object]) -> type:
     body = json.dumps(verdict)
 
     class _VerdictHttpxClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _VerdictHttpxClient:

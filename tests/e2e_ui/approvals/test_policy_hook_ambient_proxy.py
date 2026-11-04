@@ -372,7 +372,6 @@ def test_native_claude_prompt_survives_ambient_proxy(
         _type_into_tui(page, _turn_prompt(1, f"usr-{uuid.uuid4().hex[:8]}", token))
 
         outcome, pane = _wait_turn_outcome(page, live_server, session_id, token)
-        page.wait_for_timeout(3_000)
         if outcome == "blocked":
             raise AssertionError(
                 "Bug reproduced: the UserPromptSubmit policy hook posted its loopback callback "
