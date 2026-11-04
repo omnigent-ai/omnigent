@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  combineTriggerPrompt,
   compileGithubQuery,
   compileJiraJql,
   describeLinearFilter,
   describeSlackFilter,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
+  splitTriggerPrompt,
   splitJqlOrderBy,
   triggerFieldsComplete,
+  TRIGGER_SOURCES,
   type TriggerCondition,
   type TriggerFields,
   type TriggerPromptContext,
@@ -33,6 +36,38 @@ function fields(overrides: Partial<TriggerFields> = {}): TriggerFields {
 }
 
 const JQL = 'project = "ES" AND labels = "omnigent"';
+
+describe("saved trigger prompts", () => {
+  it.each(TRIGGER_SOURCES)("separates %s instructions and preserves the saved prompt", (source) => {
+    const original = renderTriggerPrompt(source, fields(), CTX);
+    const parts = splitTriggerPrompt(original);
+    expect(parts.userPrompt).toBe("Investigate the ticket.");
+    expect(parts.systemPrompt).toContain("This automation watches");
+    expect(parts.systemPrompt).not.toContain(parts.userPrompt);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(original);
+    expect(combineTriggerPrompt("Updated instructions.", parts.systemPrompt)).toBe(
+      original.replace(parts.userPrompt, "Updated instructions."),
+    );
+  });
+
+  it("reopens edits to both the system instructions and posting instructions", () => {
+    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields(), CTX));
+    const systemPrompt = parts.systemPrompt!.replace("Sent with Omnigent", "Automated reply");
+    expect(splitTriggerPrompt(combineTriggerPrompt("New user prompt.", systemPrompt))).toEqual({
+      userPrompt: "New user prompt.",
+      systemPrompt,
+    });
+  });
+
+  it.each([
+    "A plain prompt\nwith multiple lines.",
+    "\n\nInstructions for each session:\nNo system instructions.",
+    "System\n\nInstructions for each session:\nAmbiguous\n\nInstructions for each session:\ntext",
+  ])("keeps an unrecognized or ambiguous prompt intact", (prompt) => {
+    expect(splitTriggerPrompt(prompt)).toEqual({ userPrompt: prompt, systemPrompt: null });
+    expect(combineTriggerPrompt(prompt, null)).toBe(prompt);
+  });
+});
 
 describe("triggerFieldsComplete", () => {
   // Instructions are capped so each worker's first message has room for the item.

@@ -35,8 +35,10 @@ import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import {
+  combineTriggerPrompt,
   emptyTriggerFields,
   renderTriggerPrompt,
+  splitTriggerPrompt,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
   type TriggerFields,
@@ -133,6 +135,9 @@ export function CreateScheduledTaskDialog({
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
+  const [systemPromptOpen, setSystemPromptOpen] = useState(false);
+  const [editingSystemPrompt, setEditingSystemPrompt] = useState(false);
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
 
@@ -297,11 +302,15 @@ export function CreateScheduledTaskDialog({
   useEffect(() => {
     if (open && !wasOpen.current) {
       setAdvancedOpen(true);
+      setSystemPromptOpen(false);
+      setEditingSystemPrompt(false);
+      const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
+      setPrompt(parts.userPrompt);
+      setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
         const parsedSchedule = savedSchedule;
         setName(editingTask.name);
-        setPrompt(editingTask.prompt);
         setPickedAgentId(editingTask.agentId);
         // Prefill the model/effort/permission controls from the loaded task; null → "".
         setPickedModel(editingTask.modelOverride ?? "");
@@ -320,7 +329,6 @@ export function CreateScheduledTaskDialog({
         setTrigger(null);
       } else {
         setName(initialTrigger ? TRIGGER_TEMPLATES[initialTrigger].name : (initialName ?? ""));
-        setPrompt(initialPrompt ?? "");
         setPickedAgentId(null);
         setPickedModel("");
         setPickedEffort("");
@@ -488,13 +496,16 @@ export function CreateScheduledTaskDialog({
           effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
         })
       : "";
-  const effectivePrompt = trigger !== null ? renderedTriggerPrompt : prompt;
+  const effectivePrompt =
+    trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
   const canSubmit =
     name.trim() !== "" &&
     effectivePrompt.trim() !== "" &&
+    (trigger !== null || prompt.trim() !== "") &&
+    (systemPrompt === null || systemPrompt.trim() !== "") &&
     (isEdit || effectiveAgentId !== null) &&
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
@@ -505,6 +516,7 @@ export function CreateScheduledTaskDialog({
   function resetForm() {
     setName("");
     setPrompt("");
+    setSystemPrompt(null);
     setPickedAgentId(null);
     setPickedModel("");
     setPickedEffort("");
@@ -723,13 +735,19 @@ export function CreateScheduledTaskDialog({
               onSelectOpenChange={handleSelectOpenChange}
               renderedPrompt={renderedTriggerPrompt}
               onEditAsPrompt={() => {
-                setPrompt(renderedTriggerPrompt);
+                const parts = splitTriggerPrompt(renderedTriggerPrompt);
+                setPrompt(parts.userPrompt);
+                setSystemPrompt(parts.systemPrompt);
+                setSystemPromptOpen(false);
+                setEditingSystemPrompt(false);
                 setTrigger(null);
               }}
             />
           ) : (
             <div className="flex flex-col gap-1.5">
-              <Label htmlFor="task-prompt">Prompt</Label>
+              <Label htmlFor="task-prompt">
+                {systemPrompt === null ? "Prompt" : "Your prompt"}
+              </Label>
               <Textarea
                 id="task-prompt"
                 value={prompt}
@@ -741,6 +759,49 @@ export function CreateScheduledTaskDialog({
                 className="resize-none text-ui"
                 onChange={(e) => setPrompt(e.target.value)}
               />
+              {systemPrompt !== null && (
+                <Collapsible
+                  open={systemPromptOpen}
+                  onOpenChange={(expanded) => {
+                    setSystemPromptOpen(expanded);
+                    setEditingSystemPrompt(false);
+                  }}
+                  className="mt-2 rounded-md border border-border p-3"
+                >
+                  <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2 rounded-sm text-ui text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+                    <ChevronDownIcon className="size-4 transition-transform group-data-[state=closed]:-rotate-90" />
+                    System prompt
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="space-y-2 pt-3">
+                    <p className="text-sm text-muted-foreground">
+                      Instructions for how the automation runs. Your prompt is added separately.
+                    </p>
+                    {editingSystemPrompt ? (
+                      <Textarea
+                        aria-label="System prompt"
+                        value={systemPrompt}
+                        rows={8}
+                        className="max-h-80 resize-y text-ui"
+                        componentId="tasks.scheduled.system_prompt"
+                        onChange={(event) => setSystemPrompt(event.target.value)}
+                      />
+                    ) : (
+                      <pre className="max-h-56 overflow-y-auto rounded-md bg-muted/40 p-2 font-sans text-sm whitespace-pre-wrap break-words">
+                        {systemPrompt}
+                      </pre>
+                    )}
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      componentId="tasks.scheduled.edit_system_prompt"
+                      onClick={() => setEditingSystemPrompt(!editingSystemPrompt)}
+                    >
+                      {editingSystemPrompt ? "Done editing system prompt" : "Edit system prompt"}
+                    </Button>
+                  </CollapsibleContent>
+                </Collapsible>
+              )}
             </div>
           )}
 

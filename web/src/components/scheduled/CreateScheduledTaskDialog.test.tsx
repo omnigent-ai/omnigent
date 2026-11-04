@@ -33,6 +33,7 @@ import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import { emptyTriggerFields, renderTriggerPrompt, splitTriggerPrompt } from "./triggerTemplates";
 
 const gitWorkspace = vi.hoisted(() => ({
   available: true as boolean | undefined,
@@ -2438,7 +2439,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
   });
 
-  it("hands the rendered prompt to the plain Prompt field on Edit as prompt", async () => {
+  it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
     const warning = screen.getByTestId("task-trigger-untrusted-note");
@@ -2451,13 +2452,98 @@ describe("CreateScheduledTaskDialog trigger template", () => {
 
     expect(screen.queryByTestId("task-trigger-fields")).toBeNull();
     const prompt = screen.getByTestId("task-prompt-input") as HTMLTextAreaElement;
-    expect(prompt.value).toContain("repo:acme/app is:pr created:>=<that time>");
+    expect(prompt.value).toBe("Fix it.");
+    expect(screen.getByRole("button", { name: "System prompt" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
     // The kept session stays, but the user may now change it.
     expect(screen.getByTestId("task-session-mode-trigger")).toBeEnabled();
     const editedPrompt = `${prompt.value}\nOnly act on pull requests labeled ready.`;
     fireEvent.change(prompt, { target: { value: editedPrompt } });
-    expect(await submittedPrompt()).toBe(editedPrompt);
+    const submitted = await submittedPrompt();
+    expect(submitted).toContain("repo:acme/app is:pr created:>=<that time>");
+    expect(splitTriggerPrompt(submitted).userPrompt).toBe(editedPrompt);
     expect(mutateAsync.mock.calls[0][0].templateId).toBe("github");
+  });
+});
+
+describe("editing template prompts", () => {
+  const original = renderTriggerPrompt(
+    "jira",
+    { ...emptyTriggerFields("jira"), scope: "ENG", instructions: "Triage the ticket." },
+    { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
+  );
+
+  it("edits the user prompt while preserving collapsed system instructions", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ prompt: original })}
+      />,
+    );
+    expect(screen.getByLabelText("Your prompt")).toHaveValue("Triage the ticket.");
+    expect(screen.getByRole("button", { name: "System prompt" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByRole("button", { name: "Edit system prompt" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Your prompt"), { target: { value: "" } });
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Your prompt"), {
+      target: { value: "Investigate it." },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.prompt).toBe(
+      original.replace("Triage the ticket.", "Investigate it."),
+    );
+  });
+
+  it("requires expansion and Edit, saves both prompts, and resets on reopening", async () => {
+    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+    const toggle = screen.getByRole("button", { name: "System prompt" });
+    fireEvent.click(toggle);
+    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    const systemPrompt = splitTriggerPrompt(original).systemPrompt!.replace(
+      'project = "ENG"',
+      'project = "OPS"',
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
+      target: { value: systemPrompt },
+    });
+    fireEvent.change(screen.getByLabelText("Your prompt"), { target: { value: "Fix it." } });
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const saved = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "Fix it.", systemPrompt });
+
+    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    rerender(
+      <CreateScheduledTaskDialog open {...props} editingTask={scheduledTask({ prompt: saved })} />,
+    );
+    expect(screen.getByLabelText("Your prompt")).toHaveValue("Fix it.");
+    expect(screen.getByRole("button", { name: "System prompt" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
+      target: { value: "Unsaved edit" },
+    });
+    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    rerender(<CreateScheduledTaskDialog open {...props} />);
+    expect(screen.getByLabelText("Your prompt")).toHaveValue("Triage the ticket.");
+    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+    expect(screen.queryByText("Unsaved edit")).not.toBeInTheDocument();
   });
 });
 

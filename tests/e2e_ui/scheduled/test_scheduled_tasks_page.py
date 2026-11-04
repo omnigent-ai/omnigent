@@ -1005,8 +1005,9 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     live_server: str,
     entry: str,
 ) -> None:
-    """Gallery and preview save a task and keep suggestions available afterward."""
+    """Create from either gallery and edit user/system prompts independently."""
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
+    page.set_viewport_size({"width": 390 if entry == "preview" else 1280, "height": 900})
     _open_automations_page(page, live_server)
     if entry == "templates":
         page.set_viewport_size({"width": 1280, "height": 650})
@@ -1069,5 +1070,55 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     # The prompt's details are covered by the dialog and renderer tests.
     assert '(project = "ES" AND labels = "omnigent")' in created["prompt"], created
     expect(page.get_by_role("region", name="Suggested Automations")).to_be_visible()
+
+    row = _row_by_name(page, name)
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    user_prompt = page.get_by_label("Your prompt", exact=True)
+    system_toggle = page.get_by_role("dialog").get_by_role(
+        "button", name="System prompt", exact=True
+    )
+    expect(user_prompt).to_have_value("Triage the ticket.")
+    expect(system_toggle).to_have_attribute("aria-expanded", "false")
+    expect(page.get_by_role("button", name="Edit system prompt", exact=True)).to_have_count(0)
+    user_prompt.fill("Investigate the ticket and propose a fix.")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    saved = httpx.get(f"{live_server}/v1/scheduled-tasks/{created['id']}", timeout=10).json()
+    assert saved["prompt"] == created["prompt"].replace(
+        "Triage the ticket.", "Investigate the ticket and propose a fix."
+    )
+
+    row.get_by_test_id("task-row-open").click()
+    expect(page.get_by_test_id("task-detail-prompt")).to_have_text(
+        "Investigate the ticket and propose a fix."
+    )
+    detail_system_toggle = page.get_by_role("button", name="System prompt", exact=True)
+    expect(detail_system_toggle).to_have_attribute("aria-expanded", "false")
+    expect(page.get_by_test_id("task-detail-system-prompt")).to_have_count(0)
+    detail_system_toggle.click()
+    expect(page.get_by_test_id("task-detail-system-prompt")).to_contain_text('project = "ES"')
+    detail_system_toggle.click()
+    page.get_by_test_id("task-detail-edit").click()
+    expect(user_prompt).to_have_value("Investigate the ticket and propose a fix.")
+    expect(system_toggle).to_have_attribute("aria-expanded", "false")
+    system_toggle.click()
+    system_editor = page.get_by_role("textbox", name="System prompt", exact=True)
+    expect(system_editor).to_have_count(0)
+    page.get_by_role("button", name="Edit system prompt", exact=True).click()
+    system_editor.fill(system_editor.input_value().replace('project = "ES"', 'project = "OPS"'))
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    updated = httpx.get(f"{live_server}/v1/scheduled-tasks/{created['id']}", timeout=10).json()
+    assert updated["prompt"] == saved["prompt"].replace('project = "ES"', 'project = "OPS"')
+    page.get_by_test_id("task-detail-edit").click()
+    expect(system_toggle).to_have_attribute("aria-expanded", "false")
+    expect(user_prompt).to_have_value("Investigate the ticket and propose a fix.")
+    system_toggle.click()
+    expect(system_editor).to_have_count(0)
+    page.get_by_role("button", name="Edit system prompt", exact=True).click()
+    expect(system_editor).to_contain_text('project = "OPS"')
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    page.goto(f"{live_server}/tasks")
     page.get_by_test_id("suggestion-trigger-slack").click()
     expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
