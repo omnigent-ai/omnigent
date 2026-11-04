@@ -199,6 +199,7 @@ def persist_live_status(session_id: str, status: str) -> None:
 def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state for a session handed to another replica."""
     _last_status.pop(session_id, None)
+    _last_background.pop(session_id, None)
 
 
 def persist_scheduled_run_completion(

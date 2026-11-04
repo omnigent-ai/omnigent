@@ -1297,14 +1297,15 @@ def _build_session_list_item(
             if conv.runner_id is not None
             else pending_count
         ),
-        # Same cross-replica fallback as the approval count above.
+        # Shells run on the bound runner, so count them only while its
+        # liveness stamp is fresh; otherwise nothing would clear the spinner.
         background_task_count=(
             max(
                 _session_background_task_count_cache.get(conv.id, 0),
                 conv.background_task_count or 0,
             )
-            if conv.runner_id is not None
-            else _session_background_task_count_cache.get(conv.id, 0)
+            if conv.runner_id is not None and runner_seen_is_fresh(conv.runner_last_seen)
+            else 0
         ),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
@@ -8588,6 +8589,8 @@ def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
+    _session_background_task_count_cache.pop(session_id, None)
+    _session_background_tasks_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 
 

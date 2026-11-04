@@ -16,6 +16,7 @@ import asyncio
 import json
 import math
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -53,6 +54,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
+from tests._helpers.polling import poll_until_async
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import create_test_agent
 
@@ -4368,6 +4370,8 @@ async def test_list_sessions_exposes_background_task_count(
     agent = await create_test_agent(client)
     session_id = (await _create_session(client, agent["id"]))["id"]
     store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner_live")
+    store.touch_runner_liveness(["runner_live"], now=int(time.time()))
 
     async def post_count(count: int) -> None:
         resp = await client.post(
@@ -4385,31 +4389,32 @@ async def test_list_sessions_exposes_background_task_count(
             "background_task_count"
         ]
 
-    async def row_count_becomes(count: int) -> bool:
-        for _ in range(200):
-            conv = store.get_conversation(session_id)
-            if conv is not None and conv.background_task_count == count:
-                return True
-            await asyncio.sleep(0.01)
-        return False
+    def row_count_is(count: int) -> bool:
+        conv = store.get_conversation(session_id)
+        return conv is not None and conv.background_task_count == count
 
     try:
         assert await listed_count() == 0
         await post_count(2)
         assert await listed_count() == 2
-        assert await row_count_becomes(2)
+        await poll_until_async(lambda: row_count_is(2))
         await post_count(0)
         assert await listed_count() == 0
-        assert await row_count_becomes(0)
+        await poll_until_async(lambda: row_count_is(0))
     finally:
         sessions_module._session_background_task_count_cache.pop(session_id, None)
 
 
-async def test_list_sessions_background_count_falls_back_to_row_for_bound_session(
+async def test_list_sessions_background_count_follows_the_owning_replica(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """A replica without the runner tunnel reads the count from the row."""
+    """The row from the owning replica wins once this replica hands off, and a
+    stale runner stamp hides the count, since nothing could clear it."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.orchestration import (
+        _relinquish_session_live_state,
+    )
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
     )
@@ -4418,11 +4423,30 @@ async def test_list_sessions_background_count_falls_back_to_row_for_bound_sessio
     session_id = (await _create_session(client, agent["id"]))["id"]
     store = SqlAlchemyConversationStore(db_uri)
     assert store.set_runner_id(session_id, "runner_other_replica")
-    store.set_background_task_count(session_id, 3)
+    store.touch_runner_liveness(["runner_other_replica"], now=int(time.time()))
 
-    resp = await client.get("/v1/sessions")
-    row = next(r for r in resp.json()["data"] if r["id"] == session_id)
-    assert row["background_task_count"] == 3
+    async def listed_count() -> int:
+        resp = await client.get("/v1/sessions")
+        return next(r for r in resp.json()["data"] if r["id"] == session_id)[
+            "background_task_count"
+        ]
+
+    try:
+        # Another replica's write, with nothing cached here.
+        store.set_background_task_count(session_id, 3)
+        assert await listed_count() == 3
+
+        # This replica held 2, then the new owner finished every shell.
+        sessions_module._session_background_task_count_cache[session_id] = 2
+        store.set_background_task_count(session_id, 0)
+        _relinquish_session_live_state(session_id)
+        assert await listed_count() == 0
+
+        store.set_background_task_count(session_id, 3)
+        store.clear_runner_liveness("runner_other_replica")
+        assert await listed_count() == 0
+    finally:
+        sessions_module._session_background_task_count_cache.pop(session_id, None)
 
 
 async def test_get_session_includes_runner_online(

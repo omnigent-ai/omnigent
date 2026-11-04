@@ -115,6 +115,17 @@ def test_persist_background_task_count_dedupes_changes(
     assert recording_store.background_writes == [("conv_1", 2), ("conv_1", 0)]
 
 
+def test_handoff_round_trip_rewrites_the_background_count(
+    recording_store: _RecordingStore,
+) -> None:
+    """A:0, then B writes 3, then A gets 0 again: A's write must not be deduped."""
+    session_live_state.persist_background_task_count("conv_1", 0)
+    session_live_state.forget_live_status("conv_1")  # handed to replica B
+    session_live_state.persist_background_task_count("conv_1", 0)  # back on A
+    _wait_until(lambda: len(recording_store.background_writes) >= 2)
+    assert recording_store.background_writes == [("conv_1", 0), ("conv_1", 0)]
+
+
 def test_forget_live_status_drops_dedupe_state() -> None:
     """A replica handing off a session must not keep its stale dedupe state."""
     session_live_state._last_status["conv_1"] = "running"

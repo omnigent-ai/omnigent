@@ -15,6 +15,11 @@ _MONITOR_TASK = {
 }
 
 
+def _sidebar_badge(page: Page, count: int) -> Locator:
+    plural = "" if count == 1 else "s"
+    return page.get_by_role("img", name=f"{count} background task{plural} running", exact=True)
+
+
 def _pill_badge(page: Page, count: int) -> Locator:
     plural = "" if count == 1 else "s"
     return page.get_by_role(
@@ -66,6 +71,8 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
 
     page.reload()
     expect(_pill_badge(page, 1)).to_have_attribute("aria-expanded", "false", timeout=15_000)
+    # The sidebar row hydrates from the session list after the reload.
+    expect(_sidebar_badge(page, 1).get_by_test_id("running-dot")).to_be_visible(timeout=15_000)
     _pill_badge(page, 1).click()
     panel = page.get_by_role("dialog", name="1 background task", exact=True)
     expect(panel.get_by_text(_MONITOR_TASK["description"], exact=True)).to_be_visible()
@@ -73,6 +80,7 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
 
     _publish_status(base_url, session_id, background_task_count=2)
     expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
+    expect(_sidebar_badge(page, 2)).to_be_visible(timeout=15_000)
     _pill_badge(page, 2).click()
     panel = page.get_by_role("dialog", name="2 background tasks", exact=True)
     expect(panel).to_contain_text("details unavailable")
@@ -80,22 +88,5 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
 
     _publish_status(base_url, session_id, background_task_count=0)
     expect(page.locator(_PILL)).to_have_count(0, timeout=15_000)
-    expect(panel).to_have_count(0)
-
-
-def test_sidebar_row_spins_while_background_tasks_run(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """An ended turn with running shells keeps the session's sidebar spinner on."""
-    base_url, session_id = seeded_session
-    page.goto(f"{base_url}/c/{session_id}")
-    badge = page.get_by_role("img", name="2 background tasks running", exact=True)
     expect(page.get_by_test_id("session-state-badge")).to_have_count(0, timeout=15_000)
-
-    _publish_status(base_url, session_id, background_task_count=2)
-    expect(badge).to_be_visible(timeout=15_000)
-    expect(badge.get_by_test_id("running-dot")).to_be_visible()
-
-    _publish_status(base_url, session_id, background_task_count=0)
-    expect(badge).to_have_count(0, timeout=15_000)
+    expect(panel).to_have_count(0)

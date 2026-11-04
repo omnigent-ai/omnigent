@@ -6044,7 +6044,6 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "owner",
   "pending_elicitations_count",
   "background_task_count",
-  "runner_online",
   "provisional",
 ];
 

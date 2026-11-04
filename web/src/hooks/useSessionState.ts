@@ -3,8 +3,8 @@
 //
 // Liveness (runner / host reachability) is no longer a sidebar state:
 // it surfaces in the open-session view (see `useSessionLiveness`), so the
-// sidebar no longer renders a "disconnected" badge. `getSessionState` reads
-// runner liveness only to drop a background spinner an offline runner can't clear.
+// sidebar no longer renders a "disconnected" badge and `getSessionState`
+// no longer reads runner liveness.
 //
 // Errors are independent of read state. Native sessions can settle to idle
 // after an error, so callers also inspect the latest conversation message.
@@ -15,7 +15,8 @@ import type { LatestSessionError } from "@/lib/sessionError";
 export type SessionState =
   | { kind: "awaiting"; count: number }
   | { kind: "running" }
-  // The turn ended but background shells still run on a reachable runner.
+  // The turn ended but background shells still run; the server zeroes the
+  // count once the bound runner's liveness lapses.
   | { kind: "background"; count: number }
   | { kind: "error" }
   | { kind: "disconnected" }
@@ -28,10 +29,7 @@ export type SessionState =
 
 export function getSessionState(
   conversation:
-    | Pick<
-        Conversation,
-        "status" | "pending_elicitations_count" | "background_task_count" | "runner_online"
-      >
+    | Pick<Conversation, "status" | "pending_elicitations_count" | "background_task_count">
     | undefined
     | null,
   latestError: LatestSessionError | null = null,
@@ -40,9 +38,7 @@ export function getSessionState(
   if (pending > 0) return { kind: "awaiting", count: pending };
   if (conversation?.status === "running") return { kind: "running" };
   const background = conversation?.background_task_count ?? 0;
-  if (background > 0 && conversation?.runner_online !== false) {
-    return { kind: "background", count: background };
-  }
+  if (background > 0) return { kind: "background", count: background };
   if (latestError === "disconnected") return { kind: "disconnected" };
   if (latestError === "recovered_disconnect") return null;
   if (conversation?.status === "failed" || latestError === "error") return { kind: "error" };
