@@ -47,6 +47,9 @@ from omnigent.entities import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
+from omnigent.harnesses.codex_native.timeouts import (
+    SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
+)
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -337,10 +340,6 @@ async def _wake_runner_for_model_change(
     )
     return conv
 
-
-# Allow runtime recovery (15s), connect/catalog/update (12s), and confirmation
-# mirroring/cleanup (6s) to finish before the server restores a selection.
-_CODEX_SETTINGS_FORWARD_TIMEOUT_S = 40.0
 
 _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
@@ -1097,6 +1096,7 @@ def register_core_routes(
             background_title_coordinator=background_title_coordinator,
             project_store=project_store,
             created_by_session_id=source.id if source is not None else None,
+            created_by_project_id=source.project_id if source is not None else None,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -3451,7 +3451,9 @@ def register_core_routes(
         )
         # This server rolls back Codex refusals and keeps unconfirmed changes, so the
         # runner neither saves a refusal nor waits out this server's forward timeout.
-        negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
+        negotiation: dict[str, object] = (
+            {"rollback_on_refusal": True, "cold_start_settings": True} if codex_native else {}
+        )
         settings_forward_timeout = (
             _CODEX_SETTINGS_FORWARD_TIMEOUT_S if codex_native else _TUI_INJECT_FORWARD_TIMEOUT_S
         )

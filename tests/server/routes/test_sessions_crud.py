@@ -983,16 +983,19 @@ async def test_list_sessions_pinned_filter(
     assert other_user_pin.id not in ids
 
 
+@pytest.mark.parametrize(
+    "label_key",
+    ["omnigent.git.worktree_root_sha256", "omnigent.scheduled_task_worktree_source_sha256"],
+)
 async def test_patch_rejects_forged_worktree_identity(
-    client: httpx.AsyncClient, session_id: str, db_uri: str
+    client: httpx.AsyncClient, session_id: str, db_uri: str, label_key: str
 ) -> None:
     """The cleanup identity must remain server-owned after creation."""
-    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
     response = await client.patch(
-        f"/v1/sessions/{session_id}", json={"labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}}
+        f"/v1/sessions/{session_id}", json={"labels": {label_key: "forged"}}
     )
     assert response.status_code == 400, response.text
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
-    assert WORKTREE_ROOT_LABEL_KEY not in conv.labels
+    assert label_key not in conv.labels

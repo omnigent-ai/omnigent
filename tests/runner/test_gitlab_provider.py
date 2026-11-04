@@ -17,6 +17,7 @@ from omnigent.runner.session_prs import PullRequestRef
 
 URL = "https://gitlab.com/team/sub/project/-/merge_requests/7"
 HEAD, BASE = "a" * 40, "b" * 40
+MR_PATH = "projects/team%2Fsub%2Fproject/merge_requests/7"
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +94,8 @@ def api(monkeypatch: pytest.MonkeyPatch, mr: dict, change: dict) -> Mock:
     def object_response(path: str, **query):
         if path == "projects/fork%2Fsub%2Fproject":
             return {"id": 20, "forked_from_project": {"web_url": mr["web_url"].split("/-/")[0]}}
+        if path == "projects/20":
+            return {"id": 20, "web_url": "https://gitlab.com/fork/sub/project"}
         if "/repository/files/" in path:
             content = "old\n" if query["ref"] == BASE else "new\n"
             return {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()}
@@ -165,6 +168,7 @@ def test_workspace_fork_mr_keeps_target_identity_and_details(root: str, api: Moc
     pr = info["pr"]
     assert pr["number"] == 7 and pr["state"] == "OPEN" and pr["is_draft"]
     assert (pr["head_sha"], pr["base_sha"]) == (HEAD, BASE)
+    assert pr["head_repository_url"] == "https://gitlab.com/fork/sub/project"
     assert pr["comments"] == [
         {
             "author": "reviewer",
@@ -183,7 +187,28 @@ def test_workspace_fork_mr_keeps_target_identity_and_details(root: str, api: Moc
 def test_explicit_reference_keeps_live_branch_and_uses_iid(root: str, api: Mock) -> None:
     info = module.PULL_REQUESTS.reference_info(root, ref())
     assert info["branch"] == "feature" and info["pr"]["number"] == 7
-    api.object.assert_called_once_with("projects/team%2Fsub%2Fproject/merge_requests/7")
+    assert [call.args[0] for call in api.object.call_args_list] == [MR_PATH, "projects/20"]
+
+
+def test_same_project_mr_links_target_repository_without_lookup(
+    root: str, api: Mock, mr: dict
+) -> None:
+    mr["source_project_id"] = mr["target_project_id"]
+    info = module.PULL_REQUESTS.reference_info(root, ref())
+    assert info["pr"]["head_repository_url"] == "https://gitlab.com/team/sub/project"
+    api.object.assert_called_once_with(MR_PATH)
+
+
+def test_deleted_fork_hides_head_repository_with_warning(root: str, api: Mock, mr: dict) -> None:
+    def response(path, **query):
+        if path == "projects/20":
+            raise GitLabError("404 Project Not Found")
+        return mr
+
+    api.object.side_effect = response
+    info = module.PULL_REQUESTS.reference_info(root, ref())
+    assert info["pr"]["number"] == 7 and info["pr"]["head_repository_url"] is None
+    assert info["warnings"] == ["GitLab source project is unavailable; file links are hidden."]
 
 
 @pytest.mark.parametrize("remote_project", ["team/sub/project", "Team/Sub/Project"])
@@ -448,7 +473,7 @@ def test_explicit_reference_bypasses_unavailable_workspace_inference(
 ) -> None:
     info = module.PULL_REQUESTS.reference_info(root, ref())
     assert info["auth"]["authenticated"] and info["pr"]["url"] == URL and not info["warnings"]
-    api.object.assert_called_once_with("projects/team%2Fsub%2Fproject/merge_requests/7")
+    assert [call.args[0] for call in api.object.call_args_list] == [MR_PATH, "projects/20"]
     assert module.PULL_REQUESTS.changed_files(root, ref())["data"][0]["path"] == "src/new.py"
     assert "@@" in module.PULL_REQUESTS.pr_diff(root, ref())["patch"]
     assert file_diff(root)["after"] == "new\n"
