@@ -1145,6 +1145,12 @@ dedupe; the first-party web client deliberately does NOT (it keeps a
 client temp id for React-key stability and relies on a stable key +
 FIFO matching), so adoption is optional, not required.
 
+When the native harness explicitly reports that delivery failed before handoff,
+the server persists the rejected message alongside its error and removes only
+that queued input. Clients without a message stable ID are supported through
+the server's exact pending ID and delivery-attempt ID. Failures with uncertain
+acceptance stay pending for transcript reconciliation; they are not resent.
+
 A failed transcript append restores pending inputs with their prior delivery
 uncertainty, including entries that expired while persistence was in flight.
 A later mirror cannot report a possibly recorded input as definitely undelivered.

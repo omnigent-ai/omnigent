@@ -28,6 +28,7 @@ from omnigent.server.schemas import CreateResponseRequest
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["turn/start", "turn/steer"])
+@pytest.mark.parametrize("oversized", [False, True], ids=["inline", "spilled"])
 @pytest.mark.parametrize(
     "receipt_kind",
     [
@@ -50,15 +51,21 @@ from omnigent.server.schemas import CreateResponseRequest
     ],
 )
 async def test_native_receipt_requires_exact_delivery_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, receipt_kind: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    receipt_kind: str,
+    oversized: bool,
 ) -> None:
     """Only an owned input receipt recovers a lost reply; text and refusal never do."""
     requests: list[str] = []
     ordering: list[str] = []
     read_waiting = asyncio.Event()
     receipt_file = tmp_path / "native-history.json"
-    confirmed = receipt_kind in {"exact", "native-failed"} or (
-        receipt_kind == "different-turn" and method == "turn/start"
+    confirmed = (
+        receipt_kind in {"exact", "native-failed"}
+        or (receipt_kind == "different-turn" and method == "turn/start")
+        or (oversized and receipt_kind == "no-server-id")
     )
     if receipt_kind == "read-timeout":
         monkeypatch.setattr(native_executor, "_DELIVERY_RECEIPT_TIMEOUT_SECONDS", 0.05)
@@ -131,6 +138,8 @@ async def test_native_receipt_requires_exact_delivery_identity(
                 websocket.transport.abort()
                 return
             result = json.loads(receipt_file.read_text()) if rpc_method == "thread/read" else {}
+            if rpc_method == "initialize":
+                result = {"userAgent": request["params"]["clientInfo"]["name"] + "/0.166.0"}
             if rpc_method == "thread/read":
                 ordering.append("receipt_read")
                 read_waiting.set()
@@ -164,7 +173,7 @@ async def test_native_receipt_requires_exact_delivery_identity(
         adapter = ExecutorAdapter(executor_factory=lambda: executor)
         request = CreateResponseRequest(
             model="test-agent",
-            input="same text",
+            input="same text" * (120_000 if oversized else 1),
             input_stable_id="a" * 32,
             pending_id="pending_" + "b" * 32,
             delivery_attempt_id=None if receipt_kind == "no-server-id" else "c" * 32,
@@ -192,11 +201,9 @@ async def test_native_receipt_requires_exact_delivery_identity(
             await adapter._abandoned_executor_cleanup
 
     assert requests.count(method) == 1
-    should_probe = receipt_kind not in {
-        "session-before-read",
-        "no-server-id",
-        "explicit-rejection",
-    }
+    should_probe = receipt_kind not in {"session-before-read", "explicit-rejection"} and (
+        oversized or receipt_kind != "no-server-id"
+    )
     assert requests.count("thread/read") == int(should_probe)
     if receipt_kind not in {"explicit-rejection", "cancel-read"}:
         assert "turn/interrupt" not in requests
@@ -204,7 +211,12 @@ async def test_native_receipt_requires_exact_delivery_identity(
         assert ordering == ["native_receipt_persisted", "rpc_reply_lost", "receipt_read"]
     receipt = json.loads(receipt_file.read_text())
     if confirmed:
-        assert receipt["thread"]["turns"][0]["items"][0]["clientId"] == "c" * 32
+        native_id = receipt["thread"]["turns"][0]["items"][0]["clientId"]
+        if oversized:
+            assert native_id.startswith("omnigent-paste-")
+            assert native_id != "c" * 32
+        else:
+            assert native_id == "c" * 32
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_newer"
