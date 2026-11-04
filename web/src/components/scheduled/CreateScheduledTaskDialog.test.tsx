@@ -651,21 +651,47 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     expect(screen.queryByTestId("task-host-sandbox-option")).not.toBeInTheDocument();
   });
 
-  it("offers a sandbox option in the host picker when enabled; choosing it enters sandbox mode", () => {
-    renderWithSandboxes();
+  it("chooses no target until the host list loads, then starts on the sandbox", () => {
+    const hosts = vi.mocked(hostsHook.useHosts);
+    hosts.mockReturnValue({ data: undefined, isPending: true } as unknown as ReturnType<
+      typeof hostsHook.useHosts
+    >);
+    const view = renderWithSandboxes();
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Pick a host");
+    hosts.mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "online" }],
+      isPending: false,
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    view.rerender(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("task-host-trigger")).not.toHaveTextContent("laptop");
     expect(
-      screen.getByText("Runs on this host. A run fails while the host is offline."),
+      screen.getByText(
+        "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration.",
+      ),
     ).toBeInTheDocument();
-    openHostSelect();
-    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
-    // Sandbox mode swaps the helper text to the fresh-sandbox copy (no separate
-    // checkbox), and the connected-host workspace picker never appears.
+  });
+
+  it("starts a new task in sandbox mode when sandboxes are offered, and a host pick sticks", () => {
+    renderWithSandboxes();
+    // The sandbox default wins over the online host and shows the fresh-sandbox
+    // copy; the connected-host workspace picker never appears.
     expect(
       screen.getByText(
         "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration.",
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
+    openHostSelect();
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+    expect(
+      screen.getByText("Runs on this host. A run fails while the host is offline."),
+    ).toBeInTheDocument();
   });
 
   it.each([

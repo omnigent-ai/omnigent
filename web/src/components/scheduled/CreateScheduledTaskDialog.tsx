@@ -102,7 +102,7 @@ export function CreateScheduledTaskDialog({
   editingTask?: ScheduledTask | null;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
-  const { data: hosts } = useHosts({ enabled: open });
+  const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   // Gates the "new sandbox each run" option: only servers that can actually
@@ -352,13 +352,29 @@ export function CreateScheduledTaskDialog({
     savedWorkspace,
   ]);
 
-  // A new task pins a host, starting on the first online one as New Chat does.
-  const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
+  // A new task starts on a server sandbox when one is offered, so it doesn't
+  // depend on the creator's machine being online at fire time; otherwise it pins
+  // the first online host as New Chat does. The target is chosen once, after
+  // both /v1/info and the host list settle, so it never flips between the two.
+  // With no sandbox and no online host it stays open until a host comes online.
+  const targetChosenRef = useRef(false);
   useEffect(() => {
-    if (open && !isEdit && !sandboxMode && hostId === "" && defaultHostId !== undefined) {
+    if (open) targetChosenRef.current = false;
+  }, [open]);
+  const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
+  const targetInputsLoaded = info !== "loading" && !hostsPending;
+  useEffect(() => {
+    if (!open || isEdit || !targetInputsLoaded || targetChosenRef.current) return;
+    if (managedSandboxesEnabled) {
+      targetChosenRef.current = true;
+      setSandboxMode(true);
+      setHostId("");
+      setWorkspace("");
+    } else if (defaultHostId !== undefined) {
+      targetChosenRef.current = true;
       setHostId(defaultHostId);
     }
-  }, [open, isEdit, sandboxMode, hostId, defaultHostId]);
+  }, [open, isEdit, targetInputsLoaded, managedSandboxesEnabled, defaultHostId]);
 
   const savedProjectId = editingTask?.projectId ?? null;
   const savedProjectName =
@@ -403,6 +419,7 @@ export function CreateScheduledTaskDialog({
   function handleTargetChange(value: string) {
     const nextSandbox = value === SANDBOX_HOST;
     const nextHostId = nextSandbox ? "" : value;
+    targetChosenRef.current = true;
     if (nextSandbox === sandboxMode && nextHostId === hostId) return;
     const originalTarget =
       editingTask?.executionTarget === "managed_sandbox"
