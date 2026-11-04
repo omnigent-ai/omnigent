@@ -582,6 +582,20 @@ describe("bridge runtime scroll position", () => {
     expect(sentScrollOffsets(port).at(-1)).toBe(200);
   });
 
+  it("lets a scroll by the artifact's own script end the restore", () => {
+    const { scrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+    const hide = addRestoreHide();
+    const port = startRuntime({ restoreScroll: restoreTo(640) });
+    // A deferred scrollTo, focus or fragment jump moves the page without input, like the scrollbar.
+    window.scrollTo({ top: 100 });
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).toHaveBeenCalledTimes(2);
+    expect(window.scrollY).toBe(100);
+    expect(hide.isConnected).toBe(false);
+    vi.advanceTimersToNextFrame();
+    expect(sentScrollOffsets(port)).toEqual([100]);
+  });
+
   it.each<[string, () => void]>([
     ["a click", () => dispatchToPage(new Event("pointerdown", { bubbles: true }))],
     ["a tap", () => dispatchToPage(new Event("touchstart", { bubbles: true }))],

@@ -213,9 +213,9 @@
     }
   }
 
-  // Restore the saved offset after a remount, re-asserting it each frame because
-  // late content can clamp it. Only input that scrolls ends it early, not a click, a pinch
-  // or input the page handles itself; reports stay off so clamps can't overwrite the offset.
+  // Restore the saved offset after a remount, re-asserting it each frame because late content
+  // can clamp it. Scroll input ends it early, as does any scroll the layout didn't cause, the
+  // artifact's own included; a click doesn't. Reports stay off so clamps can't overwrite it.
   const USER_SCROLL_EVENTS = ["wheel", "touchmove", "keydown"];
   const SCROLL_KEYS = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "];
   let scrollRestore = null; // { top, deadline, y, layout, anchoring, inputs } while restoring
@@ -277,8 +277,8 @@
     return [document.documentElement.scrollHeight, window.innerWidth, window.innerHeight].join();
   }
 
-  // Scrollbar drags fire no input events, so treat any move that the layout didn't
-  // cause (the document and viewport keep their sizes) as the reader's.
+  // Scrollbar drags fire no input events, so any move the layout didn't cause (the document
+  // and viewport keep their sizes) ends the restore, a scroll by the artifact's script included.
   function readerMovedDuringRestore() {
     const moved = Math.abs(window.scrollY - scrollRestore.y) >= 1;
     return moved && layoutSize() === scrollRestore.layout;
