@@ -1114,9 +1114,7 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
         current = read_bridge_state(bridge_dir)
         if _bridge_owner_matches(current, state) and current is not None:
             current_interrupt_wins = current.interrupt_generation >= state.interrupt_generation
-            automatic_input = _automatic_input_fields(state)
-            if automatic_input[0] is None:
-                automatic_input = _automatic_input_fields(current)
+            automatic_input = _merge_automatic_input_fields(current, state)
             state = replace(
                 state,
                 interrupt_generation=max(state.interrupt_generation, current.interrupt_generation),
@@ -1687,6 +1685,39 @@ def _automatic_input_fields(
     )
 
 
+def _merge_automatic_input_fields(
+    current: CodexNativeBridgeState,
+    incoming: CodexNativeBridgeState,
+) -> tuple[str | None, str | None, str | None, tuple[str, ...]]:
+    """Merge same-owner control state monotonically; persisted claims win conflicts."""
+    current_fields = _automatic_input_fields(current)
+    incoming_fields = _automatic_input_fields(incoming)
+    if current_fields[0] is None:
+        return incoming_fields
+    if incoming_fields[0] is None:
+        return current_fields
+    current_claim = current_fields[0], current_fields[1], current_fields[3]
+    incoming_claim = incoming_fields[0], incoming_fields[1], incoming_fields[3]
+    if current_claim != incoming_claim:
+        _logger.warning("Ignored conflicting same-owner Codex automatic-input claim")
+        return current_fields
+    current_receipt = current_fields[2]
+    incoming_receipt = incoming_fields[2]
+    if (
+        current_receipt is not None
+        and incoming_receipt is not None
+        and current_receipt != incoming_receipt
+    ):
+        _logger.warning("Ignored conflicting same-claim Codex automatic-input receipt")
+        return current_fields
+    return (
+        current_fields[0],
+        current_fields[1],
+        current_receipt or incoming_receipt,
+        current_fields[3],
+    )
+
+
 def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     """Read state once so failure diagnostics describe the delivery decision."""
     path = bridge_dir / _STATE_FILE
@@ -1873,10 +1904,11 @@ def claim_codex_automatic_input(
 ) -> CodexNativeBridgeState | None:
     """Persist one automatic request before submission, or fail closed.
 
-    The caller must have observed the source as active and then proven it
-    completed. The claim consumes no input and grants no retry; it only records
-    the exact owner, Stop generation, source turn, and native delivery id that a
-    later receipt must echo.
+    The terminal-boundary caller supplies the source it observed as active.
+    This function proves and clears that source under the same lock that records
+    the exact owner, Stop generation, and delivery id. Combining completion and
+    claim prevents a delayed A completion from claiming after a newer B turn ran
+    to completion under the same owner.
     """
     source_turn_id = completed.active_turn_id
     if source_turn_id is None or not client_message_id:
@@ -1887,7 +1919,7 @@ def claim_codex_automatic_input(
             not _bridge_owner_matches(current, completed)
             or current is None
             or current.interrupt_generation != completed.interrupt_generation
-            or current.active_turn_id is not None
+            or current.active_turn_id != source_turn_id
             or current.pending_shell_command_id is not None
             or current.active_shell_turn_id is not None
             or current.interrupted_turn_id == source_turn_id
@@ -1896,6 +1928,7 @@ def claim_codex_automatic_input(
             return None
         updated = replace(
             current,
+            active_turn_id=None,
             automatic_input_source_turn_id=source_turn_id,
             automatic_input_client_message_id=client_message_id,
             automatic_input_owner_scope=_bridge_owner_scope(current),
