@@ -905,7 +905,9 @@ def register_hooks_routes(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",
             )
-        agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+        # A native harness calls this hook once per tool call. Keep the
+        # synchronous store reads below off the event loop shared by all sessions.
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
             return Response(
@@ -913,8 +915,13 @@ def register_hooks_routes(
                 media_type="application/json",
             )
 
-        loaded = _sf.get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        # Warm-cache loads are in-memory; the thread hop covers the cold path
+        # that extracts the bundle from disk.
+        loaded = await asyncio.to_thread(
+            _sf.get_agent_cache().load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
         )
 
         _caps = _sf.get_caps()
@@ -979,7 +986,8 @@ def register_hooks_routes(
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine(conv)
+        # The build makes several synchronous store reads.
+        engine = await asyncio.to_thread(_build_engine, conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
@@ -1033,7 +1041,7 @@ def register_hooks_routes(
                 deciding_policy = result.deciding_policy
                 assert deciding_policy is not None
                 async with _native_ask_gate_lock(session_id, deciding_policy):
-                    engine = _build_engine()
+                    engine = await asyncio.to_thread(_build_engine)
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,
