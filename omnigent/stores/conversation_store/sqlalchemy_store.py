@@ -5348,6 +5348,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -5474,6 +5475,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param copy_items: ``False`` copies no items at all, whatever the
             source holds when the fork commits. A truncation; exclusive with
             both cutoffs.
+        :param continue_source: Also copy the source's host, workspace and
+            branch, in the same write that creates the fork, for a same-owner
+            continuation of the source's work.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -5518,6 +5522,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             up_to_response_id=up_to_response_id,
             before_item_id=before_item_id,
             copy_items=copy_items,
+            continue_source=continue_source,
             project_id=project_id,
             file_id_map=file_id_map,
             created_by=created_by,
@@ -5549,6 +5554,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -6011,6 +6017,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ),
                 project_id=project_id,
             )
+            if continue_source:
+                # Born on the source's current host, so the host is referenced
+                # from the fork's creation and no teardown can miss it.
+                current = meta_sess.get(
+                    SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
+                )
+                if current is not None and current.host_id and current.workspace:
+                    fork_meta.host_id = current.host_id
+                    fork_meta.workspace = current.workspace
+                    fork_meta.git_branch = current.git_branch
             meta_sess.add(fork_meta)
             if creating_clone and agent_id is not None:
                 assert cloned_agent_name is not None and cloned_agent_bundle_location is not None

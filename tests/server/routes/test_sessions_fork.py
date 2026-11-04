@@ -195,6 +195,7 @@ class _ConversationStore:
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: dict[str, str] | None = None,
         created_by: str | None = None,

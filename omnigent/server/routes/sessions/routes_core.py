@@ -3924,6 +3924,7 @@ def register_core_routes(
         before_item_id: str | None = None,
         keep_sandbox_labels: bool = False,
         copy_history: bool = True,
+        continue_source: bool = False,
     ) -> SessionResponse:
         """Fork *source_id* as :func:`fork_session` documents.
 
@@ -3933,6 +3934,8 @@ def register_core_routes(
             for a fork that stays in the source's sandbox.
         :param copy_history: ``False`` copies none of the source's items or
             files, whatever it holds when the fork commits.
+        :param continue_source: Create the fork on the source's host and
+            workspace, as a same-owner continuation.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4403,6 +4406,7 @@ def register_core_routes(
                 up_to_response_id=body.up_to_response_id,
                 before_item_id=before_item_id,
                 copy_items=copy_history,
+                continue_source=continue_source,
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
@@ -4677,18 +4681,24 @@ def register_core_routes(
                 before_item_id=before_item_id,
                 keep_sandbox_labels=True,
                 copy_history=copy_history,
+                continue_source=True,
             )
             runner_bound = runner_online
             try:
                 if host_bound:
-                    assert source.host_id is not None and source.workspace is not None
-                    await asyncio.to_thread(
-                        conversation_store.set_host_id,
-                        fork.id,
-                        source.host_id,
-                        source.workspace,
-                        source.git_branch,
-                    )
+                    assert source.host_id is not None
+                    # The fork was born on the host, so a delete of the source
+                    # from here on keeps it. One that already tore it down
+                    # (before the fork existed) leaves the fork nothing to use.
+                    host_store = getattr(request.app.state, "host_store", None)
+                    if fork.host_id != source.host_id or (
+                        host_store is not None
+                        and await asyncio.to_thread(host_store.get_host, source.host_id) is None
+                    ):
+                        raise OmnigentError(
+                            f"This session's host went away during {command}; try again.",
+                            code=ErrorCode.CONFLICT,
+                        )
                     profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
                     if profile_catalog is not None:
                         # Adopt and reauthorize the sandbox's accepted profile
@@ -4717,12 +4727,17 @@ def register_core_routes(
                     # As native /clear does: the fork now holds the runner, so
                     # stopping or archiving the source must not stop it. The
                     # source keeps its host and resumes on a relaunched runner.
-                    await _update_session(
-                        request,
-                        source.id,
-                        UpdateSessionRequest(runner_id=""),
-                        include_usage=False,
-                    )
+                    try:
+                        await _update_session(
+                            request,
+                            source.id,
+                            UpdateSessionRequest(runner_id=""),
+                            include_usage=False,
+                        )
+                    except OmnigentError as exc:
+                        # A source deleted meanwhile has nothing left to detach.
+                        if exc.code != ErrorCode.NOT_FOUND:
+                            raise
             except Exception:
                 # Leave no announced fork for a retry to duplicate.
                 await _delete_unreturned_session(fork.id)

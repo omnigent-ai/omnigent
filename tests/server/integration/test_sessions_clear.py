@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import threading
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -479,22 +480,10 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
     assert resumed.status_code < 300, resumed.text
 
 
-@pytest.mark.parametrize("deleted_first", ["original", "continuation"])
-async def test_deleting_one_side_of_a_clear_keeps_their_shared_sandbox(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-    deleted_first: str,
-) -> None:
-    """Both sessions of a ``/clear`` work in one managed sandbox.
-
-    Deleting either leaves the other bound to the host and the sandbox
-    running; deleting the last one still tears the sandbox down.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
+def install_managed_sandbox(
+    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[HostStore, FakeSandboxLauncher]:
+    """Make ``_HOST_ID`` a managed sandbox host whose teardown is recorded."""
     host_store = HostStore(db_uri)
     host_store.register_managed_host(
         host_id=_HOST_ID,
@@ -519,6 +508,26 @@ async def test_deleting_one_side_of_a_clear_keeps_their_shared_sandbox(
             )
         ),
     )
+    return host_store, launcher
+
+
+@pytest.mark.parametrize("deleted_first", ["original", "continuation"])
+async def test_deleting_one_side_of_a_clear_keeps_their_shared_sandbox(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    deleted_first: str,
+) -> None:
+    """Both sessions of a ``/clear`` work in one managed sandbox.
+
+    Deleting either leaves the other bound to the host and the sandbox
+    running; deleting the last one still tears the sandbox down.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    host_store, launcher = install_managed_sandbox(app, db_uri, monkeypatch)
     source_id = await create_placed_session(client, store)
     cleared = await client.post(
         f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
@@ -583,6 +592,57 @@ async def test_stopping_or_archiving_the_original_leaves_the_continuation_runnin
     original = store.get_conversation(source_id)
     assert original is not None
     assert (original.runner_id, original.host_id) == (None, _HOST_ID)
+
+
+@pytest.mark.parametrize("deleted", ["before_fork", "after_fork"])
+async def test_deleting_the_original_during_the_handoff_never_strands_the_continuation(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    deleted: str,
+) -> None:
+    """A delete of the original racing the clear never leaves a sandbox-less continuation.
+
+    Once the continuation exists it already holds the host, so the delete keeps
+    the sandbox; a delete that lands first leaves no continuation behind.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    host_store, launcher = install_managed_sandbox(app, db_uri, monkeypatch)
+    source_id = await create_placed_session(client, store)
+    before = len((await client.get("/v1/sessions")).json()["data"])
+    loop = asyncio.get_running_loop()
+    paused, resume = asyncio.Event(), threading.Event()
+    fork = SqlAlchemyConversationStore.fork_conversation
+
+    def fork_around_the_delete(self: Any, *args: Any, **kwargs: Any) -> Any:
+        forked = fork(self, *args, **kwargs) if deleted == "after_fork" else None
+        loop.call_soon_threadsafe(paused.set)
+        assert resume.wait(timeout=10)
+        return forked if forked is not None else fork(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "fork_conversation", fork_around_the_delete)
+    clearing = asyncio.create_task(
+        client.post(f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}})
+    )
+    await asyncio.wait_for(paused.wait(), timeout=10)
+    removed = await client.delete(f"/v1/sessions/{source_id}")
+    resume.set()
+    cleared = await asyncio.wait_for(clearing, timeout=10)
+
+    assert removed.status_code == 200, removed.text
+    if deleted == "before_fork":
+        assert cleared.status_code >= 400, cleared.text
+        assert len((await client.get("/v1/sessions")).json()["data"]) == before - 1
+        assert launcher.terminated == ["sb-clear"]
+        return
+    assert cleared.status_code == 202, cleared.text
+    continuation = store.get_conversation(cleared.json()["session_id"])
+    assert continuation is not None and continuation.host_id == _HOST_ID
+    assert host_store.get_host(_HOST_ID) is not None
+    assert launcher.terminated == []
 
 
 async def test_claude_sdk_clear_still_redirects_when_the_notice_is_lost(

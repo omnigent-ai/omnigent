@@ -2177,6 +2177,7 @@ class ConversationStore(ABC):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -2289,6 +2290,9 @@ class ConversationStore(ABC):
         :param copy_items: ``False`` copies no items at all, whatever the
             source holds when the fork commits, e.g. for ``/clear``. A
             truncation; exclusive with both cutoffs.
+        :param continue_source: Also copy the source's host, workspace and
+            branch, in the same write that creates the fork, for a same-owner
+            continuation of the source's work.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
