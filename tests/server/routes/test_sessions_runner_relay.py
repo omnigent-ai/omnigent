@@ -18,9 +18,12 @@ import pytest
 from omnigent.entities import Conversation
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.scheduled_context import (
+    SCHEDULED_RUN_HEADER,
+    add_scheduled_run_header,
     current_scheduled_run,
     scheduled_run_scope,
 )
+from omnigent.server.scheduled.telemetry import fire_stage
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -136,10 +139,11 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     async with httpx.AsyncClient(
         base_url="http://runner",
         transport=httpx.MockTransport(respond),
+        event_hooks={"request": [add_scheduled_run_header]},
     ) as runner:
         with capture_debug_rows("server") as rows:
             try:
-                with scheduled_run_scope(occurrence):
+                with scheduled_run_scope(occurrence), fire_stage("runner_start"):
                     handle = await sessions_module._ensure_runner_relay_ready(
                         "a7f039e9f1311474878eb7d4699c1013",
                         "runner_ready",
@@ -147,6 +151,9 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
                         conversation_store=None,
                     )
                     assert current_scheduled_run() == occurrence
+                    logging.getLogger("omnigent.server.relay_test").info(
+                        "delivery caller retains stage"
+                    )
                 assert handle is not None
                 assert handle.ready.is_set()
             finally:
@@ -168,12 +175,17 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     [finished] = [row for row in rows if row["message"] == "relay finished after delivery scope"]
     assert finished["session_id"] == ready_row["session_id"]
     assert finished["attributes"]["runner_id"] == "runner_ready"
+    [caller] = [row for row in rows if row["message"] == "delivery caller retains stage"]
+    assert caller["attributes"]["run_id"] == occurrence.run_id
+    assert caller["attributes"]["fire_stage"] == "runner_start"
     for row in (ready_row, connected_row, finished):
         assert row["attributes"].get("run_id") is None
         assert row["attributes"].get("task_id") is None
+        assert row["attributes"].get("fire_stage") is None
     [request] = requests
     assert request.method == "GET"
     assert request.url.path == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream"
+    assert SCHEDULED_RUN_HEADER not in request.headers
 
 
 class _ScriptedStreamResponse:

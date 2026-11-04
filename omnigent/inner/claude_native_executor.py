@@ -19,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeComposerNotCleared,
+    ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
     ClaudeSignInPending,
@@ -27,6 +28,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
     cancellable_injection,
+    claude_pane_ready,
     has_pending_user_prompt,
     inject_slash_command,
     inject_user_message,
@@ -39,6 +41,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_model_env,
     read_model_picker_values,
     read_transcript_path,
+    terminal_dialog_pending,
 )
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.inner.executor import (
@@ -71,10 +74,8 @@ _AUTH_COMMAND_GUIDANCE_MANAGED_SANDBOX = (
     "nothing from the web chat. " + MANAGED_SANDBOX_SIGN_IN_REMEDY
 )
 
-# How long a turn holds a message refused before anything was typed: until the
-# person answers a Claude question or permission prompt, or until Claude Code's
-# input box reads clear. Inside the server's 600 s pending-input lifetime, so a
-# message still held at the end is reported.
+# Hold refusals raised before typing until the person answers or frees the box.
+# Report the result before the server's 600 s pending-input lifetime ends.
 _MESSAGE_HOLD_S = 8 * 60.0
 _MESSAGE_HOLD_POLL_S = 1.0
 # How often a message held for the input box asks Claude Code to repaint it.
@@ -87,6 +88,17 @@ _HOST_DISK_FULL_MESSAGE = (
     "The host's disk is full, so Claude Code can't save this conversation and the "
     "message was not sent."
 )
+
+
+def _can_hold_refusal(
+    exc: ClaudeUserPromptPending | ClaudeTerminalDialog | ClaudeComposerNotCleared,
+) -> bool:
+    """Return whether a refusal came before typing, so the message can be held and retried."""
+    if isinstance(exc, ClaudeUserPromptPending):
+        return exc.nothing_typed
+    if isinstance(exc, ClaudeTerminalDialog):
+        return isinstance(exc, ClaudeInputBoxOccupied) or exc.awaits_answer
+    return True
 
 
 class ClaudeNativeExecutor(Executor):
@@ -207,8 +219,10 @@ class ClaudeNativeExecutor(Executor):
         Messages sent meanwhile are refused back to the runner, which delivers
         them as later turns, so none overtakes the held one.
 
-        :param refusal: The :class:`ClaudeUserPromptPending` or
-            :class:`ClaudeComposerNotCleared` the delivery raised.
+        :param refusal: The :class:`ClaudeUserPromptPending`,
+            :class:`ClaudeTerminalDialog`, :class:`ClaudeComposerNotCleared` or
+            :class:`ClaudeInputBoxOccupied`
+            the delivery raised.
         :param deadline: Event-loop time the hold ends at, shared by every
             refusal in the turn.
         :returns: ``True`` once the message can be delivered again, ``False``
@@ -218,9 +232,31 @@ class ClaudeNativeExecutor(Executor):
         try:
             if isinstance(refusal, ClaudeComposerNotCleared):
                 return await self._wait_for_clear_input_box(deadline)
+            if isinstance(refusal, ClaudeInputBoxOccupied):
+                return await self._wait_for_free_input_box(refusal.surface, deadline)
             return await self._wait_for_answer(deadline)
         finally:
             self._holding_message = False
+
+    async def _poll_until(self, deadline: float, ready: Callable[[], bool]) -> bool:
+        """
+        Poll *ready* off the event loop every :data:`_MESSAGE_HOLD_POLL_S` until it holds.
+
+        A poll that cannot read the pane counts as not ready.
+
+        :param deadline: Event-loop time the hold ends at.
+        :param ready: A check of the pane that sends no input.
+        :returns: ``True`` once *ready* holds, ``False`` when the deadline passed.
+        """
+        loop = asyncio.get_running_loop()
+        while loop.time() < deadline:
+            await asyncio.sleep(_MESSAGE_HOLD_POLL_S)
+            try:
+                if await asyncio.to_thread(ready):
+                    return True
+            except (OSError, RuntimeError):
+                continue
+        return False
 
     async def _wait_for_clear_input_box(self, deadline: float) -> bool:
         """
@@ -244,47 +280,65 @@ class ClaudeNativeExecutor(Executor):
             extra={"session_id": self._request_session_id},
         )
         next_repaint = loop.time()
-        while loop.time() < deadline:
-            await asyncio.sleep(_MESSAGE_HOLD_POLL_S)
+
+        def reads_clear() -> bool:
+            nonlocal next_repaint
             repaint = loop.time() >= next_repaint
             if repaint:
                 next_repaint = loop.time() + _INPUT_BOX_REPAINT_INTERVAL_S
-            try:
-                clear = await asyncio.to_thread(
-                    input_box_reads_clear, self._bridge_dir, repaint=repaint
-                )
-            except (OSError, RuntimeError):
-                continue
-            if clear:
-                return True
-        return False
+            return input_box_reads_clear(self._bridge_dir, repaint=repaint)
+
+        return await self._poll_until(deadline, reads_clear)
+
+    async def _wait_for_free_input_box(self, surface: str, deadline: float) -> bool:
+        """
+        Hold a turn whose message an input box kept in another mode refused.
+
+        The person left the box in shell mode or the prompt-history search in
+        the embedded terminal, often while still typing there, and the reclaim
+        could not take it back. Nothing was typed, so the message can go once
+        the box takes chat input again (:func:`claude_pane_ready`). Nothing is
+        typed while the message is held.
+
+        :param surface: What kept the box, e.g. ``"shell mode"``.
+        :param deadline: Event-loop time the hold ends at, shared by every
+            refusal in the turn.
+        :returns: ``True`` once the box takes chat input, ``False`` when the
+            hold ran out.
+        """
+        _logger.info(
+            "claude-native: holding the message until Claude Code's input box leaves %s",
+            surface,
+            extra={"session_id": self._request_session_id},
+        )
+        return await self._poll_until(deadline, lambda: claude_pane_ready(self._bridge_dir))
 
     async def _wait_for_answer(self, deadline: float) -> bool:
         """
-        Hold a turn whose message a pending question or permission prompt refused.
+        Hold a turn whose message a pending question, permission prompt or dialog refused.
 
-        The web UI and the embedded terminal both offer the prompt, so once the
-        person answers it the message can be delivered instead of failed.
+        Questions and permission prompts are offered in the web UI and the
+        embedded terminal; the dialogs only the terminal shows are answered
+        there. Once the person answers, the message is delivered instead of failed.
 
         :param deadline: Event-loop time the hold ends at, shared by every
             refusal in the turn.
         :returns: ``True`` once nothing waits for an answer, ``False`` when the
             hold ran out.
         """
-        loop = asyncio.get_running_loop()
         _logger.info(
             "claude-native: holding the message until the pending Claude prompt is answered",
             extra={"session_id": self._request_session_id},
         )
-        while loop.time() < deadline:
-            await asyncio.sleep(_MESSAGE_HOLD_POLL_S)
-            try:
-                pending = await asyncio.to_thread(has_pending_user_prompt, self._bridge_dir)
-            except (OSError, RuntimeError):
-                continue
-            if not pending:
-                return True
-        return False
+        return await self._poll_until(
+            deadline,
+            lambda: (
+                not (
+                    has_pending_user_prompt(self._bridge_dir)
+                    or terminal_dialog_pending(self._bridge_dir)
+                )
+            ),
+        )
 
     async def _inject_prompt(self, text: str, notices: list[str]) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
@@ -326,12 +380,14 @@ class ClaudeNativeExecutor(Executor):
             ``config.model``) and the switch is applied inline, before the
             message — see the ``/model`` handling below.
         :yields: :class:`TurnComplete` after the input was injected,
-            or :class:`ExecutorError` on bridge failure. A question or
-            permission prompt that refuses the message before anything is
-            typed holds the turn until it is answered (see
+            or :class:`ExecutorError` on bridge failure. A question,
+            permission prompt or terminal dialog that refuses the message
+            before anything is typed holds the turn until it is answered (see
             :meth:`_wait_for_answer`), then the message is delivered. So does
             an input box that could not be verified clear, until it reads
-            clear (see :meth:`_wait_for_clear_input_box`).
+            clear (see :meth:`_wait_for_clear_input_box`), and one kept in
+            shell mode or the prompt-history search, until it takes chat
+            input again (see :meth:`_wait_for_free_input_box`).
         """
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
@@ -401,9 +457,13 @@ class ClaudeNativeExecutor(Executor):
                     try:
                         await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
                         break
-                    except (ClaudeUserPromptPending, ClaudeComposerNotCleared) as exc:
+                    except (
+                        ClaudeUserPromptPending,
+                        ClaudeTerminalDialog,
+                        ClaudeComposerNotCleared,
+                    ) as exc:
                         # Refused before the message was typed: hold it and retry.
-                        if isinstance(exc, ClaudeUserPromptPending) and not exc.nothing_typed:
+                        if not _can_hold_refusal(exc):
                             raise
                         if hold_deadline is None:
                             hold_deadline = asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
