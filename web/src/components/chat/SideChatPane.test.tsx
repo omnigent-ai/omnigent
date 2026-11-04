@@ -12,7 +12,12 @@ import * as filesApi from "@/lib/filesApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
-import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  clearSessionDrafts,
+  getDroppedDraftSends,
+  getSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
@@ -1052,6 +1057,15 @@ describe("side-chat interrupt", () => {
     const input = screen.getByTestId("side-chat-input");
     fireEvent.keyDown(input, { key: "Enter" });
     expect(screen.queryByRole("textbox", { name: "Reply text before quote 1" })).toBeNull();
+    onTestFinished(clearSessionDrafts);
+    // A grid pane took a reload's send back into the shared composer while the follow-up waited.
+    act(() =>
+      useChatStore.setState({
+        sideChatComposers: {
+          [childId]: { text: "saved on server", files: [], sentAs: ["stable_reload"] },
+        },
+      }),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
     expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue(
@@ -1063,6 +1077,7 @@ describe("side-chat interrupt", () => {
       quotes: [expect.objectContaining({ before: "Earlier answer", text: "Quoted passage" })],
       startupInputIds: ["pending_first"],
     });
+    expect(getDroppedDraftSends(childId)).toEqual(["stable_reload"]);
     expect(input).toHaveValue("Follow up");
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });

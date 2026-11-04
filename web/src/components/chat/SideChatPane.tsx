@@ -848,7 +848,7 @@ function SideChatComposer({
     const skill = routeLocally
       ? matchSlashCommandInvocation(trimmed, Object.keys(skillCommands))
       : null;
-    // The failed startup inputs this draft holds; the send names them, not other composers'.
+    // Name only this composer's held inputs so a send never replaces the main composer's.
     const startupInputIds = composer?.startupInputIds;
     const runSkill = (match: { command: string; args: string }) => {
       clearComposer(childId);
@@ -965,6 +965,8 @@ function SideChatComposer({
               const target = queuedMessages.find((message) => message.queueId === queueId);
               if (!target) return;
               const restored = restoreReplyDraft(target.text, target.replyDraft);
+              // Recalling replaces the draft, so its sends are dropped as clearing drops them.
+              clearComposer(childId);
               updateComposer(childId, () => ({
                 ...restored,
                 files: target.files ?? [],

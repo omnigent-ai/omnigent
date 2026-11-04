@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
 import {
   clearSessionDrafts,
+  getDroppedDraftSends,
   getSessionDraft,
   hasSessionDraft,
   setSessionDraft,
@@ -6615,6 +6616,7 @@ describe("Composer — editing queued messages", () => {
         text: "saved on server",
         files: [],
         startupInputIds: ["pending_held"],
+        sentAs: ["stable_held"],
       });
       useChatStore.setState({
         queuedMessages: [
@@ -6634,6 +6636,9 @@ describe("Composer — editing queued messages", () => {
 
       expect(textarea()).toHaveValue(QUEUED_TEXT);
       expect(getSessionDraft(CONV)?.startupInputIds).toEqual(startupInputIds);
+      // The replaced text took its send along, so a later read doesn't hand it back.
+      expect(getSessionDraft(CONV)?.sentAs).toBeUndefined();
+      expect(getDroppedDraftSends(CONV)).toEqual(["stable_held"]);
       fireEvent.keyDown(textarea(), { key: "Enter" });
       expect(props.onSend).toHaveBeenCalledExactlyOnceWith(
         QUEUED_TEXT,

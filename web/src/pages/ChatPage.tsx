@@ -137,6 +137,7 @@ import {
   addSessionDraftStartupInputs,
   getSessionDraft,
   promoteSessionDraft,
+  rememberDroppedDraftSends,
   replaceSessionDraftStartupInputs,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
@@ -3831,20 +3832,23 @@ function ComposerImpl(
   };
 
   // The recalled message replaces the composer's content, so the draft holds only its failed
-  // startup inputs: its resend replaces them, and a reload doesn't offer them again.
+  // startup inputs: its resend replaces them, and a reload doesn't offer them again. The
+  // replaced text's sends are dropped as clearing drops them.
   const takeBackQueued = (message: {
     queueId: string;
     text: string;
     files?: File[];
     startupInputIds?: string[];
   }) => {
-    if (conversationId)
+    if (conversationId) {
+      rememberDroppedDraftSends(conversationId, getSessionDraft(conversationId)?.sentAs);
       replaceSessionDraftStartupInputs(
         conversationId,
         message.text,
         message.startupInputIds ?? [],
         message.files,
       );
+    }
     dequeueMessage(message.queueId);
   };
 
