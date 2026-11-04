@@ -4304,9 +4304,17 @@ def test_augment_claude_args_allows_reading_session_attachments(
             "Read(//c/Users/alice/.omnigent/attachments/k/**)",
         ),
         (PureWindowsPath(r"\\server\share\attachments\k"), None),
+        (PureWindowsPath(r"C:attachments\k"), None),
+        (PurePosixPath("attachments/k"), None),
         (PurePosixPath("/home/a[1]/.omnigent/attachments/k"), None),
     ],
-    ids=["windows-drive", "windows-unc", "glob-metacharacters"],
+    ids=[
+        "windows-drive",
+        "windows-unc",
+        "windows-drive-relative",
+        "relative",
+        "glob-metacharacters",
+    ],
 )
 def test_claude_read_rule_only_emits_exact_absolute_patterns(
     directory: PurePath, expected: str | None

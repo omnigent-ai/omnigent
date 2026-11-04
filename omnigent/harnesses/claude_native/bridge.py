@@ -2841,6 +2841,8 @@ def _claude_read_rule(directory: PurePath) -> str | None:
     :returns: A rule such as ``"Read(//home/a/.omnigent/attachments/k/**)"``, or
         ``None`` when the path cannot be expressed exactly as a rule pattern.
     """
+    if not directory.is_absolute():
+        return None
     if isinstance(directory, PureWindowsPath):
         drive = directory.drive
         if len(drive) != 2 or drive[1] != ":":
@@ -2848,7 +2850,7 @@ def _claude_read_rule(directory: PurePath) -> str | None:
         posix_path = "/".join(("", drive[0].lower(), *directory.parts[1:]))
     else:
         posix_path = directory.as_posix()
-    if not posix_path.startswith("/") or any(char in posix_path for char in "*?[]{}\\"):
+    if any(char in posix_path for char in "*?[]{}\\"):
         return None
     return f"Read(/{posix_path.rstrip('/')}/**)"
 
