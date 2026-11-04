@@ -330,9 +330,6 @@ describe("HostBadge", () => {
       useSessionHostOnlineMock.mockReturnValue(online);
       render(<HostBadge sessionId="conv_1" appearance="composer" />);
       const trigger = screen.getByTestId("composer-host-select");
-      const indicator = screen.queryByTestId("composer-host-status");
-      if (online === false) expect(indicator).toHaveClass("border-muted-foreground");
-      else expect(indicator).toBeNull();
       // The styled tooltip replaces the native title hover.
       expect(trigger).not.toHaveAttribute("title");
       fireEvent.focus(trigger);
@@ -601,7 +598,7 @@ describe("HostBadge", () => {
     useSessionHostOnlineMock.mockReturnValue(true);
     rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />);
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, online");
-    expect(screen.queryByTestId("composer-host-status")).toBeNull();
+    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "online");
     expect(screen.getByTestId("composer-host-menu-status")).toHaveAttribute(
       "data-status",
       "online",
@@ -613,20 +610,18 @@ describe("HostBadge", () => {
     ["unsettled", undefined, "unknown"],
     ["online", true, "online"],
   ] as const)(
-    "keeps %s status in the menu and only offline status in the composer chip",
+    "draws the same %s dot in the composer chip and its menu",
     (_state, online, status) => {
       useSessionHostOnlineMock.mockReturnValue(online);
       useHostsMock.mockReturnValue({ data: undefined });
       render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
       fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
-      const chipDot = screen.queryByTestId("composer-host-status");
+      const chipDot = screen.getByTestId("composer-host-status");
       const menuDot = screen.getByTestId("composer-host-menu-status");
+      expect(chipDot).toHaveAttribute("data-status", status);
       expect(menuDot).toHaveAttribute("data-status", status);
-      if (status === "offline") {
-        expect(chipDot).toHaveAttribute("data-status", status);
-        expect(menuDot.className).toBe(chipDot?.className);
-      } else expect(chipDot).toBeNull();
-      expect(menuDot).not.toHaveClass("bg-destructive");
+      expect(menuDot.className).toBe(chipDot.className);
+      expect(chipDot).not.toHaveClass("bg-destructive");
     },
   );
 
@@ -803,7 +798,7 @@ describe("HostBadge during a sandbox launch", () => {
     rerender(<HostBadge sessionId="conv_1" appearance="composer" />);
     expect(trigger).toHaveAccessibleName("Host Modal Sandbox, online");
     expect(screen.getByTestId("composer-host-icon")).toHaveClass("lucide-monitor-cloud");
-    expect(screen.queryByTestId("composer-host-status")).not.toBeInTheDocument();
+    expect(screen.getByTestId("composer-host-status")).toBeInTheDocument();
   });
 
   it("spins a bound sandbox's dot through the server's wake stages, still reconnectable, until online", () => {
@@ -830,7 +825,7 @@ describe("HostBadge during a sandbox launch", () => {
     useSessionHostOnlineMock.mockReturnValue(true);
     rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />);
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, online");
-    expect(screen.queryByTestId("composer-host-status")).toBeNull();
+    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "online");
   });
 
   it.each(["action_required", "failed"] as const)(
@@ -853,7 +848,7 @@ describe("HostBadge during a sandbox launch", () => {
     useSessionMock.mockReturnValue({ session: { hostId: null } });
     render(<HostBadge sessionId="conv_1" appearance="composer" starting />);
     expect(screen.getByTestId("composer-host-select")).toHaveAccessibleName("No host bound");
-    expect(screen.queryByTestId("composer-host-status")).toBeNull();
+    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "unknown");
   });
 
   const timedOut = { stage: "failed", error: "Sandbox launch timed out" } as const;

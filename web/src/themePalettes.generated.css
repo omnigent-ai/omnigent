@@ -35,8 +35,8 @@
   --sidebar-accent-foreground: #27272a;
   --sidebar-border: #e4e4e7;
   --sidebar-ring: var(--ring);
-  --sidebar-active: color-mix(in srgb, var(--brand-accent) 6%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
   --sidebar-background: linear-gradient(90deg, #fffefe, #fbfafb);
   --shell-background: var(--background);
 }
@@ -76,8 +76,8 @@
   --sidebar-accent-foreground: oklch(0.965 0.003 240);
   --sidebar-border: oklch(0.28 0.005 240);
   --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
-  --sidebar-active: color-mix(in srgb, var(--brand-accent) 8%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
   --sidebar-background:
     linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)),
     linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%);

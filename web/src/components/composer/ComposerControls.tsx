@@ -166,7 +166,7 @@ export const ComposerHostTrigger = forwardRef<
       {...props}
     >
       <span className="flex items-center">
-        {(status === "offline" || status === "starting") && (
+        {status && (
           <span className="flex size-4 shrink-0 items-center justify-center">
             <HostStatusDot status={status} testId={`${testIdPrefix}-host-status`} />
           </span>

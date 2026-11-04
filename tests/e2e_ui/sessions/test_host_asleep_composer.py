@@ -204,19 +204,15 @@ def _next_held(page: Page, held: list[Route], timeout_ms: int = 10_000) -> Route
 
 
 def _expect_host_status(page: Page, status: str, *, tooltip: str) -> None:
-    """Check the host status, its activity dot, and its tooltip.
+    """Hover the composer's host chip and check its dot and tooltip.
 
     :param page: Page showing the session composer.
-    :param status: Expected host state, e.g. ``"starting"``.
+    :param status: Expected ``data-status``, e.g. ``"starting"``.
     :param tooltip: Text the hover tooltip's Status row should show.
     """
-    chip = page.get_by_test_id("composer-host-select")
-    dot = page.get_by_test_id("composer-host-status")
-    if status == "online":
-        expect(chip).to_have_accessible_name(re.compile(r", online$"), timeout=15_000)
-        expect(dot).to_have_count(0)
-    else:
-        expect(dot).to_have_attribute("data-status", status, timeout=15_000)
+    expect(page.get_by_test_id("composer-host-status")).to_have_attribute(
+        "data-status", status, timeout=15_000
+    )
     page.mouse.move(0, 0)
     page.get_by_test_id("composer-host-select").hover()
     expect(page.get_by_test_id("composer-host-tooltip")).to_contain_text(tooltip, timeout=5_000)
@@ -225,10 +221,10 @@ def _expect_host_status(page: Page, status: str, *, tooltip: str) -> None:
 
 
 def _open_host_menu(page: Page, status: str) -> None:
-    """Check the menu status and the matching activity dot when present.
+    """Open the host menu and check its current-host dot matches the chip.
 
     :param page: Page showing the session composer.
-    :param status: Expected ``data-status`` for the menu dot.
+    :param status: Expected ``data-status`` for both dots.
     """
     # A trigger click during the previous menu's close animation is dropped.
     expect(page.get_by_role("menu")).to_have_count(0, timeout=5_000)
@@ -236,11 +232,8 @@ def _open_host_menu(page: Page, status: str) -> None:
     expect(page.get_by_role("menu")).to_be_visible(timeout=5_000)
     menu_dot = page.get_by_test_id("composer-host-menu-status")
     expect(menu_dot).to_have_attribute("data-status", status, timeout=5_000)
-    chip_dot = page.get_by_test_id("composer-host-status")
-    if status == "online":
-        expect(chip_dot).to_have_count(0)
-    else:
-        assert menu_dot.get_attribute("class") == chip_dot.get_attribute("class")
+    chip_class = page.get_by_test_id("composer-host-status").get_attribute("class")
+    assert menu_dot.get_attribute("class") == chip_class
     page.wait_for_timeout(_HOLD_MS)
 
 
@@ -274,7 +267,7 @@ def test_reconnect_host_wakes_asleep_sandbox_in_status_dot(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Reconnect host spins the dot until connected, then removes it without a toast.
+    """Reconnect host spins the host dot, then turns it green, with no toast.
 
     The wake request reaches the real server, which answers once the runner is
     connected; the test holds it so the starting state can be observed, then

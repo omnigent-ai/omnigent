@@ -237,31 +237,10 @@ describe("themePalette", () => {
     expect(github.tokens.dark.primary).toBe("#58a6ff");
   });
 
-  it.each(PALETTES.filter((palette) => palette.id !== "omni"))(
-    "drives $label active sidebar colors from its accent",
-    (palette) => {
-      for (const mode of ["light", "dark"] as const) {
-        expect(palette.tokens[mode].sidebarActive).toContain("var(--primary)");
-        expect(palette.tokens[mode].sidebarActiveForeground).toBe("var(--primary)");
-      }
-    },
-  );
-
-  it("keeps the Omnigent active sidebar row subtle and readable in both modes", () => {
-    const omni = PALETTES[0];
+  it.each(PALETTES)("drives $label active sidebar colors from its accent", (palette) => {
     for (const mode of ["light", "dark"] as const) {
-      const tokens = omni.tokens[mode];
-      const weight = tokens.sidebarActive.match(/var\(--brand-accent\) (\d+)%/);
-      expect(weight).not.toBeNull();
-      const activeBackground = composite(
-        { rgb: parseColor(tokens.brandAccent).rgb, alpha: Number(weight![1]) / 100 },
-        parseColor(tokens.sidebar).rgb,
-      );
-      expect(Number(weight![1])).toBeLessThan(12);
-      expect(tokens.sidebarActiveForeground).toBe("var(--sidebar-foreground)");
-      expect(
-        contrast(parseColor(tokens.sidebarForeground).rgb, activeBackground),
-      ).toBeGreaterThanOrEqual(4.5);
+      expect(palette.tokens[mode].sidebarActive).toContain("var(--primary)");
+      expect(palette.tokens[mode].sidebarActiveForeground).toBe("var(--primary)");
     }
   });
 

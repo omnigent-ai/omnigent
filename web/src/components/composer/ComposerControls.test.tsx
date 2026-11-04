@@ -37,28 +37,7 @@ describe("shared composer controls", () => {
     );
     expect(screen.getByTestId("workspace-bar")).not.toHaveClass("items-start", "pt-1.5");
     expect(screen.getByRole("button", { name: "This machine" })).toHaveClass("w-11", "md:h-7");
-    expect(screen.queryByTestId("composer-host-status")).toBeNull();
   });
-
-  it.each([
-    ["offline", true],
-    ["starting", true],
-    ["online", false],
-    ["unknown", false],
-    [undefined, false],
-  ] as const)(
-    "renders the host indicator only for offline or starting status (%s)",
-    (status, hasIndicator) => {
-      render(<ComposerHostTrigger label="This machine" status={status} />);
-      const indicator = screen.queryByTestId("composer-host-status");
-      if (hasIndicator) {
-        expect(indicator).toHaveAttribute("data-status", status);
-        expect(indicator).toHaveClass("border-[1.5px]", "border-muted-foreground");
-        if (status === "starting") expect(indicator).toHaveClass("animate-spin");
-      } else expect(indicator).toBeNull();
-      expect(screen.getByRole("button", { name: "This machine" })).toBeInTheDocument();
-    },
-  );
 
   it.each([
     ["online", ["bg-success"], ["border-[1.5px]", "animate-spin"]],
@@ -96,13 +75,13 @@ describe("shared composer controls", () => {
     }
   });
 
-  it("renders an optional warning icon with the model trigger", () => {
+  it("renders a product-icon model trigger instead of a separate settings gear", () => {
     render(
       <ComposerHarnessTrigger
         label="Codex configuration"
         model="GPT-5.6-Sol"
         effort="High"
-        icon={<span data-testid="warning-icon" />}
+        icon={<span data-testid="product-icon" />}
       />,
     );
     const trigger = screen.getByRole("button", { name: "Codex configuration" });
@@ -118,7 +97,7 @@ describe("shared composer controls", () => {
       "GPT-5.6-Sol",
     );
     expect(screen.getByTestId("composer-agent-effort-value")).not.toHaveClass("hidden");
-    expect(screen.getByTestId("warning-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("product-icon")).toBeInTheDocument();
     expect(screen.getByTestId("composer-agent-config-value")).toHaveClass(
       COMPOSER_COLLAPSED_LABEL_CLASS,
     );

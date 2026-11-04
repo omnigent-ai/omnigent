@@ -2183,6 +2183,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
       label: picker.getAttribute("aria-label"),
       model: within(picker).getByTestId("new-chat-landing-agent-model-value").textContent,
       effort: within(picker).getByTestId("new-chat-landing-agent-effort-value").textContent,
+      icon: within(picker).getByTestId("new-chat-landing-agent-icon").innerHTML,
     };
     expect(snapshot.key).not.toBeNull();
     expect(readNewChatPickerCache(snapshot.key)).toEqual({
@@ -2209,7 +2210,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     expect(within(picker).getByTestId("new-chat-landing-agent-effort-value").textContent).toBe(
       snapshot.effort,
     );
-    expect(within(picker).queryByTestId("new-chat-landing-agent-icon")).toBeNull();
+    expect(within(picker).getByTestId("new-chat-landing-agent-icon").innerHTML).toBe(snapshot.icon);
     expect(screen.getByTestId("new-chat-landing-input")).toBeEnabled();
     return picker;
   }
@@ -3910,9 +3911,6 @@ describe("NewChatLandingScreen", () => {
 
       const chip = screen.getByTestId("new-chat-landing-host-chip");
       await waitFor(() => expect(chip).toHaveAccessibleName("Host: machine-2, Offline"));
-      expect(within(chip).getByTestId("new-chat-landing-host-status")).toHaveClass(
-        "border-muted-foreground",
-      );
       const input = screen.getByTestId("new-chat-landing-input");
       fireEvent.change(input, { target: { value: "Work on this repository" } });
       expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
@@ -4365,7 +4363,7 @@ describe("NewChatLandingScreen", () => {
       "data-icon-size",
       "16",
     );
-    expect(screen.queryByTestId("new-chat-landing-host-status")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-host-status")).toHaveClass("size-2");
     expect(screen.getByTestId("new-chat-landing-host-icon")).toHaveClass("size-4");
     expect(screen.queryByTestId("new-chat-landing-footer")).toBeNull();
     expect(composerSurface).toContainElement(composer);
@@ -4783,16 +4781,20 @@ describe("NewChatLandingScreen", () => {
       expect(key).toHaveClass("font-semibold");
     }
     fireEvent.blur(picker);
-    expect(within(picker).queryByTestId("new-chat-landing-agent-icon")).toBeNull();
-    expect(picker.querySelector("img")).toBeNull();
+    const productIcon = screen.getByTestId("new-chat-landing-agent-icon").querySelector("img");
+    expect(screen.getByTestId("new-chat-landing-agent-icon")).toHaveClass("size-4");
+    expect(productIcon).toHaveClass("size-4", "-translate-y-[0.5px]");
+    const productIconSource = decodeURIComponent(productIcon?.getAttribute("src") ?? "");
+    expect(productIconSource).toContain("<title>Claude Code</title>");
+    expect(productIconSource).toContain("M20.998 10.949H24v3.102");
+    expect(productIconSource).toContain("clip-rule='evenodd'");
+    expect(productIconSource).toContain("fill-rule='evenodd'");
+    expect(productIconSource).toContain("#D97757");
     expect(screen.getByTestId("new-chat-landing-agent-config-value")).toHaveClass(
       "inline-flex",
       "min-w-0",
       "items-baseline",
       "gap-1",
-    );
-    expect(screen.getByTestId("new-chat-landing-agent-config-value")).not.toHaveClass(
-      "group-data-[labels=collapsed]/composer-actions:hidden",
     );
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("Opus 4.8");
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass(
@@ -4809,14 +4811,10 @@ describe("NewChatLandingScreen", () => {
     fireEvent.pointerDown(picker, { button: 0 });
     const [rootMenu] = screen.getAllByRole("menu");
     expect(rootMenu).toHaveClass("w-[17.5rem]", "min-w-[17.5rem]", "composer-agent-menu");
-    const menuProductIcon = screen.getByTestId("new-chat-landing-agent-a1").querySelector("img");
-    expect(menuProductIcon).toHaveClass("size-4", "-translate-y-[0.5px]");
-    const productIconSource = decodeURIComponent(menuProductIcon?.getAttribute("src") ?? "");
-    expect(productIconSource).toContain("<title>Claude Code</title>");
-    expect(productIconSource).toContain("M20.998 10.949H24v3.102");
-    expect(productIconSource).toContain("clip-rule='evenodd'");
-    expect(productIconSource).toContain("fill-rule='evenodd'");
-    expect(productIconSource).toContain("#D97757");
+    expect(screen.getByTestId("new-chat-landing-agent-a1").querySelector("img")).toHaveAttribute(
+      "src",
+      productIcon?.getAttribute("src"),
+    );
     const editConfig = screen.getByTestId("new-chat-landing-agent-config-a1");
     expect(editConfig).toHaveTextContent(/^Edit$/);
     expect(editConfig).toHaveAttribute("aria-hidden", "true");
@@ -5519,7 +5517,9 @@ describe("NewChatLandingScreen", () => {
     expect(hostTrigger).toHaveAccessibleName(`Host: ${label}, Online`);
     expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
     expect(hostTrigger).not.toHaveAttribute("title");
-    expect(within(hostTrigger).queryByTestId("new-chat-landing-host-status")).toBeNull();
+    expect(within(hostTrigger).getByTestId("new-chat-landing-host-status")).toHaveClass(
+      "bg-success",
+    );
     expect(within(hostTrigger).getByTestId("new-chat-landing-host-icon")).toBeTruthy();
     expect(within(workspaceTrigger).getByText("repo")).toHaveClass("truncate");
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible();

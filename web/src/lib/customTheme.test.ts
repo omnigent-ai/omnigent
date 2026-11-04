@@ -160,10 +160,10 @@ describe("customTheme", () => {
     const theme = createCustomThemeFromPalette(PALETTES[0]);
     const variants = deriveCustomTheme({ ...theme, contrast: 53 });
 
-    expect(variants.light.sidebarActive).toBe(PALETTES[0].tokens.light.sidebarActive);
-    expect(variants.light.sidebarActiveForeground).toBe("var(--sidebar-foreground)");
-    expect(variants.dark.sidebarActive).toBe(PALETTES[0].tokens.dark.sidebarActive);
-    expect(variants.dark.sidebarActiveForeground).toBe("var(--sidebar-foreground)");
+    expect(variants.light.sidebarActive).toContain("var(--primary)");
+    expect(variants.light.sidebarActiveForeground).toBe("var(--primary)");
+    expect(variants.dark.sidebarActive).toContain("var(--primary)");
+    expect(variants.dark.sidebarActiveForeground).toBe("var(--primary)");
   });
 
   it("tints the sidebar active highlight with a custom accent", () => {

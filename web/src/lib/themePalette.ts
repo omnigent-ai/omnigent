@@ -251,8 +251,6 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebar: "#fdfafa",
         sidebarPrimary: "var(--link)",
         sidebarRing: "var(--ring)",
-        sidebarActive: "color-mix(in srgb, var(--brand-accent) 6%, var(--sidebar))",
-        sidebarActiveForeground: "var(--sidebar-foreground)",
         sidebarBackground: "linear-gradient(90deg, #fffefe, #fbfafb)",
         shellBackground: "var(--background)",
       }),
@@ -289,8 +287,6 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebarAccentForeground: "oklch(0.965 0.003 240)",
         sidebarBorder: "oklch(0.28 0.005 240)",
         sidebarRing: "oklch(0.92 0.003 240 / 0.4)",
-        sidebarActive: "color-mix(in srgb, var(--brand-accent) 8%, var(--sidebar))",
-        sidebarActiveForeground: "var(--sidebar-foreground)",
         sidebarBackground:
           "linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)), linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%)",
         shellBackground: "var(--background)",

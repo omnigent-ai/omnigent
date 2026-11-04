@@ -1,8 +1,25 @@
-"""E2E: long composer model labels keep Send and Stop usable on a phone.
+"""E2E: the composer action row collapses its text to icons on a phone.
 
-Permission labels collapse when crowded. Model text stays visible without a
-provider glyph and truncates to the available width, keeping the action row
-on one line and clear of Send or Stop while the viewport changes.
+On a phone-sized viewport (iOS web), the composer's action row cannot fit the
+permission chip's text and the ``<Model> <Effort>`` label — e.g.
+``databricks-claude-fable-5 xHigh`` on a Databricks-backed claude-native
+session — beside the other controls. The row must not wrap the right-hand
+controls onto a second line, nor let the model text run beneath the Stop
+(Interrupt) button while a turn is running: as soon as the labels stop
+fitting on one line, they collapse to their icons, and they come back once
+the row is wide enough again.
+
+User journeys covered (the reporter's, on iOS web, plus the landing page):
+
+1. open a session bound to a long Databricks model id at xhigh effort on a
+   phone-sized viewport — the model/effort text is collapsed to the harness
+   icon and every control sits on one row,
+2. send a message — the agent starts working, so the composer's Send button
+   becomes the destructive Stop (Interrupt) square — the icon-only model
+   trigger stays beside it, never beneath it,
+3. widen the window to desktop — the labels reappear,
+4. the new-session (landing) composer does the same with its permission and
+   model text.
 
 Harness notes:
 
@@ -56,7 +73,10 @@ _DESKTOP_VIEWPORT = {"width": 1800, "height": 900}
 # The reporter's session shape: a Databricks-served Claude model (shown raw —
 # the id is not in the alias catalog) at xhigh effort. The composer label
 # reads ``databricks-claude-fable-5-extended-thinking xHigh``. Long enough
-# (~282px at text-sm) means the model text must truncate beside the other controls.
+# (~282px at text-sm) that it can never share a phone-width action row with
+# the other controls — so the row MUST collapse it to the harness icon. On the
+# buggy build it either extends beneath the Stop button or wraps the whole
+# right-hand group onto a second line.
 _MODEL_ID = "databricks-claude-fable-5-extended-thinking"
 _EFFORT = "xhigh"
 
@@ -285,10 +305,17 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """Long model text truncates beside Stop while both controls remain usable.
+    """On a phone viewport the model/effort text collapses to the harness icon,
+    which stays beside the Stop (Interrupt) button on a single row.
 
-    The mock LLM holds a real turn open so Stop geometry is measured while
-    running. Widening the viewport keeps the same accessible model identity.
+    Asserts the label is rendered but hidden while the row is collapsed, then
+    sends a message whose turn the mock LLM holds open, waits for the
+    composer's destructive Stop square, and asserts the icon-only model
+    trigger neither intersects the Stop button's bounding box nor pushes it
+    off-screen, and that the leftmost and rightmost controls share one row. A
+    ≤1px touch is tolerated (border rounding / antialiasing); anything more is
+    the reported overlap. Finally widens the window to a laptop viewport and
+    asserts the label text comes back.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
@@ -320,24 +347,23 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         composer = page.get_by_label("Message the agent")
         expect(composer).to_be_visible(timeout=15_000)
 
-        # Keep the model identifiable while its long name truncates on the phone.
+        # The reporter's label is rendered, but a phone-width row cannot fit
+        # it beside the other controls, so the row collapses every label to
+        # its icon: the text is in the DOM yet hidden, never wrapped.
         trigger = page.get_by_test_id("composer-config-gear")
         label = page.get_by_test_id("composer-agent-config-value")
         row = page.get_by_test_id("composer-action-row")
         expect(trigger).to_be_visible(timeout=15_000)
         expect(label).to_contain_text(_MODEL_ID)
         expect(row).to_have_attribute("data-labels", "collapsed")
-        expect(label).to_be_visible()
-        expect(trigger.locator("img")).to_have_count(0)
-        model_text = page.get_by_test_id("composer-agent-model-value")
-        assert model_text.evaluate("element => element.scrollWidth > element.clientWidth")
+        expect(label).to_be_hidden()
         _screenshot(page, "chat-composer-phone-collapsed")
 
         composer.fill(_SENTINEL)
         page.get_by_role("button", name="Send", exact=True).click()
 
         # The turn is running (gated open on the mock LLM) and the draft is
-        # cleared, so the Send button is now the Stop square.
+        # cleared, so the Send button is now the destructive Stop square.
         stop = page.get_by_role("button", name="Interrupt")
         expect(stop).to_be_visible(timeout=60_000)
 
@@ -346,7 +372,7 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         page.wait_for_timeout(1_500)
         _screenshot(page, "chat-composer-phone-collapsed-running")
 
-        expect(label).to_be_visible()
+        expect(label).to_be_hidden()
         trigger_box = _box(trigger)
         stop_box = _box(stop)
 
@@ -370,10 +396,12 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
             f"Stop button at (x={stop_box['x']:.0f}, y={stop_box['y']:.0f}, "
             f"w={stop_box['width']:.0f}, h={stop_box['height']:.0f})"
         )
-        # Add and Stop stay on one line while the model name truncates.
+        # Collapsing to icons is what keeps the row on one line: the leftmost
+        # control (Add) and the rightmost (Stop) share it.
         _assert_same_row(_box(page.get_by_test_id("composer-attach")), stop_box)
 
-        # Widening preserves the model in the accessible trigger.
+        # Widening preserves the model in the accessible trigger even when the
+        # expanded action set still requires icon-only labels.
         page.set_viewport_size(_DESKTOP_VIEWPORT)
         expect(label).to_contain_text(_MODEL_ID)
         # Measured against the model trigger, not the Stop button: the gated turn
@@ -451,10 +479,9 @@ def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
 def test_new_session_composer_collapses_labels_to_icons_on_mobile(
     seeded_session: tuple[str, str],
 ) -> None:
-    """The landing composer keeps its model readable and Submit visible on a phone.
-
-    Permission text collapses while model text can truncate beside Submit.
-    Both labels fit on a laptop, and the Add menu keeps its row text readable.
+    """The landing composer hides its permission and model text on a phone
+    viewport, keeps every control on one row, and shows the text again on a
+    laptop-width window. Its Add menu never cuts off row text.
 
     :param seeded_session: ``(base_url, session_id)``; the landing page's
         create POST is stubbed to return this real session id.
@@ -509,17 +536,13 @@ async def _drive_landing_collapse(base_url: str, session_id: str) -> None:
             await async_expect(permission_text).not_to_be_empty()
             await async_expect(model_text).not_to_be_empty()
 
-            # Permission collapses; the model stays readable without a provider glyph.
+            # Phone width: both labels collapse to icons and the row stays single-line.
             await async_expect(row).to_have_attribute("data-labels", "collapsed")
             await async_expect(permission_text).to_be_hidden()
-            await async_expect(model_text).to_be_visible()
-            model_trigger = page.get_by_test_id("new-chat-landing-agent-select")
-            await async_expect(model_trigger.locator("img")).to_have_count(0)
+            await async_expect(model_text).to_be_hidden()
             add_box = await page.get_by_test_id("new-chat-landing-attach").bounding_box()
             submit_box = await page.get_by_test_id("new-chat-landing-submit").bounding_box()
-            model_box = await model_trigger.bounding_box()
-            assert add_box is not None and submit_box is not None and model_box is not None
-            assert model_box["x"] + model_box["width"] <= submit_box["x"] + 1.0
+            assert add_box is not None and submit_box is not None
             assert submit_box["x"] + submit_box["width"] <= _IPHONE_VIEWPORT["width"] + 1.0, (
                 submit_box
             )
