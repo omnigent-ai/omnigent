@@ -22697,6 +22697,36 @@ describe("a send cut off by a reload", () => {
     expect(peekUnsentSend("conv_reload")).toBeNull();
   });
 
+  it("keeps the draft of a send that failed here before identity resolved", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+    seedSession("conv_reload", []);
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      text: "rerun the failing test",
+      authorId: "user_a",
+    });
+    let identityChanged: (() => void) | undefined;
+    vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+      identityChanged = listener;
+      return () => {};
+    });
+    await useChatStore.getState().switchTo("conv_reload");
+    const failed = {
+      conversationId: "conv_reload",
+      text: "rerun the failing test",
+      files: [],
+      stableId: "stable_reload",
+      serverRefused: false,
+      unsettled: true,
+    };
+    useChatStore.setState({ failedSendDraft: failed });
+
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+    identityChanged!();
+
+    expect(useChatStore.getState().failedSendDraft).toEqual(failed);
+  });
+
   it("drops a waiting send once identity names another account", async () => {
     vi.mocked(getCurrentUserId).mockReturnValue(null);
     seedSession("conv_reload", []);

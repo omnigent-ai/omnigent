@@ -7749,7 +7749,7 @@ function unsentSendToRestore(
 /**
  * Finish a restore `unsentSendToRestore` put off until `/v1/me` names the viewer.
  * The bind has already painted, so the draft goes straight onto the session's
- * entry, after any draft already waiting there. Subscribing keeps a failed probe retrying.
+ * entry, after any messages a failed launch handed back. Subscribing keeps a failed probe retrying.
  *
  * @param conversationId - The session whose bind put the restore off.
  * @param items - That bind's snapshot items.
@@ -7765,9 +7765,13 @@ function restoreUnsentSendOnceIdentified(
     if (isConversationDisposed(conversationId)) return;
     const draft = unsentSendToRestore(conversationId, items);
     if (draft === null) return;
-    setterFor(conversationId)((state) => ({
-      failedSendDraft: joinFailedSendDrafts(state.failedSendDraft, draft),
-    }));
+    setterFor(conversationId)((state) => {
+      const waiting = state.failedSendDraft;
+      // A send this tab still tracks may be the journal's own; only handed-back messages take it.
+      if (waiting !== null && (waiting.recovered !== true || waiting.stableId !== undefined))
+        return {};
+      return { failedSendDraft: joinFailedSendDrafts(waiting, draft) };
+    });
   });
 }
 
@@ -7858,7 +7862,7 @@ function settleReplacedStartupInputs(
  * Hand the viewer's startup messages a failed managed launch left undelivered
  * back to the composer: drop the bubbles still showing them as sending and
  * restore their text after any draft already waiting there. Each is handed back
- * once: this entry remembers it, as does the saved draft the composer took it into.
+ * once: this entry remembers it, as does a saved draft that names it.
  * The composer can't take back uploaded files, so a notice names the attachments.
  *
  * @param conversationId - The session whose launch failed.
@@ -7883,23 +7887,11 @@ function returnFailedStartupInputs(
   failedInputs: FailedInput[],
   unacknowledged: ReadonlySet<string>,
 ): Partial<ConversationState> {
-  // A read that began before an accepted resend can still list the inputs it replaced.
-  const unreturned = failedInputs.filter(
-    (input) =>
-      !state.returnedStartupInputs.includes(input.pendingId) &&
-      !state.replacedStartupInputs.includes(input.pendingId),
-  );
-  // A send already handed back under its stable id, e.g. from the unanswered-send journal.
-  const sentAs = (stableId: string | null | undefined) =>
-    unreturned.filter((input) => stableId != null && input.itemId === stableId);
-  const inWaitingDraft = sentAs(state.failedSendDraft?.stableId).map((input) => input.pendingId);
-  const inComposer = sentAs(state.pendingRetryStableId).map((input) => input.pendingId);
-  const saved = getSessionDraft(conversationId);
-  // The composer's saved draft holds that send's text, so it names them for a later reload.
-  if (saved !== undefined && inComposer.length > 0)
-    addSessionDraftStartupInputs(conversationId, saved.text, inComposer);
+  const unreturned = unreturnedStartupInputs(state, failedInputs);
+  const inWaitingDraft = inputsSentAs(unreturned, state.failedSendDraft?.stableId);
+  const inComposer = inputsSentAs(unreturned, state.pendingRetryStableId);
   const held = new Set([
-    ...(saved?.startupInputIds ?? []),
+    ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
     ...(state.failedSendDraft?.startupInputIds ?? []),
     ...inWaitingDraft,
     ...inComposer,
@@ -7934,6 +7926,45 @@ function returnFailedStartupInputs(
     failedSendDraft: failedStartupDraft(conversationId, waiting, inputs),
     ...(attachments ? { blocks: [...blocks, attachments] } : {}),
   };
+}
+
+/** Hand back a failed launch's inputs, then name any the composer took back in its saved draft. */
+function handBackFailedStartupInputs(
+  entry: ConversationEntry,
+  conversationId: string,
+  failedInputs: FailedInput[],
+  unacknowledged: ReadonlySet<string>,
+): void {
+  const state = entry.getState();
+  const inComposer = inputsSentAs(
+    unreturnedStartupInputs(state, failedInputs),
+    state.pendingRetryStableId,
+  );
+  entrySetter(entry)((current) =>
+    returnFailedStartupInputs(conversationId, current, failedInputs, unacknowledged),
+  );
+  const saved = getSessionDraft(conversationId);
+  // The composer's saved draft holds that send's text, so a later reload knows them as returned.
+  if (saved !== undefined && inComposer.length > 0)
+    addSessionDraftStartupInputs(conversationId, saved.text, inComposer);
+}
+
+/** Failed inputs not yet handed back; a read begun before an accepted resend can list ones it replaced. */
+function unreturnedStartupInputs(
+  state: Pick<ConversationState, "returnedStartupInputs" | "replacedStartupInputs">,
+  failedInputs: FailedInput[],
+): FailedInput[] {
+  return failedInputs.filter(
+    (input) =>
+      !state.returnedStartupInputs.includes(input.pendingId) &&
+      !state.replacedStartupInputs.includes(input.pendingId),
+  );
+}
+
+/** Pending ids of the inputs saved under a send's stable id, e.g. one from the unanswered-send journal. */
+function inputsSentAs(inputs: FailedInput[], stableId: string | null | undefined): string[] {
+  if (stableId == null) return [];
+  return inputs.filter((input) => input.itemId === stableId).map((input) => input.pendingId);
 }
 
 /**
@@ -8093,9 +8124,11 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
     (await readWithinReconcileTimeout(read)) ?? (await readWithinReconcileTimeout(read));
   // A conversation reopened under the same id during the read is a different entry.
   if (entry.disposed) return;
+  if (inputs !== null) {
+    handBackFailedStartupInputs(entry, conversationId, inputs, unacknowledged);
+    return;
+  }
   entrySetter(entry)((state) => {
-    if (inputs !== null)
-      return returnFailedStartupInputs(conversationId, state, inputs, unacknowledged);
     if (state.blocks.some(isStartupLookupNotice)) return {};
     const notice: ErrorBlock = {
       ...makeClientErrorBlock(
@@ -8123,9 +8156,7 @@ export async function retryFailedStartupLookup(conversationId: string): Promise<
   );
   if (entry.disposed) return;
   if (inputs === null) throw new Error("The messages couldn't be read");
-  entrySetter(entry)((state) =>
-    returnFailedStartupInputs(conversationId, state, inputs, unacknowledged),
-  );
+  handBackFailedStartupInputs(entry, conversationId, inputs, unacknowledged);
 }
 
 /**

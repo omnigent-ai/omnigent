@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { readComposerDraft, type ComposerDraft } from "./replyDraft";
+import { readComposerDraft, readStartupInputIds, type ComposerDraft } from "./replyDraft";
 
 export interface SessionDraft extends ComposerDraft {
   files: File[];
@@ -31,14 +31,6 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
   } catch {
     return new Map();
   }
-}
-
-/** A stored record's `startupInputIds`, or `undefined` when missing or malformed. */
-export function readStartupInputIds(entry: unknown): string[] | undefined {
-  if (typeof entry !== "object" || entry === null || !("startupInputIds" in entry))
-    return undefined;
-  const ids = entry.startupInputIds;
-  return Array.isArray(ids) && ids.every((id) => typeof id === "string") ? ids : undefined;
 }
 
 function saveDraftsToStorage(): void {

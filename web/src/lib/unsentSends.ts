@@ -1,8 +1,7 @@
 // Sends this tab hasn't seen answered, and queued messages, per session in sessionStorage.
 // The server can hold a POST for minutes (a sandbox launch or wake) without persisting
 // it, and the queue lives in memory, so a reload would otherwise lose the text.
-import { readComposerDraft, type StoredReplyDraft } from "./replyDraft";
-import { readStartupInputIds } from "./sessionDrafts";
+import { readComposerDraft, readStartupInputIds, type StoredReplyDraft } from "./replyDraft";
 
 export interface UnsentSend {
   stableId: string;
