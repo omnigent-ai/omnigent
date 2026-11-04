@@ -1028,15 +1028,14 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
     def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
         """Seed a pre-write snapshot for *path* if one does not already exist.
 
-        Must be called **before** writing new content to the file so the
-        snapshot captures the original (pre-modification) state.  If a
-        snapshot for *path* already exists this is a no-op.  *session_id*
-        compares the disk only with a snapshot taken before its first recorded
-        change, so edits made earlier outside a tool call are part of it.
+        *content* is read before the write that replaces it and seeded once
+        that write succeeds.  If a snapshot for *path* already exists this is
+        a no-op.  *session_id* compares the disk only with a snapshot taken
+        before its first recorded change.
 
         :param path: Normalized path relative to the workspace root,
             e.g. ``"src/foo.py"``.
-        :param content: Current file content before the upcoming write.
+        :param content: File content from before the write.
         :param session_id: Optional session identifier.  When provided,
             the path is registered under this session so that
             :meth:`unregister_conversation` can evict it later.
