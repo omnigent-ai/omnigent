@@ -150,8 +150,9 @@ curl --fail-with-body -sS "$NEON_AI_GATEWAY_BASE_URL/v1/models" \
   | jq -r '.data[] | select(.enabled) | .id'
 ```
 
-`--fail-with-body` makes a `401` or `403` show its error instead of an empty
-list. Neon reports served model IDs with a `system.ai.` prefix in responses,
+With `--fail-with-body`, a bad credential makes curl report the status (for
+example `The requested URL returned error: 401`) rather than leaving only a jq
+error. Drop the `| jq ...` part to read Neon's error body. Neon reports served model IDs with a `system.ai.` prefix in responses,
 and also accepts a `databricks-` prefix in requests.
 
 Then start a session and run a turn that uses a tool, such as reading a file:
