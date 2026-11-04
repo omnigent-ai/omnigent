@@ -1901,7 +1901,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             env["ANTHROPIC_CUSTOM_HEADERS"].splitlines(),
             [
                 "Databricks-Custom-Coding-Agent: claude-code",
-                "Databricks-Custom-Client-Surfaces: omnigent, omnigent-web",
+                "Databricks-Custom-Client-Surfaces: omnigent-web",
             ],
         )
 
