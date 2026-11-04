@@ -629,6 +629,26 @@ def _is_user_turn_step(step: dict[str, object]) -> bool:
     return step.get("type") == _TYPE_USER_INPUT
 
 
+def _is_agent_work_step(step: dict[str, object]) -> bool:
+    """
+    Return whether a step indicates ongoing agent work during a turn.
+
+    Restores ``turn_active`` if an intermediate event or late reader attach left
+    the turn inactive while agy is actively executing tools or planning steps.
+    """
+    if _is_turn_close_step(step):
+        return False
+    step_type = step.get("type")
+    if step_type == _TYPE_PLANNER_RESPONSE:
+        return step.get("status") != _STATUS_ERROR
+    return bool(
+        step_type
+        and str(step_type).startswith("CORTEX_STEP_TYPE_")
+        and step_type != _TYPE_USER_INPUT
+        and step_type != "CORTEX_STEP_TYPE_ERROR_MESSAGE"
+    )
+
+
 def _is_assistant_text_close_step(step: dict[str, object]) -> bool:
     """
     Return whether a step closes a turn (assistant text, no further tool calls).
@@ -2291,7 +2311,7 @@ async def _emit_step(
     :param turn_active: Whether a turn is currently considered open on entry.
     :returns: The updated ``turn_active`` flag after this step.
     """
-    if _is_user_turn_step(step) and not turn_active:
+    if not turn_active and (_is_user_turn_step(step) or _is_agent_work_step(step)):
         turn_active = True
         await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
 

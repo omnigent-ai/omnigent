@@ -764,6 +764,50 @@ def _user_message_event(*, text: str) -> OutboundEvent:
     )
 
 
+_RETRYABLE_ERROR_PATTERNS = (
+    "please try again",
+    "cannot both be empty",
+    "model output must contain either output text or tool calls",
+    "emptyoutputcontinuationcheck",
+    "api error (attempt",
+)
+
+
+def terminal_error_text(step: dict[str, object]) -> str | None:
+    """Extract a final model failure, excluding agy's intermediate API retries."""
+    if step.get("type") == "CORTEX_STEP_TYPE_ERROR_MESSAGE":
+        if step.get("status") != _STATUS_DONE:
+            return None
+        block = step.get("errorMessage")
+        error = block.get("error") if isinstance(block, dict) else None
+        if not isinstance(error, dict):
+            return None
+        if not any(
+            error.get(key) for key in ("userErrorMessage", "modelErrorMessage", "fullError")
+        ):
+            return None
+        full_text = " ".join(
+            str(error.get(key))
+            for key in ("modelErrorMessage", "fullError", "shortError", "userErrorMessage")
+            if error.get(key)
+        ).lower()
+        if any(pattern in full_text for pattern in _RETRYABLE_ERROR_PATTERNS):
+            return None
+        for key in ("modelErrorMessage", "fullError", "shortError", "userErrorMessage"):
+            text = error.get(key)
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    if step.get("type") == _TYPE_PLANNER_RESPONSE and step.get("status") == _STATUS_ERROR:
+        planner = step.get("plannerResponse")
+        if isinstance(planner, dict):
+            for key in ("error", "errorMessage"):
+                text = planner.get(key)
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+        return "Antigravity: the model did not complete this turn (status ERROR)."
+    return None
+
+
 def _planner_error_event(
     *, conversation_id: str, step_idx: int, step: dict[str, object]
 ) -> OutboundEvent:
@@ -771,22 +815,16 @@ def _planner_error_event(
     Build a committed assistant ``message`` item for an ERROR planner step.
 
     A model/turn ERROR is otherwise dropped (the planner branch only commits at
-    DONE), so the turn looks like a silent empty reply. Surface a visible marker —
-    preferring any ``plannerResponse`` error text, falling back to a generic
-    message — mirroring the tool-level marker (:func:`_tool_error_output`). The
-    reader pairs this with a ``failed`` session-status edge.
+    DONE), so the turn looks like a silent empty reply. Surface a visible marker,
+    preferring any terminal error detail, falling back to a generic message.
 
     :param conversation_id: agy conversation id (namespaces the response id).
     :param step_idx: The ERROR planner step's index.
-    :param step: The ERROR PLANNER_RESPONSE step.
+    :param step: The ERROR step.
     :returns: One ``external_conversation_item`` event (role ``"assistant"``).
     """
-    detail = ""
-    planner = step.get("plannerResponse")
-    if isinstance(planner, dict):
-        err = planner.get("error") or planner.get("errorMessage")
-        if isinstance(err, str) and err.strip():
-            detail = f": {err.strip()}"
+    error = terminal_error_text(step)
+    detail = f": {error}" if error else ""
     text = f"[antigravity: the model did not complete this turn (status ERROR){detail}]"
     return OutboundEvent(
         event_type="external_conversation_item",
@@ -1014,6 +1052,15 @@ def map_step_to_events(
         return [_user_message_event(text=text)]
 
     status = step.get("status")
+
+    if step_type == "CORTEX_STEP_TYPE_ERROR_MESSAGE":
+        if status != _STATUS_DONE or terminal_error_text(step) is None:
+            return []
+        return [
+            _planner_error_event(
+                conversation_id=conversation_id, step_idx=_step_index(step) or 0, step=step
+            )
+        ]
 
     # PLANNER_RESPONSE: emit the COMMITTED assistant message and/or function_call(s),
     # but ONLY at terminal (DONE) status. A pre-DONE planner (GENERATING) carries a
