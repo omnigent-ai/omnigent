@@ -5492,8 +5492,8 @@ async def _forward_available_items(
     )
     if result.snapshot is None:
         fingerprint = _jsonl_cursor_fingerprint(state.transcript_path, result.byte_offset)
-    elif result.cursor_prefix_sample is not None and result.snapshot.matches(
-        state.transcript_path
+    elif result.cursor_prefix_sample is not None and await asyncio.to_thread(
+        result.snapshot.matches, state.transcript_path
     ):
         fingerprint = _jsonl_fingerprint_from_sample(
             result.byte_offset, result.cursor_prefix_sample

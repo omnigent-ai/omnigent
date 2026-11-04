@@ -970,16 +970,14 @@ async def test_rewritten_transcript_keeps_new_items_after_retained_native_record
         monkeypatch.setattr(claude_bridge.TranscriptReadSnapshot, "matches", matches_then_rewrite)
     attempts: list[str] = []
     posted: list[dict[str, Any]] = []
-    recovery_threads: list[threading.Thread] = []
-    recover = forwarder._validated_transcript_state
+    snapshot_threads: list[threading.Thread] = []
+    matches_snapshot = claude_bridge.TranscriptReadSnapshot.matches
 
-    def recover_in_worker(
-        current: forwarder.TranscriptForwardState, *, session_id: str
-    ) -> forwarder.TranscriptForwardState:
-        recovery_threads.append(threading.current_thread())
-        return recover(current, session_id=session_id)
+    def match_in_worker(snapshot: Any, path: Path) -> bool:
+        snapshot_threads.append(threading.current_thread())
+        return matches_snapshot(snapshot, path)
 
-    monkeypatch.setattr(forwarder, "_validated_transcript_state", recover_in_worker)
+    monkeypatch.setattr(claude_bridge.TranscriptReadSnapshot, "matches", match_in_worker)
 
     def handle(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
@@ -1086,9 +1084,8 @@ async def test_rewritten_transcript_keeps_new_items_after_retained_native_record
     assert all(
         item["item_data"].get("agent", "claude-native-ui") == "claude-native-ui" for item in posted
     )
-    assert recovery_threads and all(
-        thread != threading.current_thread() for thread in recovery_threads
-    )
+    assert len(snapshot_threads) >= 2
+    assert all(thread != threading.current_thread() for thread in snapshot_threads)
 
 
 @pytest.mark.asyncio
