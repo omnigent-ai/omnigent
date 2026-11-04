@@ -3931,6 +3931,38 @@ describe("Sidebar view options", () => {
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("name");
   });
 
+  it("starts Custom from the Updated window, not the Name window it leaves", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+    const banana = conv("conv_banana", "Codex", { created_at: 2, updated_at: 20 });
+    mockConversations([conv("conv_apple", "Codex", { created_at: 1, updated_at: 10 }), banana]);
+    renderGroupingSidebar();
+    const saved = () => JSON.parse(localStorage.getItem("omnigent:sidebar-view")!);
+    const rowTitles = () =>
+      within(groupSection("Sessions"))
+        .getAllByRole("link", { name: /^conv_/ })
+        .map((link) => link.textContent);
+    expect(rowTitles()).toEqual(["conv_apple", "conv_banana"]);
+
+    // Updated's first page arrives after the switch, with a newer session in it.
+    openViewSubmenu("session-ordering-menu");
+    mockConversations([conv("conv_zulu", "Codex", { created_at: 3, updated_at: 30 }), banana]);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Custom" }));
+    expect(rowTitles()).toEqual(["conv_zulu", "conv_banana"]);
+    expect(saved().ordering).toBe("custom");
+    expect(saved()).not.toHaveProperty("custom");
+
+    // The first move saves positions from the Updated rows on screen.
+    const zulu = screen.getByRole("link", { name: "conv_zulu" }).closest("li")!;
+    fireEvent.keyDown(within(zulu).getByTestId("conversation-actions"), { key: "Enter" });
+    fireEvent.click(screen.getByTestId("move-session-down"));
+    expect(rowTitles()).toEqual(["conv_banana", "conv_zulu"]);
+    expect(saved().custom).toEqual({
+      base: "updated",
+      since: 30,
+      ids: ["conv_banana", "conv_zulu"],
+    });
+  });
+
   it("shows the toggled metadata under the title and the updated time in the trailing slot", () => {
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_mac", name: "Build Mac", sandbox_provider: null }],

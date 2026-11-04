@@ -225,7 +225,7 @@ export function customSortOrder(order: SidebarCustomOrder): CustomSortOrder {
 }
 
 // Newest first, ties by id. Update times freeze for the active chat and hovered
-// list; creation times never move. Name sorts by title A to Z, without a freeze.
+// list; creation times never move. Name sorts by title A to Z.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,

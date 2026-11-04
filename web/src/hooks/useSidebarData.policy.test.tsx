@@ -578,9 +578,14 @@ it("keeps the lists when Updated is picked while a stored Name ordering lists by
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
-it.each([false, true])(
-  "clears destination sort snapshots while folders, pins and Archived reload (archived folder: %s)",
-  async (archivedFolder) => {
+it.each([
+  ["created", false, "created_at"],
+  ["created", true, "created_at"],
+  ["name", false, "title"],
+  ["name", true, "title"],
+] as const)(
+  "clears destination %s snapshots while folders, pins and Archived reload (archived folder: %s)",
+  async (ordering, archivedFolder, sortBy) => {
     groupingUi = true;
     view = "all";
     client.setQueryDefaults(["project-sessions"], { staleTime: 30_000 });
@@ -617,7 +622,7 @@ it.each([false, true])(
       result.current.pinned.data?.conversations[0]?.updated_at,
     ];
     await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
-    act(() => result.current.updateView({ ordering: "created" }));
+    act(() => result.current.updateView({ ordering }));
     await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
     updatedAt = 200;
     await act(async () => {
@@ -661,11 +666,10 @@ it.each([false, true])(
       true,
     );
     expect(
-      client.getQueryState(["conversations", "", false, null, "mine", "created_at"])?.isInvalidated,
+      client.getQueryState(["conversations", "", false, null, "mine", sortBy])?.isInvalidated,
     ).toBe(true);
     expect(
-      client.getQueryState(["project-sessions", "folder", "created_at", archivedFolder])
-        ?.isInvalidated,
+      client.getQueryState(["project-sessions", "folder", sortBy, archivedFolder])?.isInvalidated,
     ).toBe(true);
 
     updatedAt = 300;
@@ -673,7 +677,7 @@ it.each([false, true])(
       release = resolve;
     });
     fetchMock.mockClear();
-    act(() => result.current.updateView({ ordering: "created" }));
+    act(() => result.current.updateView({ ordering }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
     expect(timestamps()).toEqual([undefined, undefined, undefined, undefined, undefined]);
     await act(async () => {
@@ -682,7 +686,7 @@ it.each([false, true])(
     await waitFor(() => expect(timestamps()).toEqual([300, 300, 300, 300, 300]));
     expect(fetchMock).toHaveBeenCalledTimes(5);
     fetchMock.mockClear();
-    act(() => result.current.updateView({ ordering: "created", grouping: "status" }));
+    act(() => result.current.updateView({ ordering, grouping: "status" }));
     expect(fetchMock).not.toHaveBeenCalled();
   },
 );

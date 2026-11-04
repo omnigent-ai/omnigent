@@ -1964,8 +1964,9 @@ function ConversationList({
       onExitSelectionMode();
     }
     // Custom restores its saved positions, or starts from the order on screen.
+    // Leaving Name, it lists Updated's window and saves positions on the first move.
     const custom =
-      patch.ordering === "custom" && !view.custom
+      patch.ordering === "custom" && !view.custom && view.ordering !== "name"
         ? startCustomOrder(customOrderBase(view), orderingRows(), activeOverride, frozenKeys)
         : undefined;
     saveView(custom ? { ...patch, custom } : patch);
