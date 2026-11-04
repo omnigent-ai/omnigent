@@ -230,11 +230,13 @@ describe("InlineImage (data: URI carried by the transcript)", () => {
     expect(screen.getByRole("button", { name: "Zoom image: shot.png" })).toContainElement(img);
   });
 
-  it("swaps a corrupt data URI for the unavailable-image chip", () => {
-    // WHY: a truncated/corrupt data URI from an imported transcript used to
-    // leave the browser's broken-image glyph in the transcript. It must
-    // collapse to the same compact chip the embedded fetch failure shows.
-    render(<InlineImage src={BAD_PNG} alt="broken.png" />);
+  it.each([
+    ["data URI", BAD_PNG],
+    ["blob URL", "blob:http://localhost/broken"],
+  ])("swaps a corrupt %s for the unavailable-image chip", (_label, src) => {
+    // Corrupt local bytes (an imported data URI or a decoded workspace file)
+    // show the compact chip, not the browser's broken-image glyph.
+    render(<InlineImage src={src} alt="broken.png" />);
     fireEvent.error(screen.getByRole("img", { name: "broken.png" }));
 
     const chip = screen.getByRole("img", { name: "broken.png" });

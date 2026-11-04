@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   Database,
   File as FileIcon,
@@ -16,6 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+import { useObjectUrl } from "@/hooks/useObjectUrl";
 import { attachmentFilename, attachmentKey } from "@/lib/attachments";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { ComposerChipRow } from "@/components/composer/ChatComposer";
@@ -112,23 +113,6 @@ export function iconForFile(file: File): LucideIcon {
   if (type.startsWith("video/")) return FileVideo;
   if (type.startsWith("audio/")) return FileAudio;
   return FileIcon;
-}
-
-/** Blob URL for an image preview, created and revoked inside one effect so the
- *  URL the committed <img> points at is never revoked early (StrictMode double
- *  mount) and never leaks. Guarded: jsdom (tests) lacks createObjectURL. */
-function useObjectUrl(file: File | null): string | undefined {
-  const [url, setUrl] = useState<string>();
-  useEffect(() => {
-    if (!file || typeof URL.createObjectURL !== "function") {
-      setUrl(undefined);
-      return;
-    }
-    const objectUrl = URL.createObjectURL(file);
-    setUrl(objectUrl);
-    return () => URL.revokeObjectURL(objectUrl);
-  }, [file]);
-  return url;
 }
 
 function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }) {

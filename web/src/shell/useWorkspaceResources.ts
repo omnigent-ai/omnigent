@@ -44,6 +44,8 @@ export function useWorkspaceResources({
   return {
     canBrowseWorkspace,
     environmentQuery,
+    // A disabled query is pending but idle: its root and home will never arrive.
+    workspacePathsLoading: environmentQuery.isPending && environmentQuery.fetchStatus !== "idle",
     showFilesPanel: canBrowseWorkspace && environmentQuery.data?.available !== false,
     changedCount: changedFiles.data?.data.length ?? 0,
     isChangedPath,

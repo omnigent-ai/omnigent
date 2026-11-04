@@ -9,7 +9,11 @@ import { useTerminals } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "./useWorkspaceResources";
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
-  useWorkspaceEnvironment: vi.fn(() => ({ data: { available: true, root: "/workspace" } })),
+  useWorkspaceEnvironment: vi.fn(() => ({
+    data: { available: true, root: "/workspace" },
+    isPending: false,
+    fetchStatus: "idle",
+  })),
   useWorkspaceChangedFiles: vi.fn(() => ({ data: { data: [{ path: "notes.md" }] } })),
 }));
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
@@ -40,4 +44,20 @@ it.each([
   expect(useTerminals).toHaveBeenLastCalledWith("second", { reconcileWhilePending: true });
   expect(result.current.agentTerminal?.id).toBe("terminal_tui_main");
   expect(result.current.openTerminals).toEqual(["terminal:shell"]);
+});
+
+it.each([
+  ["while the first fetch runs", { isPending: true, fetchStatus: "fetching" }, true],
+  ["while the first fetch is paused offline", { isPending: true, fetchStatus: "paused" }, true],
+  ["when discovery is disabled", { isPending: true, fetchStatus: "idle" }, false],
+  ["once the environment loaded", { isPending: false, fetchStatus: "idle" }, false],
+  ["while a loaded environment refetches", { isPending: false, fetchStatus: "fetching" }, false],
+])("reports workspace paths as loading %s", (_label, status, loading) => {
+  vi.mocked(useWorkspaceEnvironment).mockReturnValueOnce(
+    status as unknown as ReturnType<typeof useWorkspaceEnvironment>,
+  );
+  const { result } = renderHook(() =>
+    useWorkspaceResources({ sessionId: "first", permissionLevel: null }),
+  );
+  expect(result.current.workspacePathsLoading).toBe(loading);
 });

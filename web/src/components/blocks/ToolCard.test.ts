@@ -5,6 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { RenderItem } from "@/lib/renderItems";
 import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
+import { writeShowToolResultImages } from "@/lib/toolResultImagePreferences";
 import { ToolCard, ToolGroupSummary, formatToolDuration } from "./ToolCard";
 import { getOutputPreview } from "./ToolCodePanel";
 import type * as ToolViewsModule from "./toolViews";
@@ -1021,6 +1022,39 @@ describe("ToolCard shell terminal theme", () => {
   });
 });
 
+describe("ToolCard result images", () => {
+  const PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const screenshotCall = {
+    name: "mcp__browser__take_screenshot",
+    arguments: { fullPage: false },
+    output: JSON.stringify({ content: [{ type: "image", data: PNG, mimeType: "image/png" }] }),
+    state: "output-available" as const,
+  };
+
+  afterEach(() => writeShowToolResultImages(false));
+
+  it("shows a returned image under the collapsed row while the setting is on", () => {
+    const { container } = renderCard(screenshotCall);
+    expect(screen.queryByTestId("tool-result-images")).toBeNull();
+    expect(screen.queryByRole("img", { name: "Tool result image" })).toBeNull();
+
+    act(() => writeShowToolResultImages(true));
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    const previews = screen.getByTestId("tool-result-images");
+    expect(within(previews).getByRole("img", { name: "Tool result image" })).toHaveAttribute(
+      "src",
+      `data:image/png;base64,${PNG}`,
+    );
+    // The preview sits beside the row, so collapsing never hides it.
+    expect(trigger).not.toContainElement(previews);
+
+    act(() => writeShowToolResultImages(false));
+    expect(screen.queryByTestId("tool-result-images")).toBeNull();
+  });
+});
+
 describe("ToolGroupSummary", () => {
   function toolItem(callId: string, name: string): RenderItem {
     return {
@@ -1049,6 +1083,35 @@ describe("ToolGroupSummary", () => {
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByText("Alpha tool")).toBeInTheDocument();
     expect(screen.getByText("Beta tool")).toBeInTheDocument();
+  });
+
+  it("shows a grouped tool's image preview only while the group is open", () => {
+    writeShowToolResultImages(true);
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const screenshot = {
+      ...toolItem("t1", "mcp__browser__take_screenshot"),
+      output: JSON.stringify({ content: [{ type: "image", data: png, mimeType: "image/png" }] }),
+    } as RenderItem;
+    try {
+      const { container } = render(
+        createElement(
+          TooltipProvider,
+          null,
+          createElement(ToolGroupSummary, { tools: [screenshot, toolItem("t2", "beta_tool")] }),
+        ),
+      );
+      const group = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+      expect(screen.queryByTestId("tool-result-images")).toBeNull();
+
+      fireEvent.click(group);
+      expect(screen.getByTestId("tool-result-images")).toBeInTheDocument();
+
+      fireEvent.click(group);
+      expect(screen.queryByTestId("tool-result-images")).toBeNull();
+    } finally {
+      writeShowToolResultImages(false);
+    }
   });
 
   it("uses the singular 'tool' for one hidden unrecognized tool", () => {

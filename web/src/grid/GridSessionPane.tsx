@@ -122,6 +122,7 @@ export function GridSessionPane({
   const {
     canBrowseWorkspace: canBrowse,
     environmentQuery: environment,
+    workspacePathsLoading,
     showFilesPanel: showFiles,
     changedCount,
     isChangedPath,
@@ -316,6 +317,7 @@ export function GridSessionPane({
       conversationId: sessionId,
       workspaceRoot: environment.data?.root ?? null,
       workspaceHome: environment.data?.home ?? null,
+      workspacePathsLoading,
       sessionHostId: session?.hostId,
       isChangedPath,
     }),
@@ -329,6 +331,7 @@ export function GridSessionPane({
       showFiles,
       sessionId,
       environment.data,
+      workspacePathsLoading,
       session?.hostId,
       isChangedPath,
     ],
