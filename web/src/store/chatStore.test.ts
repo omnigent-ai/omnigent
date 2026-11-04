@@ -22870,6 +22870,44 @@ describe("a send cut off by a reload", () => {
     },
   );
 
+  it("drops the sending bubble of a native startup input whose text the reload's composer already holds", async () => {
+    seedSession("conv_reload", []);
+    const native = { "omnigent.wrapper": "claude-code-native-ui" };
+    sessionLabels.set("conv_reload", { "omnigent.startup": "pending", ...native });
+    const content = [{ type: "input_text" as const, text: "saved on server" }];
+    seedPendingInputs("conv_reload", [{ pending_id: "pending_first", content }]);
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      authorId: "user_a",
+      text: "saved on server",
+    });
+    await useChatStore.getState().switchTo("conv_reload");
+    await tick();
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      expect.objectContaining({ tempId: "pending_first" }),
+    ]);
+    expect(useChatStore.getState().failedSendDraft?.text).toBe("saved on server");
+
+    sessionLabels.set("conv_reload", { "omnigent.startup": "failed", ...native });
+    seedPendingInputs("conv_reload", []);
+    sessionFailedInputs.set("conv_reload", [
+      { pending_id: "pending_first", item_id: "stable_reload", content },
+    ]);
+    handleSessionEvent(
+      { type: "session_status", conversationId: "conv_reload", status: "failed" },
+      "conv_reload",
+    );
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({
+        text: "saved on server",
+        startupInputIds: ["pending_first"],
+      }),
+    );
+
+    expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
   it.each([
     {
       unanswered: "an unanswered send the server saves only after the first read",

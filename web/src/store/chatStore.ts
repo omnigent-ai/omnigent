@@ -8082,8 +8082,17 @@ function returnFailedStartupInputs(
     state.failedSendDraft,
     unreturned.filter((input) => inWaitingDraft.includes(input.pendingId)),
   );
+  // A draft holding an input's text leaves its bubble, which only its server id can match.
+  const pendingUserMessages = withoutFailedStartupBubbles(
+    withoutFailedStartupBubbles(state.pendingUserMessages, inputs, unacknowledged),
+    failedInputs,
+    new Set(),
+  );
   const patch: Partial<ConversationState> = {
     ...(blocks.length === state.blocks.length && attachments === null ? {} : { blocks }),
+    ...(pendingUserMessages.length === state.pendingUserMessages.length
+      ? {}
+      : { pendingUserMessages }),
     ...(unreturned.length === 0
       ? {}
       : {
@@ -8106,15 +8115,7 @@ function returnFailedStartupInputs(
         }),
   };
   if (inputs.length === 0) return patch;
-  return {
-    ...patch,
-    pendingUserMessages: withoutFailedStartupBubbles(
-      state.pendingUserMessages,
-      inputs,
-      unacknowledged,
-    ),
-    failedSendDraft: failedStartupDraft(conversationId, waiting, inputs),
-  };
+  return { ...patch, failedSendDraft: failedStartupDraft(conversationId, waiting, inputs) };
 }
 
 /** Hand back a failed launch's inputs, then name any a composer took back in that composer's draft. */
