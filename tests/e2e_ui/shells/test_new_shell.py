@@ -30,9 +30,8 @@ Five behaviors are covered:
 
 4. **Terminal view startup vs. stopped states.** A starting terminal-first
    session renders a passive "Starting up…" status with no actionable
-   control; a stopped one — PTY removed mid-session, or a genuine stop
-   followed by a hard reload inside the cold-boot window — renders the
-   stopped copy with an enabled Resume action and no startup status.
+   control. A stopped one offers Resume after automatic recovery fails,
+   or when its host cannot be reached.
 
 5. **A program's terminal queries are answered once.** tmux answers a query
    such as the cursor position itself; the browser terminal must not answer
@@ -347,14 +346,7 @@ def test_starting_terminal_view_shows_loading_without_resume(
 
 
 def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[str, str]) -> None:
-    """A genuinely stopped terminal-first session keeps its Resume action.
-
-    Mirror of the startup-gap test above — same offline modeling (empty PTY
-    inventory, runner down, live channels silenced) — but the session row
-    is OLDER than the 45s cold-boot grace, so nothing can read it as a
-    starting session: the stopped-session UI and its Resume action must
-    render, with no startup status.
-    """
+    """Failed automatic recovery leaves a stopped session's Resume action."""
     base_url, session_id = terminal_session
 
     # Outside the grace window (created an hour ago), runner down.
@@ -383,6 +375,18 @@ def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[
     # for why each is needed).
     page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+    retry_payloads = []
+
+    def _fail_retry(route):
+        payload = route.request.post_data_json
+        if payload.get("type") != "retry_session":
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(status=503, json={"detail": "Terminal reconnect failed"})
+
+    page.route(f"**/v1/sessions/{session_id}/events", _fail_retry)
 
     # Every liveness carrier agrees: runner offline, created long past the
     # cold-boot grace.
@@ -421,11 +425,13 @@ def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[
 
     terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
     expect(terminal_view).to_be_visible()
-    # The stopped-session UI renders — no startup status, and the Resume
-    # action is present and enabled.
+    expect(terminal_view.get_by_role("alert")).to_have_text(
+        "Couldn't reconnect the terminal automatically."
+    )
     expect(terminal_view).to_contain_text("The harness is not running.")
     expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
     expect(terminal_view.get_by_role("status")).to_have_count(0)
+    assert retry_payloads == [{"type": "retry_session", "data": {}}]
 
 
 def test_failed_terminal_view_surfaces_runner_failure_cause(
@@ -476,6 +482,18 @@ def test_failed_terminal_view_surfaces_runner_failure_cause(
     page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
 
+    retry_payloads = []
+
+    def _fail_retry(route):
+        payload = route.request.post_data_json
+        if payload.get("type") != "retry_session":
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(status=503, json={"detail": "Terminal reconnect failed"})
+
+    page.route(f"**/v1/sessions/{session_id}/events", _fail_retry)
+
     def _patch_conversation_rows(route):
         resp = route.fetch()
         body = resp.json()
@@ -515,8 +533,12 @@ def test_failed_terminal_view_surfaces_runner_failure_cause(
 
     terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
     expect(terminal_view).to_be_visible()
-    # Baseline: the failed session renders the generic stopped terminal state.
+    expect(terminal_view.get_by_role("alert")).to_have_text(
+        "Couldn't reconnect the terminal automatically."
+    )
     expect(terminal_view).to_contain_text("The harness is not running.")
+    expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
+    assert retry_payloads == [{"type": "retry_session", "data": {}}]
 
     # The persisted failure cause must be visible, mirroring the Chat error pill.
     expect(terminal_view).to_contain_text("host authentication failed")

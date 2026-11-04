@@ -11,7 +11,10 @@ reattach when the session moves to another host.
 
 - `agent-terminal-view`: the Chat/Terminal switcher shows the harness terminal
   and returns to chat with the terminal's content kept. States: starting up
-  (no Resume action), stopped (Resume offered), connected.
+  (no Resume action), automatically restarting on an online host, stopped
+  (Resume offered after recovery fails or when the host is offline), connected.
+  Automatic recovery runs once when opening Terminal. Leaving it open does not
+  revive an idle-reaped pane. Failed recovery stays manual across view switches.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
@@ -63,6 +66,9 @@ with their own terminal retain the switcher.
   is inert while the host is offline, the session is stranded, or a shell is
   still being created, and it yields to a focused terminal or editor.
 - Select an open shell from the rail's shell list; close it from its tab.
+  In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
+  workspace tab, using the same terminal confirmation. A read-only viewer's
+  terminal stays open. Cmd/Ctrl+Shift+W closes the window.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
@@ -85,6 +91,12 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 ```
 
 - **`agent-terminal-view`:**
+  `tests/browser_ui/chat/test_terminal_auto_resume.py` covers automatic recovery
+  through the desktop switch, keyboard shortcut, mobile menu and grid switch,
+  plus failed attempts followed by manual Resume, including a cached closed
+  terminal that stays mounted during recovery. It uses the built SPA with
+  mocked host, retry and terminal transports; run with
+  `--browser-ui-skip-build --reruns 0 --video=on`.
   Grid cells: `tests/browser_ui/chat/test_session_grid.py` covers two real xterm
   surfaces against mocked terminal WebSockets, independent input, per-cell
   switches and keeping connections across view changes. Run without a server
@@ -162,6 +174,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   injects the blocked event; it does not run a vendor CLI. For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
+
+For the desktop Close Tab shortcut, open a shell tab in an ordinary session,
+focus its terminal, and press Cmd/Ctrl+W. Confirm any terminal-close prompt;
+only that tab should close. Cancel the prompt to keep the tab and session.
+Repeat as a read-only viewer: the shortcut should leave the terminal open.
+Cmd/Ctrl+Shift+W should close the window. Native accelerator delivery requires
+an Electron run; component tests cover the selection and confirmation paths.
 
 ## Gotchas
 
