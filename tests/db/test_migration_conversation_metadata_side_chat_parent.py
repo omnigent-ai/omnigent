@@ -49,10 +49,17 @@ def database(tmp_path: Path) -> Iterator[tuple[str, sa.Engine]]:
 
 
 def test_model_declares_a_nullable_uuid_column() -> None:
-    column = SqlConversationMetadata.__table__.c.side_chat_parent_id
+    table = SqlConversationMetadata.__table__
+    column = table.c.side_chat_parent_id
     assert column.nullable
     assert isinstance(column.type, Uuid16)
     assert column.server_default is None
+    index = next(index for index in table.indexes if index.name == _INDEX)
+    assert [indexed.name for indexed in index.columns] == [
+        "workspace_id",
+        "side_chat_parent_id",
+        "id",
+    ]
 
 
 def test_upgrade_adds_the_indexed_column_and_keeps_rows(
