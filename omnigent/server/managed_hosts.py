@@ -4565,7 +4565,7 @@ async def terminate_managed_host(
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,
     *,
-    only_if_unused: bool = False,
+    keep_if_bound: bool = False,
     capture_logs: bool = False,
 ) -> None:
     """
@@ -4583,13 +4583,13 @@ async def terminate_managed_host(
     :param config: The deployment's current sandbox config (supplies
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
-    :param only_if_unused: Keep a host other sessions are still bound to.
+    :param keep_if_bound: Keep a host other sessions are still bound to.
         Explicit host teardown keeps the unconditional default.
     :param capture_logs: Log the in-sandbox host and runner log tails before
         terminating, e.g. after a client saw the session's turn fail.
     """
     tombstone = await asyncio.to_thread(
-        host_store.delete_host, host.host_id, only_if_unused=only_if_unused
+        host_store.delete_host, host.host_id, keep_if_bound=keep_if_bound
     )
     if tombstone is None:
         return

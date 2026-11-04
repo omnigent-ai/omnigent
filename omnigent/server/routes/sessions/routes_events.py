@@ -3966,7 +3966,7 @@ def register_events_routes(
                     # still deletes the row and revokes the token.
                     getattr(request.app.state, "sandbox_config", None),
                     # Other sessions may still be bound to this host.
-                    only_if_unused=True,
+                    keep_if_bound=True,
                     capture_logs=capture_logs,
                 )
         try:

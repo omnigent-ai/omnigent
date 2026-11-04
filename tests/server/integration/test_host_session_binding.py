@@ -2213,9 +2213,9 @@ async def test_delete_managed_session_forwards_capture_logs(
     teardowns: list[bool] = []
 
     async def record_teardown(
-        *args: object, only_if_unused: bool = False, capture_logs: bool = False
+        *args: object, keep_if_bound: bool = False, capture_logs: bool = False
     ) -> None:
-        assert only_if_unused
+        assert keep_if_bound
         teardowns.append(capture_logs)
 
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", record_teardown)
