@@ -10,7 +10,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
-import { useSyncExternalStore } from "react";
+import { useSyncExternalStore, type ReactElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -154,6 +154,7 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
+import { HeaderTitle } from "./HeaderTitle";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -223,13 +224,23 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
 // Route so `useParams` populates), making that row the active one — the
 // rest of the suite renders at `/` where no row is active. `info` pins the
 // server sharing policy via CapabilitiesProvider (default "loading" → on).
-function renderSidebar(activeId?: string, info?: ServerInfo) {
+function renderSidebar(
+  activeId?: string,
+  info?: ServerInfo,
+  { open = true, header }: { open?: boolean; header?: ReactElement } = {},
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  let sidebarOpen = open;
   // Build a FRESH element tree per render: re-rendering the identical element
   // reference lets React bail out without re-invoking the sidebar, which
   // would swallow a `mockConversations` swap applied mid-test.
   const makeUi = () => {
-    const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
+    const sidebar = (
+      <>
+        <Sidebar open={sidebarOpen} onClose={vi.fn()} />
+        {header}
+      </>
+    );
     const tree = (
       <QueryClientProvider client={qc}>
         <SidebarDataProvider>
@@ -254,7 +265,13 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
   const view = render(makeUi());
   // Re-render so a test can apply a new `mockConversations` list mid-flight
   // (e.g. simulating a reorder pushed between user clicks).
-  return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
+  return Object.assign(view, {
+    rerenderSidebar: () => view.rerender(makeUi()),
+    setSidebarOpen: (next: boolean) => {
+      sidebarOpen = next;
+      view.rerender(makeUi());
+    },
+  });
 }
 
 beforeEach(() => {
@@ -514,6 +531,104 @@ describe("quick pin/unpin hover button", () => {
     const kebab = screen.getByTestId("conversation-actions");
     expect(kebab).toHaveClass("hidden", "md:inline-flex");
     expect(kebab).not.toHaveClass("md:block");
+  });
+});
+
+describe("rename shortcut", () => {
+  const pressRenameShortcut = () =>
+    fireEvent.keyDown(window, { code: "KeyR", ctrlKey: true, altKey: true });
+  const header = <HeaderTitle conversationId="conv_1" title="My Session" />;
+
+  it("edits the session's sidebar row, not the header title", () => {
+    renderSidebar("conv_1", undefined, { header });
+
+    pressRenameShortcut();
+
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([0, "My Session".length]);
+    expect(screen.queryByTestId("header-title-input")).toBeNull();
+    // Pressing it again keeps the open sidebar edit instead of starting a header one.
+    pressRenameShortcut();
+    expect(screen.queryByTestId("header-title-input")).toBeNull();
+    fireEvent.change(input, { target: { value: "Renamed Session" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledExactlyOnceWith({
+      id: "conv_1",
+      title: "Renamed Session",
+    });
+  });
+
+  it("falls back to the header title while the sidebar is closed", () => {
+    renderSidebar("conv_1", undefined, { open: false, header });
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
+  });
+
+  it("moves an edit left open in a closed sidebar to the header title", () => {
+    const { setSidebarOpen } = renderSidebar("conv_1", undefined, { header });
+    pressRenameShortcut();
+    expect(screen.getByTestId("rename-conversation-input")).toHaveFocus();
+
+    setSidebarOpen(false);
+    pressRenameShortcut();
+
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
+  });
+
+  it("falls back to the header title while the session's project folder is collapsed", () => {
+    mocks.projects = ["Moonshot"];
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar(undefined, undefined, { header });
+    expect(screen.getByRole("button", { name: /^Moonshot/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByRole("link", { name: /My Session/ })).toBeNull();
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
+  });
+
+  it("falls back to the header title in selection mode, then edits the row after it", () => {
+    renderSidebar("conv_1", undefined, { header });
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    const headerInput = screen.getByTestId("header-title-input");
+    expect(headerInput).toHaveFocus();
+    fireEvent.keyDown(headerInput, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Exit selection mode" }));
+
+    pressRenameShortcut();
+
+    expect(screen.getByTestId("rename-conversation-input")).toHaveFocus();
+    expect(screen.queryByTestId("header-title-input")).toBeNull();
+  });
+
+  it("falls back to the header title when the row belongs to someone else", () => {
+    mockConversations([{ ...CONV, owner: "someone-else@example.com" }]);
+    renderSidebar("conv_1", undefined, { header });
+    // Shared sessions list under the Shared filter.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeTruthy();
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
   });
 });
 
@@ -1222,16 +1337,18 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
-  it("keeps Fork visible but unavailable for a managed source", () => {
+  it("offers Fork for a managed source", () => {
     mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
     renderSidebar();
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
     expect(screen.getByRole("menu")).toHaveClass("menu-surface");
     const fork = screen.getByRole("menuitem", { name: "Fork" });
-    expect(fork).toHaveAttribute("aria-disabled", "true");
+    expect(fork).not.toHaveAttribute("aria-disabled");
     fireEvent.click(fork);
-    fireEvent.keyDown(fork, { key: "Enter" });
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("fork-session-dialog")).toHaveAttribute(
+      "data-source-session-id",
+      "conv_1",
+    );
   });
 
   it("opens the fork dialog for the selected session", () => {
