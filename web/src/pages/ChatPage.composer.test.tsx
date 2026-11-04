@@ -1214,28 +1214,27 @@ describe("Composer slash-command menu", () => {
     return { prompts, rewindToPrompt, onSend: props.onSend };
   }
 
-  it.each(["claude-sdk", "claude-native"] as const)(
-    "%s /rewind lists the prompts and rewinds to the chosen one",
-    async (harness) => {
-      const { prompts, rewindToPrompt, onSend } = renderRewindComposer(harness, {
-        session_rewind: true,
-      });
-      rewindToPrompt.mockResolvedValue();
-      fireEvent.change(textarea(), { target: { value: "/rew" } });
-      fireEvent.click(screen.getByTestId("slash-menu-item-rewind"));
+  // Which harnesses offer /rewind is ChatPage.test.ts's gating matrix; the
+  // other /rewind cases here run claude-sdk, so this one runs the native wrapper.
+  it("/rewind lists the prompts and rewinds to the chosen one", async () => {
+    const { prompts, rewindToPrompt, onSend } = renderRewindComposer("claude-native", {
+      session_rewind: true,
+    });
+    rewindToPrompt.mockResolvedValue();
+    fireEvent.change(textarea(), { target: { value: "/rew" } });
+    fireEvent.click(screen.getByTestId("slash-menu-item-rewind"));
 
-      const picker = await screen.findByTestId("rewind-picker");
-      expect(prompts).toHaveBeenCalledWith("conv_test", expect.any(AbortSignal));
-      const rows = await within(picker).findAllByTestId("rewind-prompt");
-      expect(rows.map((row) => row.textContent)).toEqual(["Add parser tests", "Write the parser"]);
-      fireEvent.click(rows[1]);
+    const picker = await screen.findByTestId("rewind-picker");
+    expect(prompts).toHaveBeenCalledWith("conv_test", expect.any(AbortSignal));
+    const rows = await within(picker).findAllByTestId("rewind-prompt");
+    expect(rows.map((row) => row.textContent)).toEqual(["Add parser tests", "Write the parser"]);
+    fireEvent.click(rows[1]);
 
-      expect(rewindToPrompt).toHaveBeenCalledExactlyOnceWith("msg_first");
-      await waitFor(() => expect(screen.queryByTestId("rewind-picker")).toBeNull());
-      expect(textarea()).toHaveValue("");
-      expect(onSend).not.toHaveBeenCalled();
-    },
-  );
+    expect(rewindToPrompt).toHaveBeenCalledExactlyOnceWith("msg_first");
+    await waitFor(() => expect(screen.queryByTestId("rewind-picker")).toBeNull());
+    expect(textarea()).toHaveValue("");
+    expect(onSend).not.toHaveBeenCalled();
+  });
 
   it("/rewind shows a failed rewind under the composer", async () => {
     const { rewindToPrompt } = renderRewindComposer("claude-sdk", { session_rewind: true });
