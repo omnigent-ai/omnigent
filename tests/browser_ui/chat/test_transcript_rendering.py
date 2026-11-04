@@ -103,7 +103,7 @@ def test_message_font_size_survives_rotation_and_reload(
     saved_size: int | None,
     touch: bool,
 ) -> None:
-    """Built message CSS keeps touch prose stable while interface defaults follow layout."""
+    """Built message CSS follows the interface size through rotation and reload."""
     chat = chat_session_contract
     chat.set_items(
         [
@@ -139,14 +139,10 @@ def test_message_font_size_survives_rotation_and_reload(
                 page.reload()
             assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
             interface_px = saved_size if saved_size is not None else (14 if width < 768 else 13)
-            message_px = (
-                (saved_size if saved_size is not None else 14) + 2
-                if touch or width < 768
-                else interface_px
-            )
+            message_px = interface_px
             for element in prose:
                 expect(element).to_have_css("font-size", f"{message_px}px")
-            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.6:g}px")
+            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.8:g}px")
             for selector in ('[data-streamdown="inline-code"]', _CODE_BODY):
                 expect(assistant.locator(selector)).to_have_css(
                     "font-size", f"{message_px * 0.875:g}px"
@@ -163,7 +159,7 @@ def test_message_font_size_survives_rotation_and_reload(
 def test_large_message_fallback_keeps_message_font_size(
     page: Page, chat_session_contract: ChatSessionContract, touch: bool
 ) -> None:
-    """Assistant and expanded user fallbacks retain touch sizing and desktop defaults."""
+    """Message fallbacks follow the mobile body tier and desktop caption tier."""
     text = "Long prose. " * 5_000 + "VISIBLE_FALLBACK_TAIL"
     chat = chat_session_contract
     chat.set_items(
@@ -182,7 +178,8 @@ def test_large_message_fallback_keeps_message_font_size(
         for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
             fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
             expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
-            expect(fallback).to_have_css("font-size", "16px" if touch else "11.7px")
+            expected_px = (14 if width < 768 else 13) if touch else 12
+            expect(fallback).to_have_css("font-size", f"{expected_px}px")
 
 
 @pytest.mark.only_browser("chromium")
@@ -210,16 +207,13 @@ def test_custom_browser_font_default_matches_rendered_sizes_and_settings(
         assert not page.evaluate("matchMedia('(min-width: 48rem)').matches")
         assert not page.evaluate("matchMedia('(pointer: coarse)').matches")
         for selector in ('[data-role="user"] p', '[data-testid="assistant-text-section"] p'):
-            expect(page.locator(selector)).to_have_css("font-size", "16px")
+            expect(page.locator(selector)).to_have_css("font-size", "14px")
         expect(page.get_by_role("textbox", name="Message the agent", exact=True)).to_have_css(
             "font-size", "14px"
         )
         page.goto(f"{chat.contract.base_url}/settings/appearance")
         expect(page.get_by_test_id("ui-font-size-input")).to_have_value("14")
         expect(page.get_by_test_id("ui-font-size-input")).to_have_css("font-size", "14px")
-        expect(
-            page.get_by_role("group", name="Interface font size", exact=True)
-        ).to_have_accessible_description("Interface 14px · Messages 16px")
         assert page.evaluate("localStorage.getItem('omnigent:ui-font-size')") is None
     finally:
         try:

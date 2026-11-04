@@ -30,7 +30,6 @@ export const UI_FONT_SIZE_MAX = 18;
 export const UI_FONT_SIZE_STEP = 1;
 // Legacy syntax keeps matchMedia compatible with the SPA's Safari 15 target.
 export const UI_FONT_SIZE_MOBILE_QUERY = "not all and (min-width: 48rem)";
-export const MESSAGE_FONT_SIZE_MOBILE_QUERY = `${UI_FONT_SIZE_MOBILE_QUERY}, (pointer: coarse)`;
 
 /** Clamp an arbitrary number into the supported px range. */
 export function clampUiFontSizePx(px: number): number {
@@ -87,21 +86,6 @@ export function readAppliedUiFontSizePx(): number {
   return readUiFontSizeOverridePx() ?? defaultUiFontSizePx();
 }
 
-/** Read conversation size, or preview a choice before storage succeeds. */
-export function readMessageFontSizePx(
-  selected: number | null = readUiFontSizeOverridePx(),
-): number {
-  const size = selected === null ? null : clampUiFontSizePx(selected);
-  if (
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia(MESSAGE_FONT_SIZE_MOBILE_QUERY).matches
-  ) {
-    return (size ?? UI_FONT_SIZE_MOBILE_DEFAULT) + 2;
-  }
-  return size ?? defaultUiFontSizePx();
-}
-
 /**
  * Persist the UI font size (px). The value is clamped to the supported range
  * before writing. Swallows quota/access errors so a failed write can't break
@@ -124,7 +108,6 @@ export function applyDesktopUiFontSize(px: number): void {
   if (!root) return;
   const size = clampUiFontSizePx(px);
   root.style.setProperty("--desktop-ui-font-size", `${size}px`);
-  root.style.setProperty("--mobile-message-font-size", `${size + 2}px`);
 }
 
 /** Apply a saved choice, or let CSS choose the viewport-specific default. */
@@ -134,7 +117,6 @@ export function applyStoredUiFontSize(): void {
   const stored = readStoredUiFontSizePx();
   if (stored === null) {
     root.style.removeProperty("--desktop-ui-font-size");
-    root.style.removeProperty("--mobile-message-font-size");
   } else {
     applyDesktopUiFontSize(stored);
   }
