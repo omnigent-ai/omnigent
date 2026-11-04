@@ -5308,6 +5308,8 @@ async function bindStream(
         }[],
       };
     });
+    if (unsentDraft !== null && get().failedSendDraft === unsentDraft)
+      adoptRestoredSendStartupInputs(id, unsentDraft.startupInputIds);
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
     if (startupFailedIn(session)) void restoreFailedStartupInputs(id);
     racedNativeModelOptions.delete(id);
@@ -7854,13 +7856,11 @@ function restoreUnsentSendOnceIdentified(
     if (isConversationDisposed(conversationId)) return;
     const draft = unsentSendToRestore(conversationId, items);
     if (draft === null) return;
-    setterFor(conversationId)((state) => {
-      const waiting = state.failedSendDraft;
-      // A send this tab still tracks may be the journal's own; only handed-back messages take it.
-      if (waiting !== null && (waiting.recovered !== true || waiting.stableId !== undefined))
-        return {};
-      return { failedSendDraft: joinFailedSendDrafts(waiting, draft) };
-    });
+    const waiting = setterForState(conversationId)?.failedSendDraft ?? null;
+    // A send this tab still tracks may be the journal's own; only handed-back messages take it.
+    if (waiting !== null && (waiting.recovered !== true || waiting.stableId !== undefined)) return;
+    setterFor(conversationId)({ failedSendDraft: joinFailedSendDrafts(waiting, draft) });
+    adoptRestoredSendStartupInputs(conversationId, draft.startupInputIds);
   });
 }
 
@@ -8353,9 +8353,17 @@ const adoptedStartupInputs = new WeakMap<ConversationEntry, Set<string>>();
 function adoptReturnedStartupInputs(entry: ConversationEntry): void {
   const carried = disposedReturnedStartupInputs.get(entry.id) ?? [];
   disposedReturnedStartupInputs.delete(entry.id);
-  const adopted = [...carried, ...(getSessionDraft(entry.id)?.startupInputIds ?? [])].filter(
-    (id) => !entry.getState().returnedStartupInputs.includes(id),
-  );
+  adoptStartupInputs(entry, [...carried, ...(getSessionDraft(entry.id)?.startupInputIds ?? [])]);
+}
+
+/** Count a reload's unsent send's startup inputs as returned, so clearing its draft keeps them out. */
+function adoptRestoredSendStartupInputs(conversationId: string, ids: string[] | undefined): void {
+  const entry = conversationRegistry.peek(conversationId);
+  if (entry !== undefined && ids !== undefined) adoptStartupInputs(entry, ids);
+}
+
+function adoptStartupInputs(entry: ConversationEntry, ids: readonly string[]): void {
+  const adopted = ids.filter((id) => !entry.getState().returnedStartupInputs.includes(id));
   if (adopted.length === 0) return;
   adoptedStartupInputs.set(
     entry,
