@@ -22,6 +22,7 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
+from omnigent.server.routes.sessions import routes_events
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from tests.server.integration._session_continuation import (
@@ -369,3 +370,46 @@ async def test_survives_the_runner_leaving_before_it_is_bound(
         assert "runner is offline" in resp.text
     assert len((await client.get("/v1/sessions")).json()["data"]) == before
     assert live_runner.superseded == []
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+async def test_stopping_or_archiving_the_original_leaves_the_continuation_running(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """The original no longer holds the runner it shares with its continuation.
+
+    Stopping or archiving the original ends only that chat: the runner is not
+    stopped under the continuation's running turn, and the original keeps its
+    host so a later message can resume it.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    continued = await continue_session(client, store, source_id, command)
+    assert continued.is_success, continued.text
+    new_id = continued.json()["session_id"]
+    monkeypatch.setitem(sessions_module._session_status_cache, new_id, "running")
+    runner_stops = AsyncMock(return_value=True)
+    monkeypatch.setattr(routes_events, "_stop_host_runner_intentionally", runner_stops)
+    monkeypatch.setattr(orchestration, "_stop_host_runner_intentionally", runner_stops)
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+
+    stopped = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "stop_session", "data": {}}
+    )
+    archived = await client.patch(f"/v1/sessions/{source_id}", json={"archived": True})
+    await asyncio.gather(*list(orchestration._detached_stop_tasks), return_exceptions=True)
+
+    assert stopped.status_code < 300, stopped.text
+    assert archived.status_code == 200, archived.text
+    runner_stops.assert_not_awaited()
+    continuation = store.get_conversation(new_id)
+    assert continuation is not None and continuation.runner_id == _RUNNER_ID
+    assert sessions_module._session_status_cache.get(new_id) == "running"
+    original = store.get_conversation(source_id)
+    assert original is not None
+    assert (original.runner_id, original.host_id) == (None, _HOST_ID)
