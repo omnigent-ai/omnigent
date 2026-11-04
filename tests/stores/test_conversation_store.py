@@ -8788,10 +8788,12 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                             "updated_at": "ix_conversations_archived_updated",
                             "title": "ix_conversations_archived_title",
                         }[sort_by]
-                        assert f"Index range scan on conversations using {index}" in cursor_plan, (
-                            where,
-                            cursor_plan,
-                        )
+                        scan = f"Index range scan on conversations using {index} over "
+                        assert scan in cursor_plan, (where, cursor_plan)
+                        # The cursor must bound the range, not filter rows read from its start.
+                        scanned_range = cursor_plan.split(scan, 1)[1].split("\n", 1)[0]
+                        scanned_range = scanned_range.split(", with index condition", 1)[0]
+                        assert sort_column in scanned_range, (where, cursor_plan)
                     else:
                         assert "USING INDEX" in cursor_plan, (where, cursor_plan)
                         assert "SCAN conversations" not in cursor_plan, (where, cursor_plan)
