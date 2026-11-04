@@ -1566,6 +1566,8 @@ def create_runner_app(
     # still held a sub-agent result (typically: the server was down when the
     # child finished). The catch-up scan re-attempts these on tunnel reconnect.
     _stranded_wake_parents: set[str] = set()
+    # Parents a passive init brought up; recovered results wait for their next init or turn.
+    _held_wake_parents: set[str] = set()
     # Single-flight holder for the paced stranded-wake retry loop, so
     # back-to-back reconnects don't stack concurrent retry loops.
     _stranded_wake_retry_task: list[asyncio.Task[None]] = []
@@ -2906,6 +2908,12 @@ def create_runner_app(
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
+        # A passive init queues recovered results; the next init or turn wakes the parent.
+        if init_context.envelope is not None and init_context.envelope.hold_subagent_wakes:
+            _held_wake_parents.add(session_id)
+        elif session_id in _held_wake_parents:
+            _held_wake_parents.discard(session_id)
+            _wake_for_queued_subagent_results(session_id)
         # A fresh queue can mean a fresh runner process rather than a fresh
         # session: re-queue results the previous process never drained. Start
         # the durable server scan now, but overlap it with terminal creation;
@@ -3690,6 +3698,7 @@ def create_runner_app(
         _subagent_recovery_locks.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
+        _held_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
@@ -4949,7 +4958,23 @@ def create_runner_app(
         _wake_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_wake_task)
 
+    def _schedule_recovered_subagent_wake(
+        entry: _SubagentWorkEntry, *, is_rewake: bool = False
+    ) -> None:
+        if entry.parent_session_id not in _held_wake_parents:
+            _schedule_subagent_wake(entry, is_rewake=is_rewake)
+
+    def _wake_for_queued_subagent_results(parent_session_id: str) -> None:
+        inbox = _session_inboxes.get(parent_session_id)
+        latest = latest_wake_eligible_subagent_work(list_subagent_work(parent_session_id))
+        if inbox is not None and not inbox.empty() and latest is not None:
+            _schedule_subagent_wake(latest)
+
     def _rewake_parent_if_inbox_stranded(parent_session_id: str) -> None:
+        if parent_session_id in _held_wake_parents:
+            # A turn after a passive init settles the results that init queued.
+            _held_wake_parents.discard(parent_session_id)
+            _stranded_wake_parents.add(parent_session_id)
         inbox = _session_inboxes.get(parent_session_id)
         drained = inbox is None or inbox.empty()
         if drained:
@@ -5059,7 +5084,7 @@ def create_runner_app(
     _subagent_recovery = build_subagent_recovery(
         app,
         _background_tasks=_background_tasks,
-        _schedule_subagent_wake=_schedule_subagent_wake,
+        _schedule_subagent_wake=_schedule_recovered_subagent_wake,
         _session_inboxes=_session_inboxes,
         _session_snapshot=_session_snapshot,
         _session_sub_agent_names=_session_sub_agent_names,

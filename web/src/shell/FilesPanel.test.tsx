@@ -32,7 +32,7 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { useSession } from "@/hooks/useSession";
-import { resetSandboxWakesForTesting, SANDBOX_WAKE_SETTLE_MS } from "@/hooks/useSandboxAutoWake";
+import { resetSandboxWakesForTesting } from "@/hooks/useSandboxAutoWake";
 import { FilesPanel, revealFolderInFilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
@@ -480,8 +480,26 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(retrySessionMock).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps starting the sandbox while a cached tab shows and it still sleeps", async () => {
+    useAsleepMock.mockReturnValue(true);
+    const { rerender } = renderPanel({
+      conversationId: "conv_asleep",
+      files: [],
+      listsLoaded: false,
+    });
+    await act(async () => {});
+    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+
+    useChangedFilesMock.mockReturnValue(changedFilesResult());
+    rerender(panelAt("conv_asleep", { flatView: true }));
+    expect(screen.getByText("No workspace changes yet")).toBeInTheDocument();
+
+    rerender(panelAt("conv_asleep"));
+    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+    expect(retrySessionMock).toHaveBeenCalledTimes(1);
+  });
+
   it("starts the sandbox once when the mobile Files drawer opens and reopens", async () => {
-    vi.useFakeTimers();
     let answerWake: (response: { queued: boolean; recovered: boolean }) => void = () => {};
     retrySessionMock.mockReturnValueOnce(
       new Promise((resolve) => {
@@ -531,16 +549,10 @@ describe("FilesPanel on an asleep sandbox", () => {
     await act(async () => rerender(drawer(true)));
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
     await act(async () => answerWake({ queued: false, recovered: true }));
-    act(() => vi.advanceTimersByTime(SANDBOX_WAKE_SETTLE_MS / 2));
     await act(async () => rerender(drawer(false)));
     await act(async () => rerender(drawer(true)));
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
     expect(retrySessionMock).toHaveBeenCalledTimes(1);
-
-    act(() => vi.advanceTimersByTime(SANDBOX_WAKE_SETTLE_MS / 2));
-    expect(screen.getByRole("alert")).toHaveTextContent("The sandbox didn't come back online.");
-    expect(retrySessionMock).toHaveBeenCalledTimes(1);
-    vi.useRealTimers();
   });
 
   it("does not wake while the session is still loading", () => {

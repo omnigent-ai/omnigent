@@ -185,6 +185,7 @@ class RunnerSessionInitializer:
         *,
         timeout: float,
         suppress_recovery_turn: bool = False,
+        hold_subagent_wakes: bool = False,
         resume_interrupted_turn: bool = False,
         generation: int | None = None,
         store_slots: asyncio.Semaphore | None = None,
@@ -263,6 +264,7 @@ class RunnerSessionInitializer:
                 conversation,
                 server_version=self._server_version,
                 suppress_recovery_turn=suppress_recovery_turn,
+                hold_subagent_wakes=hold_subagent_wakes,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
             )

@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import ModuleType
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -674,3 +675,34 @@ async def test_root_recovery_failure_is_quiet_only_after_tunnel_replacement(
             assert transport_warnings
         else:
             assert errors
+
+
+async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the_turn(
+    app: FastAPI, agent: Agent, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner reconnecting after its wake failed leaves the interrupted turn for Resume."""
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import routes_events
+
+    for module in (routes_events, orchestration):
+        monkeypatch.setattr(module, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+    interrupted = _create_session(app, agent.id)
+    retry_url = f"/v1/sessions/{interrupted.id}/events"
+    wake = await client.post(
+        retry_url, json={"type": "retry_session", "data": {"wake_only": True}}
+    )
+    assert wake.status_code == 503, wake.text
+    inits: list[dict[str, Any]] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        inits.append(body["session_init"])
+        return httpx.Response(201, json={"id": body["session_id"]})
+
+    async with _recover(app, monkeypatch, respond) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert inits == []
+        resume = await client.post(retry_url, json={"type": "retry_session", "data": {}})
+        assert resume.status_code == 202, resume.text
+
+    assert [init["suppress_recovery_turn"] for init in inits] == [False]

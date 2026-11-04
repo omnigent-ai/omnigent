@@ -12,7 +12,6 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
-import cachetools
 import httpx
 from fastapi import (
     APIRouter,
@@ -354,10 +353,6 @@ class _RetryAttempt:
 
 
 _retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, _RetryAttempt] = WorkspaceScopedCache()
-# Session -> runner a wake-only retry brought up without resuming its turn.
-_wake_skipped_resumes: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
-    lambda: cachetools.LRUCache(maxsize=4096)
-)
 
 # POST /events types that arrive per streamed chunk — the harness echoing its
 # own live output back. Their per-call audit row is pure noise (the content is
@@ -691,8 +686,13 @@ async def _recover_retry_session(
     the session's own or a descendant's. The next plain retry on that runner
     resumes them.
     """
-    from omnigent.server.child_session_recovery import defer_reconnect_recovery
+    from omnigent.server.child_session_recovery import (
+        defer_reconnect_recovery,
+        end_reconnect_deferral,
+    )
 
+    if not wake_only:
+        end_reconnect_deferral(session_id)
     deferral = defer_reconnect_recovery(session_id) if wake_only else contextlib.nullcontext()
     with deferral:
         return await _recover_retry_session_once(
@@ -717,6 +717,12 @@ async def _recover_retry_session_once(
     wake_only: bool = False,
 ) -> dict[str, bool | str]:
     """Run one recovery attempt for :func:`_recover_retry_session`."""
+    from omnigent.server.child_session_recovery import (
+        clear_skipped_resume,
+        note_skipped_resume,
+        skipped_resume_runner,
+    )
+
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
@@ -762,12 +768,17 @@ async def _recover_retry_session_once(
         not wake_only
         and not saved_inputs
         and conv.runner_id is not None
-        and _wake_skipped_resumes.get(session_id) == conv.runner_id
+        and skipped_resume_runner(session_id) == conv.runner_id
+        # Native harnesses never resume from history, so only these runners owe a resume.
+        and not _is_native_terminal_session(conv)
     )
     initializer = getattr(request.app.state, "runner_session_initializer", None)
     if resumes_wake and initializer is not None and conv.runner_id is not None:
         # Repeat the handshake the wake suppressed rather than reuse its response.
         initializer.forget_completed_handshake(session_id, runner_id=conv.runner_id)
+    if wake_only and not was_connected and conv.runner_id is not None:
+        # Record it before the handshake so a failed wake still leaves the turn for Resume.
+        note_skipped_resume(session_id, conv.runner_id)
     terminal_ready_from_init = await _ensure_runner_session_initialized(
         session_id,
         conv,
@@ -782,12 +793,7 @@ async def _recover_retry_session_once(
         trigger="retry_session",
     )
     if not wake_only:
-        _wake_skipped_resumes.pop(session_id, None)
-    elif (
-        not was_connected and conv.runner_id is not None and not _is_native_terminal_session(conv)
-    ):
-        # Native harnesses never resume from history, so only these runners owe a resume.
-        _wake_skipped_resumes[session_id] = conv.runner_id
+        clear_skipped_resume(session_id)
 
     if _is_native_terminal_session(conv):
         # A cached init response cannot prove that a connected runner's pane still exists.

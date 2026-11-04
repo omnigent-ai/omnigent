@@ -505,7 +505,8 @@ export function FilesPanel({
     serverInfo.retry_session_wake_only === true;
   const sandboxWake = useSandboxAutoWake({
     conversationId,
-    asleep: showAsleepHint,
+    asleep: sandboxAsleep,
+    needsSandbox: !dataReady,
     awake: runnerOnline === true,
     active,
     canWake,

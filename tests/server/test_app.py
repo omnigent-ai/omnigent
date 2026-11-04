@@ -2759,10 +2759,13 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reconnect after a wake-only retry resumes no interrupted descendant of its session."""
+    """A reconnect after a wake-only retry leaves its session's tree for the next plain retry."""
     from omnigent.entities import Conversation
     from omnigent.runner.routing import RoutedRunner
-    from omnigent.server.child_session_recovery import defer_reconnect_recovery
+    from omnigent.server.child_session_recovery import (
+        defer_reconnect_recovery,
+        skipped_resume_runner,
+    )
     from omnigent.server.routes import sessions as sessions_routes
 
     app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
@@ -2808,6 +2811,8 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
 
     assert sorted(initialized) == sorted([other_id, children[other_id]])
     assert store.get_conversation(children[woken_id]).runner_id == "offline_runner"  # type: ignore[union-attr]
+    assert skipped_resume_runner(woken_id) == runner_id
+    assert skipped_resume_runner(other_id) is None
 
 
 @pytest.mark.asyncio

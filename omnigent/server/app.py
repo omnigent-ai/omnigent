@@ -4521,6 +4521,7 @@ def create_app(
             _interrupted,
             _restorable,
             is_parent_owned_subagent,
+            note_skipped_resume,
             reconnect_recovery_deferred,
             restore_active_children,
         )
@@ -4597,12 +4598,15 @@ def create_app(
             if root_id is not None and not by_id[root_id].archived:
                 eager_root_ids.add(root_id)
         # A wake-only retry initializes its tree itself, without resuming work.
-        wake_only_root_ids = {
-            root_id
-            for conv in convs
-            if reconnect_recovery_deferred(conv.id)
-            and (root_id := independent_root_id(conv)) is not None
-        }
+        wake_only_root_ids: set[str] = set()
+        for conv in convs:
+            if not reconnect_recovery_deferred(conv.id):
+                continue
+            root_id = independent_root_id(conv)
+            if root_id is not None:
+                wake_only_root_ids.add(root_id)
+                # Leave the deferred resume for the session's next plain retry.
+                note_skipped_resume(conv.id, runner_id)
 
         # Attach independent roots first; their recovery restores dependent sessions.
         convs.sort(key=lambda conv: not is_independent(conv))

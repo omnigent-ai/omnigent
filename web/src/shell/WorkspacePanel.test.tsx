@@ -836,10 +836,17 @@ describe("WorkspacePanel content area", () => {
   it.each([
     ["collapsed", { open: false }],
     ["inert", { inert: true }],
+    ["squeezed to zero width", { width: 0 }],
   ])("marks the FilesPanel inactive while the rail is %s", (_label, override) => {
     renderWorkspace({ rightRailTab: "files", selectedFilePath: null, ...override });
 
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-active", "false");
+  });
+
+  it("keeps a maximized FilesPanel active without an inline width", () => {
+    renderWorkspace({ rightRailTab: "files", selectedFilePath: null, width: 0, maximized: true });
+
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-active", "true");
   });
 
   it.each([

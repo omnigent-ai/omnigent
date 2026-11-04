@@ -4039,10 +4039,12 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
 
 
 class _RecordingRunnerClient:
-    """Accepts runner session-init POSTs and records whether each suppressed recovery."""
+    """Accepts runner session-init POSTs and records what recovery each one deferred."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, fail_first: bool = False) -> None:
         self.suppressed_recovery: list[bool] = []
+        self.held_subagent_wakes: list[bool] = []
+        self._fail_first = fail_first
 
     async def post(self, path: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
         from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
@@ -4050,17 +4052,24 @@ class _RecordingRunnerClient:
         envelope = parse_runner_session_init_envelope(json)
         assert envelope is not None
         self.suppressed_recovery.append(envelope.suppress_recovery_turn)
+        self.held_subagent_wakes.append(envelope.hold_subagent_wakes)
+        status = 503 if self._fail_first and len(self.suppressed_recovery) == 1 else 201
         return httpx.Response(
-            201, json={"id": json["session_id"]}, request=httpx.Request("POST", path)
+            status, json={"id": json["session_id"]}, request=httpx.Request("POST", path)
         )
 
 
-@pytest.mark.parametrize("resume_during_wake", [True, False], ids=["concurrent", "after-wake"])
+@pytest.mark.parametrize(
+    ("resume_during_wake", "wake_handshake_fails"),
+    [(True, False), (False, False), (False, True)],
+    ids=["concurrent", "after-wake", "after-failed-wake"],
+)
 async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
     resume_during_wake: bool,
+    wake_handshake_fails: bool,
 ) -> None:
     """A Resume during or after a wake-only retry repeats the handshake unsuppressed."""
     from omnigent.runtime import set_runner_client
@@ -4072,7 +4081,7 @@ async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
     comm = await _connect_host(app)
     session_id = (await _inline_launch_session(client, comm))["id"]
-    runner_client = _RecordingRunnerClient()
+    runner_client = _RecordingRunnerClient(fail_first=wake_handshake_fails)
     connected_client: _RecordingRunnerClient | None = None
     launched, resume_arrived = asyncio.Event(), asyncio.Event()
 
@@ -4103,32 +4112,80 @@ async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
     monkeypatch.setattr(child_session_recovery, "restore_active_children", restore_children)
     set_runner_client(None)
 
-    async def _retry(data: dict[str, bool]) -> dict[str, Any]:
+    async def _retry(data: dict[str, bool], *, status: int = 202) -> dict[str, Any]:
         response = await client.post(
             f"/v1/sessions/{session_id}/events", json={"type": "retry_session", "data": data}
         )
-        assert response.status_code == 202, response.text
+        assert response.status_code == status, response.text
         return response.json()
 
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-    wake = asyncio.create_task(_retry({"wake_only": True}))
+    wake = asyncio.create_task(
+        _retry({"wake_only": True}, status=503 if wake_handshake_fails else 202)
+    )
     await asyncio.wait_for(launched.wait(), timeout=budget(5.0))
     if not resume_during_wake:
         await wake
+        assert child_session_recovery.reconnect_recovery_deferred(session_id)
     resume = await _retry({})
     relaunched = {"queued": False, "recovered": True, "recovery": "runner_relaunched"}
-    assert [await wake, resume] == [relaunched, relaunched]
+    assert resume == relaunched
+    if not wake_handshake_fails:
+        assert await wake == relaunched
     await responder
 
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
     assert runner_client.suppressed_recovery == [True, False]
+    assert runner_client.held_subagent_wakes == [True, False]
     restore_children.assert_awaited_once()
+    assert not child_session_recovery.reconnect_recovery_deferred(session_id)
     assert await _retry({}) == {
         "queued": False,
         "recovered": False,
         "recovery": "already_connected",
     }
     assert runner_client.suppressed_recovery == [True, False]
+
+
+async def test_message_after_wake_only_retry_ends_its_reconnect_grace(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message after a wake lets the next runner reconnect recover its turn."""
+    from omnigent.server import child_session_recovery
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    created = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "initial_items": []}
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    with child_session_recovery.defer_reconnect_recovery(session_id):
+        pass
+    assert child_session_recovery.reconnect_recovery_deferred(session_id)
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(accept), base_url="http://runner"
+    ) as runner:
+
+        async def resolve(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+            return runner
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", resolve)
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    assert not child_session_recovery.reconnect_recovery_deferred(session_id)
 
 
 async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(

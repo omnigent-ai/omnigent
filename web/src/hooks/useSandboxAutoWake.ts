@@ -8,6 +8,9 @@ import { retrySession } from "@/lib/sessionsApi";
  */
 export const SANDBOX_WAKE_SETTLE_MS = 30_000;
 
+/** How long the server may take to answer a wake before it counts as failed. */
+export const SANDBOX_WAKE_REQUEST_MS = 5 * 60_000;
+
 export type SandboxWakePhase = "idle" | "waking" | "failed";
 
 export interface SandboxAutoWake {
@@ -22,7 +25,7 @@ interface WakeAttempt {
   /** `requesting`: the server is resuming it; `settling`: waiting for liveness to agree. */
   step: "requesting" | "settling" | "failed";
   error: string | null;
-  /** Fails a settling attempt that liveness never confirms. */
+  /** Fails an attempt that never answers or that liveness never confirms. */
   timer?: number;
 }
 
@@ -50,22 +53,30 @@ function setAttempt(conversationId: string, attempt: WakeAttempt | undefined): v
   for (const listener of listeners) listener();
 }
 
+/** Store *attempt* for the session, failing it if it is still current after *ms*. */
+function setAttemptWithDeadline(conversationId: string, attempt: WakeAttempt, ms: number): void {
+  attempt.timer = window.setTimeout(() => {
+    if (attempts.get(conversationId) !== attempt) return;
+    setAttempt(conversationId, { step: "failed", error: "The sandbox didn't come back online." });
+  }, ms);
+  setAttempt(conversationId, attempt);
+}
+
 /** Wake a session's sandbox, joining its attempt that is still in flight. */
 async function startSandboxWake(conversationId: string): Promise<void> {
   const existing = attempts.get(conversationId);
   if (existing && existing.step !== "failed") return;
   const attempt: WakeAttempt = { step: "requesting", error: null };
-  setAttempt(conversationId, attempt);
+  setAttemptWithDeadline(conversationId, attempt, SANDBOX_WAKE_REQUEST_MS);
   try {
     // "already_connected" also settles: liveness can lag a runner that is up.
     await retrySession(conversationId, { wakeOnly: true });
     if (attempts.get(conversationId) !== attempt) return;
-    const settling: WakeAttempt = { step: "settling", error: null };
-    settling.timer = window.setTimeout(() => {
-      if (attempts.get(conversationId) !== settling) return;
-      setAttempt(conversationId, { step: "failed", error: "The sandbox didn't come back online." });
-    }, SANDBOX_WAKE_SETTLE_MS);
-    setAttempt(conversationId, settling);
+    setAttemptWithDeadline(
+      conversationId,
+      { step: "settling", error: null },
+      SANDBOX_WAKE_SETTLE_MS,
+    );
   } catch (error) {
     if (attempts.get(conversationId) !== attempt) return;
     setAttempt(conversationId, {
@@ -98,7 +109,8 @@ export function resetSandboxWakesForTesting(): void {
  * for `wake()` or a reopen, so an open panel never keeps a sandbox awake.
  *
  * @param conversationId Session whose sandbox to wake.
- * @param asleep Whether the view needs the session's asleep sandbox (`host_asleep`).
+ * @param asleep Whether the session's managed sandbox is asleep (`host_asleep`).
+ * @param needsSandbox Whether the view has nothing to show until the sandbox wakes.
  * @param awake Whether liveness reports the session's runner online.
  * @param active Whether the view is open and visible to the user.
  * @param canWake Whether the user may restart the session (edit access).
@@ -106,12 +118,14 @@ export function resetSandboxWakesForTesting(): void {
 export function useSandboxAutoWake({
   conversationId,
   asleep,
+  needsSandbox,
   awake,
   active,
   canWake,
 }: {
   conversationId: string | undefined;
   asleep: boolean;
+  needsSandbox: boolean;
   awake: boolean;
   active: boolean;
   canWake: boolean;
@@ -141,10 +155,10 @@ export function useSandboxAutoWake({
       opening.consumed = true;
       return;
     }
-    if (!asleep || !canWake) return;
+    if (!asleep || !needsSandbox || !canWake) return;
     opening.consumed = true;
     void startSandboxWake(conversationId);
-  }, [active, asleep, awake, canWake, conversationId]);
+  }, [active, asleep, awake, canWake, conversationId, needsSandbox]);
 
   const step = attempt?.step;
   useEffect(() => {

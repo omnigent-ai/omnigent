@@ -54,6 +54,8 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # Resume an interrupted child task in its existing native session.
     resume_interrupted_turn: bool = False
     recovery_id: str | None = None
+    # Queue sub-agent results recovered during init without waking the parent.
+    hold_subagent_wakes: bool = False
 
 
 def build_runner_session_init_payload(
@@ -63,6 +65,7 @@ def build_runner_session_init_payload(
     suppress_recovery_turn: bool = False,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
+    hold_subagent_wakes: bool = False,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     from omnigent.inference_config import snapshot_runtime_config
@@ -78,6 +81,7 @@ def build_runner_session_init_payload(
         suppress_recovery_turn=suppress_recovery_turn,
         resume_interrupted_turn=resume_interrupted_turn,
         recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
+        hold_subagent_wakes=hold_subagent_wakes,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,

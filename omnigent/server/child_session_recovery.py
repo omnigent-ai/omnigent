@@ -44,6 +44,10 @@ _recent_wake_only_retries: WorkspaceScopedCache[str, bool] = WorkspaceScopedCach
         maxsize=math.inf, ttl=_WAKE_ONLY_RECONNECT_GRACE_S, timer=lambda: time.monotonic()
     )
 )
+# Session -> runner a wake brought up without resuming its interrupted turn.
+_skipped_resumes: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=4096)
+)
 
 
 @contextmanager
@@ -64,9 +68,29 @@ def defer_reconnect_recovery(session_id: str) -> Iterator[None]:
         _recent_wake_only_retries[session_id] = True
 
 
+def end_reconnect_deferral(session_id: str) -> None:
+    """Let runner-connect recovery resume *session_id*'s tree once requested work starts."""
+    _recent_wake_only_retries.pop(session_id, None)
+
+
 def reconnect_recovery_deferred(session_id: str) -> bool:
     """Whether a wake-only retry of *session_id* is running or just finished."""
     return session_id in _wake_only_retries or session_id in _recent_wake_only_retries
+
+
+def note_skipped_resume(session_id: str, runner_id: str) -> None:
+    """Record that *runner_id* came up for a wake of *session_id* without resuming its turn."""
+    _skipped_resumes[session_id] = runner_id
+
+
+def skipped_resume_runner(session_id: str) -> str | None:
+    """The runner that still owes *session_id* the resume a wake skipped."""
+    return _skipped_resumes.get(session_id)
+
+
+def clear_skipped_resume(session_id: str) -> None:
+    """Forget *session_id*'s skipped resume once a plain retry has run it."""
+    _skipped_resumes.pop(session_id, None)
 
 
 def schedule_child_restoration(

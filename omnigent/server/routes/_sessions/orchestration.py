@@ -5974,7 +5974,8 @@ async def _ensure_runner_session_initialized(
     :param require_success: Raise ``runner_unavailable`` when the handshake
         fails instead of using the message path's best-effort fallback.
     :param restore_children: Restore interrupted descendants after a required
-        handshake. ``False`` leaves them for the session's next message.
+        handshake. ``False`` leaves them, and sub-agent results recovered during
+        the handshake, for the session's next interaction.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -5985,6 +5986,7 @@ async def _ensure_runner_session_initialized(
                 runner_client,
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                 suppress_recovery_turn=suppress_recovery_turn,
+                hold_subagent_wakes=not restore_children,
                 trigger=trigger,
             )
         else:
@@ -5996,6 +5998,7 @@ async def _ensure_runner_session_initialized(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
+                    hold_subagent_wakes=not restore_children,
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
@@ -8146,7 +8149,10 @@ async def _dispatch_session_event_to_runner_impl(
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message":
+        from omnigent.server.child_session_recovery import end_reconnect_deferral
+
         disconnect_outcome.note_user_turn(conv.id)
+        end_reconnect_deferral(conv.id)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors

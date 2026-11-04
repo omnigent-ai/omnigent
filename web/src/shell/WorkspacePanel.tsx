@@ -1851,7 +1851,7 @@ function WorkspacePanelImpl({
                 conversationId={contained ? conversationId : undefined}
                 frameless
                 // A phone hides the rail with CSS; its Files drawer has its own panel.
-                active={open && !inert && filesPanelActive && !isMobile}
+                active={open && !inert && filesPanelActive && !isMobile && (maximized || width > 0)}
                 onFileSelect={openFileViewer}
                 flatView={rightRailTab === "changes"}
                 showHidden={filesPanelShowHidden}

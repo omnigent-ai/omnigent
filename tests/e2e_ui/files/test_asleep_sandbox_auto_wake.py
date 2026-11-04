@@ -26,11 +26,8 @@ from tests.e2e_ui.sessions._host_asleep import force_host_asleep
 
 _FILE_PATH = "sandbox_notes.txt"
 _RETRY_SESSION = {"type": "retry_session", "data": {"wake_only": True}}
-_RESUME_ERROR = "No runner is available to recover this session."
 # Long enough for a viewer to read each state in a recorded demo.
 _HOLD_MS = 2_500
-# Long enough for an unwanted automatic retry to reach the server.
-_NO_RETRY_WAIT_MS = 2_500
 
 
 def _runner_unavailable(message: str) -> str:
@@ -148,49 +145,4 @@ def test_opening_files_wakes_asleep_sandbox(
     expect(rail.get_by_text("Starting sandbox…")).to_have_count(0)
     # The wake is the only session event: no chat message was sent.
     assert recorder.events == [_RETRY_SESSION]
-    _hold_for_viewer(request, page)
-
-
-def test_failed_sandbox_wake_offers_try_again(
-    request: pytest.FixtureRequest,
-    asleep_session_file: tuple[str, str],
-) -> None:
-    """A failed wake shows the server's reason, and Try again starts the sandbox."""
-    base_url, session_id = asleep_session_file
-    failures_left = [1]
-
-    def _fail_first_wake(route: Route) -> None:
-        if route.request.post_data_json == _RETRY_SESSION and failures_left[0] > 0:
-            failures_left[0] -= 1
-            route.fulfill(
-                status=503,
-                content_type="application/json",
-                body=_runner_unavailable(_RESUME_ERROR),
-            )
-            return
-        route.continue_()
-
-    page, recorder = _open_asleep_session(request, base_url, session_id)
-    page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}/events$"), _fail_first_wake)
-    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
-    _hold_for_viewer(request, page)
-
-    with _wait_for_wake_request(page, session_id):
-        open_right_rail(page)
-    rail = page.get_by_role("complementary", name="Workspace")
-    expect(rail.get_by_text(f"Couldn't start the sandbox: {_RESUME_ERROR}")).to_be_visible(
-        timeout=15_000
-    )
-    try_again = rail.get_by_role("button", name="Try again")
-    expect(try_again).to_be_visible()
-    # The failure is not retried automatically.
-    page.wait_for_timeout(_NO_RETRY_WAIT_MS)
-    assert recorder.events == [_RETRY_SESSION]
-
-    with _wait_for_wake_request(page, session_id):
-        try_again.click()
-    expect(rail.get_by_role("button", name=re.compile(re.escape(_FILE_PATH))).first).to_be_visible(
-        timeout=30_000
-    )
-    assert recorder.events == [_RETRY_SESSION, _RETRY_SESSION]
     _hold_for_viewer(request, page)
