@@ -264,6 +264,8 @@ class ServerInfoResponse(BaseModel):
     # Whether the scheduled-tasks routes are mounted and enabled for this caller.
     automations_enabled: bool = False
     dictation_available: bool
+    # Scheduled tasks accept the optional random-worktree base ref.
+    scheduled_task_worktrees: bool = True
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
@@ -271,8 +273,11 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
+    # Connected hosts and continued sandbox sessions accept ten-minute schedules.
+    scheduled_task_subhour: bool = True
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    scheduled_task_sandbox_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
@@ -294,6 +299,8 @@ class ServerInfoResponse(BaseModel):
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
     scheduled_task_projects: bool = False
+    # Bounded latest-failure feed for the Inbox.
+    scheduled_task_inbox: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -3598,6 +3605,9 @@ def create_app(
 
         dictation_available, _ = engine_availability()
         filesystem_attachment_policy = app.state.filesystem_attachment_policy()
+        automations_available = scheduled_task_store is not None and deployment_gate_enabled(
+            app.state.automations, "automations"
+        )
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -3621,6 +3631,7 @@ def create_app(
                 "harness_install_enabled": current_harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,
@@ -3637,8 +3648,8 @@ def create_app(
                     "all_types": filesystem_attachment_policy.all_types,
                 },
                 "scheduled_task_projects": project_store is not None,
-                "automations_enabled": scheduled_task_store is not None
-                and deployment_gate_enabled(app.state.automations, "automations"),
+                "scheduled_task_inbox": automations_available,
+                "automations_enabled": automations_available,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
             }
@@ -4381,21 +4392,12 @@ def create_app(
             runner_id, generation=connection.generation
         )
         await asyncio.gather(*cancelled, return_exceptions=True)
-        # Newest-wins guard: a superseded tunnel's teardown fires this
-        # hook after a fresh tunnel for the same ``runner_id`` already
-        # registered (``TunnelRegistry.register`` retires the old
-        # session, whose helper tasks then error out and run this
-        # teardown). Marking the runner's sessions ``failed`` here would
-        # clobber the live tunnel's recovery: reconnect-recovery
-        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
-        # may have just cleared a stale ``runner_disconnected`` failure,
-        # and this stale disconnect would silently re-fail the session.
-        # If a live tunnel is registered for this runner, the runner is
-        # NOT offline, so skip. Mirrors the registry's own
-        # generation-guarded ``deregister``.
-        if tunnel_registry.get(runner_id) is not None:
+        # Replaced tunnels still release their own initializers, but cannot
+        # cancel a newer outage or apply an old idle attestation to new work.
+        # The replacement may itself be gone before this cleanup finishes.
+        if connection.superseded or tunnel_registry.get(runner_id) is not None:
             _logger.info(
-                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                "Runner %s disconnect superseded by a newer tunnel; skipping offline-marking",
                 runner_id,
             )
             return
