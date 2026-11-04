@@ -6311,7 +6311,8 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
 
     The dialogs :func:`_terminal_dialog_headline` names (a settings error, an
     exit confirmation, an MCP approval) have no web card; the person answers
-    them in the embedded terminal.
+    them in the embedded terminal. A launcher's unanswered installation
+    confirmation, printed before Claude Code runs, is answered there too.
 
     :param bridge_dir: The session's native bridge directory.
     :returns: ``True`` while such a dialog is on screen; ``False`` once it
@@ -6323,7 +6324,8 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
     socket_path, target = info.get("socket_path"), info.get("tmux_target")
     if not isinstance(socket_path, str) or not isinstance(target, str):
         return False
-    return _terminal_dialog_headline(_capture_pane(socket_path, target)) is not None
+    pane = _capture_pane(socket_path, target)
+    return _terminal_dialog_headline(pane) is not None or launcher_install_prompt(pane)
 
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:
@@ -7241,8 +7243,9 @@ def _wait_for_claude_prompt_ready(
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
-        A launcher password or installation prompt on two consecutive polls
-        is reported the same way.
+        A launcher password prompt on two consecutive polls is reported the
+        same way; an installation prompt is reported as awaiting an answer,
+        so the delivery holds the message for it.
     :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
@@ -7349,11 +7352,15 @@ def _wait_for_claude_prompt_ready(
         waited_on_password = at_password_prompt
         at_install_prompt = launcher_install_prompt(pane)
         if at_install_prompt and waited_on_install:
+            # Nothing was typed, and the question is answered in this terminal,
+            # so the delivery can hold the message until it is (see
+            # :func:`terminal_dialog_pending`) instead of failing it.
             raise ClaudeTerminalDialog(
                 "Claude Code's launch command is waiting for installation confirmation "
                 "in its terminal, so the message was not delivered. Open the terminal, "
                 "answer the install prompt, then resend your message."
-                + _format_terminal_failure_tail(pane)
+                + _format_terminal_failure_tail(pane),
+                awaits_answer=True,
             )
         waited_on_install = at_install_prompt
         # A launcher sign-in prompt printed before Claude Code runs: an address

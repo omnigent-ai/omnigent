@@ -28,7 +28,7 @@ import re
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e_ui.conftest import (
     fetch_with_retry,
@@ -1260,3 +1260,219 @@ def test_changes_find_reveals_collapsed_and_filtered(
     page.keyboard.press("ControlOrMeta+f")
     expect(panel.get_by_role("textbox", name="Find in changes", exact=True)).to_be_focused()
     page.screenshot(path=str(tmp_path / f"find-{entry}-reopened.png"))
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
+def test_changes_viewed_progress_persists_and_resets(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """Viewed marks collapse files, survive a reload, and reset when the PR gets a new head."""
+    base_url, session_id = seeded_session
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
+    _stub_github(page)
+    pr_url = _INFO["pr"]["url"]
+    # The PR's head moves mid-test, so every resource answers for the current head.
+    head = {"sha": "head1"}
+
+    def info_at_head(route: Route) -> None:
+        route.fulfill(
+            json={
+                **_INFO,
+                "tracking_available": True,
+                "selected_pr_url": pr_url,
+                "prs": [
+                    {
+                        "url": pr_url,
+                        "host": "example.com",
+                        "repository": "acme/app",
+                        "number": _PR_NUMBER,
+                        "relationship": "created",
+                    }
+                ],
+                "pr": {**_INFO["pr"], "head_sha": head["sha"], "base_sha": "base"},
+            }
+        )
+
+    page.route(re.compile(r"/resources/github(?:\?|$)"), info_at_head)
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda r: r.fulfill(json={**_CHANGES, "head_sha": head["sha"], "base_sha": "base"}),
+    )
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda r: r.fulfill(json={**_PR_DIFF, "head_sha": head["sha"], "base_sha": "base"}),
+    )
+
+    def open_changes() -> Locator:
+        if mobile:
+            page.get_by_test_id("composer-pr-link").click()
+            panel = page.get_by_test_id("github-panel-drawer")
+        else:
+            open_right_rail(page)
+            panel = page.get_by_role("complementary", name="Workspace")
+            panel.get_by_role("tab", name="Pull Requests").click()
+        panel.get_by_role("tablist", name="Pull request", exact=True).get_by_role(
+            "tab", name="Changes", exact=True
+        ).click()
+        return panel
+
+    page.goto(f"{base_url}/c/{session_id}")
+    panel = open_changes()
+    expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
+    panel.get_by_role("checkbox", name="Viewed README.md").click()
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
+    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    if not mobile:  # Mobile shows the count without the bar.
+        expect(panel.get_by_role("progressbar", name="Files viewed")).to_have_attribute(
+            "aria-valuenow", "50"
+        )
+    # Marking collapses the file's diff.
+    expect(
+        panel.get_by_role("button", name=re.compile(r"^README\.md"), expanded=False)
+    ).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"viewed-{entry}-marked.png"), animations="disabled")
+
+    # Marks are browser-local, so they survive a reload on the same head.
+    page.reload()
+    panel = open_changes()
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked(timeout=30_000)
+    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+
+    # A new head starts with no marks and says so until the notice is dismissed.
+    head["sha"] = "head2"
+    page.reload()
+    panel = open_changes()
+    expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).not_to_be_checked()
+    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"viewed-{entry}-reset.png"), animations="disabled")
+    panel.get_by_role("button", name="Dismiss", exact=True).click()
+    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_have_count(0)
+
+    # Hiding viewed files, once every file is viewed, shows the all-viewed state.
+    panel.get_by_role("checkbox", name="Viewed README.md").click()
+    panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
+    panel.get_by_role("checkbox", name="Hide viewed").click()
+    expect(panel.get_by_text("All 2 files viewed", exact=True)).to_be_visible()
+    if not mobile:
+        expect(panel.get_by_role("progressbar", name="Files viewed")).to_have_attribute(
+            "aria-valuenow", "100"
+        )
+    page.screenshot(path=str(tmp_path / f"viewed-{entry}-all-viewed.png"), animations="disabled")
+    panel.get_by_role("button", name="Show viewed", exact=True).click()
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).not_to_be_checked()
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
+def test_changes_filter_copy_open(page: Page, seeded_session: tuple[str, str], entry: str) -> None:
+    """Filter changed files, copy a path, and open a file at the pinned head revision.
+
+    The rail covers the desktop sidebar and icon copy. The mobile composer covers the
+    collapsed sidebar's inline filter and every file action in the overflow menu.
+    """
+    base_url, session_id = seeded_session
+    is_mobile = entry == "composer-mobile"
+    pr_url = _INFO["pr"]["url"]
+    _stub_github(page)
+    # The list reports the revisions it was fetched for, which Open links use.
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda route: route.fulfill(json={**_CHANGES, "head_sha": "head", "base_sha": "base"}),
+    )
+    # Supply fork metadata and revisions for the Open-link assertion.
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_INFO,
+                "tracking_available": True,
+                "selected_pr_url": pr_url,
+                "prs": [
+                    {
+                        "url": pr_url,
+                        "host": "example.com",
+                        "repository": "acme/app",
+                        "number": _PR_NUMBER,
+                        "relationship": "created",
+                    }
+                ],
+                "pr": {
+                    **_INFO["pr"],
+                    "head_sha": "head",
+                    "base_sha": "base",
+                    "head_repository_url": "https://example.com/fork/app",
+                },
+            }
+        ),
+    )
+    if is_mobile:
+        workspace = "/workspace/demo-app"
+
+        def session_details(route: Route) -> None:
+            response = fetch_with_retry(route)
+            snapshot = response.json()
+            snapshot.update(
+                workspace=workspace, git_branch="feature/github-tab", host_id="composer-pr-host"
+            )
+            route.fulfill(response=response, json=snapshot)
+
+        page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
+        page.route(
+            "**/v1/hosts/composer-pr-host/worktrees?*",
+            lambda route: route.fulfill(
+                json={
+                    "data": [
+                        {
+                            "path": workspace,
+                            "branch": "feature/github-tab",
+                            "is_main": False,
+                            "detached": False,
+                        }
+                    ]
+                }
+            ),
+        )
+        page.set_viewport_size({"width": 390, "height": 844})
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
+    page.goto(f"{base_url}/c/{session_id}")
+    if is_mobile:
+        page.get_by_test_id("composer-pr-link").click()
+        panel = page.get_by_test_id("github-panel-drawer")
+        expect(panel).to_have_attribute("data-state", "open")
+    else:
+        open_right_rail(page)
+        panel = page.get_by_role("complementary", name="Workspace")
+        panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+
+    files = panel.locator("[data-github-file]")
+    expect(files).to_have_count(2, timeout=30_000)
+    if is_mobile:
+        # The sidebar starts collapsed on mobile, so the filter opens above the list.
+        panel.get_by_role("button", name="Show file filter").click()
+    filter_box = panel.get_by_role("searchbox", name="Filter changed files")
+    filter_box.fill("readme")
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    filter_box.fill("no-such-file")
+    expect(panel.get_by_text('No changed files match "no-such-file"')).to_be_visible()
+    panel.get_by_role("button", name="Clear filter").click()
+    expect(files).to_have_count(2)
+    filter_box.fill("readme")
+    filter_box.press("Escape")
+    expect(filter_box).to_have_value("")
+    expect(files).to_have_count(2)
+
+    if is_mobile:
+        panel.get_by_role("button", name="More actions for src/app/main.py").click()
+        page.get_by_role("menuitem", name="Copy path", exact=True).click()
+    else:
+        panel.get_by_role("button", name="Copy path src/app/main.py").click()
+    expect(page.get_by_text("Copied path", exact=True)).to_be_visible()
+    assert page.evaluate("navigator.clipboard.readText()") == "src/app/main.py"
+
+    panel.get_by_role("button", name="More actions for README.md").click()
+    expect(page.get_by_role("menuitem", name="Open in GitHub")).to_have_attribute(
+        "href", "https://example.com/fork/app/blob/head/README.md"
+    )

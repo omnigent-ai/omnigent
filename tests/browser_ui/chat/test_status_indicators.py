@@ -150,6 +150,63 @@ def test_action_banner_follows_the_launch(
     expect(banner).to_be_hidden(timeout=10_000)
 
 
+@pytest.mark.parametrize("turns", [0, 1])
+@pytest.mark.parametrize("width", [1280, 375])
+def test_sandbox_failure_stays_in_transcript_above_composer(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    turns: int,
+    width: int,
+) -> None:
+    """Live and persisted launch failures replace progress in the conversation."""
+    chat = chat_session_contract
+    page.set_viewport_size({"width": width, "height": 844})
+    chat.seed_transcript(turns)
+    chat.set_health(runner_online=False, host_online=False)
+    chat.update_session(
+        host_id=None,
+        workspace=None,
+        sandbox_status={"stage": "provisioning", "provider": "arclet"},
+    )
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    expect(page.get_by_test_id("runner-starting-indicator")).to_be_visible(timeout=20_000)
+
+    # A queued turn can still be marked running when sandbox startup fails.
+    chat.emit_busy("launching-turn")
+    status = {"stage": "failed", "provider": "arclet", "error": "Sandbox allocation failed."}
+    chat.update_session(sandbox_status=status)
+    chat.emit(
+        {
+            "event": "session.sandbox_status",
+            "data": {
+                "type": "session.sandbox_status",
+                "conversation_id": chat.session_id,
+                **status,
+            },
+        }
+    )
+
+    failure = page.get_by_test_id("sandbox-failed-indicator")
+    for persisted in (False, True):
+        if persisted:
+            page.reload()
+        expect(failure).to_have_count(1)
+        expect(page.get_by_role("log").get_by_test_id("sandbox-failed-indicator")).to_be_visible()
+        expect(page.get_by_test_id("runner-starting-indicator")).to_be_hidden()
+        expect(page.get_by_test_id("working-indicator")).to_be_hidden()
+        composer = page.get_by_label("Message the agent")
+        expect(composer).to_be_visible()
+        failure_box = failure.bounding_box()
+        composer_box = composer.bounding_box()
+        assert failure_box is not None and composer_box is not None
+        assert failure_box["y"] + failure_box["height"] <= composer_box["y"]
+        failure.get_by_test_id("error-pill").click()
+        expect(failure.get_by_test_id("error-message-content")).to_contain_text(
+            "Sandbox allocation failed."
+        )
+
+
 @pytest.mark.parametrize(
     "width",
     [1280, pytest.param(375, marks=pytest.mark.browser_context_args(has_touch=True))],

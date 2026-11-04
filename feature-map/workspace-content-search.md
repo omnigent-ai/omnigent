@@ -1,7 +1,8 @@
 # Workspace content search
 
 Users search the session workspace's file contents from the desktop Workspace
-panel, then open a matching file at its line. Filename search remains in Files.
+panel or the mobile session menu, then open a matching file at its line.
+Filename search remains in Files.
 
 ## Sub-features
 
@@ -22,6 +23,8 @@ panel, then open a matching file at its line. Filename search remains in Files.
 - Desktop web and desktop app: open a session's Workspace panel and select the
   **Content search** magnifying-glass tab.
 - Workspace panel picker: choose **Select panel → Content search**.
+- Mobile web and mobile apps: open the session's **Conversation actions** menu
+  and choose **Content search**; it opens as a full-screen drawer.
 - Keyboard: **Cmd+Shift+F** on macOS (**Ctrl+Shift+F** on Windows/Linux) opens
   the Workspace panel, selects **Content search**, and focuses its input. It
   also works from the editor and terminal. The tab strip's arrows and numbered
@@ -80,5 +83,5 @@ shortcut should be unavailable.
   runners or missing ripgrep show an error. Search has no host-daemon fallback.
 - Workspace file-sharing permissions apply. A shared conversation alone does not
   grant access to its file contents.
-- This entry is in the desktop Workspace panel. Mobile file drawers do not
-  expose content search yet.
+- On mobile, tapping a result opens the file viewer; its back button returns
+  to the drawer with the preserved search.
