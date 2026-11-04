@@ -2620,6 +2620,65 @@ def test_server_without_config_flag_serves_resolved_server_config(
     )
 
 
+@pytest.mark.parametrize(
+    ("server_config_line", "expected_instructions"),
+    [
+        pytest.param(
+            "session_title_instructions: Server guidance.\n",
+            "Server guidance.",
+            id="server-value-beats-user-value",
+        ),
+        pytest.param(
+            "session_title_instructions: null\n",
+            None,
+            id="server-null-disables-user-fallback",
+        ),
+    ],
+)
+def test_server_without_config_flag_prefers_server_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    server_config_line: str,
+    expected_instructions: str | None,
+) -> None:
+    """A title key present in the resolved server config blocks the user config fallback."""
+    import uvicorn.server
+
+    from omnigent.server import app as app_module
+
+    server_config_file = tmp_path / "server.yaml"
+    server_config_file.write_text(server_config_line)
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text("session_title_instructions: User guidance.\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(server_config_file))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    observed: dict[str, Any] = {}
+    real_create_app = app_module.create_app
+
+    def spy_create_app(**kwargs: Any) -> Any:
+        observed["server_config"] = kwargs["server_config"]
+        return real_create_app(**kwargs)
+
+    monkeypatch.setattr(app_module, "create_app", spy_create_app)
+    monkeypatch.setattr(uvicorn.server.Server, "run", lambda self, **kwargs: None)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert observed["server_config"]["session_title_instructions"] == expected_instructions
+
+
 @pytest.mark.parametrize("authority", [False, 123, [], {}, "", " ", "x" * 129])
 def test_server_rejects_invalid_preference_authority(monkeypatch, tmp_path, authority):
     import json
