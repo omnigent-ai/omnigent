@@ -1,14 +1,10 @@
-import { cleanup, render as renderRaw, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ReactElement } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { TooltipProvider } from "@/components/ui/tooltip";
 import { ComposerWorkspaceStatus } from "./ComposerWorkspaceStatus";
 
 afterEach(cleanup);
-
-const render = (ui: ReactElement) => renderRaw(ui, { wrapper: TooltipProvider });
 
 const base = {
   workspacePath: "/home/alice/repo",

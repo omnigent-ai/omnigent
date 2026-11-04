@@ -1,7 +1,7 @@
 import { FolderIcon, GitForkIcon } from "lucide-react";
 
 import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ComposerBranchState } from "@/hooks/useComposerGitStatus";
 import { cn } from "@/lib/utils";
 
@@ -51,7 +51,7 @@ export function ComposerWorkspaceStatus({
       : branchText;
 
   return (
-    <>
+    <TooltipProvider>
       <WorkspaceStatusItem
         icon={FolderIcon}
         label={workspacePath ? pathTail(workspacePath) : "No workspace"}
@@ -72,7 +72,7 @@ export function ComposerWorkspaceStatus({
           testId="composer-git-branch"
         />
       ) : null}
-    </>
+    </TooltipProvider>
   );
 }
 
