@@ -2715,7 +2715,7 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
 
 
 @pytest.mark.parametrize(
-    "original,calls,statuses,read_cap",
+    "original,calls,statuses,read_cap,baseline",
     [
         pytest.param(
             b"one\ntwo\n",
@@ -2725,6 +2725,7 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             ],
             [],
             None,
+            "one\ntwo\n",
             id="edit-reverted",
         ),
         pytest.param(
@@ -2735,6 +2736,7 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             ],
             [],
             None,
+            "one\ntwo\n",
             id="write-reverted",
         ),
         pytest.param(
@@ -2746,6 +2748,7 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             ],
             ["modified"],
             None,
+            "one\ntwo\n",
             id="partially-reverted",
         ),
         pytest.param(
@@ -2756,12 +2759,14 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             ],
             ["modified"],
             None,
+            "one\r\ntwo\r\n",
             id="line-endings-changed",
         ),
         pytest.param(
             b"\x89PNG\r\n\x1a\n\x00\xff",
             [("sys_os_write", {"content": ""}), ("sys_os_write", {"content": ""})],
             ["modified"],
+            None,
             None,
             id="binary-original",
         ),
@@ -2773,6 +2778,7 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             ],
             ["modified"],
             4,
+            None,
             id="original-beyond-read-cap",
         ),
     ],
@@ -2785,6 +2791,7 @@ async def test_runner_os_env_change_restoring_the_original_leaves_changes(
     calls: list[tuple[str, dict[str, str]]],
     statuses: list[str],
     read_cap: int | None,
+    baseline: str | None,
 ) -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
@@ -2816,6 +2823,7 @@ async def test_runner_os_env_change_restoring_the_original_leaves_changes(
 
     listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
     assert [entry["status"] for entry in listed] == statuses
+    assert filesystem_registry.get_baseline("file.txt") == baseline
 
 
 @pytest.mark.asyncio
