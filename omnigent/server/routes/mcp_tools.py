@@ -29,6 +29,8 @@ from omnigent.stores.host_store import HostStore
 _MCP_TOOLS_TIMEOUT_S = 20.0
 # The host ends a start within 30s and then stops any CLI it spawned, so it can reply first.
 _MCP_LOGIN_START_TIMEOUT_S = 40.0
+# Each step of handing a pasted redirect to the CLI may take the host's 5s callback timeout.
+_MCP_LOGIN_SUBMIT_TIMEOUT_S = 20.0
 _MCP_LOGIN_TIMEOUT_S = 10.0
 _LOGIN_STATUS_CODES = {"not_found": 404, "invalid": 400, "busy": 503}
 _ResultFrame = TypeVar("_ResultFrame")
@@ -196,7 +198,7 @@ def create_mcp_tools_router(
         conn = await login_host(request, host_id)
         return await send_login(
             conn,
-            _MCP_LOGIN_TIMEOUT_S,
+            _MCP_LOGIN_SUBMIT_TIMEOUT_S,
             action="submit",
             login_id=login_id,
             callback_url=body.callback_url,

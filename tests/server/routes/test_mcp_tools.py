@@ -22,7 +22,7 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     decode_host_frame,
 )
-from omnigent.host.mcp_login import START_TIMEOUT_SECONDS
+from omnigent.host.mcp_login import CALLBACK_TIMEOUT_SECONDS, START_TIMEOUT_SECONDS
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes import _host_launch
 from omnigent.server.routes import mcp_tools as mcp_tools_routes
@@ -401,6 +401,8 @@ async def test_unanswered_mcp_login_requests_are_cleaned_up(
     assert conn.pending_mcp_logins == {}
 
 
-def test_server_outwaits_a_host_start() -> None:
+def test_server_outwaits_host_sign_in_steps() -> None:
     # A host that gives up on a start still stops its CLI (up to 2s) before replying.
     assert mcp_tools_routes._MCP_LOGIN_START_TIMEOUT_S >= START_TIMEOUT_SECONDS + 5
+    # A submit's connect, request and reply may each take the whole callback timeout.
+    assert mcp_tools_routes._MCP_LOGIN_SUBMIT_TIMEOUT_S >= 3 * CALLBACK_TIMEOUT_SECONDS + 5
