@@ -625,6 +625,45 @@ async def test_call_tool_keeps_reply_that_arrives_after_server_reconnect() -> No
 
 
 @pytest.mark.asyncio
+async def test_call_tool_cancelled_while_awaiting_reply_stops_reconnect_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a held call ends its request and reconnect watch without a re-issue."""
+    from omnigent.runner import proxy_mcp_manager
+
+    monkeypatch.setattr(proxy_mcp_manager, "_SERVER_REPLY_GRACE_S", 0.0)
+    registry = McpExecutionRegistry()
+    transport = _RetainedOperationTransport(registry, first_reply="held")
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    tasks_before = asyncio.all_tasks()
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
+    try:
+        await asyncio.wait_for(transport.first_request_executed.wait(), timeout=5.0)
+        await poll_until_async(lambda: bool(pending_approvals._server_reconnect_waiters))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5.0)
+
+        assert asyncio.all_tasks() == tasks_before
+        assert not pending_approvals._server_reconnect_waiters
+        pending_approvals.notify_server_reconnect()
+        await asyncio.sleep(0)
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_call_tool_is_error_returns_json_error_string() -> None:
     """``isError=True`` in result must be returned as a JSON error string, not raised.
 
