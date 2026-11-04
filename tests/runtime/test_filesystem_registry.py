@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -546,7 +547,9 @@ def test_changes_read_a_file_again_only_after_it_may_have_changed(
     # Both keep the size and modification time; only ctime or the inode shows the change.
     if change == "rewritten-in-place":
         # Coarse timestamps can repeat within a clock tick, so rewrite until ctime moves.
+        deadline = time.monotonic() + 10
         while os.stat(target).st_ctime_ns == compared.st_ctime_ns:
+            assert time.monotonic() < deadline, f"ctime stayed at {compared.st_ctime_ns}"
             target.write_text("changed!\n")
             os.utime(target, ns=(compared.st_atime_ns, compared.st_mtime_ns))
     else:

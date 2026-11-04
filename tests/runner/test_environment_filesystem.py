@@ -1842,19 +1842,26 @@ async def test_changes_drop_a_file_saved_back_to_its_original_content(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "body"),
+    [
+        ("PUT", {"content": "AAAAAAAA", "encoding": "utf-8"}),
+        ("PATCH", {"old_text": "TAIL", "new_text": ""}),
+    ],
+)
 async def test_changes_keep_a_file_saved_as_the_readable_prefix_of_its_original(
     client: httpx.AsyncClient,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    body: dict[str, str],
 ) -> None:
     """A capped read is not the whole original, so saving it is still a change."""
     monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 8)
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
     (workspace / "big.txt").write_text("AAAAAAAATAIL")
 
-    saved = await client.put(
-        f"{base}/filesystem/big.txt", json={"content": "AAAAAAAA", "encoding": "utf-8"}
-    )
+    saved = await client.request(method, f"{base}/filesystem/big.txt", json=body)
     assert saved.status_code == 200, saved.text
 
     listed = (await client.get(f"{base}/changes")).json()["data"]
