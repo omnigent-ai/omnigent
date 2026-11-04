@@ -3915,34 +3915,6 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 
-  it("keeps a same-text send posted while a reopened session's first failed-input read is out", async () => {
-    seedSession("conv_real");
-    failManagedLaunch("conv_real", "saved on server");
-    let answer: (() => void) | undefined;
-    fetchMock.mockImplementation((input, init) => {
-      const response = defaultFetchHandler(input, init);
-      if (answer !== undefined || String(input) !== "/v1/sessions/conv_real/failed-inputs")
-        return response;
-      return new Promise<Response>((resolve) => {
-        answer = () => resolve(response);
-      });
-    });
-    await useChatStore.getState().switchTo("conv_real");
-    await vi.waitFor(() => expect(answer).toBeDefined());
-    const newer: PendingUserMessage = {
-      tempId: "tmp_newer",
-      content: [{ type: "input_text", text: "saved on server" }],
-      posted: true,
-    };
-    useChatStore.setState({ pendingUserMessages: [newer] });
-
-    answer!();
-    await vi.waitFor(() =>
-      expect(useChatStore.getState().failedSendDraft?.text).toBe("saved on server"),
-    );
-    expect(useChatStore.getState().pendingUserMessages).toEqual([newer]);
-  });
-
   it.each(["after", "before"])(
     "leaves out the failed startup inputs a reloaded draft already holds, cleared %s they're read",
     async (cleared) => {
@@ -4102,6 +4074,34 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       expect(useChatStore.getState().failedSendDraft).toBeNull();
     },
   );
+
+  it("keeps a same-text send posted while a reopened session's first failed-input read is out", async () => {
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+    let answer: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      const response = defaultFetchHandler(input, init);
+      if (answer !== undefined || String(input) !== "/v1/sessions/conv_real/failed-inputs")
+        return response;
+      return new Promise<Response>((resolve) => {
+        answer = () => resolve(response);
+      });
+    });
+    await useChatStore.getState().switchTo("conv_real");
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    const newer: PendingUserMessage = {
+      tempId: "tmp_newer",
+      content: [{ type: "input_text", text: "saved on server" }],
+      posted: true,
+    };
+    useChatStore.setState({ pendingUserMessages: [newer] });
+
+    answer!();
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().failedSendDraft?.text).toBe("saved on server"),
+    );
+    expect(useChatStore.getState().pendingUserMessages).toEqual([newer]);
+  });
 
   it("doesn't name the startup inputs a composer discarded", async () => {
     onTestFinished(clearSessionDrafts);
@@ -22760,6 +22760,67 @@ describe("a send cut off by a reload", () => {
     }
   });
 
+  it("doesn't hand back a reload's unanswered send after the server refuses its untouched resend and the composer sends it edited", async () => {
+    onTestFinished(clearSessionDrafts);
+    seedSession("conv_reload", []);
+    failManagedLaunch("conv_reload", "saved on server");
+    sessionFailedInputs.get("conv_reload")![0]!.item_id = "stable_reload";
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      text: "saved on server",
+      authorId: "user_a",
+    });
+    let answer: (() => void) | undefined;
+    let refused = false;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const response = defaultFetchHandler(input, init);
+      if (url === "/v1/sessions/conv_reload/failed-inputs" && answer === undefined)
+        return new Promise<Response>((resolve) => {
+          answer = () => resolve(response);
+        });
+      if (url === "/v1/sessions/conv_reload/events" && !refused) {
+        refused = true;
+        return Promise.resolve(
+          mockResponse(
+            { error: { code: "conflict", message: "Rejected" } },
+            { ok: false, status: 409 },
+          ),
+        );
+      }
+      return response;
+    });
+    await useChatStore.getState().switchTo("conv_reload");
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    expect(takeFailedSendDraft("conv_reload", false, true)?.text).toBe("saved on server");
+    setSessionDraft("conv_reload", {
+      text: "saved on server",
+      files: [],
+      sentAs: ["stable_reload"],
+    });
+    await useChatStore.getState().send("saved on server", "agent_xyz");
+    setSessionDraft("conv_reload", { text: "", files: [] });
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().failedSendDraft?.serverRefused).toBe(true),
+    );
+
+    // The composer takes the refused resend back, then sends it edited.
+    expect(takeFailedSendDraft("conv_reload", false, true)?.stableId).toBe("stable_reload");
+    setSessionDraft("conv_reload", {
+      text: "saved on server",
+      files: [],
+      sentAs: ["stable_reload"],
+    });
+    await useChatStore.getState().send("saved on server, edited", "agent_xyz");
+    setSessionDraft("conv_reload", { text: "", files: [] });
+
+    answer!();
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().returnedStartupInputs).toEqual(["pending_first"]),
+    );
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
   it("hands an unanswered send back to the composer on the next load", async () => {
     // The server held the POST for a sandbox wake and the tab reloaded meanwhile.
     seedSession("conv_reload", []);
@@ -23318,67 +23379,6 @@ describe("a send cut off by a reload", () => {
     await vi.waitFor(() =>
       expect(useChatStore.getState().failedSendDraft?.text).toBe("saved on server"),
     );
-  });
-
-  it("doesn't hand back a reload's unanswered send after the server refuses its untouched resend and the composer sends it edited", async () => {
-    onTestFinished(clearSessionDrafts);
-    seedSession("conv_reload", []);
-    failManagedLaunch("conv_reload", "saved on server");
-    sessionFailedInputs.get("conv_reload")![0]!.item_id = "stable_reload";
-    rememberUnsentSend("conv_reload", {
-      stableId: "stable_reload",
-      text: "saved on server",
-      authorId: "user_a",
-    });
-    let answer: (() => void) | undefined;
-    let refused = false;
-    fetchMock.mockImplementation((input, init) => {
-      const url = String(input);
-      const response = defaultFetchHandler(input, init);
-      if (url === "/v1/sessions/conv_reload/failed-inputs" && answer === undefined)
-        return new Promise<Response>((resolve) => {
-          answer = () => resolve(response);
-        });
-      if (url === "/v1/sessions/conv_reload/events" && !refused) {
-        refused = true;
-        return Promise.resolve(
-          mockResponse(
-            { error: { code: "conflict", message: "Rejected" } },
-            { ok: false, status: 409 },
-          ),
-        );
-      }
-      return response;
-    });
-    await useChatStore.getState().switchTo("conv_reload");
-    await vi.waitFor(() => expect(answer).toBeDefined());
-    expect(takeFailedSendDraft("conv_reload", false, true)?.text).toBe("saved on server");
-    setSessionDraft("conv_reload", {
-      text: "saved on server",
-      files: [],
-      sentAs: ["stable_reload"],
-    });
-    await useChatStore.getState().send("saved on server", "agent_xyz");
-    setSessionDraft("conv_reload", { text: "", files: [] });
-    await vi.waitFor(() =>
-      expect(useChatStore.getState().failedSendDraft?.serverRefused).toBe(true),
-    );
-
-    // The composer takes the refused resend back, then sends it edited.
-    expect(takeFailedSendDraft("conv_reload", false, true)?.stableId).toBe("stable_reload");
-    setSessionDraft("conv_reload", {
-      text: "saved on server",
-      files: [],
-      sentAs: ["stable_reload"],
-    });
-    await useChatStore.getState().send("saved on server, edited", "agent_xyz");
-    setSessionDraft("conv_reload", { text: "", files: [] });
-
-    answer!();
-    await vi.waitFor(() =>
-      expect(useChatStore.getState().returnedStartupInputs).toEqual(["pending_first"]),
-    );
-    expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
   it.each([
