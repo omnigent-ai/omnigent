@@ -95,7 +95,9 @@ it("re-probes a needs-auth server once the host's sign-in cache expires", async 
   await reopenAfter(1);
   await waitFor(() => expect(result.current.data?.harness_sign_in).toBe("signed_in"));
   expect(authenticatedFetch).toHaveBeenCalledTimes(2);
-  await reopenAfter(300_000);
+  await reopenAfter(29_999);
+  expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+  await reopenAfter(1);
   await waitFor(() => expect(result.current.data?.connection).toBe("connected"));
   expect(authenticatedFetch).toHaveBeenCalledTimes(3);
   await reopenAfter(60_000);

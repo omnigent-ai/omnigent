@@ -4339,6 +4339,7 @@ def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> N
     runner.wait()
 
 
+@pytest.mark.posix_only
 def test_reap_orphans_leaves_mcp_sign_in_exit_codes(monkeypatch: pytest.MonkeyPatch) -> None:
     """An MCP sign-in CLI's exit status belongs to its login manager."""
     host = _make_host_process()
