@@ -585,8 +585,8 @@ describe("CommentsPanel Address All", () => {
   }
 
   it.each([
-    ["drafts only in other files", [], 2, "Address all (2)", true],
-    ["this file's and other files' drafts", [makeComment("c1")], 3, "Address all (3)", true],
+    ["drafts only in other files", [], 2, "Address All (2)", true],
+    ["this file's and other files' drafts", [makeComment("c1")], 3, "Address All (3)", true],
     ["this file's drafts by default", [makeComment("c1")], undefined, "Address All1", true],
     ["no drafts anywhere", [], 0, "Address All", false],
   ])(
@@ -610,7 +610,7 @@ describe("CommentsPanel Address All", () => {
   ])("explains the send scope with drafts in %s", (_label, comments, count, fileCount, tooltip) => {
     renderAddressPanel(comments, count, fileCount);
 
-    act(() => screen.getByRole("button", { name: `Address all (${count})` }).focus());
+    act(() => screen.getByRole("button", { name: `Address All (${count})` }).focus());
     expect(screen.getByRole("tooltip")).toHaveTextContent(tooltip);
   });
 

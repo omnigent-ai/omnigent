@@ -203,7 +203,7 @@ export function CommentsPanel({
                 >
                   <WandSparklesIcon className="size-3.5" />
                   {addressesOtherFiles ? (
-                    `Address all (${addressCount})`
+                    `Address All (${addressCount})`
                   ) : (
                     <>
                       Address All
