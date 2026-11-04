@@ -3967,11 +3967,16 @@ describe("Sidebar view options", () => {
     fireEvent.keyDown(within(zulu).getByTestId("conversation-actions"), { key: "Enter" });
     fireEvent.click(screen.getByTestId("move-session-down"));
     expect(rowTitles()).toEqual(["conv_banana", "conv_zulu"]);
-    expect(saved().custom).toEqual({
-      base: "updated",
-      since: 30,
-      ids: ["conv_banana", "conv_zulu"],
-    });
+    const positions = { base: "updated", since: 30, ids: ["conv_banana", "conv_zulu"] };
+    expect(saved().custom).toEqual(positions);
+
+    // Leaving Name again restores those positions rather than Updated's order.
+    openViewSubmenu("session-ordering-menu");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Name (A to Z)" }));
+    openViewSubmenu("session-ordering-menu");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Custom" }));
+    expect(rowTitles()).toEqual(["conv_banana", "conv_zulu"]);
+    expect(saved()).toMatchObject({ ordering: "custom", custom: positions });
   });
 
   it("shows the toggled metadata under the title and the updated time in the trailing slot", () => {

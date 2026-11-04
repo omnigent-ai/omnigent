@@ -4,8 +4,8 @@
 lowercased, or ``"1"`` for an untitled session. A sub-agent's key has ``"2"`` in
 front, so it sorts after every top-level key. Keys are cut to 512 code points. A
 binary collation makes every backend compare them by code point, and
-``ix_conversations_archived_title`` lets a Name page read only the rows it
-returns instead of sorting every session first.
+``ix_conversations_archived_title`` lets a Name page walk the key in order
+instead of sorting every session first.
 
 Deployment: additive. The backfill commits per batch, and on PostgreSQL the
 index builds ``CONCURRENTLY``, so sessions stay writable during the upgrade.

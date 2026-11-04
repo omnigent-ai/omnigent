@@ -209,6 +209,10 @@ it("bounds a Name merge at each token's position after a capped refresh", () => 
   expect(mergeIds(renamed, [])).toEqual(["a0"]);
   // Mine's token still bounds the merge when none of its rows are loaded.
   expect(mergeIds([], [...shared, titled("s1", "B000")])).toEqual(["s0"]);
+  // A non-ASCII key decodes from the token's UTF-8 bytes.
+  const accented = [titled("u0", "Ä"), titled("u1", "Ö"), titled("u2", "Ü")];
+  const merged = mergeScopeRows(accented, [], true, false, titleToken(accented[1]), null, "title");
+  expect(merged.rows.map((r) => r.id)).toEqual(["u0", "u1"]);
 });
 
 it("keys names like the server: folded case, untitled last", () => {

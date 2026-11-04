@@ -88,6 +88,12 @@ const response = (rows: Conversation[], more = false) => ({
   ok: true,
   json: async () => sessionRowsPage(rows, more),
 });
+/** The server's ``sort_by=title`` continuation token for a row titled by its id. */
+const titleToken = (id: string) =>
+  `title.${btoa(JSON.stringify([`0${id}`, id]))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "")}`;
 beforeEach(() => {
   groupingUi = false;
   titleSort = true;
@@ -113,7 +119,9 @@ beforeEach(() => {
       shared,
     );
     if (pinned) next.labels[PINNED_LABEL_KEY] = "1";
-    return response([next], !pinned && !p.has("after"));
+    const page = sessionRowsPage([next], !pinned && !p.has("after"));
+    if (p.get("sort_by") === "title") page.last_id = titleToken(next.id);
+    return { ok: true, json: async () => page };
   });
   vi.stubGlobal("fetch", fetchMock);
 });
@@ -526,7 +534,11 @@ it.each([
         ([url]) => params(url).get("sort_by") === sortBy && params(url).get("order") === order,
       ),
     ).toBe(true);
-    expect(listCalls("mine").some(([url]) => params(url).has("after"))).toBe(true);
+    // Each next page sends the previous page's cursor back unchanged, a token under Name.
+    const continuations = listCalls("mine").flatMap(([url]) => params(url).getAll("after"));
+    expect(new Set(continuations)).toEqual(
+      new Set([sortBy === "title" ? titleToken("mine") : "mine"]),
+    );
     expect(client.getQueryData(["conversations", "", false, null, "mine", sortBy])).toBeDefined();
     expect(client.getQueryData(["conversations", "", false, null, "mine"])).toBeDefined();
     await act(async () => {
