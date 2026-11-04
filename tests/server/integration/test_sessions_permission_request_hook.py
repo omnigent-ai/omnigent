@@ -2653,6 +2653,93 @@ async def test_codex_mcp_elicitation_hook_persists_web_session_approval(
     }
 
 
+_CODEX_FILE_CHANGE_PAYLOAD: dict[str, Any] = {
+    "id": 21,
+    "method": "item/fileChange/requestApproval",
+    "params": {
+        "threadId": "thread_123",
+        "turnId": "turn_123",
+        "itemId": "item_patch",
+        "startedAtMs": 1,
+        "reason": None,
+        "grantRoot": None,
+    },
+}
+
+_CODEX_MCP_APPROVAL_QUESTION_PAYLOAD: dict[str, Any] = {
+    "id": 22,
+    "method": "item/tool/requestUserInput",
+    "params": {
+        "threadId": "thread_123",
+        "turnId": "turn_123",
+        "itemId": "call_inbox",
+        "questions": [
+            {
+                "id": "mcp_tool_call_approval_call_inbox",
+                "header": "Approve app tool call?",
+                "question": 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+                "options": [
+                    {"label": "Allow"},
+                    {"label": "Allow for this session"},
+                    {"label": "Cancel"},
+                ],
+            }
+        ],
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("payload", "persist", "expected"),
+    [
+        (_CODEX_FILE_CHANGE_PAYLOAD, "session", {"decision": "acceptForSession"}),
+        (_CODEX_FILE_CHANGE_PAYLOAD, "always", {"decision": "accept"}),
+        (
+            _CODEX_MCP_APPROVAL_QUESTION_PAYLOAD,
+            "session",
+            {
+                "answers": {
+                    "mcp_tool_call_approval_call_inbox": {"answers": ["Allow for this session"]}
+                }
+            },
+        ),
+    ],
+    ids=["file-change-session", "file-change-unoffered-always", "mcp-question-session"],
+)
+async def test_codex_approval_hook_returns_session_scoped_answer(
+    client: httpx.AsyncClient,
+    payload: dict[str, Any],
+    persist: str,
+    expected: dict[str, Any],
+) -> None:
+    """An approval card advertises the session scope; unoffered scopes stay one-time."""
+    agent = await create_test_agent(client, f"test-codex-session-scope-{payload['id']}-{persist}")
+    session_id = await _create_session(client, agent["id"])
+
+    collector = await start_session_stream_collector(session_id)
+    try:
+        hook_task = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+                json=payload,
+            )
+        )
+        event = await collector.next_event(timeout=5.0)
+        assert event["type"] == "response.elicitation_request"
+        assert "ask_user_question" not in event["params"]
+        assert event["params"]["codex_persist_modes"] == ["session"]
+        verdict = await _post_approval(
+            client, session_id, event["elicitation_id"], "accept", meta={"persist": persist}
+        )
+        assert verdict.status_code == 202, verdict.text
+
+        resp = await hook_task
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == expected
+    finally:
+        await collector.stop()
+
+
 async def test_codex_pending_elicitation_survives_session_snapshot_refresh(
     client: httpx.AsyncClient,
 ) -> None:

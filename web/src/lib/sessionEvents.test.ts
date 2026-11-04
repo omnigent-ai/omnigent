@@ -933,6 +933,56 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(ev.codexPersistModes).toEqual(["session", "always"]);
   });
 
+  it("lifts server-advertised Codex persistence modes on file-change approvals", () => {
+    const fileChangeParams = {
+      mode: "form",
+      message: "Codex wants to modify files",
+      phase: "codex_file_change_approval",
+      policy_name: "codex_native_file_change_approval",
+      content_preview: "",
+      requestedSchema: {},
+    };
+    const [advertised] = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_file_change",
+      params: { ...fileChangeParams, codex_persist_modes: ["session", "unsupported"] },
+    }) as ElicitationRequest[];
+    // Servers that predate the field offer only one-time approval.
+    const [legacy] = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_file_change_legacy",
+      params: fileChangeParams,
+    }) as ElicitationRequest[];
+
+    expect(advertised.codexPersistModes).toEqual(["session"]);
+    expect(legacy.codexPersistModes).toEqual([]);
+  });
+
+  it("prefers server-advertised Codex persistence modes over MCP metadata", () => {
+    const mcpParams = {
+      mode: "form",
+      message: 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+      phase: "codex_mcp_elicitation",
+      policy_name: "codex_native_mcp_elicitation",
+      content_preview: "{}",
+      requestedSchema: {},
+      _meta: { codex_approval_kind: "mcp_tool_call", persist: ["always"] },
+    };
+    const [sessionOnly] = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_mcp_session_only",
+      params: { ...mcpParams, codex_persist_modes: ["session"] },
+    }) as ElicitationRequest[];
+    const [oneTimeOnly] = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_mcp_one_time_only",
+      params: { ...mcpParams, codex_persist_modes: [] },
+    }) as ElicitationRequest[];
+
+    expect(sessionOnly.codexPersistModes).toEqual(["session"]);
+    expect(oneTimeOnly.codexPersistModes).toEqual([]);
+  });
+
   it("lifts agy permission action description and advertised persist pattern", () => {
     const out = parse("response.elicitation_request", {
       type: "response.elicitation_request",
