@@ -68,11 +68,14 @@ def _backfill(bind: sa.Connection) -> None:
         sa.column("title", sa.Text()),
         sa.column(_COLUMN, _SORT_KEY_TYPE),
     )
+    # Skip rows renamed since the read; upgraded builds write their key with the title.
     update = (
         table.update()
         .where(
             table.c.workspace_id == sa.bindparam("row_workspace_id"),
             table.c.id == sa.bindparam("row_id"),
+            table.c.title == sa.bindparam("row_title"),
+            table.c[_COLUMN] == sa.bindparam("row_sort_key"),
         )
         .values({_COLUMN: sa.bindparam("sort_key")})
     )
@@ -96,7 +99,13 @@ def _backfill(bind: sa.Connection) -> None:
         if not rows:
             break
         changed = [
-            {"row_workspace_id": row.workspace_id, "row_id": row.id, "sort_key": key}
+            {
+                "row_workspace_id": row.workspace_id,
+                "row_id": row.id,
+                "row_title": row.title,
+                "row_sort_key": row.title_sort_key,
+                "sort_key": key,
+            }
             for row in rows
             if (key := _sort_key(row.title)) != row.title_sort_key
         ]

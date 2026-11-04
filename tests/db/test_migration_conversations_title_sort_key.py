@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from importlib import import_module
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 
@@ -115,5 +116,60 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
                 ).scalar_one()
             assert "created_at DESC" in parent_index and "id DESC" in parent_index
         assert set(_conversation_ids(engine)) == set(original) | {(0, legacy_id)}
+    finally:
+        _migrate(engine, "head")
+
+
+def test_title_sort_key_backfill_keeps_a_concurrent_rename(db_uri: str) -> None:
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name == "cockroachdb":
+        pytest.skip("CockroachDB's serializable backfill batches cannot lose this update")
+    batch_size = import_module(_MIGRATION)._BATCH_SIZE
+    _migrate(engine, _PREVIOUS, command.downgrade)
+    conversations = sa.Table("conversations", sa.MetaData(), autoload_with=engine)
+    # A full untitled first batch needs no keys, so the rename lands after the
+    # column is committed and while a later batch is between its read and write.
+    renamed_id = batch_size.to_bytes(16, "big")
+    titles = {index.to_bytes(16, "big"): "" for index in range(batch_size)}
+    titles[renamed_id] = "Before"
+    renamed = False
+
+    def rename_before_backfill_write(conn, cursor, statement, parameters, context, executemany):
+        nonlocal renamed
+        if renamed or "SET title_sort_key" not in statement:
+            return
+        renamed = True
+        with engine.begin() as writer:
+            writer.execute(
+                sa.text(
+                    "UPDATE conversations SET title = 'After', title_sort_key = :key "
+                    "WHERE workspace_id = 0 AND id = :id"
+                ),
+                {"key": title_sort_key("After"), "id": renamed_id},
+            )
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                conversations.insert(),
+                [
+                    {
+                        "workspace_id": 0,
+                        "id": row_id,
+                        "root_conversation_id": row_id,
+                        "created_at": 1,
+                        "updated_at": 2,
+                        "title": title,
+                    }
+                    for row_id, title in titles.items()
+                ],
+            )
+        sa.event.listen(engine, "before_cursor_execute", rename_before_backfill_write)
+        try:
+            _migrate(engine, _REVISION)
+        finally:
+            sa.event.remove(engine, "before_cursor_execute", rename_before_backfill_write)
+        assert renamed
+        assert _keys(engine)[(0, renamed_id)] == "0after"
     finally:
         _migrate(engine, "head")
