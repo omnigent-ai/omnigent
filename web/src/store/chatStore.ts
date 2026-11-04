@@ -1994,6 +1994,7 @@ export function initChatStore(client: QueryClient): void {
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
   conversationRegistry.clear();
+  disposedReturnedStartupInputs.clear();
   // Drop this tab's held stream slots; disposed pumps release their own locks,
   // and a boot/reset starts from an empty set.
   heldStreamSlots.clear();
@@ -3284,12 +3285,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           serverRefused: true,
           startupInputIds: replaced,
         };
-        failSet((s) => {
-          const waiting = s.failedSendDraft;
-          // Messages a failed launch handed back may still wait for the composer.
-          const handedBack = waiting?.recovered === true && waiting.stableId === undefined;
-          return { failedSendDraft: handedBack ? joinFailedSendDrafts(waiting, refused) : refused };
-        });
+        // A draft may still wait for the composer, e.g. handed-back messages or another failed send.
+        failSet((s) => ({ failedSendDraft: joinFailedSendDrafts(s.failedSendDraft, refused) }));
       } else if (replaced && failTarget !== null) {
         failSet((s) => forgetReturnedStartupInputs(s, replaced));
         void restoreFailedStartupInputs(failTarget);
@@ -8148,6 +8145,24 @@ async function listFailedStartupInputs(
 /** Entries that saw their managed launch fail; its later failure report is read again. */
 const failedLaunchEntries = new WeakSet<ConversationEntry>();
 
+/** Startup inputs disposed entries had handed back, so a session reopened in this tab doesn't offer them again. */
+const disposedReturnedStartupInputs = new Map<string, string[]>();
+conversationRegistry.subscribeDisposed((id, state) => {
+  const carried = disposedReturnedStartupInputs.get(id) ?? [];
+  const returned = [...new Set([...carried, ...state.returnedStartupInputs])];
+  if (returned.length > 0) disposedReturnedStartupInputs.set(id, returned);
+});
+
+/** Count the startup inputs an earlier entry for this session handed back as returned on this one. */
+function adoptDisposedReturnedStartupInputs(entry: ConversationEntry): void {
+  const carried = disposedReturnedStartupInputs.get(entry.id);
+  if (carried === undefined) return;
+  disposedReturnedStartupInputs.delete(entry.id);
+  entrySetter(entry)((state) => ({
+    returnedStartupInputs: [...new Set([...state.returnedStartupInputs, ...carried])],
+  }));
+}
+
 /** Per entry, how many failed-input lookups began and the latest begun that read them back. */
 const startupLookups = new WeakMap<ConversationEntry, { begun: number; latestRead: number }>();
 
@@ -8177,6 +8192,7 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
   const entry = conversationRegistry.peek(conversationId);
   if (entry === undefined) return;
   failedLaunchEntries.add(entry);
+  adoptDisposedReturnedStartupInputs(entry);
   const lookup = beginStartupLookup(entry);
   const unacknowledged = unacknowledgedSends(entry.getState().pendingUserMessages);
   const read = (signal: AbortSignal) => listFailedStartupInputs(conversationId, signal);
@@ -8213,6 +8229,7 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
 export async function retryFailedStartupLookup(conversationId: string): Promise<void> {
   const entry = conversationRegistry.peek(conversationId);
   if (entry === undefined || entry.disposed) throw new Error("The session is no longer open");
+  adoptDisposedReturnedStartupInputs(entry);
   const lookup = beginStartupLookup(entry);
   const unacknowledged = unacknowledgedSends(entry.getState().pendingUserMessages);
   const inputs = await readWithinReconcileTimeout((signal) =>

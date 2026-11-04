@@ -94,8 +94,8 @@ export type ConversationGetter = () => ConversationState;
 /** Notified whenever an entry's state changes, so the root store can mirror it. */
 type ChangeListener = (id: string) => void;
 
-/** Notified when an entry is disposed (released, evicted, or cleared). */
-type DisposeListener = (id: string) => void;
+/** Notified with its last state when an entry is disposed (released, evicted, or cleared). */
+type DisposeListener = (id: string, state: ConversationState) => void;
 
 /**
  * One conversation's live state and stream.
@@ -348,7 +348,7 @@ export class ConversationRegistry {
         entry.disposed = true;
         // Ends the reconnect loop and cancels the in-flight fetch.
         state.abortController?.abort();
-        for (const listener of this.disposeListeners) listener(id);
+        for (const listener of this.disposeListeners) listener(id, state);
       },
     };
     return entry;

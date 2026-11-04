@@ -3871,6 +3871,19 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     setSessionDraft("conv_real", { text: "", files: [] });
     await retryFailedStartupLookup("conv_real");
     expect(useChatStore.getState().failedSendDraft).toBeNull();
+
+    // So does the session evicted and reopened in the same tab.
+    seedSession("conv_other");
+    await useChatStore.getState().switchTo("conv_other");
+    await settle();
+    expect(conversationRegistry.evictLruEvictable()).toBe("conv_real");
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().returnedStartupInputs).toEqual([
+      "pending_first",
+      "pending_second",
+    ]);
   });
 
   it.each([
@@ -4099,7 +4112,10 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
-  it("adds a refused skill-command resend after messages a failed launch handed back meanwhile", async () => {
+  it.each([
+    { waiting: "messages a failed launch handed back", handedBack: true },
+    { waiting: "another failed send's draft", handedBack: false },
+  ])("adds a refused skill-command resend after $waiting meanwhile", async ({ handedBack }) => {
     onTestFinished(clearSessionDrafts);
     seedSession("conv_real");
     failManagedLaunch("conv_real", "saved on server");
@@ -4126,11 +4142,22 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       .getState()
       .sendSlashCommand("review", "saved on server", "agent_xyz");
     await vi.waitFor(() => expect(refuseResend).toBeDefined());
-    sessionFailedInputs.get("conv_real")!.push({
-      pending_id: "pending_second",
-      content: [{ type: "input_text", text: "and the second" }],
-    });
-    await retryFailedStartupLookup("conv_real");
+    if (handedBack) {
+      sessionFailedInputs.get("conv_real")!.push({
+        pending_id: "pending_second",
+        content: [{ type: "input_text", text: "and the second" }],
+      });
+      await retryFailedStartupLookup("conv_real");
+    } else {
+      conversationRegistry.peek("conv_real")!.setState({
+        failedSendDraft: {
+          conversationId: "conv_real",
+          text: "and the second",
+          files: [],
+          stableId: "stable_other",
+        },
+      });
+    }
     refuseResend!();
     await resend;
 
@@ -4138,7 +4165,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       conversationId: "conv_real",
       text: "and the second\n\n/review saved on server",
       files: [],
-      startupInputIds: ["pending_second", "pending_first"],
+      startupInputIds: handedBack ? ["pending_second", "pending_first"] : ["pending_first"],
       recovered: true,
     });
   });

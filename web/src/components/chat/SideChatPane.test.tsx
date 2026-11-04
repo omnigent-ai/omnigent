@@ -1734,11 +1734,12 @@ it.each([false, true])(
 );
 
 it.each([
-  { sent: "after the reopened session reads its inputs again", readFirst: true },
-  { sent: "before the reopened session reads its inputs", readFirst: false },
+  { sent: "after the reopened session reads its inputs again", readFirst: true, refused: false },
+  { sent: "before the reopened session reads its inputs", readFirst: false, refused: false },
+  { sent: "refused before the reopened session reads its inputs", readFirst: false, refused: true },
 ])(
   "adds a failed launch's recovered message after the grid composer's newer draft and names it in a send $sent",
-  async ({ readFirst }) => {
+  async ({ readFirst, refused }) => {
     const entry = conversationRegistry.acquire(childId);
     entry.setState({
       sessionStatus: "idle",
@@ -1784,11 +1785,18 @@ it.each([
     ]);
     if (readFirst) await act(() => retryFailedStartupLookup(childId));
     expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
-    const post = vi.spyOn(sessionsApi, "postEvent").mockResolvedValue({ queued: true });
+    const post = vi.spyOn(sessionsApi, "postEvent");
+    if (refused)
+      post.mockRejectedValue(
+        new sessionsApi.ApiError("No runner bound for session", 503, "runner_unavailable"),
+      );
+    else post.mockResolvedValue({ queued: true });
     fireEvent.click(screen.getByTestId("side-chat-send"));
     await waitFor(() => expect(post).toHaveBeenCalledOnce());
     expect(post.mock.calls[0][1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+    const left = refused ? "> New quote\n\nnewer\n\nsaved on server" : "";
+    await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveValue(left));
     await act(() => retryFailedStartupLookup(childId));
-    expect(screen.getByTestId("side-chat-input")).toHaveValue("");
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(left);
   },
 );
