@@ -3000,7 +3000,7 @@ class _CodexAppServerSession:
             self._signer_exited = False
             self._signer_watch_task = asyncio.create_task(self._watch_signer())
         codex_home_root = Path(tempfile.gettempdir())
-        if self._signer is not None:
+        if self._signer is not None and sys.platform != "win32":
             root_stat = codex_home_root.lstat()
             unsafe_writable = bool(root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
             if (
@@ -3011,17 +3011,28 @@ class _CodexAppServerSession:
                 raise OSError("unsafe signer session temp root")
         # Stage outside the workspace, falling back to a private temp home
         # when the shared staging root is unavailable.
-        with suppress(OSError):
-            codex_home_root = codex_home_staging_root()
+        # Native Windows: use the caller's temporary root instead of a shared
+        # staging directory; protect the newly created home with a private DACL.
+        if sys.platform != "win32":
+            with suppress(OSError):
+                codex_home_root = codex_home_staging_root()
         self._codex_home_dir = Path(
             tempfile.mkdtemp(prefix=CODEX_HOME_PREFIX, dir=str(codex_home_root))
         )
         home_stat = self._codex_home_dir.lstat()
         self._codex_home_identity = (home_stat.st_dev, home_stat.st_ino)
-        os.chmod(self._codex_home_dir, 0o700)
-        home_stat = self._codex_home_dir.lstat()
-        if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
-            raise OSError("unsafe signer CODEX_HOME")
+        if sys.platform == "win32":
+            from .codex_windows_acl import (
+                harden_private_windows_directory,
+                verify_private_windows_directory,
+            )
+            harden_private_windows_directory(self._codex_home_dir)
+            verify_private_windows_directory(self._codex_home_dir)
+        else:
+            os.chmod(self._codex_home_dir, 0o700)
+            home_stat = self._codex_home_dir.lstat()
+            if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
+                raise OSError("unsafe signer CODEX_HOME")
         # The runner grants only this session's skills directory to its tools.
         # Keep its inode stable so cached sandbox mounts survive worker restarts.
         if self._skills_dir is None:
