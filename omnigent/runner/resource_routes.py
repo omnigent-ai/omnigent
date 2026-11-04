@@ -77,6 +77,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.entities.environment_filesystem import FilesystemEntry
+    from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.runner.environment_filesystem import CallerProcessFilesystem
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
@@ -1030,27 +1031,31 @@ def register_resource_routes(
     ) -> bool:
         """Whether edits in *environment_id* land in the files under *registry*'s root.
 
-        Copy-on-write sessions write into an overlay the runner cannot read,
-        forked sessions write into a private copy of the workspace, and
-        sessions started in scratch write relative paths into the scratch dir.
-        Without a live environment rooted at *registry*'s root, nothing shows
-        where the edits landed.
+        Copy-on-write environments write into an overlay the runner cannot read,
+        forked ones write into a private copy of the workspace, and ones started
+        in scratch write relative paths into the scratch dir; the session spec or
+        the environment's own spec can enable each. Without a live environment
+        rooted at *registry*'s root, nothing shows where the edits landed.
         """
         from omnigent.sandbox.copy_on_write import has_copy_on_write
 
-        os_env_spec = getattr(spec, "os_env", None)
-        if (
-            has_copy_on_write(os_env_spec)
-            or getattr(os_env_spec, "fork", False)
-            or getattr(os_env_spec, "start_in_scratch", False)
-        ):
+        def _writes_elsewhere(os_env_spec: OSEnvSpec | None) -> bool:
+            return bool(
+                has_copy_on_write(os_env_spec)
+                or getattr(os_env_spec, "fork", False)
+                or getattr(os_env_spec, "start_in_scratch", False)
+            )
+
+        if _writes_elsewhere(getattr(spec, "os_env", None)):
             return False
         if resource_registry.uses_copy_on_write(session_id):
             return False
         environment = resource_registry.live_environment(session_id, environment_id)
         root = getattr(environment, "cwd", None)
-        if root is None or getattr(
-            getattr(environment, "sandbox", None), "copy_on_write_roots", None
+        if (
+            root is None
+            or _writes_elsewhere(getattr(environment, "spec", None))
+            or getattr(getattr(environment, "sandbox", None), "copy_on_write_roots", None)
         ):
             return False
         return Path(root).resolve() == registry.cwd

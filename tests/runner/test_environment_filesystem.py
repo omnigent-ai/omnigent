@@ -2106,7 +2106,7 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A terminal rooted elsewhere or in an overlay keeps edits the runner cannot confirm."""
+    """A terminal rooted elsewhere, in an overlay, or in scratch keeps unconfirmable edits."""
     terminal_root = tmp_path / "terminal"
     terminal_root.mkdir()
     (terminal_root / "notes.txt").write_text("new")
@@ -2122,6 +2122,16 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     overlay_env = SimpleNamespace(
         cwd=str(workspace), sandbox=SimpleNamespace(copy_on_write_roots=[workspace])
     )
+    scratch_env = SimpleNamespace(
+        cwd=str(workspace),
+        sandbox=SimpleNamespace(copy_on_write_roots=None),
+        spec=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            start_in_scratch=True,
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        ),
+    )
     terminals._by_conversation["conv_test"] = {
         ("bash", "s1"): make_test_terminal_instance("bash", "s1", tmp_path, os_env=terminal_env),
         ("bash", "s2"): make_test_terminal_instance(
@@ -2129,6 +2139,12 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
             "s2",
             tmp_path,
             os_env=overlay_env,  # type: ignore[arg-type]
+        ),
+        ("bash", "s3"): make_test_terminal_instance(
+            "bash",
+            "s3",
+            tmp_path,
+            os_env=scratch_env,  # type: ignore[arg-type]
         ),
     }
     monkeypatch.setattr(registry, "_terminal_registry", terminals)
@@ -2152,6 +2168,10 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     listed_in_overlay = await client.get(
         f"/v1/sessions/conv_test/resources/environments/{overlay}/changes"
     )
+    scratch = terminal_environment_resource_id("bash", "s3")
+    listed_in_scratch = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{scratch}/changes"
+    )
 
     assert (in_terminal.status_code, in_workspace.status_code) == (200, 200)
     assert listed.status_code == 200, listed.text
@@ -2162,6 +2182,12 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     ]
     assert listed_in_overlay.status_code == 200, listed_in_overlay.text
     assert sorted((e["path"], e["status"]) for e in listed_in_overlay.json()["data"]) == [
+        ("hello.txt", "modified"),
+        ("notes.txt", "created"),
+        ("shared.txt", "modified"),
+    ]
+    assert listed_in_scratch.status_code == 200, listed_in_scratch.text
+    assert sorted((e["path"], e["status"]) for e in listed_in_scratch.json()["data"]) == [
         ("hello.txt", "modified"),
         ("notes.txt", "created"),
         ("shared.txt", "modified"),
