@@ -30,6 +30,7 @@ import pytest
 
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -393,7 +394,7 @@ async def test_confirmed_completion_corrects_grace_cancelled_dispatch(
 
             # No confirming edge follows, so the grace timer fires and tells the
             # parent the dispatch was cancelled.
-            await asyncio.sleep(0.2)
+            await poll_until_async(lambda: not rig.inbox.empty(), timeout_s=5)
             assert [(item["status"], item["output"]) for item in rig.drained()] == [
                 ("cancelled", "")
             ]
@@ -437,7 +438,7 @@ async def test_confirmed_completion_corrects_drained_grace_cancel(
             )
             assert resp.status_code == 204, resp.text
 
-            await asyncio.sleep(0.2)
+            await poll_until_async(lambda: not rig.inbox.empty(), timeout_s=5)
             cancelled = rig.drained()
             assert [(item["status"], item["output"]) for item in cancelled] == [("cancelled", "")]
 
@@ -489,7 +490,7 @@ async def test_confirmed_stop_blocks_late_completion_after_drain(
             )
             assert resp.status_code == 204, resp.text
 
-            await asyncio.sleep(0.2)
+            await poll_until_async(lambda: not rig.inbox.empty(), timeout_s=5)
             cancelled = rig.drained()
             assert [(item["status"], item["output"]) for item in cancelled] == [("cancelled", "")]
 
