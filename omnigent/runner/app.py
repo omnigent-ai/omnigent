@@ -1838,6 +1838,7 @@ def create_runner_app(
                 ),
             }
             if failure_detail:
+                from omnigent.harnesses.claude_native.bridge import program_status_turn_error
                 from omnigent.harnesses.claude_native.failure_telemetry import (
                     claude_failure_context,
                 )
@@ -1852,7 +1853,8 @@ def create_runner_app(
                 context = normalize_failure_context(raw_context)
                 detail = context.get("native_error_message")
                 if isinstance(detail, str):
-                    event["error"] = {"code": "native_turn_error", "message": detail}
+                    code, message = program_status_turn_error(detail)
+                    event["error"] = {"code": code, "message": message}
                     event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on

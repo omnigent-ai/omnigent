@@ -60,6 +60,7 @@ from omnigent.harnesses.claude_native.bridge import (
     pane_killed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
+    program_status_turn_error,
     read_assistant_text_since,
     read_claude_session_id,
     read_hook_events_from_offset,
@@ -9298,6 +9299,31 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert login.failure_message is not None
     assert login.failure_message.startswith("Login expired · Please run /login\n\n")
     assert "omni setup" in login.failure_message
+
+
+@pytest.mark.parametrize(
+    ("text", "code", "starts_with"),
+    [
+        # Claude's own refusal before any model call: no StopFailure hook follows.
+        ("Prompt is too long", "context_length_exceeded", "Context limit reached"),
+        (
+            "Prompt is too long · the request is ~1070450 tokens (limit 1000000)",
+            "context_length_exceeded",
+            "Context limit reached",
+        ),
+        ("Login expired · Please run /login", "native_turn_error", "Login expired"),
+        ("API Error: 500 upstream failed", "native_turn_error", "API Error: 500 upstream failed"),
+    ],
+)
+def test_program_status_turn_error_matches_stop_failure_guidance(
+    text: str, code: str, starts_with: str
+) -> None:
+    """A terminal-status error reads like the same error from ``StopFailure``."""
+    hook = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "StopFailure", "error_details": text})
+    )
+    assert program_status_turn_error(text) == (code, hook.failure_message)
+    assert program_status_turn_error(text)[1].startswith(starts_with)
 
 
 def test_hook_record_stop_failure_login_guidance_in_managed_sandbox(

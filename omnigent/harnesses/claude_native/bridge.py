@@ -10970,6 +10970,27 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
     return text
 
 
+def program_status_turn_error(text: str) -> tuple[str, str]:
+    """
+    Name the error code and display text for an error Claude reported itself.
+
+    Claude Code refuses a turn whose context is already full before calling
+    the model: it ends the turn with "Prompt is too long" in its terminal
+    status and fires no ``StopFailure`` hook, so that status is the only
+    record of the cause. The text gets the same rewrite as a ``StopFailure``
+    message, and an overflow gets its own code so the failure card describes
+    it instead of a generic turn error.
+
+    :param text: Claude's error text, e.g. ``"Prompt is too long"``.
+    :returns: ``(code, message)``, e.g. ``("context_length_exceeded",
+        "Context limit reached — ...")``; other errors keep
+        ``"native_turn_error"``.
+    """
+    if _CONTEXT_OVERFLOW_RE.match(text.strip()):
+        return "context_length_exceeded", _CONTEXT_OVERFLOW_REPLACEMENT
+    return "native_turn_error", _display_text(text, is_api_error=True)
+
+
 def _stripped_image_placeholder(source: _JsonObject) -> str:
     """
     Build the placeholder text for a stripped inline image block.
