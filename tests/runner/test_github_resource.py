@@ -394,16 +394,22 @@ def test_resolve_pr_via_commit_ignores_same_named_repo_on_another_host(
 
 
 @pytest.mark.parametrize(
-    "base_remote",
-    [pytest.param(None, id="no-base-remote"), pytest.param("upstream", id="no-tracking-ref")],
+    ("base_remote", "lookalike_ref"),
+    [
+        pytest.param(None, None, id="no-base-remote"),
+        pytest.param("upstream", None, id="no-tracking-ref"),
+        pytest.param("upstream", "refs/heads/refs/remotes/upstream/main", id="lookalike-branch"),
+    ],
 )
 def test_resolve_pr_via_commit_keeps_open_pr_without_base_tracking_ref(
-    repo: Path, monkeypatch: pytest.MonkeyPatch, base_remote: str | None
+    repo: Path, monkeypatch: pytest.MonkeyPatch, base_remote: str | None, lookalike_ref: str | None
 ) -> None:
     """Without a local tracking ref of the PR's base branch, an open row is still accepted."""
     _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
     if base_remote:
         _run(["git", "remote", "add", base_remote, "git@github.com:acme/repo.git"], repo)
+    if lookalike_ref:
+        _run(["git", "update-ref", lookalike_ref, "main"], repo)
     _run(["git", "checkout", "-q", "main"], repo)
     row = {
         "number": 270,

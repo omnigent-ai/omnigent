@@ -712,8 +712,12 @@ def _remotes_by_repo(root: str, lookup_remote: str) -> dict[str, list[str]]:
 def _contained_in_base_branch(root: str, sha: str, remotes: Sequence[str], base_ref: str) -> bool:
     """Whether the local tracking ref of ``base_ref`` on any of ``remotes`` contains ``sha``."""
     for remote in remotes:
+        # An exact ref lookup, so a lookalike branch or tag can't stand in for a missing one.
         tracking_ref = f"refs/remotes/{remote}/{base_ref}"
-        rc, _, _ = _git(["merge-base", "--is-ancestor", sha, tracking_ref], cwd=root)
+        rc, tracking_oid, _ = _git(["show-ref", "--verify", "--hash", tracking_ref], cwd=root)
+        if rc != 0:
+            continue
+        rc, _, _ = _git(["merge-base", "--is-ancestor", sha, tracking_oid.strip()], cwd=root)
         if rc == 0:
             return True
     return False
