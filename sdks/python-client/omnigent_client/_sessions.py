@@ -44,8 +44,10 @@ from ._types import PaginatedList
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
 # rollup, the CLI ``↓`` tree, and the web Agents rail all walk the same depth.
 _DEFAULT_SUBTREE_DEPTH = 3
-# Rows asked for in one ``descendants=true`` request (the server's page cap).
+# Rows asked for per ``descendants=true`` page (the server's page cap), and the
+# deepest tree the server returns that way; deeper walks go level by level.
 _DESCENDANTS_LIMIT = 1000
+_DESCENDANTS_MAX_DEPTH = 10
 
 # Adapter that validates a single SSE ``data:`` payload against the
 # typed discriminated union. Built once at module load — TypeAdapter
@@ -1065,11 +1067,12 @@ class SessionsNamespace:
     ) -> builtins.list[dict[str, Any]]:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
-        Asks the server for the whole subtree in one request
-        (``descendants=true``). A server without that, or a subtree too big
-        for one response, falls back to recursing :meth:`child_sessions`
-        breadth-first, mirroring web's ``useChildSessions`` per-node fetch;
-        the first response is then reused as the first level.
+        Asks the server for the whole subtree (``descendants=true``, paged).
+        A server without that, or a spawn tree too big for it, answers with
+        one level instead; that page is reused as the first level of a
+        breadth-first walk of :meth:`child_sessions`, mirroring web's
+        ``useChildSessions`` per-node fetch. Either way the result is what
+        that walk returns, including *limit* children per parent.
         Each returned row is the raw ``ChildSessionSummary`` dict with an added
         ``parent_id`` recording the session it was queried under, so callers can
         reconstruct the hierarchy. *session_id* itself is not included.
@@ -1086,18 +1089,13 @@ class SessionsNamespace:
         :raises OmnigentError: On non-2xx status (404 when the session does not
             exist).
         """
-        first = await self.child_sessions(
-            session_id,
-            limit=_DESCENDANTS_LIMIT,
-            descendants=True,
-            max_depth=max_depth,
-        )
-        rows = [row for row in first.data if isinstance(row, dict)]
-        if rows and not first.has_more and all(row.get("depth") is not None for row in rows):
-            return [{**row, "parent_id": row.get("parent_session_id")} for row in rows]
-        if rows and rows[0].get("depth") is not None:
-            # The subtree did not fit in one response; walk it level by level.
-            first = await self.child_sessions(session_id, limit=limit)
+        if max_depth <= 0:
+            return []
+        first: PaginatedList | None = None
+        if max_depth <= _DESCENDANTS_MAX_DEPTH:
+            rows, first = await _descendant_rows(self, session_id, max_depth)
+            if rows is not None:
+                return _limit_children_per_parent(rows, session_id, limit)
         nodes: list[dict[str, Any]] = []
         seen: set[str] = {session_id}
         frontier: list[str] = [session_id]
@@ -1105,7 +1103,12 @@ class SessionsNamespace:
         while frontier and depth < max_depth:
             next_frontier: list[str] = []
             for parent_id in frontier:
-                page = first if depth == 0 else await self.child_sessions(parent_id, limit=limit)
+                if depth == 0 and first is not None:
+                    # An older server answered the descendants request with
+                    # this level; reuse it rather than asking again.
+                    page = PaginatedList(data=first.data[:limit], has_more=first.has_more)
+                else:
+                    page = await self.child_sessions(parent_id, limit=limit)
                 for row in page.data:
                     if not isinstance(row, dict):
                         continue
@@ -1492,3 +1495,62 @@ def _try_parse_envelope(raw: str) -> ServerStreamEvent | None:
         # event in arrival order.
         _log.debug("Skipping unparseable session event: %s (%s)", raw[:200], exc)
         return None
+
+
+def _limit_children_per_parent(
+    rows: list[dict[str, Any]], root_id: str, limit: int
+) -> list[dict[str, Any]]:
+    """Keep what a level-by-level walk with page size *limit* would have seen.
+
+    The walk reads the first *limit* children of each node (newest first),
+    so it never reaches children it did not read or anything below them.
+
+    :param rows: Breadth-first ``descendants=true`` rows.
+    :param root_id: Session the subtree hangs off.
+    :param limit: Children kept per parent.
+    :returns: Kept rows, each with ``parent_id`` set to its parent.
+    """
+    reached = {root_id}
+    kept_per_parent: dict[str, int] = {}
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        parent_id, child_id = row.get("parent_session_id"), row.get("id")
+        if parent_id not in reached or not isinstance(child_id, str):
+            continue
+        if kept_per_parent.get(parent_id, 0) >= limit:
+            continue
+        kept_per_parent[parent_id] = kept_per_parent.get(parent_id, 0) + 1
+        reached.add(child_id)
+        kept.append({**row, "parent_id": parent_id})
+    return kept
+
+
+async def _descendant_rows(
+    sessions: SessionsNamespace, session_id: str, max_depth: int
+) -> tuple[list[dict[str, Any]] | None, PaginatedList | None]:
+    """Read the subtree with ``descendants=true``, following its pages.
+
+    :param sessions: Namespace whose :meth:`~SessionsNamespace.child_sessions` is read.
+    :param session_id: Root parent session identifier.
+    :param max_depth: Levels to return.
+    :returns: ``(rows, None)`` when the server returned the subtree, or
+        ``(None, page)`` when it answered with one level instead (a
+        server without the flag, or a tree too big for it), so the caller
+        walks levels starting from *page*.
+    """
+    page = await sessions.child_sessions(
+        session_id, limit=_DESCENDANTS_LIMIT, descendants=True, max_depth=max_depth
+    )
+    rows = [row for row in page.data if isinstance(row, dict)]
+    if any(row.get("depth") is None for row in rows):
+        return None, page
+    while page.has_more and page.last_id:
+        page = await sessions.child_sessions(
+            session_id,
+            limit=_DESCENDANTS_LIMIT,
+            after=page.last_id,
+            descendants=True,
+            max_depth=max_depth,
+        )
+        rows.extend(row for row in page.data if isinstance(row, dict))
+    return rows, None

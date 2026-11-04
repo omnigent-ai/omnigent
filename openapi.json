@@ -15284,7 +15284,7 @@
             }
           },
           {
-            "description": "Return the whole subtree down to *max_depth* in one response instead of one level, so a client drawing the sub-agent tree makes one request rather than one per node. Rows come breadth-first, each parent's children newest-first (the order a per-level walk sees), with `parent_session_id` set to the row's own parent and `depth` set. *limit* caps the total rows; `has_more` means the subtree was cut off. Cursors and the title filters do not apply.",
+            "description": "Return the whole subtree down to *max_depth* in one response instead of one level, so a client drawing the sub-agent tree makes one request rather than one per node. Rows come breadth-first, each parent's children newest-first (the order a per-level walk sees), with `parent_session_id` set to the row's own parent and `depth` set. *limit* and *after* page through that order. A spawn tree of more than 2000 sub-agents gets the one-level listing instead (rows without `depth`), as from a server without this flag. *before*, *order* and the title filters do not apply.",
             "in": "query",
             "name": "descendants",
             "required": false,

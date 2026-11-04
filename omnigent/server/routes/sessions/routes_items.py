@@ -11,6 +11,7 @@ from fastapi import (
 )
 
 from omnigent.entities import Conversation
+from omnigent.errors import StaleCursorError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -52,10 +53,9 @@ from omnigent.stores.permission_store import PermissionStore
 # Agents rail; the cap bounds the in-memory walk.
 _DEFAULT_DESCENDANT_DEPTH = 3
 _MAX_DESCENDANT_DEPTH = 10
-# A spawn tree is read in pages of this size, up to the cap; a bigger tree
-# answers ``has_more`` so the client falls back to walking one level at a time.
-_SPAWN_TREE_PAGE_SIZE = 500
-_SPAWN_TREE_SCAN_CAP = 5000
+# ``?descendants=true`` reads at most this many sub-agents of one spawn tree;
+# a bigger tree gets the one-level listing instead, which clients walk.
+_SPAWN_TREE_READ_CAP = 2000
 
 
 def register_items_routes(
@@ -181,9 +181,11 @@ def register_items_routes(
             sub-agent tree makes one request rather than one per node.
             Rows come breadth-first, each parent's children newest-first
             (the order a per-level walk sees), with ``parent_session_id``
-            set to the row's own parent and ``depth`` set. *limit* caps
-            the total rows; ``has_more`` means the subtree was cut off.
-            Cursors and the title filters do not apply.
+            set to the row's own parent and ``depth`` set. *limit* and
+            *after* page through that order. A spawn tree of more than
+            2000 sub-agents gets the one-level listing instead (rows without
+            ``depth``), as from a server without this flag. *before*,
+            *order* and the title filters do not apply.
         :param max_depth: Levels to return with *descendants*, ``1`` for
             direct children only.
         :returns: A :class:`PaginatedList` of
@@ -202,7 +204,11 @@ def register_items_routes(
         if parent is None:
             raise _session_not_found()
         if descendants:
-            return await _list_descendant_sessions(parent, limit=limit, max_depth=max_depth)
+            subtree = await _list_descendant_sessions(
+                parent, limit=limit, after=after, max_depth=max_depth
+            )
+            if subtree is not None:
+                return subtree
         title_filter: str | None = None
         if tool and session_name:
             title_filter = f"{tool}:{session_name}"
@@ -230,27 +236,42 @@ def register_items_routes(
         )
 
     async def _list_descendant_sessions(
-        parent: Conversation, *, limit: int, max_depth: int
-    ) -> PaginatedList:
-        """Return *parent*'s sub-agent subtree, breadth-first, from one tree scan.
+        parent: Conversation, *, limit: int, after: str | None, max_depth: int
+    ) -> PaginatedList | None:
+        """Return a page of *parent*'s sub-agent subtree, breadth-first.
 
-        Every sub-agent records the root of its spawn tree, so one query
-        reads the whole tree and the subtree is cut out in memory. READ on
-        *parent* covers its descendants: a sub-agent's access is its
-        parent chain's.
+        Every sub-agent records the root of its spawn tree, so one bounded
+        read in index order returns the whole tree and the subtree is cut out
+        in memory. READ on *parent* covers its descendants: a sub-agent's
+        access is its parent chain's.
 
         :param parent: The session the caller was authorized on.
-        :param limit: Maximum rows to return.
+        :param limit: Maximum rows in the page.
+        :param after: Id of the last row of the previous page, or ``None``.
         :param max_depth: Levels below *parent* to include.
-        :returns: The subtree's summaries with ``depth`` set.
+        :returns: The page with ``depth`` set, or ``None`` when the spawn tree
+            is too big for one read, in which case the caller answers with
+            the one-level listing a server without ``descendants`` gives.
+        :raises StaleCursorError: If *after* is not a row of the subtree.
         """
-        rows, truncated = await asyncio.to_thread(
-            _scan_spawn_tree, parent.root_conversation_id or parent.id
+        page = await asyncio.to_thread(
+            conversation_store.list_conversations,
+            limit=_SPAWN_TREE_READ_CAP + 1,
+            kind="sub_agent",
+            root_conversation_id=parent.root_conversation_id or parent.id,
+            order="asc",
+            # Index order, so the read examines at most the cap; siblings
+            # are ordered newest-first below.
+            sort_by="id",
         )
+        if page.has_more or len(page.data) > _SPAWN_TREE_READ_CAP:
+            return None
         children_of: dict[str, list[Conversation]] = {}
-        for row in rows:
+        for row in page.data:
             if row.parent_conversation_id:
                 children_of.setdefault(row.parent_conversation_id, []).append(row)
+        for siblings in children_of.values():
+            siblings.sort(key=lambda c: (c.created_at, c.id), reverse=True)
         ordered: list[Conversation] = []
         depths: dict[str, int] = {}
         parent_ids: dict[str, str] = {}
@@ -270,39 +291,20 @@ def register_items_routes(
                     parent_ids[child.id] = node_id
                     next_frontier.append(child.id)
             frontier = next_frontier
-        has_more = truncated or len(ordered) > limit
-        ordered = ordered[:limit]
+        start = 0
+        if after is not None:
+            position = next((i for i, c in enumerate(ordered) if c.id == after), None)
+            if position is None:
+                raise StaleCursorError(after)
+            start = position + 1
+        window = ordered[start : start + limit]
         summaries = await _child_session_summaries_from_conversations(
-            ordered, parent.id, conversation_store, parent_ids=parent_ids
+            window, parent.id, conversation_store, parent_ids=parent_ids
         )
         data = [s.model_copy(update={"depth": depths[s.id]}) for s in summaries]
         return PaginatedList(
             data=data,
             first_id=data[0].id if data else None,
             last_id=data[-1].id if data else None,
-            has_more=has_more,
+            has_more=start + limit < len(ordered),
         )
-
-    def _scan_spawn_tree(root_id: str) -> tuple[list[Conversation], bool]:
-        """Read every sub-agent of one spawn tree, newest first, up to a cap.
-
-        :param root_id: Root conversation of the spawn tree.
-        :returns: The rows, and whether the cap cut the scan short.
-        """
-        rows: list[Conversation] = []
-        after: str | None = None
-        while True:
-            page = conversation_store.list_conversations(
-                limit=_SPAWN_TREE_PAGE_SIZE,
-                after=after,
-                kind="sub_agent",
-                root_conversation_id=root_id,
-                order="desc",
-                sort_by="created_at",
-            )
-            rows.extend(page.data)
-            if not page.has_more or not page.data:
-                return rows, False
-            if len(rows) >= _SPAWN_TREE_SCAN_CAP:
-                return rows, True
-            after = page.last_id

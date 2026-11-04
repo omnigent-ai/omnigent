@@ -2713,7 +2713,12 @@ async def test_child_sessions_descendants_returns_the_subtree_in_walk_order(
     body = resp.json()
 
     rows = [(row["id"], row["parent_session_id"]) for row in body["data"]]
-    assert rows == await _walk_levels(client, session["id"], 3)
+    assert sorted(rows) == sorted(await _walk_levels(client, session["id"], 3))
+    # Breadth-first, and each parent's children newest first, as a walk reads them.
+    assert [row["depth"] for row in body["data"]] == sorted(row["depth"] for row in body["data"])
+    for parent_id in {row["parent_session_id"] for row in body["data"]}:
+        created = [r["created_at"] for r in body["data"] if r["parent_session_id"] == parent_id]
+        assert created == sorted(created, reverse=True)
     depths = {row["id"]: row["depth"] for row in body["data"]}
     # a3 is four levels down, past the default depth of 3.
     assert depths == {ids["a"]: 1, ids["b"]: 1, ids["a1"]: 2, ids["a2"]: 3}
@@ -2758,6 +2763,66 @@ async def test_child_sessions_descendants_honours_max_depth_and_limit(
     cut = (await client.get(url, params={"descendants": "true", "limit": 2})).json()
     assert len(cut["data"]) == 2
     assert cut["has_more"] is True
+
+
+async def test_child_sessions_descendants_pages_with_after(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``after=<last_id>`` continues a cut-off subtree with no repeats or gaps."""
+    session = await _create_parent_session(client)
+    _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+    url = f"/v1/sessions/{session['id']}/child_sessions"
+    whole = (await client.get(url, params={"descendants": "true"})).json()["data"]
+
+    paged: list[dict[str, Any]] = []
+    params: dict[str, Any] = {"descendants": "true", "limit": 2}
+    for _ in range(10):
+        page = (await client.get(url, params=params)).json()
+        paged.extend(page["data"])
+        if not page["has_more"]:
+            break
+        params["after"] = page["last_id"]
+
+    assert [row["id"] for row in paged] == [row["id"] for row in whole]
+
+
+async def test_child_sessions_descendants_rejects_a_cursor_outside_the_subtree(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session = await _create_parent_session(client)
+    _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/child_sessions",
+        params={"descendants": "true", "after": "ad563e906854634c49e1a6fd2fbb31d4"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "stale_cursor"
+
+
+async def test_child_sessions_descendants_too_big_answers_one_level(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawn tree past the read cap gets the plain one-level listing, which
+    clients already walk, instead of a partial tree."""
+    from omnigent.server.routes.sessions import routes_items
+
+    monkeypatch.setattr(routes_items, "_SPAWN_TREE_READ_CAP", 2)
+    session = await _create_parent_session(client)
+    ids = _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+    url = f"/v1/sessions/{session['id']}/child_sessions"
+
+    capped = (await client.get(url, params={"descendants": "true"})).json()
+    plain = (await client.get(url)).json()
+
+    assert capped == plain
+    assert {row["id"] for row in capped["data"]} == {ids["a"], ids["b"]}
+    assert all(row["depth"] is None for row in capped["data"])
 
 
 async def test_child_sessions_descendants_ignores_other_trees(

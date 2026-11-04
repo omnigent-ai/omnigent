@@ -1200,7 +1200,8 @@ def _tree_handler(
         # …/v1/sessions/<id>/child_sessions
         assert parts[-1] == "child_sessions"
         parent_id = parts[-2]
-        return httpx.Response(200, json={"data": tree.get(parent_id, [])})
+        limit = int(request.url.params.get("limit", "100"))
+        return httpx.Response(200, json={"data": tree.get(parent_id, [])[:limit]})
 
     return handler
 
@@ -1272,7 +1273,7 @@ def _counting_tree_handler(
     tree: dict[str, list[dict[str, Any]]],
     requests: list[httpx.Request],
     *,
-    descendants: Callable[[str, int], dict[str, Any]] | None = None,
+    descendants: Callable[[str, httpx.QueryParams], dict[str, Any]] | None = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
     """Like :func:`_tree_handler`, recording requests and optionally serving
     ``descendants=true`` the way a server that supports it does.
@@ -1280,7 +1281,7 @@ def _counting_tree_handler(
     :param tree: Parent id → its direct children.
     :param requests: Receives every request, in order.
     :param descendants: Builds the ``descendants=true`` body from the parent
-        id and ``limit``; ``None`` ignores the flag like an older server.
+        id and query; ``None`` ignores the flag like an older server.
     """
     per_level = _tree_handler(tree)
 
@@ -1288,20 +1289,25 @@ def _counting_tree_handler(
         requests.append(request)
         if descendants is not None and request.url.params.get("descendants") == "true":
             parent_id = request.url.path.split("/")[-2]
-            limit = int(request.url.params["limit"])
-            return httpx.Response(200, json=descendants(parent_id, limit))
+            return httpx.Response(200, json=descendants(parent_id, request.url.params))
         return per_level(request)
 
     return handler
 
 
 def _descendants_body(
-    tree: dict[str, list[dict[str, Any]]], parent_id: str, limit: int
+    tree: dict[str, list[dict[str, Any]]],
+    parent_id: str,
+    params: httpx.QueryParams,
+    *,
+    page_size: int = 1000,
 ) -> dict[str, Any]:
-    """The breadth-first ``descendants=true`` body for *tree* below *parent_id*."""
+    """One page of the breadth-first ``descendants=true`` body for *tree*,
+    honouring ``max_depth``, ``limit`` and ``after`` like the server."""
+    max_depth = int(params.get("max_depth", "3"))
     rows: list[dict[str, Any]] = []
     frontier, depth = [parent_id], 0
-    while frontier:
+    while frontier and depth < max_depth:
         depth += 1
         nxt: list[str] = []
         for node in frontier:
@@ -1309,7 +1315,16 @@ def _descendants_body(
                 rows.append({**row, "parent_session_id": node, "depth": depth})
                 nxt.append(row["id"])
         frontier = nxt
-    return {"data": rows[:limit], "has_more": len(rows) > limit}
+    start = 0
+    if "after" in params:
+        start = [r["id"] for r in rows].index(params["after"]) + 1
+    size = min(int(params["limit"]), page_size)
+    page = rows[start : start + size]
+    return {
+        "data": page,
+        "last_id": page[-1]["id"] if page else None,
+        "has_more": start + size < len(rows),
+    }
 
 
 _DEEP_TREE = {
@@ -1329,7 +1344,7 @@ async def test_child_sessions_tree_uses_one_request_when_the_server_returns_desc
     handler = _counting_tree_handler(
         _DEEP_TREE,
         requests,
-        descendants=lambda parent, limit: _descendants_body(_DEEP_TREE, parent, limit),
+        descendants=lambda parent, params: _descendants_body(_DEEP_TREE, parent, params),
     )
     ns, client = _make_namespace(handler)
     try:
@@ -1370,13 +1385,15 @@ async def test_child_sessions_tree_reuses_the_first_page_on_an_older_server() ->
 
 
 @pytest.mark.asyncio
-async def test_child_sessions_tree_walks_levels_when_the_subtree_is_cut_off() -> None:
-    """A subtree too big for one response falls back to the per-level walk."""
+async def test_child_sessions_tree_follows_descendant_pages() -> None:
+    """A subtree longer than one server page is read by following ``after``."""
     requests: list[httpx.Request] = []
     handler = _counting_tree_handler(
         _DEEP_TREE,
         requests,
-        descendants=lambda parent, limit: _descendants_body(_DEEP_TREE, parent, 2),
+        descendants=lambda parent, params: _descendants_body(
+            _DEEP_TREE, parent, params, page_size=2
+        ),
     )
     ns, client = _make_namespace(handler)
     try:
@@ -1384,9 +1401,78 @@ async def test_child_sessions_tree_walks_levels_when_the_subtree_is_cut_off() ->
     finally:
         await client.aclose()
 
-    assert {n["id"] for n in nodes} == {"a", "b", "a1", "a1x"}
-    assert requests[0].url.params["descendants"] == "true"
-    assert all("descendants" not in r.url.params for r in requests[1:])
+    assert [n["id"] for n in nodes] == ["a", "b", "a1", "a1x"]
+    assert [r.url.params.get("after") for r in requests] == [None, "b"]
+    assert all(r.url.params["descendants"] == "true" for r in requests)
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_walks_when_the_server_answers_one_level() -> None:
+    """A spawn tree too big for one read gets a one-level answer (no ``depth``),
+    like an older server's; it becomes the walk's first level."""
+    requests: list[httpx.Request] = []
+    handler = _counting_tree_handler(
+        _DEEP_TREE, requests, descendants=lambda parent, params: {"data": _DEEP_TREE[parent]}
+    )
+    ns, client = _make_namespace(handler)
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in nodes] == ["a", "b", "a1", "a1x"]
+    assert [r.url.path.split("/")[-2] for r in requests] == ["root", "a", "b", "a1"]
+
+
+_WIDE_TREE = {
+    "root": [_child("a"), _child("b")],
+    "a": [_child("a1"), _child("a2")],
+    "b": [_child("b1")],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_has_descendants", [True, False])
+async def test_child_sessions_tree_keeps_limit_children_per_parent(
+    server_has_descendants: bool,
+) -> None:
+    """``limit`` still caps each parent's children, and nothing below a child
+    it cut is returned, whichever way the server answers."""
+    descendants = (
+        (lambda parent, params: _descendants_body(_WIDE_TREE, parent, params))
+        if server_has_descendants
+        else None
+    )
+    ns, client = _make_namespace(_counting_tree_handler(_WIDE_TREE, [], descendants=descendants))
+    try:
+        one_level = await ns.child_sessions_tree("root", limit=1, max_depth=1)
+        nested = await ns.child_sessions_tree("root", limit=1)
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in one_level] == ["a"]
+    assert [(n["id"], n["parent_id"]) for n in nested] == [("a", "root"), ("a1", "a")]
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_depth_bounds() -> None:
+    """Depth 0 sends nothing; a depth past the server's batch limit walks levels."""
+    requests: list[httpx.Request] = []
+    handler = _counting_tree_handler(
+        _DEEP_TREE,
+        requests,
+        descendants=lambda parent, params: _descendants_body(_DEEP_TREE, parent, params),
+    )
+    ns, client = _make_namespace(handler)
+    try:
+        assert await ns.child_sessions_tree("root", max_depth=0) == []
+        assert requests == []
+        deep = await ns.child_sessions_tree("root", max_depth=11)
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in deep] == ["a", "b", "a1", "a1x"]
+    assert all("descendants" not in r.url.params for r in requests)
 
 
 @pytest.mark.asyncio

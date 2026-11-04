@@ -9299,3 +9299,39 @@ def test_profiled_host_binding_rejects_stale_rollback_state(conversation_store, 
             expected_binding=previous,
         )
     assert conversation_store.get_profile_host_binding(conversation.id) == current
+
+
+def test_list_conversations_sort_by_id_pages_a_spawn_tree_in_id_order(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``sort_by="id"`` orders one spawn tree by id, the order of the
+    ``(workspace_id, root_conversation_id, id)`` index, so a capped read of
+    the tree examines at most the cap; cursors page through it."""
+    root = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id
+    )
+    grandchildren = [
+        conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=child.id)
+        for _ in range(3)
+    ]
+    other = conversation_store.create_conversation()
+    conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=other.id)
+    expected = sorted([child.id, *(g.id for g in grandchildren)])
+
+    first = conversation_store.list_conversations(
+        limit=2, kind="sub_agent", root_conversation_id=root.id, order="asc", sort_by="id"
+    )
+    rest = conversation_store.list_conversations(
+        limit=10,
+        after=first.last_id,
+        kind="sub_agent",
+        root_conversation_id=root.id,
+        order="asc",
+        sort_by="id",
+    )
+
+    assert [c.id for c in first.data] == expected[:2]
+    assert first.has_more is True
+    assert [c.id for c in rest.data] == expected[2:]
+    assert rest.has_more is False

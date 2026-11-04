@@ -3045,8 +3045,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``. Powers ``GET /v1/sessions`` — sessions
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"``
-            or ``"updated_at"``.
+        :param sort_by: Column to sort on, ``"created_at"``,
+            ``"updated_at"``, or ``"id"``.
         :param search_query: Case-insensitive substring filter on
             the session title OR conversation item content.
             ``None`` or empty string disables the filter;
@@ -3515,12 +3515,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise StaleCursorError(cursor_id)
 
     @staticmethod
-    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
+    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[Any]:
         """
         Map a ``sort_by`` string to the corresponding
         :class:`SqlConversation` column.
 
-        :param sort_by: ``"created_at"`` or ``"updated_at"``.
+        :param sort_by: ``"created_at"``, ``"updated_at"``, or ``"id"``
+            (index order, for bounded reads of one spawn tree).
         :returns: The mapped column attribute.
         :raises ValueError: If ``sort_by`` is not a valid column
             name.
@@ -3528,6 +3529,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         allowed = {
             "created_at": SqlConversation.created_at,
             "updated_at": SqlConversation.updated_at,
+            "id": SqlConversation.id,
         }
         col = allowed.get(sort_by)
         if col is None:
@@ -3539,7 +3541,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         session: Session,
         stmt: Select[tuple[SqlConversation]],
         cursor_id: str,
-        sort_col: QueryableAttribute[int],
+        sort_col: QueryableAttribute[Any],
         is_desc: bool,
         tiebreaker_col: ColumnElement[Any],
         forward: bool,

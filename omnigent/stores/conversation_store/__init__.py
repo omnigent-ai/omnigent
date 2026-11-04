@@ -969,7 +969,9 @@ class ConversationStore(ABC):
             list endpoint.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+            ``"updated_at"``, or ``"id"`` for index order, which bounds the
+            rows a ``root_conversation_id`` read examines. A store without
+            an ``id`` order may fall back to ``"created_at"``.
         :param search_query: Case-insensitive substring filter on
             the conversation title OR conversation item content
             (``search_text``). ``None`` or empty string disables
