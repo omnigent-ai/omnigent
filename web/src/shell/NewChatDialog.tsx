@@ -6925,7 +6925,7 @@ function NewChatLandingContent({
           {siblingSourceId || isMobileViewport || selectedProject || heading ? (
             <h1 className="min-w-0 break-words text-center text-[28px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
               {siblingSourceId
-                ? "Add an agent"
+                ? "Add nested agent"
                 : isMobileViewport
                   ? "Start a new session in"
                   : selectedProject || heading}

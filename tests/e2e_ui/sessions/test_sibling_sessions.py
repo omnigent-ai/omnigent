@@ -79,9 +79,11 @@ async def _drive(rig: ManagedReplicas) -> None:
                         await row.hover()
                         await row.get_by_test_id("conversation-actions").click()
                         await page.screenshot(path=str(evidence / "add-agent-menu.png"))
-                        await page.get_by_test_id("add-sibling-session").click()
+                        await page.get_by_role(
+                            "menuitem", name="Add nested agent", exact=True
+                        ).click()
                         await expect(
-                            page.get_by_role("heading", name="Add an agent", exact=True)
+                            page.get_by_role("heading", name="Add nested agent", exact=True)
                         ).to_be_visible()
                         await expect(
                             page.get_by_test_id("new-chat-landing-host-chip")
@@ -154,7 +156,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                     row = page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
                     await row.hover()
                     await row.get_by_test_id("conversation-actions").click()
-                    await page.get_by_test_id("add-sibling-session").click()
+                    await page.get_by_role("menuitem", name="Add nested agent", exact=True).click()
                     await page.get_by_test_id("new-chat-landing-host-chip").click()
                     hosts = (await client.get(f"{rig.a}/v1/hosts")).json()["hosts"]
                     names = {host["host_id"]: host["name"] for host in hosts}
@@ -295,11 +297,11 @@ async def _drive(rig: ManagedReplicas) -> None:
                     await page.locator(f'li[data-sidebar-session-id="{sibling_id}"]').first.click(
                         button="right"
                     )
-                    await page.get_by_test_id("add-sibling-session").click()
+                    await page.get_by_role("menuitem", name="Add nested agent", exact=True).click()
                     await expect(page.get_by_test_id("sibling-composer-context")).to_be_visible()
                     await page.goto(f"{rig.ui}/c/{sibling_id}")
                     await page.get_by_test_id("header-conversation-actions").click()
-                    await page.get_by_test_id("add-sibling-session").click()
+                    await page.get_by_role("menuitem", name="Add nested agent", exact=True).click()
                     await expect(page.get_by_test_id("sibling-composer-context")).to_be_visible()
                     async with async_user_page(
                         browser,
@@ -312,7 +314,9 @@ async def _drive(rig: ManagedReplicas) -> None:
                     ) as phone:
                         await phone.goto(f"{rig.ui}/c/{sibling_id}")
                         await phone.get_by_test_id("header-conversation-actions").click()
-                        await phone.get_by_test_id("add-sibling-session").click()
+                        await phone.get_by_role(
+                            "menuitem", name="Add nested agent", exact=True
+                        ).click()
                         await expect(
                             phone.get_by_test_id("sibling-composer-context")
                         ).to_be_visible()
@@ -344,7 +348,9 @@ async def _drive(rig: ManagedReplicas) -> None:
                             "Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []}
                         )
                         await phone.screenshot(path=str(evidence / "mobile-add-agent-menu.png"))
-                        await phone.get_by_test_id("add-sibling-session").click()
+                        await phone.get_by_role(
+                            "menuitem", name="Add nested agent", exact=True
+                        ).click()
                         await expect(
                             phone.get_by_test_id("sibling-composer-context")
                         ).to_contain_text("Implement the client")

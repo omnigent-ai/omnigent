@@ -4630,7 +4630,7 @@ function ConversationMenuItems({
         <C.Item asChild data-testid="add-sibling-session">
           <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
             <PlusIcon className="size-3.5" />
-            Add Agent
+            Add nested agent
           </Link>
         </C.Item>
       )}

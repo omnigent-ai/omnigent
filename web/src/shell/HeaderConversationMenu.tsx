@@ -373,7 +373,7 @@ export function HeaderConversationMenu({
           onSelect={() => navigate(addAgentPath)}
         >
           <PlusIcon className="size-3.5" />
-          Add Agent
+          Add nested agent
         </DropdownMenuItem>
       )}
       <DropdownMenuItem

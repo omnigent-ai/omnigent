@@ -22,7 +22,7 @@ Coordinator                      sandbox 1
 The first seven items transcribe the whiteboard with the subsequent clarifications.
 
 1. Creating a sibling from any member adds a peer to the same family. Nesting
-   stays one level deep. The menu action is **Add Agent**.
+   stays one level deep. The menu action and composer heading are **Add nested agent**.
 2. Archiving/deleting the representative promotes the oldest active member;
    it does not stop or delete the other members. Restoring an older member
    restores its position. The original source wins same-second creation ties,
