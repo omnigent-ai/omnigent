@@ -39,6 +39,7 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import routes_core, routes_events
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
@@ -740,6 +741,7 @@ async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize
         (200, "none", 503, "runner is offline"),
         (200, "editor", 403, ""),
         (200, "sub_agent", 400, "only available in a top-level session"),
+        (200, "side_chat", 400, "isn't available in a side chat"),
     ],
 )
 async def test_claude_sdk_clear_refusals_create_no_session(
@@ -755,7 +757,7 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     """A refused ``clear`` creates, initializes and supersedes nothing.
 
     A busy, failing or unreachable runner, a running turn or one still
-    reaching its runner, no placement, a non-owner or a sub-agent refuses it.
+    reaching its runner, no placement, a non-owner, a sub-agent or a side chat refuses it.
     The caller and session checks run before the runner frees the client, so
     only a runner refusal reaches the runner.
     """
@@ -815,6 +817,15 @@ async def test_claude_sdk_clear_refusals_create_no_session(
         store.replace_runner_id(child.id, _RUNNER_ID)
         SqlAlchemyPermissionStore(db_uri).grant(_OWNER, child.id, LEVEL_OWNER)
         source_id = child.id
+    elif placement == "side_chat":
+        # A side chat rides its source's runner and has no host of its own.
+        side_chat = store.create_conversation(
+            agent_id=store.get_conversation(source_id).agent_id,
+            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source_id},
+        )
+        store.replace_runner_id(side_chat.id, _RUNNER_ID)
+        SqlAlchemyPermissionStore(db_uri).grant(_OWNER, side_chat.id, LEVEL_OWNER)
+        source_id = side_chat.id
     headers = {"X-Forwarded-Email": caller}
     before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
     posts_before = len(auth_live_runner.posts)

@@ -4609,7 +4609,7 @@ def register_core_routes(
             source's items or files; *before_item_id* must then be ``None``.
         :returns: The fork's session id.
         :raises OmnigentError: When the caller does not own *source*, it is a
-            sub-agent or running a turn, or no runner or host can take the fork;
+            sub-agent, a side chat or running a turn, or no runner or host can take the fork;
             ``WRONG_REPLICA`` when its runner is live on another replica.
         """
         user_id = _get_user_id(request, auth_provider)
@@ -4619,6 +4619,13 @@ def register_core_routes(
         if source.kind == "sub_agent":
             raise OmnigentError(
                 f"{command} is only available in a top-level session.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # A side chat rides its source's runner with no host of its own, so a
+        # fork (which drops the side-chat labels) would have no placement.
+        if source.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+            raise OmnigentError(
+                f"{command} isn't available in a side chat.",
                 code=ErrorCode.INVALID_INPUT,
             )
         if _session_is_moving(source.id):
