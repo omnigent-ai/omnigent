@@ -258,11 +258,13 @@
   }
 
   // Capture runs before the page's own handlers, so the next frame judges whether they
-  // consumed the input; a Ctrl+wheel is a pinch or zoom gesture, not a scroll.
+  // consumed the input; a Ctrl+wheel or a multi-touch move is a pinch, not a scroll.
   function onRestoreInput(e) {
     const scrollKey =
       SCROLL_KEYS.indexOf(e.key) !== -1 && !isEditableTarget(e.target) && !spaceActivates(e);
-    const pinch = e.type === "wheel" && e.ctrlKey;
+    const pinch =
+      (e.type === "wheel" && e.ctrlKey) ||
+      (e.type === "touchmove" && !!e.touches && e.touches.length > 1);
     if (e.type === "keydown" ? scrollKey : !pinch) scrollRestore.inputs.push(e);
   }
 

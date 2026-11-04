@@ -530,6 +530,13 @@ describe("bridge runtime scroll position", () => {
 
   const dispatchToPage = (event: Event) => document.body.dispatchEvent(event);
 
+  /** A `touchmove` with `fingers` points of contact. */
+  function touchMove(fingers: number) {
+    const move = new Event("touchmove", { bubbles: true });
+    Object.defineProperty(move, "touches", { value: Array.from({ length: fingers }, () => ({})) });
+    return move;
+  }
+
   /** Press `key` on a focused element of the page, as a reader would. */
   function pressIn(focused: HTMLElement, key: string) {
     document.body.append(focused);
@@ -557,7 +564,7 @@ describe("bridge runtime scroll position", () => {
 
   it.each<[string, (userScrollTo: (top: number) => void) => void]>([
     ["the wheel", () => dispatchToPage(new Event("wheel", { bubbles: true }))],
-    ["a touch drag", () => dispatchToPage(new Event("touchmove", { bubbles: true }))],
+    ["a touch drag", () => dispatchToPage(touchMove(1))],
     [
       "a scroll key",
       () => dispatchToPage(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true })),
@@ -612,7 +619,11 @@ describe("bridge runtime scroll position", () => {
     ["an arrow key in editable text", () => pressIn(editableText(), "ArrowDown")],
     ["a space on a focused button", () => pressIn(document.createElement("button"), " ")],
     ["a space on a <summary>", () => pressIn(document.createElement("summary"), " ")],
-    ["a pinch", () => dispatchToPage(new WheelEvent("wheel", { ctrlKey: true, bubbles: true }))],
+    [
+      "a trackpad pinch",
+      () => dispatchToPage(new WheelEvent("wheel", { ctrlKey: true, bubbles: true })),
+    ],
+    ["a two-finger pinch", () => dispatchToPage(touchMove(2))],
     [
       "a scroll key the page handles",
       () => handledByPage(new KeyboardEvent("keydown", { key: "PageDown", ...cancelable })),
