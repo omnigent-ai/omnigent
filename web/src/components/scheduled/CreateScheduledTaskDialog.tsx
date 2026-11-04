@@ -667,13 +667,13 @@ export function CreateScheduledTaskDialog({
             />
           </div>
 
-          {sessionModesSupported && (
+          {/* A trigger needs its one kept session, so its form leaves the choice out. */}
+          {sessionModesSupported && trigger === null && (
             <div className="flex flex-col gap-1.5" data-testid="task-session-mode-field">
               <Label htmlFor="task-session-mode">Session</Label>
               <Select
                 value={sessionMode}
                 componentId="tasks.scheduled.session_mode"
-                disabled={trigger !== null}
                 onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
                 onOpenChange={handleSelectOpenChange}
               >
@@ -692,11 +692,9 @@ export function CreateScheduledTaskDialog({
                 </SelectContent>
               </Select>
               <p className="text-sm text-muted-foreground">
-                {trigger !== null
-                  ? "Trigger automations keep one session, which remembers its last check and the sessions it already started."
-                  : sessionMode === "continue"
-                    ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
-                    : "Each run starts a new session."}
+                {sessionMode === "continue"
+                  ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
+                  : "Each run starts a new session."}
               </p>
               {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
                 <div className="flex items-center gap-2">
@@ -721,6 +719,10 @@ export function CreateScheduledTaskDialog({
               fields={triggerFields}
               onChange={setTriggerFields}
               onSelectOpenChange={handleSelectOpenChange}
+              // Arclet sandboxes start agents with Isaac's MCP servers, Jira and Slack included.
+              toolsProvided={
+                sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
+              }
               renderedPrompt={renderedTriggerPrompt}
               onEditAsPrompt={() => {
                 setPrompt(renderedTriggerPrompt);
