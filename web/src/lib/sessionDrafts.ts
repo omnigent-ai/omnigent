@@ -95,13 +95,15 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
  * @param conversationId - The session the inputs belong to.
  * @param text - Their text, saved only when the session has no draft yet; an existing draft keeps its text.
  * @param ids - Their pending ids.
+ * @param files - Their files, saved with the text when the session has no draft yet.
  */
 export function addSessionDraftStartupInputs(
   conversationId: string,
   text: string,
   ids: string[],
+  files: File[] = [],
 ): void {
-  const draft = sessionDrafts.get(conversationId) ?? { text, files: [] };
+  const draft = sessionDrafts.get(conversationId) ?? { text, files };
   setSessionDraft(conversationId, {
     ...draft,
     startupInputIds: [...new Set([...(draft.startupInputIds ?? []), ...ids])],

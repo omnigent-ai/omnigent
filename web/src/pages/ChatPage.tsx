@@ -3113,7 +3113,12 @@ function ComposerImpl(
     if (!failed) return;
     // The saved draft names the startup inputs it takes, so a reload doesn't add them again.
     if (failed.startupInputIds)
-      addSessionDraftStartupInputs(conversationId, failed.text, failed.startupInputIds);
+      addSessionDraftStartupInputs(
+        conversationId,
+        failed.text,
+        failed.startupInputIds,
+        failed.files,
+      );
     if (hasNewerInput) {
       const joined = appendReplyDraft(draft, restoreReplyDraft(failed.text, failed.replyDraft));
       replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));
@@ -3826,10 +3831,16 @@ function ComposerImpl(
   const takeBackQueued = (message: {
     queueId: string;
     text: string;
+    files?: File[];
     startupInputIds?: string[];
   }) => {
     if (conversationId && message.startupInputIds?.length)
-      addSessionDraftStartupInputs(conversationId, message.text, message.startupInputIds);
+      addSessionDraftStartupInputs(
+        conversationId,
+        message.text,
+        message.startupInputIds,
+        message.files,
+      );
     dequeueMessage(message.queueId);
   };
 

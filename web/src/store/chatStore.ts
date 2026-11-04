@@ -939,6 +939,8 @@ export interface ConversationState {
     recovered?: boolean;
     /** The failed startup inputs it hands back or replaces, recorded with the saved draft once taken. */
     startupInputIds?: string[];
+    /** Stable ids of the sends a joined draft holds, so a failed-input read can find them. */
+    sentAs?: string[];
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -946,6 +948,8 @@ export interface ConversationState {
    * duplicate dispatch on retry.
    */
   pendingRetryStableId: string | null;
+  /** Stable ids of joined sends whose text the composer took back, until a failed-input read finds them. */
+  composerSentAs: string[];
   /**
    * A failed-send draft the composer has restored, kept until the send's fate
    * is known: a committed item under its `stable_id` proves the POST reached
@@ -2208,6 +2212,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
   pendingRetryStableId: null,
+  composerSentAs: [],
   restoredSendDraft: null,
   sendLatchedAt: null,
   llmModel: null,
@@ -2389,7 +2394,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     setActive({
       queuedMessages: s.queuedMessages.filter((m) => !batchOrder.has(m.queueId)),
     });
-    // Off the queue, later messages' startup inputs stay theirs while earlier sends pick.
+    // Reserve later messages' startup inputs so each send in the batch names only its own.
     const batchOut = Symbol("steer_all");
     batch.forEach((m, index) => {
       const later = batch.slice(index + 1).flatMap((next) => next.startupInputIds ?? []);
@@ -5519,7 +5524,7 @@ function reconnectStatusPatch(
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
-  // A failed launch ends startup; the caller hands back its messages.
+  // Callers hand back the failed launch's messages.
   if (startupFailedIn(session)) patch.startupPending = false;
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
   // outlives it), so it settles the local send lifecycle like `idle` — it must
@@ -7622,6 +7627,7 @@ export function takeFailedSendDraft(
   const tracked = restore && !appended;
   const patch: Partial<ConversationState> = { failedSendDraft: null };
   if (!delivered) patch.pendingRetryStableId = tracked ? (failed.stableId ?? null) : null;
+  if (restore && failed.sentAs) patch.composerSentAs = [...state.composerSentAs, ...failed.sentAs];
   // A discarded failure must not untrack an earlier draft still in the composer.
   if (tracked && failed.stableId)
     patch.restoredSendDraft = {
@@ -7793,7 +7799,9 @@ function unsentSendToRestore(
     text: serializeReplyDraft(joined),
     files: [],
     // A resend of one message reuses its id, which the server dedupes; joined text is a new message.
-    ...(sends.length === 1 ? { stableId: first.stableId } : {}),
+    ...(sends.length === 1
+      ? { stableId: first.stableId }
+      : { sentAs: sends.map((send) => send.stableId) }),
     ...(replyDraft ? { replyDraft } : {}),
     ...(startupInputIds.length > 0 ? { startupInputIds } : {}),
     serverRefused: false,
@@ -7850,12 +7858,14 @@ function joinFailedSendDrafts(
   const startupInputIds = [
     ...new Set([...(waiting.startupInputIds ?? []), ...(later.startupInputIds ?? [])]),
   ];
+  const sentAs = [...new Set([...(waiting.sentAs ?? []), ...(later.sentAs ?? [])])];
   return {
     conversationId: waiting.conversationId,
     text: serializeReplyDraft(joined),
     files: [...waiting.files, ...later.files],
     ...(replyDraft ? { replyDraft } : {}),
     ...(startupInputIds.length > 0 ? { startupInputIds } : {}),
+    ...(sentAs.length > 0 ? { sentAs } : {}),
     recovered: true,
   };
 }
@@ -7943,7 +7953,9 @@ function settleReplacedStartupInputs(
   if (!ids?.length) return;
   setterFor(sessionId)((s) => ({
     ...forgetReturnedStartupInputs(s, ids),
-    ...(denied ? {} : { replacedStartupInputs: [...s.replacedStartupInputs, ...ids] }),
+    ...(denied
+      ? {}
+      : { replacedStartupInputs: [...new Set([...s.replacedStartupInputs, ...ids])] }),
   }));
   if (denied) void restoreFailedStartupInputs(sessionId);
 }
@@ -7970,14 +7982,21 @@ function returnFailedStartupInputs(
     | "replacedStartupInputs"
     | "blocks"
     | "pendingRetryStableId"
+    | "composerSentAs"
     | "restoredSendDraft"
   >,
   failedInputs: FailedInput[],
   unacknowledged: ReadonlySet<string>,
 ): Partial<ConversationState> {
   const unreturned = unreturnedStartupInputs(state, failedInputs);
-  const inWaitingDraft = inputsSentAs(unreturned, state.failedSendDraft?.stableId);
-  const inComposer = inputsSentAs(unreturned, state.pendingRetryStableId);
+  const inWaitingDraft = inputsSentAs(unreturned, [
+    state.failedSendDraft?.stableId ?? null,
+    ...(state.failedSendDraft?.sentAs ?? []),
+  ]);
+  const inComposer = inputsSentAs(unreturned, [
+    state.pendingRetryStableId,
+    ...state.composerSentAs,
+  ]);
   const held = new Set([
     ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
     ...(state.failedSendDraft?.startupInputIds ?? []),
@@ -7988,7 +8007,6 @@ function returnFailedStartupInputs(
     ...inWaitingDraft,
     ...inComposer,
   ]);
-  // Ids a composer's draft, a saved unanswered or queued send, or a resend holds count as returned.
   const inputs = unreturned.filter((input) => !held.has(input.pendingId));
   // A draft holding a saved send's text may lack its files, which the composer can't take back.
   const withoutFiles = new Set([
@@ -8013,7 +8031,9 @@ function returnFailedStartupInputs(
         }),
     ...(waiting === state.failedSendDraft ? {} : { failedSendDraft: waiting }),
     // Its resend would be deduplicated onto the failed input, so it goes out as a new message.
-    ...(inComposer.length === 0 ? {} : { pendingRetryStableId: null, restoredSendDraft: null }),
+    ...(inComposer.length === 0
+      ? {}
+      : { pendingRetryStableId: null, composerSentAs: [], restoredSendDraft: null }),
   };
   if (inputs.length === 0) return patch;
   return {
@@ -8035,10 +8055,10 @@ function handBackFailedStartupInputs(
   unacknowledged: ReadonlySet<string>,
 ): void {
   const state = entry.getState();
-  const inComposer = inputsSentAs(
-    unreturnedStartupInputs(state, failedInputs),
+  const inComposer = inputsSentAs(unreturnedStartupInputs(state, failedInputs), [
     state.pendingRetryStableId,
-  );
+    ...state.composerSentAs,
+  ]);
   entrySetter(entry)((current) =>
     returnFailedStartupInputs(conversationId, current, failedInputs, unacknowledged),
   );
@@ -8060,10 +8080,12 @@ function unreturnedStartupInputs(
   );
 }
 
-/** Pending ids of the inputs saved under a send's stable id, e.g. one from the unanswered-send journal. */
-function inputsSentAs(inputs: FailedInput[], stableId: string | null | undefined): string[] {
-  if (stableId == null) return [];
-  return inputs.filter((input) => input.itemId === stableId).map((input) => input.pendingId);
+/** Pending ids of the inputs saved under sends' stable ids, e.g. ones from the unanswered-send journal. */
+function inputsSentAs(inputs: FailedInput[], stableIds: readonly (string | null)[]): string[] {
+  const ids = new Set(stableIds.filter((id) => id !== null));
+  return inputs
+    .filter((input) => input.itemId !== undefined && ids.has(input.itemId))
+    .map((input) => input.pendingId);
 }
 
 /**
@@ -8262,13 +8284,13 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
     (await readWithinReconcileTimeout(read)) ?? (await readWithinReconcileTimeout(read));
   // A conversation reopened under the same id during the read is a different entry.
   if (entry.disposed) return;
+  // A lookup begun later already read them back; this older result may list inputs resent since.
+  if (lookup.superseded()) return;
   if (inputs !== null) {
     lookup.read();
     handBackFailedStartupInputs(entry, conversationId, inputs, unacknowledged);
     return;
   }
-  // A lookup begun later already read them back, so there's nothing to retry.
-  if (lookup.superseded()) return;
   entrySetter(entry)((state) => {
     if (state.blocks.some(isStartupLookupNotice)) return {};
     const notice: ErrorBlock = {
@@ -8297,7 +8319,7 @@ export async function retryFailedStartupLookup(conversationId: string): Promise<
   const inputs = await readWithinReconcileTimeout((signal) =>
     listFailedStartupInputs(conversationId, signal),
   );
-  if (entry.disposed) return;
+  if (entry.disposed || lookup.superseded()) return;
   if (inputs === null) throw new Error("The messages couldn't be read");
   lookup.read();
   handBackFailedStartupInputs(entry, conversationId, inputs, unacknowledged);

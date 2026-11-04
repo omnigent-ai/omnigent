@@ -4549,44 +4549,90 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(lookupNotices()).toEqual([]);
   });
 
-  it("adds no lookup notice when a read fails after a later one handed the inputs back", async () => {
+  it.each([
+    { older: "fails", resentElsewhere: false },
+    { older: "lists an input another tab resent since", resentElsewhere: true },
+  ])(
+    "keeps a later read's result when an earlier read $older after it",
+    async ({ resentElsewhere }) => {
+      seedSession("conv_real");
+      failManagedLaunch("conv_real", "saved on server");
+      let reads = 0;
+      let answerFirstRead: (() => void) | undefined;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input) !== "/v1/sessions/conv_real/failed-inputs")
+          return defaultFetchHandler(input, init);
+        reads += 1;
+        const failed = () =>
+          mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
+        if (reads === 1) {
+          const listed = defaultFetchHandler(input, init);
+          return new Promise<Response>((resolve) => {
+            answerFirstRead = () => resolve(resentElsewhere ? listed : failed());
+          });
+        }
+        return reads === 2 ? defaultFetchHandler(input, init) : failed();
+      });
+      await useChatStore.getState().switchTo("conv_real");
+      await vi.waitFor(() => expect(answerFirstRead).toBeDefined());
+      if (resentElsewhere) sessionFailedInputs.set("conv_real", []);
+
+      await retryFailedStartupLookup("conv_real");
+      answerFirstRead!();
+      await settle();
+
+      expect(reads).toBe(resentElsewhere ? 2 : 3);
+      expect(useChatStore.getState().failedSendDraft).toEqual(
+        resentElsewhere
+          ? null
+          : {
+              conversationId: "conv_real",
+              text: "saved on server",
+              files: [],
+              startupInputIds: ["pending_first"],
+              recovered: true,
+            },
+      );
+      expect(
+        useChatStore
+          .getState()
+          .blocks.filter(
+            (block) => block.type === "error" && block.code === STARTUP_INPUT_LOOKUP_FAILED_CODE,
+          ),
+      ).toEqual([]);
+    },
+  );
+
+  it("ignores a Retry's read that answers after a later Retry's", async () => {
     seedSession("conv_real");
     failManagedLaunch("conv_real", "saved on server");
     let reads = 0;
-    let failFirstRead: (() => void) | undefined;
+    let answerOlderRetry: (() => void) | undefined;
     fetchMock.mockImplementation((input, init) => {
       if (String(input) !== "/v1/sessions/conv_real/failed-inputs")
         return defaultFetchHandler(input, init);
       reads += 1;
-      const failed = () => mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
-      if (reads === 1)
-        return new Promise<Response>((resolve) => {
-          failFirstRead = () => resolve(failed());
-        });
-      return reads === 2 ? defaultFetchHandler(input, init) : failed();
+      if (reads <= 2)
+        return mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
+      if (reads > 3) return defaultFetchHandler(input, init);
+      const listed = defaultFetchHandler(input, init);
+      return new Promise<Response>((resolve) => {
+        answerOlderRetry = () => resolve(listed);
+      });
     });
     await useChatStore.getState().switchTo("conv_real");
-    await vi.waitFor(() => expect(failFirstRead).toBeDefined());
+    await settle();
+    const olderRetry = retryFailedStartupLookup("conv_real");
+    await vi.waitFor(() => expect(answerOlderRetry).toBeDefined());
+    // Another tab resends the input before the later Retry reads.
+    sessionFailedInputs.set("conv_real", []);
 
     await retryFailedStartupLookup("conv_real");
-    failFirstRead!();
-    await settle();
+    answerOlderRetry!();
+    await olderRetry;
 
-    expect(reads).toBe(3);
-    expect(useChatStore.getState().failedSendDraft).toEqual({
-      conversationId: "conv_real",
-      text: "saved on server",
-      files: [],
-      startupInputIds: ["pending_first"],
-      recovered: true,
-    });
-    expect(
-      useChatStore
-        .getState()
-        .blocks.filter(
-          (block) => block.type === "error" && block.code === STARTUP_INPUT_LOOKUP_FAILED_CODE,
-        ),
-    ).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().returnedStartupInputs).toEqual([]);
   });
 
   it("drops startup inputs read for a conversation that was reopened during the read", async () => {
@@ -22716,9 +22762,16 @@ describe("a send cut off by a reload", () => {
       queued: true,
       draft: { text: "saved on server, edited", stableId: "stable_reload", serverRefused: false },
     },
+    {
+      unanswered: "the unanswered send it saved, joined with a queued follow-up",
+      send: { text: "saved on server" },
+      savedAs: "stable_reload",
+      followUp: { text: "and then run the linter" },
+      draft: { text: "saved on server\n\nand then run the linter" },
+    },
   ])(
     "hands back $unanswered on load with the failed launch's first input once",
-    async ({ send, savedAs, image, queued, draft }) => {
+    async ({ send, savedAs, image, queued, followUp, draft }) => {
       seedSession("conv_reload", []);
       failManagedLaunch("conv_reload", "saved on server");
       const [input] = sessionFailedInputs.get("conv_reload")!;
@@ -22727,6 +22780,10 @@ describe("a send cut off by a reload", () => {
       const record = { stableId: "stable_reload", authorId: "user_a", ...send };
       if (queued) rememberQueuedSends("conv_reload", [record]);
       else rememberUnsentSend("conv_reload", record);
+      if (followUp)
+        rememberQueuedSends("conv_reload", [
+          { stableId: "stable_queued", authorId: "user_a", ...followUp },
+        ]);
 
       await useChatStore.getState().switchTo("conv_reload");
       await tick();
@@ -22775,7 +22832,11 @@ describe("a send cut off by a reload", () => {
       send: { text: "rerun the failing test" },
       queued: { text: "saved on server, edited", startupInputIds: ["pending_first"] },
       savedAs: "item_first",
-      draft: { text: "rerun the failing test\n\nsaved on server, edited", serverRefused: false },
+      draft: {
+        text: "rerun the failing test\n\nsaved on server, edited",
+        serverRefused: false,
+        sentAs: ["stable_reload", "stable_queued"],
+      },
     },
   ])(
     "keeps $unanswered whose sender is named after the failed launch's inputs came back",
@@ -22811,62 +22872,77 @@ describe("a send cut off by a reload", () => {
     },
   );
 
-  it("resends as a new message a send the composer took back on load before the failed launch's inputs were read", async () => {
-    onTestFinished(clearSessionDrafts);
-    seedSession("conv_reload", []);
-    seedSession("conv_other", []);
-    failManagedLaunch("conv_reload", "saved on server");
-    sessionFailedInputs.get("conv_reload")![0]!.item_id = "stable_reload";
-    rememberUnsentSend("conv_reload", {
-      stableId: "stable_reload",
-      text: "saved on server",
-      authorId: "user_a",
-    });
-    let answer: (() => void) | undefined;
-    fetchMock.mockImplementation((input, init) => {
-      if (answer !== undefined || String(input) !== "/v1/sessions/conv_reload/failed-inputs")
-        return defaultFetchHandler(input, init);
-      const response = defaultFetchHandler(input, init);
-      return new Promise<Response>((resolve) => {
-        answer = () => resolve(response);
+  it.each([
+    { taken: "a send", followUp: undefined, text: "saved on server" },
+    {
+      taken: "a send joined with a queued follow-up",
+      followUp: "and then run the linter",
+      text: "saved on server\n\nand then run the linter",
+    },
+  ])(
+    "resends as a new message $taken the composer took back on load before the failed launch's inputs were read",
+    async ({ followUp, text }) => {
+      onTestFinished(clearSessionDrafts);
+      seedSession("conv_reload", []);
+      seedSession("conv_other", []);
+      failManagedLaunch("conv_reload", "saved on server");
+      sessionFailedInputs.get("conv_reload")![0]!.item_id = "stable_reload";
+      rememberUnsentSend("conv_reload", {
+        stableId: "stable_reload",
+        text: "saved on server",
+        authorId: "user_a",
       });
-    });
-    await useChatStore.getState().switchTo("conv_reload");
-    await vi.waitFor(() => expect(answer).toBeDefined());
-    expect(takeFailedSendDraft("conv_reload", false)?.stableId).toBe("stable_reload");
-    // The composer saves the text it took back, before the read names its input.
-    setSessionDraft("conv_reload", { text: "saved on server", files: [] });
+      if (followUp)
+        rememberQueuedSends("conv_reload", [
+          { stableId: "stable_queued", text: followUp, authorId: "user_a" },
+        ]);
+      let answer: (() => void) | undefined;
+      fetchMock.mockImplementation((input, init) => {
+        if (answer !== undefined || String(input) !== "/v1/sessions/conv_reload/failed-inputs")
+          return defaultFetchHandler(input, init);
+        const response = defaultFetchHandler(input, init);
+        return new Promise<Response>((resolve) => {
+          answer = () => resolve(response);
+        });
+      });
+      await useChatStore.getState().switchTo("conv_reload");
+      await vi.waitFor(() => expect(answer).toBeDefined());
+      expect(takeFailedSendDraft("conv_reload", false)?.text).toBe(text);
+      // The composer saves the text it took back, before the read names its input.
+      setSessionDraft("conv_reload", { text, files: [] });
 
-    answer!();
-    await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
-    expect(useChatStore.getState()).toMatchObject({
-      failedSendDraft: null,
-      pendingRetryStableId: null,
-      restoredSendDraft: null,
-      returnedStartupInputs: ["pending_first"],
-    });
-    const saved = { text: "saved on server", files: [], startupInputIds: ["pending_first"] };
-    expect(getSessionDraft("conv_reload")).toEqual(saved);
+      answer!();
+      await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
+      expect(useChatStore.getState()).toMatchObject({
+        failedSendDraft: null,
+        pendingRetryStableId: null,
+        restoredSendDraft: null,
+        returnedStartupInputs: ["pending_first"],
+      });
+      const saved = { text, files: [], startupInputIds: ["pending_first"] };
+      expect(getSessionDraft("conv_reload")).toEqual(saved);
 
-    await useChatStore.getState().switchTo("conv_other");
-    releaseConversation("conv_reload");
-    await useChatStore.getState().switchTo("conv_reload");
-    await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
-    expect(useChatStore.getState().failedSendDraft).toBeNull();
-    expect(getSessionDraft("conv_reload")).toEqual(saved);
-    await useChatStore.getState().send("saved on server", "agent_xyz", undefined, {
-      startupInputIds: getSessionDraft("conv_reload")?.startupInputIds,
-    });
-    const [, sent] =
-      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_reload/events")).at(-1) ??
-      [];
-    const body = JSON.parse(String(sent?.body)) as {
-      data: { stable_id: string };
-      replaces_failed_inputs?: string[];
-    };
-    expect(body.replaces_failed_inputs).toEqual(["pending_first"]);
-    expect(body.data.stable_id).not.toBe("stable_reload");
-  });
+      await useChatStore.getState().switchTo("conv_other");
+      releaseConversation("conv_reload");
+      await useChatStore.getState().switchTo("conv_reload");
+      await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(getSessionDraft("conv_reload")).toEqual(saved);
+      await useChatStore.getState().send(text, "agent_xyz", undefined, {
+        startupInputIds: getSessionDraft("conv_reload")?.startupInputIds,
+      });
+      const [, sent] =
+        fetchMock.mock.calls
+          .filter(([url]) => String(url).endsWith("/conv_reload/events"))
+          .at(-1) ?? [];
+      const body = JSON.parse(String(sent?.body)) as {
+        data: { stable_id: string };
+        replaces_failed_inputs?: string[];
+      };
+      expect(body.replaces_failed_inputs).toEqual(["pending_first"]);
+      expect(body.data.stable_id).not.toBe("stable_reload");
+    },
+  );
 
   it("keeps each queued message for the next load until it leaves the queue", async () => {
     seedSession("conv_queue", []);
@@ -22997,6 +23073,7 @@ describe("a send cut off by a reload", () => {
         quotes: [{ before: "rerun the failing test", text: "the lint step" }],
         text: "run the linter next",
       },
+      sentAs: ["stable_reload", "stable_queued"],
       serverRefused: false,
       recovered: true,
     });

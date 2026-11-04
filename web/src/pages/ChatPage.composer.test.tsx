@@ -5579,31 +5579,39 @@ describe("Composer reply quotes", () => {
     },
   );
 
-  it("restores a failed launch's message into an empty composer, naming its inputs in the saved draft", async () => {
-    const props = composerProps();
-    render(<Composer {...props} />);
+  it.each<[string, string, boolean]>([
+    ["a failed launch's message", "run the linter next", false],
+    ["a refused resend of only a file", "", true],
+  ])(
+    "restores %s into an empty composer, naming its inputs in the saved draft",
+    async (_, text, withFile) => {
+      const files = withFile ? [new File(["hello"], "notes.txt", { type: "text/plain" })] : [];
+      const props = composerProps();
+      render(<Composer {...props} />);
 
-    act(() =>
-      useChatStore.setState({
-        failedSendDraft: {
-          conversationId: "conv_test",
-          text: "run the linter next",
-          files: [],
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text,
+            files,
+            startupInputIds: ["pending_first"],
+            ...(withFile ? { serverRefused: true } : { recovered: true }),
+          },
+        }),
+      );
+
+      expect(textarea()).toHaveValue(text);
+      expect(props.onSend).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(getSessionDraft("conv_test")).toMatchObject({
+          text,
+          files,
           startupInputIds: ["pending_first"],
-          recovered: true,
-        },
-      }),
-    );
-
-    expect(textarea()).toHaveValue("run the linter next");
-    expect(props.onSend).not.toHaveBeenCalled();
-    await waitFor(() =>
-      expect(getSessionDraft("conv_test")).toMatchObject({
-        text: "run the linter next",
-        startupInputIds: ["pending_first"],
-      }),
-    );
-  });
+        }),
+      );
+    },
+  );
 
   it("drops a failed-send draft whose message already committed under its stable id", () => {
     const stableId = "e".repeat(32);
@@ -6547,15 +6555,25 @@ describe("Composer — editing queued messages", () => {
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
   });
 
-  it.each(["ArrowUp", "Edit"])(
-    "takes back the failed startup inputs a queued message replaces when recalled with %s",
-    (via) => {
+  it.each<[string, boolean]>([
+    ["ArrowUp", false],
+    ["Edit", false],
+    ["ArrowUp", true],
+    ["Edit", true],
+  ])(
+    "takes back the failed startup inputs a queued message replaces when recalled with %s (only a file: %s)",
+    (via, fileOnly) => {
+      const text = fileOnly ? "" : QUEUED_TEXT;
+      const files = fileOnly
+        ? [new File(["notes"], "notes.txt", { type: "text/plain" })]
+        : undefined;
       useChatStore.setState({
         queuedMessages: [
           {
             queueId: "q_1",
-            text: QUEUED_TEXT,
+            text,
             conversationId: CONV,
+            ...(files ? { files } : {}),
             startupInputIds: ["pending_first"],
           },
         ],
@@ -6570,9 +6588,7 @@ describe("Composer — editing queued messages", () => {
       expect(useChatStore.getState().queuedMessages).toHaveLength(0);
       expect(getSessionDraft(CONV)?.startupInputIds).toEqual(["pending_first"]);
       fireEvent.keyDown(textarea(), { key: "Enter" });
-      expect(props.onSend).toHaveBeenCalledWith(QUEUED_TEXT, undefined, undefined, [
-        "pending_first",
-      ]);
+      expect(props.onSend).toHaveBeenCalledWith(text, files, undefined, ["pending_first"]);
     },
   );
 
