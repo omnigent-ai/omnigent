@@ -11,13 +11,17 @@ Events are injected via :func:`_inject`, which calls :meth:`record_change` on
 the registry so tests exercise the same code path as real tool calls.
 """
 
+import itertools
 import logging
 import os
+import shutil
 import subprocess
 import threading
+from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1600,6 +1604,55 @@ def test_nested_worktree_changes_follow_git_after_a_shell_rename(tmp_path: Path)
     assert cold.get_baseline(new) == "def greet():\n    return 'hello world'\n"
 
 
+def test_nested_repository_discovery_probes_each_ancestor_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "deep" / "tree" / "repo"
+    repo.mkdir(parents=True)
+    _init_git_with_commit(repo, "README.md", "readme\n")
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    for index in range(20):
+        for path in (f"deep/tree/repo/pkg/{index}/f.py", f"deep/tree/loose/{index}/f.py"):
+            (tmp_path / path).parent.mkdir(parents=True)
+            (tmp_path / path).write_text("new\n")
+            registry.record_change(path, "created", "session")
+    probes: Counter[Path] = Counter()
+    exists = Path.exists
+
+    def counting_exists(self: Path, *args: Any, **kwargs: Any) -> bool:
+        if self.name == ".git":
+            probes[self.parent.relative_to(tmp_path)] += 1
+        return exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", counting_exists)
+    changes = registry.with_git_runner(_trusted_test_git).list_changed_files("session", limit=100)
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == sorted(
+        [(f"deep/tree/repo/pkg/{i}/f.py", "deep/tree/repo") for i in range(20)]
+        + [(f"deep/tree/loose/{i}/f.py", None) for i in range(20)]
+    )
+    assert probes[Path("deep/tree")] == 1
+    assert {count for path, count in probes.items() if len(path.parts) > 1} == {1}
+
+
+def test_nested_discovery_skips_repositories_reached_through_symlinked_directories(
+    tmp_path: Path,
+) -> None:
+    workspace, outside = tmp_path / "workspace", tmp_path / "outside"
+    (workspace / "group" / "repo").mkdir(parents=True)
+    (workspace / "group" / "repo" / "file.txt").write_text("edited\n")
+    _init_fake_git_repo(outside / "repo")
+    registry = MultiRepositoryFilesystemRegistry(workspace)
+    registry.record_change("group/repo/file.txt", "modified", "session")
+    shutil.rmtree(workspace / "group")
+    (workspace / "group").symlink_to(outside, target_is_directory=True)
+
+    reader = registry.with_git_runner(lambda *_args: pytest.fail("ran Git outside the workspace"))
+    changes = reader.list_changed_files("session", limit=100)
+    assert [(r["path"], r["status"], r.get("repository_root")) for r in changes] == [
+        ("group/repo/file.txt", "modified", None)
+    ]
+
+
 @pytest.mark.parametrize("repository_count", [1, 4, 8])
 def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repository_count: int
@@ -1638,7 +1691,9 @@ def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     assert calls == [("status", tmp_path / "repo-0"), ("show", tmp_path / "repo-0")]
 
 
-@pytest.mark.parametrize("boundary", ["repositories", "nested_repositories", "entries", "time"])
+@pytest.mark.parametrize(
+    "boundary", ["repositories", "nested_repositories", "entries", "time", "nested_time"]
+)
 def test_multi_repo_discovery_bounds_fail_without_partial_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
 ) -> None:
@@ -1649,8 +1704,11 @@ def test_multi_repo_discovery_bounds_fail_without_partial_results(
         if boundary == "nested_repositories":
             (tmp_path / "group" / str(index) / ".git").mkdir(parents=True)
             reader.record_change(f"group/{index}/file.txt", "modified", "session")
-        else:
+        elif boundary != "nested_time":
             (tmp_path / str(index) / ".git").mkdir(parents=True)
+    if boundary == "nested_time":
+        (tmp_path / "group" / "a" / "b").mkdir(parents=True)
+        reader.record_change("group/a/b/file.txt", "modified", "session")
     with monkeypatch.context() as patches:
         patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: 0)
         if boundary == "entries":
@@ -1663,6 +1721,12 @@ def test_multi_repo_discovery_bounds_fail_without_partial_results(
             clock = iter([0, 0.251])
             patches.setattr(
                 "omnigent.runtime.filesystem_registry.time.monotonic", lambda: next(clock)
+            )
+        elif boundary == "nested_time":
+            # The deadline passes after the first ancestor probe of one recorded directory.
+            nested_clock = itertools.chain([0, 0, 0], itertools.repeat(0.251))
+            patches.setattr(
+                "omnigent.runtime.filesystem_registry.time.monotonic", lambda: next(nested_clock)
             )
         with pytest.raises(GitStatusUnavailable, match=r"discovery limit|32 repositories"):
             reader.list_changed_files("session", limit=100)

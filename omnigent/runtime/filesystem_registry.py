@@ -1517,10 +1517,9 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
             # Deeper repositories are found only from files this session changed.
             with self._lock:
                 events = list(self._session_events.get(conversation_id, []))
+            checked: dict[Path, tuple[str, Path] | None] = {}
             for directory in sorted({Path(event.path).parent for event in events}):
-                if time.monotonic() > deadline:
-                    raise GitStatusUnavailable("Repository discovery limit exceeded")
-                owner = self._nearest_repository(directory)
+                owner = self._nearest_repository(directory, checked, deadline)
                 if owner is not None and owner[0] not in roots:
                     roots[owner[0]] = owner[1]
                     if len(roots) > 32:
@@ -1537,14 +1536,32 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
             return "", self._cwd
         return self._nearest_repository(Path(norm).parent)
 
-    def _nearest_repository(self, directory: Path) -> tuple[str, Path] | None:
+    def _nearest_repository(
+        self,
+        directory: Path,
+        checked: dict[Path, tuple[str, Path] | None] | None = None,
+        deadline: float | None = None,
+    ) -> tuple[str, Path] | None:
         parts = directory.parts
         searchable = next((i for i, part in enumerate(parts) if part in _SKIP_DIRS), len(parts))
+        checked = {} if checked is None else checked
+        visited: list[Path] = []
+        owner = None
         for depth in range(searchable, 0, -1):
-            root = self._cwd.joinpath(*parts[:depth])
-            if not root.is_symlink() and (root / ".git").exists():
-                return "/".join(parts[:depth]), root
-        return None
+            prefix = Path(*parts[:depth])
+            if prefix in checked:
+                owner = checked[prefix]
+                break
+            if deadline is not None and time.monotonic() > deadline:
+                raise GitStatusUnavailable("Repository discovery limit exceeded")
+            visited.append(prefix)
+            root = self._cwd / prefix
+            # A symlinked component can lead outside the workspace, where Git cannot run.
+            if (root / ".git").exists() and _normalize_path(str(prefix), self._cwd) == str(prefix):
+                owner = "/".join(parts[:depth]), root
+                break
+        checked.update(dict.fromkeys(visited, owner))
+        return owner
 
     def _reader(self, root: Path) -> GitFilesystemRegistry:
         if self._run_repository_git is None:
