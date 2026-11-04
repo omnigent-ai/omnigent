@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import http.server
+import shlex
 import socketserver
 import subprocess
 import sys
@@ -105,6 +106,55 @@ def test_runtime_auth_headers_pick_up_rotated_file_credentials(
     assert all(rule.real_secret is None for rule in runtime.rewrites)
 
 
+def test_command_source_renews_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandbox: SandboxPolicy
+) -> None:
+    token = tmp_path / "token"
+    token.write_text("first")
+    command_file = tmp_path / "read-token.py"
+    command_file.write_text(
+        "import pathlib, sys\n"
+        "value = pathlib.Path(sys.argv[1]).read_text()\n"
+        "if value == 'fail':\n"
+        "    print('private-stderr', file=sys.stderr)\n"
+        "    sys.exit(1)\n"
+        "print(value)\n"
+    )
+    command = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(command_file))} {shlex.quote(str(token))}"
+    )
+    spec = _parse_credential_proxy(
+        [
+            {
+                "type": "https_bearer",
+                "target": "model.example.com",
+                "env": "MODEL_TOKEN",
+                "source": {"command": command, "refresh_interval_seconds": 60},
+            }
+        ]
+    )
+    clock = Mock(return_value=0.0)
+    monkeypatch.setattr(
+        "omnigent.inner.credential_proxy.RefreshingSecretProvider",
+        partial(RefreshingSecretProvider, clock=clock),
+    )
+    runtime = prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=sandbox)
+    rule = runtime.rewrites[0]
+    assert rule.resolve_secret() == "first"
+    token.write_text("second")
+    assert rule.resolve_secret() == "first"
+    clock.return_value = 60.0
+    assert rule.resolve_secret() == "second"
+    token.write_text("fail")
+    clock.return_value = 120.0
+    with pytest.raises(ValueError) as error:
+        rule.resolve_secret()
+    assert "private-stderr" not in str(error.value)
+    assert rule.synthetic == runtime.helper_env_updates["MODEL_TOKEN"]
+    token.write_text("third")
+    assert rule.resolve_secret() == "third"
+
+
 def test_failed_refresh_retries_without_reusing_cached_secret(
     tmp_path: Path, sandbox: SandboxPolicy
 ) -> None:
@@ -164,11 +214,10 @@ def test_parser_rejects_invalid_refresh_interval(interval: object) -> None:
         )
 
 
-@pytest.mark.parametrize("source", [{"env": "TOKEN"}, {"command": "token-broker"}])
-def test_environment_and_shell_sources_cannot_refresh(source: dict[str, object]) -> None:
-    with pytest.raises(OmnigentError, match="requires a file or unix_socket"):
+def test_environment_source_cannot_refresh() -> None:
+    with pytest.raises(OmnigentError, match="requires a file, command, or unix_socket"):
         _parse_credential_proxy(
-            [{"type": "gh_basic", "source": {**source, "refresh_interval_seconds": 60}}]
+            [{"type": "gh_basic", "source": {"env": "TOKEN", "refresh_interval_seconds": 60}}]
         )
 
 
@@ -394,10 +443,7 @@ def test_refresh_rejects_changed_private_symlink_target(
 
 @pytest.mark.parametrize(
     "source",
-    [
-        CredentialSourceSpec(kind="env", env="TOKEN", refresh_interval_seconds=60),
-        CredentialSourceSpec(kind="command", command="echo secret", refresh_interval_seconds=60),
-    ],
+    [CredentialSourceSpec(kind="env", env="TOKEN", refresh_interval_seconds=60)],
 )
 def test_runtime_rejects_nonrenewable_sources(
     source: CredentialSourceSpec, sandbox: SandboxPolicy
@@ -407,7 +453,7 @@ def test_runtime_rejects_nonrenewable_sources(
             CredentialProxyEntry(host="example.com", scheme="bearer", source=source),
         ]
     )
-    with pytest.raises(ValueError, match="requires a file or unix_socket"):
+    with pytest.raises(ValueError, match="requires a file, command, or unix_socket"):
         prepare_credential_proxy_runtime(spec, parent_env={"TOKEN": "secret"}, sandbox=sandbox)
 
 

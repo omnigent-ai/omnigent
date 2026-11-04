@@ -11,7 +11,9 @@ injection through a real sandbox + proxy is covered in
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 import pytest
@@ -188,6 +190,29 @@ def test_command_source_resolves_secret() -> None:
     assert runtime.rewrites[0].real_secret == "cmd-secret"
 
 
+def test_command_timeout_does_not_expose_command_or_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = "secret-bearing-command"
+
+    def timeout(*_args: object, **_kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(
+            command, 30, output=b"private-stdout", stderr=b"private-stderr"
+        )
+
+    monkeypatch.setattr("omnigent.inner.credential_proxy.subprocess.run", timeout)
+    source = CredentialSourceSpec(kind="command", command=command)
+    spec = CredentialProxySpec(
+        entries=[_bearer_entry("model.example.com", env_var="T", source=source)]
+    )
+    with pytest.raises(ValueError) as error:
+        prepare_credential_proxy_runtime(spec, parent_env={})
+    rendered = "".join(traceback.format_exception(error.value))
+    assert "secret-bearing-command" not in rendered
+    assert "private-stdout" not in rendered
+    assert "private-stderr" not in rendered
+
+
 @pytest.mark.parametrize(
     "source,parent_env,expected_fragment",
     [
@@ -196,7 +221,7 @@ def test_command_source_resolves_secret() -> None:
         (
             CredentialSourceSpec(kind="command", command="exit 7"),
             {},
-            "exited 7",
+            "command source failed",
         ),
     ],
 )

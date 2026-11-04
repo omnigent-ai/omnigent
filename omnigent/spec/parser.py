@@ -1524,7 +1524,7 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         ``"gh auth token"``.
     :param unix_socket: Private HTTP broker socket serving a token at ``/token``.
     :param refresh_interval_seconds: Optional positive cache lifetime for
-        file or Unix socket sources, in seconds.
+        file, command, or Unix socket sources, in seconds.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1569,12 +1569,9 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
             raise ValueError("source 'command' must be a non-empty command")
         if self.unix_socket is not None and not self.unix_socket.strip():
             raise ValueError("source 'unix_socket' must be a non-empty path")
-        if self.refresh_interval_seconds is not None and (
-            self.env is not None or self.command is not None
-        ):
+        if self.refresh_interval_seconds is not None and self.env is not None:
             raise ValueError(
-                "refresh_interval_seconds requires a file or unix_socket source; "
-                "shell commands cannot refresh"
+                "refresh_interval_seconds requires a file, command, or unix_socket source"
             )
         return self
 

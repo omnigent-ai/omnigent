@@ -958,6 +958,35 @@ os_env:
         self.assertEqual(entry.source.kind, "env")
         self.assertEqual(entry.source.env, "CORP")
 
+    def test_load_agent_def_accepts_renewable_command_source(self):
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt
+    egress_rules:
+      - "POST model.example.com/cyber/v1/responses"
+    credential_proxy:
+      - type: https_bearer
+        target: model.example.com
+        env: OMNIGENT_CODEX_GATEWAY_TOKEN
+        source:
+          command: /usr/local/bin/get-model-token
+          refresh_interval_seconds: 300
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                agent = load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+        source = agent.os_env.sandbox.credential_proxy.entries[0].source
+        self.assertEqual(source.kind, "command")
+        self.assertEqual(source.refresh_interval_seconds, 300)
+
     def test_load_agent_def_rejects_credential_proxy_without_egress_rules(self):
         """``credential_proxy`` without ``egress_rules`` is rejected here too.
 

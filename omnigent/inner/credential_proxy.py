@@ -286,7 +286,7 @@ def prepare_credential_proxy_runtime(
 
 
 class RefreshingSecretProvider:
-    """Cache a trusted file or private broker secret until its next refresh."""
+    """Cache a trusted source until its next refresh."""
 
     def __init__(
         self,
@@ -299,15 +299,22 @@ class RefreshingSecretProvider:
     ) -> None:
         interval = source.refresh_interval_seconds
         if (
-            source.kind not in ("file", "unix_socket")
+            source.kind not in ("file", "unix_socket", "command")
             or interval is None
             or not 0 < interval < float("inf")
         ):
             raise ValueError(
-                "credential refresh requires a file or unix_socket and a finite positive interval"
+                "credential refresh requires a file, command, or unix_socket "
+                "and a finite positive interval"
             )
+        if sandbox is None or not sandbox.active:
+            raise ValueError("credential refresh requires an active sandbox policy")
         self._cwd = (cwd or Path.cwd()).resolve()
-        self._path = protect_credential_source(source, sandbox, cwd=self._cwd)
+        self._path = (
+            protect_credential_source(source, sandbox, cwd=self._cwd)
+            if source.kind != "command"
+            else None
+        )
         self._source = source
         self._sandbox = sandbox
         self._parent_env = dict(parent_env)
@@ -321,12 +328,13 @@ class RefreshingSecretProvider:
         """Refresh on access; a failed refresh never falls back to an old token."""
         with self._lock:
             if self._secret is None or self._clock() >= self._next_refresh:
-                path = protect_credential_source(self._source, self._sandbox, cwd=self._cwd)
-                if path != self._path:
-                    raise ValueError("credential source symlink target changed")
-                self._secret = _resolve_secret(
-                    replace(self._source, path=str(self._path)), parent_env=self._parent_env
-                )
+                source = self._source
+                if self._path is not None:
+                    path = protect_credential_source(source, self._sandbox, cwd=self._cwd)
+                    if path != self._path:
+                        raise ValueError("credential source symlink target changed")
+                    source = replace(source, path=str(self._path))
+                self._secret = _resolve_secret(source, parent_env=self._parent_env)
                 self._next_refresh = self._clock() + self._interval
             return self._secret
 
@@ -391,24 +399,23 @@ def _resolve_secret(source: CredentialSourceSpec, *, parent_env: dict[str, str])
         # ``shell=True`` is intentional: the command is spec-author
         # supplied (e.g. ``gh auth token``) and runs in the trusted
         # parent process, never inside the sandbox.
-        completed = subprocess.run(
-            source.command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            env=parent_env,
-            timeout=_COMMAND_SOURCE_TIMEOUT_SECONDS,
-            check=False,
-        )
-        if completed.returncode != 0:
-            stderr = (completed.stderr or "").strip()
-            raise ValueError(
-                f"credential_proxy command source exited {completed.returncode}"
-                + (f": {stderr}" if stderr else "")
+        try:
+            completed = subprocess.run(
+                source.command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                env=parent_env,
+                timeout=_COMMAND_SOURCE_TIMEOUT_SECONDS,
+                check=False,
             )
+        except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+            raise ValueError("credential_proxy command source unavailable") from None
+        if completed.returncode != 0:
+            raise ValueError("credential_proxy command source failed")
         value = completed.stdout.strip()
-        if not value:
-            raise ValueError("credential_proxy command source produced empty stdout")
+        if not value or "\r" in value or "\n" in value:
+            raise ValueError("credential_proxy command source produced an invalid token")
         return value
     raise ValueError(f"unsupported credential_proxy source kind: {source.kind!r}")
 
