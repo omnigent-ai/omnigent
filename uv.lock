@@ -3269,7 +3269,7 @@ wheels = [
 
 [[package]]
 name = "omnigent"
-version = "0.22.0.dev0"
+version = "0.22.0.dev20261104"
 source = { editable = "." }
 default-groups = []
 dependencies = [
@@ -3629,7 +3629,7 @@ test = [
 
 [[package]]
 name = "omnigent-client"
-version = "0.22.0.dev0"
+version = "0.22.0.dev20261104"
 source = { editable = "sdks/python-client" }
 dependencies = [
     { name = "httpx" },
@@ -3673,7 +3673,7 @@ dev = [
 
 [[package]]
 name = "omnigent-slack"
-version = "0.22.0.dev0"
+version = "0.22.0.dev20261104"
 source = { editable = "integrations/slack" }
 dependencies = [
     { name = "aiohttp" },
@@ -3698,7 +3698,7 @@ requires-dist = [
 
 [[package]]
 name = "omnigent-ui-sdk"
-version = "0.22.0.dev0"
+version = "0.22.0.dev20261104"
 source = { editable = "sdks/ui" }
 dependencies = [
     { name = "omnigent-client" },
@@ -3709,7 +3709,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "omnigent-client", specifier = "==0.22.0.dev0" },
+    { name = "omnigent-client", specifier = "==0.22.0.dev20261104" },
     { name = "prompt-toolkit", specifier = ">=3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "rich", specifier = ">=13" },
