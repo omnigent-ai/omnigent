@@ -126,9 +126,9 @@ function scopeTail(rows: Conversation[], cursor: string | null | undefined) {
     const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
     const [key, id] = JSON.parse(new TextDecoder().decode(bytes)) as unknown[];
     const base = rows.find((row) => row.id === id) ?? rows.at(-1);
-    if (typeof key !== "string" || typeof id !== "string" || !base) return base;
-    // Keys are folded already, so this title keys back to the token's position.
-    return { ...base, id, title: key.slice(1) };
+    if (typeof key !== "string" || typeof id !== "string") return base;
+    // Keys are folded already, so this title keys back to the token's position, rows or not.
+    return { ...base, id, title: key.slice(1) } as Conversation;
   } catch {
     return rows.at(-1);
   }

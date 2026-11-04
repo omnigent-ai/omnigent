@@ -207,6 +207,8 @@ it("bounds a Name merge at each token's position after a capped refresh", () => 
   // A boundary row renamed since the fetch leaves the token's position in place.
   const renamed = mine.data.map((r) => (r.id === "a1" ? { ...r, title: "Zulu" } : r));
   expect(mergeIds(renamed, [])).toEqual(["a0"]);
+  // Mine's token still bounds the merge when none of its rows are loaded.
+  expect(mergeIds([], [...shared, titled("s1", "B000")])).toEqual(["s0"]);
 });
 
 it("keys names like the server: folded case, untitled last", () => {

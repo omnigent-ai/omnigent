@@ -3343,6 +3343,7 @@ def test_title_cursor_tokens_are_validated(
 ) -> None:
     """Name pages return tokens, other sorts keep ids, and bad tokens are 400s."""
     from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.stores.conversation_store.sqlalchemy_store import _TITLE_CURSOR_MAX_CHARS
 
     ids = [conversation_store.create_conversation(title=f"a{index}").id for index in range(3)]
     by_title = conversation_store.list_conversations(
@@ -3365,8 +3366,9 @@ def test_title_cursor_tokens_are_validated(
     malformed = ["title.", "title.!!", "title.bm90IGpzb24", "title.WzEsMl0", "title.WyJ4IiwiYiJd"]
     # Keys the store never issues, and a lone surrogate no driver can bind.
     malformed += [token(""), token("2"), token("2a"), token("0a\ud800")]
-    # Nesting this deep exhausts the JSON parser's recursion limit.
-    malformed.append("title." + base64.urlsafe_b64encode(b"[" * 9997).decode().rstrip("="))
+    # The deepest nesting the length cap admits; a low C recursion limit raises RecursionError.
+    deepest = base64.urlsafe_b64encode(b"[" * (_TITLE_CURSOR_MAX_CHARS * 3 // 4)).decode()
+    malformed += ["title." + deepest, "title." + "W" * (_TITLE_CURSOR_MAX_CHARS + 1)]
     # Sub-agent keys are valid positions, after every top-level session.
     sub_agent_page = conversation_store.list_conversations(
         after=token("20a"), sort_by="title", order="asc", kind=None

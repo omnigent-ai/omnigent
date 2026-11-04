@@ -2515,6 +2515,8 @@ describe("useProjectSessions", () => {
   ] as const)(
     "fetches project sessions by %s (archived: %s)",
     async (sortBy, archived, expectedKey) => {
+      // Name pages continue from an opaque token, sent back unchanged.
+      const cursor = sortBy === "title" ? "title.WyIwYSIsImNvbnZfYSJd" : "conv_a";
       fetchMock.mockResolvedValueOnce(
         mockResponse({
           data: [
@@ -2528,8 +2530,8 @@ describe("useProjectSessions", () => {
             },
           ],
           first_id: "conv_a",
-          last_id: "conv_a",
-          has_more: false,
+          last_id: cursor,
+          has_more: true,
         }),
       );
       const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -2552,6 +2554,11 @@ describe("useProjectSessions", () => {
       );
       expect(queryClient.getQueryData(expectedKey)).toBeDefined();
       expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+
+      fetchMock.mockResolvedValueOnce(mockResponse(infinitePage([]).pages[0]));
+      await act(() => result.current.fetchNextPage());
+      const next = new URL(fetchMock.mock.calls[1][0] as string, "http://localhost");
+      expect(next.searchParams.get("after")).toBe(cursor);
     },
   );
 
