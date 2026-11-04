@@ -3973,7 +3973,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     await useChatStore.getState().switchTo("conv_real");
     await settle();
 
-    // A composer holding text that doesn't add recovered text after it discards the draft.
+    // The composer discards the recovered draft; the next send must not name its inputs.
     expect(takeFailedSendDraft("conv_real", true)).toBeNull();
     await useChatStore.getState().send("something else", "agent_xyz");
     const [, sent] =
@@ -22342,7 +22342,9 @@ describe("a send cut off by a reload", () => {
   );
 
   it("resends as a new message a send the composer took back on load before the failed launch's inputs were read", async () => {
+    onTestFinished(clearSessionDrafts);
     seedSession("conv_reload", []);
+    seedSession("conv_other", []);
     failManagedLaunch("conv_reload", "saved on server");
     sessionFailedInputs.get("conv_reload")![0]!.item_id = "stable_reload";
     rememberUnsentSend("conv_reload", {
@@ -22362,6 +22364,8 @@ describe("a send cut off by a reload", () => {
     await useChatStore.getState().switchTo("conv_reload");
     await vi.waitFor(() => expect(answer).toBeDefined());
     expect(takeFailedSendDraft("conv_reload", false)?.stableId).toBe("stable_reload");
+    // The composer saves the text it took back, before the read names its input.
+    setSessionDraft("conv_reload", { text: "saved on server", files: [] });
 
     answer!();
     await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
@@ -22371,6 +22375,15 @@ describe("a send cut off by a reload", () => {
       restoredSendDraft: null,
       returnedStartupInputs: ["pending_first"],
     });
+    const saved = { text: "saved on server", files: [], startupInputIds: ["pending_first"] };
+    expect(getSessionDraft("conv_reload")).toEqual(saved);
+
+    await useChatStore.getState().switchTo("conv_other");
+    releaseConversation("conv_reload");
+    await useChatStore.getState().switchTo("conv_reload");
+    await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(getSessionDraft("conv_reload")).toEqual(saved);
     await useChatStore.getState().send("saved on server", "agent_xyz");
     const [, sent] =
       fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_reload/events")).at(-1) ??

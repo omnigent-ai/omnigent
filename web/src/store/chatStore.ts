@@ -114,7 +114,11 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  addSessionDraftStartupInputs,
+  getSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   forgetUnsentSend,
   peekQueuedSends,
@@ -7890,14 +7894,17 @@ function returnFailedStartupInputs(
     unreturned.filter((input) => stableId != null && input.itemId === stableId);
   const inWaitingDraft = sentAs(state.failedSendDraft?.stableId).map((input) => input.pendingId);
   const inComposer = sentAs(state.pendingRetryStableId).map((input) => input.pendingId);
+  const saved = getSessionDraft(conversationId);
+  // The composer's saved draft holds that send's text, so it names them for a later reload.
+  if (saved !== undefined && inComposer.length > 0)
+    addSessionDraftStartupInputs(conversationId, saved.text, inComposer);
   const held = new Set([
-    ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
+    ...(saved?.startupInputIds ?? []),
     ...(state.failedSendDraft?.startupInputIds ?? []),
     ...inWaitingDraft,
     ...inComposer,
   ]);
-  // Inputs a reloaded draft or resend holds count as returned; clearing it can't bring them back
-  // in this tab.
+  // Ids a saved draft or pending resend already holds count as returned.
   const inputs = unreturned.filter((input) => !held.has(input.pendingId));
   const blocks = state.blocks.filter((block) => !isStartupLookupNotice(block));
   const waiting = handedBackDraft(state.failedSendDraft, inWaitingDraft);

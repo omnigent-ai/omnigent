@@ -1533,21 +1533,17 @@ describe("listFailedInputs", () => {
     ]);
   });
 
-  it("stops reading when the server repeats its cursor", async () => {
-    fetchMock.mockImplementation(async () => mockJsonResponse({ data: [], next_cursor: "a1" }));
-
-    await expect(listFailedInputs("conv_abc")).rejects.toThrow("did not end");
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("stops reading after ten pages", async () => {
+  it.each([
+    { stop: "when the server repeats its cursor", advances: false, pages: 2 },
+    { stop: "after ten pages", advances: true, pages: 10 },
+  ])("stops reading $stop", async ({ advances, pages }) => {
     let cursor = 0;
     fetchMock.mockImplementation(async () =>
-      mockJsonResponse({ data: [], next_cursor: `c${(cursor += 1)}` }),
+      mockJsonResponse({ data: [], next_cursor: `c${advances ? (cursor += 1) : cursor}` }),
     );
 
     await expect(listFailedInputs("conv_abc")).rejects.toThrow("did not end");
-    expect(fetchMock).toHaveBeenCalledTimes(10);
+    expect(fetchMock).toHaveBeenCalledTimes(pages);
   });
 
   it("rejects when the server has no failed-inputs route", async () => {

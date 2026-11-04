@@ -235,6 +235,7 @@ press Space again. Escape cancels. The sidebar's Delete grid menu action forgets
 only the grid, leaving sessions untouched. Unknown local grids show a recovery link.
 Grids wait for account identity; if it is unavailable, use Reload to retry.
 Failed sends restore text and supported attachments unless the cell has a newer draft.
+Messages a failed launch or a reload hands back go after that draft instead.
 Quoted replies recover as serialized text.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
