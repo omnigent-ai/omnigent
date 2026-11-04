@@ -34,6 +34,13 @@ from tests.server.helpers import FakeSandboxLauncher, create_test_agent, registe
 
 _RUNNER_ID = "runner_live"
 _REVIEW_SKILL = {"name": "review", "description": "Review the change.", "content": "Review it."}
+# Turn inputs another tab sends while a command is being refused or run.
+_SKILL_INPUT = {"type": "slash_command", "data": {"kind": "skill", "name": "review"}}
+_COMPACT_INPUT = {"type": "compact", "data": {}}
+_MESSAGE_INPUT = {
+    "type": "message",
+    "data": {"role": "user", "content": [{"type": "input_text", "text": "Q3"}]},
+}
 _OWNER = "alice@example.com"
 _EDITOR = "bob@example.com"
 _READER = "carol@example.com"
@@ -253,15 +260,25 @@ async def continue_session(
     store: SqlAlchemyConversationStore,
     source_id: str,
     command: str,
+    headers: dict[str, str] | None = None,
 ) -> httpx.Response:
-    """Run claude-sdk ``/clear``, or ``/rewind`` to the second prompt, on *source_id*.
+    """Run claude-sdk ``/clear``, or ``/rewind`` to the last prompt, on *source_id*.
 
     :param command: ``"clear"`` or ``"rewind"``.
+    :param headers: Request headers, e.g. the caller's ``X-Forwarded-Email``.
     :returns: The response, whose ``session_id`` names the new session on success.
     """
     if command == "clear":
         return await client.post(
-            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+            f"/v1/sessions/{source_id}/events",
+            json={"type": "clear", "data": {}},
+            headers=headers,
         )
-    second_prompt = store.list_items(source_id).data[2].id
-    return await client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": second_prompt})
+    last_prompt = [
+        item.id
+        for item in store.list_items(source_id).data
+        if isinstance(item.data, MessageData) and item.data.role == "user"
+    ][-1]
+    return await client.post(
+        f"/v1/sessions/{source_id}/rewind", json={"item_id": last_prompt}, headers=headers
+    )

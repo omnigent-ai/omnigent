@@ -9,7 +9,6 @@ transport (shared with the claude-sdk ``/clear`` tests).
 
 from __future__ import annotations
 
-import contextlib
 import uuid
 from typing import Any
 
@@ -17,18 +16,13 @@ import httpx
 import pytest
 
 from omnigent.entities import MessageData, NewConversationItem
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
+from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, managed_repo_labels
-from omnigent.server.routes import sessions as sessions_module
-from omnigent.server.routes._sessions.orchestration import _mark_dispatch_in_flight
 from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
-    SIDE_CHAT_LABEL_KEY,
-    SIDE_CHAT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.integration._session_continuation import (
     _EDITOR,
     _HOST_ID,
@@ -408,12 +402,7 @@ async def test_rewind_still_returns_the_new_session_when_its_attachments_fail(
         # Well-formed ids: another session's prompt, and one no item has.
         ("claude-sdk", 2, "foreign_prompt", 400, "needs one of this session's prompts"),
         ("claude-sdk", 2, "unknown_item", 400, "needs one of this session's prompts"),
-        ("claude-sdk", 2, "none", 503, "runner is offline"),
-        ("claude-sdk", 2, "running", 400, "Stop the current turn"),
-        # A message still on its way to the runner counts as a running turn.
-        ("claude-sdk", 2, "starting", 400, "Stop the current turn"),
         ("claude-sdk", 2, "editor", 403, ""),
-        ("claude-sdk", 0, "side_chat", 400, "isn't available in a side chat"),
     ],
 )
 async def test_rewind_refusals_create_no_session(
@@ -427,21 +416,16 @@ async def test_rewind_refusals_create_no_session(
     status: int,
     message: str,
 ) -> None:
-    """Unsupported harnesses, non-prompts, no placement, busy turns and non-owners are refused."""
+    """Unsupported harnesses, items that aren't this session's prompts and non-owners are refused.
+
+    Refusals shared with ``/clear`` are in ``test_sessions_continuation.py``.
+    """
     resolve_harness_as(monkeypatch, harness)
     store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(
-        auth_client,
-        store,
-        runner_id=None if placement == "none" else _RUNNER_ID,
-        host=placement != "none",
-        user=_OWNER,
-    )
+    source_id = await create_placed_session(auth_client, store, user=_OWNER)
     items = item_ids(store, source_id)
     caller = _OWNER
-    if placement == "running":
-        monkeypatch.setitem(sessions_module._session_status_cache, source_id, "running")
-    elif placement == "editor":
+    if placement == "editor":
         granted = await auth_client.put(
             f"/v1/sessions/{source_id}/permissions",
             json={"user_id": _EDITOR, "level": LEVEL_EDIT},
@@ -449,28 +433,6 @@ async def test_rewind_refusals_create_no_session(
         )
         assert granted.status_code < 300, granted.text
         caller = _EDITOR
-    elif placement == "side_chat":
-        # A side chat rides its source's runner and has no host of its own.
-        side_chat = store.create_conversation(
-            agent_id=store.get_conversation(source_id).agent_id,
-            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source_id},
-        )
-        store.replace_runner_id(side_chat.id, _RUNNER_ID)
-        SqlAlchemyPermissionStore(db_uri).grant(_OWNER, side_chat.id, LEVEL_OWNER)
-        store.append(
-            side_chat.id,
-            [
-                NewConversationItem(
-                    type="message",
-                    response_id="resp_side",
-                    data=MessageData(
-                        role="user", content=[{"type": "input_text", "text": "Side question"}]
-                    ),
-                )
-            ],
-        )
-        source_id = side_chat.id
-        items = item_ids(store, source_id)
     item_id = items[item_index] if item_index is not None else "msg_bogus"
     if placement == "foreign_prompt":
         other_id = await create_placed_session(auth_client, store, user=_OWNER)
@@ -480,16 +442,11 @@ async def test_rewind_refusals_create_no_session(
     headers = {"X-Forwarded-Email": caller}
     before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
 
-    with (
-        _mark_dispatch_in_flight(source_id)
-        if placement == "starting"
-        else contextlib.nullcontext()
-    ):
-        resp = await auth_client.post(
-            f"/v1/sessions/{source_id}/rewind",
-            json={"item_id": item_id},
-            headers=headers,
-        )
+    resp = await auth_client.post(
+        f"/v1/sessions/{source_id}/rewind",
+        json={"item_id": item_id},
+        headers=headers,
+    )
 
     assert resp.status_code == status, resp.text
     assert message in resp.text
