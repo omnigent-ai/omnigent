@@ -4406,9 +4406,21 @@ def test_augment_claude_args_appends_caller_system_prompt(
     merged_args: tuple[str, ...] | None,
 ) -> None:
     """Omnigent's prompt joins the caller's last prompt value, or is added when there is none."""
-    # A readable caller prompt file is still left for Claude to read.
+    # Claude reads a caller's prompt file itself, so Omnigent must never open it.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
+
+    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and os.path.basename(file) == "profile.md":
+                raise AssertionError("Omnigent opened the caller's prompt file")
+            return real_open(file, *args, **kwargs)
+
+        return guarded_open
+
+    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
     omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
@@ -4423,11 +4435,13 @@ def test_augment_claude_args_appends_caller_system_prompt(
         append_system_prompt=_FRAMEWORK_PROMPT,
     )
 
+    prompt_index = omnigent_args.index("--append-system-prompt")
+    assert omnigent_args.count("--append-system-prompt") == 1
+    assert omnigent_args[prompt_index + 1] == _FRAMEWORK_PROMPT
     if merged_args is None:
         assert args == [*user_args, *omnigent_args]
     else:
         # The caller's prompt is sent once, so the launch command does not grow by its size.
-        prompt_index = omnigent_args.index("--append-system-prompt")
         del omnigent_args[prompt_index : prompt_index + 2]
         assert args == [*merged_args, *omnigent_args]
 
