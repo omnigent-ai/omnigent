@@ -190,16 +190,18 @@ _FRAME_SAMPLER = (
 )
 
 # A long HTML artifact whose later steps arrive after load, so the browser clamps
-# the restored offset until the page grows tall enough to reach it.
+# the restored offset until the page grows tall enough to reach it. A banner above the
+# reader then grows without changing the page height, which scroll anchoring follows.
 _HTML_ARTIFACT = (
     "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Plan</title>"
     "<style>body{font-family:sans-serif;margin:24px}section{min-height:220px}</style>"
     + _FRAME_SAMPLER
-    + "</head><body><h1>Migration plan</h1>"
+    + "</head><body><h1>Migration plan</h1><div id='banner' style='height:100px'></div>"
     + _plan_steps(1, 8)
     + "<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', "
-    + json.dumps(_plan_steps(9, 40))
-    + "), 400);</script></body></html>"
+    + json.dumps(_plan_steps(9, 40) + "<div id='spacer' style='height:300px'></div>")
+    + "), 400); setTimeout(() => { banner.style.height = '400px'; spacer.style.height = '0'; },"
+    + " 600);</script></body></html>"
 )
 
 _HTML_PREVIEW = 'iframe[title="HTML preview"]'
@@ -232,6 +234,7 @@ def _open_html_artifact(page: Page, base_url: str, session_id: str) -> int:
     row.click()
     preview = page.frame_locator(_HTML_PREVIEW)
     expect(preview.get_by_role("heading", name="Migration plan")).to_be_visible(timeout=30_000)
+    expect(preview.locator("#banner")).to_have_css("height", "400px")
 
     # Scroll with the wheel, as a reader would, until step 25 is on screen.
     page.locator(_HTML_PREVIEW).hover()
@@ -263,6 +266,7 @@ def _expect_html_scroll(page: Page, expected: int) -> None:
     expect(preview.get_by_role("heading", name="Step 25", exact=True)).to_be_in_viewport(
         timeout=15_000
     )
+    expect(preview.locator("#banner")).to_have_css("height", "400px")
     frame = page.locator(_HTML_PREVIEW).element_handle().content_frame()
     assert frame is not None
     frame.wait_for_function(

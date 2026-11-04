@@ -218,7 +218,7 @@
   // or the zoom shortcut; reports stay off so clamps can't overwrite the offset.
   const USER_SCROLL_EVENTS = ["wheel", "touchstart", "keydown"];
   const SCROLL_KEYS = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "];
-  let scrollRestore = null; // { top, deadline, y, layout } while restoring
+  let scrollRestore = null; // { top, deadline, y, layout, anchoring } while restoring
   let scrollRestoreFrame = 0;
   let restoreHide = null; // the injected style hiding the page until the restore ends
 
@@ -230,8 +230,14 @@
   function settleScrollRestore() {
     revealPage();
     if (!scrollRestore) return;
+    const anchoring = scrollRestore.anchoring;
     scrollRestore = null;
     cancelAnimationFrame(scrollRestoreFrame);
+    document.documentElement.style.setProperty(
+      "overflow-anchor",
+      anchoring.value,
+      anchoring.priority,
+    );
     for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
       window.removeEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, true);
     }
@@ -244,8 +250,14 @@
     );
   }
 
+  // Space presses a focused button or toggles a <summary> instead of scrolling.
+  function spaceActivates(e) {
+    return e.key === " " && !!e.target && /^(BUTTON|SUMMARY)$/.test(e.target.tagName);
+  }
+
   function onRestoreInput(e) {
-    const scrollKey = SCROLL_KEYS.indexOf(e.key) !== -1 && !isEditableTarget(e.target);
+    const scrollKey =
+      SCROLL_KEYS.indexOf(e.key) !== -1 && !isEditableTarget(e.target) && !spaceActivates(e);
     if (e.type !== "keydown" || scrollKey) settleScrollRestore();
   }
 
@@ -296,12 +308,20 @@
       revealPage();
       return;
     }
+    const rootStyle = document.documentElement.style;
     scrollRestore = {
       top: saved.top,
       deadline: performance.now() + saved.budgetMs,
       y: window.scrollY,
       layout: layoutSize(),
+      anchoring: {
+        value: rootStyle.getPropertyValue("overflow-anchor"),
+        priority: rootStyle.getPropertyPriority("overflow-anchor"),
+      },
     };
+    // Scroll anchoring follows late layout above the reader without resizing the page,
+    // which would look like the reader's own scroll.
+    rootStyle.setProperty("overflow-anchor", "none", "important");
     for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
       window.addEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, {
         capture: true,

@@ -132,7 +132,7 @@ describe("injectCommentBridge", () => {
     expect(hide?.getAttribute("data-omni-restore-hide")).toBe(NONCE);
     expect(hide?.textContent).toBe(
       `html{animation:omni-restore-hide ${2 * SCROLL_RESTORE_BUDGET_MS}ms!important}` +
-        "@keyframes omni-restore-hide{from,to{opacity:0}}",
+        "@keyframes omni-restore-hide{from,to{opacity:0;pointer-events:none}}",
     );
   });
 });
@@ -316,6 +316,7 @@ describe("bridge runtime scroll position", () => {
   afterEach(() => {
     vi.useRealTimers();
     document.head.querySelectorAll("style[data-omni-restore-hide]").forEach((el) => el.remove());
+    document.documentElement.style.removeProperty("overflow-anchor");
   });
 
   /** The style injected with a saved offset to hide the page, as the runtime finds it. */
@@ -467,6 +468,19 @@ describe("bridge runtime scroll position", () => {
     expect(window.scrollY).toBe(232);
   });
 
+  it("turns scroll anchoring off until the restore settles, then gives the page its own", () => {
+    fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+    const rootStyle = document.documentElement.style;
+    rootStyle.setProperty("overflow-anchor", "auto");
+    startRuntime({ restoreScroll: restoreTo(640) });
+    expect(rootStyle.getPropertyValue("overflow-anchor")).toBe("none");
+    expect(rootStyle.getPropertyPriority("overflow-anchor")).toBe("important");
+
+    vi.advanceTimersByTime(BUDGET_MS + 20);
+    expect(rootStyle.getPropertyValue("overflow-anchor")).toBe("auto");
+    expect(rootStyle.getPropertyPriority("overflow-anchor")).toBe("");
+  });
+
   it("keeps restoring when content growing above the reader moves the offset", () => {
     const { scrollTo, setPageHeight } = fakeScrolling();
     const port = startRuntime({ restoreScroll: restoreTo(640) });
@@ -494,6 +508,20 @@ describe("bridge runtime scroll position", () => {
 
   const dispatchToPage = (event: Event) => document.body.dispatchEvent(event);
 
+  /** Press `key` on a focused element of the page, as a reader would. */
+  function pressIn(focused: HTMLElement, key: string) {
+    document.body.append(focused);
+    focused.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+    focused.remove();
+  }
+
+  function editableText() {
+    const text = document.createElement("div");
+    // jsdom doesn't implement isContentEditable.
+    Object.defineProperty(text, "isContentEditable", { value: true });
+    return text;
+  }
+
   it.each<[string, (userScrollTo: (top: number) => void) => void]>([
     ["the wheel", () => dispatchToPage(new Event("wheel", { bubbles: true }))],
     ["a touch", () => dispatchToPage(new Event("touchstart", { bubbles: true }))],
@@ -501,6 +529,7 @@ describe("bridge runtime scroll position", () => {
       "a scroll key",
       () => dispatchToPage(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true })),
     ],
+    ["a space on a focused link", () => pressIn(document.createElement("a"), " ")],
     ["the scrollbar", (userScrollTo) => userScrollTo(100)],
   ])("stops restoring when the reader takes over with %s", (_label, takeOver) => {
     const { scrollTo, userScrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
@@ -517,20 +546,6 @@ describe("bridge runtime scroll position", () => {
     expect(sentScrollOffsets(port).at(-1)).toBe(200);
   });
 
-  /** Press `key` in an editable element of the page, as a reader typing into it would. */
-  function pressIn(editable: HTMLElement, key: string) {
-    document.body.append(editable);
-    editable.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
-    editable.remove();
-  }
-
-  function editableText() {
-    const text = document.createElement("div");
-    // jsdom doesn't implement isContentEditable.
-    Object.defineProperty(text, "isContentEditable", { value: true });
-    return text;
-  }
-
   it.each<[string, () => void]>([
     ["a click", () => dispatchToPage(new Event("pointerdown", { bubbles: true }))],
     [
@@ -544,6 +559,8 @@ describe("bridge runtime scroll position", () => {
     ],
     ["a space typed into a form field", () => pressIn(document.createElement("input"), " ")],
     ["an arrow key in editable text", () => pressIn(editableText(), "ArrowDown")],
+    ["a space on a focused button", () => pressIn(document.createElement("button"), " ")],
+    ["a space on a <summary>", () => pressIn(document.createElement("summary"), " ")],
   ])("keeps restoring through %s", (_label, interact) => {
     const { scrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
     const hide = addRestoreHide();
