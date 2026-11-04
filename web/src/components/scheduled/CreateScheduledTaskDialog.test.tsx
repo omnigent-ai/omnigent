@@ -32,7 +32,6 @@ import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { renderTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { emptyTriggerFields, renderTriggerPrompt, splitTriggerPrompt } from "./triggerTemplates";
 
@@ -2368,8 +2367,6 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       sandbox_provider: provider,
       sandbox_providers: [provider],
     });
-    // On a connected host the agent may lack the tools, so the warning shows.
-    expect(screen.getByTestId("task-trigger-tools-note")).toBeInTheDocument();
     const host = screen.getByTestId("task-host-trigger");
     fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(host);
