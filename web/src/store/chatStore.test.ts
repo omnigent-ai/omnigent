@@ -632,6 +632,9 @@ function failManagedLaunch(id: string, text: string): void {
   ]);
 }
 
+/** The failed startup input `failManagedLaunch` leaves, as the composer holding it passes it. */
+const composerHoldsFirstInput = { startupInputIds: ["pending_first"] };
+
 describe("isTempConvId", () => {
   it("recognizes client-only temp conversation ids and rejects real ones", () => {
     expect(isTempConvId("temp:0a1b2c3d")).toBe(true);
@@ -3821,6 +3824,15 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
         (block) => block.type === "error" && block.level === "info",
       );
       expect(notices).toEqual([expect.objectContaining({ title, message })]);
+
+      // No composer can hold an input without text, so the next send replaces it.
+      await useChatStore.getState().send("next message", "agent_xyz");
+      const [, sent] =
+        fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_real/events")).at(-1) ??
+        [];
+      expect(JSON.parse(String(sent?.body)).replaces_failed_inputs).toEqual(
+        draft === null ? ["pending_first"] : undefined,
+      );
     },
   );
 
@@ -3884,15 +3896,41 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       "pending_first",
       "pending_second",
     ]);
+
+    // A send names the inputs no composer holds, so a later open doesn't offer them again.
+    await useChatStore.getState().send("something else", "agent_xyz");
+    const [, sent] =
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_real/events")).at(-1) ??
+      [];
+    expect(JSON.parse(String(sent?.body)).replaces_failed_inputs).toEqual([
+      "pending_first",
+      "pending_second",
+    ]);
   });
 
   it.each([
-    { outcome: "is refused", reachesServer: true, command: false },
-    { outcome: "never reaches the server", reachesServer: false, command: false },
-    { outcome: "is refused as a skill command", reachesServer: true, command: true },
+    { outcome: "is refused", reachesServer: true, command: false, newerInput: false },
+    {
+      outcome: "never reaches the server",
+      reachesServer: false,
+      command: false,
+      newerInput: false,
+    },
+    {
+      outcome: "is refused as a skill command",
+      reachesServer: true,
+      command: true,
+      newerInput: false,
+    },
+    {
+      outcome: "is refused after newer input",
+      reachesServer: true,
+      command: false,
+      newerInput: true,
+    },
   ])(
     "keeps only the resend in the composer when it $outcome after the failed launch",
-    async ({ reachesServer, command }) => {
+    async ({ reachesServer, command, newerInput }) => {
       onTestFinished(clearSessionDrafts);
       vi.mocked(getCurrentUserId).mockReturnValue("user_a");
       onTestFinished(() => {
@@ -3927,15 +3965,21 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       });
       const resendText = command ? "/review saved on server" : "saved on server, edited";
       if (command)
-        await useChatStore.getState().sendSlashCommand("review", "saved on server", "agent_xyz");
-      else await useChatStore.getState().send(resendText, "agent_xyz");
+        await useChatStore
+          .getState()
+          .sendSlashCommand("review", "saved on server", "agent_xyz", composerHoldsFirstInput);
+      else
+        await useChatStore
+          .getState()
+          .send(resendText, "agent_xyz", undefined, composerHoldsFirstInput);
 
       if (reachesServer)
         expect(resend).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
       // A reload while a message is open finds what it replaces; skill commands aren't kept.
       expect(journaled).toEqual(command ? undefined : ["pending_first"]);
       expect(getSessionDraft("conv_real")).toBeUndefined();
-      const failed = takeFailedSendDraft("conv_real", false, true);
+      // Newer input in the composer doesn't drop the refused resend; it's added after.
+      const failed = takeFailedSendDraft("conv_real", newerInput, true);
       expect(failed).toMatchObject({
         text: resendText,
         serverRefused: reachesServer,
@@ -4014,8 +4058,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       });
 
       if (command)
-        await useChatStore.getState().sendSlashCommand("review", "saved on server", "agent_xyz");
-      else await useChatStore.getState().send("saved on server", "agent_xyz");
+        await useChatStore
+          .getState()
+          .sendSlashCommand("review", "saved on server", "agent_xyz", composerHoldsFirstInput);
+      else
+        await useChatStore
+          .getState()
+          .send("saved on server", "agent_xyz", undefined, composerHoldsFirstInput);
       await settle();
 
       expect(posts).toEqual([
@@ -4092,8 +4141,12 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       });
 
       const resend = command
-        ? useChatStore.getState().sendSlashCommand("review", "saved on server", "agent_xyz")
-        : useChatStore.getState().send("saved on server", "agent_xyz");
+        ? useChatStore
+            .getState()
+            .sendSlashCommand("review", "saved on server", "agent_xyz", composerHoldsFirstInput)
+        : useChatStore
+            .getState()
+            .send("saved on server", "agent_xyz", undefined, composerHoldsFirstInput);
       await vi.waitFor(() => expect(denyResend).toBeDefined());
       const queued =
         via === "send"
@@ -4147,7 +4200,15 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       });
 
       useChatStore.setState({ sessionStatus: "running" });
-      await useChatStore.getState().enqueueMessage("saved on server");
+      useChatStore
+        .getState()
+        .enqueueMessage(
+          "saved on server",
+          undefined,
+          undefined,
+          undefined,
+          composerHoldsFirstInput,
+        );
       await useChatStore.getState().switchTo("conv_other");
       await settle();
       expect(posts).toHaveLength(0);
@@ -4202,7 +4263,9 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     await useChatStore.getState().switchTo("conv_real");
     await settle();
 
-    const resend = useChatStore.getState().send("saved on server", "agent_xyz");
+    const resend = useChatStore.getState().send("saved on server", "agent_xyz", undefined, {
+      startupInputIds: getSessionDraft("conv_real")?.startupInputIds,
+    });
     await vi.waitFor(() => expect(denyResend).toBeDefined());
     const queued = useChatStore.getState().send("something else", "agent_xyz");
     denyResend!();
@@ -4259,8 +4322,12 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     });
 
     const resend = command
-      ? useChatStore.getState().sendSlashCommand("review", "saved on server", "agent_xyz")
-      : useChatStore.getState().send("saved on server", "agent_xyz", [file]);
+      ? useChatStore
+          .getState()
+          .sendSlashCommand("review", "saved on server", "agent_xyz", composerHoldsFirstInput)
+      : useChatStore
+          .getState()
+          .send("saved on server", "agent_xyz", [file], composerHoldsFirstInput);
     await vi.waitFor(() => expect(refuseResend).toBeDefined());
     if (handedBack) {
       sessionFailedInputs.get("conv_real")!.push({
@@ -4310,7 +4377,9 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     await vi.waitFor(() => expect(release).toBeDefined());
 
     sessionFailedInputs.delete("conv_real");
-    await useChatStore.getState().send("saved on server", "agent_xyz");
+    await useChatStore
+      .getState()
+      .send("saved on server", "agent_xyz", undefined, composerHoldsFirstInput);
     release!();
     await staleRead;
 
@@ -22551,7 +22620,9 @@ describe("a send cut off by a reload", () => {
     expect(takeFailedSendDraft("conv_reload", false, true)?.text).toBe("saved on server");
     useChatStore.setState({ sessionStatus: "running" });
 
-    useChatStore.getState().enqueueMessage("saved on server");
+    useChatStore
+      .getState()
+      .enqueueMessage("saved on server", undefined, undefined, undefined, composerHoldsFirstInput);
 
     const [queued] = useChatStore.getState().queuedMessages;
     expect(peekQueuedSends("conv_reload")).toEqual([
@@ -22749,7 +22820,9 @@ describe("a send cut off by a reload", () => {
     await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(getSessionDraft("conv_reload")).toEqual(saved);
-    await useChatStore.getState().send("saved on server", "agent_xyz");
+    await useChatStore.getState().send("saved on server", "agent_xyz", undefined, {
+      startupInputIds: getSessionDraft("conv_reload")?.startupInputIds,
+    });
     const [, sent] =
       fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_reload/events")).at(-1) ??
       [];

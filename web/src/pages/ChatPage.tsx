@@ -657,6 +657,7 @@ export function ChatPage() {
     text: string;
     files: File[];
     replyDraft?: StoredReplyDraft;
+    startupInputIds?: string[];
   } | null>(null);
 
   // Replay the queued message once the picker's bind brings the runner
@@ -669,9 +670,9 @@ export function ChatPage() {
     if (pendingResumePrompt === null || !agentId || !urlConvId) return;
     if (pendingResumePrompt.sessionId !== urlConvId) return;
     if (runnerOnline !== true) return;
-    const { text, files, replyDraft } = pendingResumePrompt;
+    const { text, files, replyDraft, startupInputIds } = pendingResumePrompt;
     setPendingResumePrompt(null);
-    void useChatStore.getState().send(text, agentId, files, { replyDraft });
+    void useChatStore.getState().send(text, agentId, files, { replyDraft, startupInputIds });
   }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
 
   // Pending elicitation = parked on user input — suppress shimmer. Must
@@ -983,7 +984,7 @@ export function ChatPage() {
   const sendReconnectsArca = isUnreachable && liveness.kind === "host_offline" && reconnectsArca;
 
   const onSend = useCallback(
-    (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
+    (text: string, files?: File[], replyDraft?: StoredReplyDraft, startupInputIds?: string[]) => {
       if (!agentId) return;
       // No server session yet (still creating) — nothing to POST to.
       if (isTempConvId(urlConvId)) return;
@@ -993,7 +994,13 @@ export function ChatPage() {
       // into a session the user may switch to first; carry any attachments
       // so the replay sends the same payload.
       if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [], replyDraft });
+        setPendingResumePrompt({
+          sessionId: urlConvId,
+          text,
+          files: files ?? [],
+          replyDraft,
+          startupInputIds,
+        });
         setResumeDirDialogOpen(true);
         return;
       }
@@ -1002,9 +1009,10 @@ export function ChatPage() {
         void reconnect();
         // Posting now could record a failed turn, so the message waits for the host.
         if (sendReconnectsArca) {
-          useChatStore
-            .getState()
-            .enqueueMessage(text, files, replyDraft, urlConvId, { waitingForHost: true });
+          useChatStore.getState().enqueueMessage(text, files, replyDraft, urlConvId, {
+            waitingForHost: true,
+            startupInputIds,
+          });
         }
         return;
       }
@@ -1030,11 +1038,12 @@ export function ChatPage() {
           holdsInitialDraft(chat),
         )
       ) {
-        chat.enqueueMessage(text, files, replyDraft);
+        chat.enqueueMessage(text, files, replyDraft, undefined, { startupInputIds });
         return;
       }
       void useChatStore.getState().send(text, agentId, files, {
         replyDraft,
+        startupInputIds,
         onConversationCreated: (newId) => {
           // Eager URL update: the moment the server tells us this
           // conversation's id, promote `/` → `/c/:newId`. Replace (not
@@ -1058,7 +1067,7 @@ export function ChatPage() {
   );
 
   const onSendSlashCommand = useCallback(
-    (name: string, args: string) => {
+    (name: string, args: string, startupInputIds?: string[]) => {
       if (!agentId) return;
       // Slash commands aren't replayed (an edge), but still route an unbound
       // coding clone to the directory picker so it isn't a dead end.
@@ -1071,6 +1080,7 @@ export function ChatPage() {
         return;
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+        startupInputIds,
         onConversationCreated: (newId) => {
           navigate(`/c/${newId}`, { replace: true });
         },
@@ -1379,14 +1389,14 @@ interface MainAgentSurfaceProps {
   liveness: SessionLiveness;
   agentsError: unknown;
   disabled: boolean;
-  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  onSend: ComposerProps["onSend"];
   /**
    * Invoke a skill via the `slash_command` event path. Gated off inside
    * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
    * is sent as plaintext for the vendor TUI to handle. See
    * `ComposerProps.onSendSlashCommand`.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: ComposerProps["onSendSlashCommand"];
   onStop: () => void;
   onShowReconnectHelp: () => void;
   /** Sending reconnects the offline Arca host, so the composer stays enabled. */
@@ -1724,9 +1734,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
-        ? (name: string, args: string) => {
+        ? (name: string, args: string, startupInputIds?: string[]) => {
             setSendScrollNonce((n) => n + 1);
-            onSendSlashCommand(name, args);
+            onSendSlashCommand(name, args, startupInputIds);
           }
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
@@ -1994,7 +2004,13 @@ interface ComposerProps {
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
   disabled: boolean;
-  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  /** `startupInputIds` names the failed startup inputs the sent draft holds. */
+  onSend: (
+    text: string,
+    files?: File[],
+    replyDraft?: StoredReplyDraft,
+    startupInputIds?: string[],
+  ) => void;
   /**
    * Send a recognised skill as a `slash_command` event (the REPL's wire
    * shape) instead of plaintext. When present and the typed command names
@@ -2003,7 +2019,7 @@ interface ComposerProps {
    * native-terminal sessions, which always send `/skill` as plaintext so
    * the vendor TUI loads the skill itself.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string, startupInputIds?: string[]) => void;
   onStop: () => void;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
@@ -3637,6 +3653,11 @@ function ComposerImpl(
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
+    // The failed startup inputs this draft holds go out with it, never with another send.
+    const startupInputIds = conversationId
+      ? getSessionDraft(conversationId)?.startupInputIds
+      : undefined;
+    const startupInputsArg = startupInputIds ? ([startupInputIds] as const) : ([] as const);
 
     // A generic (non-Codex) side chat forks the conversation and runs it on the
     // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
@@ -3678,7 +3699,7 @@ function ComposerImpl(
       const arg = parts[1] ?? "";
       const sendSkill = (match: { command: string; args: string }) => {
         appendEntry(trimmed);
-        onSendSlashCommand?.(match.command.slice(1), match.args);
+        onSendSlashCommand?.(match.command.slice(1), match.args, ...startupInputsArg);
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3772,10 +3793,16 @@ function ComposerImpl(
           index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
         ),
       };
-      onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
+      onSend(
+        serializeReplyDraft(outgoing),
+        sendFiles,
+        snapshotReplyDraft(outgoing),
+        ...startupInputsArg,
+      );
     } else {
       const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
-      onSend(mentionPreamble + message, sendFiles);
+      if (startupInputIds) onSend(mentionPreamble + message, sendFiles, undefined, startupInputIds);
+      else onSend(mentionPreamble + message, sendFiles);
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
@@ -3791,6 +3818,17 @@ function ComposerImpl(
       return;
     }
     submit({ resetNativeInputSession: true });
+  };
+
+  // A queued message pulled back into the composer brings the failed startup inputs it took.
+  const takeBackQueued = (message: {
+    queueId: string;
+    text: string;
+    startupInputIds?: string[];
+  }) => {
+    if (conversationId && message.startupInputIds?.length)
+      addSessionDraftStartupInputs(conversationId, message.text, message.startupInputIds);
+    dequeueMessage(message.queueId);
   };
 
   const applyRecall = (ta: HTMLTextAreaElement, recalled: ComposerDraft) => {
@@ -3884,7 +3922,7 @@ function ComposerImpl(
             e.preventDefault();
             resetCursor();
             restoreFiles(target.files ?? []);
-            dequeueMessage(target.queueId);
+            takeBackQueued(target);
             applyRecall(ta, target);
             return;
           }
@@ -3973,7 +4011,7 @@ function ComposerImpl(
             recallingRef.current = false;
             textareaRef.current = tailTextareaRef.current;
             restoreFiles(target.files ?? []);
-            dequeueMessage(queueId);
+            takeBackQueued(target);
             textareaRef.current?.focus();
           }}
           onSteer={(queueId) => steerMessage(queueId)}

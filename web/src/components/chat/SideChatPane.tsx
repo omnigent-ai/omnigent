@@ -54,7 +54,6 @@ import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
-  claimComposerStartupInputs,
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
   holdsInitialDraft,
@@ -841,15 +840,14 @@ function SideChatComposer({
     const skill = routeLocally
       ? matchSlashCommandInvocation(trimmed, Object.keys(skillCommands))
       : null;
-    const clearForSend = () => {
-      claimComposerStartupInputs(childId);
-      clearComposer(childId);
-    };
+    // The failed startup inputs this draft holds; the send names them, not other composers'.
+    const startupInputIds = composer?.startupInputIds;
     const runSkill = (match: { command: string; args: string }) => {
-      clearForSend();
+      clearComposer(childId);
       onSend();
       void sendSlashCommand(match.command.slice(1), match.args, agentId, {
         pinnedConversationId: childId,
+        startupInputIds,
       }).finally(refreshLabels);
     };
     // A multi-word catalog skill outranks a built-in that matches only its first
@@ -884,16 +882,21 @@ function SideChatComposer({
         holdsInitialDraft(child),
       )
     ) {
-      clearForSend();
+      clearComposer(childId);
       onSend();
-      enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
+      enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId, {
+        startupInputIds,
+      });
       return;
     }
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
-    clearForSend();
+    clearComposer(childId);
     onSend();
-    void send(message, agentId, outgoing, { pinnedConversationId: childId }).finally(refreshLabels);
+    void send(message, agentId, outgoing, {
+      pinnedConversationId: childId,
+      startupInputIds,
+    }).finally(refreshLabels);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => {
@@ -954,7 +957,11 @@ function SideChatComposer({
               const target = queuedMessages.find((message) => message.queueId === queueId);
               if (!target) return;
               const restored = restoreReplyDraft(target.text, target.replyDraft);
-              updateComposer(childId, () => ({ ...restored, files: target.files ?? [] }));
+              updateComposer(childId, () => ({
+                ...restored,
+                files: target.files ?? [],
+                ...(target.startupInputIds ? { startupInputIds: target.startupInputIds } : {}),
+              }));
               dequeueMessage(queueId);
               tailTextareaRef.current?.focus();
             }}

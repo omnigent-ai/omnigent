@@ -6,12 +6,13 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
 import { toast } from "sonner";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import * as filesApi from "@/lib/filesApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
@@ -1030,7 +1031,7 @@ describe("side-chat interrupt", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
-  it("restores a queued follow-up's quote when it is edited", () => {
+  it("restores a queued follow-up's quote and failed startup inputs when it is edited", () => {
     writeAlwaysSteer(false);
     useChatStore.setState({
       sideChatComposers: {
@@ -1038,6 +1039,7 @@ describe("side-chat interrupt", () => {
           text: "Follow up",
           files: [],
           quotes: [{ id: "quote", before: "Earlier answer", text: "Quoted passage" }],
+          startupInputIds: ["pending_first"],
         },
       },
     });
@@ -1054,6 +1056,7 @@ describe("side-chat interrupt", () => {
       text: "Follow up",
       files: [],
       quotes: [expect.objectContaining({ before: "Earlier answer", text: "Quoted passage" })],
+      startupInputIds: ["pending_first"],
     });
     expect(input).toHaveValue("Follow up");
     expect(useChatStore.getState().queuedMessages).toEqual([]);
@@ -1825,5 +1828,53 @@ it.each([
     await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveValue(left));
     await act(() => retryFailedStartupLookup(childId));
     expect(screen.getByTestId("side-chat-input")).toHaveValue(left);
+  },
+);
+
+it.each([
+  { holder: "the grid composer", sender: "the main composer", gridHolds: true },
+  { holder: "the main composer's saved draft", sender: "the grid composer", gridHolds: false },
+])(
+  "doesn't name a failed startup input $holder holds in an unrelated send from $sender",
+  async ({ gridHolds }) => {
+    onTestFinished(clearSessionDrafts);
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({
+      sessionStatus: "idle",
+      abortController: new AbortController(),
+      returnedStartupInputs: ["pending_first"],
+    });
+    useChatStore.setState({ send: initialStoreState.send });
+    renderPane(<SideChatPane childId={childId} fullSession />);
+    const recovered = { text: "saved on server", files: [], startupInputIds: ["pending_first"] };
+    if (gridHolds)
+      act(() =>
+        entry.setState({
+          failedSendDraft: { conversationId: childId, ...recovered, recovered: true },
+        }),
+      );
+    else setSessionDraft(childId, recovered);
+    const post = vi.spyOn(sessionsApi, "postEvent").mockResolvedValue({ queued: true });
+
+    if (gridHolds) {
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("saved on server");
+      // The main composer passes the inputs its own saved draft holds: none.
+      await act(() =>
+        useChatStore.getState().send("unrelated", "agent_side", undefined, {
+          pinnedConversationId: childId,
+          startupInputIds: getSessionDraft(childId)?.startupInputIds,
+        }),
+      );
+    } else {
+      fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "unrelated" } });
+      fireEvent.click(screen.getByTestId("side-chat-send"));
+    }
+    await waitFor(() => expect(post).toHaveBeenCalledOnce());
+    expect(post.mock.calls[0][1]).toMatchObject({
+      data: { content: [{ type: "input_text", text: "unrelated" }] },
+    });
+    expect(post.mock.calls[0][1]).not.toHaveProperty("replaces_failed_inputs");
+    if (gridHolds) expect(screen.getByTestId("side-chat-input")).toHaveValue("saved on server");
+    else expect(getSessionDraft(childId)).toEqual(recovered);
   },
 );

@@ -232,6 +232,16 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
   };
 }
 
+/** Queue a composer send through the store, as ChatPage does mid-turn. */
+function enqueueFromComposer(
+  text: string,
+  files?: File[],
+  replyDraft?: StoredReplyDraft,
+  startupInputIds?: string[],
+): void {
+  useChatStore.getState().enqueueMessage(text, files, replyDraft, undefined, { startupInputIds });
+}
+
 async function openSessionModels() {
   if (!screen.queryByTestId("composer-agent-menu")) openSessionConfig();
   fireEvent.click(screen.getByTestId("composer-agent-edit"));
@@ -5654,9 +5664,7 @@ describe("Composer reply quotes", () => {
   it("does not clear a new identical draft after submitting an edited restored send", async () => {
     const stableId = "f".repeat(32);
     // Submit through the store: the queued path is what a mid-turn Enter takes.
-    renderWithTooltips(
-      <Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />,
-    );
+    renderWithTooltips(<Composer {...composerProps({ onSend: enqueueFromComposer })} />);
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
@@ -6448,7 +6456,7 @@ describe("Composer — editing queued messages", () => {
 
   it("dequeues the recalled message so re-sending can't duplicate it", async () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     renderWithTooltips(<Composer {...props} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
@@ -6510,6 +6518,35 @@ describe("Composer — editing queued messages", () => {
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
   });
 
+  it.each(["ArrowUp", "Edit"])(
+    "takes back the failed startup inputs a queued message replaces when recalled with %s",
+    (via) => {
+      useChatStore.setState({
+        queuedMessages: [
+          {
+            queueId: "q_1",
+            text: QUEUED_TEXT,
+            conversationId: CONV,
+            startupInputIds: ["pending_first"],
+          },
+        ],
+      });
+      appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+      const props = composerProps();
+      renderWithTooltips(<Composer {...props} />);
+
+      if (via === "ArrowUp") fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+      else fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+
+      expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+      expect(getSessionDraft(CONV)?.startupInputIds).toEqual(["pending_first"]);
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledWith(QUEUED_TEXT, undefined, undefined, [
+        "pending_first",
+      ]);
+    },
+  );
+
   it.each([
     ["", "screenshot.png"],
     ["Look at this", "screenshot.png"],
@@ -6521,7 +6558,7 @@ describe("Composer — editing queued messages", () => {
     useChatStore.setState({
       queuedMessages: [{ queueId: "q_image", text, conversationId: CONV, files: [file] }],
     });
-    const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+    const onSend = vi.fn(enqueueFromComposer);
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
     const strip = screen.getByTestId("composer-queued-strip");
@@ -6575,7 +6612,7 @@ describe("Composer — editing queued messages", () => {
 
   it.each([false, true])("recalls queued path mentions with quotes: %s", (quoted) => {
     useChatStore.setState({ queuedMessages: [], sessionHarness: "codex-native" });
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...props} ref={ref} />);
     act(() =>

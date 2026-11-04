@@ -236,7 +236,7 @@ export interface SendOptions {
    * status still settles.
    */
   onError?: (message: string) => void;
-  /** The failed startup inputs a queued message took from the composer, named instead of the composer's. */
+  /** The failed startup inputs the submitting composer holds, replaced once the send is accepted. */
   startupInputIds?: string[];
 }
 
@@ -1266,14 +1266,15 @@ export interface ChatActions {
    * turn) when the session next goes idle — see the `session_status` handler.
    * `conversationId` targets a live conversation beside the visible one (a side chat).
    * `waitingForHost` holds it until `releaseHostHeldMessages`, for a send made
-   * while the session's host is offline.
+   * while the session's host is offline. `startupInputIds` names the failed
+   * startup inputs the submitting composer holds.
    */
   enqueueMessage: (
     text: string,
     files?: File[],
     replyDraft?: StoredReplyDraft,
     conversationId?: string,
-    opts?: { waitingForHost?: boolean },
+    opts?: { waitingForHost?: boolean; startupInputIds?: string[] },
   ) => void;
   /** Let a conversation's messages held for an offline host flush again. */
   releaseHostHeldMessages: (conversationId: string) => void;
@@ -2253,6 +2254,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       void get().send(text, boundAgentId, files, {
         replyDraft,
         pinnedConversationId: conversationId,
+        startupInputIds: opts?.startupInputIds,
       });
       return;
     }
@@ -2260,8 +2262,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
     const offScreen = targetId !== undefined && targetId !== get().conversationId;
-    const { replaces_failed_inputs: startupInputIds } =
-      failedStartupInputsReplacedBy(conversationId)();
+    const { replaces_failed_inputs: startupInputIds } = failedStartupInputsReplacedBy(
+      conversationId,
+      opts?.startupInputIds,
+    );
     target.write((s) => ({
       // Queueing consumes the composer like a send does: a restored failed
       // send is no longer what the composer holds, and the queued message
@@ -2833,12 +2837,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
     const sendOut = Symbol("send");
-    const replacedOnTurn = failedStartupInputsReplacedBy(
+    const replacesFailedInputs = failedStartupInputsReplacedBy(
       submitConversationId,
-      sendOut,
       opts?.startupInputIds,
+      sendOut,
     );
-    let replacesFailedInputs = replacedOnTurn();
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
     const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
@@ -2863,7 +2866,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     inFlightSends.set(stableId, false);
     try {
       await waitForPrior();
-      replacesFailedInputs = replacedOnTurn();
       if (initialDraft && !initialSendPending()) return;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
@@ -3219,8 +3221,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
     const commandOut = Symbol("slash_command");
-    const replacedOnTurn = failedStartupInputsReplacedBy(submitConversationId, commandOut);
-    let replacesFailedInputs = replacedOnTurn();
+    const replacesFailedInputs = failedStartupInputsReplacedBy(
+      submitConversationId,
+      opts?.startupInputIds,
+      commandOut,
+    );
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -3229,7 +3234,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     try {
       await waitForPrior();
-      replacesFailedInputs = replacedOnTurn();
       // See `send`: rekey inside the call, before the new id is visible.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
@@ -4069,7 +4073,7 @@ function queuedSendOptions(
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,
-    startupInputIds: message.startupInputIds ?? [],
+    startupInputIds: message.startupInputIds,
     onError: (error) => {
       setActive((s) => {
         if (s.queuedMessages.some((m) => m.queueId === message.queueId)) return {};
@@ -7592,7 +7596,8 @@ export function restoredSendDraftUnchanged(
 
 /**
  * Consume a session's failed send once, retaining retry identity only when restored.
- * `appendsRecovered`: the composer adds a recovered send after its newer input.
+ * `appendsRecovered`: the composer adds a recovered send, or one replacing startup inputs,
+ * after its newer input.
  */
 export function takeFailedSendDraft(
   conversationId: string,
@@ -7604,7 +7609,10 @@ export function takeFailedSendDraft(
   if (!state || !failed || failed.conversationId !== conversationId) return null;
   const delivered = committedItemProvesDelivery(state.blocks, failed);
   // Added after newer input, the text goes out as a new message.
-  const appended = hasDraft && appendsRecovered && failed.recovered === true;
+  const appended =
+    hasDraft &&
+    appendsRecovered &&
+    (failed.recovered === true || (failed.startupInputIds?.length ?? 0) > 0);
   const restore = (!hasDraft || appended) && !delivered;
   const tracked = restore && !appended;
   const patch: Partial<ConversationState> = { failedSendDraft: null };
@@ -7873,35 +7881,31 @@ function nameStartupInputsOut(conversationId: string | null, send: symbol, ids?:
 }
 
 /**
- * The failed startup inputs a send replaces: those `taken` when it was queued, else
- * those its composer holds before clearing. Ids a send still out or a queued message
- * holds stay theirs; with `send`, each read is recorded.
+ * The failed startup inputs a send replaces: those its composer `held` when submitted and any
+ * handed back that no composer holds, less those a send still out or a queued message names.
+ * With `send`, they're its own.
  */
 function failedStartupInputsReplacedBy(
   conversationId: string | null,
+  held: readonly string[] | undefined,
   send?: symbol,
-  taken?: string[],
-): () => { replaces_failed_inputs?: string[] } {
-  if (conversationId === null) return () => ({});
-  const returned = setterForState(conversationId)?.returnedStartupInputs ?? [];
-  const drafted = getSessionDraft(conversationId)?.startupInputIds ?? [];
+): { replaces_failed_inputs?: string[] } {
+  if (conversationId === null) return {};
   const ahead = new Set([
     ...[...(startupInputsNamedOut.get(conversationId)?.values() ?? [])].flat(),
     ...queuedStartupInputs(conversationId),
   ]);
-  return () => {
-    const stillReturned = setterForState(conversationId)?.returnedStartupInputs ?? [];
-    const ids = [
-      ...new Set(
-        taken?.filter((id) => !ahead.has(id)) ?? [
-          ...returned.filter((id) => stillReturned.includes(id) && !ahead.has(id)),
-          ...drafted.filter((id) => !ahead.has(id)),
-        ],
-      ),
-    ];
-    if (send) nameStartupInputsOut(conversationId, send, ids);
-    return ids.length === 0 ? {} : { replaces_failed_inputs: ids };
-  };
+  const state = setterForState(conversationId);
+  // A cleared or attachment-only input stays failed on the server until a send names it.
+  const composerHeld = new Set([
+    ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
+    ...(useChatStore.getState().sideChatComposers[conversationId]?.startupInputIds ?? []),
+    ...(state?.failedSendDraft?.startupInputIds ?? []),
+  ]);
+  const unheld = (state?.returnedStartupInputs ?? []).filter((id) => !composerHeld.has(id));
+  const ids = [...new Set([...(held ?? []), ...unheld])].filter((id) => !ahead.has(id));
+  if (send) nameStartupInputsOut(conversationId, send, ids);
+  return ids.length === 0 ? {} : { replaces_failed_inputs: ids };
 }
 
 /** The failed startup inputs a conversation's queued messages took from its composer. */
@@ -7911,24 +7915,6 @@ function queuedStartupInputs(conversationId: string): string[] {
     .queuedMessages.flatMap((m) =>
       m.conversationId === conversationId ? (m.startupInputIds ?? []) : [],
     );
-}
-
-/**
- * Count the failed startup inputs a grid or side-chat composer holds as handed
- * back before it clears them for a send, so the send names them after a reopen.
- *
- * @param conversationId - The session the composer belongs to.
- */
-export function claimComposerStartupInputs(conversationId: string): void {
-  const ids = useChatStore.getState().sideChatComposers[conversationId]?.startupInputIds ?? [];
-  const entry = conversationRegistry.peek(conversationId);
-  if (ids.length === 0 || entry === undefined || entry.disposed) return;
-  entrySetter(entry)((state) => {
-    const added = ids.filter((id) => !state.returnedStartupInputs.includes(id));
-    return added.length === 0
-      ? {}
-      : { returnedStartupInputs: [...state.returnedStartupInputs, ...added] };
-  });
 }
 
 /** Stop treating startup inputs as handed back: the server dropped them, or a later read may offer them. */
