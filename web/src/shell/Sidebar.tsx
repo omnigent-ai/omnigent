@@ -3339,6 +3339,7 @@ function projectMarkerState(
   let awaiting = 0;
   let running = false;
   let starting = false;
+  let background = 0;
   let error = false;
   let disconnected = false;
   let unseen = false;
@@ -3350,6 +3351,8 @@ function projectMarkerState(
       running = true;
     } else if (c.id === startingConversationId) {
       starting = true;
+    } else if (state?.kind === "background") {
+      background += state.count;
     } else if (state?.kind === "error") {
       error = true;
     } else if (state?.kind === "disconnected") {
@@ -3361,6 +3364,7 @@ function projectMarkerState(
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
   if (running) return { kind: "running" };
   if (starting) return { kind: "starting" };
+  if (background > 0) return { kind: "background", count: background };
   if (error) return { kind: "error" };
   if (disconnected) return { kind: "disconnected" };
   if (unseen) return { kind: "unseen" };
@@ -6039,6 +6043,8 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "project_id",
   "owner",
   "pending_elicitations_count",
+  "background_task_count",
+  "runner_online",
   "provisional",
 ];
 

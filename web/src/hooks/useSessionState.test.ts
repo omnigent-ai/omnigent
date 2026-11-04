@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import { getSessionState } from "./useSessionState";
 import type { Conversation } from "@/hooks/useConversations";
 
-function conv(
-  partial: Partial<Pick<Conversation, "status" | "pending_elicitations_count">>,
-): Pick<Conversation, "status" | "pending_elicitations_count"> {
+type StateFields = Pick<
+  Conversation,
+  "status" | "pending_elicitations_count" | "background_task_count" | "runner_online"
+>;
+
+function conv(partial: Partial<StateFields>): StateFields {
   return partial;
 }
 
@@ -79,6 +82,26 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ status: "running" }))).toEqual({
       kind: "running",
     });
+  });
+
+  it("returns background while shells outlive an ended turn on a reachable runner", () => {
+    expect(getSessionState(conv({ status: "idle", background_task_count: 2 }))).toEqual({
+      kind: "background",
+      count: 2,
+    });
+    // An active turn, a parked approval, and an offline runner all win.
+    expect(getSessionState(conv({ status: "running", background_task_count: 2 }))).toEqual({
+      kind: "running",
+    });
+    expect(
+      getSessionState(
+        conv({ status: "idle", background_task_count: 2, pending_elicitations_count: 1 }),
+      ),
+    ).toEqual({ kind: "awaiting", count: 1 });
+    expect(
+      getSessionState(conv({ status: "idle", background_task_count: 2, runner_online: false })),
+    ).toBeNull();
+    expect(getSessionState(conv({ status: "idle", background_task_count: 0 }))).toBeNull();
   });
 
   it("returns null when conversation is null (missing record)", () => {

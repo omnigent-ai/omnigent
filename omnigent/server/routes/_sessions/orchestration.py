@@ -1297,6 +1297,15 @@ def _build_session_list_item(
             if conv.runner_id is not None
             else pending_count
         ),
+        # Same cross-replica fallback as the approval count above.
+        background_task_count=(
+            max(
+                _session_background_task_count_cache.get(conv.id, 0),
+                conv.background_task_count or 0,
+            )
+            if conv.runner_id is not None
+            else _session_background_task_count_cache.get(conv.id, 0)
+        ),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,

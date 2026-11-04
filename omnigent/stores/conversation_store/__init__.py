@@ -1710,6 +1710,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_background_task_count(self, conversation_id: str, count: int) -> None:
+        """
+        Persist the running background-shell count for one session.
+
+        Written when a turn end reports a changed count so any replica's
+        session list shows the shells. Must NOT bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param count: Background shells still running, ``>= 0``.
+        """
+        ...
+
+    @abstractmethod
     def replace_runner_id(
         self,
         conversation_id: str,

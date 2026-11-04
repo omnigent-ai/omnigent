@@ -310,6 +310,7 @@ def _to_conversation(
             else None
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
+        background_task_count=meta.background_task_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
         project_id=meta.project_id if meta else None,
     )
@@ -4216,6 +4217,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
+
+    def set_background_task_count(self, conversation_id: str, count: int) -> None:
+        """
+        Persist the running background-shell count for one session.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param count: Background shells still running, ``>= 0``.
+        """
+        from sqlalchemy import update
+
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(background_task_count=count)
+            )
+
+        run_write_transaction(self._session_immediate, "set_background_task_count", write)
 
     def replace_runner_id(
         self,

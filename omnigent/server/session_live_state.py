@@ -73,6 +73,8 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Last background-shell count persisted per session, for dedupe.
+_last_background: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 # This process's own last touch_runner_liveness() stamp per runner id.
 # Never erased by clear_runner_liveness — only configure() resets it.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
@@ -97,6 +99,7 @@ def configure(
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
+    _last_background.clear()
     _last_liveness_stamp.clear()
 
 
@@ -282,6 +285,31 @@ def persist_pending_count(conversation_id: str, count: int) -> None:
     submit(
         "pending_count",
         _store.set_pending_elicitation_count,
+        conversation_id,
+        count,
+        on_failure=_evict,
+    )
+
+
+def persist_background_task_count(conversation_id: str, count: int) -> None:
+    """
+    Persist a background-shell count change so any replica's list shows it.
+
+    :param conversation_id: Session/conversation identifier.
+    :param count: Background shells still running, ``>= 0``.
+    """
+    if _store is None or _last_background.get(conversation_id) == count:
+        return
+    _last_background[conversation_id] = count
+
+    def _evict() -> None:
+        # See persist_live_status._evict.
+        if _last_background.get(conversation_id) == count:
+            _last_background.pop(conversation_id, None)
+
+    submit(
+        "background_task_count",
+        _store.set_background_task_count,
         conversation_id,
         count,
         on_failure=_evict,

@@ -53,6 +53,7 @@ class _RecordingStore:
     def __init__(self) -> None:
         self.status_writes: list[tuple[str, str]] = []
         self.pending_writes: list[tuple[str, int]] = []
+        self.background_writes: list[tuple[str, int]] = []
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
 
@@ -61,6 +62,9 @@ class _RecordingStore:
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         self.pending_writes.append((conversation_id, count))
+
+    def set_background_task_count(self, conversation_id: str, count: int) -> None:
+        self.background_writes.append((conversation_id, count))
 
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         del now
@@ -97,6 +101,18 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
         ("conv_1", "idle"),
         ("conv_2", "idle"),
     ]
+
+
+def test_persist_background_task_count_dedupes_changes(
+    recording_store: _RecordingStore,
+) -> None:
+    """Every Stop hook re-reports the count; only changes reach the store."""
+    session_live_state.persist_background_task_count("conv_1", 2)
+    session_live_state.persist_background_task_count("conv_1", 2)
+    session_live_state.persist_background_task_count("conv_1", 0)
+    session_live_state.persist_background_task_count("conv_1", 0)
+    _wait_until(lambda: len(recording_store.background_writes) >= 2)
+    assert recording_store.background_writes == [("conv_1", 2), ("conv_1", 0)]
 
 
 def test_forget_live_status_drops_dedupe_state() -> None:

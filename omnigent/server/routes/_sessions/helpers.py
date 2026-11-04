@@ -5108,9 +5108,12 @@ def _publish_status(
         else:
             _session_background_task_count_cache.pop(session_id, None)
             _session_background_tasks_cache.pop(session_id, None)
+        # Mirror onto the row so other replicas' sidebars show the shells.
+        session_live_state.persist_background_task_count(session_id, background_task_count)
     elif status == "failed":
         _session_background_task_count_cache.pop(session_id, None)
         _session_background_tasks_cache.pop(session_id, None)
+        session_live_state.persist_background_task_count(session_id, 0)
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,

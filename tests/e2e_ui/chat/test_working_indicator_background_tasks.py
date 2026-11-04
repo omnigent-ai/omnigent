@@ -81,3 +81,21 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
     _publish_status(base_url, session_id, background_task_count=0)
     expect(page.locator(_PILL)).to_have_count(0, timeout=15_000)
     expect(panel).to_have_count(0)
+
+
+def test_sidebar_row_spins_while_background_tasks_run(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """An ended turn with running shells keeps the session's sidebar spinner on."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    badge = page.get_by_role("img", name="2 background tasks running", exact=True)
+    expect(page.get_by_test_id("session-state-badge")).to_have_count(0, timeout=15_000)
+
+    _publish_status(base_url, session_id, background_task_count=2)
+    expect(badge).to_be_visible(timeout=15_000)
+    expect(badge.get_by_test_id("running-dot")).to_be_visible()
+
+    _publish_status(base_url, session_id, background_task_count=0)
+    expect(badge).to_have_count(0, timeout=15_000)

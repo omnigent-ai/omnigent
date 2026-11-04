@@ -272,6 +272,8 @@ class Conversation:
     # can judge runner liveness without a second connectivity query.
     live_status: str | None = None
     pending_elicitation_count: int | None = None
+    # Background shells still running after the turn ended (None = never written).
+    background_task_count: int | None = None
     runner_last_seen: int | None = None
     project_id: str | None = None
     # Transient: populated only by list_conversations on a content search;

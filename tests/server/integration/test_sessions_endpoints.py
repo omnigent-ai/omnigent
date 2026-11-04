@@ -4351,6 +4351,80 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     store.set_pending_elicitation_count(session_id, 0)
 
 
+async def test_list_sessions_exposes_background_task_count(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A turn end's background-shell count reaches the list and the row.
+
+    The sidebar badges a session whose turn ended while shells still run;
+    the row write lets replicas without the runner tunnel show it too.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = (await _create_session(client, agent["id"]))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+
+    async def post_count(count: int) -> None:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "background_task_count": count},
+            },
+        )
+        assert resp.status_code in (200, 202)
+
+    async def listed_count() -> int:
+        resp = await client.get("/v1/sessions")
+        return next(r for r in resp.json()["data"] if r["id"] == session_id)[
+            "background_task_count"
+        ]
+
+    async def row_count_becomes(count: int) -> bool:
+        for _ in range(200):
+            conv = store.get_conversation(session_id)
+            if conv is not None and conv.background_task_count == count:
+                return True
+            await asyncio.sleep(0.01)
+        return False
+
+    try:
+        assert await listed_count() == 0
+        await post_count(2)
+        assert await listed_count() == 2
+        assert await row_count_becomes(2)
+        await post_count(0)
+        assert await listed_count() == 0
+        assert await row_count_becomes(0)
+    finally:
+        sessions_module._session_background_task_count_cache.pop(session_id, None)
+
+
+async def test_list_sessions_background_count_falls_back_to_row_for_bound_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A replica without the runner tunnel reads the count from the row."""
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = (await _create_session(client, agent["id"]))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner_other_replica")
+    store.set_background_task_count(session_id, 3)
+
+    resp = await client.get("/v1/sessions")
+    row = next(r for r in resp.json()["data"] if r["id"] == session_id)
+    assert row["background_task_count"] == 3
+
+
 async def test_get_session_includes_runner_online(
     client: httpx.AsyncClient,
 ) -> None:
