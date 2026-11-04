@@ -42,6 +42,13 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
+import {
+  appendReviewReply,
+  type ReviewComment,
+  type ReviewThreadsPage,
+  type ReviewThread,
+  type ReviewThreadAnchor,
+} from "@/lib/pullRequestReviewThreads";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -94,6 +101,18 @@ export interface PullRequestComment {
   url: string | null;
 }
 
+export interface PullRequestTimelineEvent {
+  id: string;
+  kind: "commit" | "force_push";
+  author: string | null;
+  /** Commit time for commits; event time for force pushes. */
+  created_at: string | null;
+  url: string | null;
+  sha: string | null;
+  previous_sha?: string | null;
+  message?: string | null;
+}
+
 export type PullRequestReviewerState =
   "PENDING" | "APPROVED" | "COMMENTED" | "CHANGES_REQUESTED" | "DISMISSED";
 
@@ -140,12 +159,17 @@ export interface PullRequest {
   checks_supported?: boolean;
   head_sha?: string;
   base_sha?: string;
+  /** HTTPS web URL of the source (possibly fork) repository; null when unknown or deleted. */
+  head_repository_url?: string | null;
   /** PR description (GitHub-flavored markdown); null when empty. Optional: a
    *  host predating the Summary tab omits it, so treat undefined as none. */
   body?: string | null;
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
   comments?: PullRequestComment[];
   comments_partial?: boolean;
+  /** Commit and force-push activity; absent from older hosts and other providers. */
+  timeline_events?: PullRequestTimelineEvent[];
+  timeline_partial?: boolean;
   /** Assigned reviewers and their current review state; absent from older hosts. */
   reviewers?: PullRequestReviewer[];
   /** The PR's labels; absent from older hosts and providers that don't report them. */
@@ -196,6 +220,9 @@ export interface PullRequestCapabilities {
   merging?: boolean;
   /** Top-level comments can be posted; absent from older hosts. */
   comment_posting?: boolean;
+  review_threads?: boolean;
+  review_thread_replies?: boolean;
+  review_thread_creation?: boolean;
   /** Reviews can be requested and pending requests withdrawn; absent from older hosts. */
   reviewer_editing?: boolean;
   /** The PR's title and description can be edited; absent from older hosts. */
@@ -329,13 +356,21 @@ function legacyPullRequestAuth(raw: PullRequestInfo): PullRequestAuth {
  *  workspace changed-files list, plus a "renamed" status. */
 export type PullRequestChangedFile = Omit<WorkspaceChangedFile, "status"> & {
   status: WorkspaceChangedFile["status"] | "renamed";
+  /** The old path of a renamed file. */
+  previous_path?: string | null;
 };
 
 export interface PullRequestChangedFilesResult {
   available: boolean;
   data: PullRequestChangedFile[];
+  /** True when the provider truncated the list. */
   has_more?: boolean;
   warning?: string;
+  /** The provider's total changed-file count, when known. */
+  total_count?: number | null;
+  /** The revision the list describes, when pinned. */
+  head_sha?: string | null;
+  base_sha?: string | null;
 }
 
 export interface PullRequestFileDiffResponse {
@@ -506,6 +541,7 @@ function pullRequestInfoQueryOptions(
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
     refetchInterval: options?.poll
       ? (query) => {
           const info = query.state.data;
@@ -605,12 +641,24 @@ export function useSetPullRequestPreference(conversationId: string | undefined) 
   });
 }
 
+/** `pr_url` plus the `base:head` revision the diff and file list are pinned to. */
+function pinnedPrQuery(prUrl?: string, revision?: string): string {
+  const query = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
+  const [baseSha, headSha] = revision?.split(":") ?? [];
+  if (prUrl && baseSha && headSha) {
+    query.set("base_sha", baseSha);
+    query.set("head_sha", headSha);
+  }
+  return query.size ? `?${query}` : "";
+}
+
 async function fetchPullRequestChangedFiles(
   conversationId: string,
   prUrl?: string,
+  revision?: string,
 ): Promise<PullRequestChangedFilesResult> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${prQuery(prUrl)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${pinnedPrQuery(prUrl, revision)}`,
   );
   if (res.status === 404) return { available: false, data: [] };
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
@@ -636,13 +684,14 @@ export function usePullRequestChangedFiles(
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
     queryKey: ["github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
-    queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl),
+    queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl, revision),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
     enabled: !!conversationId && hasPr && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
   });
 }
 
@@ -681,6 +730,8 @@ export interface PullRequestDiffResponse {
   /** Available text diffs as one unified patch; listed files without a patch
    *  get a per-file fallback in the panel. */
   patch: string;
+  head_sha?: string;
+  base_sha?: string;
   /** Why the host can't diff this PR, e.g. `pr_outside_workspace`. */
   unavailable_reason?: string;
   message?: string;
@@ -689,9 +740,10 @@ export interface PullRequestDiffResponse {
 async function fetchPullRequestDiff(
   conversationId: string,
   prUrl?: string,
+  revision?: string,
 ): Promise<PullRequestDiffResponse> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${prQuery(prUrl)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${pinnedPrQuery(prUrl, revision)}`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
@@ -716,11 +768,12 @@ export function usePullRequestDiff(
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
     queryKey: ["github-pr-diff", conversationId, ...(prUrl ? [prUrl, revision] : [])],
-    queryFn: () => fetchPullRequestDiff(conversationId!, prUrl),
+    queryFn: () => fetchPullRequestDiff(conversationId!, prUrl, revision),
     enabled: !!conversationId && hasPr && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
   });
 }
 
@@ -781,6 +834,8 @@ async function fetchPullRequestEditResource<T>(
     | "labels"
     | "reviewers"
     | "comments"
+    | `review-threads/${string}/replies`
+    | "review-threads"
     | "details"
     | "attachments"
     | "merge-options"
@@ -1144,27 +1199,15 @@ function commentPostingError(error: Error): string {
     : error.message;
 }
 
-interface PullRequestCommentDraft {
+export interface PullRequestCommentDraft {
   body: string;
   pending: boolean;
   error: string | null;
+  anchor?: ReviewThreadAnchor;
 }
 
-function commentDraftKey(conversationId: string, prUrl: string) {
-  return ["github-comment-draft", conversationId, prUrl] as const;
-}
-
-function mergePostedComments(comments: PullRequestComment[], posted: PullRequestComment[]) {
-  const urls = new Set(comments.map((comment) => comment.url));
-  return [...comments, ...posted.filter((comment) => !urls.has(comment.url))].sort((left, right) =>
-    (left.created_at ?? "").localeCompare(right.created_at ?? ""),
-  );
-}
-
-/** A PR-scoped draft survives tab/session switches and settles even after unmount. */
-export function usePullRequestCommentComposer(conversationId: string, prUrl: string) {
+function usePullRequestCommentDraft(key: readonly string[]) {
   const queryClient = useQueryClient();
-  const key = commentDraftKey(conversationId, prUrl);
   const initialDraft: PullRequestCommentDraft = { body: "", pending: false, error: null };
   const { data: draft = initialDraft } = useQuery<PullRequestCommentDraft>({
     queryKey: key,
@@ -1177,20 +1220,74 @@ export function usePullRequestCommentComposer(conversationId: string, prUrl: str
     queryClient.setQueryData<PullRequestCommentDraft>(key, (current) =>
       current ? { ...current, ...update } : current,
     );
+  return { draft, updateDraft };
+}
+
+function commentDraftKey(conversationId: string, prUrl: string, threadId?: string) {
+  return ["github-comment-draft", conversationId, prUrl, ...(threadId ? [threadId] : [])] as const;
+}
+
+function mergePostedComments(comments: PullRequestComment[], posted: PullRequestComment[]) {
+  const urls = new Set(comments.map((comment) => comment.url));
+  return [...comments, ...posted.filter((comment) => !urls.has(comment.url))].sort((left, right) =>
+    (left.created_at ?? "").localeCompare(right.created_at ?? ""),
+  );
+}
+
+/** A PR-scoped draft survives tab/session switches and settles even after unmount. */
+export function usePullRequestCommentComposer(
+  conversationId: string,
+  prUrl: string,
+  threadId?: string,
+) {
+  const queryClient = useQueryClient();
+  const key = commentDraftKey(conversationId, prUrl, threadId);
+  const { draft, updateDraft } = usePullRequestCommentDraft(key);
   const mutation = useMutation({
-    mutationKey: ["github-comment-create", conversationId, prUrl],
+    mutationKey: ["github-comment-create", conversationId, prUrl, ...(threadId ? [threadId] : [])],
     retry: false,
-    mutationFn: (body: string) =>
-      fetchPullRequestEditResource<{ comment: PullRequestComment }>(conversationId, "comments", {
-        body: { pr_url: prUrl, body },
-      }),
-    onSuccess: async ({ comment }) => {
-      await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
-      updateDraft({ body: "", pending: false, error: null });
-      queryClient.setQueriesData<PullRequestInfo>(
-        { queryKey: ["github-info", conversationId] },
-        (info) =>
-          info?.pr && info.selected_pr_url === prUrl
+    mutationFn: ({
+      body,
+      conversationId: targetSessionId,
+      prUrl: targetPrUrl,
+      threadId: targetThreadId,
+    }: {
+      body: string;
+      conversationId: string;
+      prUrl: string;
+      threadId?: string;
+    }) =>
+      fetchPullRequestEditResource<{ comment: PullRequestComment & { id?: string } }>(
+        targetSessionId,
+        targetThreadId
+          ? `review-threads/${encodeURIComponent(targetThreadId)}/replies`
+          : "comments",
+        {
+          body: { pr_url: targetPrUrl, body },
+        },
+      ),
+    onSuccess: async (
+      { comment },
+      { conversationId: targetSessionId, prUrl: targetPrUrl, threadId: targetThreadId },
+    ) => {
+      const queryKey = targetThreadId
+        ? ["github-review-threads", targetSessionId, targetPrUrl]
+        : ["github-info", targetSessionId];
+      await queryClient.cancelQueries({ queryKey });
+      queryClient.setQueryData(commentDraftKey(targetSessionId, targetPrUrl, targetThreadId), {
+        body: "",
+        pending: false,
+        error: null,
+      });
+      if (targetThreadId) {
+        queryClient.setQueriesData<ReviewThreadsPage>(
+          { queryKey },
+          (page) => page && appendReviewReply(page, targetThreadId, comment as ReviewComment),
+        );
+        void queryClient.invalidateQueries({ queryKey });
+      } else {
+        queryClient.setQueriesData<PullRequestInfo>({ queryKey }, (info) =>
+          info?.pr && info.selected_pr_url === targetPrUrl
             ? {
                 ...info,
                 pr: {
@@ -1199,13 +1296,17 @@ export function usePullRequestCommentComposer(conversationId: string, prUrl: str
                 },
               }
             : info,
-      );
+        );
+      }
     },
-    onError: (error: Error) =>
-      updateDraft({
-        pending: false,
-        error: commentPostingError(error),
-      }),
+    onError: (
+      error: Error,
+      { conversationId: targetSessionId, prUrl: targetPrUrl, threadId: targetThreadId },
+    ) =>
+      queryClient.setQueryData<PullRequestCommentDraft>(
+        commentDraftKey(targetSessionId, targetPrUrl, targetThreadId),
+        (current) => current && { ...current, pending: false, error: commentPostingError(error) },
+      ),
   });
   return {
     draft,
@@ -1220,7 +1321,96 @@ export function usePullRequestCommentComposer(conversationId: string, prUrl: str
       )
         return;
       updateDraft({ pending: true, error: null });
-      mutation.mutate(current.body);
+      mutation.mutate({ body: current.body, conversationId, prUrl, threadId });
+    },
+  };
+}
+
+/** Keep a new conversation's text and coordinates together until the write settles. */
+export function usePullRequestReviewThreadComposer(
+  conversationId: string,
+  prUrl: string,
+  path: string,
+  headSha: string,
+  baseSha: string,
+) {
+  const queryClient = useQueryClient();
+  const key = ["github-new-review-thread", conversationId, prUrl, path];
+  const { draft, updateDraft } = usePullRequestCommentDraft(key);
+  const stale =
+    !!draft.anchor && (draft.anchor.head_sha !== headSha || draft.anchor.base_sha !== baseSha);
+  const mutation = useMutation({
+    retry: false,
+    mutationFn: (target: {
+      conversationId: string;
+      prUrl: string;
+      body: string;
+      anchor: ReviewThreadAnchor;
+      key: string[];
+    }) =>
+      fetchPullRequestEditResource<{ thread: ReviewThread }>(
+        target.conversationId,
+        "review-threads",
+        {
+          body: { pr_url: target.prUrl, body: target.body, anchor: target.anchor },
+        },
+      ),
+    onSuccess: async ({ thread }, target) => {
+      await queryClient.cancelQueries({
+        queryKey: ["github-review-threads", target.conversationId, target.prUrl],
+      });
+      queryClient.setQueryData(target.key, { body: "", pending: false, error: null });
+      queryClient.setQueriesData<ReviewThreadsPage>(
+        { queryKey: ["github-review-threads", target.conversationId, target.prUrl] },
+        (page) =>
+          page &&
+          page.head_sha === target.anchor.head_sha &&
+          page.base_sha === target.anchor.base_sha
+            ? {
+                ...page,
+                data: [...page.data.filter((existing) => existing.id !== thread.id), thread],
+              }
+            : page,
+      );
+      void queryClient.invalidateQueries({
+        queryKey: ["github-review-threads", target.conversationId, target.prUrl],
+      });
+    },
+    onError: (error: Error, target) =>
+      queryClient.setQueryData<PullRequestCommentDraft>(
+        target.key,
+        (current) => current && { ...current, pending: false, error: commentPostingError(error) },
+      ),
+  });
+  return {
+    draft,
+    stale,
+    setBody: (body: string) => updateDraft({ body, error: null }),
+    selectLines: (lines: Pick<ReviewThreadAnchor, "side" | "line" | "start_line">) => {
+      if (!draft.pending)
+        updateDraft({
+          anchor: { ...lines, path, head_sha: headSha, base_sha: baseSha },
+          error: null,
+        });
+    },
+    cancel: () => {
+      if (!draft.pending) updateDraft({ anchor: undefined, body: "", error: null });
+    },
+    post: () => {
+      const current = queryClient.getQueryData<PullRequestCommentDraft>(key);
+      if (
+        !current?.anchor ||
+        current.pending ||
+        !current.body.trim() ||
+        pullRequestCommentTooLong(current.body)
+      )
+        return;
+      if (current.anchor.head_sha !== headSha || current.anchor.base_sha !== baseSha) {
+        updateDraft({ error: "The pull request changed. Reselect the lines before posting." });
+        return;
+      }
+      updateDraft({ pending: true, error: null });
+      mutation.mutate({ conversationId, prUrl, body: current.body, anchor: current.anchor, key });
     },
   };
 }

@@ -86,7 +86,7 @@ def _seed_pi_extension_home(home: Path, agent_dir: Path, python: Path) -> Path:
             }
         )
     )
-    (agent_dir / "AGENTS.md").write_text("UNREQUESTED_GLOBAL_CONTEXT_71AB")
+    (agent_dir / "AGENTS.md").write_text("PI_GLOBAL_CONTEXT_71AB")
     return home / _MARKER_NAME
 
 
@@ -158,7 +158,7 @@ def test_pi_gateway_run_loads_global_extensions(
     )
     assert "PI_PACKAGE_MARKER_18CF" in system
     assert "PI_SKILL_MARKER_5E1B" in system
-    assert "UNREQUESTED_GLOBAL_CONTEXT_71AB" not in system
+    assert "PI_GLOBAL_CONTEXT_71AB" in system
     assert "DISABLED_EXTENSION_71AB" not in system
     names = {tool["function"]["name"] for request in requests for tool in request["tools"]}
     assert not (names & {"mcp__setup__echo", "codemode", "tool_search"}), (

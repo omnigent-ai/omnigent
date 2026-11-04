@@ -7,7 +7,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
-import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
+import {
+  pickerCuration,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+  UNRESTRICTED_PICKER,
+} from "./capabilities";
 import type { ServerInfo } from "./capabilities";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
@@ -90,6 +95,56 @@ describe("sandboxProviderOptions", () => {
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
+  it.each([null, [], "invalid", { arclet: null }, { arclet: [] }, { arclet: "invalid" }])(
+    "ignores malformed provider capabilities (%j)",
+    async (value) => {
+      expect(
+        (await probe({ sandbox_provider_capabilities: value })).sandbox_provider_capabilities,
+      ).toEqual({});
+    },
+  );
+
+  it.each([null, "invalid", { name: "repo", url: "https://github.com/example/repo" }])(
+    "ignores a non-array repository catalog (%j)",
+    async (repo_catalog) => {
+      const result = await probe({
+        sandbox_provider_capabilities: { arclet: { multi_repo: true, repo_catalog } },
+      });
+      expect(result.sandbox_provider_capabilities?.arclet).toEqual({
+        multi_repo: true,
+        repo_catalog: [],
+      });
+    },
+  );
+
+  it("filters malformed catalog entries while preserving provider flags", async () => {
+    const valid = { name: "runtime", url: "https://github.com/example/runtime" };
+    const result = await probe({
+      sandbox_provider_capabilities: {
+        arclet: {
+          inference_models: true,
+          default_models: true,
+          repo_catalog: [
+            null,
+            "invalid",
+            {},
+            { name: "repo" },
+            { name: 1, url: valid.url },
+            { name: "repo", url: 42 },
+            { name: "", url: valid.url },
+            { name: "repo", url: "" },
+            valid,
+          ],
+        },
+      },
+    });
+    expect(result.sandbox_provider_capabilities?.arclet).toEqual({
+      inference_models: true,
+      default_models: true,
+      repo_catalog: [valid],
+    });
+  });
+
   it.each([undefined, false, "true", true])(
     "requires an explicit durable-input capability (%s)",
     async (value) => {
@@ -197,14 +252,21 @@ describe("resolveServerInfo session_search_scope", () => {
   });
 });
 
-describe("resolveServerInfo scheduled_task_projects", () => {
+describe.each([
+  "scheduled_task_projects",
+  "scheduled_task_harness_settings",
+  "scheduled_task_sandbox_workspaces",
+  "scheduled_task_inbox",
+] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],
+    [false, false],
     [undefined, false],
+    ["true", false],
     ["yes", false],
   ])("reads %j as %j", async (advertised, expected) => {
-    const payload = advertised === undefined ? {} : { scheduled_task_projects: advertised };
-    expect((await probe(payload)).scheduled_task_projects).toBe(expected);
+    const payload = advertised === undefined ? {} : { [capability]: advertised };
+    expect((await probe(payload))[capability]).toBe(expected);
   });
 });
 
@@ -371,4 +433,58 @@ describe("custom agents settings capability", () => {
       expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
     },
   );
+});
+
+describe("picker curation", () => {
+  it("reads the names and the default off the probe", async () => {
+    const parsed = await probe({
+      picker: { restrict_to_agent_names: ["polly", "debby"], default_agent_name: "debby" },
+    });
+
+    expect([...parsed.picker!.restrictToAgentNames]).toEqual(["polly", "debby"]);
+    expect(parsed.picker!.defaultAgentName).toBe("debby");
+  });
+
+  it("reads an older server, which reports nothing, as unrestricted", async () => {
+    const parsed = await probe({});
+
+    expect(parsed.picker).toEqual(UNRESTRICTED_PICKER);
+  });
+
+  it("drops a default the restriction does not offer", async () => {
+    // It could never be selected; pinning it would strand the picker.
+    const parsed = await probe({
+      picker: { restrict_to_agent_names: ["polly"], default_agent_name: "debby" },
+    });
+
+    expect(parsed.picker!.defaultAgentName).toBeNull();
+  });
+
+  it.each([
+    { restrict_to_agent_names: "polly", default_agent_name: 7 },
+    // A list with one bad member is dropped whole, as the server drops it.
+    { restrict_to_agent_names: ["polly", 42], default_agent_name: 7 },
+  ])("ignores malformed values rather than emptying the picker: %j", async (picker) => {
+    const parsed = await probe({ picker });
+
+    expect(parsed.picker!.restrictToAgentNames.size).toBe(0);
+    expect(parsed.picker!.defaultAgentName).toBeNull();
+  });
+
+  it("treats a loading probe and a missing block as unrestricted", () => {
+    expect(pickerCuration("loading").restrictToAgentNames.size).toBe(0);
+    expect(pickerCuration(info({})).defaultAgentName).toBeNull();
+  });
+});
+
+describe("resolveServerInfo scheduled_task_worktrees", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("requires explicit support (%s)", async (advertised, expected) => {
+    expect((await probe({ scheduled_task_worktrees: advertised })).scheduled_task_worktrees).toBe(
+      expected,
+    );
+  });
 });

@@ -3842,8 +3842,9 @@ async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> No
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
+    params = {"head_sha": "a" * 40, "base_sha": "b" * 40}
     resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes", params=params
     )
 
     assert resp.status_code == 200
@@ -3851,6 +3852,7 @@ async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> No
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes",
     ) in fake_runner.calls
+    assert params in fake_runner.get_params
 
 
 @pytest.mark.asyncio
@@ -9916,6 +9918,103 @@ async def test_offline_environment_advertises_the_same_reach_as_the_runner(
     }
 
 
+@pytest.mark.parametrize("sandbox_type", [None, "linux_bwrap", "darwin_seatbelt", "none"])
+@pytest.mark.asyncio
+async def test_offline_environment_reach_does_not_require_server_sandbox(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str | None,
+) -> None:
+    """Remote file metadata uses declared grants without a server-side sandbox."""
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes.sessions import routes_resources
+
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(
+            type=sandbox_type,
+            read_paths=["../reference"],
+            write_paths=["../scratch"],
+            write_files=["../notes.txt"],
+        )
+        if sandbox_type is not None
+        else None,
+    )
+    monkeypatch.setattr(
+        routes_resources,
+        "_load_agent_spec_for_session",
+        lambda _conv, _store: SimpleNamespace(os_env=spec),
+    )
+    monkeypatch.setattr("shutil.which", lambda _command: None)
+
+    response = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["metadata"]["reachable"] == {
+        "unconfined": sandbox_type == "none",
+        "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}]
+        + (
+            [
+                {"path": "/Users/dev/scratch", "access": "write", "origin": "write_paths"},
+                {"path": "/Users/dev/notes.txt", "access": "write", "origin": "write_files"},
+                {"path": "/Users/dev/reference", "access": "read", "origin": "read_paths"},
+            ]
+            if sandbox_type is not None
+            else []
+        ),
+    }
+
+
+@pytest.mark.parametrize("sandbox_type", [None, "linux_bwrap"])
+@pytest.mark.asyncio
+async def test_offline_confined_browsing_preserves_declared_grants(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str | None,
+) -> None:
+    """Missing server sandbox tools cannot expand the remote browsing grants."""
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(
+        routes_resources,
+        "_load_agent_spec_for_session",
+        lambda _conv, _store: SimpleNamespace(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type=sandbox_type, read_paths=["../reference"])
+                if sandbox_type is not None
+                else None,
+            )
+        ),
+    )
+    monkeypatch.setattr("shutil.which", lambda _command: None)
+    requests: list[str] = []
+
+    async def read_from_host(**kwargs: Any) -> dict[str, Any]:
+        requests.append(kwargs["workspace"])
+        return {"object": "list", "data": []}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read_from_host)
+    prefix = f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem"
+    allowed_path = "/Users/dev/reference" if sandbox_type is not None else _OFFLINE_WORKSPACE
+    allowed = await offline_env_client.get(f"{prefix}{allowed_path}?base=host")
+    denied = await offline_env_client.get(f"{prefix}/Users/dev/unrelated?base=host")
+
+    assert allowed.status_code == 200, allowed.text
+    assert denied.status_code == 403, denied.text
+    assert requests == [allowed_path]
+
+
 @pytest.mark.asyncio
 async def test_github_info_falls_back_to_host_when_runner_offline(
     offline_env_client: httpx.AsyncClient,
@@ -10431,6 +10530,8 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("/labels", "github_labels"),
         ("/merge-options", "github_merge_options"),
         ("/reviewers", "github_reviewers"),
+        ("/review-threads", "github_review_threads"),
+        ("/review-threads/thread-1/comments", "github_review_thread_comments"),
     ],
 )
 async def test_selected_pr_reaches_offline_host(
@@ -10449,13 +10550,23 @@ async def test_selected_pr_reaches_offline_host(
 
     monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
     url = "https://github.com/example/second/pull/42"
+    params = {"pr_url": url}
+    if resource.startswith("/review-threads"):
+        params.update(after="cursor", head_sha="a" * 40, base_sha="b" * 40)
     response = await offline_env_client.get(
-        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params={"pr_url": url}
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params=params
     )
     assert response.status_code == 200
     assert captured["op"] == op
     assert captured["session_id"] == _OFFLINE_SESSION
     assert captured["params"]["pr_url"] == url
+    if resource.startswith("/review-threads"):
+        assert captured["params"]["after"] == "cursor"
+        if resource.endswith("/comments"):
+            assert captured["params"]["thread_id"] == "thread-1"
+        else:
+            assert captured["params"]["head_sha"] == "a" * 40
+            assert captured["params"]["base_sha"] == "b" * 40
 
 
 async def test_pr_attachment_uses_bound_session_when_runner_offline(
@@ -10485,6 +10596,18 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     "resource,body,op,params",
     [
         ("/comments", {"body": "Hello"}, "github_comment_create", {"body": "Hello"}),
+        (
+            "/review-threads",
+            {"body": "Hello", "anchor": {"line": 2}},
+            "github_review_thread_create",
+            {"body": "Hello", "anchor": {"line": 2}},
+        ),
+        (
+            "/review-threads/thread-1/replies",
+            {"body": "Hello"},
+            "github_review_thread_reply",
+            {"body": "Hello", "thread_id": "thread-1"},
+        ),
         ("/labels", {"remove": ["bug"]}, "github_labels_update", {"add": [], "remove": ["bug"]}),
         (
             "/reviewers",
@@ -11085,8 +11208,13 @@ async def test_environment_id_is_one_runner_url_segment(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource", ["comments", "review-threads", "review-threads/thread-1/replies"]
+)
 async def test_comment_transport_timeout_does_not_retry_on_host(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
 ) -> None:
     from omnigent.server.routes import _host_filesystem
 
@@ -11103,7 +11231,7 @@ async def test_comment_transport_timeout_does_not_retry_on_host(
 
     monkeypatch.setattr(runner, "post", timeout)
     monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", unexpected_fallback)
-    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/comments"
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/{resource}"
     response = await client.post(
         path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "body": "Hello"}
     )
@@ -11112,7 +11240,15 @@ async def test_comment_transport_timeout_does_not_retry_on_host(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resource,expected", [("comments", 502), ("details", 503)])
+@pytest.mark.parametrize(
+    "resource,expected",
+    [
+        ("comments", 502),
+        ("review-threads", 502),
+        ("review-threads/thread-1/replies", 502),
+        ("details", 503),
+    ],
+)
 async def test_host_write_timeout_preserves_comment_uncertainty(
     offline_env_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -11146,7 +11282,7 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
     assert response.status_code == expected, response.text
     assert len(sent) == 1
     assert connection.pending_fs_requests == {}
-    if resource == "comments":
+    if resource != "details":
         assert (
             response.json()["detail"]
             == "Could not confirm comment posting. Check GitHub before retrying."

@@ -46,10 +46,7 @@ import {
   nativeModelTooltip,
   normalizeEffortLabel,
 } from "@/lib/composerModelLabel";
-import {
-  codexCreateApprovalOptions,
-  applyCodexApprovalSelection,
-} from "@/lib/codexApprovalOptions";
+import { applyCodexApprovalSelection } from "@/lib/codexApprovalOptions";
 import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
@@ -58,6 +55,12 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
+import {
+  SandboxProfilePicker,
+  useSandboxProfileCatalog,
+  type SandboxProfileSelection,
+} from "@/components/SandboxProfilePicker";
+import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
@@ -146,12 +149,20 @@ import {
   harnessWarningBadgeText,
   isCodexHarness,
   isNativeCursorHarness,
+  isNativeOpenCodeHarness,
   skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  pickerCuration,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+  sandboxProfilesEnabled,
+} from "@/lib/capabilities";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
@@ -263,6 +274,7 @@ import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
+  nativeAgentHasModelSettings,
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
@@ -275,6 +287,7 @@ import {
   AGY_NATIVE_SKIP_MODES,
   AGY_NATIVE_SKIP_VALUE,
   AUTO_PERMISSION_MODE,
+  nativePermissionOptions,
   CODEX_NATIVE_APPROVAL_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
   CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
@@ -866,6 +879,16 @@ function harnessWarningMessage(
       </>
     );
   }
+  // OpenCode 2.x ships as a new npm package; an in-place 1.x upgrade can't reach it.
+  if (reason === "version-too-low" && !!harness && isNativeOpenCodeHarness(harness)) {
+    return (
+      <>
+        {agentName} needs OpenCode 2.0 on {hostName} — run{" "}
+        <code>npm i -g @opencode/cli@2.0.32</code> (after <code>npm rm -g opencode-ai</code>) or{" "}
+        <code>omni setup</code> on that machine.
+      </>
+    );
+  }
   // ``version-too-low`` is a uniform state across all CLI harnesses now that
   // the server checks supported version ranges. Keep the message generic so
   // the user is nudged toward setup rather than being told the CLI is missing.
@@ -1094,15 +1117,6 @@ const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
 // How many rows the backfill promotes — matches the inline list's usual size.
 const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
 
-function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
-  return (
-    nativeAgentHasCapability(agent, "modelPicker") ||
-    // devinMode owns Devin's own Model + Effort rows (see nativeCodingAgents).
-    nativeAgentHasCapability(agent, "devinMode") ||
-    nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
-  );
-}
-
 function agentHasAdvancedSettings(
   agent: AvailableAgent | undefined,
   brainHarnessLabels: Readonly<Record<string, string>>,
@@ -1193,6 +1207,8 @@ export function AgentHarnessPicker({
   onDismissCyclePreview,
   blockedReasons,
   onPrefetchEntries,
+  curatedEntries,
+  entriesFailed = false,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -1273,6 +1289,12 @@ export function AgentHarnessPicker({
   blockedReasons?: ReadonlyMap<string, string>;
   /** Called with the ids of rows the menu is about to show. */
   onPrefetchEntries?: (agentIds: string[]) => void;
+  /** Set when the deployment curates New Chat: exactly these rows, in this
+   *  order, as one flat list. Other embedders leave it unset. */
+  curatedEntries?: AvailableAgent[];
+  /** Whether the roster could not be loaded, so an empty curated list is a
+   *  failed fetch rather than the deployment's doing. */
+  entriesFailed?: boolean;
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
@@ -1547,13 +1569,52 @@ export function AgentHarnessPicker({
     }
     return { readyHarnessEntries: ready, moreHarnessEntries: more, hidOfferedHarness: hidOffered };
   }, [harnessEntries, host, hideUnconfigured, isHiddenEntry, effectiveAgentId, promotedHarnessId]);
+  // A curated list keeps the deployment's order but honours the same per-entry
+  // hides and "hide unconfigured harnesses" preference as the grouped menu, with
+  // the selected row always kept so the trigger's choice stays in the list.
+  const visibleCuratedEntries = useMemo(() => {
+    if (curatedEntries === undefined) return undefined;
+    const harnessIds = new Set(harnessEntries.map((agent) => agent.id));
+    return curatedEntries.filter((agent) => {
+      if (isHiddenEntry(agent)) return false;
+      if (agent.id === effectiveAgentId || !hideUnconfigured || !harnessIds.has(agent.id)) {
+        return true;
+      }
+      const readiness = harnessReadinessOnHost(agent.harness, host);
+      return readiness.selectable || !readiness.fallbackRelevant;
+    });
+  }, [curatedEntries, harnessEntries, hideUnconfigured, isHiddenEntry, effectiveAgentId, host]);
+  // Why a curated list is empty, which is not always the deployment's doing:
+  // a failed roster fetch and a harness this host lacks read differently.
+  const curatedEmptyState = entriesFailed
+    ? { title: "Agents could not be loaded.", detail: "Check your connection and try again." }
+    : curatedEntries?.some(isHiddenEntry)
+      ? {
+          title: "Every entry is hidden.",
+          detail: "Turn some back on in Settings, under Appearance.",
+        }
+      : {
+          title: "No agents are available here.",
+          detail:
+            curatedEntries?.length === 0
+              ? "This deployment limits which agents New Chat offers."
+              : "The offered harnesses are not set up on this host and are hidden by your settings.",
+        };
+  // What a menu open prefetches sandbox support for: every harness row it shows.
+  const prefetchIds = useMemo(
+    () =>
+      (visibleCuratedEntries ?? readyHarnessEntries)
+        .filter((agent) => harnessEntries.some((entry) => entry.id === agent.id))
+        .map((agent) => agent.id),
+    [visibleCuratedEntries, readyHarnessEntries, harnessEntries],
+  );
   // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
   const prefetchedOpenNonce = useRef(0);
   useEffect(() => {
     if (!openNonce || openNonce === prefetchedOpenNonce.current) return;
     prefetchedOpenNonce.current = openNonce;
-    onPrefetchEntries?.(readyHarnessEntries.map((agent) => agent.id));
-  }, [openNonce, onPrefetchEntries, readyHarnessEntries]);
+    onPrefetchEntries?.(prefetchIds);
+  }, [openNonce, onPrefetchEntries, prefetchIds]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
@@ -1567,6 +1628,9 @@ export function AgentHarnessPicker({
     () => partitionAgentsByKind(agentEntries.filter((agent) => !isHiddenEntry(agent))),
     [agentEntries, isHiddenEntry],
   );
+
+  // Curated deployments get one flat list in config order.
+  const curated = curatedEntries !== undefined;
 
   // Existing custom / pending agents fold into an "Other..." submenu so a
   // long roster doesn't crowd the recommended picks. When there are none, the
@@ -1583,7 +1647,7 @@ export function AgentHarnessPicker({
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
       onSelect={onCreateCustomAgent}
-      className="text-muted-foreground"
+      className="mobile-touch-target text-muted-foreground"
     >
       <PlusIcon className="size-3.5" />
       Create custom agent
@@ -1601,7 +1665,7 @@ export function AgentHarnessPicker({
           data-testid="new-chat-landing-agent-pending"
           data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
           onSelect={onSelectPending}
-          className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+          className="mobile-touch-target items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
         >
           <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
             <span className="truncate">{pendingAgent.name}</span>
@@ -1677,11 +1741,11 @@ export function AgentHarnessPicker({
           for (const agent of [...harnessEntries, ...agentEntries]) {
             void prefetchAvailableAgentDetails(agent, queryClient);
           }
-          onPrefetchEntries?.(readyHarnessEntries.map((agent) => agent.id));
+          onPrefetchEntries?.(prefetchIds);
         }
       }}
       trigger={{
-        disabled: disabledLabel !== undefined || previewOnly || !hasAgents,
+        disabled: disabledLabel !== undefined || previewOnly || (!hasAgents && !curated),
         "aria-busy": loading || undefined,
         label: disabledLabel ?? visibleCachedPreview?.label ?? triggerAccessibleName,
         model: disabledLabel ?? visibleCachedPreview?.model ?? triggerText,
@@ -1754,7 +1818,7 @@ export function AgentHarnessPicker({
               e.preventDefault();
               setMenuPage(null);
             }}
-            className="items-center font-medium"
+            className="mobile-touch-target items-center font-medium"
           >
             <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
             <span className="truncate">Other...</span>
@@ -1771,13 +1835,30 @@ export function AgentHarnessPicker({
               e.preventDefault();
               setMenuPage(null);
             }}
-            className="items-center font-medium"
+            className="mobile-touch-target items-center font-medium"
           >
             <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
             <span className="truncate">Other</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           {customAgentsBody}
+        </div>
+      ) : curated ? (
+        // One flat list: the agents this deployment offers, in its order.
+        <div data-testid="new-chat-landing-curated">
+          {visibleCuratedEntries?.length === 0 ? (
+            <div
+              data-testid="new-chat-landing-no-agents"
+              role="status"
+              // The menu is whitespace-nowrap; this copy is a sentence and has to wrap.
+              className="px-2 py-3 text-ui whitespace-normal text-muted-foreground"
+            >
+              {curatedEmptyState.title}
+              <div className="text-xs leading-4">{curatedEmptyState.detail}</div>
+            </div>
+          ) : (
+            visibleCuratedEntries?.map(renderEntry)
+          )}
         </div>
       ) : allEntriesHidden ? (
         <>
@@ -1807,7 +1888,7 @@ export function AgentHarnessPicker({
                   onSelectAutoHarness?.();
                   setOpen(false);
                 }}
-                className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+                className="mobile-touch-target group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
               >
                 <WandSparklesIcon className="size-4" aria-hidden="true" />
                 <span
@@ -1839,7 +1920,7 @@ export function AgentHarnessPicker({
                       onPrefetchEntries?.(moreHarnessEntries.map((agent) => agent.id));
                       setMenuPage("more");
                     }}
-                    className="items-center"
+                    className="mobile-touch-target items-center"
                   >
                     <HarnessMenuNavigationLabel>{otherHarnessLabel}</HarnessMenuNavigationLabel>
                     <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1853,7 +1934,7 @@ export function AgentHarnessPicker({
                   >
                     <DropdownMenuSubTrigger
                       data-testid="new-chat-landing-harness-more"
-                      className="cursor-pointer items-center"
+                      className="mobile-touch-target cursor-pointer items-center"
                       onPointerLeave={(event) => {
                         const target = event.relatedTarget;
                         if (
@@ -1902,7 +1983,7 @@ export function AgentHarnessPicker({
                   e.preventDefault();
                   setMenuPage("custom");
                 }}
-                className="items-center"
+                className="mobile-touch-target items-center"
               >
                 <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1912,7 +1993,7 @@ export function AgentHarnessPicker({
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger
                   data-testid="new-chat-landing-custom-agents"
-                  className="cursor-pointer items-center"
+                  className="mobile-touch-target cursor-pointer items-center"
                 >
                   <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 </DropdownMenuSubTrigger>
@@ -1950,6 +2031,7 @@ interface LandingDraft {
   selectedHostId: string | null;
   sandboxSelected: boolean;
   sandboxProvider: string | null;
+  sandboxProfile: SandboxProfileSelection | null;
   sandboxRepoSelections: LastSandboxRepo[];
   workspace: string;
   branchName: string;
@@ -2129,13 +2211,18 @@ export function NewChatLandingScreen() {
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
 
-  const agentList = useMemo(
-    () =>
-      selectableSessionAgents(
-        (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
-      ),
-    [agents, agentsLoading, cachedPickerOptions],
-  );
+  // Filter and order selectable agents by deployment curation.
+  const info = useServerInfo();
+  const curation = pickerCuration(info);
+  const agentList = useMemo(() => {
+    const selectable = selectableSessionAgents(
+      (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
+    );
+    if (curation.restrictToAgentNames.size === 0) return selectable;
+    const allowed = selectable.filter((agent) => curation.restrictToAgentNames.has(agent.name));
+    const order = [...curation.restrictToAgentNames];
+    return allowed.sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
+  }, [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames]);
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -2181,6 +2268,7 @@ export function NewChatLandingScreen() {
           selectedHostId: null,
           sandboxSelected: false,
           sandboxProvider: null,
+          sandboxProfile: null,
           // The repo inputs compose the managed create's workspace string, so
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
@@ -2203,10 +2291,10 @@ export function NewChatLandingScreen() {
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
     navigate(
-      { search: remaining.toString(), hash: location.hash },
+      { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [linkedPrompt, searchParams, location.hash, location.state, navigate]);
+  }, [linkedPrompt, searchParams, location.pathname, location.hash, location.state, navigate]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2251,7 +2339,7 @@ export function NewChatLandingScreen() {
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
-  const info = useServerInfo();
+  const profilesEnabled = sandboxProfilesEnabled(info);
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const {
@@ -2334,6 +2422,12 @@ export function NewChatLandingScreen() {
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
     () => restoredDraft?.sandboxProvider ?? null,
   );
+  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfileSelection | null>(
+    () => restoredDraft?.sandboxProfile ?? null,
+  );
+  useEffect(() => {
+    if (info !== "loading" && !profilesEnabled) setSandboxProfile(null);
+  }, [info, profilesEnabled]);
   const hostSelected = !sandboxSelected && selectedHostId !== null;
   const rememberedHostChoice = readLastHostChoice();
   const executionTargetSelectionPending =
@@ -2391,6 +2485,8 @@ export function NewChatLandingScreen() {
   // is what the launch will use.
   const effectiveSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const { launchError: sandboxProfileError, selection: selectedSandboxProfile } =
+    useSandboxProfileCatalog(sandboxSelected ? effectiveSandboxProvider : null, sandboxProfile);
   const sandboxMultiRepo =
     info !== "loading" &&
     effectiveSandboxProvider !== null &&
@@ -2576,6 +2672,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     sandboxSelected,
     sandboxProvider,
+    sandboxProfile,
     sandboxRepoSelections,
     workspace,
     branchName,
@@ -2709,6 +2806,7 @@ export function NewChatLandingScreen() {
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
+    setSandboxProfile(null);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     agentExplicitlySelectedRef.current = false;
@@ -3004,8 +3102,21 @@ export function NewChatLandingScreen() {
           : (agentsLoading || prefillConfig === undefined) &&
               agentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
             ? cachedPickerOptions!.agent.id
-            : (agentList[0]?.id ?? null);
+            : // No remembered pick: use the configured default, else the first agent.
+              (agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+              agentList[0]?.id ??
+              null);
   const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
+  // The remembered agent is not one this deployment offers, so the configured
+  // default runs in its place. Drives the harness re-seed below: an override
+  // belongs to the agent it was stored under, not to whatever runs instead.
+  const curationRejectedTheRememberedPick =
+    curation.restrictToAgentNames.size > 0 &&
+    agents !== undefined &&
+    !agentsArePlaceholder &&
+    pickedAgentId !== null &&
+    pickedAgentId !== PENDING_AGENT_ID &&
+    !agentList.some((agent) => agent.id === pickedAgentId);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -3296,7 +3407,7 @@ export function NewChatLandingScreen() {
   }, [brainHarnessLabelsAll, brainRoutable]);
   const isEntryConfigurable = (agent: AvailableAgent) =>
     (sandboxHasModelCatalog && agent.id === effectiveAgentId) ||
-    agentHasModelSettings(agent) ||
+    nativeAgentHasModelSettings(agent) ||
     agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
   // Only an eligible harness can display active per-turn Smart Routing.
   const routingOn = smartRoutingEligible && costControlMode === "on";
@@ -3547,14 +3658,19 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     setPickerReadyTarget(pickerDataLoading ? null : pickerTarget);
   }, [pickerDataLoading, pickerTarget]);
-  const pickerLoading = pickerDataLoading || pickerReadyTarget !== pickerTarget;
+  // The embed shows an offline fallback after 1.5s; it carries no curation.
+  const curationPending = info === "loading" || isBootFallbackInfo(info);
+  const pickerLoading = pickerDataLoading || pickerReadyTarget !== pickerTarget || curationPending;
   const [interactiveCacheKey, setInteractiveCacheKey] = useState<string | null>(null);
   useEffect(() => {
     setInteractiveCacheKey(cachedPickerOptions ? pickerCacheKey : null);
   }, [cachedPickerOptions, pickerCacheKey]);
+  // A cached roster is only safe to open once the server's curation is known:
+  // before that it could show agents this deployment does not offer.
   const interactiveWhileLoading =
     cachedPickerOptions !== null &&
     interactiveCacheKey === pickerCacheKey &&
+    !curationPending &&
     selectedAgent !== undefined &&
     (!harnessTriggerDetails.some((row) => row.label === "Model") ||
       pickerModelOptions.length > 0 ||
@@ -3627,25 +3743,7 @@ export function NewChatLandingScreen() {
         value,
         label: normalizeEffortLabel(value),
       }))
-    : supportsPermissionMode
-      ? CLAUDE_NATIVE_EFFORTS
-      : selectedNativeHarness === "devin-native"
-        ? // Devin encodes effort as a model-variant suffix, and the rung set is
-          // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a
-          // different Fusion model), so derive it from the selected model's catalog
-          // entry rather than offering a fixed ladder the model can't honor.
-          codexEffortLevelsForModel(
-            devinModelOptions,
-            pickedModel || devinModelOptions.find((option) => option.isDefault)?.id,
-          ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-        : selectedNativeHarness === "pi-native"
-          ? PI_NATIVE_EFFORTS
-          : selectedNativeHarness === "codex-native"
-            ? codexEffortLevelsForModel(
-                codexModelOptions,
-                pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-              ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-            : [];
+    : (nativeEffortOptions(selectedNativeHarness, pickerModelOptions, pickedModel) ?? []);
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const picked = pickedOptionKeysRef.current.get(harness) ?? new Set<string>();
     for (const key of Object.keys(options)) picked.add(key);
@@ -4002,19 +4100,7 @@ export function NewChatLandingScreen() {
   );
   const directModeOptions = smartRoutingHarnessSelected
     ? []
-    : supportsPermissionMode
-      ? CLAUDE_NATIVE_PERMISSION_MODES
-      : supportsApprovalMode
-        ? selectedNativeHarness === "codex-native"
-          ? codexCreateApprovalOptions()
-          : CODEX_NATIVE_APPROVAL_MODES
-        : supportsCursorMode
-          ? CURSOR_NATIVE_EXEC_MODES
-          : supportsAgySkipPermissions
-            ? AGY_NATIVE_SKIP_MODES
-            : supportsDevinPermission
-              ? DEVIN_NATIVE_PERMISSION_MODES
-              : [];
+    : nativePermissionOptions(selectedNativeHarness);
   // Unsaved custom agents launch through the host runners route, which cannot
   // refuse a host too old to start Codex in Plan mode.
   const codexPlanLaunchEnabled = isFeatureEnabled(info, "codex_plan_at_launch");
@@ -4398,7 +4484,11 @@ export function NewChatLandingScreen() {
       }),
     [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, externalRoutingConfigured],
   );
-  const smartRoutingHarnessAvailable = smartRoutingUnavailableCause === null;
+  // The curated menu has no Smart Routing row, so a remembered pick of it has
+  // nothing behind it either.
+  const smartRoutingCuratedAway = curation.restrictToAgentNames.size > 0;
+  const smartRoutingHarnessAvailable =
+    smartRoutingUnavailableCause === null && !smartRoutingCuratedAway;
   // The fully-auto brain needs SOME router able to answer for both model
   // families — the router may land the session's work on either, and an arm the
   // external router can't reach (off the workspace Unity Gateway) is only a loss
@@ -4439,12 +4529,18 @@ export function NewChatLandingScreen() {
     if (!smartRoutingHarnessSelected || smartRoutingHarnessAvailable) return;
     setPickedHarness(null);
     _setCostControlMode(null);
-    if (wasAvailable) setSmartRoutingDropped(smartRoutingUnavailableCause);
+    // The placeholder wrapper was picked only to carry Smart Routing; under
+    // curation the configured default decides instead of that leftover.
+    if (smartRoutingCuratedAway) setPickedAgentId(null);
+    if (wasAvailable && smartRoutingUnavailableCause !== null) {
+      setSmartRoutingDropped(smartRoutingUnavailableCause);
+    }
   }, [
     smartRoutingHarnessSelected,
     smartRoutingAvailabilityKnown,
     smartRoutingHarnessAvailable,
     smartRoutingUnavailableCause,
+    smartRoutingCuratedAway,
   ]);
   // Routing came back (host switched again, or the missing arm installed) —
   // there is nothing left to explain. An explicit pick clears it too, from the
@@ -4464,6 +4560,17 @@ export function NewChatLandingScreen() {
     setPickedHarness(null);
     _setCostControlMode(null);
   }, [info, smartRoutingEnabled, pickedHarness]);
+  // Curation replaced the remembered agent: re-seed brain and cost control
+  // from the agent that runs.
+  useEffect(() => {
+    if (!curationRejectedTheRememberedPick || effectiveAgentId === null) return;
+    const remembered = readLastHarness(effectiveAgentId);
+    // Top-level Smart Routing has no curated row either, so its sentinel is no
+    // more adopted here than it is restored above.
+    const inherited = remembered === AUTO_NATIVE_HARNESS_ID ? null : remembered;
+    setPickedHarness(inherited);
+    _setCostControlMode(isAutoHarness(inherited) ? "on" : null);
+  }, [curationRejectedTheRememberedPick, effectiveAgentId]);
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
@@ -5046,8 +5153,15 @@ export function NewChatLandingScreen() {
     if (pickerLoading || workspaceStartLoading || worktreeRequestPending) {
       return { field: "other", message: "Loading session configuration…" };
     }
-    if (pickerSelectionError !== null || sandboxCatalogError !== null) {
-      return { field: "other", message: pickerSelectionError ?? sandboxCatalogError };
+    if (
+      pickerSelectionError !== null ||
+      sandboxCatalogError !== null ||
+      sandboxProfileError !== null
+    ) {
+      return {
+        field: "other",
+        message: pickerSelectionError ?? sandboxCatalogError ?? sandboxProfileError,
+      };
     }
     if (sandboxSelected) {
       if (sandboxRepoOverCap) {
@@ -5293,6 +5407,7 @@ export function NewChatLandingScreen() {
   }
 
   function selectSandbox(provider: string | null = null) {
+    if (provider !== sandboxProvider) setSandboxProfile(null);
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
     // sticky default for the next visit, on the provider just picked.
@@ -5799,6 +5914,12 @@ export function NewChatLandingScreen() {
                 ...(createProjectId !== null ? { workspace: null, git: null } : {}),
                 // Omitted when null so a default create is unchanged.
                 ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
+                ...(selectedSandboxProfile !== null
+                  ? {
+                      sandbox_profile_id: selectedSandboxProfile.id,
+                      sandbox_profile_revision: selectedSandboxProfile.revision,
+                    }
+                  : {}),
                 // The new sandbox host's id, in the server's minted shape;
                 // keys the create and the session's requests until it binds.
                 ...(info !== "loading" && info.request_managed_sandbox_host_id
@@ -5895,6 +6016,9 @@ export function NewChatLandingScreen() {
         const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
           const response = await createRequest;
           if (!response.ok) {
+            if (sandboxSelected) {
+              void queryClient.invalidateQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+            }
             if (sandboxPreviewEnabled && response.status === 409) {
               void queryClient.invalidateQueries({
                 queryKey: sandboxModelOptionsKey(
@@ -6150,7 +6274,7 @@ export function NewChatLandingScreen() {
         }
         data-active={!sandboxSelected && host.host_id === selectedHostId ? "true" : undefined}
         title={`${host.name} — ${host.status}`}
-        className={reconnect ? "group" : undefined}
+        className={cn("mobile-touch-target", reconnect ? "group" : undefined)}
       >
         <HostOption
           host={host}
@@ -6276,7 +6400,7 @@ export function NewChatLandingScreen() {
           {sandboxSelected && (
             <ComposerWorkspaceBar
               key="workspace-controls"
-              className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
+              className="px-2 py-0.5 mobile-app:[--composer-context-padding-block:2px] md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
               trailingContent={mcpRegistryPicker}
             >
@@ -6292,7 +6416,7 @@ export function NewChatLandingScreen() {
                     aria-label={`Sandbox repositories: ${
                       sandboxRepoSelections.length > 0 ? sandboxRepoLabel : "None selected"
                     }`}
-                    className="relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:min-w-11"
+                    className="relative inline-flex h-6 min-w-10 mobile-touch-target mobile-app:h-auto max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:min-w-11"
                     data-testid="new-chat-landing-repo-chip"
                   >
                     <GitBranchIcon className="ui-icon" />
@@ -6311,7 +6435,8 @@ export function NewChatLandingScreen() {
                 <PopoverContent
                   ref={sandboxRepoPopoverRef}
                   align="start"
-                  className="w-96 p-3"
+                  side="top"
+                  className="w-96 mobile-app:max-w-[calc(100vw-1rem)] p-3"
                   onOpenAutoFocus={(event) => {
                     if (focusSandboxRepositoryIssue()) event.preventDefault();
                   }}
@@ -6361,12 +6486,17 @@ export function NewChatLandingScreen() {
                   </div>
                 </PopoverContent>
               </Popover>
+              <SandboxProfilePicker
+                provider={effectiveSandboxProvider}
+                value={sandboxProfile}
+                onChange={setSandboxProfile}
+              />
             </ComposerWorkspaceBar>
           )}
           {!sandboxSelected && (
             <ComposerWorkspaceBar
               key="workspace-controls"
-              className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
+              className="px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
               trailingContent={mcpRegistryPicker}
             >
@@ -6885,7 +7015,7 @@ export function NewChatLandingScreen() {
                                     ? "true"
                                     : undefined
                                 }
-                                className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                                className="mobile-touch-target text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
                               >
                                 <span className="flex items-center gap-1">
                                   <span className="flex size-4 shrink-0 items-center justify-center">
@@ -6899,7 +7029,7 @@ export function NewChatLandingScreen() {
                             <DropdownMenuItem
                               aria-disabled="true"
                               onSelect={(e) => e.preventDefault()}
-                              className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
+                              className="mobile-touch-target flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
                               data-testid="new-chat-landing-sandbox-option-disabled"
                             >
                               <span className="flex items-center gap-1">
@@ -6931,6 +7061,7 @@ export function NewChatLandingScreen() {
                         {cloudHosts.map(renderHostMenuItem)}
                         {showArcaOption && (
                           <DropdownMenuItem
+                            className="mobile-touch-target"
                             onSelect={() => {
                               pendingArcaConnectRef.current = true;
                             }}
@@ -6964,7 +7095,7 @@ export function NewChatLandingScreen() {
                             }}
                             disabled={connectingThisMachine}
                             data-testid="new-chat-landing-run-on-this-machine"
-                            className="group gap-1 text-sm"
+                            className="mobile-touch-target group gap-1 text-sm"
                           >
                             <span className="flex size-4 shrink-0 items-center justify-center">
                               <span
@@ -6992,7 +7123,7 @@ export function NewChatLandingScreen() {
                                 event.preventDefault();
                                 setOfflineHostLimit((limit) => (limit > 0 ? 0 : 5));
                               }}
-                              className="text-muted-foreground"
+                              className="mobile-touch-target text-muted-foreground"
                             >
                               {offlineHostLimit > 0 ? (
                                 <ChevronDownIcon className="size-4" />
@@ -7018,7 +7149,7 @@ export function NewChatLandingScreen() {
                                       event.preventDefault();
                                       setOfflineHostLimit((limit) => limit + 5);
                                     }}
-                                    className="text-muted-foreground"
+                                    className="mobile-touch-target text-muted-foreground"
                                   >
                                     Show more ({otherOfflineHosts.length - offlineHostLimit}{" "}
                                     remaining)
@@ -7035,7 +7166,7 @@ export function NewChatLandingScreen() {
                         <DropdownMenuItem
                           onSelect={() => setConnectOpen(true)}
                           data-testid="new-chat-landing-connect-host"
-                          className="composer-host-connect text-muted-foreground"
+                          className="mobile-touch-target composer-host-connect text-muted-foreground"
                         >
                           <PlusIcon className="size-4" />
                           Connect new host
@@ -7123,6 +7254,10 @@ export function NewChatLandingScreen() {
                         effectiveAgentId={effectiveAgentId}
                         agentLabel={agentLabel}
                         hasAgents={agentList.length > 0}
+                        curatedEntries={
+                          curation.restrictToAgentNames.size > 0 ? agentList : undefined
+                        }
+                        entriesFailed={agentsError}
                         loading={pickerLoading}
                         interactiveWhileLoading={pickerInteractiveWhileLoading}
                         disabledLabel={noExecutionTargetSelected ? "No host selected" : undefined}
@@ -7365,6 +7500,11 @@ export function NewChatLandingScreen() {
               )}
             </p>
           )}
+          {sandboxProfileError && (
+            <p className="text-sm text-muted-foreground" role="status">
+              {sandboxProfileError}
+            </p>
+          )}
           {pickerSelectionError && (
             <p className="mt-3 text-sm text-destructive" role="alert">
               {pickerSelectionError}
@@ -7441,6 +7581,7 @@ export function NewChatLandingScreen() {
           <div className="mt-5 flex flex-col items-center gap-2">
             <Button
               variant="outline"
+              className="mobile-touch-target mobile-app:h-auto"
               onClick={() => navigate("/settings/import")}
               data-testid="landing-import-sessions"
             >

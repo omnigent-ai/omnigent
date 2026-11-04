@@ -1199,16 +1199,35 @@ def register_resource_routes(
             },
         )
 
+    async def _changes_registry(
+        session_id: str, environment_id: str, agent_spec: AgentSpec | None
+    ) -> FilesystemRegistry | None:
+        from omnigent.runtime.filesystem_registry import MultiRepositoryFilesystemRegistry
+
+        if environment_id != DEFAULT_ENVIRONMENT_ID:
+            try:
+                resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.NOT_FOUND) from exc
+        registry = await _resolve_session_fs_registry(session_id)
+        if isinstance(registry, MultiRepositoryFilesystemRegistry):
+            return registry.with_git_runner(
+                lambda argv, cwd, timeout: resource_registry.resolve_environment(
+                    session_id, environment_id, agent_spec
+                ).run_git(argv, cwd, timeout)
+            )
+        return registry
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
     async def list_filesystem_changes(
         session_id: str,
-        environment_id: str,  # noqa: ARG001
+        environment_id: str,
     ) -> JSONResponse:
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
-        await _require_os_env(session_id)
+        agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _changes_registry(session_id, environment_id, agent_spec)
         try:
             # git status can take seconds; keep it off the loop (relay probes)
             # and off the default pool (native message delivery).
@@ -1236,6 +1255,9 @@ def register_resource_routes(
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                **(
+                    {"repository_root": rec["repository_root"]} if "repository_root" in rec else {}
+                ),
             }
             for rec in raw_changes
         ]
@@ -1255,7 +1277,7 @@ def register_resource_routes(
     ) -> JSONResponse:
         agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _changes_registry(session_id, environment_id, agent_spec)
 
         from omnigent.entities.environment_filesystem import InvalidPath
         from omnigent.runner.environment_filesystem import _validate_path
@@ -1293,6 +1315,11 @@ def register_resource_routes(
                 if session_registry is not None
                 else None
             )
+            before = (
+                await run_slow_io(session_registry.get_baseline, relative_path)
+                if session_registry is not None and record is not None
+                else None
+            )
         except GitStatusUnavailable as exc:
             return JSONResponse(
                 status_code=500,
@@ -1313,12 +1340,6 @@ def register_resource_routes(
             )
         is_deleted = record.get("status") == "deleted"
 
-        before: str | None = (
-            await run_slow_io(session_registry.get_baseline, relative_path)
-            if session_registry is not None
-            else None
-        )
-
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
         after: str | None = None
@@ -1333,8 +1354,13 @@ def register_resource_routes(
             content={
                 "object": "session.environment.filesystem.file_diff",
                 "path": relative_path,
-                "before": before,
+                "before": None if record.get("status") == "created" and before == "" else before,
                 "after": after,
+                **(
+                    {"baseline_state": "unknown"}
+                    if before is None and record.get("status") != "created"
+                    else {}
+                ),
             },
         )
 
@@ -1418,10 +1444,14 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "pr_changed_files",
+            head_sha=head_sha,
+            base_sha=base_sha,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
@@ -1433,10 +1463,14 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "pr_diff",
+            head_sha=head_sha,
+            base_sha=base_sha,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
@@ -1572,6 +1606,76 @@ def register_resource_routes(
             **_server_tracking_fields(body),
             add=body.get("add", []),
             remove=body.get("remove", []),
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/review-threads")
+    async def read_review_threads_route(
+        session_id: str,
+        pr_url: str,
+        after: str = "",
+        head_sha: str = "",
+        base_sha: str = "",
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_review_threads",
+            pr_url=pr_url,
+            after=after,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments")
+    async def read_review_thread_comments_route(
+        session_id: str,
+        thread_id: str,
+        pr_url: str,
+        after: str,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_review_thread_comments",
+            pr_url=pr_url,
+            thread_id=thread_id,
+            after=after,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/review-threads")
+    async def create_review_thread_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "create_pr_review_thread",
+            pr_url=body["pr_url"],
+            body=body.get("body"),
+            anchor=body.get("anchor"),
+            **_server_tracking_fields(body),
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/replies")
+    async def reply_to_review_thread_route(
+        session_id: str, thread_id: str, request: Request
+    ) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "reply_to_pr_review_thread",
+            thread_id=thread_id,
+            pr_url=body["pr_url"],
+            body=body.get("body"),
+            **_server_tracking_fields(body),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/comments")

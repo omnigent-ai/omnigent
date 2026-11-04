@@ -65,6 +65,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -1232,10 +1233,8 @@ def _claude_settings_payload(
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
     """Read the ``env`` block of Claude Code's user ``settings.json``.
 
-    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
-    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
-    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
-    relative value is relative to the CLI's working directory.
+    The file is located by
+    :func:`omnigent.onboarding.ambient.read_claude_user_settings`.
 
     :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
         ``None`` means this process's working directory.
@@ -1243,14 +1242,10 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
         ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
         when the file is missing, unreadable, or has no ``env`` object.
     """
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_dir = pathlib.Path(configured) if configured else pathlib.Path.home() / ".claude"
-    settings_path = pathlib.Path(cwd or "") / config_dir / "settings.json"
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    env = settings.get("env") if isinstance(settings, dict) else None
+    from omnigent.onboarding.ambient import read_claude_user_settings
+
+    settings = read_claude_user_settings(cwd)
+    env = settings.get("env") if settings is not None else None
     if not isinstance(env, dict):
         return {}
     return {
@@ -1305,19 +1300,17 @@ def _resolve_gateway_env(
         corresponding base URL or auth command.
     """
     host = host_override.rstrip("/") if host_override else None
-    if host is None and base_url_override is not None and auth_command_override is not None:
+    generic_provider = (
+        host is None and base_url_override is not None and auth_command_override is not None
+    )
+    if generic_provider:
         # Generic-provider gateway: explicit base_url + auth command,
         # no Databricks host or profile required (e.g. ApiKeyAuth with
         # a mock LLM server URL).
-        return {
-            "ANTHROPIC_BASE_URL": base_url_override,
-            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
-                auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
-            ),
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-            _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
-        }
-    if host is None:
+        assert base_url_override is not None and auth_command_override is not None
+        base_url = base_url_override
+        auth_command = auth_command_override
+    elif host is None:
         # Only the workspace host is needed here: the auth command mints the
         # bearer at request time. Resolving the host (rather than a static
         # ``(host, token)`` credential pair) keeps OAuth U2M profiles working
@@ -1361,9 +1354,10 @@ def _resolve_gateway_env(
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
             auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
         ),
-        _ANTHROPIC_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
         _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command,
     }
+    if not generic_provider:
+        gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = _DATABRICKS_CODING_AGENT_HEADER
     # DATABRICKS-PATCH(claude-sdk-gateway-betas)
     # Blanket-disabling betas makes Claude Code strip `interleaved-thinking`,
     # after which the Databricks gateway rejects the malformed thinking blocks
@@ -1376,9 +1370,10 @@ def _resolve_gateway_env(
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
         gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV],
+            gateway_env.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
             CLAUDE_CODE_AGENT,
             via_ug=is_ug_route(base_url),
+            client_surface=harness_client_surface(),
         )
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
@@ -2865,6 +2860,7 @@ class ClaudeSDKExecutor(Executor):
         # ``_get_or_create_client`` via ``_unset_env_var`` — setting it to
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
+        env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
         # Teach Claude Code this gateway's spellings so no model surface routes
         # to an id the gateway rejects: pins for the family aliases, rewrites
