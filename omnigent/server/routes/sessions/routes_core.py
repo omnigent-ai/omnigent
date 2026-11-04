@@ -1631,7 +1631,13 @@ def register_core_routes(
         await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        _set_read_state(user_id, session_id, body.last_seen, body.unread)
+        _set_read_state(
+            user_id,
+            session_id,
+            body.last_seen,
+            body.unread,
+            watched_turn_finish_id=body.watched_turn_finish_id,
+        )
         return Response(status_code=204)
 
     # ── GET /sessions/{session_id} ───────────────────────────────

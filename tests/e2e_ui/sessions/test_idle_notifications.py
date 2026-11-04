@@ -33,8 +33,15 @@ groups.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+
+import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Browser, Page, expect
+
+from tests._helpers.browser import user_page
+from tests._helpers.polling import poll_until
+from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm
 
 # Records constructed notifications and makes visibility/focus controllable
 # from the test via window.__hidden. Runs before any app script on every
@@ -199,15 +206,16 @@ def _wait_for_observed_session_status(
     )
 
 
-def _send_prompt(page: Page) -> None:
+def _send_prompt(page: Page, prompt: str = _PROMPT) -> None:
     """
-    Type the standard prompt into the composer and click Send.
+    Type a prompt into the composer and click Send.
 
     :param page: Playwright page already navigated to ``/c/{id}``.
+    :param prompt: Message text; defaults to the standard short prompt.
     """
     composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
-    composer.fill(_PROMPT)
+    composer.fill(prompt)
     page.get_by_role("button", name="Send", exact=True).click()
 
 
@@ -436,3 +444,96 @@ def test_idle_notification_deferred_until_settle(
     notifs = page.evaluate("window.__notifs")
     assert len(notifs) == 1, f"expected exactly one settled notification, got {notifs}"
     assert notifs[0]["options"]["tag"] == f"omnigent:session:{session_id}", notifs
+
+
+def test_idle_notification_skipped_on_phone_when_watched_on_laptop(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """
+    A turn the user watched finish on one device does not notify on another.
+
+    The same user has the session open on a focused laptop and on a
+    backgrounded phone-viewport page. Turn one finishes while the laptop is
+    viewing it, so the phone must stay silent past the settle window. Turn two
+    finishes after the laptop navigated away, so the phone must still notify
+    exactly once. Each turn is held on the mock LLM's gate until both devices
+    have seen it running, so the finish happens at a known point.
+
+    :param browser: Playwright browser; one context per device.
+    :param seeded_session: ``(base_url, session_id)`` of a real session
+        bound to the spawned runner.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL.
+    """
+    base_url, session_id = seeded_session
+    watched_prompt = f"Watched on the laptop {session_id}"
+    unwatched_prompt = f"Left running on the laptop {session_id}"
+    for prompt in (watched_prompt, unwatched_prompt):
+        # The tool requirement keeps title generation from taking the gated reply.
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": "Done.", "block": True}],
+            match=prompt,
+            required_tools=["ui_open_file"],
+        )
+
+    def start_gated_turn(prompt: str) -> None:
+        _reset_session_status_probe(laptop)
+        _reset_session_status_probe(phone)
+        _send_prompt(laptop, prompt)
+        poll_until(
+            lambda: httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=5.0).json()[
+                "pending"
+            ],
+            timeout_s=30.0,
+        )
+        _wait_for_observed_session_status(phone, session_id, "running", timeout=30_000)
+
+    def finish_gated_turn() -> None:
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+        _wait_for_observed_session_status(phone, session_id, "idle", timeout=60_000)
+
+    with ExitStack() as cleanup:
+        # The reset also releases a turn still parked on the gate.
+        cleanup.callback(reset_mock_llm, mock_llm_server_url)
+        laptop = cleanup.enter_context(
+            user_page(browser, headers={}, viewport={"width": 1280, "height": 800})
+        )
+        phone = cleanup.enter_context(
+            user_page(
+                browser,
+                headers={},
+                viewport={"width": 390, "height": 844},
+                is_mobile=True,
+                has_touch=True,
+                device_scale_factor=3,
+            )
+        )
+        for device in (laptop, phone):
+            device.add_init_script(_HARNESS_INIT_SCRIPT)
+            device.goto(f"{base_url}/c/{session_id}")
+            expect(device.get_by_label("Message the agent")).to_be_visible(timeout=15_000)
+        phone.evaluate(
+            "window.__hidden = true;"
+            "document.dispatchEvent(new Event('visibilitychange'));"
+            "window.dispatchEvent(new Event('blur'));"
+        )
+
+        start_gated_turn(watched_prompt)
+        finish_gated_turn()
+        # Past the phone's ~10s settle, so a pending notification would have fired.
+        phone.wait_for_timeout(14_000)
+        assert phone.evaluate("window.__notifs") == [], (
+            "a finish watched on the laptop must not notify the phone"
+        )
+
+        start_gated_turn(unwatched_prompt)
+        laptop.get_by_test_id("new-chat-button").click()
+        laptop.wait_for_url(lambda url: f"/c/{session_id}" not in url, timeout=10_000)
+        finish_gated_turn()
+        phone.wait_for_function("window.__notifs.length > 0", timeout=30_000)
+        phone.wait_for_timeout(3_000)
+        notifs = phone.evaluate("window.__notifs")
+        assert len(notifs) == 1, f"expected exactly one notification, got {notifs}"
+        assert notifs[0]["options"]["tag"] == f"omnigent:session:{session_id}", notifs

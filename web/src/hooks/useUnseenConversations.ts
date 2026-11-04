@@ -103,6 +103,11 @@ const seeded = new Set<string>();
 // about to hand us. Explicit user actions still apply.
 let hydrated = false;
 
+// The server's `last_turn_finish_id` this browser last watched per
+// conversation, reported so the user's other devices skip that turn-end
+// notification.
+const watchedTurnFinish = new Map<string, string>();
+
 export function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
@@ -112,18 +117,39 @@ export function nowSeconds(): number {
  * Best-effort and fire-and-forget: a failed PUT leaves the optimistic local
  * mirror in place, which the next mutation or a reload reconciles. Skips the
  * call when there's no baseline to report (nothing meaningful to sync).
+ * `watchedTurnFinishId` is sent only with the write that newly reports it.
  */
-async function syncReadState(conversationId: string): Promise<void> {
-  const lastSeen = lastSeenMap[conversationId];
-  if (lastSeen === undefined) return;
-  try {
-    await authenticatedFetch(`/v1/sessions/${encodeURIComponent(conversationId)}/read-state`, {
+async function syncReadState(conversationId: string, watchedTurnFinishId?: string): Promise<void> {
+  if (lastSeenMap[conversationId] === undefined) return;
+  // Read at send time so the retry below can't replay a superseded write.
+  const readState = () => ({
+    last_seen: lastSeenMap[conversationId],
+    unread: explicitlyUnread.has(conversationId),
+  });
+  const put = (body: object) =>
+    authenticatedFetch(`/v1/sessions/${encodeURIComponent(conversationId)}/read-state`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ last_seen: lastSeen, unread: explicitlyUnread.has(conversationId) }),
+      body: JSON.stringify(body),
     });
+  // Lets the next mark resend a finish the server never recorded.
+  const forgetWatched = () => {
+    if (watchedTurnFinish.get(conversationId) === watchedTurnFinishId) {
+      watchedTurnFinish.delete(conversationId);
+    }
+  };
+  try {
+    if (watchedTurnFinishId === undefined) {
+      await put(readState());
+      return;
+    }
+    const response = await put({ ...readState(), watched_turn_finish_id: watchedTurnFinishId });
+    // A server without finish ids rejects the field; still record the read-state.
+    if (response.status === 422) await put(readState());
+    else if (!response.ok) forgetWatched();
   } catch {
     // Network/auth errors must not break the UI; local state stays.
+    if (watchedTurnFinishId !== undefined) forgetWatched();
   }
 }
 
@@ -202,6 +228,7 @@ export function resetReadStateForTests(): void {
   lastSeenMap = {};
   explicitlyUnread.clear();
   seeded.clear();
+  watchedTurnFinish.clear();
   hydrated = false;
   try {
     globalThis.localStorage?.removeItem(STORAGE_KEY);
@@ -242,7 +269,12 @@ export function isExplicitlyUnread(conversationId: string): boolean {
 // rename, which would otherwise flag the conversation unseen because
 // the server's new updated_at can land slightly past the client's
 // nowSeconds() under clock skew.
-export function markConversationSeen(conversationId: string, atSeconds?: number): void {
+export function markConversationSeen(
+  conversationId: string,
+  atSeconds?: number,
+  // The server's `last_turn_finish_id` being watched, reported in the same PUT.
+  turnFinishId?: string,
+): void {
   // A conversation the user explicitly marked unread stays unread until they
   // reopen it (which clears the override first). This guards every caller —
   // the automatic active-view marks and the self-action anchors
@@ -254,11 +286,17 @@ export function markConversationSeen(conversationId: string, atSeconds?: number)
   if (!hydrated) return;
   const baseline = atSeconds ?? nowSeconds();
   const stored = lastSeenMap[conversationId];
-  if (stored !== undefined && stored >= baseline) return;
-  lastSeenMap[conversationId] = baseline;
-  persistToStorage();
-  notifySubscribers();
-  void syncReadState(conversationId);
+  const advanced = stored === undefined || stored < baseline;
+  const newlyWatched =
+    turnFinishId !== undefined && watchedTurnFinish.get(conversationId) !== turnFinishId;
+  if (!advanced && !newlyWatched) return;
+  if (newlyWatched) watchedTurnFinish.set(conversationId, turnFinishId);
+  if (advanced) {
+    lastSeenMap[conversationId] = baseline;
+    persistToStorage();
+    notifySubscribers();
+  }
+  void syncReadState(conversationId, newlyWatched ? turnFinishId : undefined);
 }
 
 /**
@@ -425,11 +463,13 @@ function windowHasFocus(): boolean {
  * blurred window is NOT being read, so a turn finishing there must
  * stay unseen (the dock badge counts it) until focus returns. The
  * focus listener covers the return path — refocusing while the
- * thread is open marks it seen at that moment.
+ * thread is open marks it seen at that moment. Each focused mark also
+ * reports `turnFinishId` as watched.
  */
 export function useMarkConversationSeen(
   conversationId: string | undefined,
   updatedAt: number | undefined,
+  turnFinishId?: string | null,
 ): void {
   // Opening a thread is reading it, so clear any explicit-unread
   // override before the mark-seen below runs (and runs first, so
@@ -459,7 +499,13 @@ export function useMarkConversationSeen(
       // leads the client must not leave a just-read turn reading as unseen
       // (updated_at > client wall clock). Wall clock still wins when it's
       // ahead, capturing an update the poll hasn't picked up yet.
-      if (windowHasFocus()) markConversationSeen(conversationId, Math.max(nowSeconds(), updatedAt));
+      if (windowHasFocus()) {
+        markConversationSeen(
+          conversationId,
+          Math.max(nowSeconds(), updatedAt),
+          turnFinishId ?? undefined,
+        );
+      }
     };
     markIfFocused();
     window.addEventListener("focus", markIfFocused);
@@ -470,5 +516,5 @@ export function useMarkConversationSeen(
       // another client) must not silently mark the thread read.
       markIfFocused();
     };
-  }, [conversationId, updatedAt]);
+  }, [conversationId, updatedAt, turnFinishId]);
 }

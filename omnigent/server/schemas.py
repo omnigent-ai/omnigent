@@ -2966,10 +2966,15 @@ class ReadStatePutRequest(BaseModel):
         ``updated_at - 1`` so the row reads unseen.
     :param unread: Whether this session is explicitly flagged unread for
         the caller.
+    :param watched_turn_finish_id: The session's ``last_turn_finish_id`` the
+        caller just watched with the session open and focused, e.g.
+        ``"3f9c0d1e2a4b-17"``. The caller's other devices skip that finish's
+        notification. Omitted or ``None`` keeps the stored value.
     """
 
     last_seen: int
     unread: bool
+    watched_turn_finish_id: str | None = Field(default=None, max_length=64)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3154,6 +3159,14 @@ class SessionListItem(BaseModel):
     :param viewer_unread: Whether the *requesting user* explicitly
         marked this session unread. Per-viewer; lifts the active-row
         dot suppression on the client. ``False`` by default.
+    :param last_turn_finish_id: Opaque id of the latest turn finish behind
+        ``status`` (including direct sub-agent children), e.g.
+        ``"3f9c0d1e2a4b-17"``. Changes on each finish; ``None`` when the
+        serving process recorded none. In-memory only.
+    :param viewer_watched_turn_finish_id: The ``last_turn_finish_id`` the
+        *requesting user* last watched on any device with the session open,
+        reported through ``PUT /v1/sessions/{id}/read-state``. Clients skip
+        a turn-end notification for the finish it names. In-memory only.
     :param search_snippet: Excerpt of the chat content that matched the
         request's ``search_query``, centered on the match with ``…``
         marking elided ends, so the search UI can show *where* a session
@@ -3192,6 +3205,8 @@ class SessionListItem(BaseModel):
     comments_updated_at: int | None = None
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
+    last_turn_finish_id: str | None = None
+    viewer_watched_turn_finish_id: str | None = None
     search_snippet: str | None = None
     parent_session_id: str | None = None
     # First-class project this session is filed under, or ``None`` when
