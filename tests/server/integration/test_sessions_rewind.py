@@ -76,6 +76,9 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     repos = ["https://github.com/acme/api"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
     store.set_labels(source_id, sandbox_labels)
+    store.update_conversation(
+        source_id, cost_control_mode_override="on", subagent_routing_override="on"
+    )
     listed_files: list[str] = []
     list_files = SqlAlchemyFileStore.list
 
@@ -106,6 +109,7 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
         "feature/parser",
     )
     assert (fork.model_override, fork.reasoning_effort) == ("claude-opus-4-7", "high")
+    assert (fork.cost_control_mode_override, fork.subagent_routing_override) == ("on", "on")
     assert fork.terminal_launch_args == ["--permission-mode", "acceptEdits"]
     assert fork.labels["team"] == "core"
     # A relaunch of the shared sandbox still re-clones the repositories.

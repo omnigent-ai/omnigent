@@ -6511,6 +6511,7 @@ def test_fork_conversation_up_to_unknown_response_raises(
 def test_fork_conversation_before_item_drops_the_item_and_later_history(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
 ) -> None:
     """``before_item_id`` copies only the items positioned before that item.
 
@@ -6542,6 +6543,20 @@ def test_fork_conversation_before_item_drops_the_item_and_later_history(
     fork = conversation_store.fork_conversation(source.id, before_item_id=second_prompt.id)
     assert fork_texts(fork.id) == ["Q1", "A1"]
     assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+
+    # A rewind continues the source in place: the cutoff holds, and the fork
+    # is born on the source's host.
+    HostStore(db_uri).upsert_on_connect("f" * 32, "laptop", RESERVED_USER_LOCAL)
+    conversation_store.set_host_id(source.id, "f" * 32, "/work/repo", "main")
+    rewound = conversation_store.fork_conversation(
+        source.id, before_item_id=second_prompt.id, continue_source=True
+    )
+    assert fork_texts(rewound.id) == ["Q1", "A1"]
+    assert (rewound.host_id, rewound.workspace, rewound.git_branch) == (
+        "f" * 32,
+        "/work/repo",
+        "main",
+    )
 
     first = conversation_store.fork_conversation(source.id, before_item_id=first_prompt.id)
     assert fork_texts(first.id) == []
