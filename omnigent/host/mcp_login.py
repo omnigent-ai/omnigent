@@ -265,16 +265,21 @@ async def _deliver_callback(terminal: Callable[[], int], callback_url: str) -> N
 
     # The address is the CLI's own loopback listener, checked by ``valid_callback``. A bare
     # transport skips proxies, redirects and the client's request log, which would keep the code.
-    timeout = httpx.Timeout(CALLBACK_TIMEOUT_SECONDS).as_dict()
-    request = httpx.Request("GET", callback_url, extensions={"timeout": timeout})
+    timeout = httpx.Timeout(CALLBACK_TIMEOUT_SECONDS, connect=CALLBACK_TIMEOUT_SECONDS / 2)
+    request = httpx.Request("GET", callback_url, extensions={"timeout": timeout.as_dict()})
     try:
-        async with httpx.AsyncHTTPTransport() as transport:
+        # Bound the whole exchange, as a dribbled reply resets each read timeout. Connecting
+        # gives up sooner, so an unreachable listener still falls back to the terminal.
+        async with (
+            httpx.AsyncHTTPTransport() as transport,
+            asyncio.timeout(CALLBACK_TIMEOUT_SECONDS),
+        ):
             response = await transport.handle_async_request(request)
             await response.aclose()
         return
     except (httpx.ConnectError, httpx.ConnectTimeout):
         pass
-    except httpx.HTTPError:
+    except (httpx.HTTPError, TimeoutError):
         # The listener has the request; sending it again would reuse the code.
         return
     # No listener: newer CLIs read the redirect from their terminal instead.

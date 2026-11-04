@@ -64,8 +64,12 @@ if mode == "listen":
         def do_GET(self):
             with open(log.with_suffix(".received"), "a") as received:
                 received.write(self.path + "\\n")
-            time.sleep(float(os.environ.get("FAKE_LISTEN_DELAY", "0")))
             self.send_response(200)
+            # A slow listener dribbles its headers, so no single read waits long.
+            for _ in range(int(float(os.environ.get("FAKE_LISTEN_DELAY", "0")) * 10)):
+                self.flush_headers()
+                time.sleep(0.1)
+                self.send_header("X-Slow", "1")
             self.end_headers()
         def log_message(self, *args):
             pass
@@ -372,7 +376,7 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
         monkeypatch.setenv(name, "http://127.0.0.1:9")
     if slow_listener:
         # The listener has the code even when its reply is late, so it is sent once.
-        monkeypatch.setenv("FAKE_LISTEN_DELAY", "1")
+        monkeypatch.setenv("FAKE_LISTEN_DELAY", "2")
         monkeypatch.setattr(mcp_login, "CALLBACK_TIMEOUT_SECONDS", 0.3)
     typed: list[bytes] = []
 
@@ -391,12 +395,15 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
     callback = f"{redirect}?code=abc&state=s"
     if slow_listener:
         # A second Finish while the first is delivering must not resend the code.
+        submitted_at = asyncio.get_running_loop().time()
         first, second = await asyncio.gather(
             logins.submit(started["login_id"], callback),
             logins.submit(started["login_id"], callback),
             return_exceptions=True,
         )
         assert isinstance(second, LoginError) and second.status == "invalid", (first, second)
+        # Finish answers within its timeout, not when the listener's reply ends.
+        assert asyncio.get_running_loop().time() - submitted_at < 1.5
     else:
         await logins.submit(started["login_id"], callback)
     finished = await _settled(logins, started["login_id"])
