@@ -24,6 +24,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    JSONL_CURSOR_FINGERPRINT_BYTES,
     OBSERVER_HOOK_STDERR_FILE,
     BtwOverlay,
     ClaudeHookRecord,
@@ -32,6 +33,7 @@ from omnigent.harnesses.claude_native.bridge import (
     HookReadResult,
     TranscriptReadResult,
     _display_text,
+    _parse_transcript_read_result,
     _transcript_items_from_entry,
     _transcript_timestamp,
     compute_transcript_cumulative_cost,
@@ -115,6 +117,10 @@ class _CompactionSnapshotError(ValueError):
     """A retryable failure while reading or reconstructing a local snapshot."""
 
 
+class _TranscriptChangedDuringRecovery(Exception):
+    """The transcript must be read again before its cursor can be recovered."""
+
+
 class _CompactionItemsReadError(httpx.HTTPError):
     """An HTTP failure from the pre-POST latest-item lookup."""
 
@@ -188,7 +194,7 @@ _SUBAGENT_FORWARD_CONCURRENCY = 8
 # source-keyed individual posts. Individual transient failures stay pending
 # at the durable cursor so a temporary outage cannot lose child history.
 _SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS = 12
-_CURSOR_FINGERPRINT_BYTES = 256
+_CURSOR_FINGERPRINT_BYTES = JSONL_CURSOR_FINGERPRINT_BYTES
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
 _HTTP_POST_RETRY_BASE_DELAY_S = 1.0
@@ -801,6 +807,8 @@ class TranscriptForwardState:
         has no output yet. Cleared by subsequent output and persisted for retries.
     :param api_error_response_id: Response that produced the retained API error.
         A queued prompt can clear ``current_response_id`` before its hook posts.
+    :param recovery_read: Observed recovery batch retained across partial posts.
+        Only cursors and accepted IDs are persisted; a restart validates them again.
     """
 
     transcript_path: Path
@@ -814,6 +822,7 @@ class TranscriptForwardState:
     pending_settled_at: float | None = None
     api_error_context: FailureContext | None = None
     api_error_response_id: str | None = None
+    recovery_read: TranscriptReadResult | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -1685,6 +1694,9 @@ async def forward_claude_transcript_to_session(
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
                 raise
+            except _TranscriptChangedDuringRecovery:
+                # A rewrite raced the scan; retain the durable cursor for the next poll.
+                pass
             except TimeoutError:
                 # Every parent HTTP response pushes the deadline forward, so
                 # this is a true no-progress stall rather than a healthy drain.
@@ -4831,7 +4843,8 @@ async def _ensure_state_for_transcript(
     :returns: Cursor state for ``transcript_path``.
     """
     if state is not None and state.transcript_path == transcript_path:
-        validated = _validated_transcript_state(
+        validated = await asyncio.to_thread(
+            _validated_transcript_state,
             state,
             session_id=session_id,
         )
@@ -4840,7 +4853,8 @@ async def _ensure_state_for_transcript(
         return validated
     disk_state = _read_forward_state(bridge_dir)
     if disk_state is not None and disk_state.transcript_path == transcript_path:
-        validated = _validated_transcript_state(
+        validated = await asyncio.to_thread(
+            _validated_transcript_state,
             disk_state,
             session_id=session_id,
         )
@@ -5213,6 +5227,8 @@ async def _forward_available_items(
         dedupe.pending_settled_response_id,
         dedupe.pending_settled_at,
     )
+    if state.recovery_read is not None:
+        state = replace(state, recovery_read=result)
     items = result.items
     if not items:
         if result.line_cursor == state.line_cursor and result.byte_offset == (
@@ -5233,7 +5249,7 @@ async def _forward_available_items(
             ):
                 state = _with_settle_latch(state, dedupe)
                 await _write_forward_state_async(bridge_dir, state)
-            return state
+            return replace(state, recovery_read=None)
     current_response_id = result.current_response_id
     seen_source_ids = list(state.seen_source_ids)
     seen = set(seen_source_ids)
@@ -5474,7 +5490,16 @@ async def _forward_available_items(
         transcript_path=state.transcript_path,
         byte_offset=result.byte_offset,
     )
-    fingerprint = _jsonl_cursor_fingerprint(state.transcript_path, result.byte_offset)
+    if result.snapshot is None:
+        fingerprint = _jsonl_cursor_fingerprint(state.transcript_path, result.byte_offset)
+    elif result.cursor_prefix_sample is not None and result.snapshot.matches(
+        state.transcript_path
+    ):
+        fingerprint = _jsonl_fingerprint_from_sample(
+            result.byte_offset, result.cursor_prefix_sample
+        )
+    else:
+        fingerprint = None
     # A worktree move can race the read or POSTs. Keep the last valid cursor
     # if the advanced one cannot be fingerprinted; seen IDs deduplicate replay.
     cursor = (
@@ -5498,6 +5523,7 @@ async def _forward_available_items(
         settled_response_id=dedupe.settled_response_id,
         pending_settled_response_id=dedupe.pending_settled_response_id,
         pending_settled_at=dedupe.pending_settled_at,
+        recovery_read=None,
     )
     await _write_forward_state_async(bridge_dir, updated)
     # POST usage AFTER items so the ring never leads the transcript.
@@ -5731,6 +5757,25 @@ def _read_transcript_items_for_state(
     :returns: Transcript items and updated cursors. States without a
         byte offset are migrated by one line-cursor compatibility scan.
     """
+    if state.recovery_read is not None:
+        captured = state.recovery_read
+        if captured.captured_records is None:
+            return captured
+        parsed = _parse_transcript_read_result(
+            captured.captured_records,
+            agent_name=agent_name,
+            current_response_id=captured.current_response_id,
+            settled_response_id=settled_response_id,
+            pending_settled_response_id=pending_settled_response_id,
+            pending_settled_at=pending_settled_at,
+            include_sidechains=False,
+            legacy_agent_messages=False,
+        )
+        return replace(
+            parsed,
+            snapshot=captured.snapshot,
+            cursor_prefix_sample=captured.cursor_prefix_sample,
+        )
     if state.byte_offset is None:
         return read_transcript_items_since_with_position(
             state.transcript_path,
@@ -5759,7 +5804,7 @@ def _validated_transcript_state(
     session_id: str,
 ) -> TranscriptForwardState:
     """
-    Reset a transcript cursor if its byte-offset fingerprint is stale.
+    Recover a stale transcript cursor from its last posted native record.
 
     :param state: Transcript cursor loaded from memory or disk.
     :param session_id: Omnigent session/conversation id, e.g.
@@ -5767,25 +5812,30 @@ def _validated_transcript_state(
     :returns: ``state`` unchanged when its byte cursor still matches
         the file; ``state`` with an adopted fingerprint (no reset)
         when the cursor is at byte 0 / line 0 and the file just
-        appeared; otherwise a cursor skipped to end-of-file with
-        ``seen_source_ids`` preserved so already-forwarded items
-        are not re-posted.
+        appeared; otherwise recover a retained native record or skip the
+        observed prefix if no stable anchor survives. Posted IDs stay deduplicated.
     """
-    if state.byte_offset is None:
+    if state.recovery_read is not None or state.byte_offset is None:
         return state
+    last_source_parts = state.seen_source_ids[-1].rsplit(":", 2) if state.seen_source_ids else []
+    # A partial first record has no preceding bytes to fingerprint.
+    uncheckpointed_items = (
+        state.byte_offset == 0
+        and len(last_source_parts) == 3
+        and not last_source_parts[0].startswith(("byte-", "line-"))
+    )
     current_fingerprint = _jsonl_cursor_fingerprint(state.transcript_path, state.byte_offset)
     if current_fingerprint is None:
         if not state.transcript_path.exists():
             return state
         _logger.warning(
-            "Claude transcript cursor invalid; skipping to end of transcript; "
-            "session=%s byte_offset=%s",
+            "Claude transcript cursor invalid; recovering cursor; session=%s byte_offset=%s",
             session_id,
             state.byte_offset,
             extra={"session_id": session_id},
         )
     elif state.cursor_fingerprint is None:
-        if state.byte_offset == 0 and state.line_cursor == 0:
+        if state.byte_offset == 0 and state.line_cursor == 0 and not uncheckpointed_items:
             # State was written before the transcript file existed (fingerprint
             # was None because the file was missing). The file now exists and
             # the cursor is still at the start — adopt the computed fingerprint
@@ -5795,29 +5845,57 @@ def _validated_transcript_state(
                 cursor_fingerprint=current_fingerprint,
             )
         _logger.warning(
-            "Claude transcript cursor missing fingerprint; skipping to end of transcript; "
+            "Claude transcript cursor missing fingerprint; recovering cursor; "
             "session=%s byte_offset=%s",
             session_id,
             state.byte_offset,
             extra={"session_id": session_id},
         )
     elif current_fingerprint == state.cursor_fingerprint:
-        return state
+        if not uncheckpointed_items:
+            return state
     else:
         _logger.warning(
-            "Claude transcript cursor fingerprint changed; skipping to end of transcript; "
+            "Claude transcript cursor fingerprint changed; recovering cursor; "
             "session=%s byte_offset=%s",
             session_id,
             state.byte_offset,
             extra={"session_id": session_id},
         )
-    end_offset = _transcript_end_offset(state.transcript_path)
+    result = read_transcript_items_from_offset(
+        state.transcript_path,
+        0,
+        start_line=0,
+        agent_name="",
+        current_response_id=state.current_response_id,
+        settled_response_id=state.settled_response_id,
+        pending_settled_response_id=state.pending_settled_response_id,
+        pending_settled_at=state.pending_settled_at,
+        recovery_source_ids=state.seen_source_ids,
+    )
+    cursor = result.recovery_cursor
+    if (
+        cursor is None
+        or result.snapshot is None
+        or not result.snapshot.matches(state.transcript_path)
+    ):
+        raise _TranscriptChangedDuringRecovery
+    fingerprint = _jsonl_fingerprint_from_sample(cursor.byte_offset, cursor.prefix_sample)
+    if cursor.matched:
+        return replace(
+            state,
+            line_cursor=cursor.line_cursor,
+            byte_offset=cursor.byte_offset,
+            cursor_fingerprint=fingerprint,
+            recovery_read=result,
+        )
     return TranscriptForwardState(
         transcript_path=state.transcript_path,
         line_cursor=0,
-        byte_offset=end_offset,
-        cursor_fingerprint=_jsonl_cursor_fingerprint(state.transcript_path, end_offset),
+        byte_offset=cursor.byte_offset,
+        cursor_fingerprint=fingerprint,
         seen_source_ids=state.seen_source_ids,
+        recovery_read=result,
     )
 
 
@@ -8219,6 +8297,11 @@ def _jsonl_cursor_fingerprint(
         if not missing_ok:
             raise
         return None
+    return _jsonl_fingerprint_from_sample(byte_offset, sample)
+
+
+def _jsonl_fingerprint_from_sample(byte_offset: int, sample: bytes) -> str:
+    """Hash an observed cursor sample without rereading a mutable transcript."""
     payload = byte_offset.to_bytes(8, "big", signed=False) + sample
     return hashlib.sha256(payload).hexdigest()
 

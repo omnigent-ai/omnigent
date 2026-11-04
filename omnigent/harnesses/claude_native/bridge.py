@@ -57,7 +57,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -982,6 +982,56 @@ class TranscriptRecordItems:
     items: tuple[ClaudeTranscriptItem, ...]
 
 
+JSONL_CURSOR_FINGERPRINT_BYTES = 256
+
+
+@dataclass(frozen=True)
+class TranscriptReadSnapshot:
+    """Identity and digest of a bounded JSONL prefix observed during recovery."""
+
+    device: int
+    inode: int
+    length: int
+    digest: bytes
+
+    def matches(self, path: Path) -> bool:
+        """Require the entire observed prefix to survive, allowing later appends."""
+        try:
+            with path.open("rb") as handle:
+                before = os.fstat(handle.fileno())
+                if (before.st_dev, before.st_ino) != (self.device, self.inode):
+                    return False
+                digest = hashlib.sha256()
+                remaining = self.length
+                while remaining:
+                    chunk = handle.read(min(remaining, 65_536))
+                    if not chunk:
+                        return False
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                after = os.fstat(handle.fileno())
+                current = path.stat()
+        except FileNotFoundError:
+            return False
+        return (
+            digest.digest() == self.digest
+            and (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            == (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            == (current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+            and (current.st_dev, current.st_ino) == (self.device, self.inode)
+        )
+
+
+@dataclass(frozen=True)
+class TranscriptRecoveryCursor:
+    """A checkpoint derived from the observed bytes, before any later file mutation."""
+
+    line_cursor: int
+    byte_offset: int
+    prefix_sample: bytes
+    matched: bool = False
+
+
 @dataclass(frozen=True)
 class TranscriptReadResult:
     """
@@ -1010,6 +1060,8 @@ class TranscriptReadResult:
     :param record_items: Parsed items grouped by their complete source JSONL
         record, with the byte offset immediately after each record. Native
         child-transcript batching uses these boundaries for partial checkpoints.
+    :param captured_records: Recovery-only records retained until the forwarder
+        parses and consumes them, without reopening a rewritten file.
     """
 
     line_cursor: int
@@ -1020,6 +1072,10 @@ class TranscriptReadResult:
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: tuple[TranscriptRecordItems, ...] = ()
+    recovery_cursor: TranscriptRecoveryCursor | None = None
+    snapshot: TranscriptReadSnapshot | None = None
+    cursor_prefix_sample: bytes | None = None
+    captured_records: _JsonlReadResult | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -1160,6 +1216,7 @@ class _JsonlRecord:
     byte_offset: int
     next_byte_offset: int
     text: str | None
+    prefix_sample: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -1176,6 +1233,8 @@ class _JsonlReadResult:
     line_cursor: int
     byte_offset: int
     records: list[_JsonlRecord]
+    prefix_sample: bytes = b""
+    snapshot: TranscriptReadSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -3629,6 +3688,7 @@ def read_transcript_items_from_offset(
     pending_settled_at: float | None = None,
     include_sidechains: bool = False,
     legacy_agent_messages: bool = False,
+    recovery_source_ids: tuple[str, ...] | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items appended after a byte offset.
@@ -3662,13 +3722,72 @@ def read_transcript_items_from_offset(
         unchanged.
     :param legacy_agent_messages: Offline imports hide unproven historical
         team envelopes; preserve assistant response identity across them.
+    :param recovery_source_ids: For stale-cursor recovery only, locate the last
+        posted native item in a verified scan from byte zero. Return its cursor
+        without forwarding historical items; positional source IDs cannot anchor.
     :returns: Parsed items plus updated line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
         transcript_path,
         byte_offset=byte_offset,
         start_line=start_line,
+        capture_snapshot=recovery_source_ids is not None,
     )
+    recovery_cursor = None
+    if recovery_source_ids is not None:
+        recovered = _recover_transcript_read_cursor(
+            read_result,
+            recovery_source_ids,
+            agent_name=agent_name,
+            current_response_id=current_response_id,
+        )
+        recovery_cursor = recovered.recovery_cursor
+        assert recovery_cursor is not None
+        read_result = replace(
+            read_result,
+            records=[
+                record
+                for record in read_result.records
+                if record.byte_offset >= recovery_cursor.byte_offset
+            ],
+        )
+        if not recovery_cursor.matched:
+            current_response_id = settled_response_id = pending_settled_response_id = None
+            pending_settled_at = None
+        return TranscriptReadResult(
+            line_cursor=read_result.line_cursor,
+            byte_offset=read_result.byte_offset,
+            current_response_id=current_response_id,
+            items=[],
+            recovery_cursor=recovery_cursor,
+            snapshot=read_result.snapshot,
+            cursor_prefix_sample=read_result.prefix_sample,
+            captured_records=read_result,
+        )
+    return _parse_transcript_read_result(
+        read_result,
+        agent_name=agent_name,
+        current_response_id=current_response_id,
+        settled_response_id=settled_response_id,
+        pending_settled_response_id=pending_settled_response_id,
+        pending_settled_at=pending_settled_at,
+        include_sidechains=include_sidechains,
+        legacy_agent_messages=legacy_agent_messages,
+    )
+
+
+def _parse_transcript_read_result(
+    read_result: _JsonlReadResult,
+    *,
+    agent_name: str,
+    current_response_id: str | None,
+    settled_response_id: str | None,
+    pending_settled_response_id: str | None,
+    pending_settled_at: float | None,
+    include_sidechains: bool,
+    legacy_agent_messages: bool,
+) -> TranscriptReadResult:
+    """Parse the observed records without reopening the mutable source file."""
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
     active_settled_id = settled_response_id
@@ -3750,6 +3869,68 @@ def read_transcript_items_from_offset(
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
         record_items=tuple(record_items),
+    )
+
+
+def _recover_transcript_read_cursor(
+    result: _JsonlReadResult,
+    seen_source_ids: tuple[str, ...],
+    *,
+    agent_name: str,
+    current_response_id: str | None,
+) -> TranscriptReadResult:
+    """Locate the last durable native item using the ordinary transcript parser."""
+    source_id = seen_source_ids[-1] if seen_source_ids else ""
+    source_key = source_id.rsplit(":", 2)[0]
+    seen = set(seen_source_ids)
+    cursor = TranscriptRecoveryCursor(0, result.byte_offset, result.prefix_sample)
+    previous_sample = b""
+    matches = 0
+    for record in result.records:
+        before_sample, previous_sample = previous_sample, record.prefix_sample
+        if not source_key or source_key.startswith(("byte-", "line-")) or record.text is None:
+            continue
+        try:
+            entry = json.loads(record.text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if _transcript_source_key(entry, record.line_number, record.byte_offset) != source_key:
+            continue
+        # A posted wake establishes its own response even when its stopped
+        # predecessor has disappeared from the rewritten history.
+        posted_wake = any(
+            f"{source_key}:0:{kind}" in seen for kind in ("scheduled_wake", PEER_MESSAGE_WAKE_KIND)
+        )
+        response_id = current_response_id or _response_id_from_source(source_key)
+        _, items = _transcript_items_from_entry(
+            entry,
+            line_number=record.line_number,
+            record_offset=record.byte_offset,
+            agent_name=agent_name,
+            current_response_id=response_id,
+            settled_response_id=response_id if posted_wake else None,
+        )
+        if not any(item.source_id == source_id for item in items):
+            continue
+        matches += 1
+        complete = all(item.source_id in seen for item in items)
+        cursor = TranscriptRecoveryCursor(
+            line_cursor=record.line_number if complete else record.line_number - 1,
+            byte_offset=record.next_byte_offset if complete else record.byte_offset,
+            prefix_sample=record.prefix_sample if complete else before_sample,
+            matched=True,
+        )
+    if matches != 1:
+        cursor = TranscriptRecoveryCursor(0, result.byte_offset, result.prefix_sample)
+    return TranscriptReadResult(
+        line_cursor=cursor.line_cursor,
+        byte_offset=cursor.byte_offset,
+        current_response_id=current_response_id,
+        items=[],
+        recovery_cursor=cursor,
+        snapshot=result.snapshot,
     )
 
 
@@ -4297,6 +4478,7 @@ def _read_complete_jsonl_records(
     byte_offset: int,
     start_line: int,
     emit_after_line: int | None = None,
+    capture_snapshot: bool = False,
 ) -> _JsonlReadResult:
     """
     Read complete newline-terminated records from a JSONL file.
@@ -4313,17 +4495,25 @@ def _read_complete_jsonl_records(
     :param emit_after_line: When provided, complete records at or
         before this line number are counted for cursor migration but
         not decoded or stored.
+    :param capture_snapshot: Bound a recovery scan to the initial size and
+        retain the observed prefix digest and cursor samples.
     :returns: Complete records plus updated line and byte cursors.
     """
     if byte_offset < 0:
         raise ValueError(f"byte_offset must be non-negative, got {byte_offset}")
     if start_line < 0:
         raise ValueError(f"start_line must be non-negative, got {start_line}")
+    if capture_snapshot and byte_offset != 0:
+        raise ValueError("A recovery snapshot must begin at byte zero")
     records: list[_JsonlRecord] = []
     cursor = start_line
     position = byte_offset
+    prefix_sample = b""
+    snapshot = None
+    digest = hashlib.sha256() if capture_snapshot else None
     try:
         with path.open("rb") as handle:
+            initial_stat = os.fstat(handle.fileno()) if capture_snapshot else None
             handle.seek(0, os.SEEK_END)
             file_size = handle.tell()
             if byte_offset > file_size:
@@ -4334,13 +4524,18 @@ def _read_complete_jsonl_records(
                 handle.seek(byte_offset)
             while True:
                 record_start = position
-                raw = handle.readline()
+                remaining = file_size - record_start
+                raw = handle.readline(max(0, remaining)) if capture_snapshot else handle.readline()
+                if digest is not None:
+                    digest.update(raw)
                 if not raw:
                     break
                 if not raw.endswith(b"\n"):
                     break
                 position = handle.tell()
                 cursor += 1
+                if capture_snapshot:
+                    prefix_sample = (prefix_sample + raw)[-JSONL_CURSOR_FINGERPRINT_BYTES:]
                 if emit_after_line is not None and cursor <= emit_after_line:
                     continue
                 try:
@@ -4353,7 +4548,16 @@ def _read_complete_jsonl_records(
                         byte_offset=record_start,
                         next_byte_offset=position,
                         text=text,
+                        prefix_sample=prefix_sample,
                     )
+                )
+            if digest is not None:
+                assert initial_stat is not None
+                snapshot = TranscriptReadSnapshot(
+                    device=initial_stat.st_dev,
+                    inode=initial_stat.st_ino,
+                    length=handle.tell(),
+                    digest=digest.digest(),
                 )
     except FileNotFoundError:
         return _JsonlReadResult(
@@ -4365,6 +4569,8 @@ def _read_complete_jsonl_records(
         line_cursor=cursor,
         byte_offset=position,
         records=records,
+        prefix_sample=prefix_sample,
+        snapshot=snapshot,
     )
 
 

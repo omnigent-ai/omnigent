@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
+import omnigent.harnesses.claude_native.bridge as claude_bridge
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     TranscriptReadResult,
@@ -790,6 +792,502 @@ async def test_relocation_during_batch_preserves_unread_result_without_reposting
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mirrored_prefix",
+    [
+        "first_item",
+        "first_item_at_zero",
+        "first_item_missing",
+        "request_id",
+        "rewrite_after_validation",
+        "recovery_retry",
+        "complete",
+        "wake_marker",
+        "peer_marker",
+        "peer_partial",
+    ],
+)
+@pytest.mark.parametrize("from_disk", [False, True])
+async def test_rewritten_transcript_keeps_new_items_after_retained_native_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mirrored_prefix: str,
+    from_disk: bool,
+) -> None:
+    """A rewrite must not skip accepted input appended before cursor validation."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    original_prefix = (
+        json.dumps(
+            {"type": "user", "uuid": "old-input", "message": {"role": "user", "content": "old"}}
+        )
+        + "\n"
+    )
+    if mirrored_prefix in ("first_item_at_zero", "first_item_missing"):
+        original_prefix = ""
+    retained_reply = {
+        "type": "assistant",
+        "uuid": "retained-reply",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Already mirrored"},
+                {"type": "tool_use", "id": "retained-call", "name": "Bash", "input": {}},
+            ],
+        },
+    }
+    if mirrored_prefix.startswith("peer_"):
+        retained_reply = {
+            "type": "user",
+            "uuid": "retained-reply",
+            "isMeta": mirrored_prefix == "peer_marker",
+            "origin": {"kind": "peer"},
+            "message": {"role": "user", "content": "Peer handoff"},
+        }
+    if mirrored_prefix == "request_id":
+        retained_reply["requestId"] = retained_reply.pop("uuid")
+    transcript_path.write_text(original_prefix + json.dumps(retained_reply) + "\n")
+    fully_mirrored = mirrored_prefix in ("complete", "rewrite_after_validation", "recovery_retry")
+    byte_offset = (
+        transcript_path.stat().st_size if fully_mirrored else len(original_prefix.encode())
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=int(bool(original_prefix)) + int(fully_mirrored),
+        byte_offset=byte_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, byte_offset),
+        current_response_id="resp_original",
+        seen_source_ids=("old-input:0:message", "retained-reply:0:message")
+        + (("retained-reply:1:function_call",) if fully_mirrored else ()),
+        settled_response_id="resp_original" if fully_mirrored else None,
+    )
+    if mirrored_prefix in ("wake_marker", "peer_marker", "peer_partial"):
+        wake_kind = (
+            "peer_message_wake" if mirrored_prefix.startswith("peer_") else "scheduled_wake"
+        )
+        state = replace(
+            state,
+            seen_source_ids=("old-input:0:message",),
+            settled_response_id=state.current_response_id,
+        )
+        accepted_before_rewrite: list[str] = []
+
+        def accept_only_wake(request: httpx.Request) -> httpx.Response:
+            source_id = json.loads(request.content)["data"]["source_id"]
+            if source_id == f"retained-reply:0:{wake_kind}":
+                accepted_before_rewrite.append(source_id)
+                return httpx.Response(202, json={})
+            return httpx.Response(503)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(accept_only_wake), base_url="http://test"
+        ) as client:
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_rewrite",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+            )
+        assert accepted_before_rewrite == [f"retained-reply:0:{wake_kind}"]
+        assert state.seen_source_ids[-1] == f"retained-reply:0:{wake_kind}"
+        assert state.current_response_id != "resp_original"
+    retained_response_id = state.current_response_id
+    forwarder._write_forward_state(bridge_dir, state)
+    if mirrored_prefix == "first_item_missing":
+        transcript_path.unlink()
+        assert (
+            await forwarder._ensure_state_for_transcript(
+                bridge_dir=bridge_dir,
+                state=None if from_disk else state,
+                transcript_path=transcript_path,
+                start_at_end=False,
+                session_id="conv_rewrite",
+            )
+            == state
+        )
+        assert forwarder._read_forward_state(bridge_dir) == state
+    rewritten_records = [
+        {
+            "type": "assistant",
+            "uuid": "rewritten-history",
+            "message": {
+                "role": "assistant",
+                "content": "Rewritten historical content" + "x" * 600,
+            },
+        },
+        retained_reply,
+        {
+            "type": "user",
+            "uuid": "new-tool-result",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "retained-call", "content": "ok"}
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "new-input",
+            "message": {"role": "user", "content": "Follow up accepted before the next poll"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "new-reply",
+            "message": {"role": "assistant", "content": "New reply"},
+        },
+    ]
+    transcript_path.write_text("".join(json.dumps(record) + "\n" for record in rewritten_records))
+    late_record = {
+        "type": "assistant",
+        "uuid": "late-reply",
+        "message": {"role": "assistant", "content": "x" * 1200},
+    }
+
+    def rewrite_tail() -> None:
+        transcript_path.write_text(
+            "".join(
+                json.dumps(record) + "\n"
+                for record in [retained_reply, *rewritten_records[2:], late_record]
+            )
+        )
+
+    if mirrored_prefix == "rewrite_after_validation":
+        matches = claude_bridge.TranscriptReadSnapshot.matches
+        changed_after_validation = False
+
+        def matches_then_rewrite(snapshot: Any, path: Path) -> bool:
+            nonlocal changed_after_validation
+            valid = matches(snapshot, path)
+            if valid and not changed_after_validation:
+                changed_after_validation = True
+                rewrite_tail()
+            return valid
+
+        monkeypatch.setattr(claude_bridge.TranscriptReadSnapshot, "matches", matches_then_rewrite)
+    attempts: list[str] = []
+    posted: list[dict[str, Any]] = []
+    recovery_threads: list[threading.Thread] = []
+    recover = forwarder._validated_transcript_state
+
+    def recover_in_worker(
+        current: forwarder.TranscriptForwardState, *, session_id: str
+    ) -> forwarder.TranscriptForwardState:
+        recovery_threads.append(threading.current_thread())
+        return recover(current, session_id=session_id)
+
+    monkeypatch.setattr(forwarder, "_validated_transcript_state", recover_in_worker)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload["type"] == "external_conversation_item":
+            source_id = payload["data"]["source_id"]
+            attempts.append(source_id)
+            if (
+                mirrored_prefix == "recovery_retry"
+                and source_id == "new-reply:0:message"
+                and attempts.count(source_id) == 1
+            ):
+                rewrite_tail()
+                return httpx.Response(503)
+            posted.append(payload["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        loaded = forwarder._read_forward_state(bridge_dir)
+        assert loaded is not None
+        recovered = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None if from_disk else loaded,
+            transcript_path=transcript_path,
+            start_at_end=False,
+            session_id="conv_rewrite",
+        )
+        completed = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_rewrite",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=recovered,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+        if mirrored_prefix == "recovery_retry":
+            assert completed.recovery_read is not None
+            completed = await forwarder._ensure_state_for_transcript(
+                bridge_dir=bridge_dir,
+                state=completed,
+                transcript_path=transcript_path,
+                start_at_end=False,
+                session_id="conv_rewrite",
+            )
+            completed = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_rewrite",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=completed,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+            )
+            assert attempts.count("new-reply:0:message") == 2
+        if mirrored_prefix not in ("rewrite_after_validation", "recovery_retry"):
+            assert completed.byte_offset == transcript_path.stat().st_size
+        restarted = forwarder._read_forward_state(bridge_dir)
+        assert restarted is not None
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_rewrite",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=await asyncio.to_thread(
+                forwarder._validated_transcript_state, restarted, session_id="conv_rewrite"
+            ),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    expected_retained = (
+        []
+        if fully_mirrored or mirrored_prefix == "peer_marker"
+        else ["retained-reply:1:function_call"]
+    )
+    if mirrored_prefix == "peer_partial":
+        expected_retained = ["retained-reply:0:message"]
+    if mirrored_prefix == "wake_marker":
+        expected_retained.insert(0, "retained-reply:0:message")
+    assert [item["source_id"] for item in posted] == [
+        *expected_retained,
+        "new-tool-result:0:function_call_output",
+        "new-input:0:message",
+        "new-reply:0:message",
+        *(
+            ["late-reply:0:message"]
+            if mirrored_prefix in ("rewrite_after_validation", "recovery_retry")
+            else []
+        ),
+    ]
+    assert all(
+        item["response_id"] == retained_response_id
+        for item in posted[: len(expected_retained) + 1]
+    )
+    assert next(item for item in posted if item["source_id"] == "new-input:0:message")[
+        "item_data"
+    ] == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "Follow up accepted before the next poll"}],
+    }
+    assert posted[-1]["response_id"] != retained_response_id
+    assert all(
+        item["item_data"].get("agent", "claude-native-ui") == "claude-native-ui" for item in posted
+    )
+    assert recovery_threads and all(
+        thread != threading.current_thread() for thread in recovery_threads
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["replace", "rewrite", "rewrite-leading-id", "delete", "append", "complete_partial"]
+)
+@pytest.mark.parametrize("anchor_present", [False, True])
+async def test_recovery_retries_when_transcript_changes_during_anchor_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    anchor_present: bool,
+) -> None:
+    """Rewrites defer recovery; appends leave new complete records readable."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    anchor = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "anchor",
+                "message": {"role": "user", "content": "Mirrored" + "x" * 400},
+            }
+        )
+        + "\n"
+    )
+    new_input = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "new-input",
+                "message": {"role": "user", "content": "Accepted"},
+            }
+        )
+        + "\n"
+    )
+    unmatched = anchor.replace('"anchor"', '"unmatched"')
+    initial_input = new_input[: len(new_input) // 2] if change == "complete_partial" else new_input
+    transcript_path.write_text((anchor if anchor_present else unmatched) + initial_input)
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=1,
+        byte_offset=9999,
+        cursor_fingerprint="stale",
+        seen_source_ids=("anchor:0:message",),
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    replacement = (
+        json.dumps({"type": "system", "metadata": "Changed prefix"}) + "\n" + anchor + new_input
+    )
+    read_items = forwarder.read_transcript_items_from_offset
+    changed = False
+
+    def read_then_change(*args: Any, **kwargs: Any) -> Any:
+        nonlocal changed
+        result = read_items(*args, **kwargs)
+        if not changed:
+            changed = True
+            if change == "replace":
+                candidate = tmp_path / "replacement.jsonl"
+                candidate.write_text(replacement)
+                os.replace(candidate, transcript_path)
+            elif change == "rewrite":
+                transcript_path.write_text(replacement)
+            elif change == "rewrite-leading-id":
+                before = transcript_path.read_bytes()
+                after = before.replace(b'"anchor"', b'"gone--"').replace(
+                    b'"unmatched"', b'"invalid--"'
+                )
+                assert len(before) == len(after) and before[-256:] == after[-256:]
+                transcript_path.write_bytes(after)
+            elif change in ("append", "complete_partial"):
+                with transcript_path.open("a") as transcript:
+                    transcript.write(
+                        new_input[len(initial_input) :]
+                        if change == "complete_partial"
+                        else new_input.replace('"new-input"', '"appended-input"')
+                    )
+            else:
+                transcript_path.unlink()
+        return result
+
+    monkeypatch.setattr(forwarder, "read_transcript_items_from_offset", read_then_change)
+    first_recovered = state
+    with (
+        nullcontext()
+        if change in ("append", "complete_partial")
+        else pytest.raises(forwarder._TranscriptChangedDuringRecovery)
+    ):
+        first_recovered = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=state,
+            transcript_path=transcript_path,
+            start_at_end=False,
+            session_id="conv_rewrite",
+        )
+    if change not in ("append", "complete_partial"):
+        assert forwarder._read_forward_state(bridge_dir) == state
+    else:
+        state = first_recovered
+    if change == "delete":
+        transcript_path.write_text(replacement)
+    recovered = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=state,
+        transcript_path=transcript_path,
+        start_at_end=False,
+        session_id="conv_rewrite",
+    )
+    posted: list[str] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload["type"] == "external_conversation_item":
+            posted.append(payload["data"]["source_id"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(accept), base_url="http://test"
+    ) as client:
+        for _ in range(2):
+            recovered = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_rewrite",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=recovered,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+            )
+            recovered = await forwarder._ensure_state_for_transcript(
+                bridge_dir=bridge_dir,
+                state=recovered,
+                transcript_path=transcript_path,
+                start_at_end=False,
+                session_id="conv_rewrite",
+            )
+    expected = ["new-input:0:message"] if change != "append" or anchor_present else []
+    if change == "rewrite-leading-id":
+        expected = []
+    if change == "append":
+        expected.append("appended-input:0:message")
+    assert posted == expected
+
+
+@pytest.mark.parametrize(
+    ("source_key", "item_kind"),
+    [
+        ("byte-0", "message"),
+        ("line-1", "message"),
+        ("removed-native-record", "message"),
+        ("historical-user", "scheduled_wake"),
+        ("empty-assistant", "scheduled_wake"),
+        ("historical-user", "peer_message_wake"),
+        ("empty-assistant", "peer_message_wake"),
+        ("duplicate-native-record", "message"),
+    ],
+)
+def test_rewritten_transcript_does_not_recover_from_unstable_or_missing_record(
+    tmp_path: Path,
+    source_key: str,
+    item_kind: str,
+) -> None:
+    """A byte/line location in a replacement file is not a native identity."""
+    transcript_path = tmp_path / "session.jsonl"
+    user_record: dict[str, Any] = {
+        "type": "user",
+        "uuid": "historical-user",
+        "message": {"role": "user", "content": "Historical input"},
+    }
+    if source_key == "byte-0":
+        user_record.pop("uuid")
+        assert "uuid" not in user_record
+    if source_key == "duplicate-native-record":
+        user_record["uuid"] = source_key
+    transcript_path.write_text(
+        (json.dumps(user_record) + "\n") * (2 if source_key == "duplicate-native-record" else 1)
+        + json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "empty-assistant",
+                "message": {"role": "assistant", "content": ""},
+            }
+        )
+        + "\n"
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=1,
+        byte_offset=9999,
+        cursor_fingerprint="stale",
+        seen_source_ids=(f"{source_key}:0:{item_kind}",),
+    )
+    recovered = forwarder._validated_transcript_state(state, session_id="conv_rewrite")
+    assert recovered.byte_offset == transcript_path.stat().st_size
+    assert recovered.seen_source_ids == state.seen_source_ids
+
+
+@pytest.mark.asyncio
 async def test_forwarder_skips_to_end_on_stale_byte_cursor_state(tmp_path: Path) -> None:
     """
     Stale byte-offset state skips to end of the replaced transcript.
@@ -1328,9 +1826,13 @@ def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprin
     assert str(transcript_path) not in caplog.text
 
 
+@pytest.mark.parametrize("seen_kind", ["opaque", "positional"])
+@pytest.mark.parametrize("fingerprint_present", [False, True])
 def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_reset(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    seen_kind: str,
+    fingerprint_present: bool,
 ) -> None:
     """
     Fresh state at byte_offset=0 with no fingerprint adopts the computed
@@ -1356,14 +1858,22 @@ def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_re
     )
     caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
 
-    pre_existing_seen = ("already-sent-id-1", "already-sent-id-2")
+    pre_existing_seen = (
+        ("byte-0:0:message", "line-1:0:message")
+        if seen_kind == "positional"
+        else ("already-sent-id-1", "already-sent-id-2")
+    )
     state = forwarder.TranscriptForwardState(
         transcript_path=transcript_path,
         line_cursor=0,
         byte_offset=0,
         current_response_id="resp_in_flight",
         seen_source_ids=pre_existing_seen,
-        cursor_fingerprint=None,
+        cursor_fingerprint=(
+            forwarder._jsonl_cursor_fingerprint(transcript_path, 0)
+            if fingerprint_present
+            else None
+        ),
     )
 
     validated = forwarder._validated_transcript_state(
