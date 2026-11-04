@@ -88,10 +88,10 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     Native Codex thread switches create a replacement Omnigent session.
 
     This is the ``/clear`` regression shape: Codex keeps the terminal
-    alive but starts a new app-server thread. The forwarder must move
-    terminal ownership, update bridge state, resubscribe to the new
-    thread, and send subsequent status/history events to the new AP
-    session.
+    alive but starts a new app-server thread. The forwarder must keep the
+    old title and project, move terminal ownership, update bridge state,
+    resubscribe to the new thread, and send subsequent status/history
+    events to the new AP session.
     """
     _write_forwarder_bridge(
         tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
@@ -120,6 +120,8 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                         "omnigent.wrapper": "codex-native-ui",
                         "omnigent.codex_native.bridge_id": "bridge_shared",
                     },
+                    "title": "Fix login flow",
+                    "project_id": "proj_alpha",
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
@@ -241,6 +243,10 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                 "omnigent.wrapper": "codex-native-ui",
                 "omnigent.codex_native.bridge_id": "bridge_shared",
             },
+            "title": "Fix login flow",
+            "project_id": "proj_alpha",
+            "workspace": None,
+            "git": None,
         },
     ) in requests
     assert (

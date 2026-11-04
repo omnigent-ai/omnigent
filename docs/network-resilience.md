@@ -44,7 +44,8 @@ is pinned as a strict expected failure (`xfail(strict=True)`, or `known_gap` on
 the single check), so a fix that makes it pass must also remove the marker.
 The one exception is R8: it is a race, so its marker does not turn stale when
 a run happens to pass. Outages beyond the short default run only with
-`OMNIGENT_E2E_RESILIENCE_FULL=1`.
+`OMNIGENT_E2E_RESILIENCE_FULL=1`, except S4's unanswered model call: it always
+runs at 120 s because it must outlast Claude Code's request timeout.
 
 | Scenario | Phase / action | Outage | claude-native | codex-native |
 | --- | --- | --- | --- | --- |
@@ -61,6 +62,7 @@ a run happens to pass. Outages beyond the short default run only with
 | S3 flap (full mode only) | idle | 120 s | pass | pass, R8 intermittent |
 | S3 flap (full mode only) | tool running, approval pending | 120 s | gap: [R6](#r6-repeated-blips-add-up-to-a-disconnect-failure) | gap: R6 |
 | S4 | idle, tool running, approval pending | 10 s / 60 s / 300 s | pass | pass |
+| S4 | model call unanswered | 120 s | pass | not covered |
 | S5 | approve | 20 s | pass | pass |
 | S5 | approve | 150 s | gap: R2 | pass |
 | S5 | send | 20 s / 150 s | gap: [R3](#r3-a-message-sent-while-the-host-is-unreachable-is-lost) | gap: R3 |
@@ -69,6 +71,12 @@ a run happens to pass. Outages beyond the short default run only with
 | S7 | before the first call, mid-stream | 10 s / 60 s | pass | pass |
 | S7 | before the first call | 180 s | pass | pass |
 | S7 | mid-stream | 180 s | gap: [R7](#r7-a-turn-that-lost-the-model-has-no-retry) | pass |
+
+Native Claude terminals retry a model request that gets no response headers
+within `RetryPolicy`'s 120 s per-request timeout. To give a slower gateway more
+time, set `API_TIMEOUT_MS` in the `env` of Claude Code's `settings.json`, or in
+the runner's environment. A host-started runner receives it only when
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH` lists `API_TIMEOUT_MS`.
 
 ## Findings
 
