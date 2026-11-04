@@ -114,11 +114,7 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import {
-  addSessionDraftStartupInputs,
-  getSessionDraft,
-  setSessionDraft,
-} from "@/lib/sessionDrafts";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
   forgetUnsentSend,
   peekQueuedSends,
@@ -932,7 +928,7 @@ export interface ConversationState {
      * is left, so the composer adds it after newer input instead of dropping it.
      */
     recovered?: boolean;
-    /** The failed startup inputs it hands back, recorded with the saved draft once taken. */
+    /** The failed startup inputs it hands back or replaces, recorded with the saved draft once taken. */
     startupInputIds?: string[];
   } | null;
   /**
@@ -3061,6 +3057,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             serverRefused,
             ...(unsettled ? { unsettled: true } : {}),
             ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+            ...(replacesFailedInputs.replaces_failed_inputs
+              ? { startupInputIds: replacesFailedInputs.replaces_failed_inputs }
+              : {}),
           },
         });
       }
@@ -7544,9 +7543,13 @@ export function takeFailedSendDraft(
       serverRefused: failed.serverRefused,
       delivered: false,
     };
+  // Startup inputs no composer took aren't returned, so no send names them for discarding.
+  const discarded = restore ? [] : (failed.startupInputIds ?? []);
+  if (discarded.length > 0)
+    patch.returnedStartupInputs = state.returnedStartupInputs.filter(
+      (id) => !discarded.includes(id),
+    );
   setterFor(conversationId)(patch);
-  if (restore && failed.startupInputIds)
-    addSessionDraftStartupInputs(conversationId, failed.text, failed.startupInputIds);
   return restore ? failed : null;
 }
 
@@ -7933,6 +7936,9 @@ async function listFailedStartupInputs(
   }
 }
 
+/** Entries that saw their managed launch fail; its later failure report is read again. */
+const failedLaunchEntries = new WeakSet<ConversationEntry>();
+
 /**
  * Return a failed launch's undelivered startup messages to the composer.
  * A read that fails or times out is tried once more; then a notice offers Retry.
@@ -7942,6 +7948,7 @@ async function listFailedStartupInputs(
 async function restoreFailedStartupInputs(conversationId: string): Promise<void> {
   const entry = conversationRegistry.peek(conversationId);
   if (entry === undefined) return;
+  failedLaunchEntries.add(entry);
   const unacknowledged = unacknowledgedSends(entry.getState().pendingUserMessages);
   const read = (signal: AbortSignal) => listFailedStartupInputs(conversationId, signal);
   const inputs =
@@ -8891,8 +8898,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
         return patch;
       });
-      // A failed managed launch fails its saved startup inputs before reporting it.
-      if (event.status === "failed" && startupWasPending) {
+      // A failed managed launch fails its saved startup inputs before reporting it, so
+      // a read made after its label changed may have ended startup without them.
+      const statusEntry = conversationRegistry.peek(event.conversationId);
+      const launchFailed = statusEntry !== undefined && failedLaunchEntries.has(statusEntry);
+      if (event.status === "failed" && (startupWasPending || launchFailed)) {
         void settleFailedStartup(event.conversationId);
       }
       // Refetch the snapshot at turn START too: the runner persists

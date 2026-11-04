@@ -132,7 +132,12 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  addSessionDraftStartupInputs,
+  getSessionDraft,
+  promoteSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -3090,6 +3095,9 @@ function ComposerImpl(
     const hasNewerInput = valueRef.current.trim() !== "" || filesRef.current.length > 0;
     const failed = takeFailedSendDraft(failedSendDraft.conversationId, hasNewerInput, true);
     if (!failed) return;
+    // The saved draft names the startup inputs it takes, so a reload doesn't add them again.
+    if (failed.startupInputIds)
+      addSessionDraftStartupInputs(conversationId, failed.text, failed.startupInputIds);
     if (hasNewerInput) {
       const joined = appendReplyDraft(draft, restoreReplyDraft(failed.text, failed.replyDraft));
       replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));

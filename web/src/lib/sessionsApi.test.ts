@@ -1556,7 +1556,7 @@ describe("listFailedInputs", () => {
       ),
     );
 
-    await expect(listFailedInputs("conv_abc")).rejects.toThrow();
+    await expect(listFailedInputs("conv_abc")).rejects.toMatchObject({ status: 404 });
   });
 });
 
