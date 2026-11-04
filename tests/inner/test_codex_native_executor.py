@@ -2378,6 +2378,31 @@ def test_text_spills_only_past_the_inline_threshold(
         assert not pasted_text_cache_dir(tmp_path).exists()
 
 
+@pytest.mark.parametrize("characters", [200, 1_100_000], ids=["inline", "oversized"])
+def test_side_question_keeps_its_command_and_parent_ownership(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, characters: int
+) -> None:
+    """Staging a large paste must not turn a side command into parent input."""
+    from omnigent.harnesses.codex_native import side_chat
+
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None)
+    question = "q" * characters
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "/side " + question)
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests == []
+    assert [request.question for request in side_chat.peek_side_chat_requests(tmp_path)] == [
+        question
+    ]
+    assert not pasted_text_cache_dir(tmp_path).exists()
+
+
 def test_small_text_and_text_files_are_sent_inline_unchanged(tmp_path: Path) -> None:
     """Nothing is written to disk for text that fits."""
     from omnigent.inner.codex_native_executor import _content_to_input_items

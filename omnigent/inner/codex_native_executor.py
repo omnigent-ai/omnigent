@@ -1580,6 +1580,9 @@ def _content_to_input_items(
     :returns: Codex input item dicts.
     """
     items, inline, attachments = _collect_input_items(content, bridge_dir)
+    # Side-chat commands belong to the fork's own submission path.
+    if side_chat.side_chat_question(items) is not None:
+        return items
     spilled = _spill_oversized_text(items, inline, bridge_dir, session_id)
     if spilled:
         # Pending-input matching removes generated attachment prefixes before comparing text.
