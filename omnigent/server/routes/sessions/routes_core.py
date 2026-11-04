@@ -5187,7 +5187,13 @@ def register_core_routes(
         :param fork_id: The fork continuing it.
         :param content: The prompt's content blocks.
         """
-        if file_store is None:
+        attached = [
+            part
+            for part in content
+            if part.get("type") in ("input_file", "input_image")
+            and isinstance(part.get("file_id"), str)
+        ]
+        if file_store is None or not attached:
             return []
         fork_file_ids: dict[str, str] = {}
         after: str | None = None
@@ -5199,10 +5205,8 @@ def register_core_routes(
                 break
             after = page.last_id
         attachments: list[SessionRewindAttachment] = []
-        for part in content:
-            block_type, file_id = part.get("type"), part.get("file_id")
-            if block_type not in ("input_file", "input_image") or not isinstance(file_id, str):
-                continue
+        for part in attached:
+            block_type, file_id = part["type"], part["file_id"]
             stored = file_store.get(file_id, session_id=source_id)
             fork_file_id = (
                 fork_file_ids.get(stored.blob_key or stored.id) if stored is not None else None
