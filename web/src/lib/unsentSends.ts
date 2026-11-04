@@ -1,7 +1,7 @@
 // Sends this tab hasn't seen answered, and queued messages, per session in sessionStorage.
 // The server can hold a POST for minutes (a sandbox launch or wake) without persisting
 // it, and the queue lives in memory, so a reload would otherwise lose the text.
-import { readComposerDraft, readStartupInputIds, type StoredReplyDraft } from "./replyDraft";
+import { readComposerDraft, readStoredIds, type StoredReplyDraft } from "./replyDraft";
 
 export interface UnsentSend {
   stableId: string;
@@ -34,7 +34,7 @@ function parseSend(entry: unknown): UnsentSend | null {
   const { stableId, authorId } = entry as { stableId?: unknown; authorId?: unknown };
   // A record with no sender can't be matched to the viewer.
   if (typeof stableId !== "string" || typeof authorId !== "string") return null;
-  const startupInputIds = readStartupInputIds(entry);
+  const startupInputIds = readStoredIds(entry, "startupInputIds");
   return { ...draft, stableId, authorId, ...(startupInputIds ? { startupInputIds } : {}) };
 }
 

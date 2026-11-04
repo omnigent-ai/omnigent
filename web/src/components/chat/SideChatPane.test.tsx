@@ -1776,14 +1776,22 @@ it.each([
     readFirst: false,
     refused: false,
   },
+  {
+    into: "to an empty grid composer as a reload's unanswered send",
+    sent: "after the reopened session first reads its inputs",
+    newer: false,
+    readFirst: true,
+    refused: false,
+    unanswered: true,
+  },
 ])(
   "adds a failed launch's recovered message $into and names it in a send $sent",
-  async ({ newer, readFirst, refused }) => {
+  async ({ newer, readFirst, refused, unanswered }) => {
     const entry = conversationRegistry.acquire(childId);
     entry.setState({
       sessionStatus: "idle",
       abortController: new AbortController(),
-      returnedStartupInputs: ["pending_first"],
+      returnedStartupInputs: unanswered ? [] : ["pending_first"],
     });
     useChatStore.setState({ send: initialStoreState.send });
     renderPane(<SideChatPane childId={childId} fullSession />);
@@ -1801,7 +1809,7 @@ it.each([
           conversationId: childId,
           text: "saved on server",
           files: [],
-          startupInputIds: ["pending_first"],
+          ...(unanswered ? { stableId: "stable_reload" } : { startupInputIds: ["pending_first"] }),
           recovered: true,
         },
       }),
@@ -1822,7 +1830,11 @@ it.each([
       abortController: new AbortController(),
     });
     vi.spyOn(sessionsApi, "listFailedInputs").mockResolvedValue([
-      { pendingId: "pending_first", content: [{ type: "input_text", text: "saved on server" }] },
+      {
+        pendingId: "pending_first",
+        ...(unanswered ? { itemId: "stable_reload" } : {}),
+        content: [{ type: "input_text", text: "saved on server" }],
+      },
     ]);
     if (readFirst) await act(() => retryFailedStartupLookup(childId));
     expect(screen.getByTestId("side-chat-input")).toHaveValue(shown);

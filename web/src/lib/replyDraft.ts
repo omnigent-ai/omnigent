@@ -82,11 +82,13 @@ export function readComposerDraft(value: unknown): ComposerDraft | undefined {
   return serializeReplyDraft(replyDraft) === value.text ? { ...plain, replyDraft } : plain;
 }
 
-/** A stored record's `startupInputIds`, or `undefined` when missing or malformed. */
-export function readStartupInputIds(entry: unknown): string[] | undefined {
-  if (typeof entry !== "object" || entry === null || !("startupInputIds" in entry))
-    return undefined;
-  const ids = entry.startupInputIds;
+/** A stored record's list of ids under `key`, or `undefined` when missing, empty or malformed. */
+export function readStoredIds(
+  entry: unknown,
+  key: "startupInputIds" | "sentAs",
+): string[] | undefined {
+  if (typeof entry !== "object" || entry === null || !(key in entry)) return undefined;
+  const ids: unknown = (entry as Record<string, unknown>)[key];
   return Array.isArray(ids) &&
     ids.length > 0 &&
     ids.every((id: unknown): id is string => typeof id === "string")

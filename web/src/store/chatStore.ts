@@ -115,8 +115,8 @@ import {
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import {
-  addSessionDraftStartupInputs,
   getSessionDraft,
+  replaceSessionDraftStartupInputs,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
 import {
@@ -1161,6 +1161,8 @@ export interface SideChatComposerDraft {
   files: File[];
   /** Failed startup inputs handed back into this draft, so a reopened session doesn't add them again. */
   startupInputIds?: string[];
+  /** Stable ids of sends whose text this draft holds, until a read names their failed inputs. */
+  sentAs?: string[];
 }
 
 /** The empty composer, shared so an absent entry keeps a stable identity (a
@@ -7875,14 +7877,7 @@ function joinFailedSendDrafts(
   const startupInputIds = [
     ...new Set([...(waiting.startupInputIds ?? []), ...(later.startupInputIds ?? [])]),
   ];
-  const sentAs = [
-    ...new Set(
-      [waiting, later].flatMap((draft) => [
-        ...(draft.sentAs ?? []),
-        ...(draft.stableId ? [draft.stableId] : []),
-      ]),
-    ),
-  ];
+  const sentAs = [...new Set([waiting, later].flatMap(failedSendStableIds))];
   return {
     conversationId: waiting.conversationId,
     text: serializeReplyDraft(joined),
@@ -7892,6 +7887,13 @@ function joinFailedSendDrafts(
     ...(sentAs.length > 0 ? { sentAs } : {}),
     recovered: true,
   };
+}
+
+/** The stable ids a failed send's text went out under, which a read may list as failed inputs. */
+export function failedSendStableIds(
+  draft: NonNullable<ConversationState["failedSendDraft"]>,
+): string[] {
+  return [...(draft.sentAs ?? []), ...(draft.stableId ? [draft.stableId] : [])];
 }
 
 /** Forget an unanswered send the server saved as a failed input; the read that names it hands it back. */
@@ -8021,21 +8023,30 @@ function returnFailedStartupInputs(
     state.pendingRetryStableId,
     ...state.composerSentAs,
   ]);
+  const saved = getSessionDraft(conversationId);
+  const sideChat = useChatStore.getState().sideChatComposers[conversationId];
+  // Drafts outlive the entry, so they keep the ids of the sends whose text they hold.
+  const inSavedDraft = inputsSentAs(unreturned, saved?.sentAs ?? []);
+  const inSideChat = inputsSentAs(unreturned, sideChat?.sentAs ?? []);
   const held = new Set([
-    ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
+    ...(saved?.startupInputIds ?? []),
     ...(state.failedSendDraft?.startupInputIds ?? []),
     ...(peekUnsentSend(conversationId)?.startupInputIds ?? []),
     ...peekQueuedSends(conversationId).flatMap((send) => send.startupInputIds ?? []),
     ...queuedStartupInputs(conversationId),
-    ...(useChatStore.getState().sideChatComposers[conversationId]?.startupInputIds ?? []),
+    ...(sideChat?.startupInputIds ?? []),
     ...inWaitingDraft,
     ...inComposer,
+    ...inSavedDraft,
+    ...inSideChat,
   ]);
   const inputs = unreturned.filter((input) => !held.has(input.pendingId));
   // A draft holding a saved send's text may lack its files, which the composer can't take back.
   const withoutFiles = new Set([
     ...(state.failedSendDraft?.files.length ? [] : inWaitingDraft),
     ...(state.restoredSendDraft?.files.length ? [] : inComposer),
+    ...(saved?.files.length ? [] : inSavedDraft),
+    ...(sideChat?.files.length ? [] : inSideChat),
   ]);
   const attachments = startupAttachmentsNotice(
     unreturned.filter((input) => !held.has(input.pendingId) || withoutFiles.has(input.pendingId)),
@@ -8082,26 +8093,36 @@ function handBackFailedStartupInputs(
   unacknowledged: ReadonlySet<string>,
 ): void {
   const state = entry.getState();
-  const inComposer = inputsSentAs(unreturnedStartupInputs(state, failedInputs), [
+  const unreturned = unreturnedStartupInputs(state, failedInputs);
+  const inComposer = inputsSentAs(unreturned, [
     state.pendingRetryStableId,
     ...state.composerSentAs,
   ]);
+  const store = useChatStore.getState();
+  const sideChat = store.sideChatComposers[conversationId];
+  const saved = getSessionDraft(conversationId);
+  const bySideChat = state.failedSendTakenBy === "sideChat";
+  const inSideChat = [
+    ...(bySideChat ? inComposer : []),
+    ...inputsSentAs(unreturned, sideChat?.sentAs ?? []),
+  ];
+  const inSavedDraft = [
+    ...(bySideChat ? [] : inComposer),
+    ...inputsSentAs(unreturned, saved?.sentAs ?? []),
+  ];
   entrySetter(entry)((current) =>
     returnFailedStartupInputs(conversationId, current, failedInputs, unacknowledged),
   );
-  if (inComposer.length === 0) return;
-  // The composer holding that send's text names them, and a reload knows its saved draft's as returned.
-  const store = useChatStore.getState();
-  if (state.failedSendTakenBy === "sideChat") {
-    if (store.sideChatComposers[conversationId])
-      store.updateSideChatComposer(conversationId, (draft) => ({
-        ...draft,
-        startupInputIds: [...new Set([...(draft.startupInputIds ?? []), ...inComposer])],
-      }));
-    return;
-  }
-  const saved = getSessionDraft(conversationId);
-  if (saved !== undefined) addSessionDraftStartupInputs(conversationId, saved.text, inComposer);
+  // The composer holding a send's text names its inputs, and a reload knows its saved draft's as returned.
+  if (sideChat && inSideChat.length > 0)
+    store.updateSideChatComposer(conversationId, ({ sentAs: _named, ...draft }) => ({
+      ...draft,
+      startupInputIds: [...new Set([...(draft.startupInputIds ?? []), ...inSideChat])],
+    }));
+  if (saved && inSavedDraft.length > 0)
+    replaceSessionDraftStartupInputs(conversationId, saved.text, [
+      ...new Set([...(saved.startupInputIds ?? []), ...inSavedDraft]),
+    ]);
 }
 
 /** Failed inputs not yet handed back; a read begun before an accepted resend can list ones it replaced. */

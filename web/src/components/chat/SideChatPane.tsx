@@ -56,6 +56,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
+  failedSendStableIds,
   holdsInitialDraft,
   isCompactControl,
   rejectBusyCompact,
@@ -529,8 +530,9 @@ function SideChatComposer({
     if (!failed) return;
     const { accepted, errors } = validateAttachments(failed.files, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
-    // The composer outlives the session's entry, so it keeps the startup inputs it takes.
+    // The composer outlives the session's entry, so it keeps the startup inputs and sends it takes.
     const taken = failed.startupInputIds ?? [];
+    const sentAs = failedSendStableIds(failed);
     if (hasNewerInput) {
       updateComposer(childId, (draft) => ({
         ...draft,
@@ -539,6 +541,9 @@ function SideChatComposer({
         ...(taken.length > 0
           ? { startupInputIds: [...new Set([...(draft.startupInputIds ?? []), ...taken])] }
           : {}),
+        ...(sentAs.length > 0
+          ? { sentAs: [...new Set([...(draft.sentAs ?? []), ...sentAs])] }
+          : {}),
       }));
       return;
     }
@@ -546,6 +551,7 @@ function SideChatComposer({
       text: failed.text,
       files: accepted,
       ...(taken.length > 0 ? { startupInputIds: taken } : {}),
+      ...(sentAs.length > 0 ? { sentAs } : {}),
     }));
     // Track the displayed draft for delivery; filtered files require a fresh send ID.
     const entry = conversationRegistry.peek(childId)!;

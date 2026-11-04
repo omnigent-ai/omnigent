@@ -5580,17 +5580,24 @@ describe("Composer reply quotes", () => {
       expect(useChatStore.getState().pendingRetryStableId).toBeNull();
       expect(useChatStore.getState().restoredSendDraft).toBeNull();
       await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe(joined));
-      // The saved draft names the startup inputs it took, so a reload skips them.
+      // The saved draft names the startup inputs and sends it took, so a reload skips them.
       expect(getSessionDraft("conv_test")?.startupInputIds).toEqual(startupInputIds);
+      expect(getSessionDraft("conv_test")?.sentAs).toEqual(stableId ? [stableId] : undefined);
     },
   );
 
-  it.each<[string, string, boolean]>([
-    ["a failed launch's message", "run the linter next", false],
-    ["a refused resend of only a file", "", true],
+  it.each<[string, string, boolean, { startupInputIds: string[] } | { stableId: string }]>([
+    [
+      "a failed launch's message",
+      "run the linter next",
+      false,
+      { startupInputIds: ["pending_first"] },
+    ],
+    ["a refused resend of only a file", "", true, { startupInputIds: ["pending_first"] }],
+    ["a reload's unanswered send", "run the linter next", false, { stableId: "stable_reload" }],
   ])(
-    "restores %s into an empty composer, naming its inputs in the saved draft",
-    async (_, text, withFile) => {
+    "restores %s into an empty composer, naming its inputs or send in the saved draft",
+    async (_, text, withFile, sent) => {
       const files = withFile ? [new File(["hello"], "notes.txt", { type: "text/plain" })] : [];
       const props = composerProps();
       render(<Composer {...props} />);
@@ -5601,7 +5608,7 @@ describe("Composer reply quotes", () => {
             conversationId: "conv_test",
             text,
             files,
-            startupInputIds: ["pending_first"],
+            ...sent,
             ...(withFile ? { serverRefused: true } : { recovered: true }),
           },
         }),
@@ -5613,7 +5620,7 @@ describe("Composer reply quotes", () => {
         expect(getSessionDraft("conv_test")).toMatchObject({
           text,
           files,
-          startupInputIds: ["pending_first"],
+          ...("stableId" in sent ? { sentAs: [sent.stableId] } : sent),
         }),
       );
     },

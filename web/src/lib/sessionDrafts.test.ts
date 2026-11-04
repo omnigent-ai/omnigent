@@ -52,6 +52,7 @@ describe("session drafts", () => {
         nullEntry: null,
         badStartupIds: { text, startupInputIds: ["pending_first", 42] },
         noStartupIds: { text, startupInputIds: [] },
+        badSentAs: { text, sentAs: ["stable_first", 42] },
       }),
     );
     const { getSessionDraft } = await import("./sessionDrafts");
@@ -59,6 +60,7 @@ describe("session drafts", () => {
     expect(getSessionDraft("newer")).toEqual({ text, files: [] });
     expect(getSessionDraft("badStartupIds")).toEqual({ text, files: [] });
     expect(getSessionDraft("noStartupIds")).toEqual({ text, files: [] });
+    expect(getSessionDraft("badSentAs")).toEqual({ text, files: [] });
     expect(getSessionDraft("notText")).toBeUndefined();
     expect(getSessionDraft("nullEntry")).toBeUndefined();
   });
@@ -80,33 +82,37 @@ describe("session drafts", () => {
     expect(sessionStorage.getItem(key)).toBeNull();
   });
 
-  it("keeps the startup inputs a draft holds across edits and a reload", async () => {
+  it("keeps the startup inputs and sends a draft holds across edits and a reload", async () => {
     const { addSessionDraftStartupInputs, getSessionDraft, setSessionDraft } =
       await import("./sessionDrafts");
-    addSessionDraftStartupInputs("conversation", "first", ["pending_first"]);
+    addSessionDraftStartupInputs("conversation", "first", [], [], ["stable_first"]);
     setSessionDraft("conversation", { text: "first, edited", files: [] });
     addSessionDraftStartupInputs("conversation", "second", ["pending_first", "pending_second"]);
-    expect(getSessionDraft("conversation")).toEqual({
+    const held = {
       text: "first, edited",
       files: [],
       startupInputIds: ["pending_first", "pending_second"],
-    });
+      sentAs: ["stable_first"],
+    };
+    expect(getSessionDraft("conversation")).toEqual(held);
 
     vi.resetModules();
     const reloaded = await import("./sessionDrafts");
-    expect(reloaded.getSessionDraft("conversation")?.startupInputIds).toEqual([
-      "pending_first",
-      "pending_second",
-    ]);
+    expect(reloaded.getSessionDraft("conversation")).toEqual(held);
     reloaded.setSessionDraft("conversation", { text: "", files: [] });
     reloaded.setSessionDraft("conversation", { text: "new", files: [] });
     expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ conversation: "new" });
   });
 
-  it("replaces the startup inputs a draft holds without changing its text", async () => {
+  it("replaces the startup inputs and sends a draft holds without changing its text", async () => {
     const { getSessionDraft, replaceSessionDraftStartupInputs, setSessionDraft } =
       await import("./sessionDrafts");
-    setSessionDraft("conversation", { text: "held", files: [], startupInputIds: ["pending_held"] });
+    setSessionDraft("conversation", {
+      text: "held",
+      files: [],
+      startupInputIds: ["pending_held"],
+      sentAs: ["stable_held"],
+    });
     replaceSessionDraftStartupInputs("conversation", "recalled", ["pending_first"]);
     expect(getSessionDraft("conversation")).toEqual({
       text: "held",

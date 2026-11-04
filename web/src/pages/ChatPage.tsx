@@ -92,6 +92,7 @@ import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNat
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   takeFailedSendDraft,
+  failedSendStableIds,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   holdsInitialDraft,
@@ -3112,13 +3113,15 @@ function ComposerImpl(
     const hasNewerInput = valueRef.current.trim() !== "" || filesRef.current.length > 0;
     const failed = takeFailedSendDraft(failedSendDraft.conversationId, hasNewerInput, true);
     if (!failed) return;
-    // The saved draft names the startup inputs it takes, so a reload doesn't add them again.
-    if (failed.startupInputIds)
+    // The saved draft names the startup inputs and sends it takes, so a reload doesn't add them again.
+    const sentAs = failedSendStableIds(failed);
+    if (failed.startupInputIds || sentAs.length > 0)
       addSessionDraftStartupInputs(
         conversationId,
         failed.text,
-        failed.startupInputIds,
+        failed.startupInputIds ?? [],
         failed.files,
+        sentAs,
       );
     if (hasNewerInput) {
       const joined = appendReplyDraft(draft, restoreReplyDraft(failed.text, failed.replyDraft));

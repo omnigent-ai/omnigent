@@ -1,13 +1,15 @@
 import { useSyncExternalStore } from "react";
-import { readComposerDraft, readStartupInputIds, type ComposerDraft } from "./replyDraft";
+import { readComposerDraft, readStoredIds, type ComposerDraft } from "./replyDraft";
 
 export interface SessionDraft extends ComposerDraft {
   files: File[];
   /** Failed startup inputs handed back into this draft, so a reload doesn't add them again. */
   startupInputIds?: string[];
+  /** Stable ids of sends whose text this draft holds, until a read names their failed inputs. */
+  sentAs?: string[];
 }
 
-type StoredSessionDraft = ComposerDraft & Pick<SessionDraft, "startupInputIds">;
+type StoredSessionDraft = ComposerDraft & Pick<SessionDraft, "startupInputIds" | "sentAs">;
 
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
 const listeners = new Set<() => void>();
@@ -23,9 +25,15 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
     const drafts = new Map<string, SessionDraft>();
     for (const [id, entry] of Object.entries(entries)) {
       const draft = readComposerDraft(entry);
-      const startupInputIds = readStartupInputIds(entry);
+      const startupInputIds = readStoredIds(entry, "startupInputIds");
+      const sentAs = readStoredIds(entry, "sentAs");
       if (draft?.text)
-        drafts.set(id, { ...draft, files: [], ...(startupInputIds ? { startupInputIds } : {}) });
+        drafts.set(id, {
+          ...draft,
+          files: [],
+          ...(startupInputIds ? { startupInputIds } : {}),
+          ...(sentAs ? { sentAs } : {}),
+        });
     }
     return drafts;
   } catch {
@@ -37,14 +45,15 @@ function saveDraftsToStorage(): void {
   if (typeof window === "undefined") return;
   try {
     const entries: Record<string, string | StoredSessionDraft> = {};
-    for (const [id, { text, replyDraft, startupInputIds }] of sessionDrafts) {
+    for (const [id, { text, replyDraft, startupInputIds, sentAs }] of sessionDrafts) {
       if (text)
         entries[id] =
-          replyDraft || startupInputIds
+          replyDraft || startupInputIds || sentAs
             ? {
                 text,
                 ...(replyDraft ? { replyDraft } : {}),
                 ...(startupInputIds ? { startupInputIds } : {}),
+                ...(sentAs ? { sentAs } : {}),
               }
             : text;
     }
@@ -78,11 +87,13 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   if (draft.text === "" && draft.files.length === 0) {
     sessionDrafts.delete(conversationId);
   } else {
-    const startupInputIds =
-      draft.startupInputIds ?? sessionDrafts.get(conversationId)?.startupInputIds;
+    const held = sessionDrafts.get(conversationId);
+    const startupInputIds = draft.startupInputIds ?? held?.startupInputIds;
+    const sentAs = draft.sentAs ?? held?.sentAs;
     sessionDrafts.set(conversationId, {
       ...draft,
       ...(startupInputIds ? { startupInputIds } : {}),
+      ...(sentAs ? { sentAs } : {}),
     });
   }
   saveDraftsToStorage();
@@ -96,22 +107,28 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
  * @param text - Their text, saved only when the session has no draft yet; an existing draft keeps its text.
  * @param ids - Their pending ids.
  * @param files - Their files, saved with the text when the session has no draft yet.
+ * @param sentAs - Stable ids of the sends the text came from, which a later read may list.
  */
 export function addSessionDraftStartupInputs(
   conversationId: string,
   text: string,
   ids: string[],
   files: File[] = [],
+  sentAs: string[] = [],
 ): void {
   const draft = sessionDrafts.get(conversationId) ?? { text, files };
+  const startupInputIds = [...new Set([...(draft.startupInputIds ?? []), ...ids])];
+  const sends = [...new Set([...(draft.sentAs ?? []), ...sentAs])];
   setSessionDraft(conversationId, {
     ...draft,
-    startupInputIds: [...new Set([...(draft.startupInputIds ?? []), ...ids])],
+    ...(startupInputIds.length > 0 ? { startupInputIds } : {}),
+    ...(sends.length > 0 ? { sentAs: sends } : {}),
   });
 }
 
 /**
- * Record the failed startup inputs a recalled message brings back, in place of those the draft held.
+ * Record the failed startup inputs a draft holds, in place of the inputs and sends it named: those a
+ * recalled message brings back, or those a read listed under the draft's sends.
  *
  * @param conversationId - The session the inputs belong to.
  * @param text - Their text, saved only when the session has no draft yet; an existing draft keeps its text.

@@ -22895,23 +22895,36 @@ describe("a send cut off by a reload", () => {
     },
   );
 
-  it.each([
-    { taken: "a send", followUp: undefined, newer: undefined, text: "saved on server" },
-    {
-      taken: "a send joined with a queued follow-up",
-      followUp: "and then run the linter",
-      newer: undefined,
-      text: "saved on server\n\nand then run the linter",
-    },
-    {
-      taken: "a send added after a newer draft",
-      followUp: undefined,
-      newer: "a note first",
-      text: "a note first\n\nsaved on server",
-    },
-  ])(
-    "resends as a new message $taken the composer took back on load before the failed launch's inputs were read",
-    async ({ followUp, newer, text }) => {
+  it.each(
+    [
+      {
+        taken: "a send",
+        followUp: undefined,
+        newer: undefined,
+        text: "saved on server",
+        sentAs: ["stable_reload"],
+      },
+      {
+        taken: "a send joined with a queued follow-up",
+        followUp: "and then run the linter",
+        newer: undefined,
+        text: "saved on server\n\nand then run the linter",
+        sentAs: ["stable_reload", "stable_queued"],
+      },
+      {
+        taken: "a send added after a newer draft",
+        followUp: undefined,
+        newer: "a note first",
+        text: "a note first\n\nsaved on server",
+        sentAs: ["stable_reload"],
+      },
+    ].flatMap((row) => [
+      { ...row, firstRead: "", failsFirst: false },
+      { ...row, firstRead: ", reopened after that read failed", failsFirst: true },
+    ]),
+  )(
+    "resends as a new message $taken the composer took back on load before the failed launch's inputs were read$firstRead",
+    async ({ followUp, newer, text, sentAs, failsFirst }) => {
       onTestFinished(clearSessionDrafts);
       seedSession("conv_reload", []);
       seedSession("conv_other", []);
@@ -22927,10 +22940,14 @@ describe("a send cut off by a reload", () => {
           { stableId: "stable_queued", text: followUp, authorId: "user_a" },
         ]);
       let answer: (() => void) | undefined;
+      let readFails = failsFirst;
       fetchMock.mockImplementation((input, init) => {
-        if (answer !== undefined || String(input) !== "/v1/sessions/conv_reload/failed-inputs")
+        if (String(input) !== "/v1/sessions/conv_reload/failed-inputs")
           return defaultFetchHandler(input, init);
-        const response = defaultFetchHandler(input, init);
+        const response = readFails
+          ? mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 })
+          : defaultFetchHandler(input, init);
+        if (answer !== undefined) return response;
         return new Promise<Response>((resolve) => {
           answer = () => resolve(response);
         });
@@ -22939,20 +22956,34 @@ describe("a send cut off by a reload", () => {
       await vi.waitFor(() => expect(answer).toBeDefined());
       const taken = takeFailedSendDraft("conv_reload", newer !== undefined, true)?.text;
       expect(newer === undefined ? taken : `${newer}\n\n${taken}`).toBe(text);
-      // The composer saves the text it took back, before the read names its input.
-      setSessionDraft("conv_reload", { text, files: [] });
+      // The composer saves the text it took back and its sends, before the read names its input.
+      setSessionDraft("conv_reload", { text, files: [], sentAs });
 
       answer!();
-      await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
-      expect(useChatStore.getState()).toMatchObject({
-        failedSendDraft: null,
-        pendingRetryStableId: null,
-        restoredSendDraft: null,
-        returnedStartupInputs: ["pending_first"],
-      });
       const saved = { text, files: [], startupInputIds: ["pending_first"] };
-      expect(getSessionDraft("conv_reload")).toEqual(saved);
+      if (failsFirst) {
+        await vi.waitFor(() =>
+          expect(useChatStore.getState().blocks).toContainEqual(
+            expect.objectContaining({ code: STARTUP_INPUT_LOOKUP_FAILED_CODE }),
+          ),
+        );
+        expect(useChatStore.getState().failedSendDraft).toBeNull();
+        expect(getSessionDraft("conv_reload")).toEqual({ text, files: [], sentAs });
+        readFails = false;
+      } else {
+        await vi.waitFor(() =>
+          expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1),
+        );
+        expect(useChatStore.getState()).toMatchObject({
+          failedSendDraft: null,
+          pendingRetryStableId: null,
+          restoredSendDraft: null,
+          returnedStartupInputs: ["pending_first"],
+        });
+        expect(getSessionDraft("conv_reload")).toEqual(saved);
+      }
 
+      // Reopened without the entry, the saved draft alone knows the sends whose text it holds.
       await useChatStore.getState().switchTo("conv_other");
       releaseConversation("conv_reload");
       await useChatStore.getState().switchTo("conv_reload");
