@@ -242,20 +242,9 @@ describe("resolveServerInfo release features", () => {
   });
 });
 
-describe.each(["session_search_scope", "session_title_sort"] as const)(
-  "resolveServerInfo %s",
-  (capability) => {
-    it("reads the advertised capability", async () => {
-      expect((await probe({ [capability]: true }))[capability]).toBe(true);
-    });
-
-    it("is off for an older server that omits it", async () => {
-      expect((await probe({}))[capability]).toBe(false);
-    });
-  },
-);
-
 describe.each([
+  "session_search_scope",
+  "session_title_sort",
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
   "scheduled_task_sandbox_workspaces",
