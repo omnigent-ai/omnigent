@@ -29,6 +29,8 @@ implements them separately, so a fix for one harness does not reach the others.
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
+- `gateway-attribution`: Unity Gateway requests name the coding agent and the
+  interface that created its session: desktop app, web UI, mobile, or CLI.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
   repair conflicting defaults, and keep the connection across tool turns.
 - `needs-auth`: a harness without usable credentials is shown as needing
@@ -70,7 +72,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `smart-routing`: Pi applies the chosen route before inference from the
   composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
-  the answer reaches the harness.
+  the answer reaches the harness. Shared relay calls exclude their own human
+  approval waits from the five-minute execution budget. A pending approval
+  stays pending past five minutes; rejection or expiry does not run the tool.
+  Cancellation or a disconnected caller releases that call's pending approval.
 - `devin-questions`: Devin's native question picker appears in Chat and Inbox;
   selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
@@ -138,6 +143,15 @@ implements them separately, so a fix for one harness does not reach the others.
 **Web:** start a new session, choose the harness in the harness picker, open its
 configuration for model and effort, and send. Approval cards and the Terminal
 view appear in the session.
+
+**Gateway attribution:** start a fresh Claude Code or Codex session from the
+desktop app, browser, iOS/Android app, and CLI. The session keeps that creating
+interface across resumes; backend children inherit it, and a fork records the
+interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Agent`
+(`claude-code` or `codex`) and `Databricks-Custom-Client-Surfaces`: `omnigent-desktop`,
+`omnigent-web`, `omnigent-mobile`, or `omnigent-cli`. Sessions with no known
+creating interface use `omnigent` as a fallback.
+Routes configured by ug retain the additional `ug` surface.
 
 **Agent instructions (Pi native):** launch an agent whose spec contains inline
 instructions or references a bundled instruction file. Reopen its terminal and
@@ -228,6 +242,17 @@ only when the server enables the `import_review` release feature.
 Settings. Activate either the credential card or its Reconfigure affordance;
 both open the same repair flow.
 
+**Native tmux repair:** use a host whose tmux is missing, older than 3.3, or
+prints no readable version. Ready native harnesses then show **needs tmux** in
+the New Chat picker and Settings → Harnesses (CLI install, update and sign-in
+problems still show first). Open **Set up tmux** in Settings, or the picker's
+setup action, to reach the tmux step: copy `brew install tmux` (on Linux, use
+the package manager), then press **Check again**. Without Check again, the host
+picks tmux up on its next periodic readiness refresh, about a minute later.
+The desktop app keeps the PATH it started with, so if tmux went into a new PATH
+directory, quit and reopen the app. Signing in or saving a credential on a host
+without tmux continues to the same tmux step.
+
 **Harness account sign-in and switching:** Settings → Harnesses → Codex or
 Claude. Use **Sign in again** on an expired Codex card, or open the configured
 harness and choose **Switch account**. For Codex, open or copy the HTTPS device
@@ -305,6 +330,23 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"
 ```
 
+**`gateway-attribution` (own environment):** run
+`uv run --no-sync pytest tests/e2e/test_gateway_attribution_headers_e2e.py --reruns 0 -v`.
+The recorder requires real CLIs, uses synthetic credentials and scripted local
+model responses, and checks one copy of each header on actual prompt requests.
+It covers Codex and native Claude Code for desktop, web, iOS, Android and CLI
+launch metadata, plus Claude SDK and the Pi/OpenCode writers. Missing binaries
+or machine policy that would redirect requests are explicit skips. On Linux,
+use a disposable mount namespace with empty `/etc/codex` and `/etc/claude-code`
+to test ordinary configuration without changing the host's mandatory policy.
+Claude mandatory settings can still replace its header block or destination;
+that policy case requires gateway support for `x-client-app: omnigent` or a
+managed-policy update. Source persistence and launch isolation are checked by
+`tests/server/routes/test_sessions_crud.py::test_creating_client_surface_survives_create_child_and_fork`,
+`tests/runner/test_app_sessions_native_workflow_init.py::test_create_session_envelope_is_single_flight_and_skips_metadata_callbacks`,
+and `tests/runner/test_resource_registry.py::test_terminal_resource_role_is_private_and_cleared_on_close`.
+These process/configuration checks do not launch the desktop or mobile shells.
+
 **Pi Smart Routing (own environment):**
 `tests/e2e/test_pi_native_smart_routing.py::test_pi_native_smart_routing_applies_pick`
 starts the real CLI/server/runner/Pi with scripted routing and model replies.
@@ -314,6 +356,18 @@ Each composer/TUI prompt must appear exactly once in persisted user history.
 Run with a real Pi CLI on PATH and retries disabled. Composer API evidence
 does not cover browser clicks; scripted routing does not establish live judge
 quality. Broader Smart Routing journeys remain outside this Pi-specific recipe.
+
+**Claude subscription authentication (`launch-cli`, `launch-web`):** with a
+valid Claude login and an explicit subscription provider, start `omnigent claude`
+and a new Claude session from the web picker. Even when the host inherits
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, `/status` should show the login.
+Restart existing hosts and terminals to pick up the change. Claude-configured
+gateways and cloud transports continue to own their authentication.
+`tests/harnesses/claude_native/test_claude_native.py::test_resolve_native_claude_config_subscription_uses_cli_login`
+checks CLI child-process credentials;
+`tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_claude_terminal_subscription_ignores_inherited_api_credentials`
+checks the hosted launch specification. These use synthetic credentials and do
+not prove live sign-in or artifact publishing.
 
 **Launch settings (own environment):** connect a host with Claude/Codex
 configured, and put a command and two args under
@@ -1109,7 +1163,42 @@ local files are reused unchanged. For Gemini, fork tool-containing history and
 send a follow-up; expect no empty `function_response.name` error. These automated
 checks do not prove live providers, browser rendering or thought-signature parity.
 
+For the shared native tool relay's approval deadline, run
+`tests/harnesses/claude_native/test_claude_native_bridge.py::test_relay_approval_outlives_execution_and_http_timeouts`
+and `::test_relay_mcp_cancellation_releases_pending_approval`. These use the real
+HTTP relay and stdio helper with a harmless callback and short test deadlines;
+they do not launch a vendor CLI. The same module checks concurrent calls,
+approval expiry, and uncertain completion after a write. Execution-budget
+accounting is covered by `tests/runtime/test_tool_call_deadline.py`.
+
+For a human check in an isolated instance, use a native session in Chat to ask
+for an automation named "Approval deadline check" with harmless instructions
+and a first run well after the test. Leave its create approval pending for
+more than five minutes:
+the agent must not report a tool failure or claim creation, and the automation
+must not exist yet. Approve and confirm exactly one automation appears.
+Repeat with Reject and with cancelling the turn: no automation should appear,
+and cancelled approvals must no longer be actionable. Repeat the request from
+the native terminal and answer the same approval in Chat or Inbox. Remove the
+throwaway automation afterward. The 30-second save-request timeout is unchanged.
+
+The native client's own deadline must exceed the wait being tested. Codex 0.166.0
+has a separate 300-second MCP deadline that does not extend with relay progress.
+For a bounded before/after demo, set the isolated instance's
+`harness.codex-native.app_server` command to `codex` and its args to
+`["-c", "mcp_servers.omnigent.tool_timeout_sec=600"]`, then leave approval pending
+for 345 seconds. A TUI-only launch argument does not configure the separate
+app-server's MCP client. This isolates the relay's unchanged 300-second execution
+budget; it does not prove the default client can wait for a full approval day.
+With the default client deadline, cancellation must clear the approval without
+creating the automation. Record the client configuration with the evidence.
+
 ## Gotchas
+
+- Relay approval waits retain one pending request slot. Vendor clients that do not
+  honor MCP progress notifications can still impose their own shorter deadline;
+  the relay cancels its pending approval when the client disconnects. A timeout
+  after execution starts has an unknown outcome and cannot undo a committed write.
 
 - For user/project defaults and startup-argument precedence, use
   [Preferences and config defaults](./preferences.md). The read-only Startup

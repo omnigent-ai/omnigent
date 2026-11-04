@@ -59,9 +59,7 @@ describe("SandboxFailedIndicator", () => {
 describe("ConnectionIndicator", () => {
   const onShowReconnectHelp = () => {};
 
-  it("renders the failed-sandbox band when a launch died (sandboxStatus wins)", () => {
-    // WHY: a failed launch owns this band ahead of any liveness state — the
-    // sandbox branch short-circuits before the liveness checks.
+  it("leaves a failed launch to the transcript instead of duplicating it below the composer", () => {
     useChatStore.setState({ sandboxStatus: { stage: "failed", error: "boom" } });
     render(
       <ConnectionIndicator
@@ -69,7 +67,7 @@ describe("ConnectionIndicator", () => {
         onShowReconnectHelp={onShowReconnectHelp}
       />,
     );
-    expect(screen.getByTestId("sandbox-failed-indicator")).toBeInTheDocument();
+    expect(screen.queryByTestId("sandbox-failed-indicator")).not.toBeInTheDocument();
   });
 
   it("renders nothing while a launch is still in flight (non-failed sandbox)", () => {
@@ -164,12 +162,11 @@ describe("RunnerStartingIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders nothing for a terminal sandbox stage (ready/failed handled elsewhere)", () => {
-    // WHY: "failed" gets the destructive band in ConnectionIndicator, so this
-    // in-thread indicator must skip it rather than show stale launch copy.
+  it("replaces launch progress with the recorded failure", () => {
     useChatStore.setState({ sandboxStatus: { stage: "failed", error: "x" } });
-    const { container } = render(<RunnerStartingIndicator variant="row" />);
-    expect(container).toBeEmptyDOMElement();
+    render(<RunnerStartingIndicator variant="row" />);
+    expect(screen.getByTestId("sandbox-failed-indicator")).toBeInTheDocument();
+    expect(screen.queryByTestId("runner-starting-indicator")).not.toBeInTheDocument();
   });
 });
 

@@ -385,7 +385,7 @@ function McpServerMenu({
     <div
       data-testid="mcp-server-menu"
       onMouseDown={(event) => event.preventDefault()}
-      className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+      className="menu-surface absolute bottom-full left-0 z-30 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
     >
       <div className="px-2 py-1">
         <div className="font-medium text-ui text-foreground">MCP servers</div>
