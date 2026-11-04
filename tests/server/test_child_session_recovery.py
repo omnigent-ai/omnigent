@@ -19,6 +19,7 @@ from omnigent.server.child_session_recovery import (
     RECOVERY_STORE_CONCURRENCY,
     hold_reconnect_recovery,
     reconnect_recovery_deferred,
+    release_reconnect_recovery,
     restore_active_children,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
@@ -455,6 +456,41 @@ async def test_message_handshake_does_not_wait_for_child_initialization(
             await asyncio.wait_for(restored.wait(), timeout=5)
     assert requests == [parent.id, row.id]
     assert store.get_conversation(row.id).runner_id == parent.runner_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hosted", "runner_id", "parent_released"),
+    [(False, "new", True), (True, "new", False), (False, "old", False)],
+    ids=["hostless", "hosted", "on-another-runner"],
+)
+async def test_requested_work_on_a_child_releases_the_ancestors_that_recover_it(
+    recovery_tree: Any, hosted: bool, runner_id: str, parent_released: bool
+) -> None:
+    """Work on a child ends the holds of the ancestors whose reconnect recovery restores it."""
+    store, parent, _, _, _, _ = recovery_tree
+    middle = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        agent_id=parent.agent_id,
+        runner_id=runner_id,
+    )
+    if hosted:
+        store.set_host_id(middle.id, "a" * 32, workspace="/tmp")
+    leaf = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=middle.id,
+        agent_id=parent.agent_id,
+        runner_id=runner_id,
+    )
+    for row in (parent, middle):
+        await hold_reconnect_recovery(row.id, store)
+
+    await release_reconnect_recovery(store.get_conversation(leaf.id), store)  # type: ignore[arg-type]
+
+    assert not reconnect_recovery_deferred(store.get_conversation(middle.id))  # type: ignore[arg-type]
+    held = reconnect_recovery_deferred(store.get_conversation(parent.id))  # type: ignore[arg-type]
+    assert held is not parent_released
 
 
 @pytest.mark.asyncio

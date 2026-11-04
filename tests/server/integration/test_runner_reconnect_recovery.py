@@ -61,19 +61,28 @@ def _patch_to_thread(
     monkeypatch.setattr(module, "asyncio", _AsyncioProxy(to_thread))
 
 
-def _create_session(app: FastAPI, agent_id: str, **kwargs: Any) -> Conversation:
+def _create_session(
+    app: FastAPI, agent_id: str, *, interrupted: bool = True, **kwargs: Any
+) -> Conversation:
     store = app.state.runner_router._conversation_store
     conv = store.create_conversation(agent_id=agent_id, runner_id=_RUNNER_ID, **kwargs)
-    store.set_session_live_status(conv.id, "failed")
+    if interrupted:
+        _interrupt(app, conv.id)
+    return conv
+
+
+def _interrupt(app: FastAPI, session_id: str) -> None:
+    """Leave *session_id* failed by the loss of the runner running its turn."""
+    store = app.state.runner_router._conversation_store
+    store.set_session_live_status(session_id, "failed")
     store.set_labels(
-        conv.id,
+        session_id,
         {
             "omnigent.last_task_error_code": "runner_disconnected",
             "omnigent.last_task_error_message": "Runner disconnected",
         },
     )
-    sessions._session_status_cache[conv.id] = "failed"
-    return conv
+    sessions._session_status_cache[session_id] = "failed"
 
 
 @asynccontextmanager
@@ -736,3 +745,59 @@ async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the
     # Resume runs the parent's recovery turn and continues its interrupted child.
     assert inits == [(interrupted.id, False, False), (child.id, False, True)]
     assert not reconnect_recovery_deferred(store.get_conversation(interrupted.id))
+
+
+async def test_reconnect_recovers_a_child_messaged_after_its_parent_woke(
+    app: FastAPI,
+    agent: Agent,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Work a user starts on a child after its parent's wake recovers when the runner drops."""
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import routes_events
+    from tests._helpers.polling import poll_until_async
+
+    for module in (routes_events, orchestration):
+        monkeypatch.setattr(module, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+    parent = _create_session(app, agent.id)
+    child = _create_session(
+        app, agent.id, interrupted=False, kind="sub_agent", parent_conversation_id=parent.id
+    )
+    wake = await client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={"type": "retry_session", "data": {"wake_only": True}},
+    )
+    assert wake.status_code == 503, wake.text
+    inits: list[tuple[str, bool]] = []
+    forwarded: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/v1/sessions":
+            forwarded.append(request.url.path)
+            return httpx.Response(202, json={})
+        body = json.loads(request.content)
+        inits.append((body["session_id"], body["session_init"]["resume_interrupted_turn"]))
+        return httpx.Response(201, json={"id": body["session_id"]})
+
+    async with _recover(app, monkeypatch, respond) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        message = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+        assert message.status_code == 202, message.text
+    assert inits == []
+    assert f"/v1/sessions/{child.id}/events" in forwarded
+    # The runner drops during the child's turn.
+    _interrupt(app, child.id)
+
+    async with _recover(app, monkeypatch, respond) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        await poll_until_async(lambda: len(inits) == 2, timeout_s=budget(5))
+
+    # The child's input ended the wake's hold, so its tree recovers as usual.
+    assert inits == [(parent.id, False), (child.id, True)]

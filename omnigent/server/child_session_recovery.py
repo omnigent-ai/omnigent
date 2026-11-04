@@ -70,9 +70,29 @@ async def hold_reconnect_recovery(session_id: str, store: ConversationStore) -> 
 
 
 async def end_reconnect_deferral(conv: Conversation, store: ConversationStore) -> None:
-    """Let runner-connect recovery resume *conv*'s tree once requested work starts."""
+    """End *conv*'s own hold on runner-connect recovery of its tree."""
     if RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels:
         await asyncio.to_thread(store.delete_label, conv.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
+
+
+async def release_reconnect_recovery(conv: Conversation, store: ConversationStore) -> None:
+    """When work is requested of *conv*, end its hold and those of ancestors that recover it."""
+    seen = {conv.id}
+    while True:
+        await end_reconnect_deferral(conv, store)
+        parent_id = conv.parent_conversation_id
+        # As on runner connect, a hosted child recovers as its own tree.
+        if (
+            parent_id is None
+            or parent_id in seen
+            or (conv.host_id is not None and not is_parent_owned_subagent(conv))
+        ):
+            return
+        parent = await asyncio.to_thread(store.get_conversation, parent_id)
+        if parent is None or parent.runner_id != conv.runner_id:
+            return
+        seen.add(parent.id)
+        conv = parent
 
 
 def reconnect_recovery_deferred(conv: Conversation) -> bool:

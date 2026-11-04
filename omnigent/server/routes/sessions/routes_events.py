@@ -722,10 +722,10 @@ async def _recover_retry_session_once(
     """Run one recovery attempt for :func:`_recover_retry_session`."""
     from omnigent.server.child_session_recovery import (
         clear_skipped_resume,
-        end_reconnect_deferral,
         failed_by_runner_loss,
         hold_reconnect_recovery,
         note_skipped_resume,
+        release_reconnect_recovery,
         skipped_resume_runner,
     )
 
@@ -733,7 +733,7 @@ async def _recover_retry_session_once(
     if conv is None:
         raise _session_not_found()
     if not wake_only:
-        await end_reconnect_deferral(conv, conversation_store)
+        await release_reconnect_recovery(conv, conversation_store)
 
     original_runner_id = conv.runner_id
     runner_client = await _get_runner_client(session_id, runner_router)
