@@ -956,14 +956,10 @@ def create_scheduled_tasks_router(
         request: Request,
         body: RecordRunOutcomeRequest,
     ) -> dict[str, Any]:
-        """Record whether the calling session's latest run reached its goal.
+        """Record an owned session's latest delivered-run outcome.
 
-        The agent tool ``sys_scheduled_task_record_outcome`` calls this from the
-        fired session, so the run history can show more than whether the run
-        finished. The caller must own the session; a runner-marked call must also
-        come from that session's bound runner, which
-        :func:`require_scheduled_task_agent_origin` checks. A session that no
-        scheduled task started is a 404.
+        A runner-marked call must come from the session's bound runner. Returns
+        404 when the session has no eligible run.
         """
         owner = _owner(request)
         source_id = request.headers.get(ORCHESTRATION_SOURCE_HEADER)

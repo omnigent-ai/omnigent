@@ -28,6 +28,8 @@ def _request(**overrides: object) -> RecordRunOutcomeRequest:
         "🧑🏾‍💻",
         "🏴󠁧󠁢󠁳󠁣󠁴󠁿",
         "↗️",
+        "👨🏻\u200d👩🏻\u200d👧🏻\u200d👦🏻",
+        "🏳️\u200d🌈",
     ],
 )
 def test_one_emoji_is_accepted(emoji: str) -> None:
@@ -51,6 +53,12 @@ def test_one_emoji_is_accepted(emoji: str) -> None:
         "\u200d🚀",
         "🚀\u200d",
         "\ufe0f",
+        # A selector or skin tone repeated, or tags after anything but the black flag.
+        "✅\ufe0f\ufe0f",
+        "👍\U0001f3fd\U0001f3fd",
+        "🚀\U000e0067",
+        # A flag cannot be joined into a sequence.
+        "🇺🇸\u200d🚀",
         # Symbols that are not emoji.
         "∑",
         "±",
@@ -71,6 +79,13 @@ def test_text_is_collapsed_and_bounded() -> None:
         _request(text="x" * 81)
     with pytest.raises(ValidationError, match="must not be empty"):
         _request(text=" \n ")
+
+
+@pytest.mark.parametrize("field", ["emoji", "text"])
+def test_unpaired_surrogates_are_rejected(field: str) -> None:
+    """Raw JSON can carry a lone surrogate, which cannot be stored as UTF-8."""
+    with pytest.raises(ValidationError):
+        _request(**{field: "a\ud800" if field == "text" else "\ud83d"})
 
 
 @pytest.mark.parametrize("success", ["yes", "true", 1, None])

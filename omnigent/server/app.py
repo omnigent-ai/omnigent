@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 from fastapi import FastAPI, Query, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
@@ -303,6 +304,17 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_inbox: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
+
+
+def _escape_unencodable(value: object) -> object:
+    """Backslash-escape code points UTF-8 cannot encode, such as lone surrogates."""
+    if isinstance(value, str):
+        return value.encode("utf-8", "backslashreplace").decode("utf-8")
+    if isinstance(value, dict):
+        return {key: _escape_unencodable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_escape_unencodable(item) for item in value]
+    return value
 
 
 def _resolve_extension_state(
@@ -2879,7 +2891,15 @@ def create_app(
             error_impact=ErrorImpact.BENIGN.value,
             error_phase=ErrorPhase.REQUEST.value,
         )
-        return await request_validation_exception_handler(request, exc)
+        try:
+            return await request_validation_exception_handler(request, exc)
+        except UnicodeEncodeError:
+            # JSON escapes can carry a lone surrogate, which UTF-8 cannot encode, and
+            # the stock body echoes the input; escape it so the caller still gets a 422.
+            return JSONResponse(
+                status_code=422,
+                content={"detail": _escape_unencodable(jsonable_encoder(exc.errors()))},
+            )
 
     @app.exception_handler(ConversationNotFoundError)
     async def _handle_conversation_not_found(

@@ -62,48 +62,54 @@ def _is_extended_pictographic(cp: int) -> bool:
     return any(start <= cp <= end for start, end in _EXTENDED_PICTOGRAPHIC)
 
 
-def _is_emoji_modifier(cp: int) -> bool:
-    """Skin tones and the tag characters of subdivision flags extend the emoji before them."""
-    return 0x1F3FB <= cp <= 0x1F3FF or 0xE0020 <= cp <= 0xE007F
+_EMOJI_SKIN_TONES = range(0x1F3FB, 0x1F400)
+# Tag characters spell a subdivision flag after the black flag, e.g. Scotland.
+_EMOJI_TAGS = range(0xE0020, 0xE0080)
+_EMOJI_BLACK_FLAG = 0x1F3F4
 
 
 def is_single_emoji(value: str) -> bool:
     """Whether *value* is one emoji, counting a ZWJ or keycap sequence or a flag as one.
 
-    Approximates one emoji grapheme without a Unicode segmentation dependency:
-    every code point must be an Extended_Pictographic character, a keycap base
-    followed by its keycap mark, a regional indicator of a flag pair, or a
-    joiner, variation selector or modifier attached to one of those.
+    Approximates one emoji grapheme without a Unicode segmentation dependency.
+    Each part of the sequence is an Extended_Pictographic character, a keycap
+    base followed by its keycap mark, or a regional-indicator pair, optionally
+    followed by one variation selector and one skin tone; tag characters may
+    follow only the black flag. Parts are joined by single ZWJs.
+    Extended_Pictographic also contains a few symbols that rarely render as
+    emoji (for example ``☉`` and ``🂠``); they are accepted, since the value is
+    only shown, never interpreted.
     """
     if not value or len(value) > RUN_OUTCOME_EMOJI_MAX_CHARS:
         return False
-    bases = 0
-    joined = False
-    regional = 0
-    for index, ch in enumerate(value):
-        cp = ord(ch)
-        if ch == _EMOJI_ZWJ:
-            if bases == 0 or joined:
-                return False
-            joined = True
-            continue
-        if ch in _EMOJI_VARIATION_SELECTORS or ch == _EMOJI_KEYCAP or _is_emoji_modifier(cp):
-            if bases == 0:
-                return False
-            continue
-        if 0x1F1E6 <= cp <= 0x1F1FF:  # regional indicators pair into one flag
-            regional += 1
-            if regional % 2 == 0:
-                continue
-        elif ch in _EMOJI_KEYCAP_BASES:
-            if _EMOJI_KEYCAP not in value[index + 1 : index + 3]:
-                return False
-        elif not _is_extended_pictographic(cp):
-            return False
-        if not joined:
-            bases += 1
-        joined = False
-    return bases == 1 and not joined and regional % 2 == 0
+    parts = value.split(_EMOJI_ZWJ)
+    if len(parts) > 1 and any(not part for part in parts):
+        return False
+    return all(_is_emoji_part(part) for part in parts) and (
+        len(parts) == 1 or not any(_is_flag(part) for part in parts)
+    )
+
+
+def _is_flag(part: str) -> bool:
+    return len(part) == 2 and all(0x1F1E6 <= ord(ch) <= 0x1F1FF for ch in part)
+
+
+def _is_emoji_part(part: str) -> bool:
+    """One emoji without ZWJs: a base, then at most one selector, one tone, or tags."""
+    if _is_flag(part):
+        return True
+    base, rest = part[0], part[1:]
+    if base in _EMOJI_KEYCAP_BASES:
+        return rest in (_EMOJI_KEYCAP, "\ufe0f" + _EMOJI_KEYCAP)
+    if not _is_extended_pictographic(ord(base)):
+        return False
+    if rest[:1] in _EMOJI_VARIATION_SELECTORS:
+        rest = rest[1:]
+    if rest[:1] and ord(rest[0]) in _EMOJI_SKIN_TONES:
+        rest = rest[1:]
+    if rest and ord(base) == _EMOJI_BLACK_FLAG:
+        return all(ord(ch) in _EMOJI_TAGS for ch in rest)
+    return not rest
 
 
 def normalize_run_outcome(emoji: str, text: str) -> tuple[str, str]:
@@ -112,12 +118,18 @@ def normalize_run_outcome(emoji: str, text: str) -> tuple[str, str]:
     :param emoji: Exactly one emoji, e.g. ``"🚀"``; surrounding spaces are dropped.
     :param text: A few words; runs of whitespace collapse to single spaces.
     :returns: The trimmed emoji and the collapsed text.
-    :raises ValueError: If the emoji is not exactly one emoji, or the text is
-        empty or longer than :data:`RUN_OUTCOME_TEXT_MAX_CHARS`.
+    :raises ValueError: If either value is not valid Unicode text, the emoji is
+        not exactly one emoji, or the text is empty or longer than
+        :data:`RUN_OUTCOME_TEXT_MAX_CHARS`.
     """
     emoji = emoji.strip()
     if not is_single_emoji(emoji):
         raise ValueError("emoji must be exactly one emoji, e.g. '🚀'")
+    for name, raw in (("emoji", emoji), ("text", text)):
+        try:
+            raw.encode("utf-8")
+        except UnicodeEncodeError as exc:  # e.g. an unpaired surrogate from raw JSON
+            raise ValueError(f"{name} must be valid Unicode text") from exc
     text = " ".join(text.split())
     if not text:
         raise ValueError("text must not be empty")

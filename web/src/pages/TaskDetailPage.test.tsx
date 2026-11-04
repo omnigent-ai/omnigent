@@ -659,6 +659,12 @@ describe("run history", () => {
       const outcome = screen.getByTestId("run-outcome");
       expect(outcome).toHaveAttribute("data-run-outcome", state);
       expect(outcome).toHaveTextContent(`${emoji}${announced}${text}`);
+      // The emoji is decorative; the announcement is for screen readers only.
+      expect(screen.getByText(emoji)).toHaveAttribute("aria-hidden", "true");
+      expect(screen.getByText(announced.trim())).toHaveClass("sr-only");
+      // A missed goal is set apart in amber.
+      if (success) expect(outcome).not.toHaveClass("text-amber-700");
+      else expect(outcome).toHaveClass("text-amber-700");
     },
   );
 

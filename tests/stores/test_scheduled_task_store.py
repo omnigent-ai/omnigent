@@ -1506,10 +1506,9 @@ def test_record_run_outcome_stores_an_opaque_bounded_envelope(
     from omnigent.db.db_models import RUN_OUTCOME_PAYLOAD_MAX_BYTES, SqlScheduledTaskRun
 
     run_id = _seed_running_run(store, "envelope")
-    # The largest outcome: the longest emoji, and text whose every character
-    # JSON-escapes to six bytes.
-    emoji = "👨\u200d👩\u200d👧\u200d👦" + "\ufe0f" * 9
-    assert len(emoji) == 16
+    # A long emoji sequence, and the longest text, every character of which
+    # JSON-escapes to six bytes. Any valid emoji is at most 16 code points (64 bytes).
+    emoji = "👨🏻\u200d👩🏻\u200d👧🏻\u200d👦🏻"
     text = "\x01" * 80
     store.record_run_outcome(
         _uid("conv_envelope"), success=True, emoji=emoji, text=text, recorded_at=1

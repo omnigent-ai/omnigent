@@ -3334,6 +3334,35 @@ async def test_run_outcome_is_recorded_from_the_runner_and_listed(
     assert runs[0]["outcome"]["text"] == "Shipped"
 
 
+async def test_run_outcome_with_invalid_unicode_is_422_and_keeps_the_earlier_outcome(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A lone surrogate in raw JSON is a 422, not a 500, and changes nothing."""
+    _, session_id, headers = await _seed_fired_session(auth_client, db_uri)
+    first = await auth_client.put(
+        "/v1/scheduled-tasks/run-outcome",
+        json={"session_id": session_id, "success": True, "emoji": "🚀", "text": "Shipped"},
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    # json.dumps writes the lone surrogate as a \\ud800 escape, which httpx's own
+    # serializer would refuse to send.
+    bad = {"session_id": session_id, "success": False, "emoji": "✅", "text": "a\ud800"}
+    raw = json.dumps(bad)
+    resp = await auth_client.put(
+        "/v1/scheduled-tasks/run-outcome",
+        content=raw.encode(),
+        headers={**headers, "content-type": "application/json"},
+    )
+    assert resp.status_code == 422, resp.text
+    # The stock 422 body echoes the input; the lone surrogate comes back escaped.
+    assert "valid Unicode text" in resp.text
+    assert "\\ud800" in resp.json()["detail"][0]["input"]["text"]
+    run = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(session_id)
+    assert run is not None
+    assert (run.outcome_success, run.outcome_emoji, run.outcome_text) == (True, "🚀", "Shipped")
+
+
 @pytest.mark.parametrize(
     ("case", "expected_status"),
     [
