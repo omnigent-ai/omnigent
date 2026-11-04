@@ -20,7 +20,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -189,6 +189,8 @@ class LiveRunner:
     clear_status: int | None = 200
     posts: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     superseded: list[tuple[str, str, str]] = field(default_factory=list)
+    # Sessions announced to their owner's open tabs.
+    announced: list[str] = field(default_factory=list)
     # Runs while the runner handles ``clear``; awaited when it returns a coroutine.
     on_clear: Callable[[], object] | None = None
 
@@ -221,6 +223,11 @@ async def install_live_runner(
         routes_core,
         "_publish_session_superseded",
         lambda source, target, *, reason: state.superseded.append((source, target, reason)),
+    )
+    monkeypatch.setattr(
+        routes_core,
+        "_announce_session_added",
+        lambda _user_id, session_id: state.announced.append(session_id),
     )
     try:
         yield state
@@ -455,6 +462,8 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     notice = message_texts(store, source_id)[-1]
     assert "ended by `/clear`" in notice and f"(/c/{new_id})" in notice
     assert live_runner.superseded == [(source_id, new_id, "clear")]
+    # Listed in the owner's other tabs once placed.
+    assert new_id in live_runner.announced
 
 
 async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_session(
@@ -865,39 +874,60 @@ async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
     assert live_runner.superseded == []
 
 
+@pytest.mark.parametrize("failure", ["initialization", "after_initialization"])
 async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize(
     client: httpx.AsyncClient,
     db_uri: str,
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
-    """A registered runner that rejects the new session leaves nothing behind.
+    """A continuation that fails to be placed leaves nothing behind.
 
-    The source's saved inference configuration must be accepted, so the
-    unconfirmed initialization fails the clear; the new session is deleted
-    and the source gets no notice or redirect.
+    The source's saved inference configuration must be accepted, so an
+    unconfirmed initialization fails the clear; so does a later step, such as
+    detaching the source, after the runner set the new session up. The new
+    session is deleted (and dropped from the runner it was set up on), was
+    never listed in the owner's tabs, and the source gets no notice or redirect.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     agent = await create_test_agent(client)
     source = store.create_conversation(
         agent_id=agent["id"],
-        inference_snapshot={"runtime_config": {}, "harness": "claude-sdk", "owner_id": "local"},
+        inference_snapshot=(
+            {"runtime_config": {}, "harness": "claude-sdk", "owner_id": "local"}
+            if failure == "initialization"
+            else None
+        ),
     )
     bind_to_host(store, source.id, "/work/repo")
     store.replace_runner_id(source.id, _RUNNER_ID)
+    if failure == "after_initialization":
+        monkeypatch.setattr(
+            SqlAlchemyConversationStore,
+            "clear_runner_id",
+            Mock(side_effect=OmnigentError("detach failed", code=ErrorCode.INTERNAL_ERROR)),
+        )
     before = len((await client.get("/v1/sessions")).json()["data"])
 
     resp = await client.post(
         f"/v1/sessions/{source.id}/events", json={"type": "clear", "data": {}}
     )
 
-    assert resp.status_code == 503, resp.text
-    assert "did not accept this session's saved inference configuration" in resp.text
+    if failure == "initialization":
+        assert resp.status_code == 503, resp.text
+        assert "did not accept this session's saved inference configuration" in resp.text
+    else:
+        assert resp.status_code == 500, resp.text
     initialized = [
         body["session_id"] for path, body in live_runner.posts if path == "/v1/sessions"
     ]
-    assert [session_id for session_id in initialized if session_id != source.id]
+    [new_id] = [session_id for session_id in initialized if session_id != source.id]
+    assert store.get_conversation(new_id) is None
+    released = (f"/v1/sessions/{new_id}", {})
+    assert (released in live_runner.posts) == (failure == "after_initialization")
+    assert new_id not in live_runner.announced
     assert len((await client.get("/v1/sessions")).json()["data"]) == before
     assert message_texts(store, source.id) == []
     assert live_runner.superseded == []

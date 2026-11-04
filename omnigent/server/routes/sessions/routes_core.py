@@ -556,6 +556,19 @@ def register_core_routes(
         for user_id, level in wanted.items():
             await asyncio.to_thread(permission_store.grant, user_id, target_id, level)
 
+    async def _release_unreturned_runner_session(session_id: str) -> None:
+        """Best-effort: drop a deleted fork's session from the runner it was set up on."""
+        try:
+            runner_client = await _get_runner_client(session_id, runner_router)
+            if runner_client is not None:
+                await runner_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
+        except Exception:
+            _logger.warning(
+                "Failed to release the runner session of unreturned fork %s",
+                session_id,
+                exc_info=True,
+            )
+
     async def _release_unreturned_fork_host(request: Request, host_id: str | None) -> None:
         """Tear down a deleted fork's managed sandbox if nothing else uses it.
 
@@ -3989,7 +4002,7 @@ def register_core_routes(
             files, whatever it holds when the fork commits.
         :param continue_source: Create the fork on the source's host and
             workspace, with its routing switches, as a same-owner continuation;
-            it gets no creation-default sharing.
+            it gets no creation-default sharing and is not announced here.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4577,7 +4590,8 @@ def register_core_routes(
             # row, so announcing it would leak it into every open sidebar (the
             # real-time path bypasses the list-endpoint's side-chat filter).
             # Pushed once its managed labels are written, as on a create.
-            if not body.side_chat:
+            # A continuation is announced once placed, with the source's sharing.
+            if not body.side_chat and not continue_source:
                 _announce_session_added(user_id, new_conv.id)
         # Default-public grant only after the managed launch was accepted (see
         # the create paths). A side chat is a private scratch fork of the
@@ -4746,6 +4760,7 @@ def register_core_routes(
                 continue_source=True,
             )
             runner_bound = runner_online
+            runner_initialized = False
             try:
                 # The same conversation continues there, and every live viewer
                 # of the source is redirected to it, so it shares exactly as
@@ -4782,6 +4797,7 @@ def register_core_routes(
                             raise
                         runner_bound = False
                     else:
+                        runner_initialized = True
                         # The bind tolerates a runner gone before its client
                         # lookup, so confirm the placement it reports.
                         runner_bound = runner_router.runner_is_online(source.runner_id)
@@ -4810,10 +4826,14 @@ def register_core_routes(
                         if exc.code != ErrorCode.NOT_FOUND:
                             raise
             except Exception:
-                # Leave no announced fork for a retry to duplicate.
+                # Leave no fork for a retry to duplicate, nor its runner session.
+                if runner_initialized:
+                    await _release_unreturned_runner_session(fork.id)
                 await _delete_unreturned_session(fork.id)
                 await _release_unreturned_fork_host(request, fork.host_id)
                 raise
+            # Placed and shared as the source is: now the owner's tabs list it.
+            _announce_session_added(user_id, fork.id)
 
             # Best-effort, as for native supersession: the fork already holds the
             # work, so a lost notice must not strand it unreturned.
