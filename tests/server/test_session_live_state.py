@@ -53,6 +53,7 @@ class _RecordingStore:
     def __init__(self) -> None:
         self.status_writes: list[tuple[str, str]] = []
         self.pending_writes: list[tuple[str, int]] = []
+        self.background_writes: list[tuple[str, int]] = []
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
 
@@ -61,6 +62,9 @@ class _RecordingStore:
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         self.pending_writes.append((conversation_id, count))
+
+    def set_background_task_count(self, conversation_id: str, count: int) -> None:
+        self.background_writes.append((conversation_id, count))
 
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         del now
@@ -97,6 +101,29 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
         ("conv_1", "idle"),
         ("conv_2", "idle"),
     ]
+
+
+def test_persist_background_task_count_dedupes_changes(
+    recording_store: _RecordingStore,
+) -> None:
+    """Every Stop hook re-reports the count; only changes reach the store."""
+    session_live_state.persist_background_task_count("conv_1", 2)
+    session_live_state.persist_background_task_count("conv_1", 2)
+    session_live_state.persist_background_task_count("conv_1", 0)
+    session_live_state.persist_background_task_count("conv_1", 0)
+    _wait_until(lambda: len(recording_store.background_writes) >= 2)
+    assert recording_store.background_writes == [("conv_1", 2), ("conv_1", 0)]
+
+
+def test_handoff_round_trip_rewrites_the_background_count(
+    recording_store: _RecordingStore,
+) -> None:
+    """A:0, then B writes 3, then A gets 0 again: A's write must not be deduped."""
+    session_live_state.persist_background_task_count("conv_1", 0)
+    session_live_state.forget_live_status("conv_1")  # handed to replica B
+    session_live_state.persist_background_task_count("conv_1", 0)  # back on A
+    _wait_until(lambda: len(recording_store.background_writes) >= 2)
+    assert recording_store.background_writes == [("conv_1", 0), ("conv_1", 0)]
 
 
 def test_forget_live_status_drops_dedupe_state() -> None:
@@ -229,6 +256,7 @@ def test_dropped_write_evicts_dedupe_entry_for_retry() -> None:
     the next identical publish re-attempts the write.
     """
     calls: list[tuple[str, str]] = []
+    background_calls: list[tuple[str, int]] = []
 
     class _FlakyStore(_RecordingStore):
         def set_session_live_status(self, conversation_id: str, status: str) -> None:
@@ -236,6 +264,12 @@ def test_dropped_write_evicts_dedupe_entry_for_retry() -> None:
             if len(calls) == 1:
                 raise RuntimeError("boom")  # first attempt fails
             super().set_session_live_status(conversation_id, status)
+
+        def set_background_task_count(self, conversation_id: str, count: int) -> None:
+            background_calls.append((conversation_id, count))
+            if len(background_calls) == 1:
+                raise RuntimeError("boom")
+            super().set_background_task_count(conversation_id, count)
 
     store = _FlakyStore()
     session_live_state.configure(store)  # type: ignore[arg-type]
@@ -253,11 +287,18 @@ def test_dropped_write_evicts_dedupe_entry_for_retry() -> None:
         # a no-op; because the entry was cleared, the retry re-attempts.
         session_live_state.persist_live_status("conv_1", "running")
         _wait_until(lambda: bool(store.status_writes))
+
+        session_live_state.persist_background_task_count("conv_1", 0)
+        _wait_until(lambda: "conv_1" not in session_live_state._last_background)
+        session_live_state.persist_background_task_count("conv_1", 0)
+        _wait_until(lambda: bool(store.background_writes))
     finally:
         session_live_state.configure(None)
 
     assert calls == [("conv_1", "running"), ("conv_1", "running")]
     assert store.status_writes == [("conv_1", "running")], "retry never landed"
+    assert background_calls == [("conv_1", 0), ("conv_1", 0)]
+    assert store.background_writes == [("conv_1", 0)], "background retry never landed"
 
 
 def test_unencodable_status_is_dropped_before_enqueue(

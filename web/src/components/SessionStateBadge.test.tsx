@@ -57,6 +57,21 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(spinner?.getAttribute("class")).toContain("animate-spin");
   });
 
+  it("renders background tasks with the running spinner and a count-aware label", () => {
+    const { container, rerender } = renderBadge({ kind: "background", count: 1 });
+    const badge = screen.getByTestId("session-state-badge");
+    expect(badge).toHaveAttribute("data-state", "background");
+    expect(badge).toHaveAttribute("aria-label", "1 background task running");
+    expect(container.querySelector('[data-testid="running-dot"]')).not.toBeNull();
+
+    rerender(
+      <TooltipProvider>
+        <SessionStateBadge state={{ kind: "background", count: 3 }} />
+      </TooltipProvider>,
+    );
+    expect(badge).toHaveAttribute("aria-label", "3 background tasks running");
+  });
+
   it("renders unseen messages as a solid (non-pulsing) brand-pink dot", () => {
     const { container } = renderBadge({ kind: "unseen" });
     const badge = screen.getByTestId("session-state-badge");

@@ -1297,6 +1297,14 @@ def _build_session_list_item(
             if conv.runner_id is not None
             else pending_count
         ),
+        # A count this replica relayed (zero included) beats the row, which
+        # may lag or have failed to write; otherwise read the owner's row.
+        # Shells run on the bound runner, so a stale liveness stamp reports none.
+        background_task_count=(
+            _relayed_or_persisted_background_count(conv)
+            if conv.runner_id is not None and runner_seen_is_fresh(conv.runner_last_seen)
+            else 0
+        ),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
@@ -8575,10 +8583,18 @@ class _RelayTransportLost(Exception):
         self.stream_ready = stream_ready
 
 
+def _relayed_or_persisted_background_count(conv: Conversation) -> int:
+    """Return this replica's relayed background count, else the persisted one."""
+    relayed = _session_background_task_count_cache.get(conv.id)
+    return relayed if relayed is not None else conv.background_task_count or 0
+
+
 def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
+    _session_background_task_count_cache.pop(session_id, None)
+    _session_background_tasks_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 
 

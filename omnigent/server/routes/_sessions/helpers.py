@@ -5087,30 +5087,30 @@ def _publish_status(
         _session_active_response_cache.pop(session_id, None)
     # Keep the background-shell tally sticky alongside the status (see the
     # cache's declaration). A ``Stop`` hook reports an authoritative count
-    # (``None`` is never sent by it): a positive count sets the tally, and
-    # an explicit ``0`` clears it so a finished background shell drops the
-    # indicator on the next turn end. ``None`` means "no information" (the
+    # (``None`` is never sent by it), zero included: the cache keeps an
+    # explicit ``0`` so a finished shell drops the indicator and the list knows
+    # this replica's count beats a lagging row. ``None`` means "no information" (the
     # trailing PTY-activity ``idle`` carries none) and must NOT wipe the
     # count the Stop hook just published. A new ``running`` turn does NOT clear
     # it either — background shells outlive turn boundaries, so the tally
     # persists across the turn (the composer pill stays lit alongside the
-    # working shimmer) until the next authoritative count. Only a failure
-    # clears it: a dead session may never post another count to drop a stale
-    # tally.
+    # working shimmer) until the next authoritative count. A failure zeroes
+    # it: a dead session may never post another count to drop a stale tally.
     # The per-shell detail rides in lockstep with the count: they arrive on the
     # same Stop edge, so an authoritative count owns both caches (a positive
     # count stores the detail — possibly empty when a runner sent count-only —
     # and a ``0`` / failure clears it). ``None`` leaves both untouched.
-    if background_task_count is not None:
-        if background_task_count > 0:
-            _session_background_task_count_cache[session_id] = background_task_count
+    reported_count = background_task_count
+    if reported_count is None and status == "failed":
+        reported_count = 0
+    if reported_count is not None:
+        _session_background_task_count_cache[session_id] = reported_count
+        if reported_count > 0:
             _session_background_tasks_cache[session_id] = background_tasks or []
         else:
-            _session_background_task_count_cache.pop(session_id, None)
             _session_background_tasks_cache.pop(session_id, None)
-    elif status == "failed":
-        _session_background_task_count_cache.pop(session_id, None)
-        _session_background_tasks_cache.pop(session_id, None)
+        # Mirror onto the row so other replicas' sidebars show the shells.
+        session_live_state.persist_background_task_count(session_id, reported_count)
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,

@@ -3478,7 +3478,7 @@ async def test_offline_sweep_saved_subagent_turn_without_a_cached_edge(
             assert _interrupted(refreshed)
         else:
             assert persisted is not None and persisted["code"] == "runner_disconnected"
-            assert child.id not in sessions_module._session_background_task_count_cache
+            assert sessions_module._session_background_task_count_cache.get(child.id) == 0
         logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
         assert logged["attributes"]["origin"] == "runner_offline_sweep"
         assert logged["attributes"]["decision"] == decision

@@ -1,5 +1,5 @@
 // Per-row state derivation for the sidebar badge.
-// Priority: awaiting > running > error > no badge.
+// Priority: awaiting > running > error > background > no badge.
 //
 // Liveness (runner / host reachability) is no longer a sidebar state:
 // it surfaces in the open-session view (see `useSessionLiveness`), so the
@@ -15,6 +15,9 @@ import type { LatestSessionError } from "@/lib/sessionError";
 export type SessionState =
   | { kind: "awaiting"; count: number }
   | { kind: "running" }
+  // The turn ended but background shells still run; the server zeroes the
+  // count once the bound runner's liveness lapses.
+  | { kind: "background"; count: number }
   | { kind: "error" }
   | { kind: "disconnected" }
   | { kind: "unseen" }
@@ -25,14 +28,21 @@ export type SessionState =
   | { kind: "starting" };
 
 export function getSessionState(
-  conversation: Pick<Conversation, "status" | "pending_elicitations_count"> | undefined | null,
+  conversation:
+    | Pick<Conversation, "status" | "pending_elicitations_count" | "background_task_count">
+    | undefined
+    | null,
   latestError: LatestSessionError | null = null,
 ): SessionState | null {
   const pending = conversation?.pending_elicitations_count ?? 0;
   if (pending > 0) return { kind: "awaiting", count: pending };
   if (conversation?.status === "running") return { kind: "running" };
   if (latestError === "disconnected") return { kind: "disconnected" };
-  if (latestError === "recovered_disconnect") return null;
-  if (conversation?.status === "failed" || latestError === "error") return { kind: "error" };
+  const failed =
+    latestError !== "recovered_disconnect" &&
+    (conversation?.status === "failed" || latestError === "error");
+  if (failed) return { kind: "error" };
+  const background = conversation?.background_task_count ?? 0;
+  if (background > 0) return { kind: "background", count: background };
   return null;
 }

@@ -7759,13 +7759,15 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     connectivity = conversation_store.get_session_connectivity([conv_a.id])
     assert connectivity[conv_a.id].runner_last_seen is None
 
-    # Status + pending count round-trip through the entity.
+    # Status + pending and background counts round-trip through the entity.
     conversation_store.set_session_live_status(conv_a.id, "running")
     conversation_store.set_pending_elicitation_count(conv_a.id, 2)
+    conversation_store.set_background_task_count(conv_a.id, 3)
     updated = conversation_store.get_conversation(conv_a.id)
     assert updated is not None
     assert updated.live_status == "running"
     assert updated.pending_elicitation_count == 2
+    assert updated.background_task_count == 3
 
     # None of the live-state writes moved updated_at.
     assert updated.updated_at == before.updated_at

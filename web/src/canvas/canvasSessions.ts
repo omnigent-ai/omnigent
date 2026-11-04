@@ -135,6 +135,7 @@ function sessionSignature(sessions: readonly Conversation[]): string {
         row.status,
         row.title,
         row.pending_elicitations_count,
+        row.background_task_count,
         row.git_branch,
         row.project_id,
         row.workspace,
@@ -314,6 +315,7 @@ function sameCard(left: Conversation, right: Conversation): boolean {
     left.title === right.title &&
     left.updated_at === right.updated_at &&
     (left.pending_elicitations_count ?? 0) === (right.pending_elicitations_count ?? 0) &&
+    (left.background_task_count ?? 0) === (right.background_task_count ?? 0) &&
     (left.git_branch ?? null) === (right.git_branch ?? null) &&
     (left.project_id ?? null) === (right.project_id ?? null) &&
     (left.workspace ?? null) === (right.workspace ?? null) &&

@@ -31,6 +31,8 @@ function stateLabel(state: SessionState | null, status: Conversation["status"]):
     case "running":
     case "starting":
       return "Running";
+    case "background":
+      return "Background tasks running";
     case "unseen":
       return "New messages";
     default:

@@ -16,6 +16,7 @@ import asyncio
 import json
 import math
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -53,6 +54,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
+from tests._helpers.polling import poll_until_async
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import create_test_agent
 
@@ -4349,6 +4351,114 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     assert row["pending_elicitations_count"] == 2
 
     store.set_pending_elicitation_count(session_id, 0)
+
+
+async def test_list_sessions_exposes_background_task_count(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A turn end's background-shell count reaches the list and the row.
+
+    The sidebar badges a session whose turn ended while shells still run;
+    the row write lets replicas without the runner tunnel show it too.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = (await _create_session(client, agent["id"]))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner_live")
+    store.touch_runner_liveness(["runner_live"], now=int(time.time()))
+
+    async def post_count(count: int) -> None:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "background_task_count": count},
+            },
+        )
+        assert resp.status_code in (200, 202)
+
+    async def listed_count() -> int:
+        resp = await client.get("/v1/sessions")
+        return next(r for r in resp.json()["data"] if r["id"] == session_id)[
+            "background_task_count"
+        ]
+
+    def row_count_is(count: int) -> bool:
+        conv = store.get_conversation(session_id)
+        return conv is not None and conv.background_task_count == count
+
+    try:
+        assert await listed_count() == 0
+        await post_count(2)
+        assert await listed_count() == 2
+        await poll_until_async(lambda: row_count_is(2))
+        await post_count(0)
+        assert await listed_count() == 0
+        await poll_until_async(lambda: row_count_is(0))
+    finally:
+        sessions_module._session_background_task_count_cache.pop(session_id, None)
+
+
+async def test_list_sessions_background_count_follows_the_owning_replica(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A count this replica relayed wins; otherwise the owner's row speaks; a
+    stale runner stamp reports none, since nothing could clear it."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.orchestration import (
+        _relinquish_session_live_state,
+    )
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = (await _create_session(client, agent["id"]))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner_other_replica")
+    store.touch_runner_liveness(["runner_other_replica"], now=int(time.time()))
+
+    async def listed_count() -> int:
+        resp = await client.get("/v1/sessions")
+        return next(r for r in resp.json()["data"] if r["id"] == session_id)[
+            "background_task_count"
+        ]
+
+    try:
+        # Nothing relayed here (e.g. after a restart): the owner's row speaks,
+        # even once a status-only runner probe refills the status cache.
+        _relinquish_session_live_state(session_id)
+        store.set_background_task_count(session_id, 3)
+        assert await listed_count() == 3
+        sessions_module._session_status_cache[session_id] = "idle"
+        assert await listed_count() == 3
+
+        # A relayed count wins over a lagging or failed row write, a zero included.
+        store.set_background_task_count(session_id, 2)
+        sessions_module._session_background_task_count_cache[session_id] = 1
+        assert await listed_count() == 1
+        sessions_module._session_background_task_count_cache[session_id] = 0
+        assert await listed_count() == 0
+
+        # Handed off: the local count is dropped and the new owner's row speaks.
+        sessions_module._session_background_task_count_cache[session_id] = 2
+        store.set_background_task_count(session_id, 0)
+        _relinquish_session_live_state(session_id)
+        assert session_id not in sessions_module._session_background_task_count_cache
+        assert await listed_count() == 0
+
+        store.set_background_task_count(session_id, 3)
+        store.clear_runner_liveness("runner_other_replica")
+        assert await listed_count() == 0
+    finally:
+        _relinquish_session_live_state(session_id)
 
 
 async def test_get_session_includes_runner_online(

@@ -180,6 +180,8 @@ export interface Conversation {
   harness?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
+  /** Background shells still running after the turn ended; keeps the row's spinner on. */
+  background_task_count?: number;
   status?: "idle" | "running" | "failed";
   /**
    * Whether the session's runner is reachable, matching `GET /health`.
@@ -516,6 +518,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     agent_name: wire.agent_name ?? null,
     harness: wire.harness ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
+    background_task_count: wire.background_task_count ?? 0,
     status: wire.status ?? "idle",
     runner_online: wire.runner_online ?? undefined,
     host_online: wire.host_online ?? undefined,

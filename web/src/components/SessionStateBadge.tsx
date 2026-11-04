@@ -44,6 +44,15 @@ function describe(state: SessionState): Visual {
         tooltip: "Session running",
         render: () => <RunningDot className="size-3" />,
       };
+    case "background": {
+      const tooltip = `${state.count} background task${state.count === 1 ? "" : "s"} running`;
+      return {
+        kind: state.kind,
+        ariaLabel: tooltip,
+        tooltip,
+        render: () => <RunningDot className="size-3" />,
+      };
+    }
     case "starting":
       // Same spinner as running — the session is coming up, not yet working.
       return {

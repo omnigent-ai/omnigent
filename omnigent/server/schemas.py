@@ -3115,6 +3115,9 @@ class SessionListItem(BaseModel):
         passing through ``session_stream`` and decrements when a
         verdict is dispatched. ``0`` when the session has no
         outstanding elicitations.
+    :param background_task_count: Background shells still running after
+        the session's turn ended (claude-native ``Stop`` hook), so the
+        sidebar can show the session is still in progress. ``0`` when none.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. ``None`` for
         sessions that haven't been bound to a host workspace.
@@ -3185,6 +3188,7 @@ class SessionListItem(BaseModel):
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
+    background_task_count: int = 0
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False

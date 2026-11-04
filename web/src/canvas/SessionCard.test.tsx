@@ -73,6 +73,15 @@ describe("SessionCard", () => {
     expect(screen.getAllByText("Needs response").length).toBeGreaterThan(0);
   });
 
+  it("keeps a spinner while background tasks outlive the turn", () => {
+    const { card } = renderCard({
+      conversation: conversation({ status: "idle", background_task_count: 1 }),
+    });
+    expect(card).toHaveAttribute("data-state", "background");
+    expect(screen.getByText("Background tasks running")).toBeInTheDocument();
+    expect(screen.getByTestId("running-dot")).toBeInTheDocument();
+  });
+
   it("shows the unread dot for finished output the user has not seen", () => {
     // The list seeds the viewer's last-seen baseline; a later updated_at reads as unseen.
     seedReadState([{ id: "conv_1", viewer_last_seen: 50, updated_at: 100 }]);

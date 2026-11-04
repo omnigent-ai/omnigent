@@ -2960,6 +2960,35 @@ describe("Sidebar collapsed project marker", () => {
     ).toBeInTheDocument();
   });
 
+  it("sums hidden rows' background tasks ahead of an unread sibling", () => {
+    projectsMock.push("Customer X");
+    seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
+    mockConversations([
+      conv("conv_unread", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "idle",
+        updated_at: 200,
+      }),
+      conv("conv_shell_a", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "idle",
+        background_task_count: 1,
+      }),
+      conv("conv_shell_b", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "idle",
+        background_task_count: 2,
+      }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(within(header).getByRole("img", { name: "3 background tasks running" })).toHaveAttribute(
+      "data-state",
+      "background",
+    );
+  });
+
   it.each(["failed", "idle"] as const)(
     "prioritizes a running session over an unread $0 sibling",
     (status) => {

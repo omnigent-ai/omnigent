@@ -657,12 +657,14 @@ _runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+# Last background-shell count this replica relayed per session, zero included,
+# so a reported zero is distinguishable from unknown. Dropped only on handoff.
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
 # Per-shell detail behind the tally above, kept sticky in lockstep with it (see
 # ``_publish_status``) so a reload/reconnect can restore it. Absent when the
-# count cache is absent, or when a runner reported only the count with no detail.
+# count is zero or unknown, or when a runner reported only the count.
 _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
     WorkspaceScopedCache()
 )

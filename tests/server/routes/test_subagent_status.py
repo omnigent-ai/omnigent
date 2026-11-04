@@ -172,7 +172,7 @@ async def status_route(
         pytest.param(
             {"response_id": None, "background_task_count": 0},
             {"background_task_count": 0},
-            None,
+            0,
             None,
             id="clear-background",
         ),
