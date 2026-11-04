@@ -20,7 +20,8 @@ to customize.
   system prompt to change it. Saving preserves both parts; reopening collapses
   and locks the system prompt again. Edit as prompt during creation uses the same
   separation. Unrecognized or ambiguous prompt formats remain fully editable
-  as a single Prompt field.
+  as a single Prompt field. Edits that remove the template signature or add
+  ambiguous section headings show a notice before saving as a single prompt.
   The detail page also keeps the system prompt collapsed by default, with a
   bounded read-only preview when expanded; use Edit automation to change it.
 - `workspace`: connected-host setup disables workspace browsing while the
@@ -73,7 +74,9 @@ to customize.
 
 Preconditions: enable session orchestration and scheduled-task session modes.
 Use the isolated environment and dismiss the first-visit introduction. The
-creation round-trip test supplies its own isolated host. No agent turn is needed.
+creation round-trip test supplies its own feature-enabled server and isolated
+host; run it with plain pytest and `--ui-skip-build` after building the SPA.
+No agent turn is needed.
 
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`
   covers the preview and Templates tab with reload. It creates

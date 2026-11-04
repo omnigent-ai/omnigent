@@ -2475,6 +2475,64 @@ describe("editing template prompts", () => {
     { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
   );
 
+  it.each(["Include the agenda.", "", "  \n"])(
+    "keeps a hand-written heading editable for unrelated changes (%j)",
+    async (instructions) => {
+      const prompt = `Write a training document.\n\nInstructions for each session:\n${instructions}`;
+      render(
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({ prompt })}
+        />,
+      );
+      expect(screen.getByLabelText("Prompt", { exact: true })).toHaveValue(prompt);
+      expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
+      fireEvent.change(screen.getByTestId("task-name-input"), {
+        target: { value: "Updated name" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        name: "Updated name",
+        prompt: prompt.trim(),
+      });
+    },
+  );
+
+  it.each(["Your prompt", "System prompt"])(
+    "explains a format-changing edit to %s before saving",
+    (field) => {
+      render(
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({ prompt: original })}
+        />,
+      );
+      expect(
+        screen.queryByText(/These edits change the template structure/),
+      ).not.toBeInTheDocument();
+      if (field === "System prompt") {
+        fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+        fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+      }
+      const editor = screen.getByRole("textbox", { name: field }) as HTMLTextAreaElement;
+      const savedValue = editor.value;
+      fireEvent.change(editor, {
+        target: { value: `${savedValue}\n\nInstructions for each session:\nExtra heading.` },
+      });
+      expect(
+        screen.getByText(/After saving, the full text will appear as one prompt/),
+      ).toBeVisible();
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+      fireEvent.change(editor, { target: { value: savedValue } });
+      expect(
+        screen.queryByText(/These edits change the template structure/),
+      ).not.toBeInTheDocument();
+    },
+  );
+
   it("edits the user prompt while preserving collapsed system instructions", async () => {
     render(
       <CreateScheduledTaskDialog
@@ -2539,11 +2597,18 @@ describe("editing template prompts", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
       target: { value: "Unsaved edit" },
     });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(props.onOpenChange).toHaveBeenLastCalledWith(false);
+    expect(updateMutateAsync).toHaveBeenCalledTimes(1);
     rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-    rerender(<CreateScheduledTaskDialog open {...props} />);
-    expect(screen.getByLabelText("Your prompt")).toHaveValue("Triage the ticket.");
+    rerender(
+      <CreateScheduledTaskDialog open {...props} editingTask={scheduledTask({ prompt: saved })} />,
+    );
+    expect(screen.getByLabelText("Your prompt")).toHaveValue("Fix it.");
     fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
     expect(screen.queryByText("Unsaved edit")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(systemPrompt);
   });
 });
 

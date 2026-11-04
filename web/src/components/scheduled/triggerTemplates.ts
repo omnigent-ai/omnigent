@@ -299,19 +299,32 @@ export function splitTriggerPrompt(prompt: string): {
   userPrompt: string;
   systemPrompt: string | null;
 } {
+  const unsplit = { userPrompt: prompt, systemPrompt: null };
+  if (
+    !TRIGGER_SOURCES.some((source) =>
+      prompt.startsWith(`This automation watches ${triggerServiceName(source)} `),
+    )
+  ) {
+    return unsplit;
+  }
   const sections = prompt.split(SESSION_INSTRUCTIONS);
   if (sections.length !== 2 || sections[0].trim() === "") {
-    return { userPrompt: prompt, systemPrompt: null };
+    return unsplit;
   }
   const [systemPrompt, instructions] = sections;
-  // Older templates place the posting instructions after the user's text.
+  // Templates append posting instructions after the user's text; show them with the system prompt.
   const suffix = `\n${POSTING_INSTRUCTIONS}`;
-  return instructions.endsWith(suffix)
+  const parts = instructions.endsWith(suffix)
     ? {
         userPrompt: instructions.slice(0, -suffix.length),
         systemPrompt: `${systemPrompt}\n\n${POSTING_INSTRUCTIONS}`,
       }
     : { userPrompt: instructions, systemPrompt };
+  // Unfamiliar layouts must not be reordered on an unrelated save.
+  return parts.userPrompt.trim() !== "" &&
+    combineTriggerPrompt(parts.userPrompt, parts.systemPrompt) === prompt
+    ? parts
+    : unsplit;
 }
 
 /** Keep existing template prompts byte-for-byte when neither part changed. */

@@ -759,6 +759,13 @@ export function CreateScheduledTaskDialog({
                 className="resize-none text-ui"
                 onChange={(e) => setPrompt(e.target.value)}
               />
+              {systemPrompt !== null &&
+                splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
+                  <p role="status" className="text-sm text-warning">
+                    These edits change the template structure. After saving, the full text will
+                    appear as one prompt.
+                  </p>
+                )}
               {systemPrompt !== null && (
                 <Collapsible
                   open={systemPromptOpen}

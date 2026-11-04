@@ -998,14 +998,15 @@ def test_scheduled_task_create_persists_continuing_one_session(
     assert (created["session_mode"], created["session_id"]) == ("continue", None), created
 
 
-@pytest.mark.usefixtures("online_host")
+@pytest.mark.usefixtures("automations_v2_host")
 @pytest.mark.parametrize("entry", ["preview", "templates"])
 def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page: Page,
-    live_server: str,
+    automations_v2_server: str,
     entry: str,
 ) -> None:
     """Create from either gallery and edit user/system prompts independently."""
+    live_server = automations_v2_server
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
     page.set_viewport_size({"width": 390 if entry == "preview" else 1280, "height": 900})
     _open_automations_page(page, live_server)

@@ -61,11 +61,29 @@ describe("saved trigger prompts", () => {
 
   it.each([
     "A plain prompt\nwith multiple lines.",
+    "Write a training document.\n\nInstructions for each session:\nInclude the agenda.",
+    "Write a training document.\n\nInstructions for each session:\n",
+    "Write a training document.\n\nInstructions for each session:\n  \n",
     "\n\nInstructions for each session:\nNo system instructions.",
     "System\n\nInstructions for each session:\nAmbiguous\n\nInstructions for each session:\ntext",
+    renderTriggerPrompt("jira", fields({ instructions: "" }), CTX),
+    renderTriggerPrompt("jira", fields({ instructions: "  \n" }), CTX),
+    renderTriggerPrompt(
+      "jira",
+      fields({ instructions: "Include\n\nInstructions for each session:\nan agenda." }),
+      CTX,
+    ),
   ])("keeps an unrecognized or ambiguous prompt intact", (prompt) => {
     expect(splitTriggerPrompt(prompt)).toEqual({ userPrompt: prompt, systemPrompt: null });
     expect(combineTriggerPrompt(prompt, null)).toBe(prompt);
+  });
+
+  it("keeps an unfamiliar posting-instruction placement intact", () => {
+    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields(), CTX));
+    const prompt = `${parts.systemPrompt}\n\nInstructions for each session:\n${parts.userPrompt}`;
+    const parsed = splitTriggerPrompt(prompt);
+    expect(parsed).toEqual({ userPrompt: prompt, systemPrompt: null });
+    expect(combineTriggerPrompt(parsed.userPrompt, parsed.systemPrompt)).toBe(prompt);
   });
 });
 
