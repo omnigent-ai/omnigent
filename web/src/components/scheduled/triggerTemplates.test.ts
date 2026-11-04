@@ -139,6 +139,11 @@ describe("triggerFieldsComplete", () => {
     ["comma-only scope", { scope: " , ," }, false],
     ["a condition with no value", { conditions: [{ ...LABEL_OMNIGENT, value: " " }] }, false],
     [
+      "a blank free-text condition",
+      { conditions: [{ field: "free_text", operator: "matches", value: " \n " }] },
+      false,
+    ],
+    [
       "a valueless condition",
       { conditions: [{ field: "assignee", operator: "empty", value: "" }] },
       true,
@@ -327,6 +332,69 @@ describe("isTriggerPrompt", () => {
 });
 
 describe("renderTriggerPrompt", () => {
+  it.each(TRIGGER_SOURCES)(
+    "evaluates all free-text conditions before creating sessions for %s",
+    (source) => {
+      const structuredFields = fields({
+        conditions: [
+          source === "slack"
+            ? { field: "text", operator: "contains", value: "error" }
+            : LABEL_OMNIGENT,
+        ],
+      });
+      const conditions = [
+        'Reports a "login failure".\nAffects multiple users.',
+        "Includes steps to reproduce",
+      ];
+      const withFreeText = {
+        ...structuredFields,
+        conditions: [
+          ...structuredFields.conditions,
+          ...conditions.map((value) => ({
+            field: "free_text",
+            operator: "matches" as const,
+            value,
+          })),
+        ],
+      };
+      const compile = {
+        jira: compileJiraJql,
+        github: compileGithubQuery,
+        slack: describeSlackFilter,
+        linear: describeLinearFilter,
+      }[source];
+      expect(compile(withFreeText)).toBe(compile(structuredFields));
+      const prompt = renderTriggerPrompt(source, withFreeText, CTX);
+      expect(prompt).toContain("in addition to the structured filters");
+      expect(prompt).toContain("All of these conditions must match:");
+      for (const condition of conditions) {
+        expect(prompt).toContain(`- ${JSON.stringify(condition)}`);
+      }
+      expect(prompt.indexOf("All of these conditions must match:")).toBeLessThan(
+        prompt.indexOf("call sys_session_create"),
+      );
+      expect(prompt).toContain("do not advance the check time past it");
+      expect(splitTriggerPrompt(prompt).userPrompt).toBe(structuredFields.instructions);
+
+      const freeTextOnly = renderTriggerPrompt(
+        source,
+        { ...withFreeText, conditions: withFreeText.conditions.slice(1) },
+        CTX,
+      );
+      expect(freeTextOnly).toContain("All of these conditions must match:");
+      expect(freeTextOnly).not.toContain("Every top-level message counts.");
+      expect(freeTextOnly).not.toContain("Every issue counts.");
+      if (source === "slack") {
+        expect(freeTextOnly).toContain(
+          "Check each message against the free-text conditions below.",
+        );
+      }
+      if (source === "linear") {
+        expect(freeTextOnly).toContain("Check each issue against the free-text conditions below.");
+      }
+    },
+  );
+
   it("renders the Jira manager prompt with the JQL, placement, dedupe title and link", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
 
