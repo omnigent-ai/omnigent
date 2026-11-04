@@ -76,6 +76,23 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
                 ],
             )
 
+        # An interrupted backfill keeps the batches it committed, and a retry finishes.
+        writes = 0
+
+        def interrupt_second_batch(conn, cursor, statement, parameters, context, executemany):
+            nonlocal writes
+            if "SET title_sort_key" in statement:
+                writes += 1
+                if writes == 2:
+                    raise RuntimeError("backfill interrupted")
+
+        sa.event.listen(engine, "before_cursor_execute", interrupt_second_batch)
+        try:
+            with pytest.raises(RuntimeError, match="backfill interrupted"):
+                _migrate(engine, _REVISION)
+        finally:
+            sa.event.remove(engine, "before_cursor_execute", interrupt_second_batch)
+        assert sum(key != "1" for key in _keys(engine).values()) == batch_size
         _migrate(engine, _REVISION)
         expected = {key: title_sort_key(title) for key, title in original.items()}
         assert _keys(engine) == expected
@@ -98,7 +115,7 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
             )
         assert _keys(engine)[(0, legacy_id)] == "1"
 
-        # A rerun after a partial upgrade keeps the column and index and fixes keys.
+        # Stamping back and rerunning the revision keeps the column and index and fixes keys.
         _migrate(engine, _PREVIOUS, command.stamp)
         _migrate(engine, _REVISION)
         assert _keys(engine) == {**expected, (0, legacy_id): "0legacy"}
