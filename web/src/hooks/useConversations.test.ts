@@ -378,6 +378,11 @@ describe("useConversations search timeout", () => {
     // A genuine server/network error still retries (up to the default cap).
     expect(retry(0, new Error("500 Internal Server Error"))).toBe(true);
     expect(retry(3, new Error("500 Internal Server Error"))).toBe(false);
+    // Throttling retries; a client error the same request repeats does not.
+    expect(retry(0, new ApiError("slow down", 429, null))).toBe(true);
+    expect(retry(0, new ApiError("unavailable", 503, null))).toBe(true);
+    expect(retry(0, new ApiError("not found", 404, null))).toBe(false);
+    expect(retry(0, new ApiError("forbidden", 403, null))).toBe(false);
   });
 });
 
@@ -436,7 +441,10 @@ describe("useConversations stale cursor", () => {
     // Reissuing the same dead cursor fails identically, so the restart owns
     // the recovery instead.
     expect(retry(0, new ApiError("gone", 400, "stale_cursor"))).toBe(false);
-    expect(retry(0, new ApiError("bad", 400, "invalid_input"))).toBe(true);
+    // Any other 4xx repeats on the same request too, so it isn't retried either.
+    expect(retry(0, new ApiError("bad", 400, "invalid_input"))).toBe(false);
+    // A server-side failure still retries.
+    expect(retry(0, new ApiError("unavailable", 503, null))).toBe(true);
   });
 });
 
