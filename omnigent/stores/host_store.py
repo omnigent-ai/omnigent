@@ -1186,9 +1186,12 @@ class HostStore:
                 raise ValueError(f"managed host {host.host_id!r} no longer exists")
             key = (current_workspace_id(), "__host_lifecycle__", "recovery:" + host.host_id)
             lease = session.get(SqlPreference, key)
-            if lease is not None and json.loads(lease.value).get("expires", 0) > now_epoch():
+            value = json.loads(lease.value) if lease is not None else {}
+            if value.get("expires", 0) > now_epoch():
                 return False
             if row.sandbox_id != host.sandbox_id:
+                if value.get("workspace") and value.get("sandbox_id") == row.sandbox_id:
+                    return False
                 raise ValueError("Sandbox changed before recovery; retry with its current state")
             value = json.dumps({"token": token, "expires": now_epoch() + 300})
             if lease is None:
@@ -1637,7 +1640,7 @@ class HostStore:
                 )
             return True
 
-    def revoke_launch_token(self, host_id: str, *, expected_token: str | None = None) -> None:
+    def revoke_launch_token(self, host_id: str) -> None:
         """
         Clear a managed host's launch credential, keeping the row.
 
@@ -1661,10 +1664,7 @@ class HostStore:
                     SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
-            if row is None or (
-                expected_token is not None
-                and row.token_hash != hash_host_launch_token(expected_token)
-            ):
+            if row is None:
                 return
             row.token_hash = None
             row.token_expires_at = None

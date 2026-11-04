@@ -1301,6 +1301,8 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
         "/v1/sessions",
         params={"limit": 1, "search_query": "Private sibling", "expand_families": True},
     )
+    assert [row["id"] for row in expanded.json()["data"]] == [sibling_id]
+    expanded = await auth_client.get("/v1/sessions", params={"limit": 1, "expand_families": True})
     assert {row["id"] for row in expanded.json()["data"]} == {source["id"], sibling_id}
     ids = []
     after = None

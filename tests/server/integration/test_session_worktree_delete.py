@@ -912,16 +912,21 @@ async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
     assert len(captured) == 1
 
 
+@pytest.mark.parametrize("deleted_host", [False, True])
 async def test_managed_worktree_lives_until_sandbox_teardown(
     app: FastAPI,
     client: httpx.AsyncClient,
     db_uri: str,
+    deleted_host: bool,
 ) -> None:
     captured = await _register_fake_host(app, db_uri)
     hosts = HostStore(db_uri)
     app.state.host_store = hosts
     assert hosts.bind_sandbox(_HOST_ID, provider="modal", sandbox_id="managed-worktree")
     session_id = _make_worktree_conversation(db_uri)
+    if deleted_host:
+        hosts.delete_host(_HOST_ID)
+        app.state.host_registry.deregister(_HOST_ID)
     response = await client.delete(f"/v1/sessions/{session_id}?delete_branch=true")
     assert response.status_code == 200, response.text
     assert captured == []

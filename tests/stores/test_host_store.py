@@ -2219,8 +2219,13 @@ def test_recovery_fences_expired_attempts_and_connected_hosts(host_store: HostSt
         expected_updated_at=replacement.updated_at,
         expected_token="winner",
     )
-    host_store.revoke_launch_token(host.host_id, expected_token="loser")
     assert host_store.resolve_launch_token(host.host_id, "winner") is not None
+    assert host_store.update_managed_recovery(
+        host.host_id, "second", finished=True, workspace="/recovered", sandbox_id="winner"
+    )
+    assert not host_store.claim_managed_recovery(host, "late-sibling")
+    assert host_store.managed_recovery_result(host.host_id) == ("/recovered", "winner")
+    assert host_store.claim_managed_recovery(replacement, "next-recovery")
 
 
 @pytest.mark.asyncio

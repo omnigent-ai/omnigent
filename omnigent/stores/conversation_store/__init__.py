@@ -2417,16 +2417,15 @@ class ConversationStore(ABC):
         include_archived: bool = False,
     ) -> bool:
         """
-        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+        Does another conversation use this workspace (active only unless ``include_archived``)?
 
         Sessions routinely share one directory: a fork reusing the source's
         worktree, or several sessions attached to the same existing worktree
         via the picker. Worktree cleanup must not remove a directory a live
         session still runs in, so this is the "is it in use?" gate.
 
-        Archived sessions do not count. They run nothing, so removing the
-        directory cannot wedge them, and counting them would mean a worktree
-        shared by two forks is never cleaned up once either is archived.
+        Archived sessions count only with ``include_archived=True``. Cleanup uses
+        that flag to preserve files needed when an archived session resumes.
 
         :param host_id: Host owning the worktree, e.g. ``"host_a1b2..."``.
         :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.

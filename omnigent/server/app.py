@@ -2192,8 +2192,7 @@ def create_app(
         if sandbox_config is not None:
             if host_store is None:
                 _logger.warning(
-                    "Managed sandbox reaper is enabled but no host store is configured; "
-                    "the reaper will not run"
+                    "No host store is configured; managed sandbox cleanup will not run"
                 )
             else:
                 managed_sandbox_reaper = ManagedSandboxReaper(

@@ -2196,7 +2196,7 @@ def register_core_routes(
             permission_store,
             page.data,
             user_id,
-            expand=expand_families,
+            expand=expand_families and not normalized_query,
             include_archived=include_archived_param,
             archived_only=archived_only_param,
         )

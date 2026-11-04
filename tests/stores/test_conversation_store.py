@@ -9859,6 +9859,43 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id):
     assert [member.id for member in families[another.id]] == [another.id, another_sibling.id]
 
 
+@pytest.mark.parametrize("split_database", [False, True])
+def test_failed_family_membership_preserves_source_pin(tmp_path, monkeypatch, split_database):
+    from omnigent.stores.conversation_store import family_pinned_label_key, pinned_label_key
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    source = store.create_conversation()
+    target = store.create_conversation()
+    store.set_labels(source.id, {pinned_label_key("alice"): "123"})
+    original = store._session_immediate
+
+    @contextmanager
+    def fail_membership_commit(operation):
+        with original(operation) as session:
+            yield session
+            if operation == "create_sibling_membership":
+                raise RuntimeError("metadata commit failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store,
+            "_session_immediate",
+            MagicMock(side_effect=fail_membership_commit, engine=original.engine),
+        )
+        with pytest.raises(RuntimeError, match="metadata commit failed"):
+            store.add_new_sibling(source.id, target.id, user_id="alice")
+    for session_id in (source.id, target.id):
+        saved = store.get_conversation(session_id)
+        assert saved.family_id is None
+        assert family_pinned_label_key("alice") not in saved.labels
+    assert store.get_conversation(source.id).labels[pinned_label_key("alice")] == "123"
+    store.delete_label(source.id, pinned_label_key("alice"))
+    assert not store.list_conversations(pinned=True, pinned_owner="alice").data
+
+
 def test_generic_label_writes_cannot_change_family_pins(conversation_store) -> None:
     from omnigent.errors import OmnigentError
 

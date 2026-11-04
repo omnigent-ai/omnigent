@@ -10351,7 +10351,7 @@ async def _remove_session_worktree_best_effort(
     from omnigent.server.routes._workspace_validation import _is_subpath_of
 
     if host_store is not None:
-        host = await asyncio.to_thread(host_store.get_host, host_id)
+        host = await asyncio.to_thread(host_store.get_host, host_id, include_deleted=True)
         if host is not None and host.sandbox_provider is not None:
             # Shared sandbox files live until last-binding teardown, including
             # admissions racing this optional worktree cleanup.

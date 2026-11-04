@@ -1873,7 +1873,33 @@ class SqlAlchemyConversationStore(ConversationStore):
         pin_key = pinned_label_key(user_id)
         family_pin_key = family_pinned_label_key(user_id)
 
-        def write(session: Session) -> None:
+        def copy_labels(
+            labels_session: Session,
+            member_ids: list[str],
+            *,
+            promote_pin: bool,
+            project_id: str | None,
+        ) -> None:
+            source_labels = _fetch_labels(labels_session, source_id)
+            updates: dict[str, str] = {}
+            if project_id is None and PROJECT_LABEL_KEY in source_labels:
+                updates[PROJECT_LABEL_KEY] = source_labels[PROJECT_LABEL_KEY]
+            if promote_pin and pin_key in source_labels:
+                updates[family_pin_key] = source_labels[pin_key]
+                labels_session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == source_id,
+                        SqlConversationLabel.key == pin_key,
+                    )
+                )
+            elif family_pin_key in source_labels:
+                updates[family_pin_key] = source_labels[family_pin_key]
+            if updates:
+                for member_id in member_ids:
+                    _upsert_prepared_labels(labels_session, member_id, updates, now_epoch())
+
+        def write(session: Session) -> bool:
             self._lock_session_family(session, family_id)
             source_meta = session.get(SqlConversationMetadata, (current_workspace_id(), source_id))
             target_meta = session.get(
@@ -1888,7 +1914,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 target_row = labels_session.get(
                     SqlConversation, (current_workspace_id(), session_id), with_for_update=True
                 )
-                source_labels = _fetch_labels(labels_session, source_id)
                 if (
                     source_row is None
                     or target_row is None
@@ -1906,28 +1931,43 @@ class SqlAlchemyConversationStore(ConversationStore):
                     raise OmnigentError(
                         "A family supports up to 100 sessions", code=ErrorCode.INVALID_INPUT
                     )
-                updates: dict[str, str] = {}
-                if source_meta.project_id is None and PROJECT_LABEL_KEY in source_labels:
-                    updates[PROJECT_LABEL_KEY] = source_labels[PROJECT_LABEL_KEY]
-                if source_meta.family_id is None and pin_key in source_labels:
-                    updates[family_pin_key] = source_labels[pin_key]
-                    labels_session.execute(
-                        delete(SqlConversationLabel).where(
-                            SqlConversationLabel.workspace_id == current_workspace_id(),
-                            SqlConversationLabel.conversation_id == source_id,
-                            SqlConversationLabel.key == pin_key,
-                        )
+                if self._conv_engine is self._engine:
+                    copy_labels(
+                        labels_session,
+                        [source_id, session_id],
+                        promote_pin=source_meta.family_id is None,
+                        project_id=source_meta.project_id,
                     )
-                elif family_pin_key in source_labels:
-                    updates[family_pin_key] = source_labels[family_pin_key]
-                if updates:
-                    _upsert_prepared_labels(labels_session, source_id, updates, now_epoch())
-                    _upsert_prepared_labels(labels_session, session_id, updates, now_epoch())
+            new_family = source_meta.family_id is None
             target_meta.project_id = source_meta.project_id
             source_meta.family_id = family_id
             target_meta.family_id = family_id
+            return new_family
 
-        run_write_transaction(self._session_immediate, "create_sibling_membership", write)
+        new_family = run_write_transaction(
+            self._session_immediate, "create_sibling_membership", write
+        )
+        if self._conv_engine is not self._engine:
+            # Commit membership before moving pins in a separate database.
+            def finish_labels(session: Session) -> None:
+                self._lock_session_family(session, family_id)
+                source_meta = session.get(
+                    SqlConversationMetadata, (current_workspace_id(), source_id)
+                )
+                members = self._family_member_ids(session, family_id)
+                if source_meta is None or source_id not in members or session_id not in members:
+                    raise OmnigentError(
+                        "Sibling source is no longer available", code=ErrorCode.CONFLICT
+                    )
+                with self._profile_label_session(session) as labels_session:
+                    copy_labels(
+                        labels_session,
+                        members if new_family else [session_id],
+                        promote_pin=new_family,
+                        project_id=source_meta.project_id,
+                    )
+
+            run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
 
     def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
         source = self.get_conversation(session_id)
@@ -6454,7 +6494,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         include_archived: bool = False,
     ) -> bool:
         """
-        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+        Does another conversation use this workspace (active only unless ``include_archived``)?
         See the protocol docstring for the semantics.
 
         Two queries, not one: ``host_id`` / ``workspace`` live on the metadata
