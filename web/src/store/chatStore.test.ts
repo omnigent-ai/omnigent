@@ -3749,12 +3749,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
 
   it.each([
     {
-      sent: "text and an image",
+      sent: "two text blocks and an image",
       content: [
-        { type: "input_text", text: "explain this chart" },
+        { type: "input_text", text: "explain" },
+        { type: "input_text", text: "this chart" },
         { type: "input_image", file_id: "file_chart", filename: "chart.png" },
       ],
-      draft: "explain this chart",
+      draft: "explain\nthis chart",
       title: "An attachment wasn't restored",
       message: "Attach chart.png again before you resend.",
     },
@@ -22233,6 +22234,49 @@ describe("a send cut off by a reload", () => {
         recovered: true,
       });
       expect(useChatStore.getState().returnedStartupInputs).toEqual(["pending_first"]);
+    },
+  );
+
+  it.each([
+    {
+      unanswered: "an unanswered send",
+      savedAs: "item_first",
+      text: "rerun the failing test",
+      draft: "saved on server\n\nrerun the failing test",
+    },
+    {
+      unanswered: "the unanswered send it saved",
+      savedAs: "stable_reload",
+      text: "saved on server",
+      draft: "saved on server",
+    },
+  ])(
+    "keeps $unanswered whose sender is named after the failed launch's inputs came back",
+    async ({ savedAs, text, draft }) => {
+      vi.mocked(getCurrentUserId).mockReturnValue(null);
+      let identityChanged: (() => void) | undefined;
+      vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+        identityChanged = listener;
+        return () => {};
+      });
+      seedSession("conv_reload", []);
+      failManagedLaunch("conv_reload", "saved on server");
+      sessionFailedInputs.get("conv_reload")![0]!.item_id = savedAs;
+      rememberUnsentSend("conv_reload", { stableId: "stable_reload", text, authorId: "user_a" });
+
+      await useChatStore.getState().switchTo("conv_reload");
+      await vi.waitFor(() => expect(useChatStore.getState().returnedStartupInputs).toHaveLength(1));
+      vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+      identityChanged!();
+
+      expect(useChatStore.getState().failedSendDraft).toEqual({
+        conversationId: "conv_reload",
+        text: draft,
+        files: [],
+        startupInputIds: ["pending_first"],
+        recovered: true,
+      });
+      expect(peekUnsentSend("conv_reload")).toBeNull();
     },
   );
 

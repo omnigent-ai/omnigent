@@ -7738,7 +7738,7 @@ function unsentSendToRestore(
 /**
  * Finish a restore `unsentSendToRestore` put off until `/v1/me` names the viewer.
  * The bind has already painted, so the draft goes straight onto the session's
- * entry. Subscribing keeps a failed probe retrying.
+ * entry, after any draft already waiting there. Subscribing keeps a failed probe retrying.
  *
  * @param conversationId - The session whose bind put the restore off.
  * @param items - That bind's snapshot items.
@@ -7754,10 +7754,47 @@ function restoreUnsentSendOnceIdentified(
     if (isConversationDisposed(conversationId)) return;
     const draft = unsentSendToRestore(conversationId, items);
     if (draft === null) return;
-    setterFor(conversationId)((state) =>
-      state.failedSendDraft === null ? { failedSendDraft: draft } : {},
-    );
+    setterFor(conversationId)((state) => ({
+      failedSendDraft: joinFailedSendDrafts(state.failedSendDraft, draft),
+    }));
   });
+}
+
+/**
+ * One draft after another, as a new message: a joined resend can't reuse either's stable id.
+ *
+ * @param waiting - The draft the composer has yet to take, if any.
+ * @param later - The draft to add after it.
+ * @returns `later` itself when nothing is waiting.
+ */
+function joinFailedSendDrafts(
+  waiting: ConversationState["failedSendDraft"],
+  later: NonNullable<ConversationState["failedSendDraft"]>,
+): NonNullable<ConversationState["failedSendDraft"]> {
+  if (waiting === null) return later;
+  const joined = appendReplyDraft(
+    restoreReplyDraft(waiting.text, waiting.replyDraft),
+    restoreReplyDraft(later.text, later.replyDraft),
+  );
+  const replyDraft = snapshotReplyDraft(joined);
+  const startupInputIds = [
+    ...new Set([...(waiting.startupInputIds ?? []), ...(later.startupInputIds ?? [])]),
+  ];
+  return {
+    conversationId: waiting.conversationId,
+    text: serializeReplyDraft(joined),
+    files: waiting.files,
+    ...(replyDraft ? { replyDraft } : {}),
+    ...(startupInputIds.length > 0 ? { startupInputIds } : {}),
+    recovered: true,
+  };
+}
+
+/** Forget an unanswered send the server saved as a failed input; the read that names it hands it back. */
+function forgetUnsentSendSavedAsFailed(conversationId: string, inputs: FailedInput[]): void {
+  const unsent = peekUnsentSend(conversationId);
+  if (unsent !== null && inputs.some((input) => input.itemId === unsent.stableId))
+    forgetUnsentSend(conversationId, unsent.stableId);
 }
 
 /** A client notice whose Retry reads a failed launch's startup inputs again. */
@@ -7891,11 +7928,11 @@ function isStartupLookupNotice(block: AnyBlock): boolean {
   return block.type === "error" && block.code === STARTUP_INPUT_LOOKUP_FAILED_CODE;
 }
 
-/** A startup input's text, without its attachments. */
+/** A startup input's text, its blocks a line apart as the server joins them, without attachments. */
 function startupInputText(input: PendingInput): string {
   return input.content
     .flatMap((block) => (block.type === "input_text" ? [block.text] : []))
-    .join("");
+    .join("\n");
 }
 
 /** A notice naming the failed startup inputs' attachments, or `null` without any. */
@@ -7934,26 +7971,13 @@ function failedStartupDraft(
 ): ConversationState["failedSendDraft"] {
   const texts = inputs.map(startupInputText).filter((text) => text.trim() !== "");
   if (texts.length === 0) return waiting;
-  const text = texts.join("\n\n");
-  const startupInputIds = [
-    ...(waiting?.startupInputIds ?? []),
-    ...inputs.map((input) => input.pendingId),
-  ];
-  if (waiting === null)
-    return { conversationId, text, files: [], startupInputIds, recovered: true };
-  const joined = appendReplyDraft(restoreReplyDraft(waiting.text, waiting.replyDraft), {
-    quotes: [],
-    text,
-  });
-  const replyDraft = snapshotReplyDraft(joined);
-  return {
+  return joinFailedSendDrafts(waiting, {
     conversationId,
-    text: serializeReplyDraft(joined),
-    files: waiting.files,
-    ...(replyDraft ? { replyDraft } : {}),
-    startupInputIds,
+    text: texts.join("\n\n"),
+    files: [],
+    startupInputIds: inputs.map((input) => input.pendingId),
     recovered: true,
-  };
+  });
 }
 
 /** The viewer's sends whose bubble no server receipt has named, e.g. a managed session's first message. */
@@ -7997,13 +8021,15 @@ function withoutFailedStartupBubbles(
   });
 }
 
-/** The viewer's failed startup inputs; a server without the route has none. */
+/** The viewer's failed startup inputs, read to be handed back; a server without the route has none. */
 async function listFailedStartupInputs(
   conversationId: string,
   signal?: AbortSignal,
 ): Promise<FailedInput[]> {
   try {
-    return await listFailedInputs(conversationId, { signal });
+    const inputs = await listFailedInputs(conversationId, { signal });
+    forgetUnsentSendSavedAsFailed(conversationId, inputs);
+    return inputs;
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) return [];
     throw error;
