@@ -1376,6 +1376,11 @@ def test_changes_filter_copy_open(page: Page, seeded_session: tuple[str, str], e
     is_mobile = entry == "composer-mobile"
     pr_url = _INFO["pr"]["url"]
     _stub_github(page)
+    # The list reports the revisions it was fetched for, which Open links use.
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda route: route.fulfill(json={**_CHANGES, "head_sha": "head", "base_sha": "base"}),
+    )
     # Supply fork metadata and revisions for the Open-link assertion.
     page.route(
         re.compile(r"/resources/github(?:\?|$)"),

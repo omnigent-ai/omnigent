@@ -1095,6 +1095,44 @@ describe("PullRequestChangesTab file actions and filter", () => {
     expect(screen.getByRole("menuitem", { name: label })).toHaveAttribute("href", href);
   });
 
+  it("disables Open when the list reports no pinned revision, even with a polled head", () => {
+    const conversationId = "changes-tab-open-unpinned";
+    const props = tabProps(conversationId, { files: [changed("src/app.ts")] });
+    props.changes = {
+      ...props.changes,
+      data: { ...props.changes.data, head_sha: undefined, base_sha: undefined },
+    } as typeof props.changes;
+    render(tree(props));
+    openMenu("src/app.ts");
+    const disabled = screen.getByRole("menuitem", { name: /Open in GitHub/ });
+    expect(disabled).toHaveAttribute("data-disabled");
+    expect(disabled).toHaveTextContent("Revision unknown");
+    expect(disabled).not.toHaveAttribute("href");
+  });
+
+  it("disables Open for a deleted file when the list reports no base revision", () => {
+    const conversationId = "changes-tab-open-no-base";
+    const props = tabProps(conversationId, {
+      files: [{ ...changed("old.ts"), status: "deleted" }, changed("src/app.ts")],
+    });
+    props.changes = {
+      ...props.changes,
+      data: { ...props.changes.data, base_sha: undefined },
+    } as typeof props.changes;
+    render(tree(props));
+    openMenu("old.ts");
+    const disabled = screen.getByRole("menuitem", { name: /Open in GitHub/ });
+    expect(disabled).toHaveAttribute("data-disabled");
+    expect(disabled).toHaveTextContent("Revision unknown");
+    expect(disabled).not.toHaveAttribute("href");
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    openMenu("src/app.ts");
+    expect(screen.getByRole("menuitem", { name: /Open in GitHub/ })).toHaveAttribute(
+      "href",
+      `${FORK_URL}/blob/head/src/app.ts`,
+    );
+  });
+
   it("opens a deleted file at the base revision in the base repository", () => {
     const conversationId = "changes-tab-open-deleted";
     render(

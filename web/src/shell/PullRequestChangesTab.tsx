@@ -449,9 +449,10 @@ export function PullRequestChangesTab({
   const { revealedPaths, reveal, clearReveal, find } = view;
   // The filter input shows in the sidebar; while the sidebar is collapsed it opens inline.
   const [filterOpen, setFilterOpen] = useState(false);
-  // The revision the displayed list was fetched for; the header links use it, not a newer poll.
-  const renderedHeadSha = changes.data?.head_sha ?? headSha;
-  const renderedBaseSha = changes.data?.base_sha ?? baseSha;
+  // The revision the displayed list reports. Open uses only this pinned revision, so a newer
+  // poll never changes the link, and a list without one leaves Open disabled.
+  const renderedHeadSha = changes.data?.head_sha ?? null;
+  const renderedBaseSha = changes.data?.base_sha ?? null;
   const baseRepoUrl = pullRequestRepoUrl(data.provider, pr.url);
   const providerLabel = gitProviderCopy(data.provider, undefined, data.provider_display).label;
   const findInputRef = useRef<HTMLInputElement>(null);
