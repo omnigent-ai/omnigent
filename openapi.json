@@ -6247,6 +6247,11 @@
             "title": "Scheduled Task Session Modes",
             "type": "boolean"
           },
+          "scheduled_task_subhour": {
+            "default": true,
+            "title": "Scheduled Task Subhour",
+            "type": "boolean"
+          },
           "scheduled_task_worktrees": {
             "default": true,
             "title": "Scheduled Task Worktrees",

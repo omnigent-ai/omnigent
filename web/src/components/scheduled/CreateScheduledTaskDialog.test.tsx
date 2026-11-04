@@ -2160,10 +2160,17 @@ describe("shouldGuardDialogDismiss (backdrop click closes; dropdown-dismiss guar
 });
 
 describe("CreateScheduledTaskDialog session mode", () => {
-  function renderWithSessionModes(editingTask?: ScheduledTasksApiModule.ScheduledTask) {
+  function renderWithSessionModes(
+    editingTask?: ScheduledTasksApiModule.ScheduledTask,
+    extraInfo: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
+  ) {
     return render(
       <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          ...extraInfo,
+        }}
       >
         <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />
       </CapabilitiesProvider>,
@@ -2276,6 +2283,102 @@ describe("CreateScheduledTaskDialog session mode", () => {
     );
   });
 
+  it.each(["connected_host", "managed_sandbox"] as const)(
+    "preserves a minute schedule while changing target and session mode to %s",
+    async (target) => {
+      renderWithSessionModes(
+        scheduledTask({
+          sessionMode: "continue",
+          rrule: "FREQ=MINUTELY;INTERVAL=10",
+          executionTarget: "managed_sandbox",
+          hostId: null,
+          workspace: null,
+        }),
+        {
+          features: { automations_v2: true },
+          scheduled_task_subhour: true,
+          managed_sandboxes_enabled: true,
+        },
+      );
+      expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
+      fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "New session each run" }));
+      expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      expect(screen.getByTestId("schedule-error")).toHaveTextContent(
+        "New sandbox sessions require schedules of at least 60 minutes",
+      );
+      if (target === "connected_host") {
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+      } else {
+        chooseContinue();
+      }
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(input.rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
+      if (target === "connected_host") {
+        expect(input).toMatchObject({ sessionMode: "new", executionTarget: "connected_host" });
+      } else {
+        // Unchanged fields are omitted from PATCH, preserving sandbox/continue.
+        expect(input).not.toHaveProperty("sessionMode");
+        expect(input).not.toHaveProperty("executionTarget");
+      }
+    },
+  );
+
+  it.each([undefined, false, true])(
+    "negotiates minute schedules with subhour support %s",
+    async (supported) => {
+      renderWithSessionModes(
+        scheduledTask({ sessionMode: "continue", rrule: "FREQ=MINUTELY;INTERVAL=10" }),
+        {
+          features: { automations_v2: true },
+          ...(supported === undefined ? {} : { scheduled_task_subhour: supported }),
+        },
+      );
+      expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
+      const submit = screen.getByTestId("create-scheduled-task-submit");
+      if (supported) expect(submit).toBeEnabled();
+      else {
+        expect(submit).toBeDisabled();
+        expect(screen.getByTestId("schedule-error")).toHaveTextContent("at least 60 minutes");
+        fireEvent.click(submit);
+        expect(updateMutateAsync).not.toHaveBeenCalled();
+      }
+      fireEvent.click(screen.getByTestId("custom-schedule-trigger"));
+      fireEvent.keyDown(screen.getByTestId("custom-freq-trigger"), { key: "Enter" });
+      const minutes = await screen.findByRole("option", { name: "Minutes" });
+      if (supported) expect(minutes).not.toHaveAttribute("aria-disabled", "true");
+      else expect(minutes).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(screen.getByRole("option", { name: "Hours" }));
+      expect(screen.getByTestId("custom-interval")).toHaveValue(1);
+      fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+      fireEvent.click(submit);
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
+        "FREQ=HOURLY;INTERVAL=1;BYMINUTE=0",
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "offers Minutes on create only with subhour support %s",
+    async (supported) => {
+      renderWithSessionModes(undefined, {
+        features: { automations_v2: true },
+        scheduled_task_subhour: supported,
+      });
+      fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "Custom schedule" }));
+      fireEvent.keyDown(screen.getByTestId("custom-freq-trigger"), { key: "Enter" });
+      await screen.findByRole("option", { name: "Hours" });
+      expect(screen.queryByRole("option", { name: "Minutes" }) !== null).toBe(supported);
+    },
+  );
+
   it("offers no new-session option before the first run creates a session", () => {
     renderWithSessionModes(scheduledTask({ sessionMode: "continue" }));
     expect(screen.queryByTestId("task-start-new-session")).toBeNull();
@@ -2368,6 +2471,11 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       sandbox_providers: [provider],
     });
     const host = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(host);
+    fireEvent.click(screen.getByRole("option", { name: "laptop" }));
+    // On a connected host the agent may lack the tools, so the warning shows.
+    expect(screen.getByTestId("task-trigger-tools-note")).toBeInTheDocument();
     fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(host);
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
