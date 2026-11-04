@@ -1380,6 +1380,12 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     monkeypatch.setattr("omnigent.server.session_families._FAMILY_GRANT_BATCH_SIZE", 2)
     list_grants = SqlAlchemyPermissionStore.list_for_sessions
     grant_sizes = []
+    is_admin = SqlAlchemyPermissionStore.is_admin
+    admin_checks = []
+
+    def counted_is_admin(self, user_id):
+        admin_checks.append(user_id)
+        return is_admin(self, user_id)
 
     def bounded_grants(self, ids, *, user_id=None):
         grant_sizes.append(len(ids))
@@ -1387,6 +1393,7 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
         return list_grants(self, ids, user_id=user_id)
 
     monkeypatch.setattr(SqlAlchemyPermissionStore, "list_for_sessions", bounded_grants)
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "is_admin", counted_is_admin)
     expanded = await auth_client.get("/v1/sessions", params={"expand_families": True})
     assert expanded.status_code == 200, expanded.text
     assert {row["id"] for row in expanded.json()["data"]} == {
@@ -1396,6 +1403,7 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
         from_side.json()["id"],
     }
     assert grant_sizes.count(2) >= 3
+    assert admin_checks == ["alice"]
     permissions.grant("reader", source["id"], LEVEL_EDIT)
     response = await auth_client.post(
         "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}

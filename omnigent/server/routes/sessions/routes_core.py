@@ -2203,6 +2203,11 @@ def register_core_routes(
             archived_only=archived_only_param,
         )
         items: list[SessionListItem] = []
+        user_is_admin = (
+            await asyncio.to_thread(permission_store.is_admin, user_id)
+            if page.data and permission_store is not None and user_id is not None
+            else False
+        )
         # Expanded families can contain many more rows than the source page.
         for list_batch in batched(page.data, _SESSION_LIST_BATCH_SIZE):
             # list_conversations may return rows with agent_id=None for
@@ -2223,11 +2228,6 @@ def register_core_routes(
                         conv_ids,
                     ),
                 )
-                user_is_admin = (
-                    await asyncio.to_thread(permission_store.is_admin, user_id)
-                    if user_id is not None
-                    else False
-                )
             else:
                 agent_metadata, child_ids_by_parent = await asyncio.gather(
                     asyncio.to_thread(_session_agent_metadata, list_batch),
@@ -2237,7 +2237,6 @@ def register_core_routes(
                     ),
                 )
                 perms_by_conv = {}
-                user_is_admin = False
             agent_names_by_id, harnesses_by_id = agent_metadata
             # In-memory lookup — no I/O, so batching avoids re-acquiring
             # the index's lock per row but otherwise has no DB cost.
