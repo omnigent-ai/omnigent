@@ -250,6 +250,42 @@ describe("McpSignInDialog", () => {
     expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(0);
   });
 
+  it.each([
+    [
+      "the dialog closed",
+      async (view: ReturnType<typeof render>) => {
+        on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
+        view.rerender(<McpSignInDialog {...props} open={false} />);
+        await act(async () => {});
+      },
+      0,
+    ],
+    ["another host was chosen", switchToSecondHost, 1],
+  ] as const)("ignores the reply to a pasted address once %s", async (_, leave, links) => {
+    on("POST", BASE, () => json(login()));
+    const view = await renderDialog();
+    let respond: (response: Response) => void = () => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          respond = resolve;
+        }),
+    );
+    fireEvent.change(screen.getByLabelText(/paste it here/), {
+      target: { value: "http://localhost:9/callback?code=c&state=s" },
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Finish" })));
+
+    await leave(view);
+    await act(async () => respond(json(login({ state: "succeeded", authorization_url: null }))));
+    await tick();
+
+    expect(props.onSignedIn).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryAllByRole("link", { name: /Open sign-in page/ })).toHaveLength(links);
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(1);
+  });
+
   it("shows why the sign-in ended and starts a fresh one on retry", async () => {
     on(
       "POST",
