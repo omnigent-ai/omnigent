@@ -660,9 +660,11 @@ Other connection providers alone do not enable the managed MCP picker.
   Claude Code native `/rewind` is covered at the process boundary by
   `tests/e2e/test_host_claude_native_fork_e2e.py::test_rewind_claude_native_resumes_only_the_earlier_history`
   (and `::test_rewind_claude_sdk_keeps_only_the_earlier_turns`). The typed
-  full command, the fallback to text or a custom command, older-prompt
-  loading, and a prompt that arrives after the redirect are component-covered
-  in `web/src/pages/ChatPage.composer.test.tsx`. Manually, repeat both entry
+  full command, the fallback to text or a custom command, and a prompt that
+  arrives after the redirect are component-covered in
+  `web/src/pages/ChatPage.composer.test.tsx`; the picker's older-prompt
+  loading, retry and stale replies in `web/src/components/RewindPicker.test.tsx`.
+  Manually, repeat both entry
   routes (menu click; whole command plus Enter) for SDK `/clear`, SDK
   `/rewind` and native `/rewind`, and rewind to a prompt with an attachment.
 - **`slash-menu`:**
