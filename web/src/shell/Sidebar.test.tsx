@@ -3935,7 +3935,7 @@ describe("Sidebar view options", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
     const banana = conv("conv_banana", "Codex", { created_at: 2, updated_at: 20 });
     mockConversations([conv("conv_apple", "Codex", { created_at: 1, updated_at: 10 }), banana]);
-    renderGroupingSidebar();
+    const view = renderGroupingSidebar();
     const saved = () => JSON.parse(localStorage.getItem("omnigent:sidebar-view")!);
     const rowTitles = () =>
       within(groupSection("Sessions"))
@@ -3950,6 +3950,17 @@ describe("Sidebar view options", () => {
     expect(rowTitles()).toEqual(["conv_zulu", "conv_banana"]);
     expect(saved().ordering).toBe("custom");
     expect(saved()).not.toHaveProperty("custom");
+
+    // A reload before the first move keeps Custom selected.
+    view.unmount();
+    renderGroupingSidebar();
+    expect(rowTitles()).toEqual(["conv_zulu", "conv_banana"]);
+    openViewSubmenu("session-ordering-menu");
+    expect(screen.getByRole("menuitemradio", { name: "Custom" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
 
     // The first move saves positions from the Updated rows on screen.
     const zulu = screen.getByRole("link", { name: "conv_zulu" }).closest("li")!;

@@ -68,10 +68,16 @@ describe("sidebarViewPreferences", () => {
     expect(readSidebarViewPreferences()).toEqual(DEFAULT_SIDEBAR_VIEW);
   });
 
-  it("round-trips a Custom order and drops a malformed one", () => {
+  it("round-trips a Custom order, with or without positions, and drops a malformed one", () => {
     const custom = { base: "created", since: 100, ids: ["b", "a"] } as const;
     writeSidebarViewPreferences({ grouping: "status", ordering: "custom", show: [], custom });
     expect(readSidebarViewPreferences()).toMatchObject({ ordering: "custom", custom });
+    writeSidebarViewPreferences({ grouping: "status", ordering: "custom", show: [] });
+    expect(readSidebarViewPreferences()).toEqual({
+      grouping: "status",
+      ordering: "custom",
+      show: [],
+    });
 
     localStorage.setItem(
       "omnigent:sidebar-view",

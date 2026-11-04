@@ -73,9 +73,11 @@ export function readSidebarViewPreferences(): SidebarViewPreferences {
   const show = Array.isArray(stored.show) ? stored.show : [];
   const custom = parseCustomOrder(stored.custom);
   const ordering = pick(SIDEBAR_ORDERINGS, stored.ordering, DEFAULT_SIDEBAR_VIEW.ordering);
+  // Custom with no positions yet saves them on its first move; malformed ones fall back.
+  const malformedCustom = stored.custom !== undefined && !custom;
   return {
     grouping: pick(SIDEBAR_GROUPINGS, stored.grouping, DEFAULT_SIDEBAR_VIEW.grouping),
-    ordering: ordering === "custom" && !custom ? DEFAULT_SIDEBAR_VIEW.ordering : ordering,
+    ordering: ordering === "custom" && malformedCustom ? DEFAULT_SIDEBAR_VIEW.ordering : ordering,
     // Keep the menu's field order so equal selections compare equal.
     show: SIDEBAR_SHOW_FIELDS.filter((field) => show.includes(field)),
     ...(custom && { custom }),
