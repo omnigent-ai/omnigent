@@ -31,6 +31,7 @@ from tests.server.integration._session_continuation import (
     _RUNNER_ID,
     LiveRunner,
     create_placed_session,
+    install_managed_sandbox,
     message_texts,
     resolve_harness_as,
 )
@@ -105,6 +106,90 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     notice = message_texts(store, source_id)[-1]
     assert "/rewind" in notice and f"(/c/{new_id})" in notice
     assert live_runner.superseded == [(source_id, new_id, "rewind")]
+
+
+async def test_rewind_refuses_a_message_sent_while_it_moves_the_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message sent while the rewound session is being set up is refused.
+
+    Rewind frees no client first, so the window is the new session's setup on
+    the runner. The message would otherwise run in the original chat while
+    viewers follow the rewound one.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    sent: list[httpx.Response] = []
+
+    async def send_from_another_tab() -> None:
+        live_runner.on_session_init = None
+        sent.append(
+            await client.post(
+                f"/v1/sessions/{source_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "Q3"}]},
+                },
+            )
+        )
+
+    live_runner.on_session_init = send_from_another_tab
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/rewind", json={"item_id": item_ids(store, source_id)[2]}
+    )
+
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["session_id"]
+    assert [response.status_code for response in sent] == [409], sent[0].text
+    assert "moving to a new session" in sent[0].text
+    assert [body for _path, body in live_runner.posts if body.get("type") == "message"] == []
+    assert "Q3" not in message_texts(store, source_id)
+    assert live_runner.superseded == [(source_id, new_id, "rewind")]
+
+
+@pytest.mark.parametrize("deleted_first", ["original", "rewound"])
+async def test_deleting_one_side_of_a_rewind_keeps_their_shared_sandbox(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    deleted_first: str,
+) -> None:
+    """The original and the rewound chat work in one managed sandbox.
+
+    Deleting either leaves the other bound to the host and the sandbox
+    running; deleting the last one tears the sandbox down.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    host_store, launcher = install_managed_sandbox(app, db_uri, monkeypatch, "sb-rewind")
+    source_id = await create_placed_session(client, store)
+    rewound = await client.post(
+        f"/v1/sessions/{source_id}/rewind", json={"item_id": item_ids(store, source_id)[2]}
+    )
+    assert rewound.status_code == 200, rewound.text
+    new_id = rewound.json()["session_id"]
+    first, last = (source_id, new_id) if deleted_first == "original" else (new_id, source_id)
+
+    deleted = await client.delete(f"/v1/sessions/{first}")
+
+    assert deleted.status_code == 200, deleted.text
+    survivor = store.get_conversation(last)
+    assert survivor is not None and survivor.host_id == _HOST_ID
+    assert host_store.get_host(_HOST_ID) is not None
+    assert launcher.terminated == []
+
+    deleted = await client.delete(f"/v1/sessions/{last}")
+
+    assert deleted.status_code == 200, deleted.text
+    assert launcher.terminated == ["sb-rewind"]
+    assert host_store.get_host(_HOST_ID) is None
 
 
 @pytest.mark.parametrize(
