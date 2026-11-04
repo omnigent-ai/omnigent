@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -700,6 +701,81 @@ async def test_call_tool_keeps_reply_that_arrives_after_server_reconnect() -> No
         pending_approvals.reset_for_tests()
 
     assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "execution_finished_first",
+    [True, False],
+    ids=["finished-before-reconnect", "running-at-reconnect"],
+)
+@pytest.mark.parametrize("reply_arrives", [True, False], ids=["reply-before-deadline", "no-reply"])
+async def test_reply_grace_starts_after_reconnect_and_runner_result(
+    monkeypatch: pytest.MonkeyPatch,
+    execution_finished_first: bool,
+    reply_arrives: bool,
+) -> None:
+    """The 30 s grace starts once both the reconnect and the runner's result have happened."""
+    from omnigent.runner import proxy_mcp_manager
+
+    grace_delays: list[float] = []
+    grace_started = asyncio.Event()
+    grace_elapsed = asyncio.Event()
+
+    async def _grace_sleep(delay: float) -> None:
+        grace_delays.append(delay)
+        grace_started.set()
+        await grace_elapsed.wait()
+
+    asyncio_facade = SimpleNamespace(**vars(asyncio))
+    asyncio_facade.sleep = _grace_sleep
+    monkeypatch.setattr(proxy_mcp_manager, "asyncio", asyncio_facade)
+
+    result_checked = asyncio.Event()
+    execution_finished = asyncio.Event()
+    if execution_finished_first:
+        execution_finished.set()
+
+    async def _runner_holds_final_result() -> bool:
+        result_checked.set()
+        await execution_finished.wait()
+        return True
+
+    reply: asyncio.Future[httpx.Response] = asyncio.get_running_loop().create_future()
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(
+        proxy_mcp_manager._reply_unless_server_replaced(
+            reply, pending_approvals.current_server_generation(), _runner_holds_final_result
+        )
+    )
+    try:
+        await poll_until_async(
+            lambda: bool(pending_approvals._server_reconnect_waiters) or grace_started.is_set()
+        )
+        assert not result_checked.is_set()
+        assert not grace_started.is_set()
+
+        pending_approvals.notify_server_reconnect()
+        await asyncio.wait_for(result_checked.wait(), timeout=5.0)
+        if not execution_finished_first:
+            assert not grace_started.is_set()
+            execution_finished.set()
+        await asyncio.wait_for(grace_started.wait(), timeout=5.0)
+        assert grace_delays == [30.0]
+        assert not task.done()
+
+        if reply_arrives:
+            reply.set_result(httpx.Response(200, text="original"))
+            response = await asyncio.wait_for(task, timeout=5.0)
+            assert response is not None
+            assert response.text == "original"
+        else:
+            grace_elapsed.set()
+            assert await asyncio.wait_for(task, timeout=5.0) is None
+    finally:
+        if not task.done():
+            task.cancel()
+        pending_approvals.reset_for_tests()
 
 
 @pytest.mark.asyncio

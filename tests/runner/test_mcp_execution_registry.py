@@ -136,3 +136,80 @@ async def test_reattach_rejects_changed_execution_parameters() -> None:
         )
 
     assert invocations == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["failed", "session-cancelled"])
+async def test_step_observer_returns_none_when_execution_ends_without_result(ending: str) -> None:
+    """An observer of a running step gets no result when the step fails or is cancelled."""
+    registry = McpExecutionRegistry()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _failing_work() -> McpExecutionResult:
+        started.set()
+        await release.wait()
+        raise RuntimeError("tool failed")
+
+    assert await registry.wait_for_step_result("conv_restart", "mcpop_restart", "initial") is None
+    execution = asyncio.create_task(
+        registry.execute(
+            session_id="conv_restart",
+            operation_id="mcpop_restart",
+            step="initial",
+            params={},
+            run=_failing_work,
+        )
+    )
+    await started.wait()
+    observer = asyncio.create_task(
+        registry.wait_for_step_result("conv_restart", "mcpop_restart", "initial")
+    )
+    done, _pending = await asyncio.wait({observer}, timeout=0.05)
+    assert not done
+
+    if ending == "failed":
+        release.set()
+    else:
+        await registry.cancel_session("conv_restart")
+
+    assert await asyncio.wait_for(observer, timeout=5.0) is None
+    with pytest.raises(RuntimeError if ending == "failed" else asyncio.CancelledError):
+        await execution
+
+
+@pytest.mark.asyncio
+async def test_cancelled_step_observer_leaves_execution_running() -> None:
+    """Cancelling a step observer must not cancel the execution it waits on."""
+    registry = McpExecutionRegistry()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    result = McpExecutionResult(status_code=200, content={"result": {"output": "done"}})
+
+    async def _external_work() -> McpExecutionResult:
+        started.set()
+        await release.wait()
+        return result
+
+    execution = asyncio.create_task(
+        registry.execute(
+            session_id="conv_restart",
+            operation_id="mcpop_restart",
+            step="initial",
+            params={},
+            run=_external_work,
+        )
+    )
+    await started.wait()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            registry.wait_for_step_result("conv_restart", "mcpop_restart", "initial"),
+            timeout=0.05,
+        )
+
+    assert not execution.done()
+    release.set()
+    assert await asyncio.wait_for(execution, timeout=5.0) == result
+    assert (
+        await registry.wait_for_step_result("conv_restart", "mcpop_restart", "initial") == result
+    )
