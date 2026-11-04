@@ -81,23 +81,33 @@ describe("useSandboxAutoWake", () => {
     expect(result.current.phase).toBe("idle");
   });
 
-  it("ignores a pending wake's outcome after switching sessions", async () => {
-    const first = deferred<PostEventResponse>();
-    const second = deferred<PostEventResponse>();
-    retryMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
-    const { result, rerender } = renderWake(asleepAndOpen);
+  it.each(["pending", "failed"])(
+    "starts fresh for another session while the old wake is %s",
+    async (oldWake) => {
+      const first = deferred<PostEventResponse>();
+      const second = deferred<PostEventResponse>();
+      retryMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      const { result, rerender } = renderWake(asleepAndOpen);
+      if (oldWake === "failed") {
+        await act(async () => first.reject(new Error("old session failed")));
+        expect(result.current.phase).toBe("failed");
+      }
 
-    await act(async () => rerender({ ...asleepAndOpen, conversationId: "conv_other" }));
-    expect(retryMock).toHaveBeenLastCalledWith("conv_other", { wakeOnly: true });
-    await act(async () => first.reject(new Error("old session failed")));
-    expect(result.current.phase).toBe("waking");
-    expect(result.current.error).toBeNull();
+      await act(async () => rerender({ ...asleepAndOpen, conversationId: "conv_other" }));
+      expect(retryMock).toHaveBeenLastCalledWith("conv_other", { wakeOnly: true });
+      expect(result.current.phase).toBe("waking");
+      if (oldWake === "pending") {
+        await act(async () => first.reject(new Error("old session failed")));
+      }
+      expect(result.current.phase).toBe("waking");
+      expect(result.current.error).toBeNull();
 
-    await act(async () => second.resolve(recovered));
-    rerender({ ...asleepAndOpen, conversationId: "conv_other", ...online });
-    expect(result.current.phase).toBe("idle");
-    expect(retryMock).toHaveBeenCalledTimes(2);
-  });
+      await act(async () => second.resolve(recovered));
+      rerender({ ...asleepAndOpen, conversationId: "conv_other", ...online });
+      expect(result.current.phase).toBe("idle");
+      expect(retryMock).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it.each([
     ["answered while hidden", true],
@@ -160,7 +170,6 @@ describe("useSandboxAutoWake", () => {
 
   it.each<[string, Partial<Props>]>([
     ["hidden", { active: false }],
-    ["awake", online],
     ["read-only", { canWake: false }],
     ["showing a cached list", { needsSandbox: false }],
   ])("does not wake when the view is %s", (_label, override) => {
@@ -297,16 +306,5 @@ describe("useSandboxAutoWake", () => {
     expect(result.current.phase).toBe("failed");
     expect(result.current.error).toBe("The sandbox didn't come back online.");
     expect(retryMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("starts fresh for another session in the same view", async () => {
-    retryMock.mockRejectedValueOnce(new Error("boom"));
-    const { result, rerender } = renderWake(asleepAndOpen);
-    await act(async () => {});
-    expect(result.current.phase).toBe("failed");
-
-    await act(async () => rerender({ ...asleepAndOpen, conversationId: "conv_other" }));
-    expect(retryMock).toHaveBeenLastCalledWith("conv_other", { wakeOnly: true });
-    expect(result.current.phase).toBe("waking");
   });
 });

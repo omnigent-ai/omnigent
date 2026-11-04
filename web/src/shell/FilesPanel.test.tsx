@@ -544,14 +544,38 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(retrySessionMock).toHaveBeenCalledTimes(1);
   });
 
-  it("does not wake while the session is still loading", () => {
-    vi.mocked(useSession).mockReturnValue({ session: undefined } as unknown as ReturnType<
-      typeof useSession
-    >);
+  it.each([
+    [
+      "the session to load",
+      () =>
+        vi
+          .mocked(useSession)
+          .mockReturnValue({ session: undefined } as unknown as ReturnType<typeof useSession>),
+    ],
+    [
+      "the capability probe",
+      () => {
+        serverInfo = "loading";
+      },
+    ],
+  ])("waits for %s, then wakes the open panel once", async (_label, startLoading) => {
+    startLoading();
     useAsleepMock.mockReturnValue(true);
-    renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
-
+    const { rerender } = renderPanel({
+      conversationId: "conv_asleep",
+      files: [],
+      listsLoaded: false,
+    });
     expect(retrySessionMock).not.toHaveBeenCalled();
+
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: LEVEL_EDIT },
+    } as unknown as ReturnType<typeof useSession>);
+    serverInfo = WAKE_CAPABLE_INFO;
+    await act(async () => rerender(panelAt("conv_asleep")));
+    await act(async () => rerender(panelAt("conv_asleep")));
+    expect(retrySessionMock).toHaveBeenCalledTimes(1);
+    expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
   });
 
   it("does not wake the sandbox from a hidden panel, but offers to start it", async () => {
