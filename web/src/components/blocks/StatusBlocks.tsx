@@ -38,7 +38,7 @@ import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
-import { useChatStore } from "@/store/chatStore";
+import { STARTUP_INPUT_LOOKUP_FAILED_CODE, useChatStore } from "@/store/chatStore";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
 import {
@@ -126,6 +126,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "rate_limit_exceeded",
   "transient_upstream_error",
   "connection_error",
+  STARTUP_INPUT_LOOKUP_FAILED_CODE,
 ]);
 
 // Failed turns the runner itself survived: the session is healthy, so retry
@@ -376,8 +377,10 @@ export function ErrorBanner({
     ...relatedErrors,
   ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
   const retryable = !workspaceMissing && onRetry !== undefined && actionableError !== undefined;
+  // Retrying a startup-input lookup reads the messages again and leaves the session alone.
+  const lookupRetry = actionableError?.code === STARTUP_INPUT_LOOKUP_FAILED_CODE;
   const retryLabel =
-    actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code)
+    lookupRetry || (actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code))
       ? "Retry"
       : "Resume session";
 
@@ -414,7 +417,9 @@ export function ErrorBanner({
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
           <Loader2Icon aria-hidden="true" className="animate-spin" />
-          {actionableError?.code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
+          {lookupRetry || actionableError?.code === "rate_limit_exceeded"
+            ? "Retrying"
+            : "Reconnecting"}
         </Badge>
       </div>
     );

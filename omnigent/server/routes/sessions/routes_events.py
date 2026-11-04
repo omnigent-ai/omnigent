@@ -296,7 +296,7 @@ from omnigent.server.schemas import (
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
-from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
+from omnigent.server.startup_inputs import STARTUP_LABEL, StartupDispatch, StartupInputContext
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
@@ -1455,15 +1455,18 @@ def register_events_routes(
             await validate_saved_selection(cast("Request", request), conv, conv.model_override)
 
         startup = getattr(request.app.state, "startup_inputs", None)
-        if (
+        startup_input = (
             not isinstance(request, (StartupInputContext, _RunnerEventContext))
             and startup is not None
             and (
                 (body.type == "message" and body.data.get("role") == "user")
                 or (body.type == _SLASH_COMMAND_TYPE and body.data.get("kind") == "skill")
             )
-            and await startup.accepts(conv, request.app)
-        ):
+        )
+        if startup_input and not peer_message and conv.labels.get(STARTUP_LABEL) == "failed":
+            # The sender resends what the failed launch handed back to their composer.
+            await startup.discard_failed(session_id, user_id)
+        if startup_input and await startup.accepts(conv, request.app):
             if peer_message:
                 await asyncio.to_thread(
                     require_orchestration_source,

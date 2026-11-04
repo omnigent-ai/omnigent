@@ -289,23 +289,43 @@ class ManagedStartupInputs:
         ]
 
     async def failed_page(
-        self, conv: Conversation, viewer_id: str | None, *, after: int | None, limit: int
-    ) -> tuple[list[dict[str, Any]], int | None]:
+        self, conv: Conversation, viewer_id: str | None, *, after: str | None, limit: int
+    ) -> tuple[list[dict[str, Any]], str | None]:
         """The viewer's messages a failed launch couldn't deliver, until a runner is bound.
 
+        Pages follow item ids, so each entry carries its submission ``position``.
         Each page reads at most ``limit`` saved inputs, so it can hold fewer
         than ``limit`` of the viewer's while a continuation remains.
         """
         if conv.labels.get(STARTUP_LABEL) != "failed" or conv.runner_id is not None:
             return [], None
-        items, next_position = await asyncio.to_thread(
-            self.conversations.list_pending_inputs_page, conv.id, after=after, limit=limit
+        items, cursor = await asyncio.to_thread(
+            self.conversations.list_pending_inputs_by_id, conv.id, after=after, limit=limit
         )
         return [
-            _snapshot_entry(conv.id, item)
-            for item in items
+            {**_snapshot_entry(conv.id, item), "position": position}
+            for item, position in items
             if item.status == "failed" and item.created_by == viewer_id
-        ], next_position
+        ], cursor
+
+    async def discard_failed(self, session_id: str, viewer_id: str | None) -> None:
+        """Drop the viewer's undelivered inputs when they send again, so none returns twice."""
+        after: str | None = None
+        while True:
+            items, after = await asyncio.to_thread(
+                self.conversations.list_pending_inputs_by_id, session_id, after=after
+            )
+            for item, _position in items:
+                if item.status == "failed" and item.created_by == viewer_id:
+                    await asyncio.to_thread(
+                        self.conversations.transition_pending_input,
+                        session_id,
+                        item.id,
+                        expected="failed",
+                        status=None,
+                    )
+            if after is None:
+                return
 
     def host_changed(self, app: Any, host_id: str) -> None:
         key = (current_workspace_id(), host_id)

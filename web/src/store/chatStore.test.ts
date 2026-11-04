@@ -26,6 +26,7 @@ import type {
   AnyBlock,
   ElicitationBlock,
   ErrorBlock,
+  MessageContentBlock,
   NativeToolBlock,
   TextDone,
   ToolGroup,
@@ -88,6 +89,8 @@ import {
   committedItemProvesDelivery,
   takeFailedSendDraft,
   restoredSendDraftUnchanged,
+  retryFailedStartupLookup,
+  STARTUP_INPUT_LOOKUP_FAILED_CODE,
   consumePendingInitialPrompt,
   handleSessionEvent,
   hydrateLocalConversation,
@@ -362,8 +365,9 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
   }
   const failedInputsMatch = path.match(/^\/v1\/sessions\/([^/]+)\/failed-inputs$/);
   if (failedInputsMatch && (init?.method ?? "GET") === "GET") {
+    const inputs = sessionFailedInputs.get(failedInputsMatch[1]!) ?? [];
     return mockResponse({
-      data: sessionFailedInputs.get(failedInputsMatch[1]!) ?? [],
+      data: inputs.map((failedInput, position) => ({ ...failedInput, position })),
       next_cursor: null,
     });
   }
@@ -3705,6 +3709,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       );
       await settle();
       expect(useChatStore.getState().startupPending).toBe(true);
+      // Another participant sent the same text; only the viewer's input failed.
+      const content = [{ type: "input_text" as const, text: "saved on server" }];
+      seedPendingInputs("conv_real", [{ pending_id: "pending_bob", content, created_by: "bob" }]);
+      const othersBubble: PendingUserMessage = { tempId: "pending_bob", content, author: "bob" };
+      useChatStore.setState((state) => ({
+        pendingUserMessages: [othersBubble, ...state.pendingUserMessages],
+      }));
 
       failManagedLaunch("conv_real", "saved on server");
       handleSessionEvent(
@@ -3719,9 +3730,11 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
         conversationId: "conv_real",
         text: "saved on server",
         files: [],
+        startupInputIds: ["pending_first"],
         recovered: true,
       });
-      expect(state.pendingUserMessages).toEqual([]);
+      // A non-native failure clears every bubble; a native one keeps the others'.
+      expect(state.pendingUserMessages).toEqual(native ? [othersBubble] : []);
       expect(state.startupPending).toBe(false);
       const posts = fetchMock.mock.calls.filter(
         ([u, init]) => String(u).endsWith("/events") && init?.method === "POST",
@@ -3730,45 +3743,81 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
-  it("keeps the bubble of a failed startup input with no text to hand back", async () => {
-    seedSession("conv_real");
-    // A native session's failure leaves its pending bubbles to their own reconciliation.
-    const native = { "omnigent.wrapper": "claude-code-native-ui" };
-    sessionLabels.set("conv_real", { "omnigent.startup": "pending", ...native });
-    await useChatStore.getState().switchTo("conv_real");
-    const image: PendingUserMessage = {
-      tempId: "tmp_image",
-      content: [{ type: "input_image", file_id: "file_chart" }],
-      posted: true,
-    };
-    useChatStore.setState({
-      pendingUserMessages: [
-        image,
-        { tempId: "tmp_text", content: [{ type: "input_text", text: "explain it" }], posted: true },
+  it.each([
+    {
+      sent: "text and an image",
+      content: [
+        { type: "input_text", text: "explain this chart" },
+        { type: "input_image", file_id: "file_chart", filename: "chart.png" },
       ],
-    });
+      draft: "explain this chart",
+      title: "An attachment wasn't restored",
+      message: "Attach chart.png again before you resend.",
+    },
+    {
+      sent: "an image alone",
+      content: [{ type: "input_image", file_id: "file_chart" }],
+      draft: null,
+      title: "An attachment wasn't restored",
+      message: "Attach an image again before you resend.",
+    },
+    {
+      sent: "text and two attachments",
+      content: [
+        { type: "input_text", text: "compare these" },
+        { type: "input_image", file_id: "file_chart", filename: "chart.png" },
+        { type: "input_file", file_id: "file_notes", filename: "notes.pdf" },
+      ],
+      draft: "compare these",
+      title: "Attachments weren't restored",
+      message: "Attach chart.png and notes.pdf again before you resend.",
+    },
+  ] satisfies {
+    sent: string;
+    content: MessageContentBlock[];
+    draft: string | null;
+    title: string;
+    message: string;
+  }[])(
+    "hands back a failed launch's first input of $sent, naming its attachments",
+    async ({ content, draft, title, message }) => {
+      seedSession("conv_real");
+      // A native session's failure leaves its pending bubbles to their own reconciliation.
+      const native = { "omnigent.wrapper": "claude-code-native-ui" };
+      sessionLabels.set("conv_real", { "omnigent.startup": "pending", ...native });
+      await useChatStore.getState().switchTo("conv_real");
+      useChatStore.setState({
+        pendingUserMessages: [{ tempId: "tmp_first", content, posted: true }],
+      });
 
-    sessionLabels.set("conv_real", { "omnigent.startup": "failed", ...native });
-    sessionFailedInputs.set("conv_real", [
-      { pending_id: "pending_image", content: [{ type: "input_image", file_id: "file_chart" }] },
-      { pending_id: "pending_text", content: [{ type: "input_text", text: "explain it" }] },
-    ]);
-    handleSessionEvent(
-      { type: "session_status", conversationId: "conv_real", status: "failed" },
-      "conv_real",
-    );
-    await settle();
+      sessionLabels.set("conv_real", { "omnigent.startup": "failed", ...native });
+      sessionFailedInputs.set("conv_real", [{ pending_id: "pending_first", content }]);
+      handleSessionEvent(
+        { type: "session_status", conversationId: "conv_real", status: "failed" },
+        "conv_real",
+      );
+      await settle();
 
-    const state = useChatStore.getState();
-    expect(state.returnedStartupInputs).toEqual(["pending_text"]);
-    expect(state.pendingUserMessages).toEqual([image]);
-    expect(state.failedSendDraft).toEqual({
-      conversationId: "conv_real",
-      text: "explain it",
-      files: [],
-      recovered: true,
-    });
-  });
+      const state = useChatStore.getState();
+      expect(state.returnedStartupInputs).toEqual(["pending_first"]);
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.failedSendDraft).toEqual(
+        draft === null
+          ? null
+          : {
+              conversationId: "conv_real",
+              text: draft,
+              files: [],
+              startupInputIds: ["pending_first"],
+              recovered: true,
+            },
+      );
+      const notices = state.blocks.filter(
+        (block) => block.type === "error" && block.level === "info",
+      );
+      expect(notices).toEqual([expect.objectContaining({ title, message })]);
+    },
+  );
 
   it("reopening a session whose managed launch failed offers its first input for resending", async () => {
     seedSession("conv_real");
@@ -3781,25 +3830,159 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       conversationId: "conv_real",
       text: "saved on server",
       files: [],
+      startupInputIds: ["pending_first"],
       recovered: true,
     });
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 
+  it("leaves out the failed startup inputs a reloaded draft already holds", async () => {
+    onTestFinished(clearSessionDrafts);
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+    sessionFailedInputs
+      .get("conv_real")!
+      .push({ pending_id: "pending_second", content: [{ type: "input_text", text: "and this" }] });
+    // The page before the reload took the first input into the draft it saved.
+    setSessionDraft("conv_real", {
+      text: "saved on server, edited",
+      files: [],
+      startupInputIds: ["pending_first"],
+    });
+
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_real",
+      text: "and this",
+      files: [],
+      startupInputIds: ["pending_second"],
+      recovered: true,
+    });
+  });
+
+  it("keeps only the resend in the composer when it is refused after the failed launch", async () => {
+    onTestFinished(clearSessionDrafts);
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+
+    expect(takeFailedSendDraft("conv_real", false, true)?.text).toBe("saved on server");
+    expect(getSessionDraft("conv_real")).toEqual({
+      text: "saved on server",
+      files: [],
+      startupInputIds: ["pending_first"],
+    });
+
+    // Sending empties the composer; the server drops the failed input, and no runner takes the resend.
+    setSessionDraft("conv_real", { text: "", files: [] });
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_real/events") && init?.method === "POST") {
+        sessionFailedInputs.delete("conv_real");
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: "No runner bound for session" } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("saved on server, edited", "agent_xyz");
+
+    const failed = useChatStore.getState().failedSendDraft;
+    expect(failed).toMatchObject({ text: "saved on server, edited", serverRefused: true });
+    expect(failed?.startupInputIds).toBeUndefined();
+    expect(getSessionDraft("conv_real")).toBeUndefined();
+  });
+
+  it("offers Retry when a failed launch's startup inputs can't be read back", async () => {
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+    let unreadable = true;
+    fetchMock.mockImplementation((input, init) =>
+      unreadable && String(input) === "/v1/sessions/conv_real/failed-inputs"
+        ? mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 })
+        : defaultFetchHandler(input, init),
+    );
+    const lookupNotices = () =>
+      useChatStore
+        .getState()
+        .blocks.filter(
+          (block) => block.type === "error" && block.code === STARTUP_INPUT_LOOKUP_FAILED_CODE,
+        );
+
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+
+    const reads = fetchMock.mock.calls.filter(([u]) => String(u).endsWith("/failed-inputs"));
+    expect(reads).toHaveLength(2);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(lookupNotices()).toEqual([
+      expect.objectContaining({ title: "Couldn't return your unsent messages" }),
+    ]);
+
+    await expect(retryFailedStartupLookup("conv_real")).rejects.toThrow();
+    expect(lookupNotices()).toHaveLength(1);
+
+    unreadable = false;
+    await retryFailedStartupLookup("conv_real");
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_real",
+      text: "saved on server",
+      files: [],
+      startupInputIds: ["pending_first"],
+      recovered: true,
+    });
+    expect(lookupNotices()).toEqual([]);
+  });
+
+  it("drops startup inputs read for a conversation that was reopened during the read", async () => {
+    seedSession("conv_real");
+    seedSession("conv_other");
+    failManagedLaunch("conv_real", "saved on server");
+    let answer: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      if (answer !== undefined || String(input) !== "/v1/sessions/conv_real/failed-inputs")
+        return defaultFetchHandler(input, init);
+      const response = defaultFetchHandler(input, init);
+      return new Promise<Response>((resolve) => {
+        answer = () => resolve(response);
+      });
+    });
+    await useChatStore.getState().switchTo("conv_real");
+    await vi.waitFor(() => expect(answer).toBeDefined());
+
+    // Resent from another tab meanwhile, so the reopened session has nothing to hand back.
+    await useChatStore.getState().switchTo("conv_other");
+    releaseConversation("conv_real");
+    sessionFailedInputs.delete("conv_real");
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    answer!();
+    await settle();
+
+    expect(useChatStore.getState().conversationId).toBe("conv_real");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().returnedStartupInputs).toEqual([]);
+  });
+
   it.each([
-    { returns: "no input of the viewer's", snapshot: "served" },
-    { returns: "an unreadable snapshot", snapshot: "fails" },
-  ] as const)("ends managed startup when its launch fails with $returns", async ({ snapshot }) => {
+    { returns: "no input of the viewer's", failing: null },
+    { returns: "an unreadable snapshot", failing: "/v1/sessions/conv_real?" },
+    { returns: "no failed-inputs route", failing: "/v1/sessions/conv_real/failed-inputs" },
+  ] as const)("ends managed startup when its launch fails with $returns", async ({ failing }) => {
     seedSession("conv_real");
     sessionLabels.set("conv_real", { "omnigent.startup": "pending" });
     await useChatStore.getState().switchTo("conv_real");
     expect(useChatStore.getState().startupPending).toBe(true);
 
     sessionLabels.set("conv_real", { "omnigent.startup": "failed" });
-    if (snapshot === "fails") {
+    if (failing !== null) {
+      const status = failing.endsWith("/failed-inputs") ? 404 : 500;
       fetchMock.mockImplementation((input, init) =>
-        String(input).startsWith("/v1/sessions/conv_real?")
-          ? mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 })
+        String(input).startsWith(failing)
+          ? mockResponse({ error: { message: "boom" } }, { ok: false, status })
           : defaultFetchHandler(input, init),
       );
     }
@@ -3809,8 +3992,17 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     );
     await settle();
 
-    expect(useChatStore.getState().startupPending).toBe(false);
-    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    const state = useChatStore.getState();
+    expect(state.startupPending).toBe(false);
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.blocks.some((block) => block.type === "error" && block.level === "info")).toBe(
+      false,
+    );
+    expect(
+      state.blocks.some(
+        (block) => block.type === "error" && block.code === STARTUP_INPUT_LOOKUP_FAILED_CODE,
+      ),
+    ).toBe(false);
   });
 
   it("ends managed startup when its failed launch's snapshot read outlasts the reconcile timeout", async () => {
@@ -14900,6 +15092,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       conversationId: "conv_launch_gap",
       text: "saved on server",
       files: [],
+      startupInputIds: ["pending_first"],
       recovered: true,
     });
     expect(state.pendingUserMessages).toEqual([]);
@@ -14929,10 +15122,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     sessionLabels.set("conv_launch_gap", { "omnigent.startup": "pending" });
     const sinks = routeStreamOpens();
     const routed = fetchMock.getMockImplementation()!;
-    let rejectRead = false;
+    let rejectedReads = 0;
     fetchMock.mockImplementation((input, init) => {
-      if (rejectRead && String(input) === "/v1/sessions/conv_launch_gap/failed-inputs") {
-        rejectRead = false;
+      if (rejectedReads > 0 && String(input) === "/v1/sessions/conv_launch_gap/failed-inputs") {
+        rejectedReads -= 1;
         return mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
       }
       return routed(input, init);
@@ -14954,16 +15147,23 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const loop = startStreamPump("conv_launch_gap", controller, setState, getState);
     await drainAsync();
     failManagedLaunch("conv_launch_gap", "saved on server");
-    rejectRead = true;
+    rejectedReads = 2;
     handleSessionEvent(
       { type: "session_status", conversationId: "conv_launch_gap", status: "failed" },
       "conv_launch_gap",
     );
     await drainAsync();
-    expect(rejectRead).toBe(false);
+    const lookupNotices = () =>
+      useChatStore
+        .getState()
+        .blocks.filter(
+          (block) => block.type === "error" && block.code === STARTUP_INPUT_LOOKUP_FAILED_CODE,
+        );
+    expect(rejectedReads).toBe(0);
     expect(useChatStore.getState().startupPending).toBe(false);
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(lookupNotices()).toHaveLength(1);
 
     sinks[0]!.error();
     await drainAsync();
@@ -14972,9 +15172,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       conversationId: "conv_launch_gap",
       text: "saved on server",
       files: [],
+      startupInputIds: ["pending_first"],
       recovered: true,
     });
     expect(useChatStore.getState().startupPending).toBe(false);
+    expect(lookupNotices()).toEqual([]);
 
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
@@ -15598,6 +15800,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       conversationId: "conv_status_launch",
       text: "saved on server",
       files: [],
+      startupInputIds: ["pending_first"],
       recovered: true,
     });
     expect(bound.get().pendingUserMessages).toEqual([]);
@@ -21737,6 +21940,7 @@ describe("a send cut off by a reload", () => {
       conversationId: "conv_reload",
       text: "rerun the failing test\n\nsaved on server",
       files: [],
+      startupInputIds: ["pending_first"],
       recovered: true,
     });
     expect(useChatStore.getState().returnedStartupInputs).toEqual(["pending_first"]);

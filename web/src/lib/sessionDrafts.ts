@@ -3,7 +3,11 @@ import { readComposerDraft, type ComposerDraft } from "./replyDraft";
 
 export interface SessionDraft extends ComposerDraft {
   files: File[];
+  /** Failed startup inputs handed back into this draft, so a reload doesn't add them again. */
+  startupInputIds?: string[];
 }
+
+type StoredSessionDraft = ComposerDraft & Pick<SessionDraft, "startupInputIds">;
 
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
 const listeners = new Set<() => void>();
@@ -19,7 +23,9 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
     const drafts = new Map<string, SessionDraft>();
     for (const [id, entry] of Object.entries(entries)) {
       const draft = readComposerDraft(entry);
-      if (draft?.text) drafts.set(id, { ...draft, files: [] });
+      const startupInputIds = readStartupInputIds(entry);
+      if (draft?.text)
+        drafts.set(id, { ...draft, files: [], ...(startupInputIds ? { startupInputIds } : {}) });
     }
     return drafts;
   } catch {
@@ -27,15 +33,27 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
   }
 }
 
+function readStartupInputIds(entry: unknown): string[] | undefined {
+  if (typeof entry !== "object" || entry === null || !("startupInputIds" in entry))
+    return undefined;
+  const ids = entry.startupInputIds;
+  return Array.isArray(ids) && ids.every((id) => typeof id === "string") ? ids : undefined;
+}
+
 function saveDraftsToStorage(): void {
   if (typeof window === "undefined") return;
   try {
-    const entries: Record<string, string | ComposerDraft> = {};
-    for (const [id, draft] of sessionDrafts) {
-      if (draft.text)
-        entries[id] = draft.replyDraft
-          ? { text: draft.text, replyDraft: draft.replyDraft }
-          : draft.text;
+    const entries: Record<string, string | StoredSessionDraft> = {};
+    for (const [id, { text, replyDraft, startupInputIds }] of sessionDrafts) {
+      if (text)
+        entries[id] =
+          replyDraft || startupInputIds
+            ? {
+                text,
+                ...(replyDraft ? { replyDraft } : {}),
+                ...(startupInputIds ? { startupInputIds } : {}),
+              }
+            : text;
     }
     if (Object.keys(entries).length === 0) {
       window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);
@@ -67,10 +85,34 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   if (draft.text === "" && draft.files.length === 0) {
     sessionDrafts.delete(conversationId);
   } else {
-    sessionDrafts.set(conversationId, draft);
+    const startupInputIds =
+      draft.startupInputIds ?? sessionDrafts.get(conversationId)?.startupInputIds;
+    sessionDrafts.set(conversationId, {
+      ...draft,
+      ...(startupInputIds ? { startupInputIds } : {}),
+    });
   }
   saveDraftsToStorage();
   notifyListeners();
+}
+
+/**
+ * Record failed startup inputs the composer is taking into a session's draft.
+ *
+ * @param conversationId - The session the inputs belong to.
+ * @param text - Their text, the draft's text until the composer publishes its own.
+ * @param ids - Their pending ids.
+ */
+export function addSessionDraftStartupInputs(
+  conversationId: string,
+  text: string,
+  ids: string[],
+): void {
+  const draft = sessionDrafts.get(conversationId) ?? { text, files: [] };
+  setSessionDraft(conversationId, {
+    ...draft,
+    startupInputIds: [...(draft.startupInputIds ?? []), ...ids],
+  });
 }
 
 /** Remove a draft and ignore any late cleanup write for the retired id. */

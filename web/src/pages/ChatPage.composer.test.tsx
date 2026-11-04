@@ -5507,27 +5507,37 @@ describe("Composer reply quotes", () => {
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
   });
 
-  it.each<[string, StoredReplyDraft | undefined, string | undefined, string]>([
-    ["a message", undefined, "stable_queued", "also check the docs\n\nrun the linter next"],
+  it.each<[string, StoredReplyDraft | undefined, string | undefined, string, string[] | undefined]>(
     [
-      "a reply",
-      {
-        version: 1,
-        quotes: [{ before: "", text: "the failing test" }],
-        text: "run the linter next",
-      },
-      "stable_queued",
-      "also check the docs\n\n> the failing test\n\nrun the linter next",
+      [
+        "a message",
+        undefined,
+        "stable_queued",
+        "also check the docs\n\nrun the linter next",
+        undefined,
+      ],
+      [
+        "a reply",
+        {
+          version: 1,
+          quotes: [{ before: "", text: "the failing test" }],
+          text: "run the linter next",
+        },
+        "stable_queued",
+        "also check the docs\n\n> the failing test\n\nrun the linter next",
+        undefined,
+      ],
+      [
+        "a failed launch's message",
+        undefined,
+        undefined,
+        "also check the docs\n\nrun the linter next",
+        ["pending_first"],
+      ],
     ],
-    [
-      "a failed launch's message",
-      undefined,
-      undefined,
-      "also check the docs\n\nrun the linter next",
-    ],
-  ])(
+  )(
     "adds %s recovered on load after the draft the reload kept, sending neither",
-    async (_, replyDraft, stableId, joined) => {
+    async (_, replyDraft, stableId, joined, startupInputIds) => {
       setSessionDraft("conv_test", { text: "also check the docs", files: [] });
       const props = composerProps();
       render(<Composer {...props} />);
@@ -5541,6 +5551,7 @@ describe("Composer reply quotes", () => {
             files: [],
             ...(stableId ? { stableId } : {}),
             ...(replyDraft ? { replyDraft } : {}),
+            ...(startupInputIds ? { startupInputIds } : {}),
             serverRefused: false,
             recovered: true,
           },
@@ -5553,6 +5564,8 @@ describe("Composer reply quotes", () => {
       expect(useChatStore.getState().pendingRetryStableId).toBeNull();
       expect(useChatStore.getState().restoredSendDraft).toBeNull();
       await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe(joined));
+      // The saved draft names the startup inputs it took, so a reload skips them.
+      expect(getSessionDraft("conv_test")?.startupInputIds).toEqual(startupInputIds);
     },
   );
 

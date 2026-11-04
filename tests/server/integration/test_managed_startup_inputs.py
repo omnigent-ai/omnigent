@@ -1044,7 +1044,7 @@ async def test_crashed_create_launch_is_recorded_on_the_session(
     assert page == {"data": [], "next_cursor": None}
 
 
-async def test_failed_launch_returns_each_sender_their_own_inputs_page_by_page(
+async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_resend(
     auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
     startup_permissions: SqlAlchemyPermissionStore,
@@ -1057,7 +1057,8 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_page_by_page(
     startup = auth_app.state.startup_inputs
     startup.conversations.set_labels(session_id, {STARTUP_LABEL: "pending"})
     startup_permissions.grant("bob", session_id, LEVEL_EDIT)
-    for sender, text in (("alice", "first"), ("bob", "from bob"), ("alice", "second")):
+
+    async def send(sender: str, text: str) -> httpx.Response:
         auth_client.headers["X-Forwarded-Email"] = sender
         event = {
             "type": "message",
@@ -1067,34 +1068,46 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_page_by_page(
                 "stable_id": uuid4().hex,
             },
         }
-        response = await auth_client.post(f"/v1/sessions/{session_id}/events", json=event)
+        return await auth_client.post(f"/v1/sessions/{session_id}/events", json=event)
+
+    for sender, text in (("alice", "first"), ("bob", "from bob"), ("alice", "second")):
+        response = await send(sender, text)
         assert response.status_code == 202, response.text
     url = f"/v1/sessions/{session_id}/failed-inputs"
     auth_client.headers["X-Forwarded-Email"] = "alice"
     assert (await auth_client.get(url)).json() == {"data": [], "next_cursor": None}
     await startup.record_launch_failure(session_id, "sandbox never came online")
 
-    async def read_all(sender: str) -> list[list[str]]:
+    async def read_all(sender: str) -> tuple[list[str], int]:
         auth_client.headers["X-Forwarded-Email"] = sender
-        pages: list[list[str]] = []
+        entries: list[dict[str, Any]] = []
+        pages = 0
         params: dict[str, Any] = {"limit": 1}
         while True:
             response = await auth_client.get(url, params=params)
             assert response.status_code == 200, response.text
             page = response.json()
-            pages.append([entry["content"][0]["text"] for entry in page["data"]])
+            pages += 1
+            entries.extend(page["data"])
             if page["next_cursor"] is None:
-                return pages
+                entries.sort(key=lambda entry: entry["position"])
+                return [entry["content"][0]["text"] for entry in entries], pages
             params["after"] = page["next_cursor"]
 
     # One saved input per page, so another sender's leaves an empty page.
-    assert await read_all("alice") == [["first"], [], ["second"]]
-    assert await read_all("bob") == [[], ["from bob"], []]
-    for cursor in ("-1", "x", "9" * 19):
+    assert await read_all("alice") == (["first", "second"], 3)
+    assert await read_all("bob") == (["from bob"], 3)
+    for cursor in ("-1", "x", "A" * 32, "0" * 31):
         response = await auth_client.get(url, params={"after": cursor})
         assert response.status_code == 422, response.text
+    # A resend carries the handed-back text, so only the sender's inputs are
+    # dropped, even when the resend itself fails and returns to the composer.
+    response = await send("alice", "first\n\nsecond")
+    assert response.status_code == 503, response.text
+    assert await read_all("alice") == ([], 1)
+    assert await read_all("bob") == (["from bob"], 1)
     startup.conversations.set_runner_id(session_id, uuid4().hex)
-    assert await read_all("alice") == [[]]
+    assert await read_all("bob") == ([], 1)
 
 
 async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input(

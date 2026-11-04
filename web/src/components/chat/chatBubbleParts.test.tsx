@@ -3,7 +3,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
-import { useChatStore, type ChatState } from "@/store/chatStore";
+import { STARTUP_INPUT_LOOKUP_FAILED_CODE, useChatStore, type ChatState } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
 
@@ -479,6 +480,31 @@ describe("AssistantBubble error retry", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_retry/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data: {} });
+  });
+
+  it("reads unreturned startup inputs again instead of resuming the session", async () => {
+    const entry = conversationRegistry.acquire("conv_retry");
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        data: [
+          {
+            pending_id: "pending_first",
+            content: [{ type: "input_text", text: "explain this chart" }],
+            position: 0,
+          },
+        ],
+        next_cursor: null,
+      }),
+    );
+    render(<BubbleView bubble={errorBubble(STARTUP_INPUT_LOOKUP_FAILED_CODE)} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(screen.queryByTestId("error-pill")).toBeNull());
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/sessions/conv_retry/failed-inputs");
+    expect(entry.getState().failedSendDraft).toMatchObject({ text: "explain this chart" });
+    conversationRegistry.release("conv_retry");
   });
 });
 

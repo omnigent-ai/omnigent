@@ -481,6 +481,23 @@ class ConversationStore(ABC):
         """
         return [], None
 
+    def list_pending_inputs_by_id(
+        self,
+        conversation_id: str,  # noqa: ARG002
+        *,
+        after: str | None = None,  # noqa: ARG002
+        limit: int = MAX_PENDING_INPUTS,  # noqa: ARG002
+    ) -> tuple[list[tuple[ConversationItem, int]], str | None]:
+        """
+        Page the conversation's startup inputs in item-id order.
+
+        :param after: The cursor a previous page returned, or ``None`` to start.
+        :param limit: Most inputs to return.
+        :returns: Each input with its submission position, and the cursor for
+            the next page, ``None`` at the end.
+        """
+        return [], None
+
     def list_pending_inputs(self, conversation_id: str) -> list[ConversationItem]:
         """Return all startup inputs (at most ``MAX_PENDING_INPUTS``) in submission order."""
         items: list[ConversationItem] = []

@@ -68,7 +68,12 @@ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
-import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import {
+  retryFailedStartupLookup,
+  STARTUP_INPUT_LOOKUP_FAILED_CODE,
+  useChatStore,
+  type PendingUserMessage,
+} from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
@@ -1034,6 +1039,10 @@ function AssistantBubble({
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
+      if (item.code === STARTUP_INPUT_LOOKUP_FAILED_CODE) {
+        await retryFailedStartupLookup(conversationId);
+        return;
+      }
       if (CONTINUE_TURN_ERROR_CODES.has(item.code)) {
         // Read a FRESH snapshot of the target conversation at click time: the
         // scoped child's own entry in a side chat, else the root store. The

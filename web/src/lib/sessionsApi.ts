@@ -106,6 +106,12 @@ interface PendingInputWire {
   created_by?: string;
 }
 
+interface FailedInputWire extends PendingInputWire {
+  position: number;
+}
+
+const MAX_FAILED_INPUT_PAGES = 10;
+
 /**
  * Wire shape of `SessionResponse` from
  * `omnigent/server/schemas.py`. Snake-case; converted to the
@@ -1263,31 +1269,38 @@ export async function getSessionSlim(
  *
  * @param sessionId - The session whose launch failed.
  * @param options - `signal` aborts the read.
- * @returns The messages, empty unless the launch failed and no runner is bound.
- * @throws When a page can't be read, including from servers without the route.
+ * @returns The messages in the order they were sent, empty unless the launch
+ *   failed and no runner is bound.
+ * @throws When a page can't be read, including from servers without the route,
+ *   or the cursor stops advancing.
  */
 export async function listFailedInputs(
   sessionId: string,
   options: { signal?: AbortSignal } = {},
 ): Promise<PendingInput[]> {
-  const inputs: PendingInput[] = [];
+  const entries: FailedInputWire[] = [];
   let after: string | null = null;
   // Each page provides the cursor for the next request.
   /* oxlint-disable no-await-in-loop */
-  do {
+  for (let pages = 1; ; pages += 1) {
     const query: string = after !== null ? `?after=${encodeURIComponent(after)}` : "";
     const res = await authenticatedFetch(
       `/v1/sessions/${encodeURIComponent(sessionId)}/failed-inputs${query}`,
       { signal: options.signal },
     );
-    const page = await readJsonOrThrow<{ data: PendingInputWire[]; next_cursor: string | null }>(
+    const page = await readJsonOrThrow<{ data: FailedInputWire[]; next_cursor: string | null }>(
       res,
     );
-    inputs.push(...page.data.map(pendingInputFromWire));
+    entries.push(...page.data);
+    if (page.next_cursor === null) break;
+    if (page.next_cursor === after || pages === MAX_FAILED_INPUT_PAGES) {
+      throw new Error("Failed-input pages did not end");
+    }
     after = page.next_cursor;
-  } while (after !== null);
+  }
   /* oxlint-enable no-await-in-loop */
-  return inputs;
+  // Pages follow item ids, so positions restore the order the messages were sent in.
+  return entries.sort((a, b) => a.position - b.position).map(pendingInputFromWire);
 }
 
 export interface SessionSignInLink {

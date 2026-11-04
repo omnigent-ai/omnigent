@@ -114,7 +114,11 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  addSessionDraftStartupInputs,
+  getSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   forgetUnsentSend,
   peekQueuedSends,
@@ -928,6 +932,8 @@ export interface ConversationState {
      * is left, so the composer adds it after newer input instead of dropping it.
      */
     recovered?: boolean;
+    /** The failed startup inputs it hands back, recorded with the saved draft once taken. */
+    startupInputIds?: string[];
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -7535,6 +7541,8 @@ export function takeFailedSendDraft(
       delivered: false,
     };
   setterFor(conversationId)(patch);
+  if (restore && failed.startupInputIds)
+    addSessionDraftStartupInputs(conversationId, failed.text, failed.startupInputIds);
   return restore ? failed : null;
 }
 
@@ -7723,42 +7731,60 @@ function restoreUnsentSendOnceIdentified(
   });
 }
 
+/** A client notice whose Retry reads a failed launch's startup inputs again. */
+export const STARTUP_INPUT_LOOKUP_FAILED_CODE = "startup_input_lookup_failed";
+const STARTUP_ATTACHMENTS_NOT_RESTORED_CODE = "startup_attachments_not_restored";
+const ATTACHMENT_LIST = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
+
 /**
  * Hand the viewer's startup messages a failed managed launch left undelivered
  * back to the composer: drop the bubbles still showing them as sending and
  * restore their text after any draft already waiting there. Each is handed back
- * once per conversation, so a later resend of the same text is not taken for it.
- * Inputs without text (images only) have nothing to restore and keep their bubbles.
+ * once: this entry remembers it, as does the saved draft the composer took it into.
+ * The composer can't take back uploaded files, so a notice names the attachments.
  *
  * @param conversationId - The session whose launch failed.
  * @param state - The conversation's state.
  * @param failedInputs - The viewer's inputs the server holds as failed.
+ * @param unacknowledged - Bubbles of the viewer's sends no server receipt named
+ *   when the read began, the only ones matched by text.
  * @returns The state patch, empty when nothing is left to hand back.
  */
 function returnFailedStartupInputs(
   conversationId: string,
   state: Pick<
     ConversationState,
-    "pendingUserMessages" | "failedSendDraft" | "returnedStartupInputs"
+    "pendingUserMessages" | "failedSendDraft" | "returnedStartupInputs" | "blocks"
   >,
   failedInputs: PendingInput[],
-): Partial<
-  Pick<ConversationState, "pendingUserMessages" | "failedSendDraft" | "returnedStartupInputs">
-> {
-  const inputs = failedInputs.filter(
-    (input) =>
-      !state.returnedStartupInputs.includes(input.pendingId) &&
-      startupInputText(input).trim() !== "",
-  );
-  if (inputs.length === 0) return {};
+  unacknowledged: ReadonlySet<string>,
+): Partial<ConversationState> {
+  const returned = new Set([
+    ...state.returnedStartupInputs,
+    ...(getSessionDraft(conversationId)?.startupInputIds ?? []),
+  ]);
+  const inputs = failedInputs.filter((input) => !returned.has(input.pendingId));
+  const blocks = state.blocks.filter((block) => !isStartupLookupNotice(block));
+  const patch = blocks.length === state.blocks.length ? {} : { blocks };
+  if (inputs.length === 0) return patch;
+  const attachments = startupAttachmentsNotice(inputs);
   return {
-    pendingUserMessages: withoutFailedStartupBubbles(state.pendingUserMessages, inputs),
+    pendingUserMessages: withoutFailedStartupBubbles(
+      state.pendingUserMessages,
+      inputs,
+      unacknowledged,
+    ),
     returnedStartupInputs: [
       ...state.returnedStartupInputs,
       ...inputs.map((input) => input.pendingId),
     ],
     failedSendDraft: failedStartupDraft(conversationId, state.failedSendDraft, inputs),
+    ...(attachments ? { blocks: [...blocks, attachments] } : patch),
   };
+}
+
+function isStartupLookupNotice(block: AnyBlock): boolean {
+  return block.type === "error" && block.code === STARTUP_INPUT_LOOKUP_FAILED_CODE;
 }
 
 /** A startup input's text, without its attachments. */
@@ -7768,6 +7794,25 @@ function startupInputText(input: PendingInput): string {
     .join("");
 }
 
+/** A notice naming the failed startup inputs' attachments, or `null` without any. */
+function startupAttachmentsNotice(inputs: PendingInput[]): ErrorBlock | null {
+  const names = inputs.flatMap((input) =>
+    input.content.flatMap((block) => {
+      if (block.type === "input_image") return [block.filename ?? "an image"];
+      return block.type === "input_file" ? [block.filename ?? "a file"] : [];
+    }),
+  );
+  if (names.length === 0) return null;
+  return {
+    ...makeClientErrorBlock(
+      `Attach ${ATTACHMENT_LIST.format(names)} again before you resend.`,
+      STARTUP_ATTACHMENTS_NOT_RESTORED_CODE,
+    ),
+    level: "info",
+    title: names.length === 1 ? "An attachment wasn't restored" : "Attachments weren't restored",
+  };
+}
+
 /**
  * Failed startup inputs as a recovered failed-send draft, after the draft
  * already waiting, if any. It carries no stable id: the server already holds
@@ -7775,16 +7820,23 @@ function startupInputText(input: PendingInput): string {
  *
  * @param conversationId - The session the inputs belong to.
  * @param waiting - The failed-send draft the composer has yet to take.
- * @param inputs - The failed inputs, each with text.
- * @returns The draft to restore.
+ * @param inputs - The failed inputs.
+ * @returns The draft to restore, `waiting` when no input has text.
  */
 function failedStartupDraft(
   conversationId: string,
   waiting: ConversationState["failedSendDraft"],
   inputs: PendingInput[],
-): NonNullable<ConversationState["failedSendDraft"]> {
-  const text = inputs.map(startupInputText).join("\n\n");
-  if (waiting === null) return { conversationId, text, files: [], recovered: true };
+): ConversationState["failedSendDraft"] {
+  const texts = inputs.map(startupInputText).filter((text) => text.trim() !== "");
+  if (texts.length === 0) return waiting;
+  const text = texts.join("\n\n");
+  const startupInputIds = [
+    ...(waiting?.startupInputIds ?? []),
+    ...inputs.map((input) => input.pendingId),
+  ];
+  if (waiting === null)
+    return { conversationId, text, files: [], startupInputIds, recovered: true };
   const joined = appendReplyDraft(restoreReplyDraft(waiting.text, waiting.replyDraft), {
     quotes: [],
     text,
@@ -7795,45 +7847,110 @@ function failedStartupDraft(
     text: serializeReplyDraft(joined),
     files: waiting.files,
     ...(replyDraft ? { replyDraft } : {}),
+    startupInputIds,
     recovered: true,
   };
 }
 
+/** The viewer's sends whose bubble no server receipt has named, e.g. a managed session's first message. */
+function unacknowledgedSends(pending: PendingUserMessage[]): Set<string> {
+  return new Set(
+    pending
+      .filter((message) => message.posted === true && message.pendingId === undefined)
+      .map((message) => message.tempId),
+  );
+}
+
 /**
- * Drop the bubbles still showing failed startup inputs as sending.
- * Matched by text, one bubble per input, since a bubble's attachments carry local ids.
+ * Drop the bubbles still showing failed startup inputs as sending. A bubble
+ * matches its input's pending id; one with no id yet is matched by text, one
+ * bubble per input, since its attachments carry local ids.
  *
  * @param pending - The bubbles to filter.
  * @param inputs - The failed inputs.
+ * @param unacknowledged - The bubbles that may match by text.
  * @returns The remaining bubbles.
  */
 function withoutFailedStartupBubbles(
   pending: PendingUserMessage[],
   inputs: PendingInput[],
+  unacknowledged: ReadonlySet<string>,
 ): PendingUserMessage[] {
-  const failedTexts = inputs
-    .map((input) => messageContentText(input.content))
-    .filter((text) => text !== "");
+  // Snapshot-replayed bubbles carry the server id as their tempId.
+  const bubbleId = (message: PendingUserMessage) => message.pendingId ?? message.tempId;
+  const shown = new Set(pending.map(bubbleId));
+  const failedIds = new Set(inputs.map((input) => input.pendingId));
+  const unmatchedTexts = inputs
+    .filter((input) => !shown.has(input.pendingId))
+    .map((input) => messageContentText(input.content));
   return pending.filter((message) => {
-    const index = failedTexts.indexOf(messageContentText(message.content));
+    if (failedIds.has(bubbleId(message))) return false;
+    if (!unacknowledged.has(message.tempId)) return true;
+    const index = unmatchedTexts.indexOf(messageContentText(message.content));
     if (index === -1) return true;
-    failedTexts.splice(index, 1);
+    unmatchedTexts.splice(index, 1);
     return false;
   });
 }
 
+/** The viewer's failed startup inputs; a server without the route has none. */
+async function listFailedStartupInputs(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<PendingInput[]> {
+  try {
+    return await listFailedInputs(conversationId, { signal });
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return [];
+    throw error;
+  }
+}
+
 /**
  * Return a failed launch's undelivered startup messages to the composer.
- * A read that fails or times out leaves them to the next reconnect or reload.
+ * A read that fails or times out is tried once more; then a notice offers Retry.
  *
  * @param conversationId - The session whose launch failed.
  */
 async function restoreFailedStartupInputs(conversationId: string): Promise<void> {
-  const inputs = await readWithinReconcileTimeout((signal) =>
-    listFailedInputs(conversationId, { signal }),
+  const entry = conversationRegistry.peek(conversationId);
+  if (entry === undefined) return;
+  const unacknowledged = unacknowledgedSends(entry.getState().pendingUserMessages);
+  const read = (signal: AbortSignal) => listFailedStartupInputs(conversationId, signal);
+  const inputs =
+    (await readWithinReconcileTimeout(read)) ?? (await readWithinReconcileTimeout(read));
+  // A conversation reopened under the same id during the read is a different entry.
+  if (entry.disposed) return;
+  entrySetter(entry)((state) => {
+    if (inputs !== null)
+      return returnFailedStartupInputs(conversationId, state, inputs, unacknowledged);
+    if (state.blocks.some(isStartupLookupNotice)) return {};
+    const notice: ErrorBlock = {
+      ...makeClientErrorBlock(
+        "Messages sent while the session was starting weren't delivered. Retry to move them back to the composer.",
+        STARTUP_INPUT_LOOKUP_FAILED_CODE,
+      ),
+      title: "Couldn't return your unsent messages",
+    };
+    return { blocks: [...state.blocks, notice] };
+  });
+}
+
+/**
+ * Read a failed launch's startup messages again from the lookup-failure notice.
+ *
+ * @param conversationId - The session whose launch failed.
+ * @throws When the session is gone or its messages still can't be read.
+ */
+export async function retryFailedStartupLookup(conversationId: string): Promise<void> {
+  const entry = conversationRegistry.peek(conversationId);
+  if (entry === undefined || entry.disposed) throw new Error("The session is no longer open");
+  const unacknowledged = unacknowledgedSends(entry.getState().pendingUserMessages);
+  const inputs = await listFailedStartupInputs(conversationId);
+  if (entry.disposed) return;
+  entrySetter(entry)((state) =>
+    returnFailedStartupInputs(conversationId, state, inputs, unacknowledged),
   );
-  if (inputs === null || isConversationDisposed(conversationId)) return;
-  setterFor(conversationId)((state) => returnFailedStartupInputs(conversationId, state, inputs));
 }
 
 /**
@@ -7845,11 +7962,13 @@ async function restoreFailedStartupInputs(conversationId: string): Promise<void>
  * @param conversationId - The session that reported the failure.
  */
 async function settleFailedStartup(conversationId: string): Promise<void> {
+  const entry = conversationRegistry.peek(conversationId);
+  if (entry === undefined) return;
   const session = await readWithinReconcileTimeout((signal) =>
     getSessionSlim(conversationId, { signal }),
   );
-  if (isConversationDisposed(conversationId)) return;
-  setterFor(conversationId)({ startupPending: session !== null && startupPendingIn(session) });
+  if (entry.disposed) return;
+  entrySetter(entry)({ startupPending: session !== null && startupPendingIn(session) });
   if (session !== null && startupFailedIn(session)) {
     await restoreFailedStartupInputs(conversationId);
   }

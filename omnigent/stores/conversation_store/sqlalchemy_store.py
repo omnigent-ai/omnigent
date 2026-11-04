@@ -2282,6 +2282,31 @@ class SqlAlchemyConversationStore(ConversationStore):
         items = [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
         return items, rows[-1].position if more else None
 
+    def list_pending_inputs_by_id(
+        self,
+        conversation_id: str,
+        *,
+        after: str | None = None,
+        limit: int = MAX_PENDING_INPUTS,
+    ) -> tuple[list[tuple[ConversationItem, int]], str | None]:
+        # The response-id index ends in id, so each page seeks and reads limit + 1 rows.
+        query = select(SqlConversationItem).where(
+            SqlConversationItem.workspace_id == current_workspace_id(),
+            SqlConversationItem.conversation_id == conversation_id,
+            SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
+        )
+        if after is not None:
+            query = query.where(SqlConversationItem.id > after)
+        with self._conv_session("page_pending_inputs_by_id") as session:
+            rows = list(session.scalars(query.order_by(SqlConversationItem.id).limit(limit + 1)))
+        more = len(rows) > limit
+        rows = rows[:limit]
+        decoded = self._decode_item_data_batch([row.data for row in rows])
+        items = [
+            (_to_item(row, data), row.position) for row, data in zip(rows, decoded, strict=True)
+        ]
+        return items, rows[-1].id if more else None
+
     def transition_pending_input(
         self,
         conversation_id: str,

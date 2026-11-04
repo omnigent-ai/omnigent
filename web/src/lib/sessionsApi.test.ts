@@ -1479,24 +1479,31 @@ describe("getSessionUsage", () => {
 });
 
 describe("listFailedInputs", () => {
-  it("follows the cursor across pages and maps each input", async () => {
+  it("follows the cursor across pages and returns inputs in the order they were sent", async () => {
     fetchMock
       .mockResolvedValueOnce(
         mockJsonResponse({
           data: [
             {
               pending_id: "pending_1",
-              content: [{ type: "input_text", text: "first" }],
+              content: [{ type: "input_text", text: "second" }],
               created_by: "user_1",
+              position: 7,
             },
           ],
-          next_cursor: "1",
+          next_cursor: "a1",
         }),
       )
-      .mockResolvedValueOnce(mockJsonResponse({ data: [], next_cursor: "2" }))
+      .mockResolvedValueOnce(mockJsonResponse({ data: [], next_cursor: "b2" }))
       .mockResolvedValueOnce(
         mockJsonResponse({
-          data: [{ pending_id: "pending_3", content: [{ type: "input_text", text: "third" }] }],
+          data: [
+            {
+              pending_id: "pending_3",
+              content: [{ type: "input_text", text: "first" }],
+              position: 3,
+            },
+          ],
           next_cursor: null,
         }),
       );
@@ -1506,8 +1513,8 @@ describe("listFailedInputs", () => {
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/v1/sessions/conv%20with%20space/failed-inputs",
-      "/v1/sessions/conv%20with%20space/failed-inputs?after=1",
-      "/v1/sessions/conv%20with%20space/failed-inputs?after=2",
+      "/v1/sessions/conv%20with%20space/failed-inputs?after=a1",
+      "/v1/sessions/conv%20with%20space/failed-inputs?after=b2",
     ]);
     expect(fetchMock.mock.calls.map(([, init]) => init.signal)).toEqual([
       controller.signal,
@@ -1515,13 +1522,30 @@ describe("listFailedInputs", () => {
       controller.signal,
     ]);
     expect(inputs).toEqual([
+      { pendingId: "pending_3", content: [{ type: "input_text", text: "first" }] },
       {
         pendingId: "pending_1",
-        content: [{ type: "input_text", text: "first" }],
+        content: [{ type: "input_text", text: "second" }],
         createdBy: "user_1",
       },
-      { pendingId: "pending_3", content: [{ type: "input_text", text: "third" }] },
     ]);
+  });
+
+  it("stops reading when the server repeats its cursor", async () => {
+    fetchMock.mockImplementation(async () => mockJsonResponse({ data: [], next_cursor: "a1" }));
+
+    await expect(listFailedInputs("conv_abc")).rejects.toThrow("did not end");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops reading after ten pages", async () => {
+    let cursor = 0;
+    fetchMock.mockImplementation(async () =>
+      mockJsonResponse({ data: [], next_cursor: `c${(cursor += 1)}` }),
+    );
+
+    await expect(listFailedInputs("conv_abc")).rejects.toThrow("did not end");
+    expect(fetchMock).toHaveBeenCalledTimes(10);
   });
 
   it("rejects when the server has no failed-inputs route", async () => {

@@ -50,11 +50,13 @@ describe("session drafts", () => {
         newer: { text, replyDraft: { version: 2, quotes: [], text: "" } },
         notText: { text: 42 },
         nullEntry: null,
+        badStartupIds: { text, startupInputIds: ["pending_first", 42] },
       }),
     );
     const { getSessionDraft } = await import("./sessionDrafts");
     expect(getSessionDraft("invalid")).toEqual({ text, files: [] });
     expect(getSessionDraft("newer")).toEqual({ text, files: [] });
+    expect(getSessionDraft("badStartupIds")).toEqual({ text, files: [] });
     expect(getSessionDraft("notText")).toBeUndefined();
     expect(getSessionDraft("nullEntry")).toBeUndefined();
   });
@@ -74,6 +76,29 @@ describe("session drafts", () => {
     setSessionDraft("conversation", { text: "", files: [] });
     expect(hasSessionDraft("conversation")).toBe(false);
     expect(sessionStorage.getItem(key)).toBeNull();
+  });
+
+  it("keeps the startup inputs a draft holds across edits and a reload", async () => {
+    const { addSessionDraftStartupInputs, getSessionDraft, setSessionDraft } =
+      await import("./sessionDrafts");
+    addSessionDraftStartupInputs("conversation", "first", ["pending_first"]);
+    setSessionDraft("conversation", { text: "first, edited", files: [] });
+    addSessionDraftStartupInputs("conversation", "second", ["pending_second"]);
+    expect(getSessionDraft("conversation")).toEqual({
+      text: "first, edited",
+      files: [],
+      startupInputIds: ["pending_first", "pending_second"],
+    });
+
+    vi.resetModules();
+    const reloaded = await import("./sessionDrafts");
+    expect(reloaded.getSessionDraft("conversation")?.startupInputIds).toEqual([
+      "pending_first",
+      "pending_second",
+    ]);
+    reloaded.setSessionDraft("conversation", { text: "", files: [] });
+    reloaded.setSessionDraft("conversation", { text: "new", files: [] });
+    expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ conversation: "new" });
   });
 
   it("recovers a failed temporary draft and ignores its late cleanup write", async () => {

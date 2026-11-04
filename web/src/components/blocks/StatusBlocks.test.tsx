@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
-import { useChatStore } from "@/store/chatStore";
+import { STARTUP_INPUT_LOOKUP_FAILED_CODE, useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
@@ -785,6 +785,37 @@ describe("ErrorBanner", () => {
     await waitFor(() =>
       expect(onRetry).toHaveBeenCalledWith(expect.objectContaining({ code: "connection_error" })),
     );
+  });
+
+  it("retries reading unreturned startup inputs and keeps the notice while the read fails", async () => {
+    let rejectRetry: ((error: Error) => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectRetry = reject;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message="Messages sent while the session was starting weren't delivered."
+        title="Couldn't return your unsent messages"
+        source="client"
+        code={STARTUP_INPUT_LOOKUP_FAILED_CODE}
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status")).toHaveTextContent(/^Retrying$/);
+
+    await act(async () => rejectRetry?.(new Error("Server unavailable")));
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "Couldn't return your unsent messages",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Retry failed: Server unavailable");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
   });
 
   it("suppresses the runner's unavailable last-output diagnostics tab", () => {

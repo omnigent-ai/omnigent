@@ -1771,7 +1771,7 @@ def register_core_routes(
         response: Response,
         session_id: str,
         limit: int = Query(default=100, ge=1, le=100),
-        after: str | None = Query(default=None, max_length=19),
+        after: str | None = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     ) -> SessionFailedInputPage:
         """
         List the caller's startup inputs a failed managed launch could not deliver.
@@ -1788,8 +1788,6 @@ def register_core_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
-        if after is not None and not (after.isascii() and after.isdigit() and int(after) < 2**63):
-            raise HTTPException(status_code=422, detail="Invalid failed-input cursor")
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
@@ -1802,13 +1800,8 @@ def register_core_routes(
         startup = getattr(request.app.state, "startup_inputs", None)
         if startup is None:
             return SessionFailedInputPage()
-        data, next_position = await startup.failed_page(
-            conv, user_id, after=int(after) if after is not None else None, limit=limit
-        )
-        return SessionFailedInputPage(
-            data=data,
-            next_cursor=str(next_position) if next_position is not None else None,
-        )
+        data, next_cursor = await startup.failed_page(conv, user_id, after=after, limit=limit)
+        return SessionFailedInputPage(data=data, next_cursor=next_cursor)
 
     # ── GET /sessions ───────────────────────────────────────────
 

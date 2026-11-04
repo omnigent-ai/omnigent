@@ -830,7 +830,7 @@ already includes usage, so clients should not issue the separate request.
 ```
 GET /v1/sessions/{session_id}/failed-inputs[?limit=100&after=<next_cursor>]
 
-200 OK — {"data": [{pending_id, content}], "next_cursor": string|null}
+200 OK — {"data": [{pending_id, content, position}], "next_cursor": string|null}
 404 Not Found — no session with that id is visible to the caller
 422 Unprocessable Entity — `after` is not a cursor this route returned
 ```
@@ -839,10 +839,13 @@ Returns the caller's own startup inputs that a failed managed launch
 (`omnigent.startup` label `failed`) could not deliver, shaped like the
 snapshot's `pending_inputs`, so clients can offer them back to the composer for
 resending. The list is empty for any other startup state and once a runner is
-bound to the session. Each page reads at most `limit` (1-100) of the session's
-saved startup inputs, so a page can hold fewer than `limit` entries while
-`next_cursor` is set; pass it as `after` until it is `null`. Older servers
-answer 404 for this route. The response is `Cache-Control: no-store`.
+bound to the session. The caller's next message or skill command to the session
+discards them, since that resend carries what the client handed back. Pages
+follow item ids; sort the collected entries by `position` for submission order.
+Each page reads at most `limit` (1-100) of the session's saved startup inputs,
+so a page can hold fewer than `limit` entries while `next_cursor` is set; pass
+it as `after` until it is `null`. Older servers answer 404 for this route. The
+response is `Cache-Control: no-store`.
 
 ### Delete Session
 

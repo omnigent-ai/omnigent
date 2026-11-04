@@ -221,3 +221,21 @@ def test_pending_input_pages_continue_in_submission_order(db_uri):
     assert [item.id for item in store.list_pending_inputs(session.id)] == [
         item.id for item in saved
     ]
+
+
+def test_pending_input_id_pages_carry_submission_positions(db_uri):
+    store = SqlAlchemyConversationStore(db_uri)
+    session = store.create_conversation()
+    saved = store.append(session.id, [_input() for _ in range(5)])
+    sent = MessageData(role="user", content=[{"type": "input_text", "text": "delivered"}])
+    store.append(session.id, [NewConversationItem(type="message", response_id="turn", data=sent)])
+    first, cursor = store.list_pending_inputs_by_id(session.id, limit=2)
+    second, cursor = store.list_pending_inputs_by_id(session.id, after=cursor, limit=2)
+    third, end = store.list_pending_inputs_by_id(session.id, after=cursor, limit=2)
+    assert end is None
+    paged = first + second + third
+    assert [item.id for item, _position in paged] == sorted(item.id for item in saved)
+    by_position = sorted(paged, key=lambda entry: entry[1])
+    assert [item for item, _position in by_position] == saved
+    exact, end = store.list_pending_inputs_by_id(session.id, limit=5)
+    assert len(exact) == 5 and end is None
