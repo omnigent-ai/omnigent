@@ -83,6 +83,12 @@ from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
+from omnigent.server.managed_hosts import (
+    is_repo_workspace,
+    managed_repo_labels,
+    parse_repo_workspace,
+    read_managed_repo_workspaces,
+)
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -114,6 +120,7 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
 )
 
 if TYPE_CHECKING:
@@ -355,9 +362,17 @@ UNATTENDED_RUN_NOTE = (
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
     "No one can answer questions, approve requests or give input, so work toward the "
     "goal above on your own. Don't ask questions, wait for confirmation or stop to "
-    "request permission. When something is unclear, make a reasonable choice and keep "
-    "going. If an action needs approval or is denied, skip it and say so in your reply. "
-    "End with a reply that says what you did, what you assumed and anything you couldn't do."
+    "request permission. When something is unclear, make a reasonable assumption only "
+    "if it is easy to reverse and within the user's authorization. Record each "
+    "assumption, its basis and how easily it can be changed. For decisions that are "
+    "hard to reverse, involve significant trade-offs or would likely surprise the user, "
+    "record the options and your recommendation, and defer the affected work. Continue "
+    "independent work that does not depend on those decisions. If an action is denied or "
+    "requires unavailable approval, skip that action and explain the blocker. Continue "
+    "independent work and permitted alternatives. Do not change permission settings to "
+    "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
+    "prioritizing those the user is most likely to want to change, then summarize what "
+    "you did and anything you couldn't do."
 )
 
 
@@ -649,7 +664,7 @@ async def _run_fire_for_task(
     try:
         start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
-        conv = await _create_session(deps, effective)
+        conv = await _create_session(deps, effective, labels=_session_labels(task))
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
         _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
@@ -670,9 +685,9 @@ async def _run_fire_for_task(
             task.id,
             conv.id,
         )
+        await _discard_session(deps, conv)
         await recorder.finish(
             "failed",
-            conversation_id=conv.id,
             error="owner grant failed",
             error_code="owner_grant_failed",
         )
@@ -687,7 +702,7 @@ async def _run_fire_for_task(
             deps, stored, conv.id, host_id=None if managed else effective.host_id
         )
     except _SessionTaken:
-        await _discard_session(deps, conv.id)
+        await _discard_session(deps, conv)
         await recorder.finish(
             "skipped",
             error="another run already started the session this automation continues",
@@ -697,7 +712,7 @@ async def _run_fire_for_task(
     except _SessionNotRecorded as exc:
         # Running anyway would put this run's work in a session later runs never see.
         if exc.certain:
-            await _discard_session(deps, conv.id)
+            await _discard_session(deps, conv)
         await recorder.finish(
             "failed",
             error="could not record the session this automation continues",
@@ -746,7 +761,9 @@ async def _run_fire_for_task(
         return
 
     if hand_off:
-        await recorder.hand_off_managed(conv, effective, fire_dispatch.managed_start)
+        await recorder.hand_off_managed(
+            conv, replace(effective, workspace=task.workspace), fire_dispatch.managed_start
+        )
     else:
         await recorder.finish("running", conversation_id=conv.id)
     _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
@@ -880,14 +897,42 @@ async def continued_session_problem(
         return "the session runs a different agent", "continued_session_incompatible"
     # A pin the task changed since would otherwise be ignored silently: the
     # session keeps running where it was created.
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        recorded_worktree_root,
+        worktree_root_fingerprint,
+    )
+
+    fingerprint = conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+    own_worktree = (
+        task.base_branch is not None
+        and conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) == task.id
+        and task.workspace is not None
+        and conv.labels.get(SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY)
+        == worktree_root_fingerprint(task.workspace)
+        and conv.git_branch is not None
+        and conv.workspace is not None
+        and fingerprint is not None
+        and recorded_worktree_root(conv.workspace, fingerprint) is not None
+    )
+    if task.base_branch is not None and not own_worktree:
+        return (
+            "the session does not use this automation’s random worktree",
+            "continued_session_incompatible",
+        )
     if (task.host_id is not None and task.host_id != conv.host_id) or (
-        task.workspace is not None and task.workspace != conv.workspace
+        task.execution_target != "managed_sandbox"
+        and task.workspace is not None
+        and task.workspace != conv.workspace
+        and not own_worktree
     ):
         return (
             "the session runs on a different host or workspace than the automation pins",
             "continued_session_incompatible",
         )
     if task.execution_target == "managed_sandbox":
+        if read_managed_repo_workspaces(conv.labels) != _sandbox_workspaces(task):
+            return "the session uses a different repository", "continued_session_incompatible"
         if conv.host_id is None:
             # Hostless only while the task's own first run provisions its sandbox.
             # The origin label is server-set, so no other session can claim it.
@@ -981,17 +1026,34 @@ async def _keep_first_session(
     return True
 
 
-async def _discard_session(deps: FireDeps, conversation_id: str) -> None:
+async def _discard_session(deps: FireDeps, conv: Conversation) -> None:
     """Delete a first firing's session that lost to another run's, before anything ran in it.
 
     Deleting the session also drops its owner grant.
     """
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        recorded_worktree_root,
+    )
+    from omnigent.server.routes._sessions.helpers import _remove_session_worktree_best_effort
+
     try:
-        await deps.conversation_store.delete_conversation(conversation_id)
+        if conv.host_id and conv.workspace and conv.git_branch:
+            fingerprint = conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+            root = recorded_worktree_root(conv.workspace, fingerprint)
+            if fingerprint is not None and root is not None:
+                await _remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=root,
+                    branch=conv.git_branch,
+                    delete_branch=True,
+                    host_registry=deps.host_registry,
+                    reason="scheduled-unused-session",
+                    expected_root_fingerprint=fingerprint,
+                )
+        await deps.conversation_store.delete_conversation(conv.id)
     except Exception:
-        _logger.exception(
-            "scheduled fire: could not delete the unused session %s", conversation_id
-        )
+        _logger.exception("scheduled fire: could not delete the unused session %s", conv.id)
 
 
 async def _continued_host_binding(deps: FireDeps, task: ScheduledTask) -> tuple[str, str] | None:
@@ -1011,6 +1073,8 @@ async def _continued_host_binding(deps: FireDeps, task: ScheduledTask) -> tuple[
         deps.conversation_store.get_conversation, task.last_run_conversation_id
     )
     if earlier is None or earlier.host_id != host_id or earlier.workspace is None:
+        return None
+    if read_managed_repo_workspaces(earlier.labels) != _sandbox_workspaces(task):
         return None
     return host_id, earlier.workspace
 
@@ -1332,13 +1396,27 @@ async def _fire_project_id(deps: FireDeps, task: ScheduledTask) -> str | None:
     return project.id
 
 
+def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
+    """Repository selection, excluding stale directory pins from legacy sandbox tasks."""
+    if (
+        task.execution_target == "managed_sandbox"
+        and task.workspace is not None
+        and is_repo_workspace(task.workspace)
+    ):
+        return [task.workspace]
+    return []
+
+
 def _session_labels(task: ScheduledTask) -> dict[str, str]:
     """Labels a fired session starts with.
 
     A continue task's sandbox session records the host id it routes by, so a
     relaunched sandbox keeps connecting to the replica that owns that id.
     """
-    labels = {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id}
+    labels = {
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id,
+        **managed_repo_labels(_sandbox_workspaces(task)),
+    }
     if task.execution_target == "managed_sandbox" and task.session_mode == "continue":
         from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 
@@ -1346,41 +1424,123 @@ def _session_labels(task: ScheduledTask) -> dict[str, str]:
     return labels
 
 
-async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
+async def _create_session(
+    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+) -> Conversation:
+    # Host operations and database threads can commit after caller cancellation.
+    creation = asyncio.create_task(_create_session_resources(deps, task, labels=labels))
+    try:
+        return await asyncio.shield(creation)
+    except asyncio.CancelledError:
+
+        async def settle_and_discard() -> None:
+            try:
+                conv = await creation
+            except Exception:
+                _logger.exception("scheduled fire: cancelled session creation failed")
+            else:
+                await _discard_session(deps, conv)
+
+        cleanup = asyncio.create_task(settle_and_discard())
+        while not cleanup.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(cleanup)
+        cleanup.result()
+        raise
+
+
+async def _create_session_resources(
+    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
-    launch_args, permission_labels = await _permission_mode_launch_options(deps, task)
-    conv: Conversation = await asyncio.to_thread(
-        deps.conversation_store.create_conversation,
-        agent_id=task.agent_id,
-        title=task.name,
-        host_id=task.host_id,
-        workspace=task.workspace,
-        terminal_launch_args=launch_args,
-        labels={**_session_labels(task), **permission_labels},
-        project_id=await _fire_project_id(deps, task),
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        WorktreeHostUnavailableError,
+        WorktreeProxyError,
+        create_worktree_on_host,
+        worktree_root_fingerprint,
     )
-    reasoning_effort = task.reasoning_effort
-    if reasoning_effort is None:
-        reasoning_effort = await _spec_reasoning_effort(deps, task)
-    if task.model_override is not None or reasoning_effort is not None:
-        updated: Conversation | None = await asyncio.to_thread(
-            deps.conversation_store.update_conversation,
-            conv.id,
-            model_override=task.model_override,
-            reasoning_effort=reasoning_effort,
+
+    launch_args, permission_labels = await _permission_mode_launch_options(deps, task)
+    workspace = task.workspace
+    labels = {**labels, **permission_labels}
+    worktree = None
+    if task.base_branch is not None:
+        if task.execution_target != "connected_host" or not task.host_id or not workspace:
+            raise ValueError("random worktree requires a connected host and repository workspace")
+        host_conn = deps.host_registry.get(task.host_id) if deps.host_registry else None
+        if host_conn is None:
+            raise _CannotLaunchScheduledFire(
+                "connected host is not online", error_code="host_offline"
+            )
+        assert deps.host_registry is not None
+        try:
+            worktree = await create_worktree_on_host(
+                host_registry=deps.host_registry,
+                host_conn=host_conn,
+                repo_path=workspace,
+                branch_name=f"worktree-{uuid.uuid4().hex[:12]}",
+                base_branch=task.base_branch,
+            )
+        except WorktreeHostUnavailableError as exc:
+            raise _CannotLaunchScheduledFire(str(exc), error_code="host_offline") from exc
+        except WorktreeProxyError as exc:
+            raise _CannotLaunchScheduledFire(
+                str(exc), error_code="worktree_create_failed"
+            ) from exc
+        labels[SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY] = worktree_root_fingerprint(workspace)
+        workspace = worktree.workspace or worktree.worktree_path
+        labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
+    conv: Conversation | None = None
+    try:
+        conv = await asyncio.to_thread(
+            deps.conversation_store.create_conversation,
+            agent_id=task.agent_id,
+            title=task.name,
+            host_id=task.host_id,
+            workspace=workspace,
+            git_branch=worktree.branch if worktree else None,
+            terminal_launch_args=launch_args,
+            labels=labels,
+            project_id=await _fire_project_id(deps, task),
         )
-        if updated is not None:
-            conv = updated
-    # Stamp terminal-first presentation labels the interactive create path would
-    # have set, so a fired session on a terminal harness exposes the
-    # Chat/Terminal switcher instead of rendering Chat-only. Stamped last (after
-    # the override reload above) so the labels land on the conversation returned
-    # to the launch/dispatch caller, not a stale pre-label reload of it.
-    labels = await _presentation_labels(deps, task)
-    if labels:
-        await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
-        conv.labels.update(labels)
-    return conv
+        reasoning_effort = task.reasoning_effort
+        if reasoning_effort is None:
+            reasoning_effort = await _spec_reasoning_effort(deps, task)
+        if task.model_override is not None or reasoning_effort is not None:
+            updated: Conversation | None = await asyncio.to_thread(
+                deps.conversation_store.update_conversation,
+                conv.id,
+                model_override=task.model_override,
+                reasoning_effort=reasoning_effort,
+            )
+            if updated is not None:
+                conv = updated
+        # Mirror the interactive path's terminal labels after reloading overrides
+        # so the returned conversation carries the Chat/Terminal presentation.
+        labels = await _presentation_labels(deps, task)
+        if labels:
+            await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
+            conv.labels.update(labels)
+        return conv
+    except Exception:
+        if conv is not None:
+            await _discard_session(deps, conv)
+        elif worktree is not None:
+            from omnigent.server.routes._sessions.helpers import (
+                _remove_session_worktree_best_effort,
+            )
+
+            assert task.host_id is not None
+            await _remove_session_worktree_best_effort(
+                host_id=task.host_id,
+                worktree_path=worktree.worktree_path,
+                branch=worktree.branch,
+                delete_branch=True,
+                host_registry=deps.host_registry,
+                reason="scheduled-create-rollback",
+            )
+        raise
 
 
 _COST_BUDGET_HANDLER = "omnigent.policies.builtins.cost.cost_budget"
@@ -1954,7 +2114,9 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
                     session_id=conv.id,
                     owner=task.user_id or RESERVED_USER_LOCAL,
                     sandbox_config=deps.sandbox_config,
-                    repos=(),
+                    repos=tuple(
+                        parse_repo_workspace(value) for value in _sandbox_workspaces(task)
+                    ),
                     tracker=tracker,
                     conversation_store=deps.conversation_store,
                     host_store=deps.host_store,
