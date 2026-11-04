@@ -67,6 +67,10 @@ class LoginError(Exception):
         self.status = status
 
 
+class _PartialDelivery(LoginError):
+    """Part of a redirect reached the CLI's input, so sending it again would garble it."""
+
+
 def harness_server_name(server: ConfiguredMcpServer) -> str | None:
     """The name the harness CLI uses for *server*, or ``None`` if it can't log in to it."""
     summary = server.summary
@@ -281,18 +285,19 @@ async def _write_all(terminal: Callable[[], int], data: bytes) -> None:
     """Write *data* to ``terminal()``, which is -1 once the sign-in has ended."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + CALLBACK_TIMEOUT_SECONDS
-    while data:
+    written = 0
+    while written < len(data):
         # A finished sign-in closes its terminal, and the OS may reuse the number.
         if (master_fd := terminal()) < 0:
             raise LoginError("invalid", "This sign-in is no longer waiting")
         try:
-            data = data[os.write(master_fd, data) :]
-        except BlockingIOError:
-            if loop.time() > deadline:
-                raise LoginError("failed", "Couldn't hand the address to the harness") from None
-            await asyncio.sleep(0.02)
-        except OSError:
-            raise LoginError("failed", "Couldn't hand the address to the harness") from None
+            written += os.write(master_fd, data[written:])
+        except OSError as error:
+            if isinstance(error, BlockingIOError) and loop.time() <= deadline:
+                await asyncio.sleep(0.02)
+                continue
+            failure = _PartialDelivery if written else LoginError
+            raise failure("failed", "Couldn't hand the address to the harness") from None
 
 
 @dataclass
@@ -543,6 +548,9 @@ class HostMcpLogins:
         login.delivered = True
         try:
             await _deliver_callback(login.terminal, callback_url)
+        except _PartialDelivery as error:
+            await self._finish(login, "failed", str(error))
+            return login.status()
         except BaseException:
             # The code went unused, so the user may paste it again.
             login.delivered = False

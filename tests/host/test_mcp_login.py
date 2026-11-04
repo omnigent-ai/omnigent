@@ -306,19 +306,29 @@ async def test_redirect_written_to_a_busy_terminal_arrives_whole(
         assert ended.value.status == "invalid"
         assert os.read(read_fd, 100) == b"y" * 10
 
+        # Past the deadline, a write that stopped partway can't be retried.
         monkeypatch.setattr(mcp_login.os, "write", short_write)
+        monkeypatch.setattr(mcp_login, "CALLBACK_TIMEOUT_SECONDS", -1.0)
         terminal = write_fd
+        calls.clear()
+        with pytest.raises(mcp_login._PartialDelivery) as partial:
+            await mcp_login._write_all(lambda: terminal, b"z" * 25)
+        assert partial.value.status == "failed"
+        assert os.read(read_fd, 100) == b"z" * 10
+
         os.close(read_fd)
         calls.clear()
         with pytest.raises(LoginError) as failed:
             await mcp_login._write_all(lambda: terminal, b"x")
         assert failed.value.status == "failed"
+        assert not isinstance(failed.value, mcp_login._PartialDelivery)
     finally:
         os.close(write_fd)
 
 
+@pytest.mark.parametrize("no_listener", [httpx.ConnectError, httpx.ConnectTimeout])
 async def test_sign_in_that_ends_during_delivery_gets_no_redirect(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, no_listener: type[httpx.TransportError]
 ) -> None:
     # The pipe stands in for a file that reused the closed terminal's number.
     read_fd, reused_fd = os.pipe()
@@ -327,7 +337,7 @@ async def test_sign_in_that_ends_during_delivery_gets_no_redirect(
     async def sign_in_ends_meanwhile(*_args: object, **_kwargs: object) -> None:
         nonlocal terminal
         terminal = -1
-        raise httpx.ConnectError("no listener")
+        raise no_listener("no listener")
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", sign_in_ends_meanwhile)
     try:
@@ -420,11 +430,12 @@ async def test_redirect_is_resent_only_after_a_failed_delivery(
     fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
 ) -> None:
     delivered: list[str] = []
+    failures = [LoginError("failed", "Couldn't hand the address to the harness")]
 
     async def deliver(terminal: Callable[[], int], callback_url: str) -> None:
         delivered.append(callback_url)
-        if len(delivered) == 1:
-            raise LoginError("failed", "Couldn't hand the address to the harness")
+        if failures:
+            raise failures.pop()
 
     monkeypatch.setattr(mcp_login, "_deliver_callback", deliver)
     logins = host_logins()
@@ -439,6 +450,22 @@ async def test_redirect_is_resent_only_after_a_failed_delivery(
         await logins.submit(started["login_id"], callback)
     assert repeated.value.status == "invalid"
     assert delivered == [callback, callback]
+
+    # Part of the address reached the CLI, so sending it again would garble it.
+    other = await logins.start(_server("other"))
+    pid = logins._logins[other["login_id"]].process.pid
+    failures.append(
+        mcp_login._PartialDelivery("failed", "Couldn't hand the address to the harness")
+    )
+    ended = await logins.submit(other["login_id"], callback)
+    assert (ended["state"], ended["error"]) == (
+        "failed",
+        "Couldn't hand the address to the harness",
+    )
+    await _assert_gone(pid)
+    with pytest.raises(LoginError) as refused:
+        await logins.submit(other["login_id"], callback)
+    assert refused.value.status == "invalid"
 
 
 @pytest.mark.parametrize(
