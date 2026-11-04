@@ -6,6 +6,7 @@ import {
   RECONCILE_MAX_GAP_MS,
   RECONCILE_MIN_GAP_MS,
   RECONCILE_ROUND_TIMEOUT_MS,
+  RECONCILE_WHILE_ACTIVE_MS,
 } from "./listReconcileScheduler";
 
 /** A round whose completion the test controls. */
@@ -132,6 +133,41 @@ describe("createListReconcileScheduler", () => {
     scheduler.schedule();
     await vi.advanceTimersByTimeAsync(RECONCILE_MIN_GAP_MS);
     expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it("runs a round for activity only once the last round is a minute old", async () => {
+    const run = vi.fn(async () => {});
+    const scheduler = createListReconcileScheduler(run);
+
+    await vi.advanceTimersByTimeAsync(RECONCILE_WHILE_ACTIVE_MS - 1);
+    scheduler.noteActivity();
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    expect(run).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    scheduler.noteActivity();
+    scheduler.noteActivity();
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    expect(run).toHaveBeenCalledTimes(1);
+
+    // That round restarts the minute.
+    await vi.advanceTimersByTimeAsync(RECONCILE_WHILE_ACTIVE_MS - RECONCILE_DEBOUNCE_MS - 1);
+    scheduler.noteActivity();
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts a requested round toward the activity minute", async () => {
+    const run = vi.fn(async () => {});
+    const scheduler = createListReconcileScheduler(run);
+
+    await vi.advanceTimersByTimeAsync(RECONCILE_WHILE_ACTIVE_MS / 2);
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(RECONCILE_WHILE_ACTIVE_MS / 2);
+    scheduler.noteActivity();
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    expect(run).toHaveBeenCalledTimes(1);
   });
 
   it("never runs a round requested before disposal", async () => {

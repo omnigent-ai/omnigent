@@ -521,6 +521,41 @@ describe("SessionUpdatesProvider list invalidation", () => {
     }
   });
 
+  it("still reconciles the lists once a minute while frames keep arriving", () => {
+    // Each frame's cache write restarts the lists' own polls, so a steadily
+    // running session would otherwise keep new and out-of-window sessions
+    // from ever appearing.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+      const tick = (updatedAt: number) => {
+        act(() => handler({ type: "changed", items: [{ id: "conv_b", updated_at: updatedAt }] }));
+        act(() => vi.advanceTimersByTime(10_000));
+      };
+
+      // Frames at 0 s … 50 s.
+      for (let t = 1; t <= 6; t += 1) tick(t);
+      expect(listInvalidations(invalidate)).toEqual([]);
+
+      tick(7); // 60 s
+      expect(invalidate).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: ["conversations"] }),
+      );
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+      const firstRound = listInvalidations(invalidate).length;
+
+      // 70 s … 110 s: within a minute of that round.
+      for (let t = 8; t <= 12; t += 1) tick(t);
+      expect(listInvalidations(invalidate)).toHaveLength(firstRound);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not treat a watched sub-agent child as a new session", () => {
     // Children are watched for their tree views but never appear in a list,
     // so their changes must not trigger a list refetch.

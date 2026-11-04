@@ -4,6 +4,12 @@
 // slow server. Requests that arrive during a round collapse into one trailing
 // round, and rounds are spaced further apart the longer they take; a round that
 // never settles is released after a timeout.
+//
+// Frames also starve the lists' own polls: TanStack Query restarts a query's
+// refetchInterval on every cache write, and each frame writes the list caches.
+// So while frames keep arriving, a round still runs every
+// RECONCILE_WHILE_ACTIVE_MS to pick up sessions no frame covers (new, or
+// outside the loaded window).
 
 /** Delay before a round, so a burst of frames triggers one. */
 export const RECONCILE_DEBOUNCE_MS = 250;
@@ -17,10 +23,14 @@ export const RECONCILE_MAX_GAP_MS = 30_000;
  * it was waiting on.
  */
 export const RECONCILE_ROUND_TIMEOUT_MS = 60_000;
+/** Longest the lists go without a round while frames keep arriving; the Mine poll's interval. */
+export const RECONCILE_WHILE_ACTIVE_MS = 60_000;
 
 export interface ListReconcileScheduler {
   /** Ask for a reconcile; coalesced with any pending or running one. */
   schedule: () => void;
+  /** Record a frame; asks for a reconcile if none started in RECONCILE_WHILE_ACTIVE_MS. */
+  noteActivity: () => void;
   /** Drop a pending reconcile and stop scheduling new ones. */
   dispose: () => void;
 }
@@ -39,10 +49,13 @@ export function createListReconcileScheduler(
   let disposed = false;
   let lastEnd = Number.NEGATIVE_INFINITY;
   let lastDuration = 0;
+  // The lists were just loaded when the stream starts, so that counts as a round.
+  let lastStart = now();
 
   const fire = async (): Promise<void> => {
     running = true;
     const started = now();
+    lastStart = started;
     let roundTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -83,6 +96,9 @@ export function createListReconcileScheduler(
 
   return {
     schedule,
+    noteActivity() {
+      if (now() - lastStart >= RECONCILE_WHILE_ACTIVE_MS) schedule();
+    },
     dispose() {
       disposed = true;
       pending = false;

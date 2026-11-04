@@ -433,6 +433,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             ? missingIds.filter((id) => id !== activeIdRef.current)
             : missingIds;
           if (sidebarMissingIds.length > 0 || needsRefetch) scheduleInvalidate();
+          else reconciler.noteActivity();
           return;
         }
       }
