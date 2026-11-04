@@ -804,7 +804,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         last_op: dict[str, str] = {}
         by_path: dict[str, _FileEvent] = {}
         for e in events:
-            if "" in excluded_roots or e.path.split("/", 1)[0] in excluded_roots:
+            parts = Path(e.path).parts
+            if "" in excluded_roots or any(
+                "/".join(parts[:depth]) in excluded_roots for depth in range(1, len(parts) + 1)
+            ):
                 continue
             # Ephemeral artifacts are filtered here as a second line of defence
             # (events injected without record_change, e.g. in tests). Harness
@@ -1494,7 +1497,7 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
         reader._run_repository_git = bounded_run
         return reader
 
-    def _repository_roots(self) -> dict[str, Path]:
+    def _repository_roots(self, conversation_id: str) -> dict[str, Path]:
         if (self._cwd / ".git").exists() and _is_git_repo(self._cwd):
             return {"": self._cwd}
         roots = {}
@@ -1511,6 +1514,17 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
                         roots[entry.name] = root
                         if len(roots) > 32:
                             raise GitStatusUnavailable("Workspace exceeds 32 repositories")
+            # Deeper repositories are found only from files this session changed.
+            with self._lock:
+                events = list(self._session_events.get(conversation_id, []))
+            for directory in sorted({Path(event.path).parent for event in events}):
+                if time.monotonic() > deadline:
+                    raise GitStatusUnavailable("Repository discovery limit exceeded")
+                owner = self._nearest_repository(directory)
+                if owner is not None and owner[0] not in roots:
+                    roots[owner[0]] = owner[1]
+                    if len(roots) > 32:
+                        raise GitStatusUnavailable("Workspace exceeds 32 repositories")
         except OSError as exc:
             raise GitStatusUnavailable("Repository discovery could not complete") from exc
         return roots
@@ -1521,11 +1535,16 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
             return None
         if (self._cwd / ".git").exists() and _is_git_repo(self._cwd):
             return "", self._cwd
-        parts = Path(norm).parts
-        if len(parts) < 2 or parts[0] in _SKIP_DIRS:
-            return None
-        root = self._cwd / parts[0]
-        return (parts[0], root) if not root.is_symlink() and (root / ".git").exists() else None
+        return self._nearest_repository(Path(norm).parent)
+
+    def _nearest_repository(self, directory: Path) -> tuple[str, Path] | None:
+        parts = directory.parts
+        searchable = next((i for i, part in enumerate(parts) if part in _SKIP_DIRS), len(parts))
+        for depth in range(searchable, 0, -1):
+            root = self._cwd.joinpath(*parts[:depth])
+            if not root.is_symlink() and (root / ".git").exists():
+                return "/".join(parts[:depth]), root
+        return None
 
     def _reader(self, root: Path) -> GitFilesystemRegistry:
         if self._run_repository_git is None:
@@ -1544,7 +1563,7 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
         )
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
-        roots = self._repository_roots()
+        roots = self._repository_roots(conversation_id)
         records = self._list_observed_files(conversation_id, limit=10_001, excluded_roots=roots)
         for prefix, root in sorted(roots.items()):
             try:

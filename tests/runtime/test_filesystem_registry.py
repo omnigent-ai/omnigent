@@ -1558,6 +1558,48 @@ def test_multi_repo_parent_preserves_head_changes_and_recovers_without_hooks(
     assert reader.get_baseline("unborn/new.txt") is None
 
 
+def test_nested_worktree_changes_follow_git_after_a_shell_rename(tmp_path: Path) -> None:
+    project = tmp_path / "code" / "project"
+    (project / "src").mkdir(parents=True)
+    _init_git_with_commit(project, "src/old_name.py", "def greet():\n    return 'hi'\n")
+    _trusted_test_git(
+        ["worktree", "add", "-b", "feature", "../project-wt"], project, 5
+    ).check_returncode()
+    worktree = tmp_path / "code" / "project-wt"
+    old, new = "code/project-wt/src/old_name.py", "code/project-wt/src/new_name.py"
+    registry = create_filesystem_registry(tmp_path)
+    assert isinstance(registry, MultiRepositoryFilesystemRegistry)
+    calls: list[Path] = []
+
+    def run_git(argv: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[bytes]:
+        calls.append(cwd)
+        return _trusted_test_git(argv, cwd, timeout)
+
+    reader = registry.with_git_runner(run_git)
+    (worktree / "src" / "old_name.py").write_text("def greet():\n    return 'hello world'\n")
+    registry.record_change(old, "modified", "session")
+
+    # The agent renames the file from its shell, which records nothing.
+    _trusted_test_git(["mv", "src/old_name.py", "src/new_name.py"], worktree, 5).check_returncode()
+    changes = reader.list_changed_files("session", limit=100)
+    assert [(r["path"], r["status"], r.get("repository_root")) for r in changes] == [
+        (new, "modified", "code/project-wt")
+    ]
+    assert set(calls) == {worktree}
+    stale = reader.get_changed_file("session", old)
+    assert stale is not None
+    assert (stale["status"], stale["repository_root"]) == ("deleted", "code/project-wt")
+
+    _trusted_test_git(["commit", "-am", "rename"], worktree, 5).check_returncode()
+    assert reader.list_changed_files("session", limit=100) == []
+    (worktree / "src" / "new_name.py").write_text("next edit\n")
+    assert not registry.needs_snapshot(new)
+    cold = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(_trusted_test_git)
+    record = cold.get_changed_file("session", new)
+    assert record is not None and record["repository_root"] == "code/project-wt"
+    assert cold.get_baseline(new) == "def greet():\n    return 'hello world'\n"
+
+
 @pytest.mark.parametrize("repository_count", [1, 4, 8])
 def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repository_count: int
@@ -1588,7 +1630,7 @@ def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     calls.clear()
     cold = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(run_git)
     monkeypatch.setattr(
-        cold, "_repository_roots", lambda: pytest.fail("scoped read scanned siblings")
+        cold, "_repository_roots", lambda _session: pytest.fail("scoped read scanned siblings")
     )
     record = cold.get_changed_file("session", "repo-0/same.txt")
     assert record is not None and record["repository_root"] == "repo-0"
@@ -1596,15 +1638,19 @@ def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     assert calls == [("status", tmp_path / "repo-0"), ("show", tmp_path / "repo-0")]
 
 
-@pytest.mark.parametrize("boundary", ["repositories", "entries", "time"])
+@pytest.mark.parametrize("boundary", ["repositories", "nested_repositories", "entries", "time"])
 def test_multi_repo_discovery_bounds_fail_without_partial_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
 ) -> None:
-    for index in range(33):
-        (tmp_path / str(index) / ".git").mkdir(parents=True)
     reader = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(
         lambda *_args: pytest.fail("discovery must finish before running Git")
     )
+    for index in range(33):
+        if boundary == "nested_repositories":
+            (tmp_path / "group" / str(index) / ".git").mkdir(parents=True)
+            reader.record_change(f"group/{index}/file.txt", "modified", "session")
+        else:
+            (tmp_path / str(index) / ".git").mkdir(parents=True)
     with monkeypatch.context() as patches:
         patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: 0)
         if boundary == "entries":
