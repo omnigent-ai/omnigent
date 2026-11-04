@@ -246,3 +246,22 @@ def install_managed_sandbox(
         ),
     )
     return host_store, launcher
+
+
+async def continue_session(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    source_id: str,
+    command: str,
+) -> httpx.Response:
+    """Run claude-sdk ``/clear``, or ``/rewind`` to the second prompt, on *source_id*.
+
+    :param command: ``"clear"`` or ``"rewind"``.
+    :returns: The response, whose ``session_id`` names the new session on success.
+    """
+    if command == "clear":
+        return await client.post(
+            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+        )
+    second_prompt = store.list_items(source_id).data[2].id
+    return await client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": second_prompt})

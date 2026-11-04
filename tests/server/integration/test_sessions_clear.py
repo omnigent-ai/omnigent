@@ -15,7 +15,6 @@ import asyncio
 import contextlib
 import json
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -31,7 +30,6 @@ from omnigent.db.db_models import SqlAgent, SqlConversation, current_workspace_i
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import HostHelloFrame
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -45,7 +43,6 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
-from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core, routes_events
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.sharing_settings import DefaultPublicSessions
@@ -377,60 +374,6 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
     assert not orchestration._session_is_starting(source_id)
 
 
-@pytest.mark.parametrize(
-    ("deleted_first", "survivor_archived"),
-    [
-        pytest.param("original", False, id="original"),
-        pytest.param("continuation", False, id="continuation"),
-        pytest.param("original", True, id="original-archived-survivor"),
-    ],
-)
-async def test_deleting_one_side_of_a_clear_keeps_their_shared_sandbox(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-    deleted_first: str,
-    survivor_archived: bool,
-) -> None:
-    """Both sessions of a ``/clear`` work in one managed sandbox.
-
-    Deleting either leaves the other bound to the host and the sandbox
-    running, even when the survivor is archived; deleting the last one still
-    tears the sandbox down.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    host_store, launcher = install_managed_sandbox(app, db_uri, monkeypatch)
-    source_id = await create_placed_session(client, store)
-    cleared = await client.post(
-        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
-    )
-    assert cleared.status_code == 202, cleared.text
-    new_id = cleared.json()["session_id"]
-    first, last = (source_id, new_id) if deleted_first == "original" else (new_id, source_id)
-    if survivor_archived:
-        monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
-        archived = await client.patch(f"/v1/sessions/{last}", json={"archived": True})
-        assert archived.status_code == 200, archived.text
-        await asyncio.gather(*list(orchestration._detached_stop_tasks), return_exceptions=True)
-
-    deleted = await client.delete(f"/v1/sessions/{first}")
-
-    assert deleted.status_code == 200, deleted.text
-    survivor = store.get_conversation(last)
-    assert survivor is not None and survivor.host_id == _HOST_ID
-    assert host_store.get_host(_HOST_ID) is not None
-    assert launcher.terminated == []
-
-    deleted = await client.delete(f"/v1/sessions/{last}")
-
-    assert deleted.status_code == 200, deleted.text
-    assert launcher.terminated == ["sb-clear"]
-    assert host_store.get_host(_HOST_ID) is None
-
-
 async def test_stopping_or_archiving_the_original_leaves_the_continuation_running(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -472,121 +415,6 @@ async def test_stopping_or_archiving_the_original_leaves_the_continuation_runnin
     original = store.get_conversation(source_id)
     assert original is not None
     assert (original.runner_id, original.host_id) == (None, _HOST_ID)
-
-
-@dataclass
-class Handoff:
-    """The app and client a clear runs on, with a live runner installed."""
-
-    app: FastAPI
-    client: httpx.AsyncClient
-    owner: str | None
-
-
-@pytest.fixture
-def handoff(request: pytest.FixtureRequest) -> Handoff:
-    """Signed in as ``request.param`` on the app with permissions, else the shared app.
-
-    A sync fixture, so it can pick the async app fixtures before the test's loop runs.
-    """
-    owner: str | None = getattr(request, "param", None)
-    prefix = "auth_" if owner is not None else ""
-    client: httpx.AsyncClient = request.getfixturevalue(f"{prefix}client")
-    request.getfixturevalue(f"{prefix}live_runner")
-    if owner is not None:
-        client.headers["X-Forwarded-Email"] = owner
-    return Handoff(app=request.getfixturevalue(f"{prefix}app"), client=client, owner=owner)
-
-
-@pytest.mark.parametrize(
-    ("deleted", "handoff"),
-    [
-        ("before_fork", None),
-        ("after_fork", None),
-        # Signed in with the runner offline: nothing but the copied sharing
-        # gives the owner the continuation, and the deleted original has none.
-        ("after_fork", _OWNER),
-        ("after_fork_then_failure", None),
-        ("not_then_failure", None),
-    ],
-    indirect=["handoff"],
-)
-async def test_deleting_the_original_during_the_handoff_never_strands_the_continuation(
-    handoff: Handoff,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-    deleted: str,
-) -> None:
-    """A delete of the original racing the clear never leaves a sandbox-less continuation.
-
-    Once the continuation exists it already holds the host, so the delete keeps
-    the sandbox; a delete that lands first leaves no continuation behind. If
-    the continuation then fails to be placed, or no one would own it, removing
-    it releases the sandbox it was the last user of, but not one the original
-    still uses.
-    """
-    app, client, owner = handoff.app, handoff.client, handoff.owner
-    signed_in = owner is not None
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    host_store, launcher = install_managed_sandbox(app, db_uri, monkeypatch)
-    source_id = await create_placed_session(
-        client, store, runner_id=None if signed_in else _RUNNER_ID, user=owner
-    )
-    before = len((await client.get("/v1/sessions")).json()["data"])
-    if deleted.endswith("then_failure"):
-        resolve_runner = sessions_module._get_runner_client
-
-        async def reject_the_continuation(session_id: str, *args: Any, **kwargs: Any) -> Any:
-            if session_id != source_id:
-                raise OmnigentError(
-                    "the runner rejected the new session", code=ErrorCode.RUNNER_UNAVAILABLE
-                )
-            return await resolve_runner(session_id, *args, **kwargs)
-
-        monkeypatch.setattr(sessions_module, "_get_runner_client", reject_the_continuation)
-    loop = asyncio.get_running_loop()
-    paused, resume = asyncio.Event(), threading.Event()
-    fork = SqlAlchemyConversationStore.fork_conversation
-
-    def fork_around_the_delete(self: Any, *args: Any, **kwargs: Any) -> Any:
-        forked = fork(self, *args, **kwargs) if deleted != "before_fork" else None
-        loop.call_soon_threadsafe(paused.set)
-        assert resume.wait(timeout=10)
-        return forked if forked is not None else fork(self, *args, **kwargs)
-
-    monkeypatch.setattr(SqlAlchemyConversationStore, "fork_conversation", fork_around_the_delete)
-    clearing = asyncio.create_task(
-        client.post(f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}})
-    )
-    await asyncio.wait_for(paused.wait(), timeout=10)
-    if deleted != "not_then_failure":
-        removed = await client.delete(f"/v1/sessions/{source_id}")
-        assert removed.status_code == 200, removed.text
-    resume.set()
-    cleared = await asyncio.wait_for(clearing, timeout=10)
-
-    if deleted == "not_then_failure":
-        # The original still uses the sandbox, so only the continuation goes.
-        assert cleared.status_code >= 400, cleared.text
-        assert len((await client.get("/v1/sessions")).json()["data"]) == before
-        original = store.get_conversation(source_id)
-        assert original is not None and original.host_id == _HOST_ID
-        assert host_store.get_host(_HOST_ID) is not None
-        assert launcher.terminated == []
-        return
-    if deleted != "after_fork" or signed_in:
-        # No session is left on the sandbox, so it is torn down.
-        assert cleared.status_code >= 400, cleared.text
-        assert len((await client.get("/v1/sessions")).json()["data"]) == before - 1
-        assert launcher.terminated == ["sb-clear"]
-        assert host_store.get_host(_HOST_ID) is None
-        return
-    assert cleared.status_code == 202, cleared.text
-    continuation = store.get_conversation(cleared.json()["session_id"])
-    assert continuation is not None and continuation.host_id == _HOST_ID
-    assert host_store.get_host(_HOST_ID) is not None
-    assert launcher.terminated == []
 
 
 @pytest.mark.parametrize("cancelled_during", ["fork", "runner_binding"])
@@ -764,150 +592,37 @@ async def test_claude_sdk_clear_still_redirects_when_the_notice_is_lost(
     assert message_texts(store, source_id) == ["Q1", "A1", "Q2", "A2"]
 
 
-@pytest.mark.parametrize(
-    ("runner_id", "host_live", "runner_reachable"),
-    [
-        pytest.param("runner_gone", False, True, id="offline"),
-        pytest.param("runner_gone", True, True, id="on-another-replica"),
-        pytest.param(_RUNNER_ID, True, False, id="moved-before-release"),
-    ],
-)
-async def test_claude_sdk_clear_tells_an_offline_runner_from_one_on_another_replica(
+async def test_claude_sdk_clear_re_addresses_a_runner_that_moved_before_release(
     app: FastAPI,
     client: httpx.AsyncClient,
     db_uri: str,
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
-    runner_id: str,
-    host_live: bool,
-    runner_reachable: bool,
 ) -> None:
-    """An offline runner leaves the new session on the host, which relaunches it on send.
+    """A runner that moved to another replica before the release is re-addressed.
 
-    A runner absent here whose host is live elsewhere is on another replica, so
-    ``clear`` re-addresses there before anything is created.
+    It is still registered here but unreachable, and its host is live
+    elsewhere. The offline and other-replica cases shared with ``/rewind`` are
+    in ``test_sessions_continuation.py``.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store, runner_id=runner_id)
+    source_id = await create_placed_session(client, store)
     host_store = HostStore(db_uri)
     host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
-    if not host_live:
-        host_store.set_offline(_HOST_ID)
     monkeypatch.setattr(app.state, "host_store", host_store)
-    if not runner_reachable:
-        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
-        monkeypatch.setattr(omnigent.runtime, "get_runner_client", lambda: None)
-    before = len((await client.get("/v1/sessions")).json()["data"])
-
-    resp = await client.post(
-        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
-    )
-
-    if host_live:
-        assert resp.status_code == 400, resp.text
-        assert "wrong_replica" in resp.text
-        assert len((await client.get("/v1/sessions")).json()["data"]) == before
-        assert clear_requests(live_runner) == []
-        assert live_runner.superseded == []
-        return
-    assert resp.status_code == 202, resp.text
-    new_id = resp.json()["session_id"]
-    fork = store.get_conversation(new_id)
-    assert fork is not None
-    assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
-
-    # Its next message asks the original host to launch a runner in the same workspace.
-    app.state.host_registry.register(
-        _HOST_ID,
-        AsyncMock(),
-        HostHelloFrame(version="test", frame_protocol_version=1, name="laptop", runners=[]),
-        owner=None,
-    )
     monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
-    launches: list[tuple[str, str | None, str | None]] = []
-
-    async def launch_runner_on_host(conv: Any, *_args: Any, **_kwargs: Any) -> Any:
-        launches.append((conv.id, conv.host_id, conv.workspace))
-        return _HostLaunchAttempt(
-            runner_id="runner_relaunched", error_code="harness_not_configured", error="stop here"
-        )
-
-    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", launch_runner_on_host)
-    sent = await client.post(f"/v1/sessions/{new_id}/events", json=_MESSAGE_INPUT)
-    assert sent.status_code == 202, sent.text
-    assert launches == [(new_id, _HOST_ID, "/work/repo")]
-
-
-@pytest.mark.parametrize(
-    ("left", "host"),
-    [
-        pytest.param("before_validation", True, id="before_validation-host-bound"),
-        pytest.param("before_validation", False, id="before_validation-runner-only"),
-        pytest.param("after_validation", True, id="after_validation-host-bound"),
-        pytest.param("after_validation", False, id="after_validation-runner-only"),
-        # Only a host tells another replica's runner apart from a gone one.
-        pytest.param("to_another_replica", True, id="to_another_replica-host-bound"),
-    ],
-)
-async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-    host: bool,
-    left: str,
-) -> None:
-    """A runner that disconnects after the check leaves no half-made session.
-
-    Whether it leaves before the new session's runner is validated or just
-    after (when binding still reports success), a host-bound session continues
-    on the host alone; otherwise the new session is removed, so a retry does
-    not leave a second copy. A runner that reconnected to another replica is
-    re-addressed there instead.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store, host=host)
-    if left == "after_validation":
-        resolve_runner = sessions_module._get_runner_client
-
-        async def lose_runner_at_lookup(session_id: str, *args: Any, **kwargs: Any) -> Any:
-            if session_id != source_id:
-                app.state.tunnel_registry.deregister(_RUNNER_ID)
-                return None
-            return await resolve_runner(session_id, *args, **kwargs)
-
-        monkeypatch.setattr(sessions_module, "_get_runner_client", lose_runner_at_lookup)
-    else:
-        live_runner.on_clear = lambda: app.state.tunnel_registry.deregister(_RUNNER_ID)
-    if left == "to_another_replica":
-        host_store = HostStore(db_uri)
-        host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
-        monkeypatch.setattr(app.state, "host_store", host_store)
+    monkeypatch.setattr(omnigent.runtime, "get_runner_client", lambda: None)
     before = len((await client.get("/v1/sessions")).json()["data"])
 
     resp = await client.post(
         f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
     )
 
-    if left == "to_another_replica":
-        assert resp.status_code == 400, resp.text
-        assert "wrong_replica" in resp.text
-    elif host:
-        assert resp.status_code == 202, resp.text
-        new_id = resp.json()["session_id"]
-        fork = store.get_conversation(new_id)
-        assert fork is not None
-        # Placed on the host alone, holding no runner that went away.
-        assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
-        assert live_runner.superseded == [(source_id, new_id, "clear")]
-        return
-    else:
-        assert resp.status_code == 503, resp.text
-        assert "runner is offline" in resp.text
+    assert resp.status_code == 400, resp.text
+    assert "wrong_replica" in resp.text
     assert len((await client.get("/v1/sessions")).json()["data"]) == before
+    assert clear_requests(live_runner) == []
     assert live_runner.superseded == []
 
 
