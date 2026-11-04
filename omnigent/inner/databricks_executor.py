@@ -958,11 +958,14 @@ def _resolve_databricks_auth_for_host(
 def _databrickscfg_path() -> Path:
     """Return the Databricks config file the SDK and CLI read.
 
-    :returns: ``$DATABRICKS_CONFIG_FILE`` when set, else ``~/.databrickscfg``.
+    :returns: ``$DATABRICKS_CONFIG_FILE`` when set, else ``~/.databrickscfg``,
+        with a leading ``~`` expanded as the SDK does.
     """
     from pathlib import Path
 
-    return Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    return Path(
+        os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg")
+    ).expanduser()
 
 
 def _databrickscfg_fingerprint() -> tuple[int, int, int, int] | None:

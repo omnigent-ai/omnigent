@@ -3134,60 +3134,43 @@ def test_reused_token_source_logs_first_failure_until_resolution_succeeds(monkey
     ]
 
 
+@pytest.mark.parametrize("config_file_env", ["absolute", "tilde"])
 def test_reused_token_source_picks_up_a_rotated_pat_profile(
-    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+    config_file_env: str,
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
 ) -> None:
     """A PAT profile rewritten on disk is served on the next mint, without a restart.
 
     The profile is reached through a symlink and replaced atomically, the way a
     credential agent rotates a short-lived token behind ``~/.databrickscfg``.
+    The ``tilde`` case sets ``DATABRICKS_CONFIG_FILE`` to a literal
+    ``~/.databrickscfg``, which the SDK expands.
     """
-    import configparser
+    from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
 
-    from omnigent.inner.databricks_executor import (
-        _DatabricksBearerAuth,
-        _ReusedDatabricksTokenSource,
-    )
+    write_profile, resolve = _rotating_pat_profile(tmp_path, monkeypatch)
+    if config_file_env == "tilde":
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", "~/.databrickscfg")
+    resolutions: list[object] = []
 
-    target = tmp_path / "credentials" / "databrickscfg"
-    target.parent.mkdir()
-    link = tmp_path / ".databrickscfg"
-    link.symlink_to(target)
-    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(link))
-
-    def _write_profile(token: str) -> None:
-        staged = target.with_name("databrickscfg.tmp")
-        staged.write_text(f"[DEFAULT]\nhost = https://ex.test\nauth_type = pat\ntoken = {token}\n")
-        staged.replace(target)
-
-    class _PatCfg:
-        """Reads the token once at construction, like the SDK's PAT provider."""
-
-        def __init__(self) -> None:
-            parser = configparser.ConfigParser()
-            parser.read(link)
-            self._token = parser["DEFAULT"]["token"]
-
-        def authenticate(self) -> dict[str, str]:
-            return {"Authorization": f"Bearer {self._token}"}
-
-    resolutions: list[_PatCfg] = []
-
-    def _fake_resolve(profile=None, *, host=None):
-        resolutions.append(_PatCfg())
-        return _DatabricksBearerAuth(resolutions[-1], profile_name=None), "https://ex.test"
+    def _counting_resolve(profile=None, *, host=None, workspace_id=None):
+        resolutions.append(None)
+        return resolve(profile, host=host, workspace_id=workspace_id)
 
     monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _counting_resolve
     )
 
-    _write_profile("tok-1")
+    write_profile("tok-1")
     source = _ReusedDatabricksTokenSource()
     assert source.current_token() == "tok-1"
     assert source.current_token() == "tok-1"
     assert len(resolutions) == 1, "an unchanged profile must reuse the resolved auth"
 
-    _write_profile("tok-2")
+    write_profile("tok-2")
     assert source.current_token() == "tok-2", "the source kept the token from the old profile"
     assert source.current_token() == "tok-2"
     assert len(resolutions) == 2
