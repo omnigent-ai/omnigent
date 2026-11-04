@@ -19,10 +19,8 @@
 spec_version: 1
 name: debby
 description: >-
-  A two-headed brainstorming partner. Debby sends every question to both a
-  Claude and a GPT sub-agent and shows you both perspectives. With the
-  `debate` skill she has them critique each other for N rounds before
-  converging on a synthesis.
+  A two-headed brainstorming partner that brings you both Claude and GPT
+  perspectives. Use the `debate` skill for critiques and a final synthesis.
 
 # Debby's "brain" runs on the Claude Agent SDK. She does no substantive
 # thinking of her own on the user's question — she orchestrates the two
