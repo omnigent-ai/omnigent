@@ -6,6 +6,8 @@ from urllib.parse import quote
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.browser_ui.chat._geometry_helpers import DESKTOP, PHONE, assert_within_viewport
+
 _ROWS = "[data-testid^='slash-menu-item-']"
 
 
@@ -451,8 +453,9 @@ _FIRST_LINE_OFFSET = """element => {
 }"""
 
 
+@pytest.mark.parametrize("viewport", [DESKTOP, PHONE], ids=["desktop", "phone"])
 def test_slash_menu_bounds_a_very_long_skill_description(
-    page: Page, chat_session_contract
+    page: Page, chat_session_contract, viewport: dict[str, int]
 ) -> None:
     chat_session_contract.set_skills(
         [
@@ -460,6 +463,7 @@ def test_slash_menu_bounds_a_very_long_skill_description(
             {"name": "sprawl", "description": _SPRAWLING_SKILL_DESCRIPTION},
         ]
     )
+    page.set_viewport_size(viewport)
     page.goto(chat_session_contract.url)
     composer = _composer(page)
     expect(composer).to_be_visible()
@@ -474,11 +478,12 @@ def test_slash_menu_bounds_a_very_long_skill_description(
     description_box = description.bounding_box()
     assert description_box is not None
     assert description_box["height"] == pytest.approx(line_height, abs=1)
-    # Its tooltip stops at the height cap and scrolls from the first line.
+    # Its tooltip stays on screen, stops at the height cap and scrolls from the first line.
     tooltip = page.get_by_test_id("slash-menu-tooltip-sprawl")
     expect(tooltip).to_be_visible()
     tooltip_box = tooltip.bounding_box()
     assert tooltip_box is not None
+    assert_within_viewport(tooltip_box, viewport["width"])
     assert tooltip_box["height"] <= 256 + 1
     assert tooltip.evaluate(_OVERFLOWS_VERTICALLY)
     assert 0 <= tooltip.evaluate(_FIRST_LINE_OFFSET) < line_height

@@ -563,7 +563,7 @@ function MenuRowButton({
           align="end"
           data-testid={`slash-menu-tooltip-${row.name.slice(1)}`}
           // Top-aligned so a description taller than the cap scrolls from its first line.
-          className="max-h-64 max-w-md items-start overflow-y-auto break-words text-xs leading-4"
+          className="max-h-64 max-w-[min(28rem,calc(100vw-2rem))] items-start overflow-y-auto break-words text-xs leading-4"
           // Pressing inside the tooltip keeps the textarea focused, so the menu stays open.
           onMouseDown={(e) => e.preventDefault()}
         >
