@@ -172,9 +172,13 @@ async function consolePage(electronApp, previous = null) {
   return page;
 }
 
+const filming = Boolean(process.env.OMNIGENT_DESKTOP_RECORD_DIR);
+/** Hold a journey step on screen, only while filming a clip. */
+const filmingPause = (milliseconds) => (filming ? sleep(milliseconds) : Promise.resolve());
+
 async function withDesktop(name, run) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-arca-background-"));
-  const recordDir = process.env.OMNIGENT_DESKTOP_RECORD_DIR
+  const recordDir = filming
     ? path.join(path.resolve(process.env.OMNIGENT_DESKTOP_RECORD_DIR), name)
     : fs.mkdtempSync(path.join(os.tmpdir(), `omni-arca-background-${name}-`));
   fs.mkdirSync(recordDir, { recursive: true });
@@ -214,9 +218,8 @@ async function withDesktop(name, run) {
     });
     const page = desktop.window;
     await page.getByTestId("new-chat-landing-host-chip").waitFor({ timeout: 30_000 });
-    // Filming setup is done; the journey starts here. Recorded so the clip can
-    // be cut at a measured offset rather than a guessed one.
-    fs.writeFileSync(path.join(recordDir, "journey-start.txt"), String(Date.now()));
+    // Setup is done and the journey starts here, so a clip is cut at a measured offset.
+    if (filming) fs.writeFileSync(path.join(recordDir, "journey-start.txt"), String(Date.now()));
     await run({ ...desktop, page, stateDir, readEvents });
   } finally {
     if (desktop) {
@@ -224,7 +227,7 @@ async function withDesktop(name, run) {
       await desktop.stopDisplayCapture();
       // The display capture's name carries its start time; keep it past the rename.
       const capture = fs.readdirSync(recordDir).find((file) => /^display@\d+\.webm$/.test(file));
-      if (capture) {
+      if (filming && capture) {
         fs.writeFileSync(path.join(recordDir, "capture-start.txt"), capture.match(/\d+/)[0]);
       }
       saveRecording(recordDir, name);
@@ -260,7 +263,7 @@ async function startRunOnArca(page) {
 
 it("connects Arca in the background after consent and keeps the app usable", testOptions, () =>
   withDesktop("arca-connect-background", async ({ electronApp, page, stateDir, readEvents }) => {
-    await sleep(800);
+    await filmingPause(800);
     await startRunOnArca(page);
     const consent = await consolePage(electronApp);
     await consent.getByText("Connect your Arca instance?", { exact: true }).waitFor();
@@ -271,7 +274,7 @@ it("connects Arca in the background after consent and keeps the app usable", tes
       readEvents().some((event) => event.name === "connect-start"),
       false,
     );
-    await sleep(1500);
+    await filmingPause(1500);
 
     await consent.getByRole("button", { name: "Connect", exact: true }).click();
     await waitUntil(
@@ -297,7 +300,7 @@ it("connects Arca in the background after consent and keeps the app usable", tes
     assert.equal(await send.isDisabled(), true);
     await send.hover({ force: true });
     await page.getByText("Waiting for Arca to connect…").first().waitFor();
-    await sleep(2500);
+    await filmingPause(2500);
 
     fs.writeFileSync(path.join(stateDir, "release"), "release");
     await waitUntil(
@@ -310,7 +313,7 @@ it("connects Arca in the background after consent and keeps the app usable", tes
     // The connect's identity reached the page, which remembers its Arca host.
     assert.equal(await page.evaluate(() => localStorage.getItem("omnigent:arca-host-id")), HOST_ID);
     assert.equal(await page.getByTestId("new-chat-landing-arca-error").count(), 0);
-    await sleep(2000);
+    await filmingPause(2000);
   }),
 );
 
@@ -319,13 +322,13 @@ it(
   testOptions,
   () =>
     withDesktop("arca-connect-output", async ({ electronApp, page, readEvents }) => {
-      await sleep(800);
+      await filmingPause(800);
       await startRunOnArca(page);
       const consent = await consolePage(electronApp);
-      await sleep(800);
+      await filmingPause(800);
       await consent.getByRole("button", { name: "Connect", exact: true }).click();
       await page.getByTestId("new-chat-landing-arca-progress").waitFor();
-      await sleep(2500);
+      await filmingPause(2500);
 
       await page.getByTestId("new-chat-landing-arca-show-output").click();
       const output = await consolePage(electronApp, consent);
@@ -340,7 +343,7 @@ it(
         .getByText(/Waiting for the instance to accept SSH… [3-9]s/)
         .first()
         .waitFor();
-      await sleep(2000);
+      await filmingPause(2000);
 
       await clickClosingButton(output.getByRole("button", { name: "Hide", exact: true }));
       await waitUntil(
@@ -350,7 +353,7 @@ it(
       const connect = readEvents().find((event) => event.name === "connect-start");
       assert.equal(processExists(connect.pid), true, "Hiding the output stopped the connect");
       await page.getByTestId("new-chat-landing-arca-progress").waitFor();
-      await sleep(2500);
+      await filmingPause(2500);
 
       await page.getByTestId("new-chat-landing-arca-show-output").click();
       const reopened = await consolePage(electronApp, output);
@@ -358,7 +361,7 @@ it(
         .getByText(/Waiting for the instance to accept SSH… ([6-9]|1\d)s/)
         .first()
         .waitFor();
-      await sleep(1500);
+      await filmingPause(1500);
       await clickClosingButton(
         reopened.getByRole("button", { name: "Stop connecting", exact: true }),
       );
@@ -370,7 +373,7 @@ it(
       await page.getByTestId("new-chat-landing-arca-progress").waitFor({ state: "detached" });
       // A stop is the user's choice, so the page shows no error for it.
       assert.equal(await page.getByTestId("new-chat-landing-arca-error").count(), 0);
-      await sleep(2000);
+      await filmingPause(2000);
     }),
 );
 

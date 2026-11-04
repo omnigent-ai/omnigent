@@ -13,19 +13,16 @@ beforeEach(() => vi.clearAllMocks());
 describe("openArcaConnectOutput", () => {
   it("opens the output without a notice when the shell shows it", async () => {
     vi.mocked(showArcaConnectOutput).mockResolvedValue(true);
-    openArcaConnectOutput();
-    await vi.waitFor(() => expect(showArcaConnectOutput).toHaveBeenCalledOnce());
-    await Promise.resolve();
+    await openArcaConnectOutput();
+    expect(showArcaConnectOutput).toHaveBeenCalledOnce();
     expect(showToast).not.toHaveBeenCalled();
   });
 
   it("says so when the shell has no output for the connect", async () => {
     vi.mocked(showArcaConnectOutput).mockResolvedValue(false);
-    openArcaConnectOutput();
-    await vi.waitFor(() =>
-      expect(showToast).toHaveBeenCalledWith(
-        "There's no connection output to show for this Arca connect.",
-      ),
+    await openArcaConnectOutput();
+    expect(showToast).toHaveBeenCalledWith(
+      "There's no connection output to show for this Arca connect.",
     );
   });
 });

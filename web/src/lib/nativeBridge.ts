@@ -223,7 +223,7 @@ interface ElectronDesktopApi extends NativeShellApi {
   connectArcaHost?: (options?: ArcaConnectOptions) => Promise<ArcaConnectResult>;
   /**
    * Show the in-flight Arca connect's live output in a non-blocking window;
-   * resolves false when none is running. Absent on shells whose connect
+   * resolves false when there is none, as for an automatic connect. Absent on shells whose connect
    * console blocks the window for the whole run.
    */
   showArcaConnectOutput?: () => Promise<boolean>;

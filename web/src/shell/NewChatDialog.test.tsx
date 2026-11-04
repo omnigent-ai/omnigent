@@ -3821,25 +3821,45 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
   });
 
-  it("keeps a host picked during the connect instead of selecting Arca when it finishes", async () => {
-    const connect = await startPendingArcaConnect([host("online"), host("online", 2)]);
-    await openHostMenu();
-    fireEvent.click(await screen.findByTestId("new-chat-landing-host-host_2"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/),
-    );
-    expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_2");
-
-    await act(async () => {
-      connect.finish({
+  it.each([
+    {
+      completion: "with the host's identity",
+      result: {
         ok: true,
         identity: { serverUrl: "https://server.databricks.com/omnigent", hostId: "arca-1" },
+      },
+      taggedArcaHost: "arca-1",
+    },
+    // Without an identity the landing would poll for the new host, so it stops quietly instead.
+    { completion: "through host polling", result: { ok: true }, taggedArcaHost: null },
+  ])(
+    "keeps a host picked during the connect when it finishes $completion",
+    async ({ result, taggedArcaHost }) => {
+      const hosts = [host("online"), host("online", 2)];
+      vi.mocked(fetchHosts).mockResolvedValue([
+        ...hosts,
+        { host_id: "arca-1", name: "arca-box", owner: "me", status: "online" },
+      ]);
+      const connect = await startPendingArcaConnect(hosts);
+      await openHostMenu();
+      fireEvent.click(await screen.findByTestId("new-chat-landing-host-host_2"));
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/),
+      );
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_2");
+
+      await act(async () => {
+        connect.finish(result);
       });
-    });
-    expect(localStorage.getItem("omnigent:arca-host-id")).toBe("arca-1");
-    expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_2");
-    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/);
-  });
+      await waitFor(() =>
+        expect(screen.queryByTestId("new-chat-landing-arca-progress")).toBeNull(),
+      );
+      expect(localStorage.getItem("omnigent:arca-host-id")).toBe(taggedArcaHost);
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_2");
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/);
+      expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
+    },
+  );
 
   it("drops Show output once the connect finished while its host registers", async () => {
     vi.mocked(supportsArcaConnectOutput).mockReturnValue(true);

@@ -1,8 +1,8 @@
 "use strict";
 
 /**
- * Shell-owned modal consent showing the exact `arca ssh` command starts a
- * background run; a non-modal output window offers replay, Hide, and Stop.
+ * A modal consent sheet shows the exact `arca ssh` command; confirming starts a
+ * background run whose non-modal output window offers replay, Hide, and Stop.
  *
  * Trust model: these windows are created by the main process and load a
  * bundled file:// page with its own narrow preload. The server-served SPA can
@@ -259,7 +259,8 @@ function createArcaConnectFlow({
     };
     const initPayload = (view) => ({
       serverUrl,
-      command: commandLine(serverUrl),
+      // The output shows what is running, which is the login command during sign-in.
+      command: (view === "output" && started?.command) || commandLine(serverUrl),
       reason,
       view,
     });
@@ -295,25 +296,31 @@ function createArcaConnectFlow({
       }
       // The window that started the run may have closed while another watches it.
       outputReady = false;
-      outputWin = openConsole({
-        parentWin: [requestedBy, parentWin, ...watchers.keys()].find(alive),
-        modal: false,
-        height: RUNNING_CONTENT_HEIGHT,
-        title: titleFor(reason),
-        handlers: { phase: () => phase, onConfirm: () => {}, onStop: stop },
-        onLoad: (win) => {
-          sendTo(win, "arca-connect:init", initPayload("output"));
-          if (started) sendTo(win, "arca-connect:started", started);
-          if (output) sendTo(win, "arca-connect:output", output);
-          if (done) sendTo(win, "arca-connect:done", done);
-          outputReady = true;
-        },
-        // Hiding the output never stops the run; Stop connecting does.
-        onClosed: () => {
-          outputWin = null;
-          outputReady = false;
-        },
-      });
+      try {
+        outputWin = openConsole({
+          parentWin: [requestedBy, parentWin, ...watchers.keys()].find(alive),
+          modal: false,
+          height: RUNNING_CONTENT_HEIGHT,
+          title: titleFor(reason),
+          handlers: { phase: () => phase, onConfirm: () => {}, onStop: stop },
+          onLoad: (win) => {
+            sendTo(win, "arca-connect:init", initPayload("output"));
+            if (started) sendTo(win, "arca-connect:started", started);
+            if (output) sendTo(win, "arca-connect:output", output);
+            if (done) sendTo(win, "arca-connect:done", done);
+            outputReady = true;
+          },
+          // Hiding the output never stops the run; Stop connecting does.
+          onClosed: () => {
+            outputWin = null;
+            outputReady = false;
+          },
+        });
+      } catch (error) {
+        // The run goes on without a window; its result still reaches the page.
+        log(`arca connect: output window failed to open: ${error?.message ?? error}`);
+        outputWin = null;
+      }
     };
 
     const appendOutput = (text) => {
@@ -357,8 +364,9 @@ function createArcaConnectFlow({
         settle({ ...result, shownInConsole: alive(outputWin) });
       };
       void connect.promise.then(finish).catch((error) => {
-        // A window that fails to open must not leave the run unsettled.
+        // Starting the next command can throw; the run must still settle.
         log(`arca connect: finishing the run failed: ${error?.message ?? error}`);
+        phase = "done";
         try {
           connect.cancel();
         } catch {

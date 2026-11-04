@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from urllib.parse import urlparse
 
@@ -235,6 +236,12 @@ def test_desktop_reconnects_arca_from_current_chat(
     page.wait_for_timeout(1500)
 
 
+def _filming_pause(page: Page, milliseconds: int) -> None:
+    """Hold a journey step on screen, only while filming a clip."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(milliseconds)
+
+
 @pytest.mark.browser_context_args(record_video_size={"width": 1280, "height": 720})
 def test_desktop_arca_reconnect_runs_in_background_with_output_on_request(
     request: pytest.FixtureRequest,
@@ -244,12 +251,12 @@ def test_desktop_arca_reconnect_runs_in_background_with_output_on_request(
     page, host_picker, host_state = _open_offline_arca_chat(
         request, seeded_session, remembered=True, host_name="arca-devbox", shows_output=True
     )
-    page.wait_for_timeout(1000)
+    _filming_pause(page, 1000)
 
     host_picker.click()
     reconnect = page.get_by_role("menuitem", name="Reconnect host", exact=True)
     reconnect.hover()
-    page.wait_for_timeout(1000)
+    _filming_pause(page, 1000)
     reconnect.click()
     toast = page.locator("[data-sonner-toast]").filter(has_text="Reconnecting Arca…")
     expect(toast).to_be_visible()
@@ -257,27 +264,27 @@ def test_desktop_arca_reconnect_runs_in_background_with_output_on_request(
         "data-status", "starting"
     )
     expect(host_picker).to_have_attribute("aria-label", re.compile(r"arca-devbox, Starting$"))
-    page.wait_for_timeout(1500)
+    _filming_pause(page, 1500)
 
     toast.get_by_role("button", name="Show output", exact=True).click()
     page.wait_for_function("window.__showArcaOutputCalls === 1")
     # Showing the output doesn't dismiss the progress toast.
     expect(toast).to_be_visible()
-    page.wait_for_timeout(1500)
+    _filming_pause(page, 1500)
 
     host_picker.click()
     show_output = page.get_by_role("menuitem", name="Show connection output", exact=True)
     show_output.hover()
-    page.wait_for_timeout(1200)
+    _filming_pause(page, 1200)
     show_output.click()
     page.wait_for_function("window.__showArcaOutputCalls === 2")
-    page.wait_for_timeout(800)
+    _filming_pause(page, 800)
 
     composer = page.get_by_label("Message the agent")
     composer.click()
     composer.press_sequentially("Notes while Arca starts", delay=60)
     expect(composer).to_have_value("Notes while Arca starts")
-    page.wait_for_timeout(1500)
+    _filming_pause(page, 1500)
 
     host_state["online"] = True
     page.evaluate("window.__finishArcaReconnect({ ok: true })")
@@ -285,7 +292,7 @@ def test_desktop_arca_reconnect_runs_in_background_with_output_on_request(
     expect(page.get_by_text("Arca is back online.", exact=True)).to_be_visible()
     expect(composer).to_have_value("Notes while Arca starts")
     assert page.evaluate("window.__connectArcaCalls") == 1
-    page.wait_for_timeout(2000)
+    _filming_pause(page, 2000)
 
 
 def test_desktop_arca_reconnect_failure_offers_retry(

@@ -5140,10 +5140,8 @@ function registerIpc() {
     return { win, arcaServerUrl };
   };
 
-  // SPA → run `isaac omni host --background` on the user's Arca instance over
-  // `arca ssh`, after consent in the shell-owned console (arca_connect_window.js).
-  // A page that shows progress itself passes `inlineProgress`; otherwise the
-  // output opens on consent. A connect in flight is re-surfaced, never refused.
+  // SPA → `isaac omni host --background` on Arca after consent in the shell's
+  // console (arca_connect_window.js); a connect in flight is re-surfaced, never refused.
   ipcMain.handle("omnigent:arca-connect", async (event, options) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-connect is only available to a connected server page");

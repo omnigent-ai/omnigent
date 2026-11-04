@@ -329,6 +329,12 @@ describe("arca connect console flow", () => {
     assert.equal(channelPayloads(output, "arca-connect:done").length, 0);
     world.sendFrom(output, "arca-connect:confirm");
     assert.equal(world.logins.length, 1);
+    // Re-attaching during sign-in keeps showing the login command.
+    void flow.run(null, url);
+    assert.equal(
+      channelPayloads(output, "arca-connect:init").at(-1).command,
+      `arca ssh isaac omni login ${url}`,
+    );
     world.logins[0].finish({ ok: true });
     await Promise.resolve();
     assert.equal(world.connects[1].serverUrl, url);
@@ -661,16 +667,31 @@ describe("arca connect console flow", () => {
       assert.equal(world.windows[2].options.parent, second);
     });
 
-    it("settles the run even when its output window can't open", async () => {
+    it("settles with the command's own error when its output window can't open", async () => {
       const { world, flow } = flowHarness();
       const { result } = confirmedRun(world, flow, { inlineProgress: true });
       world.failWindows = true;
       world.connects[0].finish({ ok: false, error: "Couldn't reach the Arca instance." });
-      assert.deepEqual(await result, { ok: false, error: "Connecting to Arca failed." });
+      assert.deepEqual(await result, {
+        ok: false,
+        error: "Couldn't reach the Arca instance.",
+        shownInConsole: false,
+      });
 
       world.failWindows = false;
       void flow.run(null, SERVER);
       assert.equal(world.windows.at(-1).options.modal, true, "a new run asks consent again");
+    });
+
+    it("keeps running in the background when the output can't open on consent", async () => {
+      const { world, flow } = flowHarness();
+      const result = flow.run(null, SERVER);
+      world.failWindows = true;
+      assert.doesNotThrow(() => world.sendFrom(world.windows[0], "arca-connect:confirm"));
+      assert.equal(world.connects.length, 1);
+      assert.equal(world.connects[0].canceled, false);
+      world.connects[0].finish({ ok: true });
+      assert.deepEqual(await result, { ok: true, shownInConsole: false });
     });
 
     it("opens the output when sign-in needs the browser", async () => {

@@ -115,7 +115,7 @@ export function useSessionReconnect({
               onClick: (event) => {
                 // Keep the progress toast; the output opens in its own window.
                 event.preventDefault();
-                openArcaConnectOutput();
+                void openArcaConnectOutput();
               },
             },
           })

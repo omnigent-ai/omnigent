@@ -192,8 +192,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     }),
   /**
    * Show the live output of this window's in-flight Arca connect in a
-   * non-blocking shell window. Resolves false when no connect is running.
-   * Its presence also marks that a confirmed connect can run in the
+   * non-blocking shell window. Resolves false when there is no output to show,
+   * including during an automatic connect, which has none. Its presence also marks that a confirmed connect can run in the
    * background, so the page can show the progress itself.
    */
   showArcaConnectOutput: () => ipcRenderer.invoke("omnigent:arca-connect-output"),

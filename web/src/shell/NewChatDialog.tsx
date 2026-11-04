@@ -5496,8 +5496,10 @@ export function NewChatLandingScreen() {
     setArcaBridgeRunning(true);
     setArcaTargetPending(true);
     const choiceAtStart = hostChoiceRef.current;
+    // A host or sandbox the user picked during the connect wins over Arca.
+    const choiceMoved = () => hostChoiceRef.current !== choiceAtStart;
     const selectArcaHost = (hostId: string) => {
-      if (hostChoiceRef.current === choiceAtStart) selectHost(hostId);
+      if (!choiceMoved()) selectHost(hostId);
     };
     setArcaError(null);
     const onlineBefore = new Set(
@@ -5512,7 +5514,7 @@ export function NewChatLandingScreen() {
         // console already displayed must not be echoed as a second error —
         // this strip is only for gate failures with no other surface (e.g.
         // the feature being unavailable to this window).
-        if (!res.canceled && !res.shownInConsole) {
+        if (!res.canceled && !res.shownInConsole && !choiceMoved()) {
           setArcaError(res.error ?? "Couldn't connect to Arca.");
         }
         return;
@@ -5536,6 +5538,7 @@ export function NewChatLandingScreen() {
       /* oxlint-disable no-await-in-loop */
       const deadline = Date.now() + 30_000;
       while (Date.now() < deadline) {
+        if (choiceMoved()) return;
         const hostList = await queryClient.fetchQuery({
           queryKey: ["hosts", { includeSandbox: false }],
           queryFn: () => fetchHosts(false),
@@ -5553,6 +5556,7 @@ export function NewChatLandingScreen() {
         });
       }
       /* oxlint-enable no-await-in-loop */
+      if (choiceMoved()) return;
       // The daemon started but its registration hasn't landed — soft-fail so
       // the user knows to look at the host list rather than re-running.
       setArcaError(
@@ -7609,7 +7613,7 @@ export function NewChatLandingScreen() {
                   <button
                     type="button"
                     className="underline underline-offset-2 hover:no-underline"
-                    onClick={openArcaConnectOutput}
+                    onClick={() => void openArcaConnectOutput()}
                     data-testid="new-chat-landing-arca-show-output"
                   >
                     Show output

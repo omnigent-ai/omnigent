@@ -252,9 +252,12 @@ describe("showArcaConnectOutput", () => {
     desktop.showArcaConnectOutput = () => Promise.resolve(false);
     expect(await showArcaConnectOutput()).toBe(false);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    desktop.showArcaConnectOutput = () => Promise.reject(new Error("ipc gone"));
-    expect(await showArcaConnectOutput()).toBe(false);
-    warn.mockRestore();
+    try {
+      desktop.showArcaConnectOutput = () => Promise.reject(new Error("ipc gone"));
+      expect(await showArcaConnectOutput()).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
