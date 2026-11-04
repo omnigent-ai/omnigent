@@ -29,6 +29,21 @@ const RUNNING_CONTENT_HEIGHT = 500;
 const MAX_CONTENT_HEIGHT = 640;
 /** UTF-16 characters kept for an output window opened mid-run; a connect prints far less. */
 const OUTPUT_BACKLOG_CHARS = 256 * 1024;
+
+/**
+ * The last OUTPUT_BACKLOG_CHARS of `output`, starting on a whole line when the
+ * tail has one, and otherwise never on half of a surrogate pair.
+ */
+function backlogTail(output) {
+  const cut = output.length - OUTPUT_BACKLOG_CHARS;
+  const tail = output.slice(cut);
+  if (output[cut - 1] === "\n") return tail;
+  const lineStart = tail.indexOf("\n") + 1;
+  if (lineStart > 0 && lineStart < tail.length) return tail.slice(lineStart);
+  const first = tail.charCodeAt(0);
+  return first >= 0xdc00 && first <= 0xdfff ? tail.slice(1) : tail;
+}
+
 const { arcaTarget } = require("./arcaIdentity");
 
 /**
@@ -278,6 +293,7 @@ function createArcaConnectFlow({
       // An unwatched enrollment must not keep executing once the user stopped
       // it or closed the window that asked for it.
       log("arca connect: stopped mid-run; canceling");
+      phase = "done";
       connect.cancel();
       // The canceled command's exit settles via its promise too; settle() is
       // idempotent.
@@ -327,12 +343,7 @@ function createArcaConnectFlow({
 
     const appendOutput = (text) => {
       output += text;
-      if (output.length > OUTPUT_BACKLOG_CHARS) {
-        const tail = output.slice(-OUTPUT_BACKLOG_CHARS);
-        // Replay from a whole line, never mid-character or mid-escape sequence.
-        const lineStart = tail.indexOf("\n") + 1;
-        output = lineStart > 0 && lineStart < tail.length ? tail.slice(lineStart) : tail;
-      }
+      if (output.length > OUTPUT_BACKLOG_CHARS) output = backlogTail(output);
       sendLive("arca-connect:output", text);
     };
 
@@ -493,5 +504,6 @@ module.exports = {
   RUNNING_CONTENT_HEIGHT,
   MAX_CONTENT_HEIGHT,
   OUTPUT_BACKLOG_CHARS,
+  backlogTail,
   createArcaConnectFlow,
 };

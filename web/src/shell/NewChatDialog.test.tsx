@@ -3862,6 +3862,31 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     },
   );
 
+  it("hides the Arca progress once another host is picked during the host poll", async () => {
+    vi.mocked(supportsArcaConnectOutput).mockReturnValue(true);
+    vi.mocked(fetchHosts).mockReturnValue(new Promise(() => {}));
+    try {
+      const hosts = [host("online"), host("online", 2)];
+      const connect = await startPendingArcaConnect(hosts);
+      await act(async () => {
+        connect.finish({ ok: true });
+      });
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-arca-progress")).toHaveTextContent(
+          "Arca started. Waiting for its host to come online…",
+        ),
+      );
+      await openHostMenu();
+      fireEvent.click(await screen.findByTestId("new-chat-landing-host-host_2"));
+      await waitFor(() =>
+        expect(screen.queryByTestId("new-chat-landing-arca-progress")).toBeNull(),
+      );
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/);
+    } finally {
+      vi.mocked(supportsArcaConnectOutput).mockReturnValue(false);
+    }
+  });
+
   it("drops Show output once the connect finished while its host registers", async () => {
     vi.mocked(supportsArcaConnectOutput).mockReturnValue(true);
     vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });

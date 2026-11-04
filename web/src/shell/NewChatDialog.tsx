@@ -5265,19 +5265,22 @@ export function NewChatLandingScreen() {
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
-  // The Arca row is remembered by host ID, never inferred from its machine hostname.
-  // A recovery-capable desktop restores preview identity on demand. Older
-  // shells keep Run on Arca visible because reconnecting is their only recovery.
   function landingHostLabel(): string {
     if (connectingThisMachine) return "Connecting…";
     if (arcaTargetPending) return "Connecting to Arca…";
     if (sandboxSelected) return selectedSandboxLabel;
     return selectedHostDisplayName ?? "No host selected";
   }
+  // The Arca row is remembered by host ID, never inferred from its machine hostname.
+  // A recovery-capable desktop restores preview identity on demand. Older
+  // shells keep Run on Arca visible because reconnecting is their only recovery.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
   const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
   const showArcaOption = arcaEnabled && (!arcaPreviewRecovery || !arcaHostOnline);
   const hostLabel = landingHostLabel();
+  // Once the user picks another host, the remaining host poll is no longer theirs.
+  const showArcaProgress =
+    connectingArca && (arcaBridgeRunning || arcaTargetPending) && supportsArcaConnectOutput();
   const hostTooltipRows =
     connectingThisMachine || arcaTargetPending
       ? [
@@ -7602,7 +7605,7 @@ export function NewChatLandingScreen() {
 
           {/* Shells that connect in the background after consent leave the
               page usable, so its progress and output live here. */}
-          {connectingArca && supportsArcaConnectOutput() && (
+          {showArcaProgress && (
             <p
               className="flex flex-wrap items-center gap-x-1.5 text-sm text-muted-foreground"
               role="status"

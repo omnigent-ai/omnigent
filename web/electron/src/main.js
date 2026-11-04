@@ -5175,9 +5175,7 @@ function registerIpc() {
     return arcaConnectFlow.run(win, arcaServerUrl, runOptions);
   });
 
-  // SPA → show the in-flight connect's live output in a non-blocking shell
-  // window. It can only surface a run the user already started; consent and
-  // Stop stay in the shell-owned console.
+  // SPA → re-surface this server's in-flight connect (consent sheet or output); never starts one.
   ipcMain.handle("omnigent:arca-connect-output", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-connect-output is only available to a connected server page");

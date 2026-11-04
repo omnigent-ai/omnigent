@@ -10,6 +10,7 @@ const {
   RUNNING_CONTENT_HEIGHT,
   MAX_CONTENT_HEIGHT,
   OUTPUT_BACKLOG_CHARS,
+  backlogTail,
 } = require("../src/arca_connect_window");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -751,5 +752,28 @@ describe("arca connect console flow", () => {
       const { flow } = flowHarness();
       assert.equal(flow.showOutput(null, SERVER), false);
     });
+  });
+});
+
+describe("backlogTail", () => {
+  const line = "0123456789abcde\n";
+  const lines = line.repeat(OUTPUT_BACKLOG_CHARS / line.length);
+
+  it("keeps a tail that already starts on a line", () => {
+    assert.equal(backlogTail(`${line}${lines}`), lines);
+  });
+
+  it("drops the partial first line", () => {
+    const tail = backlogTail(`x${lines}`);
+    assert.equal(tail, lines.slice(line.length));
+  });
+
+  it("never starts on half of a surrogate pair when there is no newline", () => {
+    const emoji = "\u{1F600}";
+    const redrawn = emoji.repeat(OUTPUT_BACKLOG_CHARS / 2) + "x";
+    const tail = backlogTail(redrawn);
+    assert.ok(tail.length <= OUTPUT_BACKLOG_CHARS);
+    assert.ok(tail.startsWith(emoji));
+    assert.ok(tail.endsWith(`${emoji}x`));
   });
 });
