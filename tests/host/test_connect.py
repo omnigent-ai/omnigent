@@ -33,6 +33,7 @@ from omnigent.host.connect import (
     HostRetryableConnectionError,
     ModelOptionsResult,
     _build_runner_env,
+    _connection_refused,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -201,7 +202,8 @@ def _write_discovery_skill(root: Path, name: str, *, visible: bool = True) -> No
     "harness,expected",
     [
         ("claude-native", {"project", "user", "agents", "toolkit:review"}),
-        ("codex-native", {"codex-user"}),
+        ("codex-native", {"agents", "codex-user"}),
+        ("codex", {"agents"}),
     ],
 )
 async def test_host_discovers_harness_skills_without_a_runner(
@@ -914,6 +916,45 @@ def _make_host_process() -> HostProcess:
         identity=identity,
         server_url="http://localhost:8000",
     )
+
+
+async def test_local_host_does_not_dial_port_after_its_server_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local host whose server is gone never registers on the port's next owner.
+
+    Registering there would rotate away the same-name row of the host that
+    owns that server, leaving it connected but invisible to ``GET /v1/hosts``.
+    """
+    owned = [True]
+    host = HostProcess(
+        identity=HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        server_url="http://127.0.0.1:6767",
+        server_still_ours=lambda: owned[0],
+    )
+    dialed: list[str] = []
+
+    class _RejectedConnection:
+        async def __aenter__(self) -> None:
+            raise ConnectionError("dialed")
+
+    def _connect(url: str, **_kwargs: object) -> _RejectedConnection:
+        dialed.append(url)
+        return _RejectedConnection()
+
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    monkeypatch.setattr("omnigent.host.connect.websockets.asyncio.client.connect", _connect)
+
+    with pytest.raises(ConnectionError, match="dialed"):
+        await host._connect_and_serve()
+    assert len(dialed) == 1
+
+    owned[0] = False
+    with pytest.raises(ConnectionRefusedError) as refused:
+        await host._connect_and_serve()
+    assert len(dialed) == 1
+    # Counted as refused, so the loopback give-up bound still applies.
+    assert _connection_refused(refused.value)
 
 
 def _cleanup_host(host: HostProcess) -> None:
@@ -8546,12 +8587,15 @@ def _spawn_with_fake_zygote(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     zygote: _FakeZygote,
+    popen_kwargs: list[dict[str, object]] | None = None,
 ) -> tuple[HostProcess, list[list[str]]]:
     """Drive ``_spawn_runner_proc`` with *zygote* and a stubbed direct Popen.
 
     :param monkeypatch: The pytest monkeypatch fixture.
     :param tmp_path: Holds the fake runner log file.
     :param zygote: The scripted zygote installed on the host.
+    :param popen_kwargs: Optional sink for the keyword arguments of every
+        direct ``Popen`` call.
     :returns: The host and the argv of every direct ``Popen`` call.
     """
     host = _make_host_process()
@@ -8570,14 +8614,35 @@ def _spawn_with_fake_zygote(
         return log_path, open(log_path, "ab", buffering=0)
 
     def _fake_popen(argv: list[str], **kwargs: object) -> _FakeSpawnedProc:
-        del kwargs
         popen_argvs.append(list(argv))
+        if popen_kwargs is not None:
+            popen_kwargs.append(kwargs)
         return _FakeSpawnedProc()
 
     monkeypatch.setattr("omnigent.host.connect.open_process_log_file", _fake_open_log)
     monkeypatch.setattr("omnigent.host.connect.subprocess.Popen", _fake_popen)
     host._spawn_runner_proc({}, "slug", tmp_path)
     return host, popen_argvs
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions")
+def test_direct_runner_spawn_starts_its_own_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A directly spawned runner leaves the daemon's terminal session.
+
+    A hangup of that terminal would otherwise reach the runner and its harness
+    children mid-turn instead of only the daemon.
+    """
+    popen_kwargs: list[dict[str, object]] = []
+    _spawn_with_fake_zygote(
+        monkeypatch, tmp_path, _FakeZygote(fail_at="start", running=False), popen_kwargs
+    )
+
+    assert len(popen_kwargs) == 1
+    assert popen_kwargs[0]["start_new_session"] is True
+    assert popen_kwargs[0]["stdin"] is subprocess.DEVNULL
 
 
 def test_dead_zygote_is_reaped_and_respawnable(

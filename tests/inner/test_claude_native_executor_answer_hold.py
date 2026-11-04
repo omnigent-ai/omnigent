@@ -1,12 +1,10 @@
 """
 A refusal before a web message was typed holds the message instead of failing it.
 
-When a Claude question or permission prompt refuses the message before anything
-was typed, the turn waits for the person to answer it and then delivers the
-message. When Claude Code's input box could not be verified clear, the turn
-waits until it reads clear, and when the box is kept in shell mode or the
-prompt-history search, until it takes chat input again. A refusal after typing
-began, or a hold that runs out, still fails as before.
+Questions, permission prompts and answerable terminal dialogs hold the message
+until the person answers them. An uncleared input box waits until clear; shell
+mode and history search wait until chat input is available. Refusals after typing
+and expired holds still fail as before.
 """
 
 from __future__ import annotations
@@ -19,6 +17,7 @@ import pytest
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeComposerNotCleared,
     ClaudeInputBoxOccupied,
+    ClaudeTerminalDialog,
     ClaudeUserPromptPending,
 )
 from omnigent.inner import claude_native_executor
@@ -30,6 +29,7 @@ _NOT_CLEARED = (
     "Claude Code's input box could not be verified clear, so nothing was sent. "
     "Open the terminal, expand it and clear the input box, then retry."
 )
+_DIALOG = "Claude Code is waiting for an answer in its terminal (Settings Error)"
 _SHELL_MODE = (
     "Claude Code's input box is occupied by shell mode, so the message was not "
     "delivered. Open the terminal, dismiss it, then resend your message."
@@ -49,6 +49,7 @@ class _Pane:
     def __init__(self, refusals: list[bool | Exception], pending_polls: int) -> None:
         self.refusals = list(refusals)
         self.pending_polls = pending_polls
+        self.dialog_polls = 0
         self.delivered: list[str] = []
         self.deliveries = 0
         self.polls = 0
@@ -77,6 +78,13 @@ class _Pane:
         del bridge_dir
         self.repaints += repaint
         return not self._still_refusing()
+
+    def terminal_dialog_pending(self, bridge_dir: Path) -> bool:
+        del bridge_dir
+        if self.dialog_polls > 0:
+            self.dialog_polls -= 1
+            return True
+        return False
 
     def claude_pane_ready(self, bridge_dir: Path) -> bool:
         del bridge_dir
@@ -113,6 +121,9 @@ def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
     )
     monkeypatch.setattr(
         claude_native_executor, "claude_pane_ready", fake.claude_pane_ready, raising=False
+    )
+    monkeypatch.setattr(
+        claude_native_executor, "terminal_dialog_pending", fake.terminal_dialog_pending
     )
     monkeypatch.setattr(claude_native_executor, "kill_session", fake.kill_session)
     monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_POLL_S", 0.0, raising=False)
@@ -395,3 +406,36 @@ async def test_an_input_box_kept_in_shell_mode_fails_with_the_refusal(
     assert pane.deliveries == 1
     assert pane.delivered == []
     assert pane.kills == 0
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_dialog_holds_the_message_until_it_closes(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """A dialog only the terminal shows, such as a settings error, holds the message."""
+    pane.refusals = [ClaudeTerminalDialog(_DIALOG, awaits_answer=True)]
+    pane.pending_polls = 0
+    pane.dialog_polls = 2
+
+    events = await _run(tmp_path)
+
+    assert events == [TurnComplete(response=None)]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.deliveries == 2
+    assert pane.kills == 0, "A held message must not reap the pane."
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_dialog_that_awaits_no_answer_is_reported_at_once(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """A surface refusal that names no answer for the person is not held."""
+    pane.refusals = [ClaudeTerminalDialog(_DIALOG)]
+
+    events = await _run(tmp_path)
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].message.startswith(_DIALOG)
+    assert events[0].undelivered is True
+    assert pane.deliveries == 1
+    assert pane.polls == 0

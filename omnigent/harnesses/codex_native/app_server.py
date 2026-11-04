@@ -81,6 +81,9 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     codex_app_server_diagnostic_env,
     report_capture_start_failure,
 )
+from omnigent.harnesses.codex_native.timeouts import (
+    APP_SERVER_READY_TIMEOUT_SECONDS as _APP_SERVER_READY_TIMEOUT_SECONDS,
+)
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
@@ -141,10 +144,6 @@ _MODEL_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
-# The session app-server has no fallback, and a loaded host can take well over
-# 10 s to start codex. Match the 60 s native-terminal readiness budget; a child
-# that exits early still fails at once.
-_APP_SERVER_READY_TIMEOUT_SECONDS = 60.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 # Provider attribution is best-effort on the launch path, so it shares discovery's
@@ -547,7 +546,7 @@ def _sync_codex_developer_instructions(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     try:
         document = tomlkit.parse(existing) if existing else tomlkit.document()
-    except Exception:  # title metadata must never block Codex startup.
+    except Exception:
         _logger.warning(
             "Could not synchronize native Codex agent instructions: invalid private config",
             exc_info=True,
@@ -2089,7 +2088,7 @@ async def _codex_launch_catalog(
     try:
         if launch is None:
             launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
-    except Exception:  # a broken provider config means no catalog
+    except Exception:
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
     fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
@@ -2773,7 +2772,7 @@ class CodexNativeAppServer:
                                 ),
                                 timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
                             )
-                    except Exception:  # the local write below still repairs it
+                    except Exception:
                         _logger.warning(
                             "Could not persist supported Codex reasoning effort at startup",
                             exc_info=True,
@@ -2793,7 +2792,7 @@ class CodexNativeAppServer:
             finally:
                 try:
                     await startup_client.close()
-                except Exception:  # a dead control socket cannot undo trust
+                except Exception:
                     _logger.warning("Could not close Codex startup client", exc_info=True)
         except BaseException as exc:
             if isinstance(exc, Exception):
@@ -2915,7 +2914,7 @@ class CodexNativeAppServer:
             if self.router_hooks_registered:
                 try:
                     await trust_codex_router_hooks(client.request, cwd=str(self.cwd))
-                except Exception:  # routing trust never blocks startup
+                except Exception:
                     _logger.warning(
                         "codex subagent-routing hook trust failed; routing will not be enforced",
                         exc_info=True,
@@ -2939,7 +2938,7 @@ class CodexNativeAppServer:
                             len(still_untrusted),
                             ", ".join(still_untrusted),
                         )
-                except Exception:  # trust-all never blocks startup
+                except Exception:
                     _logger.warning(
                         "codex hook trust-all failed; the startup hook-review screen "
                         "may appear on resume",
@@ -3942,7 +3941,7 @@ def databricks_profile_codex_models(profile: str) -> DatabricksCodexModelListing
     """
     try:
         host = _databricks_gateway_host(profile)
-    except Exception as exc:  # an unresolvable profile has no listing
+    except Exception as exc:
         _logger.warning(
             "native-codex: could not resolve the workspace host for profile %r (%s)",
             profile,
@@ -3971,7 +3970,7 @@ def _databricks_servable_codex_models(host: str, profile: str) -> DatabricksCode
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         return DatabricksCodexModelListing(discover_databricks_codex_models(host, creds.token))
-    except Exception as exc:  # cached ucode state is the launch fallback
+    except Exception as exc:
         # Recoverable fallback; frames are debug-only so a TTY-mirrored
         # host console stays concise.
         _logger.warning(
@@ -3989,7 +3988,7 @@ def _databricks_servable_codex_models(host: str, profile: str) -> DatabricksCode
                 return DatabricksCodexModelListing(
                     tuple(workspace_state.codex_models), cached=True
                 )
-        except Exception:  # the bundled catalog is the last resort
+        except Exception:
             _logger.warning(
                 "native-codex: could not read ucode state for %r", profile, exc_info=True
             )
