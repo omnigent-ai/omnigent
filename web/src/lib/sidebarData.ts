@@ -111,6 +111,29 @@ export function compareSessionRows(
   return b[sortBy] - a[sortBy] || b.id.localeCompare(a.id);
 }
 
+const TITLE_CURSOR_PREFIX = "title.";
+
+/**
+ * A row that sorts where a page's cursor continues. A ``sort_by=title`` token
+ * is ``"title."`` plus base64url JSON of ``[title_sort_key, id]``.
+ */
+function scopeTail(rows: Conversation[], cursor: string | null | undefined) {
+  if (!cursor?.startsWith(TITLE_CURSOR_PREFIX)) {
+    return rows.find((row) => row.id === cursor) ?? rows.at(-1);
+  }
+  try {
+    const base64 = cursor.slice(TITLE_CURSOR_PREFIX.length).replace(/-/g, "+").replace(/_/g, "/");
+    const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    const [key, id] = JSON.parse(new TextDecoder().decode(bytes)) as unknown[];
+    const base = rows.find((row) => row.id === id) ?? rows.at(-1);
+    if (typeof key !== "string" || typeof id !== "string" || !base) return base;
+    // Keys are folded already, so this title keys back to the token's position.
+    return { ...base, id, title: key.slice(1) };
+  } catch {
+    return rows.at(-1);
+  }
+}
+
 /** Only the merged prefix above both unfinished scopes' tails is complete. */
 export function mergeScopeRows(
   mine: Conversation[],
@@ -122,8 +145,8 @@ export function mergeScopeRows(
   sortBy: SessionSortBy = "updated_at",
 ): { rows: Conversation[]; watermark: Conversation | undefined } {
   const compare = (a: Conversation, b: Conversation) => compareSessionRows(a, b, sortBy);
-  const mineTail = mine.find((row) => row.id === mineCursor) ?? mine.at(-1);
-  const sharedTail = shared.find((row) => row.id === sharedCursor) ?? shared.at(-1);
+  const mineTail = scopeTail(mine, mineCursor);
+  const sharedTail = scopeTail(shared, sharedCursor);
   const tails = [mineHasMore ? mineTail : undefined, sharedHasMore ? sharedTail : undefined]
     .filter((row): row is Conversation => row !== undefined)
     .sort(compare);
