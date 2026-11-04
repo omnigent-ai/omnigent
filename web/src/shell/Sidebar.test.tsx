@@ -2795,6 +2795,7 @@ describe("Sidebar project Show more", () => {
     const trigger = screen.getByTestId("project-folder-pagination-menu");
     expect(within(trigger).getByText("Sessions per project")).toBeInTheDocument();
     expect(within(trigger).getByText(`First ${PROJECT_FOLDER_PAGE_SIZE}`)).toBeInTheDocument();
+    expect(trigger.nextElementSibling).toHaveAttribute("role", "separator");
     fireEvent.keyDown(trigger, { key: "ArrowRight" });
     expect(screen.getByTestId("project-folder-pagination-first-page")).toHaveAttribute(
       "aria-checked",

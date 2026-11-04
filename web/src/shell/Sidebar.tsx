@@ -3882,6 +3882,7 @@ function ProjectHeaderActions({
                 ))}
               </DropdownMenuRadioGroup>
             </FilterMenuSub>
+            {(showExpandControls || hasProjectSessions) && <DropdownMenuSeparator />}
             {/* Gated independently: each hides only when it would be a no-op, so
                 a mixed set offers both. */}
             {showExpandControls && !allExpanded && (
