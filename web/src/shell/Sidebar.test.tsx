@@ -2911,6 +2911,11 @@ describe("Sidebar project Show more", () => {
     act(() => writeProjectFolderPagination(true));
     expect(folderRowIds()).toEqual(filedIds(5));
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
+
+    // The switch-off right after that page reset still lists every loaded row.
+    act(() => writeProjectFolderPagination(false));
+    expect(folderRowIds()).toEqual(filedIds(15));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
   });
 
   it("badges Show more with the state of the sessions it hides", () => {
