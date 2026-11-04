@@ -681,12 +681,12 @@ function loadNavigationHarness({
   };
 
   if (arcaConsentResult !== undefined) {
-    let runsInFlight = 0;
+    const serversInFlight = [];
     localRequires["./arca_connect_window"] = {
       createArcaConnectFlow: (deps) => ({
         run: async (_parentWin, consentServerUrl, options) => {
           calls.arcaConsentRuns.push({ serverUrl: consentServerUrl, options });
-          runsInFlight += 1;
+          serversInFlight.push(consentServerUrl);
           try {
             const consent =
               typeof arcaConsentResult === "function"
@@ -696,13 +696,13 @@ function loadNavigationHarness({
             const connect = deps.startConnect(consentServerUrl, () => {});
             return { ...(await connect.promise), shownInConsole: true };
           } finally {
-            runsInFlight -= 1;
+            serversInFlight.splice(serversInFlight.indexOf(consentServerUrl), 1);
           }
         },
-        // Like the real flow, there is only output to show while a run is in flight.
+        // Like the real flow, only a run in flight for this server has output to show.
         showOutput: (_parentWin, outputServerUrl) => {
           calls.arcaOutputRequests.push(outputServerUrl);
-          return runsInFlight > 0;
+          return serversInFlight.includes(outputServerUrl);
         },
       }),
     };
@@ -1176,7 +1176,8 @@ describe("Arca auto-connect wiring", () => {
     assert.equal(await showOutput(event), false);
   });
 
-  it("opens the output on consent for a page that shows no progress of its own", async (t) => {
+  // The flow's own tests cover the output opening on consent without the opt-in.
+  it("passes inlineProgress only when the page sends exactly true", async (t) => {
     const h = loadNavigationHarness({
       serverUrl: workspace,
       databricksMode: "browser",

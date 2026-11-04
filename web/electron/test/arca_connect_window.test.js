@@ -75,7 +75,8 @@ for (const copy of [
   },
 ]) {
   it(`renders consent, sign-in, retry, and completion for ${copy.name}`, (t) => {
-    const { document, events, sizes } = renderConsole(t, { scrollHeight: 360 });
+    const { document, events, sizes, calls } = renderConsole(t, { scrollHeight: 360 });
+    const status = document.getElementById("status");
     const confirm = document.getElementById("confirm");
     const command = document.getElementById("command");
     events.Init({
@@ -89,16 +90,16 @@ for (const copy of [
     assert.equal(sizes.at(-1).height, 360);
     assert.equal(sizes.at(-1).phase, "asking");
     confirm.click();
+    assert.deepEqual(calls, ["confirm"]);
     events.Started({ login: false, command: "host command" });
-    assert.equal(confirm.disabled, true);
+    assert.equal(confirm.hidden, true);
     // The console can go straight from the connect to sign-in.
     events.Started({ login: true, command: "login command" });
     assert.equal(command.textContent, "login command");
-    assert.equal(confirm.textContent, "Signing in…");
-    assert.equal(confirm.disabled, true);
+    assert.match(status.textContent, /Complete sign-in in your browser/);
     events.Started({ login: false, command: "host command" });
     assert.equal(command.textContent, "host command");
-    assert.equal(confirm.textContent, "Connecting…");
+    assert.match(status.textContent, /cold instance/);
     events.Done({ ok: true });
     assert.equal(confirm.hidden, true);
     assert.equal(document.getElementById("cancel").textContent, "Close");
@@ -153,6 +154,10 @@ function flowHarness() {
 
   class FakeWindow extends EventEmitter {
     constructor(options) {
+      // Electron refuses a destroyed parent, and a test can make opening fail.
+      if (world.failWindows || options.parent?.isDestroyed?.()) {
+        throw new TypeError("Object has been destroyed");
+      }
       super();
       this.options = options;
       this.webContents = new EventEmitter();
@@ -246,6 +251,14 @@ const SERVER = "https://srv.example.com";
 const channelPayloads = (win, name) =>
   win.webContents.sent.filter(([channel]) => channel === name).map(([, payload]) => payload);
 
+/** A window that asked for a run: only its closing and liveness matter here. */
+function parentWindow() {
+  const win = new EventEmitter();
+  win.destroyed = false;
+  win.isDestroyed = () => win.destroyed;
+  return win;
+}
+
 /** Start a run and confirm it in its consent sheet; returns the run's result promise. */
 function confirmedRun(world, flow, options) {
   const result = flow.run(null, SERVER, options);
@@ -274,12 +287,16 @@ describe("arca connect console flow", () => {
 
   it("asks consent in a modal sheet and releases it once confirmed", () => {
     const { world, flow } = flowHarness();
-    const parent = new EventEmitter();
+    const parent = parentWindow();
     void flow.run(parent, SERVER);
     const consent = world.windows[0];
     assert.equal(consent.options.modal, true);
     assert.equal(consent.options.parent, parent);
     assert.equal(channelPayloads(consent, "arca-connect:init")[0].view, "consent");
+    assert.equal(
+      channelPayloads(consent, "arca-connect:init")[0].command,
+      "arca ssh isaac omni host --server https://srv.example.com …",
+    );
     assert.equal(world.connects.length, 0); // nothing ran yet — consent first
 
     world.sendFrom(consent, "arca-connect:confirm");
@@ -481,8 +498,8 @@ describe("arca connect console flow", () => {
 
   it("keeps a background run while another window that re-attached is open", async () => {
     const { world, flow } = flowHarness();
-    const first = Object.assign(new EventEmitter(), { isDestroyed: () => false });
-    const second = Object.assign(new EventEmitter(), { isDestroyed: () => false });
+    const first = parentWindow();
+    const second = parentWindow();
     const result = flow.run(first, SERVER, { inlineProgress: true });
     world.sendFrom(world.windows[0], "arca-connect:confirm");
     assert.equal(flow.showOutput(second, SERVER), true);
@@ -546,7 +563,7 @@ describe("arca connect console flow", () => {
 
     it("shows the output on request, replaying what already ran", async () => {
       const { world, flow } = flowHarness();
-      const parent = Object.assign(new EventEmitter(), { isDestroyed: () => false });
+      const parent = parentWindow();
       const result = flow.run(null, SERVER, { inlineProgress: true });
       world.sendFrom(world.windows[0], "arca-connect:confirm");
       world.connects[0].onOutput("ssh-keyscan could not retrieve the host key\n");
@@ -623,10 +640,37 @@ describe("arca connect console flow", () => {
       assert.deepEqual(channelPayloads(output, "arca-connect:output"), [
         "arca: instance unreachable\n",
       ]);
-      assert.deepEqual(channelPayloads(output, "arca-connect:done")[0], {
-        ok: false,
-        error: "Couldn't reach the Arca instance.",
-      });
+      assert.deepEqual(channelPayloads(output, "arca-connect:done"), [
+        { ok: false, error: "Couldn't reach the Arca instance." },
+      ]);
+    });
+
+    it("opens a failure's output over a window still watching after the starter closed", async () => {
+      const { world, flow } = flowHarness();
+      const first = parentWindow();
+      const second = parentWindow();
+      const result = flow.run(first, SERVER, { inlineProgress: true });
+      world.sendFrom(world.windows[0], "arca-connect:confirm");
+      assert.equal(flow.showOutput(second, SERVER), true);
+      world.sendFrom(world.windows[1], "arca-connect:cancel"); // Hide
+      first.destroyed = true;
+      first.emit("closed");
+
+      world.connects[0].finish({ ok: false, error: "Couldn't reach the Arca instance." });
+      assert.equal((await result).shownInConsole, true);
+      assert.equal(world.windows[2].options.parent, second);
+    });
+
+    it("settles the run even when its output window can't open", async () => {
+      const { world, flow } = flowHarness();
+      const { result } = confirmedRun(world, flow, { inlineProgress: true });
+      world.failWindows = true;
+      world.connects[0].finish({ ok: false, error: "Couldn't reach the Arca instance." });
+      assert.deepEqual(await result, { ok: false, error: "Connecting to Arca failed." });
+
+      world.failWindows = false;
+      void flow.run(null, SERVER);
+      assert.equal(world.windows.at(-1).options.modal, true, "a new run asks consent again");
     });
 
     it("opens the output when sign-in needs the browser", async () => {

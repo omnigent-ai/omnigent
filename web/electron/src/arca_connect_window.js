@@ -25,7 +25,7 @@ const CONTENT_WIDTH = 720;
 const MIN_CONTENT_HEIGHT = 300;
 const RUNNING_CONTENT_HEIGHT = 500;
 const MAX_CONTENT_HEIGHT = 640;
-/** Output kept for an output window opened mid-run; a connect prints far less. */
+/** UTF-16 characters kept for an output window opened mid-run; a connect prints far less. */
 const OUTPUT_BACKLOG_CHARS = 256 * 1024;
 const { arcaTarget } = require("./arcaIdentity");
 
@@ -293,8 +293,10 @@ function createArcaConnectFlow({
         surface(outputWin);
         return;
       }
+      // The window that started the run may have closed while another watches it.
+      outputReady = false;
       outputWin = openConsole({
-        parentWin: alive(requestedBy) ? requestedBy : parentWin,
+        parentWin: [requestedBy, parentWin, ...watchers.keys()].find(alive),
         modal: false,
         height: RUNNING_CONTENT_HEIGHT,
         title: titleFor(reason),
@@ -329,7 +331,7 @@ function createArcaConnectFlow({
       sendLive("arca-connect:started", started);
       // Sign-in waits on the user's browser, so its instructions are shown.
       if (login) openOutput();
-      void connect.promise.then((result) => {
+      const finish = (result) => {
         // A stopped run must not start the next command after a late exit.
         if (settled) return;
         if (login && result.ok) {
@@ -348,10 +350,21 @@ function createArcaConnectFlow({
           ok: result.ok === true,
           error: result.ok === true ? null : (result.error ?? "Connecting to Arca failed."),
         };
+        // Sent before a failure opens the output, whose load replays it once.
+        sendLive("arca-connect:done", done);
         // A failure is reported where its output can be read.
         if (!done.ok) openOutput();
-        sendLive("arca-connect:done", done);
         settle({ ...result, shownInConsole: alive(outputWin) });
+      };
+      void connect.promise.then(finish).catch((error) => {
+        // A window that fails to open must not leave the run unsettled.
+        log(`arca connect: finishing the run failed: ${error?.message ?? error}`);
+        try {
+          connect.cancel();
+        } catch {
+          // Already exited.
+        }
+        settle({ ok: false, error: "Connecting to Arca failed." });
       });
     };
 

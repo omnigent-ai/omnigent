@@ -83,12 +83,8 @@ window.arcaConnect.onStarted(({ login, command }) => {
   resizeToContent();
   // Mount the terminal now that its container has real dimensions.
   requestAnimationFrame(() => ensureTerminal());
-  // The button itself carries the progress: spinner + "Connecting…".
-  confirmBtn.disabled = true;
-  confirmBtn.classList.add("loading");
-  confirmBtn.textContent = login ? "Signing in…" : "Connecting…";
-  // The output view has no Connect button; Hide carries the action instead.
-  if (view === "output") confirmBtn.hidden = true;
+  // Only the output view receives started; it has no Connect button.
+  confirmBtn.hidden = true;
   statusEl.dataset.kind = "";
   statusEl.textContent = login
     ? "Complete sign-in in your browser. If no browser opened, check that Arca Companion is running. Credentials stay on the Arca instance."
@@ -128,7 +124,6 @@ window.arcaConnect.onDone(({ ok, error }) => {
   statusEl.dataset.kind = ok ? "ok" : "error";
   statusEl.textContent = ok ? "Connected. The Arca host should appear online shortly." : error;
   document.body.dataset.phase = "done";
-  confirmBtn.classList.remove("loading");
   confirmBtn.hidden = true;
   hideBtn.hidden = true;
   cancelBtn.textContent = "Close";

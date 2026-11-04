@@ -159,30 +159,6 @@
         opacity: 0.5;
         cursor: default;
       }
-      /* Inline spinner for the (still disabled) Connect button while the
-         command runs. Flex centering keeps the ring optically middle-aligned
-         with the label at any font metrics. */
-      button.loading {
-        display: inline-flex;
-        align-items: center;
-        gap: 7px;
-        opacity: 0.85;
-      }
-      button.loading::before {
-        content: "";
-        flex: none;
-        width: 10px;
-        height: 10px;
-        border: 2px solid rgb(255 255 255 / 40%);
-        border-top-color: #fff;
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
-      }
     </style>
   </head>
   <body data-phase="asking">

@@ -361,7 +361,7 @@ export interface DbcertRefreshOptions {
 }
 export type DbcertStatusResult = { ok: true; valid: boolean } | { ok: false; error: string };
 
-/** Result of connecting the Arca instance as a host, from the desktop shell. */
+/** Options the page passes when starting an Arca connect. */
 export interface ArcaConnectOptions {
   /**
    * The page shows the connect's progress itself, so a shell that can run it
@@ -370,6 +370,7 @@ export interface ArcaConnectOptions {
   inlineProgress?: boolean;
 }
 
+/** Result of connecting the Arca instance as a host, from the desktop shell. */
 export interface ArcaConnectResult extends HostActionResult {
   /** Actual daemon identity captured on Arca for this selected server target. */
   identity?: { serverUrl: string; hostId: string };

@@ -38,6 +38,11 @@ async function fixtureArca({ stateDir, hostId }) {
     return;
   }
   event("connect-start", { pid: process.pid });
+  // Stop connecting sends SIGTERM; log the exit so cleanup won't kill a reused pid.
+  process.once("SIGTERM", () => {
+    event("connect-exit", { pid: process.pid });
+    process.exit(143);
+  });
   process.stdout.write("Checking your Arca instance…\n");
   await sleep(600);
   process.stdout.write("Attempting to start your Classic Arca instance (cold start)\n");
@@ -123,16 +128,32 @@ function processExists(pid) {
 /** Main-process view of every window: the shell, the consent sheet, the output window. */
 function windowStates(electronApp) {
   return electronApp.evaluate(({ BrowserWindow }) =>
-    BrowserWindow.getAllWindows()
-      .filter((win) => !win.isDestroyed())
-      .map((win) => ({
-        id: win.id,
-        url: win.webContents.getURL(),
-        modal: win.isModal(),
-        enabled: win.isEnabled(),
-        visible: win.isVisible(),
-      })),
+    BrowserWindow.getAllWindows().flatMap((win) => {
+      // A window closing mid-read (its webContents goes first) is already gone.
+      try {
+        return [
+          {
+            id: win.id,
+            url: win.webContents.getURL(),
+            modal: win.isModal(),
+            enabled: win.isEnabled(),
+            visible: win.isVisible(),
+          },
+        ];
+      } catch {
+        return [];
+      }
+    }),
   );
+}
+
+/** Click a button that closes its own window, which can end the page before the click returns. */
+async function clickClosingButton(button) {
+  try {
+    await button.click();
+  } catch (error) {
+    if (!/has been closed/.test(String(error?.message))) throw error;
+  }
 }
 
 const isConsole = (state) => state.url.includes("/arca-connect/index.html") && state.visible;
@@ -213,7 +234,9 @@ async function withDesktop(name, run) {
     try {
       const events = readEvents();
       const exited = new Set(events.filter((e) => e.name === "connect-exit").map((e) => e.pid));
-      running = events.filter((e) => e.name === "connect-start" && !exited.has(e.pid));
+      running = events.filter(
+        (e) => e.name === "connect-start" && !exited.has(e.pid) && processExists(e.pid),
+      );
     } catch {
       /* An unreadable events log leaves nothing known to kill. */
     }
@@ -269,6 +292,11 @@ it("connects Arca in the background after consent and keeps the app usable", tes
     await composer.click();
     await composer.pressSequentially("Draft this while Arca starts", { delay: 60 });
     assert.equal(await composer.inputValue(), "Draft this while Arca starts");
+    // Send waits for Arca rather than starting on the previously selected host.
+    const send = page.getByTestId("new-chat-landing-submit");
+    assert.equal(await send.isDisabled(), true);
+    await send.hover({ force: true });
+    await page.getByText("Waiting for Arca to connect…").first().waitFor();
     await sleep(2500);
 
     fs.writeFileSync(path.join(stateDir, "release"), "release");
@@ -314,7 +342,7 @@ it(
         .waitFor();
       await sleep(2000);
 
-      await output.getByRole("button", { name: "Hide", exact: true }).click();
+      await clickClosingButton(output.getByRole("button", { name: "Hide", exact: true }));
       await waitUntil(
         async () => !(await windowStates(electronApp)).some(isConsole),
         "Hide left the output window open",
@@ -331,7 +359,9 @@ it(
         .first()
         .waitFor();
       await sleep(1500);
-      await reopened.getByRole("button", { name: "Stop connecting", exact: true }).click();
+      await clickClosingButton(
+        reopened.getByRole("button", { name: "Stop connecting", exact: true }),
+      );
       await waitUntil(() => !processExists(connect.pid), "Stop connecting left arca running");
       await waitUntil(
         async () => !(await windowStates(electronApp)).some(isConsole),

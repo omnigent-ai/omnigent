@@ -77,10 +77,12 @@ be able to write resources without a separate Omnigent account.
   toast) with **Show output**, which opens a non-modal output window. **Hide**
   closes that window and the connect keeps running; **Stop connecting** stops
   it. The output window opens by itself for a browser sign-in or a failure.
+  On the landing, drafting stays open but Send waits for Arca; picking another
+  host instead keeps that host when the connect finishes.
   States: consent, running in the background, output shown or hidden,
-  stopped, sign-in, failed, connected (the Arca host selected), and the window
-  that asked for it closed (the connect stops). An older desktop shell keeps
-  its blocking console.
+  stopped, sign-in, failed, waiting for the host to register, connected (the
+  Arca host selected), and every window that asked for it closed (the connect
+  stops). An older desktop shell keeps its blocking console.
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.

@@ -178,9 +178,11 @@ def _open_offline_arca_chat(
             page.unroute_all(behavior="ignoreErrors")
 
     request.addfinalizer(_drop_routes)
-    page.add_init_script(_DESKTOP_BRIDGE_INIT_SCRIPT)
-    if shows_output:
-        page.add_init_script(_SHOW_OUTPUT_BRIDGE_SCRIPT)
+    # One script: Playwright doesn't order separate init scripts, and the output
+    # bridge extends the desktop bridge.
+    page.add_init_script(
+        _DESKTOP_BRIDGE_INIT_SCRIPT + (_SHOW_OUTPUT_BRIDGE_SCRIPT if shows_output else "")
+    )
     page.add_init_script(
         f"window.localStorage.setItem('omnigent:arca-host-id', {_ARCA_HOST_ID!r});"
         if remembered

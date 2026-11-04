@@ -5118,18 +5118,8 @@ function registerIpc() {
     return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
 
-  // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
-  // the window's server as a host, by running `isaac omni host --background`
-  // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,
-  // the MDM flag re-checked HERE (the renderer is not trusted to have checked
-  // it), and user consent in the shell-owned connect console — which shows
-  // the exact command and streams its live output (arca_connect_window.js).
-  // A connect already in flight is re-surfaced (console focused, outcome
-  // shared), never refused; the runner itself enforces CONNECT_TIMEOUT_MS so
-  // a wedged command always settles. No local process outlives the connect:
-  // the enrolled host keeps its own outbound tunnel from the Arca box.
-
-  // Resolves the sender's window and Arca server URL, or the gate's error.
+  // Both Arca IPCs share this gate so neither can skip the MDM flag or the
+  // Databricks-managed server check; the renderer is not trusted to have checked.
   const arcaConnectTarget = (event) => {
     if (!databricksInternalFeaturesEnabled()) {
       return { error: "Arca support is not enabled on this machine." };
@@ -5150,9 +5140,10 @@ function registerIpc() {
     return { win, arcaServerUrl };
   };
 
-  // A page that shows the connect's progress itself opts in with
-  // `inlineProgress`; its output then opens only for sign-in, a failure, or on
-  // request. Older pages keep the output opening as soon as the user confirms.
+  // SPA → run `isaac omni host --background` on the user's Arca instance over
+  // `arca ssh`, after consent in the shell-owned console (arca_connect_window.js).
+  // A page that shows progress itself passes `inlineProgress`; otherwise the
+  // output opens on consent. A connect in flight is re-surfaced, never refused.
   ipcMain.handle("omnigent:arca-connect", async (event, options) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-connect is only available to a connected server page");
