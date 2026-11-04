@@ -525,7 +525,7 @@ function SideChatComposer({
     if (!fullSession || !failedSendDraft) return;
     const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
     const hasNewerInput = !!(current.text.trim() || current.files.length || current.quotes?.length);
-    const failed = takeFailedSendDraft(childId, hasNewerInput, true);
+    const failed = takeFailedSendDraft(childId, hasNewerInput, true, "sideChat");
     if (!failed) return;
     const { accepted, errors } = validateAttachments(failed.files, attachmentPolicy);
     errors.forEach((message) => toast.error(message));

@@ -1834,26 +1834,59 @@ it.each([
 it.each([
   { holder: "the grid composer", sender: "the main composer", gridHolds: true },
   { holder: "the main composer's saved draft", sender: "the grid composer", gridHolds: false },
+  {
+    holder: "the grid composer, told its id by a later read,",
+    sender: "the main composer",
+    gridHolds: true,
+    readAs: "pending_late",
+  },
+  {
+    holder: "the grid composer, told its id by a later read,",
+    sender: "the main composer's saved draft",
+    gridHolds: true,
+    readAs: "pending_late_with_main_draft",
+    mainDraft: { text: "unrelated", files: [] },
+  },
 ])(
   "doesn't name a failed startup input $holder holds in an unrelated send from $sender",
-  async ({ gridHolds }) => {
+  async ({ gridHolds, readAs, mainDraft }) => {
+    const late = readAs !== undefined;
     onTestFinished(clearSessionDrafts);
     const entry = conversationRegistry.acquire(childId);
     entry.setState({
       sessionStatus: "idle",
       abortController: new AbortController(),
-      returnedStartupInputs: ["pending_first"],
+      returnedStartupInputs: late ? [] : ["pending_first"],
     });
     useChatStore.setState({ send: initialStoreState.send });
     renderPane(<SideChatPane childId={childId} fullSession />);
     const recovered = { text: "saved on server", files: [], startupInputIds: ["pending_first"] };
+    // A reload's unanswered send is known by its stable id until a read names its input.
+    const sent = late ? { files: [], stableId: "stable_reload" } : recovered;
     if (gridHolds)
       act(() =>
         entry.setState({
-          failedSendDraft: { conversationId: childId, ...recovered, recovered: true },
+          failedSendDraft: {
+            conversationId: childId,
+            text: recovered.text,
+            ...sent,
+            recovered: true,
+          },
         }),
       );
     else setSessionDraft(childId, recovered);
+    if (mainDraft) setSessionDraft(childId, mainDraft);
+    if (late) {
+      // A new id per row: this tab still counts earlier tests' inputs as returned, and sends name them.
+      vi.spyOn(sessionsApi, "listFailedInputs").mockResolvedValue([
+        {
+          pendingId: readAs,
+          itemId: "stable_reload",
+          content: [{ type: "input_text", text: "saved on server" }],
+        },
+      ]);
+      await act(() => retryFailedStartupLookup(childId));
+    }
     const post = vi.spyOn(sessionsApi, "postEvent").mockResolvedValue({ queued: true });
 
     if (gridHolds) {
@@ -1873,8 +1906,15 @@ it.each([
     expect(post.mock.calls[0][1]).toMatchObject({
       data: { content: [{ type: "input_text", text: "unrelated" }] },
     });
-    expect(post.mock.calls[0][1]).not.toHaveProperty("replaces_failed_inputs");
-    if (gridHolds) expect(screen.getByTestId("side-chat-input")).toHaveValue("saved on server");
-    else expect(getSessionDraft(childId)).toEqual(recovered);
+    expect(post.mock.calls[0][1]).not.toMatchObject({
+      replaces_failed_inputs: expect.arrayContaining([readAs ?? "pending_first"]),
+    });
+    if (gridHolds) {
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("saved on server");
+      expect(useChatStore.getState().sideChatComposers[childId]?.startupInputIds).toEqual([
+        readAs ?? "pending_first",
+      ]);
+      expect(getSessionDraft(childId)).toEqual(mainDraft);
+    } else expect(getSessionDraft(childId)).toEqual(recovered);
   },
 );

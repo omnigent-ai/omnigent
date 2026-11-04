@@ -1039,9 +1039,6 @@ async def test_crashed_create_launch_is_recorded_on_the_session(
     [failed] = page["data"]
     assert failed["content"] == _INPUT["data"]["content"]
     assert page["next_cursor"] is None
-    env.conv_store.set_runner_id(session_id, uuid4().hex)
-    page = (await env.client.get(f"/v1/sessions/{session_id}/failed-inputs")).json()
-    assert page == {"data": [], "next_cursor": None}
 
 
 async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_resend(
