@@ -522,7 +522,10 @@ def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
     comments = data.get("comments")
     reviews = data.get(_PR_COMMENTS_FIELD)
     shaped = _shape_comments(comments, reviews, pr_url=data.get("url"), cap=False)
-    result: dict[str, Any] = {"comments": shaped[-_MAX_COMMENTS:]}
+    result: dict[str, Any] = {
+        "comments": shaped[-_MAX_COMMENTS:],
+        **_timeline_payload(data.get("timelineItems")),
+    }
     if (
         not isinstance(comments, list)
         or not isinstance(reviews, list)
@@ -532,6 +535,59 @@ def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
     ):
         result["comments_partial"] = True
     return result
+
+
+def _timeline_payload(raw: Any) -> dict[str, Any]:
+    """Shape commit and force-push activity without treating commit dates as push dates."""
+    connection = raw if isinstance(raw, dict) else {}
+    nodes = connection.get("nodes")
+    page = connection.get("pageInfo")
+    partial = not isinstance(page, dict) or page.get("hasPreviousPage") is not False
+    events: list[dict[str, Any]] = []
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not node["id"]:
+            partial = True
+            continue
+        if node.get("__typename") == "PullRequestCommit":
+            commit = node.get("commit")
+            if not isinstance(commit, dict):
+                partial = True
+                continue
+            author = commit.get("author")
+            author = author if isinstance(author, dict) else {}
+            user = author.get("user")
+            user = user if isinstance(user, dict) else {}
+            events.append(
+                {
+                    "id": node["id"],
+                    "kind": "commit",
+                    "author": user.get("login") or author.get("name"),
+                    "created_at": commit.get("committedDate"),
+                    "url": node.get("url"),
+                    "sha": commit.get("oid"),
+                    "message": commit.get("messageHeadline"),
+                }
+            )
+        elif node.get("__typename") == "HeadRefForcePushedEvent":
+            actor = node.get("actor")
+            actor = actor if isinstance(actor, dict) else {}
+            before = node.get("beforeCommit")
+            before = before if isinstance(before, dict) else {}
+            after = node.get("afterCommit")
+            after = after if isinstance(after, dict) else {}
+            events.append(
+                {
+                    "id": node["id"],
+                    "kind": "force_push",
+                    "author": actor.get("login"),
+                    "created_at": node.get("createdAt"),
+                    "url": after.get("url"),
+                    "sha": after.get("oid"),
+                    "previous_sha": before.get("oid"),
+                }
+            )
+    events.sort(key=lambda event: event["created_at"] or "")
+    return {"timeline_events": events, "timeline_partial": partial or not isinstance(nodes, list)}
 
 
 # GitHub label colors are six hex digits; the panel puts them in inline styles.
@@ -717,14 +773,13 @@ def _gh_pr_view(
         return None
     if not isinstance(data, dict):
         return None
-    comments = data.get("comments")
-    if isinstance(comments, list) and len(comments) >= _MAX_COMMENTS:
-        _refresh_latest_comments(data, cwd=cwd, token=token)
+    if "comments" in fields.split(","):
+        _refresh_conversation(data, cwd=cwd, token=token)
     return data
 
 
-def _refresh_latest_comments(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
-    """Read the latest page when gh's bounded conversation list may omit new posts."""
+def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
+    """Read recent comments and activity, preserving gh's comments if this read fails."""
     url = data.get("url")
     if not isinstance(url, str):
         return
@@ -733,12 +788,29 @@ def _refresh_latest_comments(data: dict[str, Any], *, cwd: str, token: str | Non
         host = _host_args(cwd, reference)
     except ValueError:
         return
+    comments = data.get("comments")
+    refresh_comments = isinstance(comments, list) and len(comments) >= _MAX_COMMENTS
     owner, name = reference.repository.split("/", 1)
-    query = """query($owner: String!, $name: String!, $number: Int!) {
+    query = """query($owner: String!, $name: String!, $number: Int!, $includeComments: Boolean!) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
-          comments(last: 100) {
+          comments(last: 100) @include(if: $includeComments) {
             nodes { author { login } body createdAt url isMinimized }
+          }
+          timelineItems(last: 100, itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT]) {
+            pageInfo { hasPreviousPage }
+            nodes {
+              __typename
+              ... on PullRequestCommit {
+                id url
+                commit { oid messageHeadline committedDate author { name user { login } } }
+              }
+              ... on HeadRefForcePushedEvent {
+                id createdAt actor { login }
+                beforeCommit { oid }
+                afterCommit { oid url }
+              }
+            }
           }
         }
       }
@@ -748,6 +820,8 @@ def _refresh_latest_comments(data: dict[str, Any], *, cwd: str, token: str | Non
             "api",
             *host,
             "graphql",
+            # ponytail: gh handles token-scoped caching; busy comment tails stay fresh.
+            *([] if refresh_comments else ["--cache", "30s"]),
             "-f",
             f"query={query}",
             "-f",
@@ -756,6 +830,8 @@ def _refresh_latest_comments(data: dict[str, Any], *, cwd: str, token: str | Non
             f"name={name}",
             "-F",
             f"number={reference.number}",
+            "-F",
+            f"includeComments={str(refresh_comments).lower()}",
         ],
         cwd=cwd,
         token=token,
@@ -763,9 +839,14 @@ def _refresh_latest_comments(data: dict[str, Any], *, cwd: str, token: str | Non
     if rc != 0:
         return
     try:
-        latest = json.loads(out)["data"]["repository"]["pullRequest"]["comments"]["nodes"]
+        conversation = json.loads(out)["data"]["repository"]["pullRequest"]
     except (ValueError, KeyError, TypeError):
         return
+    if not isinstance(conversation, dict):
+        return
+    data["timelineItems"] = conversation.get("timelineItems")
+    comments = conversation.get("comments")
+    latest = comments.get("nodes") if isinstance(comments, dict) else None
     if isinstance(latest, list):
         data["comments"] = latest
 

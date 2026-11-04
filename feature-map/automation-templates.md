@@ -38,7 +38,7 @@ to customize.
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
   failures still allow Default.
-- `capabilities`: Jira, Slack, and GitHub templates require session continuity
+- `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `responsive`: gallery items have icons, descriptions, hourly polling summaries,
   access requirements, pointer cursors, and keyboard focus indicators. Desktop

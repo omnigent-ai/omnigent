@@ -669,7 +669,16 @@ class ClaudeTerminalDialog(RuntimeError):
     Deliberately not a :class:`ClaudePromptTimeout`: the pane is healthy and
     the dialog is answerable from the embedded terminal, so delivery handlers
     must report it without reaping the pane.
+
+    :param message: Human-readable refusal.
+    :param awaits_answer: Whether the refusal names a dialog waiting for the
+        person's answer and nothing was typed, so the same delivery can run
+        again once :func:`terminal_dialog_pending` reports it closed.
     """
+
+    def __init__(self, message: str, *, awaits_answer: bool = False) -> None:
+        super().__init__(message)
+        self.awaits_answer = awaits_answer
 
 
 class ClaudeInputBoxOccupied(ClaudeTerminalDialog):
@@ -1424,6 +1433,10 @@ class ClaudeNativeToolRelay:
         self._httpd = httpd
         self._advertised_url = advertised_url
         self._relay_info = relay_info
+        # Held in memory, not re-read from tool_relay.json: the bridge dir is
+        # writable by the session user, so editing the file must not widen
+        # what the relay runs.
+        self._advertised_tool_names = _relay_info_tool_names(relay_info)
         self._tool_executor = tool_executor
         self._closed = closed
 
@@ -1440,6 +1453,7 @@ class ClaudeNativeToolRelay:
         }
         _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
         self._relay_info = relay_info
+        self._advertised_tool_names = _relay_info_tool_names(relay_info)
         self._tool_executor = tool_executor
 
     def close(self) -> None:
@@ -1467,6 +1481,24 @@ class ClaudeNativeToolRelay:
         self._closed.set()
         self._httpd.shutdown()
         self._httpd.server_close()
+
+
+def _relay_info_tool_names(relay_info: _JsonObject) -> frozenset[str]:
+    """
+    Return the tool names listed in a relay advertisement.
+
+    :param relay_info: Relay advertisement, e.g.
+        ``{"tools": [{"name": "list_comments", ...}]}``.
+    :returns: Listed names, e.g. ``frozenset({"list_comments"})``.
+    """
+    tools = relay_info.get("tools")
+    if not isinstance(tools, list):
+        return frozenset()
+    return frozenset(
+        name
+        for name in (tool.get("name") for tool in tools if isinstance(tool, dict))
+        if isinstance(name, str) and name
+    )
 
 
 def _ensure_secure_dir(target: Path) -> None:
@@ -4535,12 +4567,13 @@ def _paste_and_submit(
     # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
     # interior newlines (mapped to CR below) stay data instead of becoming
     # per-line submits. See anthropics/claude-code#52126.
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        paste_file.write(_paste_payload_bytes(text + "\n"))
-        paste_path = paste_file.name
+    paste_path: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            paste_path = paste_file.name
+            paste_file.write(_paste_payload_bytes(text + "\n"))
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
         _run_tmux(
             socket_path,
@@ -4554,8 +4587,9 @@ def _paste_and_submit(
         )
         delivery_diagnostics.record_details(paste_sent=True)
     finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
+        if paste_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
     # Wait until the TUI has visibly committed the paste into its input
     # box before submitting. Claude Code coalesces rapid stdin bursts
     # into a paste; an Enter that arrives while it is still consuming
@@ -5079,7 +5113,8 @@ def inject_slash_command(
     )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
-            "Answer the pending Claude question or permission request before changing settings."
+            "Answer the pending Claude question or permission request before changing settings.",
+            nothing_typed=True,
         )
     # Clear any draft the user is mid-typing; otherwise the command below
     # concatenates with their text and Enter submits
@@ -6235,6 +6270,27 @@ def input_box_reads_clear(bridge_dir: Path, *, repaint: bool = False) -> bool:
     return False
 
 
+def terminal_dialog_pending(bridge_dir: Path) -> bool:
+    """
+    Check whether a dialog only the terminal shows still holds Claude Code.
+
+    The dialogs :func:`_terminal_dialog_headline` names (a settings error, an
+    exit confirmation, an MCP approval) have no web card; the person answers
+    them in the embedded terminal.
+
+    :param bridge_dir: The session's native bridge directory.
+    :returns: ``True`` while such a dialog is on screen; ``False`` once it
+        closed, or when the pane cannot be read.
+    """
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    return _terminal_dialog_headline(_capture_pane(socket_path, target)) is not None
+
+
 def auto_mode_billing_notice_visible(pane: str) -> bool:
     """Recognize the exact informational notice below the live pane's last rule."""
     return _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_NOTICE)
@@ -7241,7 +7297,8 @@ def _wait_for_claude_prompt_ready(
             raise ClaudeTerminalDialog(
                 f"Claude Code is waiting for an answer in its terminal ({headline}), "
                 "so the message was not delivered. Open the terminal, answer the "
-                "prompt, then resend your message." + _format_terminal_failure_tail(pane)
+                "prompt, then resend your message." + _format_terminal_failure_tail(pane),
+                awaits_answer=True,
             )
         dialog_headline = headline
         # A launcher asking for a password, e.g. sudo writing managed settings.
@@ -7574,6 +7631,18 @@ def start_tool_relay(
     closed = threading.Event()
 
     async def _execute_current_tool(name: str, arguments: _JsonObject) -> object:
+        # The token proves only that the caller runs as the session user,
+        # which any command the agent runs does. The MCP bridge forwards only
+        # advertised names, so refuse the rest. Check and pick the executor in
+        # one loop step: update_tools swaps both on this loop.
+        if name not in relay._advertised_tool_names:
+            _logger.warning(
+                "tool relay refused unadvertised tool %r for session=%s",
+                name,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            return {"error": f"unknown tool: {name!r}"}
         return await relay._tool_executor(name, arguments)
 
     handler_cls = _tool_relay_handler_factory(
