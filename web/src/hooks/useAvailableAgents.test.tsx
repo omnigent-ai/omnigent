@@ -53,7 +53,7 @@ function wrapper({ children }: { children: ReactNode }) {
   // retry off so the no-network/error case resolves on the first
   // attempt instead of stalling the test on TanStack's backoff.
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
   });
   return (
     <QueryClientProvider client={client}>
@@ -131,7 +131,9 @@ describe("useAvailableAgents", () => {
   });
 
   it("limits discovery to 30 Mine sessions and updates when that cache refreshes", async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
     const mineKey = ["conversations", "", false, null, "mine"];
     const rows: Conversation[] = Array.from({ length: 60 }, (_, index) => ({
       id: `mine_${index}`,
@@ -1007,7 +1009,9 @@ describe("useAvailableAgents", () => {
 
 describe("prefetchAvailableAgentDetails", () => {
   it("patches harness, description, and skills into the cache on success", async () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
     const agent = testAgent("ag_doc", "doc-writer", {
       display_name: "Doc-writer",
       harness: null,
@@ -1043,7 +1047,9 @@ describe("prefetchAvailableAgentDetails", () => {
   });
 
   it("is a no-op when harness is already populated", async () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
     const agent = testAgent("ag_doc", "doc-writer", {
       display_name: "Doc-writer",
       harness: "claude-sdk",
@@ -1058,7 +1064,9 @@ describe("prefetchAvailableAgentDetails", () => {
   });
 
   it("is a no-op when sessionId is absent (catalog agent)", async () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
     const agent = testAgent("ag_native", "claude-native-ui", {
       display_name: "Claude Code",
       harness: null,
@@ -1071,7 +1079,9 @@ describe("prefetchAvailableAgentDetails", () => {
   });
 
   it("leaves the agent name-only when the enrich fetch fails", async () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
     const agent = testAgent("ag_doc", "doc-writer", {
       display_name: "Doc-writer",
       harness: null,
@@ -1092,7 +1102,9 @@ describe("prefetchAvailableAgentDetails", () => {
     // typo). On initial load harness is null so it passes the kiro filter.
     // prefetchAvailableAgentDetails detects harness: "kiro-native" after
     // enrichment and removes the agent since a seeded kiro built-in exists.
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
     const kiroBuiltin = testAgent("ag_kiro", "kiro-native-ui", {
       display_name: "Kiro",
       harness: "kiro-native",
@@ -1124,7 +1136,9 @@ describe("prefetchAvailableAgentDetails", () => {
     // The sole kiro peer is a user-flagged custom agent, not the stock
     // wrapper, so enrichment must not fold the session row into it. Both keep
     // their own rows.
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
     const customKiro = testAgent("ag_teamkiro", "teamkiro", {
       display_name: "Teamkiro",
       harness: "kiro-native",
@@ -1698,7 +1712,9 @@ describe("useAgentCatalog", () => {
         ],
       }),
     });
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
     const { result } = renderHook(() => useAgentCatalog(), {
       wrapper: ({ children }: { children: ReactNode }) => (
         <QueryClientProvider client={client}>
@@ -1721,7 +1737,9 @@ describe("useAgentCatalog", () => {
       [BUILTINS_URL]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
       [HARNESSES_URL]: harnesses,
     });
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
     const { result } = renderHook(() => useAgentCatalog(), {
       wrapper: ({ children }: { children: ReactNode }) => (
         <QueryClientProvider client={client}>

@@ -1776,6 +1776,7 @@ export function usePinnedConversations(sharedEnabled = true, limit = sidebarConf
   const viewerId = useViewerId();
   const query = useQuery<PinnedConversationsResult>({
     queryKey: PINNED_CONVERSATIONS_KEY,
+    retry: retryListFetch,
     queryFn: () => fetchPinnedConversations(sharedEnabled, limit),
     select: (data) =>
       sharedEnabled

@@ -38,6 +38,7 @@ import {
   useTogglePinnedConversation,
   useReorderPinnedConversations,
   fetchPinnedConversations,
+  usePinnedConversations,
   clearSessionTombstones,
   markRecentlyCreated,
   clearRecentlyCreated,
@@ -48,6 +49,7 @@ import {
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
+import { useScopeCache } from "./useScopeCache";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -458,7 +460,7 @@ describe("session-list retry policy", () => {
     ]);
   });
 
-  it("is shared by the list, search, and project-folder queries", () => {
+  it("is shared by every session-list query", () => {
     fetchMock.mockResolvedValue(
       mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
     );
@@ -470,6 +472,8 @@ describe("session-list retry policy", () => {
         useConversations("", false);
         useSessionSearch("linear", "all", { limit: 8 });
         useProjectSessions("Sprint 42", true);
+        useScopeCache("mine", false);
+        usePinnedConversations();
       },
       { wrapper },
     );
@@ -477,7 +481,7 @@ describe("session-list retry policy", () => {
       .getQueryCache()
       .getAll()
       .map((query) => (query.options as { retry?: unknown }).retry);
-    expect(retries).toHaveLength(3);
+    expect(retries).toHaveLength(5);
     for (const retry of retries) expect(retry).toBe(retryListFetch);
   });
 });
