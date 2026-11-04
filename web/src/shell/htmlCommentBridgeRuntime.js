@@ -254,15 +254,19 @@
   }
 
   // Space presses a focused button or toggles a <summary> instead of scrolling.
-  function spaceActivates(e) {
-    return e.key === " " && !!e.target && /^(BUTTON|SUMMARY)$/.test(e.target.tagName);
+  function spaceActivates(key, target) {
+    return key === " " && !!target && /^(BUTTON|SUMMARY)$/.test(target.tagName);
   }
 
   // Capture runs before the page's own handlers, so the next frame judges whether they
   // consumed the input; a Ctrl+wheel or a multi-touch move is a pinch, not a scroll.
   function onRestoreInput(e) {
+    // At `window`, a key pressed inside a web component's shadow root targets its host.
+    const target = e.composedPath()[0] || e.target;
     const scrollKey =
-      SCROLL_KEYS.indexOf(e.key) !== -1 && !isEditableTarget(e.target) && !spaceActivates(e);
+      SCROLL_KEYS.indexOf(e.key) !== -1 &&
+      !isEditableTarget(target) &&
+      !spaceActivates(e.key, target);
     const pinch =
       (e.type === "wheel" && e.ctrlKey) ||
       (e.type === "touchmove" && !!e.touches && e.touches.length > 1);

@@ -549,6 +549,15 @@ describe("bridge runtime scroll position", () => {
     focused.remove();
   }
 
+  /** Press `key` in `focused` inside a web component, which `window` sees as its host. */
+  function pressInShadowRoot(focused: HTMLElement, key: string) {
+    const host = document.createElement("div");
+    host.attachShadow({ mode: "open" }).append(focused);
+    document.body.append(host);
+    focused.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, composed: true }));
+    host.remove();
+  }
+
   const cancelable = { bubbles: true, cancelable: true };
 
   /** Dispatch `event` to a widget that consumes it, as a slide deck does with its keys. */
@@ -624,6 +633,14 @@ describe("bridge runtime scroll position", () => {
     ["an arrow key in editable text", () => pressIn(editableText(), "ArrowDown")],
     ["a space on a focused button", () => pressIn(document.createElement("button"), " ")],
     ["a space on a <summary>", () => pressIn(document.createElement("summary"), " ")],
+    [
+      "a space typed into a form field in a shadow root",
+      () => pressInShadowRoot(document.createElement("input"), " "),
+    ],
+    [
+      "a space on a button in a shadow root",
+      () => pressInShadowRoot(document.createElement("button"), " "),
+    ],
     [
       "a trackpad pinch",
       () => dispatchToPage(new WheelEvent("wheel", { ctrlKey: true, bubbles: true })),
