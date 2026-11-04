@@ -10,6 +10,9 @@ export interface McpServerTools {
   harness_sign_in?: "available" | "signed_in" | null;
 }
 
+/** Matches the host's sign-in status cache, so a sign-in made outside Omnigent shows. */
+const SIGN_IN_STALE_MS = 30_000;
+
 export function mcpServerToolsKey(
   hostId: string,
   harness: string,
@@ -44,7 +47,8 @@ export function useMcpServerTools(
       return (await response.json()) as McpServerTools;
     },
     enabled,
-    staleTime: 5 * 60_000,
+    staleTime: (query) =>
+      query.state.data?.connection === "needs_auth" ? SIGN_IN_STALE_MS : 5 * 60_000,
     retry: false,
     refetchOnWindowFocus: false,
   });
