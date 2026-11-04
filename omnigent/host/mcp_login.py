@@ -556,10 +556,11 @@ class HostMcpLogins:
 
     async def close(self, owner: object | None = None) -> None:
         """Stop every login and refuse later starts from *owner*; its web UI is gone."""
+        # Recorded first so starts queued ahead of the lock launch nothing.
+        if owner is not None:
+            self._closed_owners.add(owner)
         # The lock lets an in-flight start register its CLI before it is stopped.
         async with self._start_lock:
-            if owner is not None:
-                self._closed_owners.add(owner)
             for login in list(self._logins.values()):
                 await self._finish(login, "cancelled")
             self._logins.clear()

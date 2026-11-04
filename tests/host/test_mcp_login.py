@@ -636,11 +636,17 @@ async def test_disconnect_stops_an_in_flight_start(
     logins = host_logins()
     start = asyncio.create_task(logins.start(_server(), tunnel))
     await spawning.wait()
+    queued = asyncio.create_task(logins.start(_server("other"), tunnel))
+    await asyncio.sleep(0)
     close = asyncio.create_task(logins.close(tunnel))
     await asyncio.sleep(0)
     release.set()
-    started, _ = await asyncio.gather(start, close)
+    started, queued_result, _ = await asyncio.gather(start, queued, close, return_exceptions=True)
     assert started["state"] == "cancelled"
+    # The start queued ahead of the disconnect launches no CLI.
+    assert isinstance(queued_result, LoginError)
+    assert queued_result.status == "failed"
+    assert len(pids) == 1
     await _assert_gone(pids[0])
     assert not logins.pids()
 
