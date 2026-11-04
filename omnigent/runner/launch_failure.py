@@ -701,6 +701,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "host, then start a new session."
     ),
     "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
+    "prompt_blocked_by_hook": "A hook blocked this message, so the agent did not run it.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 

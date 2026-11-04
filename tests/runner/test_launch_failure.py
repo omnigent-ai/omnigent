@@ -892,6 +892,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("codex_thread_not_started", "never ran"),
         ("codex_compaction_model_failed", "previous model"),
         ("codex_provider_auth_failed", "model provider's sign-in command"),
+        ("prompt_blocked_by_hook", "A hook blocked this message"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

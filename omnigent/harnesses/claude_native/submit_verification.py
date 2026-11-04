@@ -95,8 +95,12 @@ def has_matching_hook_refusal(
     submitted_text: str,
     *,
     normalize_prompt: Callable[[str], str],
-) -> bool:
-    """Match a fresh explicit refusal only to stop retries, without assigning ownership."""
+) -> str | None:
+    """
+    Match a fresh explicit refusal only to stop retries, without assigning ownership.
+
+    :returns: The hook's reason (possibly empty) for a matching refusal, else ``None``.
+    """
     for entry in read_fresh_submit_records(boundary):
         if (
             entry.get("type") != "system"
@@ -120,9 +124,9 @@ def has_matching_hook_refusal(
                 continue
             prompt = body[len(reason + _PROMPT_SEPARATOR) :]
         elif ending is None and body.count(_PROMPT_SEPARATOR) == 1:
-            _reason, _separator, prompt = body.partition(_PROMPT_SEPARATOR)
+            reason, _separator, prompt = body.partition(_PROMPT_SEPARATOR)
         else:
             continue
         if normalize_prompt(prompt) == submitted_text:
-            return True
-    return False
+            return reason
+    return None

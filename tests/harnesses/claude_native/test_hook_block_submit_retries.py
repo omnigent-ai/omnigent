@@ -38,6 +38,7 @@ def _blocked_prompt_entry(reason: str, prompt: str, *, native_session_id: str) -
     [
         ("fresh", True),
         ("legacy", True),
+        ("multiline-reason", True),
         ("stale", False),
         ("different-prompt", False),
         ("same-prefix", False),
@@ -71,8 +72,14 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
         },
     )
     block = _blocked_prompt_entry("Refused.", content, native_session_id=native_session_id)
+    expected_reason = "Refused."
     if scenario == "legacy":
         del block["promptSubmitEnding"]
+    elif scenario == "multiline-reason":
+        block = _blocked_prompt_entry(
+            "Refused.\n  See policy.", content, native_session_id=native_session_id
+        )
+        expected_reason = "Refused. See policy."
     elif scenario == "different-prompt":
         block = _blocked_prompt_entry(
             "Refused.", "another input", native_session_id=native_session_id
@@ -159,8 +166,12 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
 
     assert enters == (1 if stops else 5)
     if stops:
-        assert type(caught.value).__name__ == "ClaudeSubmitBlockedUnconfirmed"
-        assert "could not be confirmed" in str(caught.value)
+        assert isinstance(caught.value, bridge.ClaudeSubmitBlockedUnconfirmed)
+        assert caught.value.code == "prompt_blocked_by_hook"
+        assert str(caught.value) == (
+            "A hook blocked this message, so the agent did not run it. "
+            f"Hook reason: {expected_reason}"
+        )
     else:
         assert isinstance(caught.value, bridge.ClaudeMessageNotAccepted)
     records = [
@@ -178,7 +189,7 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
 
 
 @pytest.mark.asyncio
-async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
+async def test_hook_refusal_is_a_coded_executor_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
@@ -186,7 +197,7 @@ async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
     from omnigent.runtime import pending_inputs
 
     async def refused(*_args: object) -> None:
-        raise bridge.ClaudeSubmitBlockedUnconfirmed("Web delivery could not be confirmed.")
+        raise bridge.ClaudeSubmitBlockedUnconfirmed("A hook blocked this message.")
 
     pending_inputs.reset_for_tests()
     session_id = "unconfirmed-refusal"
@@ -199,7 +210,7 @@ async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
         )
         executor = ClaudeNativeExecutor(bridge_dir=tmp_path)
         monkeypatch.setattr(executor, "_inject_prompt", refused)
-        with caplog.at_level(logging.ERROR):
+        with caplog.at_level(logging.WARNING):
             events = [
                 event
                 async for event in executor.run_turn(
@@ -209,8 +220,9 @@ async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
         assert len(events) == 1
         assert isinstance(events[0], ExecutorError)
         assert events[0].undelivered is False
-        assert events[0].code is None
-        assert any(record.levelno == logging.ERROR for record in caplog.records)
+        assert events[0].code == "prompt_blocked_by_hook"
+        assert events[0].message == "A hook blocked this message."
+        assert [record.levelno for record in caplog.records] == [logging.WARNING]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
             pending_id
         ]

@@ -23,6 +23,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
     ClaudeSignInPending,
+    ClaudeSubmitBlockedUnconfirmed,
     ClaudeTerminalDialog,
     ClaudeTerminalExited,
     ClaudeUserPromptPending,
@@ -545,6 +546,14 @@ class ClaudeNativeExecutor(Executor):
                 extra={"session_id": self._request_session_id},
             )
             yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ClaudeSubmitBlockedUnconfirmed as exc:
+            # A hook's refusal is a policy outcome; the pane stays for the next message.
+            _logger.warning(
+                "claude-native: a UserPromptSubmit hook blocked the message",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=str(exc), code=exc.code)
             return
         except RuntimeError as exc:
             _logger.exception(

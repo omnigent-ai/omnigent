@@ -751,6 +751,8 @@ class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
 class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
     """A fresh matching native refusal stops retries without proving web ownership."""
 
+    code = "prompt_blocked_by_hook"
+
 
 @contextlib.contextmanager
 def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
@@ -4725,12 +4727,14 @@ def _verify_submit_accepted(
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         delivery_diagnostics.record_submit_composer(pane=pane, box_reader=_composer_box)
-        if (
-            bridge_dir is not None
+        hook_reason = (
+            _fresh_matching_hook_block(bridge_dir, submit_boundary, submitted_text)
+            if bridge_dir is not None
             and submit_boundary is not None
             and submitted_text is not None
-            and _fresh_matching_hook_block(bridge_dir, submit_boundary, submitted_text)
-        ):
+            else None
+        )
+        if hook_reason is not None:
             delivery_diagnostics.record_verification(
                 draft_still_present=_draft_in_input_box(pane, needle),
                 pane=pane,
@@ -4741,10 +4745,10 @@ def _verify_submit_accepted(
                 polls=polls,
             )
             delivery_diagnostics.record_details(verification="hook_block_unowned")
-            raise ClaudeSubmitBlockedUnconfirmed(
-                "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
-                "could not be confirmed; inspect the terminal before retrying."
-            )
+            message = "A hook blocked this message, so the agent did not run it."
+            if reason_line := " ".join(hook_reason.split()):
+                message = f"{message} Hook reason: {reason_line}"
+            raise ClaudeSubmitBlockedUnconfirmed(message)
         # An empty capture can be a repaint or failed tmux read. It proves
         # neither that the draft cleared nor that another Enter is safe.
         if not pane.strip():
@@ -4803,16 +4807,16 @@ def _verify_submit_accepted(
 
 def _fresh_matching_hook_block(
     bridge_dir: Path, boundary: SubmitBoundary, submitted_text: str
-) -> bool:
-    """A matching refusal prevents retries; it never establishes input ownership."""
+) -> str | None:
+    """Return a matching refusal's hook reason; it never establishes input ownership."""
     if read_claude_session_id(bridge_dir) != boundary.native_session_id:
-        return False
+        return None
     path = read_transcript_path(bridge_dir)
     try:
         if path is None or path.resolve() != boundary.path:
-            return False
+            return None
     except (OSError, ValueError, RuntimeError):
-        return False
+        return None
     return has_matching_hook_refusal(
         boundary, submitted_text, normalize_prompt=_unwrap_pasted_content_markers
     )
