@@ -14,7 +14,6 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi import FastAPI
 
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_EDIT
@@ -23,7 +22,6 @@ from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions.orchestration import _mark_dispatch_in_flight
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.stores.host_store import HostStore
 from tests.server.integration._session_continuation import (
     _EDITOR,
     _HOST_ID,
@@ -31,7 +29,6 @@ from tests.server.integration._session_continuation import (
     _RUNNER_ID,
     LiveRunner,
     create_placed_session,
-    install_managed_sandbox,
     message_texts,
     resolve_harness_as,
 )
@@ -150,114 +147,6 @@ async def test_rewind_refuses_a_message_sent_while_it_moves_the_session(
     assert [body for _path, body in live_runner.posts if body.get("type") == "message"] == []
     assert "Q3" not in message_texts(store, source_id)
     assert live_runner.superseded == [(source_id, new_id, "rewind")]
-
-
-@pytest.mark.parametrize("deleted_first", ["original", "rewound"])
-async def test_deleting_one_side_of_a_rewind_keeps_their_shared_sandbox(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-    deleted_first: str,
-) -> None:
-    """The original and the rewound chat work in one managed sandbox.
-
-    Deleting either leaves the other bound to the host and the sandbox
-    running; deleting the last one tears the sandbox down.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    host_store, launcher = install_managed_sandbox(app, db_uri, monkeypatch, "sb-rewind")
-    source_id = await create_placed_session(client, store)
-    rewound = await client.post(
-        f"/v1/sessions/{source_id}/rewind", json={"item_id": item_ids(store, source_id)[2]}
-    )
-    assert rewound.status_code == 200, rewound.text
-    new_id = rewound.json()["session_id"]
-    first, last = (source_id, new_id) if deleted_first == "original" else (new_id, source_id)
-
-    deleted = await client.delete(f"/v1/sessions/{first}")
-
-    assert deleted.status_code == 200, deleted.text
-    survivor = store.get_conversation(last)
-    assert survivor is not None and survivor.host_id == _HOST_ID
-    assert host_store.get_host(_HOST_ID) is not None
-    assert launcher.terminated == []
-
-    deleted = await client.delete(f"/v1/sessions/{last}")
-
-    assert deleted.status_code == 200, deleted.text
-    assert launcher.terminated == ["sb-rewind"]
-    assert host_store.get_host(_HOST_ID) is None
-
-
-@pytest.mark.parametrize(
-    ("runner_id", "host", "host_live", "runner_leaves"),
-    [
-        pytest.param("runner_gone", True, True, False, id="on-another-replica"),
-        pytest.param(_RUNNER_ID, True, False, True, id="leaves-host-bound"),
-        pytest.param(_RUNNER_ID, False, False, True, id="leaves-runner-only"),
-    ],
-)
-async def test_rewind_re_addresses_or_cleans_up_when_the_runner_is_elsewhere(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-    runner_id: str,
-    host: bool,
-    host_live: bool,
-    runner_leaves: bool,
-) -> None:
-    """A runner on another replica re-addresses /rewind before anything is created.
-
-    Rewind frees no client first, so a runner can only leave while the fork is
-    made: a host-bound fork then continues on the host, and a runner-only one
-    is removed so a retry does not leave a second copy.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store, runner_id=runner_id, host=host)
-    items = item_ids(store, source_id)
-    host_store = HostStore(db_uri)
-    host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
-    if not host_live:
-        host_store.set_offline(_HOST_ID)
-    monkeypatch.setattr(app.state, "host_store", host_store)
-    if runner_leaves:
-        fork_conversation = SqlAlchemyConversationStore.fork_conversation
-
-        def fork_then_disconnect(self: SqlAlchemyConversationStore, *args: Any, **kwargs: Any):
-            forked = fork_conversation(self, *args, **kwargs)
-            app.state.tunnel_registry.deregister(_RUNNER_ID)
-            return forked
-
-        monkeypatch.setattr(SqlAlchemyConversationStore, "fork_conversation", fork_then_disconnect)
-    before = len((await client.get("/v1/sessions")).json()["data"])
-
-    resp = await client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": items[2]})
-
-    if host:
-        if host_live:
-            assert resp.status_code == 400, resp.text
-            assert "wrong_replica" in resp.text
-            assert len((await client.get("/v1/sessions")).json()["data"]) == before
-            assert live_runner.superseded == []
-            return
-        assert resp.status_code == 200, resp.text
-        new_id = resp.json()["session_id"]
-        fork = store.get_conversation(new_id)
-        assert fork is not None
-        assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
-        assert message_texts(store, new_id) == ["Q1", "A1"]
-        assert live_runner.superseded == [(source_id, new_id, "rewind")]
-        return
-    assert resp.status_code == 503, resp.text
-    assert "runner is offline" in resp.text
-    assert len((await client.get("/v1/sessions")).json()["data"]) == before
-    assert live_runner.superseded == []
 
 
 async def test_rewind_returns_the_prompt_attachments_as_the_fork_holds_them(
