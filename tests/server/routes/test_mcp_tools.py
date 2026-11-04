@@ -368,15 +368,21 @@ async def test_mcp_login_requests_rejected_before_the_host(
     assert conn.outbound_queue.empty()
 
 
-async def test_mcp_login_disconnect_fails_fast(tools_app) -> None:
+@pytest.mark.parametrize("outcome,status", [("timeout", 504), ("disconnect", 502)])
+async def test_unanswered_mcp_login_requests_are_cleaned_up(
+    tools_app, monkeypatch: pytest.MonkeyPatch, outcome: str, status: int
+) -> None:
     app, registry, _ = tools_app
     conn = _register(registry, CAP_MCP_LOGIN)
+    if outcome == "timeout":
+        monkeypatch.setattr(mcp_tools_routes, "_MCP_LOGIN_TIMEOUT_S", 0.01)
     async with _client(app) as client:
         task = asyncio.create_task(client.get(f"{_LOGIN_URL}/abc", headers=_OWNER))
         await asyncio.wait_for(conn.outbound_queue.get(), 2)
-        registry.deregister(conn.host_id)
+        if outcome == "disconnect":
+            registry.deregister(conn.host_id)
         response = await asyncio.wait_for(task, 2)
-    assert response.status_code == 502
+    assert response.status_code == status
     assert conn.pending_mcp_logins == {}
 
 

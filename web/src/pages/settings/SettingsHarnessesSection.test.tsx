@@ -1300,7 +1300,7 @@ it.each([
   expect(screen.queryByText(/· 0 tools/)).toBeNull();
 });
 
-it("offers the harness sign-in for a server that needs it", async () => {
+it("offers the harness sign-in for a server that needs it", () => {
   hosts = [ONLINE];
   mcpResult = {
     data: { tools: [], connection: "needs_auth", truncated: false, harness_sign_in: "available" },

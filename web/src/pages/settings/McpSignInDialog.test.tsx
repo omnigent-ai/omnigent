@@ -275,7 +275,8 @@ describe("McpSignInDialog", () => {
     ],
     [503, { detail: "Too many sign-ins are in progress" }, "Too many sign-ins are in progress"],
     [404, { detail: "MCP server not found" }, "MCP server not found"],
-    [502, { detail: "private host text" }, "Couldn't reach my-laptop."],
+    [502, { detail: "private host text" }, "The sign-in request failed. Try again."],
+    [504, { detail: "private host text" }, "Couldn't reach my-laptop."],
   ])("explains a %s from the server", async (status, body, message) => {
     on("POST", BASE, () => json(body, status));
     await renderDialog();
@@ -319,7 +320,7 @@ describe("McpSignInDialog", () => {
     });
     expect(screen.queryByRole("alert")).toBeNull();
     await tick();
-    expect(screen.getByRole("alert").textContent).toBe("Couldn't reach my-laptop.");
+    expect(screen.getByRole("alert").textContent).toBe("The sign-in request failed. Try again.");
     const polls = calls("GET", `${BASE}/L1`).length;
     await tick();
     expect(calls("GET", `${BASE}/L1`)).toHaveLength(polls);

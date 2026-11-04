@@ -50,10 +50,11 @@ function endedMessage(login: McpLogin): string {
 }
 
 function requestErrorMessage(error: unknown, hostName: string): string {
-  if (!(error instanceof ApiError)) return `Couldn't reach ${hostName}.`;
+  if (!(error instanceof ApiError) || error.status === 504) return `Couldn't reach ${hostName}.`;
   if (error.status === 501) return `Update ${hostName} to sign in to MCP servers from here.`;
   if ((error.status < 500 || error.status === 503) && error.message) return error.message;
-  return `Couldn't reach ${hostName}.`;
+  // A host that answered can still fail, and its details stay private.
+  return "The sign-in request failed. Try again.";
 }
 
 /** Runs the harness's own sign-in for one MCP server on the host. */

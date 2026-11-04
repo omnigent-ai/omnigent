@@ -426,7 +426,9 @@ async def test_queued_starts_finish_within_the_start_budget(
     assert all(login.process.returncode is not None for login in logins._logins.values())
 
 
-async def test_cancel_restart_and_close_stop_the_cli(fake_cli: Path) -> None:
+async def test_cancel_restart_and_close_stop_the_cli(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     logins = HostMcpLogins()
     first = await logins.start(_server())
     first_pid = json.loads(fake_cli.read_text())["pid"]
@@ -439,6 +441,13 @@ async def test_cancel_restart_and_close_stop_the_cli(fake_cli: Path) -> None:
     await _assert_gone(second_pid)
     third = await logins.start(_server(name="other"))
     third_pid = json.loads(fake_cli.read_text())["pid"]
+    # Past the retention window, ended sign-ins are forgotten but a pending one is kept.
+    monkeypatch.setattr(mcp_login, "FINISHED_RETENTION_SECONDS", 0.0)
+    for ended in (first, second):
+        with pytest.raises(LoginError) as forgotten:
+            logins.status(ended["login_id"])
+        assert forgotten.value.status == "not_found"
+    assert logins.status(third["login_id"])["state"] == "pending"
     await logins.close()
     await _assert_gone(third_pid)
     with pytest.raises(LoginError) as missing:
