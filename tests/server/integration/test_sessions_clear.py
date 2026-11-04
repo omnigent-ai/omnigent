@@ -735,6 +735,50 @@ async def test_deleting_the_original_during_the_handoff_never_strands_the_contin
     assert launcher.terminated == []
 
 
+async def test_a_continuation_that_cannot_be_shared_leaves_no_host_reference(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    auth_live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure right after the new session is written still removes it.
+
+    Granting the new session its sharing fails; the clear then deletes it, so
+    nothing but the original holds the managed sandbox, and deleting the
+    original still tears the sandbox down.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    host_store, launcher = install_managed_sandbox(auth_app, db_uri, monkeypatch)
+    source_id = await create_placed_session(auth_client, store, user=_OWNER)
+    owner = {"X-Forwarded-Email": _OWNER}
+    grant = SqlAlchemyPermissionStore.grant
+
+    def grant_on_the_original_only(self: Any, user_id: str, session_id: str, level: int) -> Any:
+        if session_id != source_id:
+            raise OmnigentError("grant failed", code=ErrorCode.INTERNAL_ERROR)
+        return grant(self, user_id, session_id, level)
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "grant", grant_on_the_original_only)
+
+    cleared = await auth_client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}, headers=owner
+    )
+
+    assert cleared.status_code == 500, cleared.text
+    assert [
+        conv.id
+        for conv in store.list_conversations(limit=100, kind=None).data
+        if conv.host_id == _HOST_ID
+    ] == [source_id]
+    assert auth_live_runner.superseded == []
+    deleted = await auth_client.delete(f"/v1/sessions/{source_id}", headers=owner)
+    assert deleted.status_code == 200, deleted.text
+    assert launcher.terminated == ["sb-clear"]
+    assert host_store.get_host(_HOST_ID) is None
+
+
 async def test_claude_sdk_clear_still_redirects_when_the_notice_is_lost(
     client: httpx.AsyncClient,
     db_uri: str,

@@ -30,7 +30,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.db.utils import generate_agent_id, generate_file_id
+from omnigent.db.utils import generate_agent_id, generate_conversation_id, generate_file_id
 from omnigent.debug_logging import (
     add_audit_attrs,
     debug_event,
@@ -3991,6 +3991,7 @@ def register_core_routes(
         keep_sandbox_labels: bool = False,
         copy_history: bool = True,
         continue_source: bool = False,
+        fork_id: str | None = None,
     ) -> SessionResponse:
         """Fork *source_id* as :func:`fork_session` documents.
 
@@ -4002,7 +4003,11 @@ def register_core_routes(
             files, whatever it holds when the fork commits.
         :param continue_source: Create the fork on the source's host and
             workspace, with its routing switches, as a same-owner continuation;
-            it gets no creation-default sharing and is not announced here.
+            it gets no creation-default sharing nor owner grant (the caller sets
+            its grants), is not announced here, and the response carries no
+            items or permission.
+        :param fork_id: Id to create the fork under, e.g. so a caller can
+            remove it by id even if this call fails part-way.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4474,6 +4479,7 @@ def register_core_routes(
                 before_item_id=before_item_id,
                 copy_items=copy_history,
                 continue_source=continue_source,
+                conversation_id=fork_id,
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
@@ -4560,7 +4566,7 @@ def register_core_routes(
         # both create paths: a managed-guard failure (misconfigured server,
         # unconfigured provider) must not leave the just-forked session
         # unowned and thus invisible to the caller.
-        if permission_store is not None and user_id is not None:
+        if permission_store is not None and user_id is not None and not continue_source:
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
@@ -4611,6 +4617,9 @@ def register_core_routes(
         # transcript via the paged items endpoint, so returning the whole
         # copied history only made the user-blocked response scale with
         # source size.
+        if continue_source:
+            # The continuation reads only the new session's metadata.
+            return _build_session_response(new_conv, [], "idle", agent_name=base_agent.name)
         fork_items = await asyncio.to_thread(
             conversation_store.list_items,
             new_conv.id,
@@ -4750,18 +4759,22 @@ def register_core_routes(
             if prepare is not None:
                 await prepare()
 
-            fork = await _fork_session(
-                request,
-                source.id,
-                SessionForkRequest(title=title),
-                before_item_id=before_item_id,
-                keep_sandbox_labels=True,
-                copy_history=copy_history,
-                continue_source=True,
-            )
+            # Chosen up front so a failure anywhere after the fork is written,
+            # inside the fork call included, can remove it by id.
+            fork_id = generate_conversation_id()
             runner_bound = runner_online
             runner_initialized = False
             try:
+                fork = await _fork_session(
+                    request,
+                    source.id,
+                    SessionForkRequest(title=title),
+                    before_item_id=before_item_id,
+                    keep_sandbox_labels=True,
+                    copy_history=copy_history,
+                    continue_source=True,
+                    fork_id=fork_id,
+                )
                 # The same conversation continues there, and every live viewer
                 # of the source is redirected to it, so it shares exactly as
                 # the source does (no creation default was applied).
@@ -4832,9 +4845,11 @@ def register_core_routes(
             except Exception:
                 # Leave no fork for a retry to duplicate, nor its runner session.
                 if runner_initialized:
-                    await _release_unreturned_runner_session(fork.id)
-                await _delete_unreturned_session(fork.id)
-                await _release_unreturned_fork_host(request, fork.host_id)
+                    await _release_unreturned_runner_session(fork_id)
+                await _delete_unreturned_session(fork_id)
+                await _release_unreturned_fork_host(
+                    request, source.host_id if host_bound else None
+                )
                 raise
             # Placed and shared as the source is: now the owner's tabs list it.
             _announce_session_added(user_id, fork.id)
