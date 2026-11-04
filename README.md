@@ -502,14 +502,14 @@ and a key. The base URL depends on which agent you point it at:
 |---|---|---|---|
 | **OpenRouter** | Claude Code | `https://openrouter.ai/api` | your OpenRouter key (`sk-or-…`) |
 | **OpenRouter** | Codex / OpenAI agents | `https://openrouter.ai/api/v1` | your OpenRouter key (`sk-or-…`) |
-| **Neon AI Gateway** | Claude Code | `https://<branch-host>/anthropic` | your Neon credential (`nt_live_…`) |
-| **Neon AI Gateway** | Codex / OpenAI agents | `https://<branch-host>/openai/v1` (Responses API) | your Neon credential (`nt_live_…`) |
+| **Neon AI Gateway** | Claude Code / Claude SDK / Pi | `https://<host>/anthropic` | your Neon credential (`nt_live_…`) |
+| **Neon AI Gateway** | Codex / OpenAI agents | `https://<host>/openai/v1` (Responses API) | your Neon credential (`nt_live_…`) |
 | **Ollama** (local) | Codex / OpenAI agents | `http://localhost:11434/v1` | any value (Ollama ignores it) |
 
 For Claude Code, point at OpenRouter's Anthropic-compatible endpoint
 (`…/api`, **not** `…/api/v1`). For Codex and the OpenAI-agents harness, use
-the OpenAI-compatible `…/api/v1`. To serve both from one Neon provider entry,
-see the [Neon AI Gateway guide](docs/neon-ai-gateway.md).
+the OpenAI-compatible `…/api/v1`. For Neon, `<host>` is your branch's AI Gateway host; to serve
+both from one provider entry, see the [Neon AI Gateway guide](docs/neon-ai-gateway.md).
 
 </details>
 

@@ -54,7 +54,7 @@ request path, so do not include `/v1/messages`, `/responses`, or
 |---|---|---|---|
 | `anthropic` | `claude-native` (`omnigent claude`), `claude-sdk`, `pi` | `<host>/anthropic` | Claude models only |
 | `openai`, `wire_api: responses` | `codex-native` (`omnigent codex`), `codex`, `openai-agents` | `<host>/openai/v1` | OpenAI models only; required for `gpt-5-3-codex` and `gpt-5-5-pro` |
-| `openai`, `wire_api: chat` | Harnesses that speak Chat Completions | `<host>/v1` | Every chat model in the catalog, including Gemini, Qwen, and Llama |
+| `openai`, `wire_api: chat` | `openai-agents`, `pi` (not Codex) | `<host>/v1` | Every chat model in the catalog, including Gemini, Qwen, and Llama |
 
 Use Neon's short model IDs, such as `claude-sonnet-4-6` or `gpt-5-mini`. Sending
 a model to the wrong path returns `400 model "<id>" is not available on the
@@ -106,14 +106,19 @@ titles, so pin it; otherwise Claude Code requests its canonical model ID, which
 the gateway may not route.
 
 To reach non-OpenAI models over the OpenAI surface, point the `openai` block at
-`<host>/v1` with `wire_api: chat` and a chat model such as
-`gemini-3-flash`. Codex model variants do not work on that path.
+`<host>/v1` with `wire_api: chat` and a chat model such as `gemini-3-flash`.
+That works for `openai-agents` and `pi`. Codex needs the Responses API, so
+Omnigent rejects `wire_api: chat` for the `codex` harness; keep Codex on
+`<host>/openai/v1` with `wire_api: responses`.
 
-If you prefer the wizard, run `omnigent setup` twice and add two **Gateway**
-credentials: one for **Claude only** with the `/anthropic` base URL, and one for
-**Codex / OpenAI only** with the `/openai/v1` base URL and **Responses API**.
-The wizard stores the token in Omnigent's secret store rather than reading it
-from the environment.
+The `omnigent setup` wizard can't create this single provider, because each
+**Gateway** credential it adds takes one base URL for every family it serves.
+You can instead add two uniquely named Gateway credentials, one for **Claude
+only** with the `/anthropic` base URL and one for **Codex / OpenAI only** with
+the `/openai/v1` base URL and **Responses API**, and make each the default for
+its family. That gives you two providers rather than one `neon`, so an agent
+selects them by their separate names. The wizard stores the token in Omnigent's
+secret store rather than reading it from the environment.
 
 ## Use it from an agent
 
@@ -131,17 +136,23 @@ executor:
     name: neon
 ```
 
-The same `auth` block works with `harness: codex` and an OpenAI model ID.
+Save it as `neon-agent.yaml` and run `omnigent run neon-agent.yaml`. The same
+`auth` block works with `harness: codex` or `harness: openai-agents` and an
+OpenAI model ID, or `harness: pi` and a Claude model ID.
 
 ## Verify the connection
 
-Check the credential and list what the account can call:
+Check the credential and list what the account can call (this uses `jq`):
 
 ```bash
-curl -s "$NEON_AI_GATEWAY_BASE_URL/v1/models" \
+curl --fail-with-body -sS "$NEON_AI_GATEWAY_BASE_URL/v1/models" \
   -H "Authorization: Bearer $NEON_AI_GATEWAY_TOKEN" \
   | jq -r '.data[] | select(.enabled) | .id'
 ```
+
+`--fail-with-body` makes a `401` or `403` show its error instead of an empty
+list. Neon reports served model IDs with a `system.ai.` prefix in responses,
+and also accepts a `databricks-` prefix in requests.
 
 Then start a session and run a turn that uses a tool, such as reading a file:
 
@@ -159,12 +170,12 @@ follow-up turn, and a resumed session prove the full agent flow.
 |---|---|
 | `400 model "<id>" is not available on the anthropic_messages endpoint` (or `openai_responses`) | The model does not match the path. Use a Claude model on `/anthropic` and an OpenAI model on `/openai/v1`, or switch to `/v1` with `wire_api: chat`. |
 | `403` with `AI Gateway credits required`, or `/v1/models` lists no enabled models (`unavailable_reason: credits_required`) | The organization has no prepaid AI Gateway credits. Add credits from the Neon Console **Billing** page; the error's `recovery_url` links to it. |
-| `401` | The token lacks the `ai_gateway:invoke` scope, was revoked, or belongs to a branch outside this host's lineage. |
-| `429` mentioning the input or output token limit | The account's 200,000 tokens per minute limit (input and output are counted separately). Requests resume when the window resets. |
-| `429` with `REQUEST_LIMIT_EXCEEDED` | Neon's account-level daily spend cap. See Neon's [troubleshooting guide](https://neon.com/docs/ai-gateway/troubleshooting). |
-| Claude Code reports `There's an issue with the selected model`, and no Messages request reaches Neon | A managed Claude Code settings file (on macOS, `/Library/Application Support/ClaudeCode/managed-settings.json`) sets `ANTHROPIC_BASE_URL` or `apiKeyHelper`. Managed settings take precedence over the environment Omnigent passes, so Claude Code calls that endpoint instead of Neon. Use a machine without that policy, or route through the `openai` family. |
+| `401` | The token is missing, malformed, or revoked. Check that `NEON_AI_GATEWAY_TOKEN` holds the full token where `omnigent host` runs. |
+| `403` with `credential not authorized for ai gateway` or `credential not authorized for this branch` | The credential lacks the `ai_gateway:invoke` scope, or was created on a branch outside this host's lineage. Use a credential from this branch or an ancestor. |
+| `429` with `REQUEST_LIMIT_EXCEEDED` | Neon returns this for both of its account limits: the 200,000 tokens per minute limit (input and output counted separately), which clears when the minute resets, and the daily spend cap, which clears when the cap resets. The error message says which one. See Neon's [troubleshooting guide](https://neon.com/docs/ai-gateway/troubleshooting). |
+| `claude-sdk` or `omnigent claude` reports `There's an issue with the selected model` or `Your apiKeyHelper script is failing`, and no Messages request reaches Neon | A managed Claude Code settings file (on macOS, `/Library/Application Support/ClaudeCode/managed-settings.json`) sets `ANTHROPIC_BASE_URL`, `apiKeyHelper`, or `ANTHROPIC_DEFAULT_*_MODEL`. Both Claude harnesses run the Claude CLI, and managed settings take precedence over the environment and model pins Omnigent passes, so the CLI uses the managed endpoint and credential instead of Neon. Use a machine without that policy, run Claude models through `pi`, or use the `openai` family. |
 | Turn setup fails with `Unresolved environment variable '$NEON_AI_GATEWAY_BASE_URL'` | `base_url` references a variable the runner does not receive. Write the host literally, or add the variable to `OMNIGENT_RUNNER_ENV_PASSTHROUGH`. |
-| Claude Code falls back to its own login | The `anthropic` block is missing or its credential does not resolve, for example `NEON_AI_GATEWAY_TOKEN` is unset in the process running `omnigent host`. |
+| Claude Code falls back to its own login | The `anthropic` block is missing or its credential does not resolve, for example `NEON_AI_GATEWAY_TOKEN` is unset in the process running `omnigent host`. Export it, then restart `omnigent host` so the runner picks it up. |
 
 Neon's [AI Gateway docs](https://neon.com/docs/ai-gateway/overview) are the
 source of truth for regions, models, pricing, and limits.
