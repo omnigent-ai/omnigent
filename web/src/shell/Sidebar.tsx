@@ -388,6 +388,8 @@ const PinOrderContext = createContext<{
 const RowEditHoldContext = createContext<(id: string, editing: boolean) => void>(() => {});
 // Moves a session into another row's slot in the Custom order (row menu Move up/down).
 const SessionReorderContext = createContext<(fromId: string, toId: string) => void>(() => {});
+// The list's scroll container, so an active row can tell whether it's already in view.
+const ScrollContainerContext = createContext<RefObject<HTMLElement | null>>({ current: null });
 
 // Stable callback identity that always runs the latest `fn` — keeps the row
 // handlers from changing on every Sidebar render and defeating the row memo.
@@ -407,6 +409,7 @@ function SidebarRowDataProvider({
   serverInfo,
   onActivate,
   onReorder,
+  scrollContainerRef,
   children,
 }: {
   projectNamesById: Map<string, string>;
@@ -418,6 +421,7 @@ function SidebarRowDataProvider({
   serverInfo: ReturnType<typeof useServerInfo>;
   onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
   onReorder: (fromId: string, toId: string) => void;
+  scrollContainerRef: RefObject<HTMLElement | null>;
   children: ReactNode;
 }) {
   return (
@@ -430,7 +434,9 @@ function SidebarRowDataProvider({
                 <ServerInfoContext.Provider value={serverInfo}>
                   <RowActivationContext.Provider value={onActivate}>
                     <SessionReorderContext.Provider value={onReorder}>
-                      {children}
+                      <ScrollContainerContext.Provider value={scrollContainerRef}>
+                        {children}
+                      </ScrollContainerContext.Provider>
                     </SessionReorderContext.Provider>
                   </RowActivationContext.Provider>
                 </ServerInfoContext.Provider>
@@ -2879,6 +2885,7 @@ function ConversationList({
       serverInfo={serverInfo}
       onActivate={activateRow}
       onReorder={reorderSessions}
+      scrollContainerRef={scrollContainerRef}
     >
       <DndContext
         sensors={sensors}
@@ -4940,6 +4947,17 @@ function SessionTooltipContent({
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
 
+// How to reveal an active row in the list: not at all when it's fully visible,
+// minimally when an edge clips it, and centered when it's off-screen.
+function activeRowScrollBlock(row: Element, list: Element | null): ScrollLogicalPosition | null {
+  if (!list) return "center";
+  const rowBox = row.getBoundingClientRect();
+  const listBox = list.getBoundingClientRect();
+  if (rowBox.top >= listBox.top && rowBox.bottom <= listBox.bottom) return null;
+  if (rowBox.bottom <= listBox.top || rowBox.top >= listBox.bottom) return "center";
+  return "nearest";
+}
+
 function ConversationRowImpl({
   conversation,
   isActive,
@@ -4995,13 +5013,16 @@ function ConversationRowImpl({
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
   // When this row becomes the active conversation (e.g. a freshly created
-  // session navigated to via `/c/:id`), scroll it toward the center of the
-  // sidebar so it's comfortably in view rather than pinned to an edge.
+  // session navigated to via `/c/:id`), bring it into view if the list has it
+  // off-screen; clicking a visible row leaves the list where it is.
   const rowRef = useRef<HTMLLIElement>(null);
+  const scrollContainerRef = useContext(ScrollContainerContext);
   useEffect(() => {
-    if (!isActive) return;
-    rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [isActive]);
+    const row = rowRef.current;
+    if (!isActive || !row) return;
+    const block = activeRowScrollBlock(row, scrollContainerRef.current);
+    if (block) row.scrollIntoView({ behavior: "smooth", block });
+  }, [isActive, scrollContainerRef]);
   const queryClient = useQueryClient();
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();

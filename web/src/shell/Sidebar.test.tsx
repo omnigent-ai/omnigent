@@ -3318,9 +3318,9 @@ describe("Sidebar mobile overlay background", () => {
 });
 
 // When the active conversation changes (e.g. a freshly created session the
-// app navigates to via /c/:id), its sidebar row scrolls into view so it isn't
-// stranded below the fold. We center it with a smooth animation. jsdom doesn't
-// implement scrollIntoView, so it's spied on.
+// app navigates to via /c/:id), its sidebar row scrolls into view only if the
+// list doesn't already show all of it. jsdom has no layout or scrollIntoView,
+// so rects are stubbed and scrolling is spied on.
 describe("Sidebar active-row auto-scroll", () => {
   function renderAtRoute(initialEntry: string) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -3340,16 +3340,59 @@ describe("Sidebar active-row auto-scroll", () => {
     );
   }
 
-  it("scrolls the active session's row to center with a smooth animation", () => {
+  // The list shows y 0–300; each session row is 28px tall at the given top.
+  function stubRowTops(tops: Record<string, number>) {
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      if (this.tagName === "NAV") return new DOMRect(0, 0, 200, 300);
+      const top = tops[this.getAttribute("data-sidebar-session-id") ?? ""];
+      return top === undefined ? new DOMRect(0, 0, 0, 0) : new DOMRect(0, top, 200, 28);
+    });
+  }
+
+  it("centers an off-screen active row with a smooth animation", () => {
     const scrollIntoView = vi.fn();
     vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+    stubRowTops({ conv_top: 20, conv_active: 600 });
 
     mockConversations([conv("conv_top", "Claude Code"), conv("conv_active", "Claude Code")]);
     renderAtRoute("/c/conv_active");
 
-    // The active row owns the only scrollIntoView call, centered + smooth.
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
+
+    vi.restoreAllMocks();
+  });
+
+  it("leaves the list in place when the active row is already visible", () => {
+    const scrollIntoView = vi.fn();
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+    stubRowTops({ conv_top: 20, conv_low: 260 });
+
+    mockConversations([conv("conv_top", "Claude Code"), conv("conv_low", "Claude Code")]);
+    renderAtRoute("/c/conv_top");
+    fireEvent.click(screen.getByRole("link", { name: /conv_low/ }));
+
+    expect(screen.getByRole("link", { name: /conv_low/ })).toHaveClass(
+      "bg-[var(--sidebar-active)]",
+    );
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+
+  it("scrolls a row clipped by the list edge only as far as needed", () => {
+    const scrollIntoView = vi.fn();
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+    stubRowTops({ conv_top: 20, conv_clipped: 290 });
+
+    mockConversations([conv("conv_top", "Claude Code"), conv("conv_clipped", "Claude Code")]);
+    renderAtRoute("/c/conv_top");
+    fireEvent.click(screen.getByRole("link", { name: /conv_clipped/ }));
+
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "nearest" });
 
     vi.restoreAllMocks();
   });
