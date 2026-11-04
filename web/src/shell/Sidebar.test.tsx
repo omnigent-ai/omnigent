@@ -3317,10 +3317,8 @@ describe("Sidebar mobile overlay background", () => {
   });
 });
 
-// When the active conversation changes (e.g. a freshly created session the
-// app navigates to via /c/:id), its sidebar row scrolls into view only if the
-// list doesn't already show all of it. jsdom has no layout or scrollIntoView,
-// so rects are stubbed and scrolling is spied on.
+// The active row scrolls into view only when it isn't fully visible.
+// jsdom has no layout, so rects are stubbed and scrollIntoView is spied on.
 describe("Sidebar active-row auto-scroll", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -3380,10 +3378,13 @@ describe("Sidebar active-row auto-scroll", () => {
     expect(scrollIntoView).not.toHaveBeenCalled();
   });
 
-  it("scrolls a row clipped by the list edge only as far as needed", () => {
+  it.each([
+    ["top", -10],
+    ["bottom", 290],
+  ])("scrolls a row clipped by the list's %s edge only as far as needed", (_edge, clippedTop) => {
     const scrollIntoView = vi.fn();
     vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
-    stubRowTops({ conv_top: 20, conv_clipped: 290 });
+    stubRowTops({ conv_top: 20, conv_clipped: clippedTop });
 
     mockConversations([conv("conv_top", "Claude Code"), conv("conv_clipped", "Claude Code")]);
     renderAtRoute("/c/conv_top");
