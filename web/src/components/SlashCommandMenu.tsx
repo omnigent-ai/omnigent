@@ -11,6 +11,7 @@ import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 
 /**
  * Built-in slash commands the web UI recognises directly. Each entry
@@ -461,22 +462,24 @@ function MenuRowButton({
   const { name, isBuiltin } = row;
   const descriptionRef = useRef<HTMLSpanElement>(null);
   const hoverTimerRef = useRef<number | undefined>(undefined);
-  // A highlight resting on a cut-off row opens its tooltip; moving the highlight
-  // closes it and drops a pending hover.
+  const coarsePointer = useIsCoarsePointer();
+  // A highlight resting on a cut-off row opens its tooltip, except on touch screens where most
+  // rows are cut off; moving the highlight closes it and drops a pending hover.
   useEffect(() => {
-    const timer = active
-      ? window.setTimeout(
-          () => onTooltipOpenChange(name, isCutOff(descriptionRef.current)),
-          DESCRIPTION_TOOLTIP_DELAY_MS,
-        )
-      : undefined;
+    const timer =
+      active && !coarsePointer
+        ? window.setTimeout(
+            () => onTooltipOpenChange(name, isCutOff(descriptionRef.current)),
+            DESCRIPTION_TOOLTIP_DELAY_MS,
+          )
+        : undefined;
     return () => {
       window.clearTimeout(timer);
       window.clearTimeout(hoverTimerRef.current);
       hoverTimerRef.current = undefined;
       onTooltipOpenChange(name, false);
     };
-  }, [active, activeIndex, name, onTooltipOpenChange]);
+  }, [active, activeIndex, coarsePointer, name, onTooltipOpenChange]);
   const tooltipRef = useRef<HTMLDivElement>(null);
   // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
   useEffect(() => {

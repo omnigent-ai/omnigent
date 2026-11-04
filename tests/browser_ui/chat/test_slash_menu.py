@@ -433,6 +433,24 @@ def test_slash_menu_shows_a_long_single_match_from_the_keyboard(
     expect(composer).to_have_value("")
 
 
+@pytest.mark.browser_context_args(has_touch=True)
+def test_slash_menu_highlight_opens_no_tooltip_on_a_touch_screen(
+    page: Page, chat_session_contract
+) -> None:
+    chat_session_contract.set_skills([{"name": "triage", "description": _LONG_SKILL_DESCRIPTION}])
+    page.set_viewport_size(PHONE)
+    page.goto(chat_session_contract.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    assert page.evaluate("matchMedia('(pointer: coarse)').matches")
+    composer.press_sequentially("/tri")
+
+    expect(page.get_by_test_id("slash-menu-item-triage")).to_have_attribute("data-active", "true")
+    assert page.get_by_test_id("slash-menu-description-triage").evaluate(_IS_CUT_OFF)
+    page.wait_for_timeout(800)
+    expect(page.get_by_test_id("slash-menu-tooltip-triage")).to_have_count(0)
+
+
 _SPRAWLING_SKILL_DESCRIPTION = " ".join(
     f"Step {step}: collect the logs, compare them with the last good run, and note what changed."
     for step in range(1, 41)
