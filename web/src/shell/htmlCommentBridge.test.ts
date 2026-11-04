@@ -628,6 +628,8 @@ describe("bridge runtime scroll position", () => {
       },
     });
   const smoothScroll = expect.objectContaining({ behavior: "smooth" });
+  // Centers the 20px highlight at 4,640 in jsdom's 768px viewport.
+  const toOffscreenComment = { top: 4_266, behavior: "smooth" };
 
   it.each([
     ["an offscreen comment, scrolling to it", 4_640, true],
@@ -639,7 +641,7 @@ describe("bridge runtime scroll position", () => {
       expect(hide.isConnected).toBe(true);
       activate(port, "c1");
       expect(hide.isConnected).toBe(false);
-      if (scrollsToComment) expect(scrollTo).toHaveBeenLastCalledWith(smoothScroll);
+      if (scrollsToComment) expect(scrollTo).toHaveBeenLastCalledWith(toOffscreenComment);
       else expect(scrollTo).not.toHaveBeenCalledWith(smoothScroll);
 
       const writes = scrollTo.mock.calls.length;
@@ -674,7 +676,7 @@ describe("bridge runtime scroll position", () => {
     const { scrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
     restoreWithComment(4_640, (port, hide) => {
       activate(port, "c1");
-      expect(scrollTo).toHaveBeenLastCalledWith(smoothScroll);
+      expect(scrollTo).toHaveBeenLastCalledWith(toOffscreenComment);
       expect(hide.isConnected).toBe(false);
       const writes = scrollTo.mock.calls.length;
       vi.advanceTimersToNextFrame();

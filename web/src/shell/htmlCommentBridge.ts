@@ -314,8 +314,9 @@ const BRIDGE_HIGHLIGHT_STYLE =
 
 /**
  * Hides the page while a scroll restore is pending, so clamped offsets never paint and
- * hidden controls take no clicks. The runtime removes it once the restore settles; as an
- * animation it also ends by itself, so the page still shows if the runtime never runs.
+ * hidden controls take no clicks. The runtime removes it once the restore settles. If the
+ * runtime never runs, the animation still ends, but the rule keeps overriding the page's own
+ * <html> animation.
  */
 function restoreHideStyle(nonce: string): string {
   // The runtime's budget starts only when the bridge script at the end of the body runs.
