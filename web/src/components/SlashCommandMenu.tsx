@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CircleAlertIcon,
   CommandIcon,
@@ -441,6 +441,8 @@ function MenuRowButton({
   row,
   active,
   activeIndex,
+  tooltipOpen,
+  onTooltipOpenChange,
   onSelect,
 }: {
   /** The row to render. */
@@ -449,25 +451,32 @@ function MenuRowButton({
   active: boolean;
   /** The menu's highlighted index; moving it closes this row's tooltip. */
   activeIndex: number;
+  /** Whether this row's description tooltip is the menu's open one. */
+  tooltipOpen: boolean;
+  /** Opens or closes this row's tooltip, called with the row's name. */
+  onTooltipOpenChange: (name: string, open: boolean) => void;
   /** Selection callback, called with the slash-prefixed name. */
   onSelect: (cmd: string) => void;
 }) {
-  const isBuiltin = row.isBuiltin;
+  const { name, isBuiltin } = row;
   const descriptionRef = useRef<HTMLSpanElement>(null);
-  const [tooltipOpen, setTooltipOpen] = useState(false);
-  // A highlight resting on a cut-off row opens its tooltip; moving the highlight closes them all.
+  const hoverTimerRef = useRef<number | undefined>(undefined);
+  // A highlight resting on a cut-off row opens its tooltip; moving the highlight
+  // closes it and drops a pending hover.
   useEffect(() => {
     const timer = active
       ? window.setTimeout(
-          () => setTooltipOpen(isCutOff(descriptionRef.current)),
+          () => onTooltipOpenChange(name, isCutOff(descriptionRef.current)),
           DESCRIPTION_TOOLTIP_DELAY_MS,
         )
       : undefined;
     return () => {
       window.clearTimeout(timer);
-      setTooltipOpen(false);
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = undefined;
+      onTooltipOpenChange(name, false);
     };
-  }, [active, activeIndex]);
+  }, [active, activeIndex, name, onTooltipOpenChange]);
   const tooltipRef = useRef<HTMLDivElement>(null);
   // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
   useEffect(() => {
@@ -493,7 +502,7 @@ function MenuRowButton({
   return (
     <Tooltip
       open={tooltipOpen}
-      onOpenChange={(open) => setTooltipOpen(open && isCutOff(descriptionRef.current))}
+      onOpenChange={(open) => onTooltipOpenChange(name, open && isCutOff(descriptionRef.current))}
     >
       <TooltipTrigger asChild>
         <button
@@ -504,10 +513,20 @@ function MenuRowButton({
             "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
             active && "bg-muted dark:bg-muted/50",
           )}
-          // Rows that fit skip Radix's hover timer: an opening it starts and the menu
-          // rejects would still let the next cut-off row skip the delay.
+          // The menu times hovers itself, since a highlight move can't cancel Radix's timer.
           onPointerMove={(e) => {
-            if (!isCutOff(descriptionRef.current)) e.preventDefault();
+            e.preventDefault();
+            if (e.pointerType === "touch" || tooltipOpen || hoverTimerRef.current !== undefined) {
+              return;
+            }
+            hoverTimerRef.current = window.setTimeout(() => {
+              hoverTimerRef.current = undefined;
+              if (isCutOff(descriptionRef.current)) onTooltipOpenChange(name, true);
+            }, DESCRIPTION_TOOLTIP_DELAY_MS);
+          }}
+          onPointerLeave={() => {
+            window.clearTimeout(hoverTimerRef.current);
+            hoverTimerRef.current = undefined;
           }}
           // preventDefault keeps the textarea focused while the user clicks.
           onMouseDown={(e) => e.preventDefault()}
@@ -588,6 +607,11 @@ export function SlashCommandMenu({
 }: SlashCommandMenuProps) {
   const matchedNames = rankedSlashCommandNames(commands, query, builtinNames, labels);
   const listRef = useRef<HTMLDivElement>(null);
+  // One description tooltip at a time, so a hover never leaves one beside the highlighted row's.
+  const [tooltipRow, setTooltipRow] = useState<string | null>(null);
+  const setRowTooltipOpen = useCallback((name: string, open: boolean) => {
+    setTooltipRow((current) => (open ? name : current === name ? null : current));
+  }, []);
   // Keep the keyboard-highlighted row visible as the user arrows past the
   // visible window of this capped-height, scrollable list. Without this the
   // selection silently moves off-screen. Mirrors the WorkspacePathField
@@ -630,7 +654,7 @@ export function SlashCommandMenu({
   // with section headers and icon + name + inline description rows. No separate
   // detail card — each row is self-describing.
   return (
-    <TooltipProvider delayDuration={DESCRIPTION_TOOLTIP_DELAY_MS}>
+    <TooltipProvider>
       <div
         data-testid="slash-command-menu"
         className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
@@ -643,6 +667,8 @@ export function SlashCommandMenu({
               row={row}
               active={row.flatIndex === activeIndex}
               activeIndex={activeIndex}
+              tooltipOpen={tooltipRow === row.name}
+              onTooltipOpenChange={setRowTooltipOpen}
               onSelect={onSelect}
             />
           ))}
@@ -690,6 +716,8 @@ export function SlashCommandMenu({
               row={row}
               active={row.flatIndex === activeIndex}
               activeIndex={activeIndex}
+              tooltipOpen={tooltipRow === row.name}
+              onTooltipOpenChange={setRowTooltipOpen}
               onSelect={onSelect}
             />
           ))}

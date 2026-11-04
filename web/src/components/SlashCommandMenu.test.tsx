@@ -1,4 +1,12 @@
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -247,6 +255,48 @@ describe("full skill descriptions", () => {
     rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
     advanceTimers(500);
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+  });
+
+  it("drops a pending hover when the highlight moves and keeps one tooltip open", () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
+    );
+    overflowDescription("triage", 900);
+    overflowDescription("review", 900);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    advanceTimers(200);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    advanceTimers(300);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    advanceTimers(100);
+    expect(screen.getByTestId("slash-menu-tooltip-review")).toBeInTheDocument();
+    // A new hover replaces the highlighted row's tooltip instead of opening beside it.
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    advanceTimers(400);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toBeInTheDocument();
+    expect(screen.queryByTestId("slash-menu-tooltip-review")).toBeNull();
+  });
+
+  it("pages an overflowing tooltip with plain PageUp and PageDown only", () => {
+    render(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    overflowDescription("triage", 900);
+    advanceTimers(400);
+    const tooltip = screen.getByTestId("slash-menu-tooltip-triage");
+    const scrollBy = vi.fn();
+    Object.assign(tooltip, { scrollBy });
+    tooltip.style.lineHeight = "16px";
+    Object.defineProperty(tooltip, "clientHeight", { configurable: true, value: 254 });
+    Object.defineProperty(tooltip, "scrollHeight", { configurable: true, value: 900 });
+    // fireEvent returns false when a listener prevented the key's default action.
+    expect(fireEvent.keyDown(document.body, { key: "PageDown" })).toBe(false);
+    expect(fireEvent.keyDown(document.body, { key: "PageUp" })).toBe(false);
+    expect(fireEvent.keyDown(document.body, { key: "PageDown", shiftKey: true })).toBe(true);
+    const consumed = createEvent.keyDown(document.body, { key: "PageDown" });
+    consumed.preventDefault();
+    fireEvent(document.body, consumed);
+    Object.defineProperty(tooltip, "scrollHeight", { configurable: true, value: 254 });
+    expect(fireEvent.keyDown(document.body, { key: "PageDown" })).toBe(true);
+    expect(scrollBy.mock.calls).toEqual([[{ top: 222 }], [{ top: -222 }]]);
   });
 
   it("closes a hover tooltip when the highlight moves between other rows", () => {

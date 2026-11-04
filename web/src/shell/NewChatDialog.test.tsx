@@ -9325,16 +9325,16 @@ describe("NewChatLandingScreen skills menu", () => {
         { name: "triage", description: triage },
       ],
     });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
     renderLanding();
     typeMessage("/");
     const description = screen.getByTestId("slash-menu-description-triage");
     // jsdom has no layout, so report the overflow of a cut-off line.
     Object.defineProperty(description, "scrollWidth", { configurable: true, value: 900 });
     expect(screen.getByTestId("slash-menu-item-review-pr")).toHaveAttribute("data-active", "true");
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    onTestFinished(() => {
-      vi.useRealTimers();
-    });
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "ArrowDown" });
     expect(screen.getByTestId("slash-menu-item-triage")).toHaveAttribute("data-active", "true");
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).not.toBeInTheDocument();
