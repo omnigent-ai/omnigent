@@ -4221,16 +4221,18 @@ def register_core_routes(
             if continue_source
             else None
         )
-        await asyncio.to_thread(
-            _require_attachment_compatible_history,
-            source_id,
-            base_agent,
-            conversation_store,
-            file_store,
-            up_to_response_id=body.up_to_response_id,
-            before_item_id=before_item_id,
-            target_harness=continuation_harness,
-        )
+        # A fork that keeps no history has no attachments to replay.
+        if copy_history:
+            await asyncio.to_thread(
+                _require_attachment_compatible_history,
+                source_id,
+                base_agent,
+                conversation_store,
+                file_store,
+                up_to_response_id=body.up_to_response_id,
+                before_item_id=before_item_id,
+                target_harness=continuation_harness,
+            )
 
         # Cross-user forks copy the agent (bundle under the copy's id) so its owner
         # can never change code in the caller's sessions; same-user forks share it.
