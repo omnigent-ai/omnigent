@@ -3322,6 +3322,8 @@ describe("Sidebar mobile overlay background", () => {
 // list doesn't already show all of it. jsdom has no layout or scrollIntoView,
 // so rects are stubbed and scrolling is spied on.
 describe("Sidebar active-row auto-scroll", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   function renderAtRoute(initialEntry: string) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return render(
@@ -3361,8 +3363,6 @@ describe("Sidebar active-row auto-scroll", () => {
 
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
-
-    vi.restoreAllMocks();
   });
 
   it("leaves the list in place when the active row is already visible", () => {
@@ -3378,8 +3378,6 @@ describe("Sidebar active-row auto-scroll", () => {
       "bg-[var(--sidebar-active)]",
     );
     expect(scrollIntoView).not.toHaveBeenCalled();
-
-    vi.restoreAllMocks();
   });
 
   it("scrolls a row clipped by the list edge only as far as needed", () => {
@@ -3393,8 +3391,6 @@ describe("Sidebar active-row auto-scroll", () => {
 
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "nearest" });
-
-    vi.restoreAllMocks();
   });
 
   it("hides the draft indicator for the active conversation", () => {
@@ -3406,7 +3402,6 @@ describe("Sidebar active-row auto-scroll", () => {
 
     const row = screen.getByText("Active draft").closest("li")!;
     expect(within(row).queryByTestId("conversation-draft-indicator")).toBeNull();
-    vi.restoreAllMocks();
   });
 
   it("does not scroll any row when no conversation is active", () => {
@@ -3419,8 +3414,6 @@ describe("Sidebar active-row auto-scroll", () => {
     renderAtRoute("/");
 
     expect(scrollIntoView).not.toHaveBeenCalled();
-
-    vi.restoreAllMocks();
   });
 });
 
