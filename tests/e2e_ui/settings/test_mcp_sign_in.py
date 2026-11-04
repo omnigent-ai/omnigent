@@ -56,7 +56,8 @@ def _cli_env(home: Path, llm_url: str) -> dict[str, str | None]:
 
 def _run(argv: list[str], home: Path, llm_url: str) -> None:
     env = isolated_process_env(home, _cli_env(home, llm_url), None)
-    subprocess.run(argv, env=env, cwd=home, check=True, capture_output=True, timeout=60)
+    result = subprocess.run(argv, env=env, cwd=home, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @contextmanager
