@@ -16,6 +16,7 @@ vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn().mockResolvedValue(undefine
 
 const AUTH_URL = "https://auth.example.test/authorize?client_id=c&redirect_uri=x";
 const BASE = "/v1/hosts/host%2F1/mcp-servers/login";
+const OTHER_BASE = "/v1/hosts/host%2F2/mcp-servers/login";
 const SERVER_UPDATE = "Update the Omnigent server to sign in to MCP servers from here.";
 
 function json(body: unknown, status = 200) {
@@ -66,6 +67,15 @@ async function renderDialog(overrides: Partial<McpSignInDialogProps> = {}) {
   const view = render(<McpSignInDialog {...props} {...overrides} />);
   await act(async () => {});
   return view;
+}
+
+// Moves the dialog to host/2, which starts sign-in L2; host/1 accepts a cancel of L1.
+async function switchToSecondHost(view: ReturnType<typeof render>) {
+  on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
+  on("POST", OTHER_BASE, () => json(login({ login_id: "L2" })));
+  on("GET", `${OTHER_BASE}/L2`, () => json(login({ login_id: "L2" })));
+  view.rerender(<McpSignInDialog {...props} host={{ ...props.host, host_id: "host/2" }} />);
+  await act(async () => {});
 }
 
 async function tick() {
@@ -139,7 +149,6 @@ describe("McpSignInDialog", () => {
   });
 
   it("moves a starting sign-in to the newly chosen host", async () => {
-    const otherBase = "/v1/hosts/host%2F2/mcp-servers/login";
     let respond: (response: Response) => void = () => {};
     fetchMock.mockImplementationOnce(
       () =>
@@ -147,43 +156,34 @@ describe("McpSignInDialog", () => {
           respond = resolve;
         }),
     );
-    on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
-    on("POST", otherBase, () => json(login({ login_id: "L2" })));
-    on("GET", `${otherBase}/L2`, () => json(login({ login_id: "L2" })));
     const view = await renderDialog();
 
-    view.rerender(<McpSignInDialog {...props} host={{ ...props.host, host_id: "host/2" }} />);
-    await act(async () => {});
+    await switchToSecondHost(view);
     await act(async () => respond(json(login())));
     await tick();
 
     expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(1);
     expect(calls("GET", `${BASE}/L1`)).toHaveLength(0);
-    expect(calls("POST", otherBase)).toHaveLength(1);
-    expect(calls("GET", `${otherBase}/L2`)).toHaveLength(1);
+    expect(calls("POST", OTHER_BASE)).toHaveLength(1);
+    expect(calls("GET", `${OTHER_BASE}/L2`)).toHaveLength(1);
     expect(screen.getByRole("link", { name: /Open sign-in page/ })).toBeTruthy();
   });
 
   it("cancels a pending sign-in on its own host when another host is chosen", async () => {
-    const otherBase = "/v1/hosts/host%2F2/mcp-servers/login";
     on("POST", BASE, () => json(login()));
     on("GET", `${BASE}/L1`, () => json(login()));
-    on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
-    on("POST", otherBase, () => json(login({ login_id: "L2" })));
-    on("GET", `${otherBase}/L2`, () => json(login({ login_id: "L2" })));
     const view = await renderDialog();
     await tick();
 
-    view.rerender(<McpSignInDialog {...props} host={{ ...props.host, host_id: "host/2" }} />);
-    await act(async () => {});
+    await switchToSecondHost(view);
     await tick();
 
     expect(fetchMock.mock.calls.map(([url, init]) => `${init?.method ?? "GET"} ${url}`)).toEqual([
       `POST ${BASE}`,
       `GET ${BASE}/L1`,
       `DELETE ${BASE}/L1`,
-      `POST ${otherBase}`,
-      `GET ${otherBase}/L2`,
+      `POST ${OTHER_BASE}`,
+      `GET ${OTHER_BASE}/L2`,
     ]);
   });
 
