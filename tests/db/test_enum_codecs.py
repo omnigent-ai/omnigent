@@ -27,6 +27,11 @@ _CODECS = [
     (ec.HOST_STATUS, ec.encode_host_status, ec.decode_host_status),
     (ec.AGENT_KIND, ec.encode_agent_kind, ec.decode_agent_kind),
     (
+        ec.INSTALLED_SKILL_SCOPE,
+        ec.encode_installed_skill_scope,
+        ec.decode_installed_skill_scope,
+    ),
+    (
         ec.SCHEDULED_TASK_STATE,
         ec.encode_scheduled_task_state,
         ec.decode_scheduled_task_state,
@@ -117,6 +122,7 @@ def test_shipped_codes_are_stable() -> None:
     assert ec.POLICY_SCOPE == {"default": 1, "session": 2}
     assert ec.HOST_STATUS == {"online": 1, "offline": 2}
     assert ec.AGENT_KIND == {"server": 1, "user": 2}
+    assert ec.INSTALLED_SKILL_SCOPE == {"user": 1, "org": 2}
     assert ec.SCHEDULED_TASK_STATE == {
         "active": 1,
         "paused": 2,
