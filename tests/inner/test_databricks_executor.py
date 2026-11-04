@@ -6,6 +6,7 @@ import json
 import sys
 import threading
 import unittest
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -3221,3 +3222,123 @@ def test_reused_token_source_without_a_config_file_resolves_once(
     for _ in range(3):
         assert source.current_token() == "tok-env"
     assert len(resolutions) == 1
+
+
+def _rotating_pat_profile(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Callable[[str], None], Callable[..., object]]:
+    """Point the config file at a symlinked PAT profile that can be rotated.
+
+    :returns: ``(write_profile, resolve)`` — ``write_profile(token)`` atomically
+        replaces the profile, and ``resolve`` builds auth that reads the token
+        once at construction, like the SDK's PAT provider.
+    """
+    import configparser
+
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    target = tmp_path / "credentials" / "databrickscfg"
+    target.parent.mkdir()
+    link = tmp_path / ".databrickscfg"
+    link.symlink_to(target)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(link))
+
+    def _write_profile(token: str) -> None:
+        staged = target.with_name("databrickscfg.tmp")
+        staged.write_text(f"[DEFAULT]\nhost = https://ex.test\nauth_type = pat\ntoken = {token}\n")
+        staged.replace(target)
+
+    class _PatCfg:
+        def __init__(self) -> None:
+            parser = configparser.ConfigParser()
+            parser.read(link)
+            self._token = parser["DEFAULT"]["token"]
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": f"Bearer {self._token}"}
+
+    def _resolve(profile=None, *, host=None, workspace_id=None):
+        return _DatabricksBearerAuth(_PatCfg(), profile_name=None), "https://ex.test"
+
+    return _write_profile, _resolve
+
+
+def test_reused_token_source_keeps_a_late_old_resolution_stale(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """A resolution that finishes after a newer one never hides the rotation.
+
+    Mint A resolves the old profile; the profile rotates and mint B resolves
+    and publishes the new token; then A publishes. The old auth A installs
+    must still read as stale, so the next mint serves the rotated token.
+    """
+    from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
+
+    write_profile, resolve = _rotating_pat_profile(tmp_path, monkeypatch)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", resolve)
+    write_profile("tok-1")
+    source = _ReusedDatabricksTokenSource()
+    resolve_once = source._resolve
+    interleaved = {"done": False}
+
+    def _resolve_then_let_b_publish():
+        resolved = resolve_once()
+        if not interleaved["done"]:
+            interleaved["done"] = True
+            write_profile("tok-2")
+            assert source.current_token() == "tok-2"
+        return resolved
+
+    monkeypatch.setattr(source, "_resolve", _resolve_then_let_b_publish)
+
+    assert source.current_token() == "tok-1"
+    assert source.current_token() == "tok-2", "the late old resolution hid the rotation"
+
+
+def test_reused_token_source_adopt_keeps_the_resolution_time_config_file(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """Adopted auth resolved before a rotation is replaced on the next mint."""
+    from omnigent.inner.databricks_executor import (
+        _resolve_databricks_auth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    write_profile, resolve = _rotating_pat_profile(tmp_path, monkeypatch)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._discover_databricks_auth", resolve)
+    write_profile("tok-1")
+    verified, _host = _resolve_databricks_auth()
+    write_profile("tok-2")
+
+    source = _ReusedDatabricksTokenSource()
+    source.adopt(verified)
+    assert source.current_token() == "tok-2", "adopt marked the old auth as current"
+
+    current, _host = _resolve_databricks_auth()
+    source.adopt(current)
+    assert source.current_token() == "tok-2"
+    assert source._cached is not None and source._cached[0] is current, (
+        "auth adopted from the current file must be reused"
+    )
+
+
+def test_reused_token_source_re_resolves_adopted_auth_without_provenance(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """Auth built outside ``_resolve_databricks_auth`` is re-resolved on the next mint."""
+    from omnigent.inner.databricks_executor import (
+        _DatabricksBearerAuth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    write_profile, resolve = _rotating_pat_profile(tmp_path, monkeypatch)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._discover_databricks_auth", resolve)
+    write_profile("tok-1")
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer tok-unknown"}
+
+    source = _ReusedDatabricksTokenSource()
+    source.adopt(_DatabricksBearerAuth(_Cfg(), profile_name=None))
+    assert source.current_token() == "tok-1"
