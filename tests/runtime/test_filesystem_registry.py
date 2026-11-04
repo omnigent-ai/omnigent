@@ -288,6 +288,7 @@ def test_session_isolation_events_not_shared_between_sessions(
 )
 def test_each_session_compares_the_disk_with_its_own_baseline(
     registry: AgentEditFilesystemRegistry,
+    monkeypatch: pytest.MonkeyPatch,
     reverted_to: str,
     expected_paths_a: list[str],
     expected_paths_b: list[str],
@@ -311,6 +312,18 @@ def test_each_session_compares_the_disk_with_its_own_baseline(
     assert [
         r["path"] for r in registry.list_changed_files(conv_b, limit=10, check_disk=True)
     ] == expected_paths_b
+    # Once the file settles, each session's cached comparison must stay its own.
+    written = target.stat()
+    settled_at = max(written.st_mtime_ns, written.st_ctime_ns)
+    monkeypatch.setattr(time, "time_ns", lambda: settled_at + 2_000_000_001)
+    for session, expected_paths in [
+        (conv_a, expected_paths_a),
+        (conv_b, expected_paths_b),
+        (conv_b, expected_paths_b),
+        (conv_a, expected_paths_a),
+    ]:
+        listed = registry.list_changed_files(session, limit=10, check_disk=True)
+        assert [r["path"] for r in listed] == expected_paths
 
 
 def test_limit_parameter_caps_results(registry: AgentEditFilesystemRegistry) -> None:
@@ -327,9 +340,9 @@ def test_limit_parameter_caps_results(registry: AgentEditFilesystemRegistry) -> 
 
     results = registry.list_changed_files(conv_id, limit=3, check_disk=True)
 
-    # At most 3 records must be returned.
-    assert len(results) <= 3, (
-        f"Expected at most 3 results with limit=3, got {len(results)}. "
+    # Exactly 3 of the 5 records must be returned.
+    assert len(results) == 3, (
+        f"Expected 3 results with limit=3, got {len(results)}. "
         "The limit parameter is not being respected."
     )
 

@@ -128,7 +128,7 @@ async def test_sync_cleanup_cancellation_wins_over_worker_error(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", [None, ValueError("work failed")], ids=["returns", "raises"])
 async def test_started_work_finishes_before_repeated_cancellation(
-    error: Exception | None,
+    caplog: pytest.LogCaptureFixture, error: Exception | None
 ) -> None:
     """Cancellation waits for the work, whatever its outcome, then reaches the caller."""
     from omnigent.inner.async_utils import finish_before_cancellation
@@ -146,16 +146,24 @@ async def test_started_work_finishes_before_repeated_cancellation(
         return "done"
 
     caller = asyncio.create_task(finish_before_cancellation(work()))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
-    caller.cancel()
-    await asyncio.sleep(0)
-    caller.cancel()
-    done, _ = await asyncio.wait({caller}, timeout=0.05)
-    assert not done
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await caller
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        caller.cancel()
+        await asyncio.sleep(0)
+        caller.cancel()
+        done, _ = await asyncio.wait({caller}, timeout=0.05)
+        assert not done
+    finally:
+        release.set()
+        outcome = await asyncio.wait_for(asyncio.gather(caller, return_exceptions=True), 1.0)
+    assert isinstance(outcome[0], asyncio.CancelledError)
     assert finished == [True]
+    failures = [
+        record.exc_info[1]
+        for record in caplog.records
+        if record.getMessage() == "Work failed after its caller was cancelled" and record.exc_info
+    ]
+    assert failures == ([] if error is None else [error])
 
 
 @pytest.mark.asyncio

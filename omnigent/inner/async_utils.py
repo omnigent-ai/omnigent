@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import contextvars
 import logging
 import queue as sync_queue
@@ -69,14 +68,19 @@ async def finish_before_cancellation[Result](work: Awaitable[Result]) -> Result:
     :param work: The started operation, e.g. a write and its recording.
     :returns: The result of *work*.
     :raises asyncio.CancelledError: After *work* finishes when the caller was
-        cancelled, including when cancellation was requested repeatedly.
+        cancelled, including when cancellation was requested repeatedly. A
+        failure of *work* after the cancellation is logged.
     """
     task = asyncio.ensure_future(work)
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        with contextlib.suppress(Exception, asyncio.CancelledError):
+        try:
             await await_cleanup_task(task)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _logger.exception("Work failed after its caller was cancelled")
         raise
 
 
