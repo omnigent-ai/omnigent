@@ -281,7 +281,7 @@ def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
     """
     from omnigent.harnesses.claude_native import bridge
 
-    claude_version = subprocess.check_output(["claude", "--version"], text=True).split()[0]
+    claude_version = _run_real_claude(["--version"]).split()[0]
     if with_caller_file and release_tuple(claude_version) < (2, 1, 295):
         pytest.skip(f"Claude Code {claude_version} refuses both prompt flags together")
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)

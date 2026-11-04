@@ -3063,7 +3063,7 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
-# Required-value options of Claude Code 2.1.278-2.1.317. Claude consumes the next token
+# Required-value options of Claude Code 2.1.161-2.1.317. Claude consumes the next token
 # as the value even when it starts with a dash (``--system-prompt --append-system-prompt``).
 _CLAUDE_VALUE_FLAGS = frozenset(
     {
@@ -3154,7 +3154,7 @@ _CLAUDE_VALUE_FLAGS = frozenset(
 )
 
 
-# Boolean short options of Claude Code 2.1.278-2.1.317 (``-n`` requires a value;
+# Boolean short options of Claude Code 2.1.161-2.1.317 (``-n`` requires a value;
 # ``-d``, ``-r`` and ``-w`` take an optional one).
 _CLAUDE_SHORT_BOOLEAN_FLAGS = frozenset({"-c", "-h", "-p", "-v"})
 
@@ -3197,7 +3197,7 @@ def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]
     Claude Code keeps only the last value of the flag, so ``extra`` joins that
     value in place, or a new flag carries it. Other caller tokens, including an
     ``--append-system-prompt-file``, are left as they are. Claude Code 2.1.295+
-    applies such a file before the inline prompt; 2.1.278 refuses to start with both.
+    applies such a file before the inline prompt; 2.1.161 and 2.1.278 refuse to start with both.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
