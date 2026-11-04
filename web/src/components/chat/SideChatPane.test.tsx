@@ -26,6 +26,7 @@ import {
   retryFailedStartupLookup,
   useChatStore,
   type ChatState,
+  type ConversationState,
 } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
@@ -1762,6 +1763,16 @@ it.each([false, true])(
   },
 );
 
+/** Render the grid's full-session pane on an idle child whose sends go through the real store. */
+function renderRecoveringGridPane(state: Partial<ConversationState> = {}) {
+  onTestFinished(clearSessionDrafts);
+  const entry = conversationRegistry.acquire(childId);
+  entry.setState({ sessionStatus: "idle", abortController: new AbortController(), ...state });
+  useChatStore.setState({ send: initialStoreState.send });
+  renderPane(<SideChatPane childId={childId} fullSession />);
+  return entry;
+}
+
 it.each([
   {
     into: "after the grid composer's newer draft",
@@ -1810,15 +1821,9 @@ it.each([
 ])(
   "adds a failed launch's recovered message $into and names it in a send $sent",
   async ({ newer, readFirst, refused, unanswered }) => {
-    onTestFinished(clearSessionDrafts);
-    const entry = conversationRegistry.acquire(childId);
-    entry.setState({
-      sessionStatus: "idle",
-      abortController: new AbortController(),
+    const entry = renderRecoveringGridPane({
       returnedStartupInputs: unanswered ? [] : ["pending_first"],
     });
-    useChatStore.setState({ send: initialStoreState.send });
-    renderPane(<SideChatPane childId={childId} fullSession />);
     if (newer)
       act(() =>
         useChatStore.getState().updateSideChatComposer(childId, () => ({
@@ -1892,11 +1897,7 @@ it.each([
 it.each([false, true])(
   "keeps the ids of a grid composer's sends a read didn't list for a later read, evicted: %s",
   async (evicted) => {
-    onTestFinished(clearSessionDrafts);
-    const entry = conversationRegistry.acquire(childId);
-    entry.setState({ sessionStatus: "idle", abortController: new AbortController() });
-    useChatStore.setState({ send: initialStoreState.send });
-    renderPane(<SideChatPane childId={childId} fullSession />);
+    const entry = renderRecoveringGridPane();
     const text = "first\n\nsecond";
     act(() =>
       entry.setState({
@@ -1950,11 +1951,7 @@ it.each([false, true])(
 );
 
 it("doesn't hand back a send whose text was deleted from the grid composer before a failed send replaced it", async () => {
-  onTestFinished(clearSessionDrafts);
-  const entry = conversationRegistry.acquire(childId);
-  entry.setState({ sessionStatus: "idle", abortController: new AbortController() });
-  useChatStore.setState({ send: initialStoreState.send });
-  renderPane(<SideChatPane childId={childId} fullSession />);
+  const entry = renderRecoveringGridPane();
   act(() =>
     entry.setState({
       failedSendDraft: {
@@ -2022,17 +2019,11 @@ it.each([
   "doesn't name a failed startup input $holder holds in an unrelated send from $sender",
   async ({ gridHolds, readAs, mainDraft, mainTook }) => {
     const late = readAs !== undefined;
-    onTestFinished(clearSessionDrafts);
-    const entry = conversationRegistry.acquire(childId);
-    entry.setState({
-      sessionStatus: "idle",
-      abortController: new AbortController(),
+    const entry = renderRecoveringGridPane({
       returnedStartupInputs: late ? [] : ["pending_first"],
       // The main composer added its own unanswered send after its draft before the grid took one.
       ...(mainTook ? { composerSentAs: ["stable_main"] } : {}),
     });
-    useChatStore.setState({ send: initialStoreState.send });
-    renderPane(<SideChatPane childId={childId} fullSession />);
     const recovered = { text: "saved on server", files: [], startupInputIds: ["pending_first"] };
     // A reload's unanswered send is known by its stable id until a read names its input.
     const sent = late ? { files: [], stableId: "stable_reload" } : recovered;
