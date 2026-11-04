@@ -570,8 +570,21 @@ async def test_user_without_grants_sees_no_sessions(
 # ── Grant read: can GET but not POST events ──────────────────
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "blocked"}]},
+        },
+        # The Files panel's sandbox wake.
+        {"type": "retry_session", "data": {"wake_only": True}},
+    ],
+    ids=["message", "wake-only-retry"],
+)
 async def test_read_grant_allows_get_but_blocks_post_events(
     auth_client: httpx.AsyncClient,
+    event: dict[str, object],
 ) -> None:
     """A user with read-only access can GET a session but cannot POST events."""
     agent = await create_test_agent(auth_client, user="bryan")
@@ -603,13 +616,7 @@ async def test_read_grant_allows_get_but_blocks_post_events(
     # user-b cannot POST events (requires edit level).
     resp = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "message",
-            "data": {
-                "role": "user",
-                "content": [{"type": "input_text", "text": "blocked"}],
-            },
-        },
+        json=event,
         headers={"X-Forwarded-Email": "user-b"},
     )
     assert resp.status_code == 403, (

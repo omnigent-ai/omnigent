@@ -1029,9 +1029,10 @@ Request body matches `SessionEventInput`:
                                   failed saved inputs stay failed and the
                                   request resumes no interrupted turn, the
                                   session's own or a sub-agent's; they
-                                  resume on the next message. A concurrent
-                                  retry shares the in-flight attempt,
-                                  started by its first caller.
+                                  resume on the next message or plain
+                                  retry. A wake-only retry shares any
+                                  in-flight attempt; a plain retry waits
+                                  out a wake-only one, then runs its own.
                                   Send `wake_only` only when `/v1/info`
                                   reports `retry_session_wake_only: true`;
                                   older servers ignore it.

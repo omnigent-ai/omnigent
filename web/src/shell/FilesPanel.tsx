@@ -495,12 +495,12 @@ export function FilesPanel({
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
   // Opening the panel on an asleep sandbox starts it, as Reconnect host does,
-  // so its files load without a chat message. Restarting needs edit access,
-  // and a server that can wake without resuming an interrupted turn.
+  // so its files load without a chat message. Restarting needs known edit
+  // access and a server that can wake without resuming an interrupted turn.
   const serverInfo = useServerInfo();
   const canWake =
-    session != null &&
-    isEditorLevel(session.permissionLevel ?? null) &&
+    session?.permissionLevel != null &&
+    isEditorLevel(session.permissionLevel) &&
     serverInfo !== "loading" &&
     serverInfo.retry_session_wake_only === true;
   const sandboxWake = useSandboxAutoWake({

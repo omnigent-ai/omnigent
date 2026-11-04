@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+import cachetools
 import httpx
 from fastapi import (
     APIRouter,
@@ -342,8 +343,20 @@ _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
 # One shared Resume attempt per session, split by caller for side chats; see
 # _retry_session_single_flight.
 _RetryFlight = tuple[str, str | None]
-_retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, asyncio.Task[dict[str, bool | str]]] = (
-    WorkspaceScopedCache()
+
+
+@dataclass(frozen=True)
+class _RetryAttempt:
+    """An in-flight recovery and whether a wake-only request started it."""
+
+    task: asyncio.Task[dict[str, bool | str]]
+    wake_only: bool
+
+
+_retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, _RetryAttempt] = WorkspaceScopedCache()
+# Session -> runner a wake-only retry brought up without resuming its turn.
+_wake_skipped_resumes: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=4096)
 )
 
 # POST /events types that arrive per streamed chunk — the harness echoing its
@@ -468,7 +481,8 @@ def _evict_retry_recovery_task(
     completed_task: asyncio.Task[dict[str, bool | str]],
 ) -> None:
     """Evict a settled retry task without disturbing a newer attempt."""
-    if _retry_recovery_tasks.get(flight) is completed_task:
+    attempt = _retry_recovery_tasks.get(flight)
+    if attempt is not None and attempt.task is completed_task:
         _retry_recovery_tasks.pop(flight, None)
     if not completed_task.cancelled():
         completed_task.exception()
@@ -674,7 +688,8 @@ async def _recover_retry_session(
     """Recover runner/terminal readiness without creating transcript input.
 
     *wake_only* reconnects the runner without resuming an interrupted turn,
-    the session's own or a descendant's.
+    the session's own or a descendant's. The next plain retry on that runner
+    resumes them.
     """
     from omnigent.server.child_session_recovery import defer_reconnect_recovery
 
@@ -743,17 +758,36 @@ async def _recover_retry_session_once(
         if startup
         else []
     )
+    resumes_wake = (
+        not wake_only
+        and not saved_inputs
+        and conv.runner_id is not None
+        and _wake_skipped_resumes.get(session_id) == conv.runner_id
+    )
+    initializer = getattr(request.app.state, "runner_session_initializer", None)
+    if resumes_wake and initializer is not None and conv.runner_id is not None:
+        # Repeat the handshake the wake suppressed rather than reuse its response.
+        initializer.forget_completed_handshake(session_id, runner_id=conv.runner_id)
     terminal_ready_from_init = await _ensure_runner_session_initialized(
         session_id,
         conv,
         runner_client,
         conversation_store,
-        initializer=getattr(request.app.state, "runner_session_initializer", None),
-        suppress_recovery_turn=wake_only or was_connected or bool(saved_inputs),
+        initializer=initializer,
+        suppress_recovery_turn=(
+            wake_only or (was_connected and not resumes_wake) or bool(saved_inputs)
+        ),
         require_success=True,
         restore_children=not wake_only,
         trigger="retry_session",
     )
+    if not wake_only:
+        _wake_skipped_resumes.pop(session_id, None)
+    elif (
+        not was_connected and conv.runner_id is not None and not _is_native_terminal_session(conv)
+    ):
+        # Native harnesses never resume from history, so only these runners owe a resume.
+        _wake_skipped_resumes[session_id] = conv.runner_id
 
     if _is_native_terminal_session(conv):
         # A cached init response cannot prove that a connected runner's pane still exists.
@@ -783,7 +817,8 @@ async def _recover_retry_session_once(
             "recovery": "runner_relaunched" if runner_relaunched else "native_terminal_ready",
         }
 
-    if runner_relaunched:
+    # Resuming after a wake completes the recovery of the runner it relaunched.
+    if runner_relaunched or resumes_wake:
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,
@@ -811,32 +846,38 @@ async def _retry_session_single_flight(
 
     A side chat's recovery depends on the caller's access to its source and
     ownership of the source's runner, so it is shared only by one caller's
-    concurrent requests. A wake-only request joins any in-flight attempt, so
-    the attempt's first caller decides whether an interrupted turn resumes;
-    after a reconnect a later attempt would not resume one either.
+    concurrent requests. A wake-only request joins any in-flight attempt. A
+    plain request waits out a wake-only attempt and then runs its own, which
+    resumes what the wake left interrupted.
     """
     is_side_chat = conversation is not None and _side_chat_source_id(conversation) is not None
     flight: _RetryFlight = (session_id, user_id if is_side_chat else None)
     lock = _retry_recovery_lock(session_id)
-    async with lock:
-        task = _retry_recovery_tasks.get(flight)
-        if task is None:
-            task = asyncio.create_task(
-                _recover_retry_session(
-                    request=request,
-                    session_id=session_id,
-                    conversation_store=conversation_store,
-                    runner_router=runner_router,
-                    user_id=user_id,
-                    permission_store=permission_store,
+    while True:
+        async with lock:
+            attempt = _retry_recovery_tasks.get(flight)
+            if attempt is None or attempt.task.done():
+                attempt = _RetryAttempt(
+                    asyncio.create_task(
+                        _recover_retry_session(
+                            request=request,
+                            session_id=session_id,
+                            conversation_store=conversation_store,
+                            runner_router=runner_router,
+                            user_id=user_id,
+                            permission_store=permission_store,
+                            wake_only=wake_only,
+                        )
+                    ),
                     wake_only=wake_only,
                 )
-            )
-            _retry_recovery_tasks[flight] = task
-            task.add_done_callback(
-                lambda completed_task: _evict_retry_recovery_task(flight, completed_task)
-            )
-    return await asyncio.shield(task)
+                _retry_recovery_tasks[flight] = attempt
+                attempt.task.add_done_callback(
+                    lambda completed_task: _evict_retry_recovery_task(flight, completed_task)
+                )
+        if wake_only or not attempt.wake_only:
+            return await asyncio.shield(attempt.task)
+        await asyncio.wait([attempt.task])
 
 
 class _RunnerNotBoundError(OmnigentError):

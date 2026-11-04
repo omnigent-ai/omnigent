@@ -576,6 +576,37 @@ async def test_cancelling_waiter_preserves_shared_initialization() -> None:
     assert len(client.calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_forgetting_a_handshake_repeats_only_finished_ones() -> None:
+    """Only a finished non-recovery handshake on the named runner is sent again."""
+    registry, client = _Registry(), _Client()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conv = _conversation()
+    client.release.set()
+    await initializer.initialize(conv, client, timeout=10)  # type: ignore[arg-type]
+    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+
+    initializer.forget_completed_handshake(conv.id, runner_id="other_runner")
+    await initializer.initialize(conv, client, timeout=10)  # type: ignore[arg-type]
+    assert len(client.calls) == 2
+    initializer.forget_completed_handshake(conv.id, runner_id="runner_init")
+    await initializer.initialize(conv, client, timeout=10)  # type: ignore[arg-type]
+    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    assert len(client.calls) == 3
+
+    client.release.clear()
+    client.entered.clear()
+    initializer.forget_completed_handshake(conv.id, runner_id="runner_init")
+    in_flight = asyncio.create_task(initializer.initialize(conv, client, timeout=10))  # type: ignore[arg-type]
+    await client.entered.wait()
+    initializer.forget_completed_handshake(conv.id, runner_id="runner_init")
+    joined = asyncio.create_task(initializer.initialize(conv, client, timeout=10))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    client.release.set()
+    assert await in_flight is await joined
+    assert len(client.calls) == 4
+
+
 class _Agents:
     """Agent store stub whose ``get`` finds only the given ids."""
 

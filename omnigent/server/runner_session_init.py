@@ -365,6 +365,14 @@ class RunnerSessionInitializer:
                 self._recovery_ids.pop(key, None)
         return cancelled
 
+    def forget_completed_handshake(self, session_id: str, *, runner_id: str) -> None:
+        """Let the next handshake repeat a finished one; in-flight ones keep their callers."""
+        for key, task in list(self._tasks.items()):
+            key_runner_id, _generation, key_session_id, _agent, _sub_agent, recovery = key
+            if (key_runner_id, key_session_id) == (runner_id, session_id) and not recovery:
+                if task.done():
+                    self._tasks.pop(key, None)
+
     async def _post_initialize(
         self,
         runner_client: httpx.AsyncClient,

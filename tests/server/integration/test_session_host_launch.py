@@ -3955,19 +3955,18 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
 
 
 @pytest.mark.parametrize(
-    ("first_data", "second_data"),
-    [({}, {}), ({}, {"wake_only": True}), ({"wake_only": True}, {})],
-    ids=["same-mode", "resume-then-wake-only", "wake-only-then-resume"],
+    "second_data",
+    [{}, {"wake_only": True}],
+    ids=["same-mode", "resume-then-wake-only"],
 )
 async def test_retry_session_single_flight_launches_and_rotates_once(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    first_data: dict[str, bool],
     second_data: dict[str, bool],
 ) -> None:
-    """Concurrent retries share one launch and rotation; the first caller picks the mode."""
+    """Concurrent retries share one launch and rotation; a wake-only caller joins a Resume."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -4013,7 +4012,7 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     first = asyncio.create_task(
         client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": "retry_session", "data": first_data},
+            json={"type": "retry_session", "data": {}},
         )
     )
     await asyncio.wait_for(launched.wait(), timeout=budget(5.0))
@@ -4031,13 +4030,105 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     }
     assert [response.json() for response in responses] == [expected, expected]
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
-    first_wake_only = first_data.get("wake_only", False)
     initialize.assert_awaited_once()
-    assert initialize.await_args.kwargs["suppress_recovery_turn"] is first_wake_only
-    assert initialize.await_args.kwargs["restore_children"] is not first_wake_only
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is False
+    assert initialize.await_args.kwargs["restore_children"] is True
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.runner_id != original_runner_id
+
+
+class _RecordingRunnerClient:
+    """Accepts runner session-init POSTs and records whether each suppressed recovery."""
+
+    def __init__(self) -> None:
+        self.suppressed_recovery: list[bool] = []
+
+    async def post(self, path: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
+        from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
+
+        envelope = parse_runner_session_init_envelope(json)
+        assert envelope is not None
+        self.suppressed_recovery.append(envelope.suppress_recovery_turn)
+        return httpx.Response(
+            201, json={"id": json["session_id"]}, request=httpx.Request("POST", path)
+        )
+
+
+@pytest.mark.parametrize("resume_during_wake", [True, False], ids=["concurrent", "after-wake"])
+async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_during_wake: bool,
+) -> None:
+    """A Resume during or after a wake-only retry repeats the handshake unsuppressed."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server import child_session_recovery
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session_id = (await _inline_launch_session(client, comm))["id"]
+    runner_client = _RecordingRunnerClient()
+    connected_client: _RecordingRunnerClient | None = None
+    launched, resume_arrived = asyncio.Event(), asyncio.Event()
+
+    async def _runner_connects(*_args: Any, **_kwargs: Any) -> _RecordingRunnerClient:
+        nonlocal connected_client
+        launched.set()
+        if resume_during_wake:
+            await resume_arrived.wait()
+        connected_client = runner_client
+        return runner_client
+
+    async def _connected_runner(*_args: Any, **_kwargs: Any) -> _RecordingRunnerClient | None:
+        return connected_client
+
+    single_flight = routes_events._retry_session_single_flight
+
+    async def _note_resume(**kwargs: Any) -> dict[str, bool | str]:
+        if not kwargs["wake_only"]:
+            resume_arrived.set()
+        return await single_flight(**kwargs)
+
+    restore_children = AsyncMock(return_value=None)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _runner_connects)
+    monkeypatch.setattr(routes_events, "_get_runner_client", _connected_runner)
+    monkeypatch.setattr(routes_events, "_retry_session_single_flight", _note_resume)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+    monkeypatch.setattr(orchestration, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+    monkeypatch.setattr(child_session_recovery, "restore_active_children", restore_children)
+    set_runner_client(None)
+
+    async def _retry(data: dict[str, bool]) -> dict[str, Any]:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "retry_session", "data": data}
+        )
+        assert response.status_code == 202, response.text
+        return response.json()
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    wake = asyncio.create_task(_retry({"wake_only": True}))
+    await asyncio.wait_for(launched.wait(), timeout=budget(5.0))
+    if not resume_during_wake:
+        await wake
+    resume = await _retry({})
+    relaunched = {"queued": False, "recovered": True, "recovery": "runner_relaunched"}
+    assert [await wake, resume] == [relaunched, relaunched]
+    await responder
+
+    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
+    assert runner_client.suppressed_recovery == [True, False]
+    restore_children.assert_awaited_once()
+    assert await _retry({}) == {
+        "queued": False,
+        "recovered": False,
+        "recovery": "already_connected",
+    }
+    assert runner_client.suppressed_recovery == [True, False]
 
 
 async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(

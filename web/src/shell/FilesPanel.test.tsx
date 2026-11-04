@@ -21,6 +21,7 @@ import { retrySession } from "@/lib/sessionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { LEVEL_EDIT } from "@/lib/permissionsApi";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/hooks/useHostSshTarget", () => ({ useHostSshTarget: () => null }));
@@ -433,6 +434,12 @@ describe("FilesPanel hidden-files toggle icon", () => {
 });
 
 describe("FilesPanel on an asleep sandbox", () => {
+  beforeEach(() => {
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: LEVEL_EDIT },
+    } as unknown as ReturnType<typeof useSession>);
+  });
+
   afterEach(() => {
     vi.mocked(useSession).mockReturnValue({
       session: { hostId: "host_test" },
@@ -600,9 +607,12 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
   });
 
-  it("keeps the send-a-message hint for a read-only viewer", () => {
+  it.each([
+    ["a read-only viewer", LEVEL_EDIT - 1],
+    ["an unknown access level", null],
+  ])("keeps the send-a-message hint for %s", (_label, permissionLevel) => {
     vi.mocked(useSession).mockReturnValue({
-      session: { hostId: "host_test", permissionLevel: 1 },
+      session: { hostId: "host_test", permissionLevel },
     } as unknown as ReturnType<typeof useSession>);
     useAsleepMock.mockReturnValue(true);
     renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });

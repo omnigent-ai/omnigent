@@ -405,13 +405,14 @@ stays in the menu then, in case that stage never finishes.
 Opening Files or Changes on such a session wakes the sandbox for editors, in the
 desktop Workspace rail and the mobile Files drawer alike. The wake only
 reconnects: it resumes no interrupted turn, its own or a sub-agent's, and
-retries no failed startup input; interrupted work resumes on the next message.
+retries no failed startup input; interrupted work resumes on the next message
+or on Resume, including a Resume clicked while the wake is still running.
 On a phone only the Files drawer counts as open, not the hidden desktop rail.
 The panel shows **Starting sandbox…**, then the file list; a failed wake shows
 the reason and **Try again**. If the sandbox sleeps again while the panel stays
 open, it shows **Start sandbox** rather than waking again. Read-only viewers,
-and servers that don't advertise `retry_session_wake_only` in `/v1/info`, keep
-the send-a-message hint.
+sessions whose access level isn't known, and servers that don't advertise
+`retry_session_wake_only` in `/v1/info` keep the send-a-message hint.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
