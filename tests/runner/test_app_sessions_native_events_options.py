@@ -3899,18 +3899,52 @@ async def test_events_compact_on_claude_sdk_buffers_behind_active_turn() -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("busy", ["active_turn", "buffered_message", None])
-async def test_events_clear_on_claude_sdk_releases_the_idle_client(busy: str | None) -> None:
+@pytest.mark.parametrize("busy", ["active_turn", "buffered_message", "ingesting", None])
+async def test_events_clear_on_claude_sdk_releases_the_idle_client(
+    busy: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     A server-coordinated ``clear`` drops an idle claude-sdk session's client and history.
 
     The server continues the work in a fresh session, so the old session's
     SDK client must not keep the old context warm. A turn in flight, or a
     message waiting for one, refuses with 409 and leaves everything intact.
+    A clear that arrives while a message is still being ingested waits for
+    it, then sees the turn it started.
     """
+    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_histories_ref
 
     app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    ingest_held, release_ingest = asyncio.Event(), asyncio.Event()
+    finish_turn = asyncio.Event()
+    if busy == "ingesting":
+        resolve_content = runner_app._resolve_forwarded_message_content
+
+        async def held_ingest(*args: Any, **kwargs: Any) -> Any:
+            ingest_held.set()
+            await release_ingest.wait()
+            return await resolve_content(*args, **kwargs)
+
+        monkeypatch.setattr(runner_app, "_resolve_forwarded_message_content", held_ingest)
+        stream = pm._client.stream
+
+        def held_stream(*args: Any, **kwargs: Any) -> Any:
+            opened = stream(*args, **kwargs)
+
+            class _HeldTurn:
+                status_code = 200
+
+                async def __aenter__(self) -> Any:
+                    await finish_turn.wait()
+                    return await opened.__aenter__()
+
+                async def __aexit__(self, *exc: Any) -> None:
+                    await opened.__aexit__(*exc)
+
+            return _HeldTurn()
+
+        monkeypatch.setattr(pm._client, "stream", held_stream)
     sid = "d3f2b8c4e5a16b7c9d0e1f2a31425344"
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -3924,11 +3958,37 @@ async def test_events_clear_on_claude_sdk_releases_the_idle_client(busy: str | N
             app.state.active_turns[sid] = object()
         elif busy == "buffered_message":
             app.state.session_message_buffers[sid] = [{"type": "message"}]
+        message = None
+        if busy == "ingesting":
+            message = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{sid}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "next"}],
+                    },
+                )
+            )
+            await asyncio.wait_for(ingest_held.wait(), timeout=5)
 
-        resp = await client.post(
-            f"/v1/sessions/{sid}/events",
-            json={"type": "clear", "continue_in_new_session": True},
+        clear = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "clear", "continue_in_new_session": True},
+            )
         )
+        if message is not None:
+            # The clear queues behind the ingest instead of releasing under it.
+            await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- non-event
+            assert not clear.done() and pm.released == []
+            release_ingest.set()
+            assert (await asyncio.wait_for(message, timeout=5)).status_code < 300
+        resp = await asyncio.wait_for(clear, timeout=5)
+        finish_turn.set()
+        turn = app.state.active_turns.get(sid) if message is not None else None
+        if turn is not None:
+            await asyncio.wait_for(asyncio.shield(turn), timeout=5)
 
     try:
         if busy is None:
