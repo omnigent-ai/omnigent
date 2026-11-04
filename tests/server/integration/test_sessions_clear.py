@@ -26,8 +26,11 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from sqlalchemy import update
 
 import omnigent.runtime
+from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.managed_hosts import (
@@ -240,6 +243,19 @@ def resolve_harness_as(monkeypatch: pytest.MonkeyPatch, harness: str) -> None:
     monkeypatch.setattr(sessions_module, "_resolve_harness", lambda *_a, **_k: harness)
 
 
+def set_runner_workspace(db_uri: str, session_id: str, workspace: str, git_branch: str) -> None:
+    """Give a runner-only *session_id* a workspace and branch, with no host."""
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            update(SqlConversationMetadata)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == session_id,
+            )
+            .values(workspace=workspace, git_branch=git_branch)
+        )
+
+
 def bind_to_host(
     store: SqlAlchemyConversationStore,
     session_id: str,
@@ -322,11 +338,12 @@ def message_texts(store: SqlAlchemyConversationStore, session_id: str) -> list[s
 
 
 @pytest.mark.parametrize(
-    ("runner_status", "turns"),
+    ("runner_status", "turns", "host"),
     [
-        pytest.param(200, 2, id="release"),
-        pytest.param(204, 2, id="older-runner"),
-        pytest.param(200, 0, id="empty-source"),
+        pytest.param(200, 2, True, id="release"),
+        pytest.param(204, 2, True, id="older-runner"),
+        pytest.param(200, 0, True, id="empty-source"),
+        pytest.param(200, 2, False, id="runner-only"),
     ],
 )
 async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
@@ -336,19 +353,23 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     monkeypatch: pytest.MonkeyPatch,
     runner_status: int,
     turns: int,
+    host: bool,
 ) -> None:
     """``clear`` frees the old SDK client, then continues in an empty bound session.
 
     The runner gets a marked request, so only a server that continues the work
     makes it release the client; an older runner's 204 still continues. The new
     session keeps the source's host, workspace, branch, runner, sandbox
-    repositories, run settings and routing switches but none of its files; the source keeps its
-    history and gets a notice plus a redirect.
+    repositories, run settings and routing switches but none of its files; the
+    source keeps its history and gets a notice plus a redirect. A source on a
+    runner with no host keeps its workspace and branch too.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     live_runner.clear_status = runner_status
     store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store, turns=turns)
+    source_id = await create_placed_session(client, store, turns=turns, host=host)
+    if not host:
+        set_runner_workspace(db_uri, source_id, "/work/repo", "feature/parser")
     file_store = SqlAlchemyFileStore(db_uri)
     file_store.create("notes.txt", bytes=5, session_id=source_id)
     repos = ["https://github.com/acme/api", "https://github.com/acme/web#main"]
@@ -378,10 +399,17 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert fork is not None
     assert (fork.runner_id, fork.host_id, fork.workspace, fork.git_branch) == (
         _RUNNER_ID,
-        _HOST_ID,
+        _HOST_ID if host else None,
         "/work/repo",
         "feature/parser",
     )
+    # The runner starts the new session's turns in that workspace.
+    init = next(
+        body
+        for path, body in live_runner.posts
+        if path == "/v1/sessions" and body.get("session_id") == new_id
+    )
+    assert init["session_init"]["snapshot"]["workspace"] == "/work/repo"
     assert (fork.model_override, fork.reasoning_effort) == ("claude-opus-4-7", "high")
     assert (fork.cost_control_mode_override, fork.subagent_routing_override) == ("on", "on")
     assert fork.terminal_launch_args == ["--permission-mode", "acceptEdits"]
