@@ -88,6 +88,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
     update_harness_accounts,
+    update_harness_readiness,
 )
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import HostStore
@@ -459,11 +460,9 @@ def create_host_tunnel_router(
                     _ping_loop(ws, conn, host_id, heartbeat_requested),
                     name=f"host-ping:{host_id}",
                 )
-                readiness_requested = asyncio.Event()
                 readiness_abandoned = threading.Event()
                 readiness_task = asyncio.create_task(
                     _readiness_loop(
-                        readiness_requested,
                         readiness_abandoned,
                         conn,
                         host_store,
@@ -480,7 +479,6 @@ def create_host_tunnel_router(
                         host_registry,
                         runner_exit_reports,
                         on_runner_exited,
-                        readiness_requested,
                     ),
                     name=f"host-receive:{host_id}",
                 )
@@ -793,7 +791,6 @@ async def _receive_loop(
     host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: RunnerExitedCallback | None,
-    readiness_requested: asyncio.Event,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -809,7 +806,6 @@ async def _receive_loop(
     :param on_runner_exited: Callback fired with ``(host_id, runner_id,
         error)`` when a ``host.runner_exited`` frame arrives; ``None``
         logs the session-less ``runner_exited`` event here instead.
-    :param readiness_requested: Coalesced signal to persist the latest live readiness.
     """
     # Per-request reassembly of chunked import sessions; buffers die with the
     # connection, so a tunnel drop can never leak a partial session.
@@ -867,14 +863,13 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostHarnessReadinessFrame):
-            conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            update_harness_readiness(conn, frame.configured_harnesses)
             if frame.harness_accounts is not None:
                 conn.hello.harness_accounts = dict(frame.harness_accounts)
             conn.hello.gateway_inference = (
                 dict(frame.gateway_inference) if frame.gateway_inference is not None else None
             )
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
-            readiness_requested.set()
             continue
 
         if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -1042,7 +1037,6 @@ async def _receive_loop(
         if isinstance(frame, HostProbeAccountsResultFrame):
             if frame.status == "ok" and frame.harness_accounts is not None:
                 update_harness_accounts(conn, frame.harness_accounts)
-                readiness_requested.set()
             probe_future = conn.pending_harness_account_probes.pop(frame.request_id, None)
             if probe_future is not None and not probe_future.done():
                 probe_future.set_result(
@@ -1089,10 +1083,9 @@ async def _receive_loop(
                 state.harness_accounts = frame.harness_accounts
                 conn.active_harness_logins.pop(state.harness, None)
                 if frame.configured_harnesses is not None:
-                    conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+                    update_harness_readiness(conn, frame.configured_harnesses)
                     if frame.harness_accounts is not None:
                         update_harness_accounts(conn, frame.harness_accounts)
-                    readiness_requested.set()
             continue
 
         if isinstance(frame, HostHarnessLogoutResultFrame):
@@ -1269,7 +1262,6 @@ async def _receive_loop(
 
 
 async def _readiness_loop(
-    requested: asyncio.Event,
     abandoned: threading.Event,
     conn: HostConnection,
     host_store: HostStore,
@@ -1277,6 +1269,7 @@ async def _readiness_loop(
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
     """Persist the newest readiness snapshot without delaying tunnel frames."""
+    requested = conn.harness_readiness_requested
 
     def retired() -> bool:
         return abandoned.is_set() or host_registry.get(conn.host_id, conn.workspace_id) is not conn
@@ -1314,12 +1307,16 @@ async def _readiness_loop(
         if retired():
             return
         if conn.hello.configured_harnesses is not configured:
+            requested.set()
             continue
         if notify and on_host_update is not None:
             try:
                 await on_host_update(conn.host_id, conn.owner)
             except Exception:
                 _logger.exception("on_host_update callback failed for %s", conn.host_id)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(requested.wait(), timeout=PING_INTERVAL_S)
+                requested.set()
 
 
 async def _heartbeat_loop(

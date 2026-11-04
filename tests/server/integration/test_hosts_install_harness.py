@@ -145,8 +145,17 @@ def install_app(
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = FastAPI()
+    app.state.host_updates = []
+
+    async def record_host_update(host_id: str, _owner: str | None) -> None:
+        conn = registry.get(host_id)
+        assert conn is not None
+        app.state.host_updates.append(
+            (conn.hello.configured_harnesses, conn.hello.harness_accounts)
+        )
+
     app.include_router(
-        create_host_tunnel_router(registry, host_store),
+        create_host_tunnel_router(registry, host_store, on_host_update=record_host_update),
         prefix="/v1",
     )
     app.include_router(
@@ -655,7 +664,16 @@ async def test_refresh_harnesses_returns_fresh_host_maps(
     }
 
 
-@pytest.mark.parametrize("first_update", ["notification", "refresh"])
+@pytest.mark.parametrize(
+    ("first_update", "same_readiness", "fail_refresh"),
+    [
+        ("notification", False, False),
+        ("refresh", False, False),
+        ("notification", True, False),
+        ("notification", True, True),
+        ("notification", False, True),
+    ],
+)
 async def test_refresh_and_readiness_keep_the_newest_snapshot(
     install_setup: tuple[
         FastAPI,
@@ -667,6 +685,8 @@ async def test_refresh_and_readiness_keep_the_newest_snapshot(
     install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
     monkeypatch: pytest.MonkeyPatch,
     first_update: str,
+    same_readiness: bool,
+    fail_refresh: bool,
 ) -> None:
     app, registry, comm, replies, _drain = install_setup
     store = install_app[2]
@@ -675,20 +695,27 @@ async def test_refresh_and_readiness_keep_the_newest_snapshot(
     finished = threading.Event()
     newest_written = threading.Event()
     original_update = store.update_harness_readiness
-    older, newest = {"codex": False}, {"codex": True}
+    older, newest = {"codex": same_readiness}, {"codex": True}
     older_accounts = {"codex": {"kind": "unknown", "expired": True}}
     newest_accounts = {"codex": {"kind": "chatgpt"}}
 
+    refresh_failed = threading.Event()
+
     def delayed_update(host_id, configured_harnesses, **kwargs):
-        if configured_harnesses == older:
+        blocked = configured_harnesses == older and not entered.is_set()
+        if blocked:
             entered.set()
             assert release.wait(timeout=budget(5.0))
         try:
+            if fail_refresh and not blocked and configured_harnesses == newest:
+                if not refresh_failed.is_set():
+                    refresh_failed.set()
+                    raise RuntimeError("test HTTP readiness persistence failure")
             original_update(host_id, configured_harnesses, **kwargs)
-            if configured_harnesses == newest:
+            if configured_harnesses == newest and not blocked:
                 newest_written.set()
         finally:
-            if configured_harnesses == older:
+            if blocked:
                 finished.set()
 
     monkeypatch.setattr(store, "update_harness_readiness", delayed_update)
@@ -724,12 +751,23 @@ async def test_refresh_and_readiness_keep_the_newest_snapshot(
                 refresh_task = asyncio.create_task(
                     client.post(f"/v1/hosts/{_HOST_ID}/harnesses/refresh")
                 )
-            assert await asyncio.to_thread(newest_written.wait, budget(1.0))
+            if fail_refresh:
+                assert await asyncio.to_thread(refresh_failed.wait, budget(1.0))
+            else:
+                assert await asyncio.to_thread(newest_written.wait, budget(1.0))
             release.set()
             assert await asyncio.to_thread(finished.wait, budget(1.0))
             assert refresh_task is not None
-            response = await asyncio.wait_for(refresh_task, timeout=budget(1.0))
-            assert response.status_code == 200
+            if fail_refresh:
+                with pytest.raises(RuntimeError, match="test HTTP readiness persistence failure"):
+                    await asyncio.wait_for(refresh_task, timeout=budget(1.0))
+            else:
+                response = await asyncio.wait_for(refresh_task, timeout=budget(1.0))
+                assert response.status_code == 200
+        await poll_until_async(
+            lambda: (newest, newest_accounts) in app.state.host_updates,
+            timeout_s=budget(1.0),
+        )
         persisted = store.get_host(_HOST_ID)
         conn = registry.get(_HOST_ID)
         assert persisted is not None and persisted.configured_harnesses == newest
@@ -752,9 +790,33 @@ async def test_refresh_harness_accounts_updates_hosts_and_throttles(
         dict[str, dict[str, Any]],
         asyncio.Task[None],
     ],
+    install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A successful account probe updates list/detail and is cached for 60 seconds."""
-    app, registry, _comm, replies, _drain = install_setup
+    app, registry, comm, replies, _drain = install_setup
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHarnessReadinessFrame(
+                    configured_harnesses=conn.hello.configured_harnesses or {}
+                )
+            ),
+        }
+    )
+    await poll_until_async(lambda: bool(app.state.host_updates), timeout_s=budget(1.0))
+    app.state.host_updates.clear()
+    readiness_writes = []
+    original_update = install_app[2].update_harness_readiness
+
+    def record_readiness_write(host_id, configured_harnesses, **kwargs):
+        readiness_writes.append(configured_harnesses)
+        return original_update(host_id, configured_harnesses, **kwargs)
+
+    monkeypatch.setattr(install_app[2], "update_harness_readiness", record_readiness_write)
     accounts = {"codex": {"kind": "chatgpt", "email": "person@example.test"}}
     replies["__accounts__"] = {"harness_accounts": accounts}
 
@@ -773,6 +835,9 @@ async def test_refresh_harness_accounts_updates_hosts_and_throttles(
     assert replies["__accounts__"]["count"] == 2
     assert listing.json()["hosts"][0]["harness_accounts"] == accounts
     assert detail.json()["harness_accounts"] == accounts
+    await poll_until_async(lambda: len(app.state.host_updates) == 2, timeout_s=budget(1.0))
+    assert app.state.host_updates == [(conn.hello.configured_harnesses, accounts)] * 2
+    assert readiness_writes == []
 
 
 async def test_refresh_harness_accounts_rejects_unsupported_host(

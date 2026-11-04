@@ -81,6 +81,7 @@ from omnigent.server.host_registry import (
     HostLaunchResult,
     HostRegistry,
     update_harness_accounts,
+    update_harness_readiness,
 )
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
@@ -861,8 +862,8 @@ def create_hosts_router(
         if isinstance(result_accounts, dict):
             update_harness_accounts(conn, result_accounts)
         if isinstance(result_configured, dict):
-            snapshot = dict(result_configured)
-            conn.hello.configured_harnesses = snapshot
+            update_harness_readiness(conn, result_configured)
+            snapshot = conn.hello.configured_harnesses
             await asyncio.to_thread(
                 host_store.update_harness_readiness,
                 host_id,

@@ -10,7 +10,12 @@ import pytest
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.host.frames import CAP_CODEX_PLAN_AT_LAUNCH, CAP_CODEX_SIDE_CHAT, HostHelloFrame
-from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.host_registry import (
+    HostRegistry,
+    RunnerExitReports,
+    update_harness_accounts,
+    update_harness_readiness,
+)
 
 
 @dataclass
@@ -71,6 +76,30 @@ def test_register_and_get() -> None:
     assert fetched.host_id == "host_aaa"
     assert fetched.owner == "alice"
     assert fetched.hello.name == "test-host"
+
+
+@pytest.mark.parametrize("configured", [{"codex": True}, {}])
+def test_harness_snapshots_schedule_only_their_connection(configured) -> None:
+    registry = HostRegistry()
+    conn = registry.register("host_snapshots", FakeWebSocket(), _make_hello(), owner="alice")
+    replacement = registry.register(
+        "host_snapshots", FakeWebSocket(), _make_hello(), owner="alice"
+    )
+
+    reported = dict(configured)
+    update_harness_readiness(conn, reported)
+    reported["pi"] = True
+    assert "pi" not in (conn.hello.configured_harnesses or {})
+    assert conn.harness_readiness_requested.is_set()
+    assert not replacement.harness_readiness_requested.is_set()
+    assert replacement.hello.configured_harnesses is None
+
+    conn.harness_readiness_requested.clear()
+    update_harness_accounts(conn, {})
+    assert conn.hello.harness_accounts == {}
+    assert conn.harness_accounts_probed_at is not None
+    assert conn.harness_readiness_requested.is_set()
+    assert not replacement.harness_readiness_requested.is_set()
 
 
 def test_host_supports_codex_side_chat_by_capability() -> None:

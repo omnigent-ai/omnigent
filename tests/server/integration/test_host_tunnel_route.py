@@ -1192,19 +1192,26 @@ async def test_retired_readiness_write_cannot_overwrite_reconnect(
             await replacement.wait(timeout=budget(2.0))
 
 
-@pytest.mark.parametrize("failed_at", ["store", "callback"])
+@pytest.mark.parametrize(
+    "failed_at", ["store", "callback", "callback_disconnect", "callback_superseded"]
+)
 async def test_host_readiness_failure_does_not_disconnect(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, failed_at: str
 ) -> None:
     from omnigent.server.routes import host_tunnel
 
-    monkeypatch.setattr(host_tunnel, "PING_INTERVAL_S", budget(0.02))
+    monkeypatch.setattr(
+        host_tunnel,
+        "PING_INTERVAL_S",
+        budget(10.0 if failed_at == "callback_disconnect" else 0.02),
+    )
     monkeypatch.setattr(host_tunnel, "PING_MISS_THRESHOLD", 100_000)
     registry = HostRegistry()
     store = HostStore(db_uri)
     original_update = store.update_harness_readiness
     writes = 0
     notified = asyncio.Event()
+    callback_failed = asyncio.Event()
     notifications = 0
 
     def update_readiness(host_id, configured_harnesses, **kwargs):
@@ -1220,9 +1227,10 @@ async def test_host_readiness_failure_does_not_disconnect(
     async def on_update(_host_id: str, _owner: str | None) -> None:
         nonlocal notifications
         notifications += 1
-        notified.set()
-        if failed_at == "callback" and notifications == 1:
+        if failed_at.startswith("callback") and notifications == 1:
+            callback_failed.set()
             raise RuntimeError("test readiness callback failure")
+        notified.set()
 
     monkeypatch.setattr(store, "update_harness_readiness", update_readiness)
     app = FastAPI()
@@ -1240,6 +1248,33 @@ async def test_host_readiness_failure_does_not_disconnect(
                 ),
             }
         )
+        if failed_at == "callback_superseded":
+            await asyncio.wait_for(callback_failed.wait(), timeout=budget(1.0))
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostHarnessReadinessFrame(configured_harnesses={"codex": True})
+                    ),
+                }
+            )
+            await asyncio.wait_for(notified.wait(), timeout=budget(1.0))
+            persisted = store.get_host(_HOST_ID)
+            assert persisted is not None and persisted.configured_harnesses == {"codex": True}
+            assert writes == notifications == 2
+            return
+        if failed_at == "callback_disconnect":
+            await asyncio.wait_for(callback_failed.wait(), timeout=budget(1.0))
+            readiness_task = next(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"host-readiness:{_HOST_ID}"
+            )
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(2.0))
+            assert readiness_task.cancelled()
+            assert writes == notifications == 1
+            return
         await asyncio.wait_for(notified.wait(), timeout=budget(1.0))
         assert writes == (2 if failed_at == "store" else 1)
         persisted = store.get_host(_HOST_ID)
@@ -1256,13 +1291,14 @@ async def test_host_readiness_failure_does_not_disconnect(
             }
         )
         await asyncio.wait_for(notified.wait(), timeout=budget(1.0))
-        assert notifications == 2
+        assert notifications == (3 if failed_at == "callback" else 2)
         assert writes == (3 if failed_at == "store" else 2)
         persisted = store.get_host(_HOST_ID)
         assert persisted is not None and persisted.configured_harnesses == {"codex": True}
     finally:
-        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
-        await comm.wait(timeout=budget(2.0))
+        if not comm.future.done():
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(2.0))
 
 
 async def test_host_tunnel_sets_offline_on_disconnect(

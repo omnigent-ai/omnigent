@@ -213,10 +213,19 @@ def _fail_pending_harness_rpcs(conn: HostConnection) -> None:
         _fail_pending_inventory(pending, conn.host_id)
 
 
+def update_harness_readiness(
+    conn: HostConnection, configured_harnesses: dict[str, HarnessAvailability]
+) -> None:
+    """Publish a live snapshot and schedule persistence and notification."""
+    conn.hello.configured_harnesses = dict(configured_harnesses)
+    conn.harness_readiness_requested.set()
+
+
 def update_harness_accounts(conn: HostConnection, accounts: HarnessAccounts) -> None:
     """Apply a successful account probe and record its per-connection age."""
     conn.hello.harness_accounts = dict(accounts)
     conn.harness_accounts_probed_at = time.monotonic()
+    conn.harness_readiness_requested.set()
 
 
 # How long a runner exit report stays answerable, and how many are kept.
@@ -541,6 +550,7 @@ class HostConnection:
     )
     harness_account_probe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     harness_accounts_probed_at: float | None = None
+    harness_readiness_requested: asyncio.Event = field(default_factory=asyncio.Event)
     pending_harness_login_starts: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
