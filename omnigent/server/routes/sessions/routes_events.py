@@ -1088,7 +1088,7 @@ def register_events_routes(
         """Submit a session event, then run the steps that wait for its acceptance."""
         on_accepted: list[Callable[[], Awaitable[None]]] = []
         result = await _submit_event(request, session_id, body, in_flight, on_accepted)
-        # A policy denial saves nothing, so nothing it would replace may be dropped.
+        # A denied send doesn't carry the inputs it names, so keep them.
         if result.get("denied"):
             return result
         for step in on_accepted:

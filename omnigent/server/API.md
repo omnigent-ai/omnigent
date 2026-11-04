@@ -830,9 +830,9 @@ already includes usage, so clients should not issue the separate request.
 ```
 GET /v1/sessions/{session_id}/failed-inputs[?limit=100&after=<next_cursor>]
 
-200 OK — {"data": [{pending_id, item_id, content, position}], "next_cursor": string|null}
+200 OK — {"data": [{pending_id, item_id, content, position, created_by?}], "next_cursor": string|null}
 404 Not Found — no session with that id is visible to the caller
-422 Unprocessable Entity — `after` is not a valid cursor (32 lowercase hex characters)
+422 Unprocessable Entity — `after` is not a valid cursor (32 lowercase hex characters), or `limit` is outside 1-100
 ```
 
 Returns the caller's own startup inputs that a failed managed launch

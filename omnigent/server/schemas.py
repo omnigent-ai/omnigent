@@ -2053,7 +2053,8 @@ class SessionFailedInputPage(BaseModel):
     A page of ``GET /v1/sessions/{id}/failed-inputs``.
 
     :param data: The viewer's startup inputs a failed managed launch could not
-        deliver, each ``{"pending_id", "item_id", "content", "position"}``.
+        deliver, each ``{"pending_id", "item_id", "content", "position"}``,
+        plus ``created_by`` when the input records its sender.
         ``item_id`` is a follow-up's ``stable_id``. Pages follow item ids;
         ``position`` orders the inputs as they were sent. A page can hold
         fewer than ``limit`` inputs while more remain.
