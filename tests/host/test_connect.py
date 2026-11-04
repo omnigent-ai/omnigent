@@ -11492,38 +11492,58 @@ async def test_host_drives_mcp_login_over_the_tunnel(monkeypatch):
     )
 
     async def find(harness, name, plugin, source_id):
+        if name == "gone":
+            raise LookupError(name)
         assert (harness, name, plugin, source_id) == ("claude", "docs", "toolkit", None)
         return server
 
-    started = []
+    started, handled = [], []
+
+    def login(login_id, state):
+        return {"login_id": login_id, "state": state, "authorization_url": None, "error": None}
 
     async def start(self, configured, owner):
         started.append((configured, owner))
-        return {
-            "login_id": "l1",
-            "state": "pending",
-            "authorization_url": "https://auth.example.test/a",
-            "error": None,
-        }
+        return {**login("l1", "pending"), "authorization_url": "https://auth.example.test/a"}
+
+    async def submit(self, login_id, callback_url):
+        handled.append(("submit", login_id, callback_url))
+        return login(login_id, "pending")
+
+    async def cancel(self, login_id):
+        handled.append(("cancel", login_id))
+        return login(login_id, "cancelled")
 
     monkeypatch.setattr("omnigent.host.mcp_tools.find_configured_server", find)
     monkeypatch.setattr("omnigent.host.mcp_login.HostMcpLogins.start", start)
+    monkeypatch.setattr("omnigent.host.mcp_login.HostMcpLogins.submit", submit)
+    monkeypatch.setattr("omnigent.host.mcp_login.HostMcpLogins.cancel", cancel)
     host = _make_host_process()
     ws = _RecordingWS()
-    host._start_frame_task(
-        ws,
-        encode_host_frame(HostMcpLoginFrame("m", "start", "claude", "docs", "toolkit")),
-    )
-    host._start_frame_task(ws, encode_host_frame(HostMcpLoginFrame("n", "status", login_id="x")))
+    for frame in [
+        HostMcpLoginFrame("m", "start", "claude", "docs", "toolkit"),
+        HostMcpLoginFrame("n", "status", login_id="x"),
+        HostMcpLoginFrame("s", "submit", login_id="l1", callback_url="http://localhost:9/cb"),
+        HostMcpLoginFrame("c", "cancel", login_id="l1"),
+        HostMcpLoginFrame("g", "start", "claude", "gone"),
+        HostMcpLoginFrame("i", "cancel"),
+    ]:
+        host._start_frame_task(ws, encode_host_frame(frame))
     await _drain_frame_tasks(host)
-    results = {frame.request_id: frame for frame in map(decode_host_frame, ws.sent)}
+    results = {
+        frame.request_id: (frame.status, frame.login_id, frame.state, frame.error)
+        for frame in map(decode_host_frame, ws.sent)
+    }
     assert started == [(server, ws)]
-    assert (results["m"].status, results["m"].login_id, results["m"].state) == (
-        "ok",
-        "l1",
-        "pending",
-    )
-    assert (results["n"].status, results["n"].error) == ("not_found", "Sign-in not found")
+    assert sorted(handled) == [("cancel", "l1"), ("submit", "l1", "http://localhost:9/cb")]
+    assert results == {
+        "m": ("ok", "l1", "pending", None),
+        "n": ("not_found", None, None, "Sign-in not found"),
+        "s": ("ok", "l1", "pending", None),
+        "c": ("ok", "l1", "cancelled", None),
+        "g": ("not_found", None, None, "MCP server not found"),
+        "i": ("invalid", None, None, "Missing sign-in id"),
+    }
 
 
 async def test_host_pauses_orphan_reaping_during_mcp_status_checks(monkeypatch):

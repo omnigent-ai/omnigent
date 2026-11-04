@@ -161,6 +161,8 @@ _LOOPBACK_AUTH_URL = f"http://127.0.0.1:9/authorize?redirect_uri={_REDIRECT}"
         ("https://auth.example.test/a?redirect_uri=https%3A%2F%2Fevil.test%2Fcb\n", None),
         ("https://auth.example.test/a?redirect_uri=http%3A%2F%2Fevil.test%3A8080%2Fcb\n", None),
         (f"https://user:pw@auth.example.test/a?redirect_uri={_REDIRECT}\n", None),
+        # With two redirect addresses, the host can't tell which one the provider uses.
+        (f"{_AUTH_URL}&redirect_uri=http%3A%2F%2Flocalhost%3A9%2Fcb\n", None),
         # The server won't relay a link longer than this, so the host doesn't offer it.
         (f"{_AUTH_URL}&pad={'a' * MCP_LOGIN_MAX_URL}\n", None),
     ],
