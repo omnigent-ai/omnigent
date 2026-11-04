@@ -8,13 +8,15 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import psutil
 import pytest
+import pytest_asyncio
 
 from omnigent.host import mcp_login
 from omnigent.host.frames import MCP_LOGIN_MAX_CALLBACK, MCP_LOGIN_MAX_URL
@@ -106,6 +108,20 @@ def fake_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("OMNIGENT_RUNNER_TOKEN", "private")
     monkeypatch.setenv("FAKE_LOG", str(log))
     return log
+
+
+@pytest_asyncio.fixture()
+async def host_logins() -> AsyncIterator[Callable[..., HostMcpLogins]]:
+    """Makes login managers whose CLIs stop even after a failed assertion."""
+    created: list[HostMcpLogins] = []
+
+    def make(**options: Any) -> HostMcpLogins:
+        created.append(HostMcpLogins(**options))
+        return created[-1]
+
+    yield make
+    for logins in created:
+        await logins.close()
 
 
 def _server(
@@ -220,9 +236,16 @@ def test_harness_server_name(server: ConfiguredMcpServer, expected: str | None) 
     assert harness_server_name(server) == expected
 
 
-async def test_pasted_redirect_completes_sign_in(fake_cli: Path) -> None:
+async def test_pasted_redirect_completes_sign_in(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
+) -> None:
+    async def no_listener(*_args: object, **_kwargs: object) -> None:
+        raise httpx.ConnectError("no listener")
+
+    # Whatever listens on the redirect port, this CLI reads the address from its terminal.
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", no_listener)
     completed = []
-    logins = HostMcpLogins(
+    logins = host_logins(
         # Caches clear before a poll can observe the success.
         on_success=lambda: completed.append(logins.status(started["login_id"])["state"])
     )
@@ -236,8 +259,7 @@ async def test_pasted_redirect_completes_sign_in(fake_cli: Path) -> None:
     with pytest.raises(LoginError) as rejected:
         await logins.submit(started["login_id"], "http://localhost:1/callback?code=abc")
     assert rejected.value.status == "invalid"
-    # Nothing listens on the redirect port, so the CLI reads it from its terminal,
-    # which takes the longest accepted address whole.
+    # The terminal takes the longest accepted address whole.
     callback = _padded("http://localhost:43117/callback?code=abc&state=s", MCP_LOGIN_MAX_CALLBACK)
     await logins.submit(started["login_id"], callback)
     finished = await _settled(logins, started["login_id"])
@@ -251,7 +273,6 @@ async def test_pasted_redirect_completes_sign_in(fake_cli: Path) -> None:
     assert completed == ["pending"]
     with pytest.raises(LoginError):
         await logins.submit(started["login_id"], callback)
-    await logins.close()
 
 
 async def test_redirect_written_to_a_busy_terminal_arrives_whole(
@@ -324,6 +345,7 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
     fake_cli: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    host_logins: Callable[..., HostMcpLogins],
     slow_listener: bool,
 ) -> None:
     for name in ("httpx", "httpcore"):
@@ -348,7 +370,7 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
         typed.append(data)
 
     monkeypatch.setattr(mcp_login, "_write_all", type_into_terminal)
-    logins = HostMcpLogins()
+    logins = host_logins()
     await logins.start(_server())
     started = await logins.start(_server())
     recorded = json.loads(fake_cli.read_text())
@@ -374,27 +396,28 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
     assert typed == []
     # The host's logs never hold the one-time code.
     assert "code=abc" not in caplog.text
-    await logins.close()
 
 
 @pytest.mark.parametrize("help_failure", ["FAKE_HELP_HANG", "FAKE_HELP_EXIT"])
 async def test_an_unanswered_flag_check_leaves_the_flag_out(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, help_failure: str
+    fake_cli: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_logins: Callable[..., HostMcpLogins],
+    help_failure: str,
 ) -> None:
     monkeypatch.setenv("FAKE_OLD_CLI", "1")
     monkeypatch.setenv("FAKE_MODE", "listen")
     monkeypatch.setenv(help_failure, "1")
     monkeypatch.setattr(mcp_login, "STATUS_TIMEOUT_SECONDS", 0.5)
-    logins = HostMcpLogins()
+    logins = host_logins()
     started = await logins.start(_server())
     assert started["state"] == "pending", started
     recorded = json.loads(fake_cli.read_text())
     assert (recorded["argv"], recorded["browser"]) == (["mcp", "login", "demo"], "true")
-    await logins.close()
 
 
 async def test_redirect_is_resent_only_after_a_failed_delivery(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
 ) -> None:
     delivered: list[str] = []
 
@@ -404,7 +427,7 @@ async def test_redirect_is_resent_only_after_a_failed_delivery(
             raise LoginError("failed", "Couldn't hand the address to the harness")
 
     monkeypatch.setattr(mcp_login, "_deliver_callback", deliver)
-    logins = HostMcpLogins()
+    logins = host_logins()
     started = await logins.start(_server())
     callback = f"{_CALLBACK}abc&state=s"
     with pytest.raises(LoginError) as failed:
@@ -416,7 +439,6 @@ async def test_redirect_is_resent_only_after_a_failed_delivery(
         await logins.submit(started["login_id"], callback)
     assert repeated.value.status == "invalid"
     assert delivered == [callback, callback]
-    await logins.close()
 
 
 @pytest.mark.parametrize(
@@ -427,20 +449,27 @@ async def test_redirect_is_resent_only_after_a_failed_delivery(
     ],
 )
 async def test_failed_and_expired_sign_in(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, mode: str, state: str, error: str
+    fake_cli: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_logins: Callable[..., HostMcpLogins],
+    mode: str,
+    state: str,
+    error: str,
 ) -> None:
     monkeypatch.setenv("FAKE_MODE", mode)
     monkeypatch.setattr(mcp_login, "LOGIN_TIMEOUT_SECONDS", 0.5)
-    logins = HostMcpLogins(on_success=lambda: pytest.fail("must not report success"))
+    logins = host_logins(on_success=lambda: pytest.fail("must not report success"))
     started = await logins.start(_server(harness="codex"))
     finished = await _settled(logins, started["login_id"])
     assert (finished["state"], finished["error"]) == (state, error)
     await _assert_gone(json.loads(fake_cli.read_text())["pid"])
-    await logins.close()
 
 
 async def test_codex_signs_in_to_the_home_that_lists_its_servers(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    fake_cli: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    host_logins: Callable[..., HostMcpLogins],
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -448,19 +477,18 @@ async def test_codex_signs_in_to_the_home_that_lists_its_servers(
     # A nested launch inherits its parent session's private home.
     private_home = home / ".omnigent" / "codex-native" / "abc" / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(private_home))
-    logins = HostMcpLogins()
+    logins = host_logins()
     await logins.start(_server(harness="codex"))
     assert json.loads(fake_cli.read_text())["codex_home"] == str(home / ".codex")
-    await logins.close()
 
 
 async def test_cli_without_a_sign_in_page_fails_start(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
 ) -> None:
     monkeypatch.setenv("FAKE_MODE", "silent")
     # Long enough for the flag check and spawn on a loaded runner.
     monkeypatch.setattr(mcp_login, "START_TIMEOUT_SECONDS", 3.0)
-    logins = HostMcpLogins()
+    logins = host_logins()
     started = await logins.start(_server())
     assert (started["state"], started["authorization_url"]) == ("failed", None)
     assert started["error"] == "The harness didn't offer a sign-in page"
@@ -499,13 +527,13 @@ async def test_cli_that_fails_to_launch_leaves_nothing_open(
 
 
 async def test_queued_starts_finish_within_the_start_budget(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
 ) -> None:
     # A stalled flag check holds the start lock; neither start may outlive the budget.
     monkeypatch.setenv("FAKE_HELP_HANG", "1")
     monkeypatch.setenv("FAKE_MODE", "silent")
     monkeypatch.setattr(mcp_login, "START_TIMEOUT_SECONDS", 1.0)
-    logins = HostMcpLogins()
+    logins = host_logins()
     loop = asyncio.get_running_loop()
     began = loop.time()
     first, second = await asyncio.gather(
@@ -520,9 +548,9 @@ async def test_queued_starts_finish_within_the_start_budget(
 
 
 async def test_cancel_restart_and_close_stop_the_cli(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
 ) -> None:
-    logins = HostMcpLogins()
+    logins = host_logins()
     first = await logins.start(_server())
     first_pid = json.loads(fake_cli.read_text())["pid"]
     # Signing in to the same server again replaces the earlier attempt.
@@ -549,21 +577,19 @@ async def test_cancel_restart_and_close_stop_the_cli(
 
 
 async def test_concurrent_sign_ins_are_bounded(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
 ) -> None:
     monkeypatch.setattr(mcp_login, "MAX_ACTIVE_LOGINS", 1)
-    logins = HostMcpLogins()
+    logins = host_logins()
     await logins.start(_server(name="one"))
     with pytest.raises(LoginError) as busy:
         await logins.start(_server(name="two"))
     assert busy.value.status == "busy"
-    await logins.close()
     # Simultaneous starts for one server, e.g. a double-click, leave one CLI running.
-    racing = HostMcpLogins()
+    racing = host_logins()
     first, second = await asyncio.gather(racing.start(_server()), racing.start(_server()))
     states = sorted(racing.status(started["login_id"])["state"] for started in (first, second))
     assert states == ["cancelled", "pending"]
-    await racing.close()
 
 
 class _Tunnel:
@@ -571,7 +597,7 @@ class _Tunnel:
 
 
 async def test_disconnect_stops_an_in_flight_start(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, host_logins: Callable[..., HostMcpLogins]
 ) -> None:
     spawning = asyncio.Event()
     release = asyncio.Event()
@@ -588,7 +614,7 @@ async def test_disconnect_stops_an_in_flight_start(
 
     monkeypatch.setattr(HostMcpLogins, "_spawn", paused_spawn)
     tunnel = _Tunnel()
-    logins = HostMcpLogins()
+    logins = host_logins()
     start = asyncio.create_task(logins.start(_server(), tunnel))
     await spawning.wait()
     close = asyncio.create_task(logins.close(tunnel))
@@ -605,12 +631,14 @@ async def test_disconnect_stops_an_in_flight_start(
     assert len(pids) == 1
     # The next tunnel signs in normally.
     assert (await logins.start(_server(), _Tunnel()))["state"] == "pending"
-    await logins.close()
 
 
 @pytest.mark.parametrize("during", ["spawn", "url"])
 async def test_cancelled_start_stops_its_cli(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, during: str
+    fake_cli: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_logins: Callable[..., HostMcpLogins],
+    during: str,
 ) -> None:
     if during == "url":
         monkeypatch.setenv("FAKE_MODE", "silent")
@@ -629,7 +657,7 @@ async def test_cancelled_start_stops_its_cli(
         return login
 
     monkeypatch.setattr(HostMcpLogins, "_spawn", observed_spawn)
-    logins = HostMcpLogins()
+    logins = host_logins()
     start = asyncio.create_task(logins.start(_server()))
     await spawned.wait()
     if during == "url":
@@ -639,10 +667,11 @@ async def test_cancelled_start_stops_its_cli(
         await start
     await _assert_gone(pids[0])
     assert not logins.pids()
-    await logins.close()
 
 
-async def test_spawn_holds_the_reaper_guard_until_the_login_is_tracked(fake_cli: Path) -> None:
+async def test_spawn_holds_the_reaper_guard_until_the_login_is_tracked(
+    fake_cli: Path, host_logins: Callable[..., HostMcpLogins]
+) -> None:
     tracked_on_release = []
 
     @contextlib.contextmanager
@@ -652,10 +681,9 @@ async def test_spawn_holds_the_reaper_guard_until_the_login_is_tracked(fake_cli:
         finally:
             tracked_on_release.append(bool(logins.pids()))
 
-    logins = HostMcpLogins(subprocess_guard=guard)
+    logins = host_logins(subprocess_guard=guard)
     await logins.start(_server())
     assert tracked_on_release == [True]
-    await logins.close()
 
 
 @pytest.mark.parametrize(

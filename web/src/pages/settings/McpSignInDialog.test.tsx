@@ -198,6 +198,35 @@ describe("McpSignInDialog", () => {
     expect(finish).toBeDisabled();
   });
 
+  it("ends the sign-in on the host's reply to a pasted address", async () => {
+    const succeeded = () => json(login({ state: "succeeded", authorization_url: null }));
+    on("POST", BASE, () => json(login()));
+    on("POST", `${BASE}/L1/callback`, succeeded);
+    const view = await renderDialog();
+    let respond: (response: Response) => void = () => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          respond = resolve;
+        }),
+    );
+    await tick();
+
+    fireEvent.change(screen.getByLabelText(/paste it here/), {
+      target: { value: "http://localhost:9/callback?code=c&state=s" },
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Finish" })));
+    expect(props.onSignedIn).toHaveBeenCalledTimes(1);
+
+    // The poll that was already in flight sees the same ending.
+    await act(async () => respond(succeeded()));
+    await tick();
+    expect(props.onSignedIn).toHaveBeenCalledTimes(1);
+    expect(calls("GET", `${BASE}/L1`)).toHaveLength(1);
+    view.unmount();
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(0);
+  });
+
   it("shows why the sign-in ended and starts a fresh one on retry", async () => {
     on(
       "POST",

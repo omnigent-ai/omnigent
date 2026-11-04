@@ -88,6 +88,7 @@ export function McpSignInDialog({
   const [phase, setPhase] = useState<Phase>({ kind: "starting" });
   const onSignedInRef = useRef(onSignedIn);
   onSignedInRef.current = onSignedIn;
+  const onSubmittedRef = useRef<(login: McpLogin) => void>(() => {});
   const hostId = host.host_id;
   const hostName = host.name;
   // A renamed host must not restart a sign-in the user may be partway through.
@@ -128,7 +129,7 @@ export function McpSignInDialog({
       setPhase({ kind: "error", message, unsupported });
     };
     const pollFailed = (error: unknown) => {
-      if (!active || controller.signal.aborted) return;
+      if (!active || loginId === null || controller.signal.aborted) return;
       if (isMissingRoute(error)) {
         fail(error);
         return;
@@ -147,11 +148,17 @@ export function McpSignInDialog({
       if (!active || loginId === null) return;
       fetchMcpLogin(hostId, loginId, controller.signal)
         .then((login) => {
-          if (!active) return;
+          if (!active || loginId === null) return;
           pollFailures = 0;
           settle(login);
         })
         .catch(pollFailed);
+    };
+    // A pasted address can end the sign-in before the next poll would see it.
+    onSubmittedRef.current = (login) => {
+      if (!active || loginId !== login.login_id || login.state === "pending") return;
+      window.clearTimeout(timer);
+      settle(login);
     };
 
     startMcpLogin({ hostId, harness, server, plugin, sourceId })
@@ -184,7 +191,12 @@ export function McpSignInDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-5 px-6 pb-2">
-          <PhaseBody phase={phase} hostId={hostId} hostName={hostName} />
+          <PhaseBody
+            phase={phase}
+            hostId={hostId}
+            hostName={hostName}
+            onSubmitted={(login) => onSubmittedRef.current(login)}
+          />
         </div>
         <DialogFooter className="mx-0 -mb-0 mt-4 rounded-none border-t border-border px-6 py-4">
           <Button
@@ -207,10 +219,12 @@ function PhaseBody({
   phase,
   hostId,
   hostName,
+  onSubmitted,
 }: {
   phase: Phase;
   hostId: string;
   hostName: string;
+  onSubmitted: (login: McpLogin) => void;
 }) {
   if (phase.kind === "starting") {
     return (
@@ -236,6 +250,7 @@ function PhaseBody({
       hostId={hostId}
       hostName={hostName}
       login={phase.login}
+      onSubmitted={onSubmitted}
     />
   );
 }
@@ -244,16 +259,18 @@ function PendingSteps({
   hostId,
   hostName,
   login,
+  onSubmitted,
 }: {
   hostId: string;
   hostName: string;
   login: McpLogin;
+  onSubmitted: (login: McpLogin) => void;
 }) {
   const [callbackUrl, setCallbackUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const url = login.authorization_url;
-  // ``settle`` only shows this phase for a safe link.
+  // settle() only shows this phase with a safe link.
   if (!url) return null;
   const submit = () => {
     const value = callbackUrl.trim();
@@ -262,7 +279,10 @@ function PendingSteps({
     setSubmitError(null);
     submitMcpLoginCallback(hostId, login.login_id, value)
       // Sending the same address twice would reuse its one-time code.
-      .then(() => setCallbackUrl(""))
+      .then((next) => {
+        setCallbackUrl("");
+        onSubmitted(next);
+      })
       .catch((error: unknown) => setSubmitError(requestErrorMessage(error, hostName)))
       .finally(() => setSubmitting(false));
   };
