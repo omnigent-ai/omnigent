@@ -1813,16 +1813,20 @@ def register_resource_routes(
         )
 
     async def _read_original(fs: CallerProcessFilesystem, relative_path: str) -> str | None:
-        """Return *relative_path*'s complete text before an editor save, if it has one."""
+        """Return *relative_path*'s complete UTF-8 text before an editor save, if it has one."""
         if filesystem_registry is None:
             return None
         try:
             existing = await fs.read(relative_path, limit=None)
         except Exception:  # noqa: BLE001
             return None  # a new or unreadable file has no original to keep
-        if not existing.encoding or existing.truncated:
+        # Only strict UTF-8 re-encodes to the bytes Changes later compares with the disk.
+        if existing.encoding != "utf-8" or existing.truncated:
             return None
-        return existing.data.decode(existing.encoding, errors="replace")
+        try:
+            return existing.data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     def _change_lock(relative_path: str) -> contextlib.AbstractAsyncContextManager[None]:
         """Return the lock an editor save holds from reading its original to recording it."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from fastapi import FastAPI
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.environment_filesystem import (
     DirectoryNotEmpty,
+    FileContent,
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
@@ -1989,6 +1991,45 @@ async def test_changes_keep_a_save_over_an_original_the_editor_cannot_read_whole
     assert [(e["path"], e["status"]) for e in listed] == [("saved", "modified")]
     diff = (await client.get(f"{base}/diff/saved")).json()
     assert (diff["before"], diff["after"], diff["baseline_state"]) == (None, after, "unknown")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reported_encoding", "saved"),
+    [
+        pytest.param("latin-1", "caf\u00e9\n", id="other-encoding"),
+        pytest.param("utf-8", "caf\ufffd\n", id="invalid-utf-8"),
+    ],
+)
+async def test_changes_keep_a_save_over_an_original_that_is_not_strict_utf_8(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reported_encoding: str,
+    saved: str,
+) -> None:
+    """Saving the text a non-UTF-8 original decodes to still changes the file's bytes."""
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    (workspace / "menu.txt").write_bytes(b"caf\xe9\n")
+    read = CallerProcessFilesystem.read
+
+    async def read_as_text(
+        self: CallerProcessFilesystem,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+        limit: int | None = None,
+    ) -> FileContent:
+        content = await read(self, path, max_bytes=max_bytes, limit=limit)
+        return dataclasses.replace(content, encoding=reported_encoding)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CallerProcessFilesystem, "read", read_as_text)
+        response = await client.put(f"{base}/filesystem/menu.txt", json={"content": saved})
+    assert response.status_code == 200, response.text
+
+    listed = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(e["path"], e["status"]) for e in listed] == [("menu.txt", "modified")]
 
 
 @pytest.mark.asyncio
