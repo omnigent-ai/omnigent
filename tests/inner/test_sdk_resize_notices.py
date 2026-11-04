@@ -42,7 +42,7 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
     class Client:
         fail_query = False
 
-        def __init__(self, options):
+        def __init__(self, options, transport=None):
             self.options = options
             clients.append(self)
 
