@@ -531,9 +531,10 @@ def test_changes_read_a_file_again_only_after_it_may_have_changed(
 
     monkeypatch.setattr(os, "open", counting_open)
 
+    # A file written just now could change again without a new timestamp.
+    monkeypatch.setattr(filesystem_registry, "_RACY_NS", float("inf"))
     for _ in range(2):
         assert registry.list_changed_files(conv_id, limit=10, check_disk=True) == []
-    # A file written just now could change again without a new timestamp.
     assert len(opened) == 2
 
     monkeypatch.setattr(filesystem_registry, "_RACY_NS", float("-inf"))
