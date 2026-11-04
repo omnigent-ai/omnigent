@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import string
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
@@ -40,6 +41,38 @@ from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
+
+# At up to 4 bytes per character, an indexed key stays under PostgreSQL's
+# ~2.7 KB btree entry and InnoDB's 3 KB key limits.
+TITLE_SORT_KEY_MAX_CHARS = 512
+# Code-point order on every dialect, so the web client can reproduce it. SQLite
+# and CockroachDB compare strings bytewise already; MySQL's _bin is NO PAD.
+_TITLE_SORT_KEY = (
+    String(TITLE_SORT_KEY_MAX_CHARS)
+    .with_variant(String(TITLE_SORT_KEY_MAX_CHARS, collation="C"), "postgresql")
+    .with_variant(
+        MySQLVarchar(TITLE_SORT_KEY_MAX_CHARS, charset="utf8mb4", collation="utf8mb4_0900_bin"),
+        "mysql",
+    )
+)
+_ASCII_LOWERCASE = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def title_sort_key(title: str | None) -> str:
+    """
+    Return the stored Name-ordering key for a conversation title.
+
+    The key is ``"0"`` plus the title with only ASCII letters lowercased,
+    truncated to :data:`TITLE_SORT_KEY_MAX_CHARS` code points, or ``"1"``
+    when untitled so untitled conversations sort after titled ones. The web
+    client's ``titleSortKey`` mirrors this exactly.
+
+    :param title: Conversation title; empty or ``None`` when untitled.
+    :returns: The key stored in ``conversations.title_sort_key``.
+    """
+    if not title:
+        return "1"
+    return ("0" + title.translate(_ASCII_LOWERCASE))[:TITLE_SORT_KEY_MAX_CHARS]
 
 
 class Uuid16(TypeDecorator[str]):
@@ -789,6 +822,8 @@ class SqlConversation(ConversationBase):
     :param updated_at: Unix epoch seconds when the conversation was
         last updated (item append, title change, etc.).
     :param title: Human-readable title; empty string when untitled.
+    :param title_sort_key: Name-ordering key derived from ``title`` by
+        :func:`title_sort_key`.
     :param parent_conversation_id: For Phase 4 named sub-agents,
         points at the parent conversation. ``None`` for top-level
         conversations.
@@ -818,6 +853,11 @@ class SqlConversation(ConversationBase):
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(768), nullable=False, server_default="")
+    # title_sort_key(title), written by the store with every title. The default
+    # keeps inserts from builds that predate the column valid.
+    title_sort_key: Mapped[str] = mapped_column(
+        _TITLE_SORT_KEY, nullable=False, server_default="1"
+    )
     parent_conversation_id: Mapped[str | None] = mapped_column(
         Uuid16(),
         nullable=True,
@@ -853,6 +893,10 @@ class SqlConversation(ConversationBase):
         # permission probes. The default sidebar (archived=false, updated_at
         # DESC) is served by the archived_updated index below.
         Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
+        # Name ordering (sort_by=title) under the same archived filter.
+        Index(
+            "ix_conversations_archived_title", "workspace_id", "archived", "title_sort_key", "id"
+        ),
         Index(
             "ix_conversations_root_conversation_id",
             "workspace_id",

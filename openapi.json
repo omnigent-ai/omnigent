@@ -14225,7 +14225,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return sessions after this session ID in sort order, e.g. `\"conv_abc123\"`.",
+            "description": "Cursor \u2014 return sessions after this session ID in sort order, e.g. `\"conv_abc123\"`, or after a page's `last_id`. With `sort_by=title`, `first_id` and `last_id` are opaque tokens: pass them back unchanged. A malformed token returns 400 `invalid_input`.",
             "in": "query",
             "name": "after",
             "required": false,
@@ -14242,7 +14242,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return sessions before this session ID.",
+            "description": "Cursor \u2014 return sessions before this session ID, or before a page's `first_id`.",
             "in": "query",
             "name": "before",
             "required": false,

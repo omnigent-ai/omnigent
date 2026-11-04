@@ -3190,6 +3190,132 @@ def test_list_conversations_sort_by_title(
         assert [c.id for c in preceding.data] == full_ids[:index], index
 
 
+def _stored_title_sort_keys(store: SqlAlchemyConversationStore, ids: list[str]) -> dict[str, str]:
+    """Read the stored ``title_sort_key`` of each conversation in *ids*."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+
+    with store._conv_session("test_setup") as session:
+        rows = session.execute(
+            select(_Conv.id, _Conv.title_sort_key).where(_Conv.id.in_(ids))
+        ).all()
+    return {row.id: row.title_sort_key for row in rows}
+
+
+def test_title_sort_key_follows_every_title_write(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Each write path that sets a title also stores the matching Name key."""
+    created = conversation_store.create_conversation(title="Plan B")
+    untitled = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=created.id
+    )
+    renamed = conversation_store.create_conversation(title="old")
+    conversation_store.update_conversation(renamed.id, title="Q" * 600)
+    cleared = conversation_store.create_conversation(title="temporary")
+    conversation_store.update_conversation(cleared.id, title="")
+    swapped = conversation_store.create_conversation(title="Draft")
+    assert conversation_store.rename_conversation_if_title_matches(swapped.id, "Draft", "Final")
+    fork = conversation_store.fork_conversation(created.id, title="Fork Of Plan")
+
+    keys = _stored_title_sort_keys(
+        conversation_store,
+        [created.id, untitled.id, child.id, renamed.id, cleared.id, swapped.id, fork.id],
+    )
+    assert keys == {
+        created.id: "0plan b",
+        untitled.id: "1",
+        child.id: f"0untitled:{child.id}",
+        renamed.id: "0" + "q" * 511,
+        cleared.id: "1",
+        swapped.id: "0final",
+        fork.id: "0fork of plan",
+    }
+
+
+def test_title_cursor_survives_renaming_the_boundary_row(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Renaming a page's last row forward must not skip the sessions after it.
+
+    The renamed row reappears at its new position, as any keyset cursor shows a
+    row that moved past it; every other session is still listed exactly once.
+    """
+    ids = [conversation_store.create_conversation(title=f"a{index}").id for index in range(9)]
+
+    first = conversation_store.list_conversations(limit=3, sort_by="title", order="asc", kind=None)
+    assert [c.id for c in first.data] == ids[:3]
+    assert first.last_id is not None
+    conversation_store.update_conversation(ids[2], title="z")
+
+    walked = [c.id for c in first.data]
+    after = first.last_id
+    while True:
+        page = conversation_store.list_conversations(
+            limit=3, after=after, sort_by="title", order="asc", kind=None
+        )
+        walked.extend(c.id for c in page.data)
+        if not page.has_more:
+            break
+        after = page.last_id
+    assert walked == [*ids, ids[2]]
+
+
+@pytest.mark.asyncio
+async def test_title_cursor_does_not_go_stale_when_its_row_is_deleted(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A Name page token keeps its position after the boundary row is deleted."""
+    ids = [conversation_store.create_conversation(title=f"a{index}").id for index in range(5)]
+    first = conversation_store.list_conversations(limit=2, sort_by="title", order="asc", kind=None)
+    assert first.first_id is not None and first.last_id is not None
+    assert await conversation_store.delete_conversation(ids[1])
+    assert await conversation_store.delete_conversation(ids[0])
+
+    after = conversation_store.list_conversations(
+        after=first.last_id, sort_by="title", order="asc", kind=None
+    )
+    assert [c.id for c in after.data] == ids[2:]
+    before = conversation_store.list_conversations(
+        before=first.first_id, sort_by="title", order="desc", kind=None
+    )
+    assert [c.id for c in before.data] == list(reversed(ids[2:]))
+
+
+def test_title_cursor_tokens_are_validated(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Name pages return tokens, other sorts keep ids, and bad tokens are 400s."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    ids = [conversation_store.create_conversation(title=f"a{index}").id for index in range(3)]
+    by_title = conversation_store.list_conversations(
+        limit=2, sort_by="title", order="asc", kind=None
+    )
+    by_created = conversation_store.list_conversations(limit=2, order="asc", kind=None)
+    assert by_title.last_id is not None and by_title.last_id.startswith("title.")
+    assert by_created.last_id == by_created.data[-1].id
+
+    # A plain id still pages a Name listing, through the cursor row's live key.
+    plain = conversation_store.list_conversations(
+        after=ids[0], sort_by="title", order="asc", kind=None
+    )
+    assert [c.id for c in plain.data] == ids[1:]
+
+    malformed = ["title.", "title.!!", "title.bm90IGpzb24", "title.WzEsMl0", "title.WyJ4IiwiYiJd"]
+    for cursor in malformed:
+        with pytest.raises(OmnigentError) as exc_info:
+            conversation_store.list_conversations(
+                after=cursor, sort_by="title", order="asc", kind=None
+            )
+        assert exc_info.value.code == ErrorCode.INVALID_INPUT, cursor
+    with pytest.raises(OmnigentError) as exc_info:
+        conversation_store.list_conversations(after=by_title.last_id, order="asc", kind=None)
+    assert exc_info.value.code == ErrorCode.INVALID_INPUT
+
+
 # ─── Phase 4: parent_conversation_id + name uniqueness ──────
 
 
@@ -8234,7 +8360,7 @@ def _bulk_seed_conversations_and_grants(
     Core bulk inserts, not per-row store calls, so a plan test can reach a
     realistic row count without a slow fixture.
 
-    :param tie_size: How many rows share one ``created_at`` value. The
+    :param tie_size: How many rows share one ``created_at`` value and title. The
         default of 1 gives every row a distinct timestamp; a larger value
         creates ties, which is what makes the cursor's tiebreaker term
         load-bearing (without ties, dropping it changes nothing).
@@ -8245,6 +8371,7 @@ def _bulk_seed_conversations_and_grants(
 
     from omnigent.db.db_models import SqlConversation as _Conv
     from omnigent.db.db_models import SqlSessionPermission as _Perm
+    from omnigent.db.db_models import title_sort_key
 
     base = 1_900_000_000
     conv_rows = []
@@ -8258,7 +8385,8 @@ def _bulk_seed_conversations_and_grants(
                 "id": cid,
                 "created_at": stamp,
                 "updated_at": stamp,
-                "title": f"seed-{i}",
+                "title": f"seed-{i // tie_size}",
+                "title_sort_key": title_sort_key(f"seed-{i // tie_size}"),
                 "parent_conversation_id": None,
                 "root_conversation_id": cid,
                 "next_position": 0,
@@ -8466,8 +8594,8 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
        filter, so a deep cursor reads and discards every row above it, at a
        cost that grows with cursor depth.
 
-    The SQL shape is asserted for both sort columns. The PLAN assertion is
-    limited to ``updated_at``, which has an existing compatible index; a
+    The SQL shape is asserted for every sort. The PLAN assertion is limited to
+    ``updated_at`` and ``title``, which have compatible indexes; a
     ``created_at`` plan may rationally sort or hash-join without one. EXPLAIN
     uses the driver form because the cursor binds a 16-byte identifier that
     cannot be written as a SQL literal, and re-binding raw values to a
@@ -8560,15 +8688,15 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
     expected_ids = [c.id for c in baseline.data]
     deep = int(len(expected_ids) * 0.7)
 
-    tiebreaker_col = conversation_store._tiebreaker_col
-    # The tiebreaker column is dialect-chosen (SQLite rowid = insertion order,
-    # otherwise the uuid id) — assert against the store's own choice rather
-    # than hard-coding one dialect's spelling.
-    tiebreaker = str(getattr(tiebreaker_col, "expression", tiebreaker_col))
-
     first = None
     second = None
-    for sort_by in ("created_at", "updated_at"):
+    for sort_by in ("created_at", "updated_at", "title"):
+        sort_column = "title_sort_key" if sort_by == "title" else sort_by
+        # The tiebreaker column is dialect-chosen (SQLite rowid = insertion order,
+        # otherwise the uuid id) — assert against the store's own choice rather
+        # than hard-coding one dialect's spelling.
+        _, tiebreaker_col = conversation_store._resolve_sort_columns(sort_by)
+        tiebreaker = str(getattr(tiebreaker_col, "expression", tiebreaker_col))
         for order in ("desc", "asc"):
             for direction in ("after", "before"):
                 page = conversation_store.list_conversations(
@@ -8580,7 +8708,7 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                     order=order,
                 )
                 assert page.has_more, "seed must be deeper than one page"
-                cursor_id = page.data[-1].id
+                cursor = page.last_id
                 with _capture_conversation_selects(conversation_store) as clauses:
                     with _capture_driver_sql(conversation_store) as driver_captured:
                         cursor_page = conversation_store.list_conversations(
@@ -8590,16 +8718,16 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                             kind="default",
                             sort_by=sort_by,
                             order=order,
-                            **{direction: cursor_id},
+                            **{direction: cursor},
                         )
                 where = f"{sort_by}/{order}/{direction}"
-                if sort_by == "updated_at":
-                    # With the existing compatible index, the row value must
-                    # become a range condition rather than a residual filter.
-                    cursor_plan = _plan_of(driver_captured, sort_by)
+                if sort_by in ("updated_at", "title"):
+                    # With a compatible index, the row value must become a
+                    # range condition rather than a residual filter.
+                    cursor_plan = _plan_of(driver_captured, sort_column)
                     if dialect == "postgresql":
                         index_conds, rows_filtered = _index_conds_and_filtered(cursor_plan)
-                        assert any(sort_by in c and "id" in c for c in index_conds), (
+                        assert any(sort_column in c and "id" in c for c in index_conds), (
                             where,
                             cursor_plan,
                         )
@@ -8614,12 +8742,12 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                 # Skip the cursor point lookup, which also mentions ``sort_by``:
                 # only the paged listing carries an ORDER BY.
                 listing = next(
-                    (c for c in clauses if sort_by in str(c) and "ORDER BY" in str(c)),
+                    (c for c in clauses if sort_column in str(c) and "ORDER BY" in str(c)),
                     clauses[0],
                 )
                 descending_scan = (order == "desc") if direction == "after" else (order == "asc")
                 comparison = "<" if descending_scan else ">"
-                assert f"(conversations.{sort_by}, {tiebreaker}) {comparison}" in " ".join(
+                assert f"(conversations.{sort_column}, {tiebreaker}) {comparison}" in " ".join(
                     str(listing).split()
                 ), (where, tiebreaker, str(listing))
 

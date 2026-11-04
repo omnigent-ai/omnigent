@@ -1820,9 +1820,13 @@ def register_core_routes(
         :param limit: Maximum number of sessions to return
             (1-1000, default 20).
         :param after: Cursor — return sessions after this
-            session ID in sort order, e.g. ``"conv_abc123"``.
+            session ID in sort order, e.g. ``"conv_abc123"``, or
+            after a page's ``last_id``. With ``sort_by=title``,
+            ``first_id`` and ``last_id`` are opaque tokens: pass
+            them back unchanged. A malformed token returns 400
+            ``invalid_input``.
         :param before: Cursor — return sessions before this
-            session ID.
+            session ID, or before a page's ``first_id``.
         :param agent_id: When set, only return sessions bound
             to this agent, e.g. ``"ag_abc123"``. ``None``
             returns sessions across all agents.

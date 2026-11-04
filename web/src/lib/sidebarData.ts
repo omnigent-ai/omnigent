@@ -71,12 +71,19 @@ export function dedupeSessionRows(rows: Conversation[]): Conversation[] {
   return [...byId.values()];
 }
 
+/** Code points the server keeps of its stored ``sort_by=title`` key. */
+const TITLE_SORT_KEY_MAX_CHARS = 512;
+
 /**
  * The server's ``sort_by=title`` key: ASCII case folded, untitled last. The
  * server folds only ASCII on every database, so this must not use toLowerCase.
  */
 export function titleSortKey(title: string | null | undefined): string {
-  return title ? `0${title.replace(/[A-Z]/g, (letter) => letter.toLowerCase())}` : "1";
+  if (!title) return "1";
+  const key = `0${title.replace(/[A-Z]/g, (letter) => letter.toLowerCase())}`;
+  return key.length > TITLE_SORT_KEY_MAX_CHARS
+    ? Array.from(key).slice(0, TITLE_SORT_KEY_MAX_CHARS).join("")
+    : key;
 }
 
 /** Orders like the server's binary collations: by code point, not UTF-16 unit. */

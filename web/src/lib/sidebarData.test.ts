@@ -163,6 +163,14 @@ it("keys names like the server: folded case, untitled last", () => {
   ]);
 });
 
+it("truncates long name keys to the server's 512 code points", () => {
+  expect(titleSortKey(`A${"b".repeat(600)}`)).toBe(`0a${"b".repeat(510)}`);
+  // Astral characters count once, as in the server's stored key.
+  const emoji = titleSortKey("\u{1F600}".repeat(600));
+  expect(Array.from(emoji)).toHaveLength(512);
+  expect(emoji).toBe(`0${"\u{1F600}".repeat(511)}`);
+});
+
 it("orders names like every server dialect: ASCII-only folding, code points, id ties", () => {
   const titled = (id: string, title: string) => ({ ...row(id, 0), title });
   const rows = [
