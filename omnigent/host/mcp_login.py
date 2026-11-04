@@ -71,7 +71,7 @@ def harness_server_name(server: ConfiguredMcpServer) -> str | None:
     """The name the harness CLI uses for *server*, or ``None`` if it can't log in to it."""
     summary = server.summary
     harness = summary["harness"]
-    if harness not in LOGIN_HARNESSES or summary["transport"] != "http":
+    if harness not in LOGIN_HARNESSES or summary["transport"] != "http" or server.shared_name:
         return None
     name = summary["name"]
     plugin = summary.get("plugin")

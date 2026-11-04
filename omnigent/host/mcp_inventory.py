@@ -15,6 +15,7 @@ import os
 import threading
 import time
 import tomllib
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,9 @@ class ConfiguredMcpServer:
     summary: McpServerSummary
     config: Mapping[str, object]
     plugin_root: Path | None = None
+    #: Another server has the same harness, name and plugin (one plugin installed from
+    #: two marketplaces), so the harness CLI can't tell them apart.
+    shared_name: bool = False
 
 
 def _summary(
@@ -238,6 +242,12 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
             out.extend(read())
         except Exception:
             _logger.exception("MCP inventory failed for %s", harness)
+    names = Counter(
+        (s.summary["harness"], s.summary["name"], s.summary.get("plugin")) for s in out
+    )
+    for server in out:
+        summary = server.summary
+        server.shared_name = names[summary["harness"], summary["name"], summary.get("plugin")] > 1
     return out
 
 

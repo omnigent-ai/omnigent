@@ -104,11 +104,19 @@ def fake_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return log
 
 
-def _server(name: str = "demo", harness: str = "claude", plugin: str | None = None, **summary):
+def _server(
+    name: str = "demo",
+    harness: str = "claude",
+    plugin: str | None = None,
+    shared_name: bool = False,
+    **summary,
+):
     fields = {"name": name, "harness": harness, "transport": "http", **summary}
     if plugin is not None:
         fields["plugin"] = plugin
-    return ConfiguredMcpServer(fields, {"url": "https://mcp.example.test/mcp"})
+    return ConfiguredMcpServer(
+        fields, {"url": "https://mcp.example.test/mcp"}, shared_name=shared_name
+    )
 
 
 async def _settled(logins: HostMcpLogins, login_id: str) -> dict:
@@ -147,6 +155,7 @@ _LOOPBACK_AUTH_URL = f"http://127.0.0.1:9/authorize?redirect_uri={_REDIRECT}"
         (_AUTH_URL, None),
         ("https://auth.example.test/authorize?client_id=c\n", None),
         ("https://auth.example.test/a?redirect_uri=https%3A%2F%2Fevil.test%2Fcb\n", None),
+        ("https://auth.example.test/a?redirect_uri=http%3A%2F%2Fevil.test%3A8080%2Fcb\n", None),
         (f"https://user:pw@auth.example.test/a?redirect_uri={_REDIRECT}\n", None),
         # The server won't relay a link longer than this, so the host doesn't offer it.
         (f"{_AUTH_URL}&pad={'a' * MCP_LOGIN_MAX_URL}\n", None),
@@ -193,6 +202,7 @@ def test_valid_callback(callback: str, valid: bool) -> None:
     [
         (_server(), "demo"),
         (_server(plugin="tools"), "plugin:tools:demo"),
+        (_server(plugin="tools", shared_name=True), None),
         (_server(harness="codex"), "demo"),
         (_server(harness="codex", plugin="tools"), None),
         (_server(harness="cursor"), None),
@@ -309,6 +319,11 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
 ) -> None:
     monkeypatch.setenv("FAKE_OLD_CLI", "1")
     monkeypatch.setenv("FAKE_MODE", "listen")
+    # The redirect goes straight to the CLI's listener, never through a proxy.
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
     if slow_listener:
         # The listener has the code even when its reply is late, so it is sent once.
         monkeypatch.setenv("FAKE_LISTEN_DELAY", "1")
@@ -565,12 +580,17 @@ async def test_spawn_holds_the_reaper_guard_until_the_login_is_tracked(fake_cli:
     await logins.close()
 
 
-async def test_unsupported_servers_never_spawn(fake_cli: Path) -> None:
+@pytest.mark.parametrize(
+    "server", [_server(harness="cursor"), _server(plugin="tools", shared_name=True)]
+)
+async def test_unsupported_servers_never_spawn(
+    fake_cli: Path, server: ConfiguredMcpServer
+) -> None:
     with pytest.raises(LoginError) as refused:
-        await HostMcpLogins().start(_server(harness="cursor"))
+        await HostMcpLogins().start(server)
     assert refused.value.status == "invalid"
     assert not fake_cli.exists()
-    assert await harness_sign_in_state(_server(harness="cursor")) is None
+    assert await harness_sign_in_state(server) is None
     assert not fake_cli.exists()
 
 
