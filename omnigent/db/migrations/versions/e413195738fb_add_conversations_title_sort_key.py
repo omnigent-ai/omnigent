@@ -136,6 +136,7 @@ def _backfill(bind: sa.Connection) -> None:
         if bind.dialect.name == "cockroachdb":
             _publish(bind)
         else:
+            # Entering the block commits this batch, so an interrupted run keeps it.
             with op.get_context().autocommit_block():
                 pass
 
