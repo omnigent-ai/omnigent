@@ -4068,11 +4068,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
   );
 
   it.each([
-    { resend: "resend", command: false },
-    { resend: "skill-command resend", command: true },
+    { outcome: "denied", resend: "resend", command: false, refused: false },
+    { outcome: "denied", resend: "skill-command resend", command: true, refused: false },
+    { outcome: "refused", resend: "resend", command: false, refused: true },
+    { outcome: "refused", resend: "skill-command resend", command: true, refused: true },
   ])(
-    "doesn't name the startup inputs a denied $resend took back in a send queued behind it",
-    async ({ command }) => {
+    "doesn't name the startup inputs a $outcome $resend took back in a send queued behind it",
+    async ({ command, refused }) => {
       onTestFinished(clearSessionDrafts);
       seedSession("conv_real");
       failManagedLaunch("conv_real", "saved on server");
@@ -4087,7 +4089,15 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
           posts.push(JSON.parse(String(init.body)));
           if (posts.length === 1)
             return new Promise<Response>((resolve) => {
-              denyResend = () => resolve(mockResponse({ queued: false, denied: true }));
+              denyResend = () =>
+                resolve(
+                  refused
+                    ? mockResponse(
+                        { error: { code: "conflict", message: "Rejected" } },
+                        { ok: false, status: 409 },
+                      )
+                    : mockResponse({ queued: false, denied: true }),
+                );
             });
         }
         return defaultFetchHandler(input, init);
@@ -4106,7 +4116,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       expect(posts[0]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
       expect(posts[1]).not.toHaveProperty("replaces_failed_inputs");
       expect(useChatStore.getState().failedSendDraft).toMatchObject({
-        text: "saved on server",
+        text: command && refused ? "/review saved on server" : "saved on server",
         startupInputIds: ["pending_first"],
       });
     },

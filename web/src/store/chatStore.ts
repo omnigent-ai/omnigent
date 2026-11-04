@@ -2819,7 +2819,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
-    const replacedOnTurn = failedStartupInputsReplacedBy(submitConversationId);
+    const sendOut = Symbol("send");
+    const replacedOnTurn = failedStartupInputsReplacedBy(submitConversationId, sendOut);
     let replacesFailedInputs = replacedOnTurn();
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
@@ -3147,6 +3148,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
+      nameStartupInputsOut(submitConversationId, sendOut);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -3199,7 +3201,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
-    const replacedOnTurn = failedStartupInputsReplacedBy(submitConversationId);
+    const commandOut = Symbol("slash_command");
+    const replacedOnTurn = failedStartupInputsReplacedBy(submitConversationId, commandOut);
     let replacesFailedInputs = replacedOnTurn();
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
@@ -3306,6 +3309,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
       }
     } finally {
+      nameStartupInputsOut(submitConversationId, commandOut);
       releaseSend();
     }
   },
@@ -7839,21 +7843,43 @@ export const STARTUP_INPUT_LOOKUP_FAILED_CODE = "startup_input_lookup_failed";
 const STARTUP_ATTACHMENTS_NOT_RESTORED_CODE = "startup_attachments_not_restored";
 const ATTACHMENT_LIST = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 
+/** Per session, the failed startup inputs each send still out names. */
+const startupInputsNamedOut = new Map<string, Map<symbol, string[]>>();
+
+/** Record the failed startup inputs a send still out names; none once it settles. */
+function nameStartupInputsOut(conversationId: string | null, send: symbol, ids?: string[]): void {
+  if (conversationId === null) return;
+  const named = startupInputsNamedOut.get(conversationId) ?? new Map<symbol, string[]>();
+  if (ids?.length) named.set(send, ids);
+  else named.delete(send);
+  if (named.size > 0) startupInputsNamedOut.set(conversationId, named);
+  else startupInputsNamedOut.delete(conversationId);
+}
+
 /**
  * The failed startup inputs a send replaces: those already handed back to its
  * composer, so the server can drop them. Called before the composer clears its
- * draft; the returned reader drops ids that a denied send ahead of it took back.
+ * draft. Ids a send still out ahead names stay its own: accepted, it replaces
+ * them; otherwise they come back with it. With `send`, each read is recorded.
  */
 function failedStartupInputsReplacedBy(
   conversationId: string | null,
+  send?: symbol,
 ): () => { replaces_failed_inputs?: string[] } {
   if (conversationId === null) return () => ({});
   const returned = setterForState(conversationId)?.returnedStartupInputs ?? [];
   const drafted = getSessionDraft(conversationId)?.startupInputIds ?? [];
+  const ahead = new Set([...(startupInputsNamedOut.get(conversationId)?.values() ?? [])].flat());
   return () => {
     const stillReturned = setterForState(conversationId)?.returnedStartupInputs ?? [];
-    const ids = new Set([...returned.filter((id) => stillReturned.includes(id)), ...drafted]);
-    return ids.size === 0 ? {} : { replaces_failed_inputs: [...ids] };
+    const ids = [
+      ...new Set([
+        ...returned.filter((id) => stillReturned.includes(id) && !ahead.has(id)),
+        ...drafted,
+      ]),
+    ];
+    if (send) nameStartupInputsOut(conversationId, send, ids);
+    return ids.length === 0 ? {} : { replaces_failed_inputs: ids };
   };
 }
 
