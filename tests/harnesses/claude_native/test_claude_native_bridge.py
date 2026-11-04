@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import io
 import itertools
 import json
@@ -11,6 +12,7 @@ import os
 import queue
 import select
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -20,7 +22,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -1394,6 +1396,17 @@ _TEAMMATE_MESSAGE = '<teammate-message teammate_id="reviewer">Done</teammate-mes
 _TASK_COMPLETION = (
     "<task-notification><task-id>agent-1</task-id><status>completed</status></task-notification>"
 )
+_BACKGROUND_TASK_REMINDER = (
+    "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n"
+    "This is an automated background-task event, NOT a message from the user.\n\n"
+    "<task-notification>\n<task-id>bx1</task-id>\n<status>completed</status>\n"
+    '<summary>Background command "Run triage" completed (exit code 0)</summary>\n'
+    "</task-notification>\n</system-reminder>"
+)
+_NESTED_RULES_REMINDER = (
+    "<system-reminder>\nContents of /repo/.claude/rules/general.md:\n\n"
+    "# Rules\nKeep changes focused.\n</system-reminder>"
+)
 
 
 def _read_native_user(
@@ -1481,6 +1494,9 @@ def test_team_markup_needs_provenance(
             "<task-notification><task-id>agent-1</task-id><status>completed</status>",
             {"isMeta": True},
         ),
+        (None, _BACKGROUND_TASK_REMINDER, {}),
+        (None, _NESTED_RULES_REMINDER + "\n" + _NESTED_RULES_REMINDER, {}),
+        ("prompt", _BACKGROUND_TASK_REMINDER, {}),
     ],
 )
 def test_internal_scaffolding_does_not_split_parent_response(
@@ -1489,6 +1505,40 @@ def test_internal_scaffolding_does_not_split_parent_response(
     _, response_id, items = _read_native_user(tmp_path, text, queued=queued, **metadata)
     assert items == []
     assert response_id == "active"
+
+
+@pytest.mark.parametrize(
+    "content,origin,visible",
+    [
+        ([{"type": "text", "text": _NESTED_RULES_REMINDER}], None, []),
+        (
+            [
+                {"type": "text", "text": _BACKGROUND_TASK_REMINDER},
+                {"type": "text", "text": "Push the branch"},
+            ],
+            None,
+            ["Push the branch"],
+        ),
+        (_NESTED_RULES_REMINDER, {"kind": "human"}, [_NESTED_RULES_REMINDER]),
+        (
+            [{"type": "text", "text": _NESTED_RULES_REMINDER}],
+            {"kind": "human"},
+            [_NESTED_RULES_REMINDER],
+        ),
+        (
+            _NESTED_RULES_REMINDER + "\nWhat do these rules mean?",
+            None,
+            [_NESTED_RULES_REMINDER + "\nWhat do these rules mean?"],
+        ),
+    ],
+)
+def test_claude_system_reminders_stay_out_of_user_messages(
+    tmp_path: Path, content: Any, origin: dict[str, str] | None, visible: list[str]
+) -> None:
+    _, response_id, items = _read_native_user(tmp_path, content, origin=origin)
+    assert [block["text"] for item in items for block in item.data["content"]] == visible
+    assert not any(item.data.get("is_meta") for item in items)
+    assert response_id == (None if visible else "active")
 
 
 @pytest.mark.parametrize("queued", [None, "prompt", "task-notification"])
@@ -4249,22 +4299,108 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
     assert settings["effortLevel"] == "high"
 
 
+_FRAMEWORK_PROMPT = "Keep framework metadata separate."
+
+
+@pytest.mark.parametrize(
+    ("user_args", "merged_args"),
+    [
+        ((), None),
+        (
+            ("--append-system-prompt", "--- Reviewer profile ---"),
+            ("--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\n--- Reviewer profile ---"),
+        ),
+        (
+            ("--append-system-prompt=Review carefully.",),
+            (f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nReview carefully.",),
+        ),
+        (
+            ("--append-system-prompt", "Earlier.", "--append-system-prompt=Later."),
+            (
+                "--append-system-prompt",
+                "Earlier.",
+                f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nLater.",
+            ),
+        ),
+        (
+            ("--append-system-prompt=Earlier.", "--append-system-prompt", ""),
+            ("--append-system-prompt=Earlier.", "--append-system-prompt", _FRAMEWORK_PROMPT),
+        ),
+        (
+            ("--append-system-prompt=Earlier.", "--append-system-prompt="),
+            ("--append-system-prompt=Earlier.", f"--append-system-prompt={_FRAMEWORK_PROMPT}"),
+        ),
+        (("--append-system-prompt-file", "profile.md"), None),
+        (("--append-system-prompt-file=profile.md",), None),
+        (
+            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
+            (
+                "--append-system-prompt-file",
+                "profile.md",
+                "--append-system-prompt",
+                f"{_FRAMEWORK_PROMPT}\n\nReview.",
+            ),
+        ),
+        (("--", "--append-system-prompt=Positional."), None),
+    ],
+    ids=[
+        "no-user-prompt",
+        "user-prompt-separate-value",
+        "user-prompt-joined-value",
+        "repeated-flags-last-wins",
+        "final-empty-value-clears",
+        "final-empty-joined-value-clears",
+        "caller-file-separate-value",
+        "caller-file-joined-value",
+        "caller-file-and-prompt",
+        "after-end-of-options",
+    ],
+)
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    user_args: tuple[str, ...],
+    merged_args: tuple[str, ...] | None,
 ) -> None:
-    """Claude native appends framework instructions supplied by its launcher."""
-    framework_instruction = "Keep framework metadata separate."
+    """Omnigent's prompt joins the caller's last prompt value, or is added when there is none."""
+    # Claude reads a caller's prompt file itself, so Omnigent must never open it.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
 
-    args = augment_claude_args(
+    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and os.path.basename(file) == "profile.md":
+                raise AssertionError("Omnigent opened the caller's prompt file")
+            return real_open(file, *args, **kwargs)
+
+        return guarded_open
+
+    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
+    omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
-        append_system_prompt=framework_instruction,
+        append_system_prompt=_FRAMEWORK_PROMPT,
     )
 
-    assert args.count("--append-system-prompt") == 1
-    index = args.index("--append-system-prompt")
-    assert args[index + 1] == framework_instruction
+    args = augment_claude_args(
+        user_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+
+    prompt_index = omnigent_args.index("--append-system-prompt")
+    assert omnigent_args.count("--append-system-prompt") == 1
+    assert omnigent_args[prompt_index + 1] == _FRAMEWORK_PROMPT
+    if merged_args is None:
+        assert args == [*user_args, *omnigent_args]
+    else:
+        # The caller's prompt is sent once, so the launch command does not grow by its size.
+        del omnigent_args[prompt_index : prompt_index + 2]
+        assert args == [*merged_args, *omnigent_args]
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
@@ -4737,6 +4873,51 @@ def test_inject_user_message_pastes_content_then_submits(
         "claude:0.0",
         "Enter",
     ]
+    assert not list(bridge_dir.glob("paste_*.bin"))
+
+
+@pytest.mark.parametrize("failure_phase", ["write", "close"])
+def test_paste_file_is_removed_when_payload_write_fails(
+    failure_phase: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write or buffered close must not leave the prompt on disk."""
+    original_temporary_file = tempfile.NamedTemporaryFile
+    failure = OSError(errno.ENOSPC, "synthetic disk full")
+    created_paths: list[Path] = []
+
+    @contextmanager
+    def failing_temporary_file(**kwargs: Any) -> Iterator[Any]:
+        with original_temporary_file(**kwargs) as paste_file:
+            created_paths.append(Path(paste_file.name))
+            if failure_phase == "write":
+
+                def partial_write(payload: bytes) -> None:
+                    paste_file.file.write(payload[:3])
+                    paste_file.file.flush()
+                    raise failure
+
+                monkeypatch.setattr(paste_file, "write", partial_write)
+            yield paste_file
+        if failure_phase == "close":
+            raise failure
+
+    run_tmux = Mock()
+    monkeypatch.setattr(
+        claude_native_bridge.tempfile, "NamedTemporaryFile", failing_temporary_file
+    )
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _bridge_dir: False)
+    monkeypatch.setattr(claude_native_bridge, "_clear_composer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+
+    with pytest.raises(OSError) as caught:
+        claude_native_bridge._paste_and_submit(
+            tmp_path, "synthetic.sock", "claude:0.0", text="synthetic prompt", needle="synthetic"
+        )
+
+    assert caught.value is failure
+    assert len(created_paths) == 1
+    assert not created_paths[0].exists()
+    run_tmux.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -7257,6 +7438,47 @@ def test_call_relay_tool_returns_mcp_error_on_read_timeout(
     assert result["isError"] is True
     error_text = json.loads(result["content"][0]["text"])["error"]
     assert "failed to call Omnigent tool relay" in error_text
+
+
+@pytest.mark.parametrize(
+    ("payload", "heartbeat", "reason"),
+    [
+        (b"", True, "closed before delivering its result"),
+        (b"\n \n", True, "closed before delivering its result"),
+        (b'{"content":', True, "malformed JSON"),
+        (b"[]", True, "non-object JSON"),
+        (b'{"content":[{"type":"text","text":"created"}]}', False, None),
+    ],
+)
+def test_call_relay_tool_decodes_complete_or_uncertain_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    heartbeat: bool,
+    reason: str | None,
+) -> None:
+    """Legacy success is preserved; missing or invalid results stay uncertain."""
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {"X-Omnigent-Relay-Heartbeat": "1"} if heartbeat else {}
+
+    claude_native_bridge._write_json_file(
+        tmp_path / claude_native_bridge._TOOL_RELAY_FILE,
+        {"url": "http://127.0.0.1:12345", "token": "test-token"},
+    )
+    monkeypatch.setattr(
+        claude_native_bridge.request, "urlopen", lambda *_args, **_kwargs: Response(payload)
+    )
+    result = claude_native_bridge._call_relay_tool(tmp_path, "sys_scheduled_task_create", {})
+    if reason is None:
+        assert result == {"content": [{"type": "text", "text": "created"}]}
+        return
+    assert result["isError"]
+    message = json.loads(result["content"][0]["text"])["error"]
+    assert "Completion is unknown" in message
+    assert "check the affected state before retrying" in message
+    assert reason in message
 
 
 @pytest.mark.asyncio
@@ -13010,6 +13232,17 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
     ]
 
 
+_WRAPPED_BTW_PANE = "\n".join(
+    [
+        "▔" * 50,
+        "    /btw do the checks pass?",
+        "      Yes, the checks pass.",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to",
+        "    close",
+    ]
+)
+
+
 @pytest.mark.parametrize(
     ("occupied_pane", "after_preflight"),
     [
@@ -13022,6 +13255,8 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         (_TASK_DETAILS_PANE, False),
         (_SETTINGS_PANEL_PANE, True),
         (_TASK_DETAILS_PANE, True),
+        (_WRAPPED_BTW_PANE, False),
+        (_WRAPPED_BTW_PANE, True),
     ],
     ids=[
         "reverse-search",
@@ -13033,6 +13268,8 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "task-details-panel",
         "settings-after-preflight",
         "task-details-after-preflight",
+        "wrapped-quick-answer",
+        "wrapped-quick-answer-after-preflight",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -13136,9 +13373,13 @@ def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
         lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
     )
 
-    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by shell mode"):
+    with pytest.raises(
+        claude_native_bridge.ClaudeInputBoxOccupied, match="occupied by shell mode"
+    ) as refused:
         inject_user_message(bridge_dir, content="hello from the web")
 
+    # Nothing was typed, so the executor can hold the message until the box frees.
+    assert refused.value.surface == "shell mode"
     tails = [args[-1] for args in sends]
     assert tails and all(
         not tail.replace("\x1b[107;5u", "").replace("\x1b[117;5u", "") for tail in tails
@@ -13627,9 +13868,15 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
     assert min(gaps) >= 1.0, f"Escapes {gaps} apart can open Claude Code's rewind dialog"
 
 
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE],
+    ids=["search", "wrapped-quick-answer"],
+)
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    occupied_pane: str,
 ) -> None:
     """
     The same reclaim guards slash commands (e.g. a routed model switch).
@@ -13644,8 +13891,8 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
         # re-confirmation, idle after the Escape, then the typed command
         # renders and the submit clears it.
         [
-            _REVERSE_SEARCH_PANE,
-            _REVERSE_SEARCH_PANE,
+            occupied_pane,
+            occupied_pane,
             _IDLE_PANE,
             _composer_pane("/effort high"),
             _IDLE_PANE,
@@ -14153,8 +14400,12 @@ def test_inject_slash_command_refuses_an_input_mode_that_survives_the_restore(
     sends = _fake_tmux(monkeypatch, [pane])
     clock = claude_native_bridge.time
 
-    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match=f"occupied by {surface}"):
+    with pytest.raises(
+        claude_native_bridge.ClaudeInputBoxOccupied, match=f"occupied by {surface}"
+    ) as refused:
         claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert refused.value.surface == surface
 
     tails = [args[-1] for args in sends]
     assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
@@ -14517,6 +14768,68 @@ async def test_relay_tool_update_preserves_cached_policy_endpoint(
             assert policy_client.bodies == [_PRE_TOOL_USE_PAYLOAD, _PRE_TOOL_USE_PAYLOAD]
     finally:
         relay.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_relay_runs_only_advertised_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/tool`` refuses names the relay does not currently advertise.
+
+    Any process running as the session user can read the relay token, so the
+    token cannot tell the MCP bridge from other callers. The relay's own
+    advertised set bounds what either can run, and rewriting
+    ``tool_relay.json`` does not widen it.
+    """
+    from omnigent.harnesses.pi_native import bridge as pi_native_bridge
+
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
+    bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_relay_surface")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+    dispatched: list[str] = []
+
+    async def _executor(name: str, arguments: dict[str, object]) -> str:
+        """Record each dispatched tool name."""
+        del arguments
+        dispatched.append(name)
+        return "ok"
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "list_comments", "parameters": {"type": "object"}}],
+        tool_executor=_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    shell_call = {"name": "sys_os_shell", "arguments": {"command": "id"}}
+    try:
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        tampered = {**info, "tools": [*info["tools"], {"name": "sys_os_shell"}]}
+        relay_file.write_text(json.dumps(tampered), encoding="utf-8")
+        async with httpx.AsyncClient(
+            base_url=info["url"],
+            headers={"Authorization": f"Bearer {info['token']}"},
+            trust_env=False,
+        ) as client:
+            advertised = await client.post(
+                "/tool", json={"name": "list_comments", "arguments": {}}
+            )
+            refused = await client.post("/tool", json=shell_call)
+            relay.update_tools(
+                [{"name": "sys_os_shell", "parameters": {"type": "object"}}], _executor
+            )
+            updated = await client.post("/tool", json=shell_call)
+            withdrawn = await client.post("/tool", json={"name": "list_comments", "arguments": {}})
+    finally:
+        relay.close()
+
+    assert "isError" not in advertised.json()
+    assert refused.json()["isError"] is True
+    assert json.loads(refused.json()["content"][0]["text"]) == {
+        "error": "unknown tool: 'sys_os_shell'"
+    }
+    assert "isError" not in updated.json()
+    assert withdrawn.json()["isError"] is True
+    assert dispatched == ["list_comments", "sys_os_shell"]
 
 
 @pytest.mark.asyncio
@@ -14893,6 +15206,49 @@ async def test_curl_evaluate_policy_command_round_trips(
         output = json.loads(result.stdout)
         assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+        # A failing curl replays stdin into the Python hook, which reaches the
+        # same verdict through the relay's policy proxy.
+        (bridge_dir / "bridge.json").write_text(
+            json.dumps({"active_session_id": "conv_hook_eval"}), encoding="utf-8"
+        )
+        failing_bin = tmp_path / "failing-curl"
+        failing_bin.mkdir()
+        (failing_bin / "curl").write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+        (failing_bin / "curl").chmod(0o755)
+        calls_before = client.calls
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": f"{failing_bin}{os.pathsep}{os.environ['PATH']}"},
+        )
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+        assert client.calls == calls_before + 1
+
+        # Without curl on PATH, the command goes straight to the Python hook.
+        no_curl_bin = tmp_path / "no-curl"
+        no_curl_bin.mkdir()
+        for tool in ("cat", "date", "env"):
+            (no_curl_bin / tool).symlink_to(shutil.which(tool))
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": str(no_curl_bin)},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "not found" not in result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert client.calls == calls_before + 2
     finally:
         relay.close()
 
@@ -14919,6 +15275,457 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.fixture
+def unaccepting_relay_url() -> Iterator[str]:
+    """Yield the URL of a relay that accepts no connections, like one whose runner is stuck.
+
+    One unaccepted connection fills the listener's accept queue, so the kernel
+    drops later connection attempts and curl's connect hangs.
+    """
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(0)
+        with socket.create_connection(server.getsockname()):
+            yield f"http://127.0.0.1:{server.getsockname()[1]}"
+
+
+def test_policy_hook_runs_python_soon_when_the_relay_accepts_no_connections(
+    tmp_path: Path, unaccepting_relay_url: str
+) -> None:
+    """The policy hook gives up on the connection after seconds, not its day-long ``--max-time``.
+
+    Then it hands the event to the Python hook, which evaluates it without the relay.
+    """
+    python = tmp_path / "python"
+    received = tmp_path / "python-stdin"
+    python.write_text(f"#!/bin/sh\ncat > {shlex.quote(str(received))}\n", encoding="utf-8")
+    python.chmod(0o755)
+    settings = claude_native_bridge.build_hook_settings(
+        tmp_path, python_executable=str(python), ap_server_url="http://127.0.0.1:9"
+    )
+    command = next(entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry)[
+        "hooks"
+    ][0]["command"]
+    (tmp_path / "tool_relay.env").write_text(
+        f"OMNIGENT_RELAY_URL='{unaccepting_relay_url}'\nOMNIGENT_RELAY_TOKEN='token'\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert received.read_text() == json.dumps(_PRE_TOOL_USE_PAYLOAD)
+
+
+@pytest.mark.asyncio
+async def test_curl_evaluate_policy_command_keeps_the_relay_token_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The policy hook's curl gets the relay token from a here-doc, not its arguments.
+
+    It also ignores the user's ``.curlrc`` and proxy settings: through the
+    refusing proxy, the verdict would come from the Python fallback ("ask")
+    instead of the relay ("deny").
+    """
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "curl says no"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        args = augment_claude_args((), bridge_dir=bridge_dir, ap_server_url="http://127.0.0.1:9")
+        settings = _load_invocation_settings(args)
+        command = next(
+            entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry
+        )["hooks"][0]["command"]
+        relay_info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+        home = tmp_path / "home"
+        home.mkdir()
+        trace = home / "trace.log"
+        (home / ".curlrc").write_text(f'verbose\ntrace-ascii = "{trace}"\n', encoding="utf-8")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        argv_file = tmp_path / "curl-argv"
+        (bin_dir / "curl").write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$@" > {shlex.quote(str(argv_file))}\n'
+            f'exec {shlex.quote(str(shutil.which("curl")))} "$@"\n',
+            encoding="utf-8",
+        )
+        (bin_dir / "curl").chmod(0o755)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            refusing_proxy = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "HOME": str(home),
+            **dict.fromkeys(
+                ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"), refusing_proxy
+            ),
+        }
+
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+    finally:
+        relay.close()
+
+    assert result.returncode == 0, result.stderr
+    assert relay_info["token"] not in argv_file.read_text()
+    assert not trace.exists()
+    output = json.loads(result.stdout)
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+_TERMINAL_ENV = {
+    "OMNIGENT_TERMINAL_INSTANCE_ID": "a" * 32,
+    "OMNIGENT_TERMINAL_LAUNCH_ID": "b" * 32,
+    "OMNIGENT_TERMINAL_LAUNCH_SESSION_ID": "conv_lifecycle",
+}
+
+
+def _fake_hook_python(directory: Path) -> tuple[Path, Path]:
+    """Write a stand-in Python that appends each run's arguments and stdin to a log."""
+    script = directory / "python"
+    runs = directory / "python-runs.log"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> {shlex.quote(str(runs))}\n'
+        f"/bin/cat >> {shlex.quote(str(runs))}\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script, runs
+
+
+def _unmatched_hook_command(settings: dict[str, Any], event: str, marker: str) -> str:
+    """Return the command of *event*'s catch-all hook whose command contains *marker*."""
+    return next(
+        hook["command"]
+        for group in settings["hooks"][event]
+        if "matcher" not in group
+        for hook in group["hooks"]
+        if marker in hook["command"]
+    )
+
+
+async def _run_hook_command(
+    command: str, payload: dict[str, object], env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Run a hook command through /bin/sh off-loop with *env* added to PATH."""
+    return await asyncio.to_thread(
+        subprocess.run,
+        ["/bin/sh", "-c", command],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"], **env},
+        timeout=60,
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_hooks_record_through_the_relay_without_starting_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lifecycle hook posts to the relay with curl.
+
+    The relay does the Python hook's work: it records each event and its
+    lifecycle evidence under the terminal's launch ids, and answers
+    SessionStart with the session link.
+    """
+    from omnigent.conversation_browser import conversation_url
+
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient({}))
+    try:
+        python, runs = _fake_hook_python(tmp_path)
+        settings = claude_native_bridge.build_hook_settings(
+            bridge_dir, python_executable=str(python), ap_server_url="http://127.0.0.1:9"
+        )
+        (bridge_dir / "bridge.json").write_text(
+            json.dumps({"active_session_id": "conv_hook_eval"}), encoding="utf-8"
+        )
+        lifecycle_hook = _unmatched_hook_command(
+            settings, "UserPromptSubmit", "/hook/claude/event"
+        )
+        outputs = {}
+        for event, extra in (
+            ("SessionStart", {"source": "startup"}),
+            ("UserPromptSubmit", {}),
+            ("PreCompact", {"trigger": "manual"}),
+        ):
+            payload = {"hook_event_name": event, "session_id": "claude-1", **extra}
+            result = await _run_hook_command(lifecycle_hook, payload, _TERMINAL_ENV)
+            assert result.returncode == 0, result.stderr
+            outputs[event] = result.stdout
+    finally:
+        relay.close()
+
+    assert not runs.exists()
+    assert claude_native_bridge.read_hook_events_since(bridge_dir, 0)[1] == [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreCompact",
+    ]
+    assert json.loads(outputs["SessionStart"]) == {
+        "systemMessage": "Open this session in Omnigent: "
+        + conversation_url("http://127.0.0.1:9", "conv_hook_eval")
+    }
+    assert outputs["UserPromptSubmit"] == outputs["PreCompact"] == ""
+    lifecycle = json.loads((bridge_dir / f"lifecycle-{'b' * 32}.json").read_text())
+    assert lifecycle["terminal_instance_id"] == "a" * 32
+    assert lifecycle["launch_session_id"] == "conv_lifecycle"
+    assert [event["event_name"] for event in lifecycle["events"]] == [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreCompact",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_turn_ends_session_rotation_and_a_missing_relay_run_the_python_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stop, and a SessionStart from ``/clear`` or ``/resume``, run the Python hook.
+
+    Claude writes a turn's final message while its Stop hooks run, and Python's
+    start-up keeps that message ahead of the Stop record. ``/clear`` and
+    ``/resume`` can rotate the Omnigent session, which the Python hook does
+    with the terminal's credentials. Once the relay is gone, every hook runs it.
+    """
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient({}))
+    python, runs = _fake_hook_python(tmp_path)
+    settings = claude_native_bridge.build_hook_settings(
+        bridge_dir, python_executable=str(python), ap_server_url="http://127.0.0.1:9"
+    )
+    lifecycle_hook = _unmatched_hook_command(settings, "SessionStart", "/hook/claude/event")
+    try:
+        for source in ("clear", "resume"):
+            payload = {"hook_event_name": "SessionStart", "source": source, "session_id": "c-1"}
+            result = await _run_hook_command(lifecycle_hook, payload, _TERMINAL_ENV)
+            assert result.returncode == 0, result.stderr
+        for event in ("Stop", "StopFailure"):
+            stop_hook = _unmatched_hook_command(settings, event, "claude_native.hook")
+            result = await _run_hook_command(stop_hook, {"hook_event_name": event}, _TERMINAL_ENV)
+            assert result.returncode == 0, result.stderr
+    finally:
+        relay.close()
+    prompt = {"hook_event_name": "UserPromptSubmit"}
+    result = await _run_hook_command(lifecycle_hook, prompt, _TERMINAL_ENV)
+    assert result.returncode == 0, result.stderr
+
+    log = runs.read_text()
+    assert log.count(f"-I -m omnigent.harnesses.claude_native.hook --bridge-dir {bridge_dir}") == 5
+    assert '"source": "clear"' in log and '"source": "resume"' in log
+    for event in ("Stop", "StopFailure", "UserPromptSubmit"):
+        assert f'"hook_event_name": "{event}"' in log
+    assert claude_native_bridge.read_hook_events_since(bridge_dir, 0)[1] == []
+
+
+def test_lifecycle_hook_runs_python_only_when_the_relay_missed_the_event(tmp_path: Path) -> None:
+    """Python records the event when curl couldn't send it, not after a dropped answer.
+
+    A dropped answer can follow the relay recording the event, so Python would
+    record it twice. An empty relay file leaves curl nowhere to send it.
+    """
+    python, runs = _fake_hook_python(tmp_path)
+    settings = claude_native_bridge.build_hook_settings(tmp_path, python_executable=str(python))
+    command = _unmatched_hook_command(settings, "UserPromptSubmit", "/hook/claude/event")
+    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+
+    def run() -> None:
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    received = threading.Event()
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+
+        def take_request_and_hang_up() -> None:
+            connection, _ = server.accept()
+            with connection:
+                connection.recv(65536)
+                received.set()
+
+        thread = threading.Thread(target=take_request_and_hang_up, daemon=True)
+        thread.start()
+        (tmp_path / "tool_relay.env").write_text(
+            f"OMNIGENT_RELAY_URL='http://127.0.0.1:{server.getsockname()[1]}'\n"
+            "OMNIGENT_RELAY_TOKEN='token'\n",
+            encoding="utf-8",
+        )
+        run()
+        thread.join(timeout=5)
+    assert received.is_set()
+    assert not runs.exists()
+
+    (tmp_path / "tool_relay.env").write_text("", encoding="utf-8")
+    run()
+    assert payload in runs.read_text()
+
+
+@pytest.mark.parametrize("shell", ["/bin/sh", "bash", "zsh"])
+def test_lifecycle_hook_runs_python_after_a_timeout_that_sent_nothing(
+    tmp_path: Path, shell: str
+) -> None:
+    """curl exits 28 for a connect timeout too; only a timeout after sending skips Python.
+
+    The stand-in curl answers like a real timeout: no body, the ``-w`` request
+    size, exit 28. Request bytes sent mean the relay may have recorded the event.
+    """
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
+    python, runs = _fake_hook_python(tmp_path)
+    settings = claude_native_bridge.build_hook_settings(tmp_path, python_executable=str(python))
+    command = _unmatched_hook_command(settings, "UserPromptSubmit", "/hook/claude/event")
+    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+    (tmp_path / "tool_relay.env").write_text(
+        "OMNIGENT_RELAY_URL='http://127.0.0.1:9'\nOMNIGENT_RELAY_TOKEN='token'\n",
+        encoding="utf-8",
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "curl").write_text(
+        '#!/bin/sh\ncat >/dev/null\nprintf "\\n%s" "$SENT"\nexit 28\n', encoding="utf-8"
+    )
+    (bin_dir / "curl").chmod(0o755)
+
+    def run(sent: str) -> None:
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "SENT": sent}
+        result = subprocess.run(
+            [shell, "-c", command],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+
+    run("149")
+    assert not runs.exists(), "a timeout after sending would record the event twice"
+    run("0")
+    assert payload in runs.read_text()
+
+
+def test_lifecycle_hook_runs_python_soon_when_the_relay_accepts_no_connections(
+    tmp_path: Path, unaccepting_relay_url: str
+) -> None:
+    """The connect timeout ends the wait, and Python records the event the relay never got."""
+    python, runs = _fake_hook_python(tmp_path)
+    settings = claude_native_bridge.build_hook_settings(tmp_path, python_executable=str(python))
+    command = _unmatched_hook_command(settings, "UserPromptSubmit", "/hook/claude/event")
+    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+    (tmp_path / "tool_relay.env").write_text(
+        f"OMNIGENT_RELAY_URL='{unaccepting_relay_url}'\nOMNIGENT_RELAY_TOKEN='token'\n",
+        encoding="utf-8",
+    )
+
+    started = time.monotonic()
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert payload in runs.read_text()
+    assert time.monotonic() - started < 8, "the hook waited out its 10-second --max-time"
+
+
+@pytest.mark.asyncio
+async def test_relay_hook_failures_reach_the_sessions_hook_stderr_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relay-side recording failure is written where the Python hook's stderr goes.
+
+    The forwarder reports that file's lines with the session id.
+    """
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient({}))
+    try:
+        python, runs = _fake_hook_python(tmp_path)
+        settings = claude_native_bridge.build_hook_settings(
+            bridge_dir, python_executable=str(python)
+        )
+        command = _unmatched_hook_command(settings, "UserPromptSubmit", "/hook/claude/event")
+        (bridge_dir / claude_native_bridge._HOOKS_FILE).mkdir()
+        result = await _run_hook_command(command, {"hook_event_name": "UserPromptSubmit"}, {})
+    finally:
+        relay.close()
+
+    assert result.returncode == 0, result.stderr
+    assert not runs.exists()
+    stderr_file = bridge_dir / claude_native_bridge.OBSERVER_HOOK_STDERR_FILE
+    assert "omnigent claude hook: failed to record hook" in stderr_file.read_text()
+
+
+def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path: Path) -> None:
+    """Without pending framework context the shell answers the prompt hook.
+
+    Pending context still goes to the Python hook, which reads and removes it,
+    so Claude gets it once.
+    """
+    fake_python, runs = _fake_hook_python(tmp_path)
+    fake_settings = claude_native_bridge.build_hook_settings(
+        tmp_path, python_executable=str(fake_python)
+    )
+    fake_hook = _unmatched_hook_command(fake_settings, "UserPromptSubmit", "framework-context")
+    real_hook = _unmatched_hook_command(
+        claude_native_bridge.build_hook_settings(tmp_path), "UserPromptSubmit", "framework-context"
+    )
+    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+
+    def run(command: str) -> str:
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    assert run(fake_hook) == ""
+    assert not runs.exists()
+    (tmp_path / claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE).write_text(
+        "pending context", encoding="utf-8"
+    )
+    outputs = [run(real_hook), run(fake_hook)]
+
+    assert json.loads(outputs[0]) == {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "pending context",
+        }
+    }
+    assert outputs[1] == ""
+    assert not runs.exists()
 
 
 @pytest.mark.asyncio
@@ -15048,6 +15855,7 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
 # ── /btw side-chat overlay parsing ─────────────────────────────────
 
 _BTW_BORDER = "▔" * 120
+_BTW_COMPLETE_FOOTER = "    ↑/↓ to scroll · c to copy · f to fork · Esc to close"
 
 
 def _btw_pane(*body_lines: str) -> str:
@@ -15065,7 +15873,28 @@ def _btw_pane(*body_lines: str) -> str:
     return "\n".join([*prefix, *body_lines])
 
 
-def test_btw_overlay_parses_completed_single_turn() -> None:
+@pytest.mark.parametrize(
+    "footer",
+    [
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to\n    close",
+        "    ↑/↓ to scroll · c to copy · f to\n    fork · Esc to close",
+        *[
+            "\n".join(
+                _BTW_COMPLETE_FOOTER[start : start + width]
+                for start in range(0, len(_BTW_COMPLETE_FOOTER), width)
+            )
+            for width in range(20, len(_BTW_COMPLETE_FOOTER))
+        ],
+    ],
+    ids=[
+        "one-row",
+        "wrapped-close",
+        "wrapped-fork",
+        *[f"columns-{width}" for width in range(20, len(_BTW_COMPLETE_FOOTER))],
+    ],
+)
+def test_btw_overlay_parses_completed_single_turn(footer: str) -> None:
     """A settled single-turn overlay yields its question and answer."""
     pane = _btw_pane(
         "",
@@ -15073,7 +15902,7 @@ def test_btw_overlay_parses_completed_single_turn() -> None:
         "",
         "      Yes, the public API is unchanged.",
         "",
-        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        footer,
     )
     overlay = claude_native_bridge._btw_overlay_from_pane(pane)
     assert overlay is not None
@@ -15143,33 +15972,35 @@ def test_btw_overlay_preserves_relative_indentation() -> None:
     assert overlay.answer == "- top\n  - nested"
 
 
-def test_btw_overlay_present_matches_settled_multiturn_and_generating() -> None:
+@pytest.mark.parametrize("close_hint", ["Esc to close", "Esc to\n    close"])
+def test_btw_overlay_present_matches_settled_multiturn_and_generating(close_hint: str) -> None:
     """The dismiss guard matches every /btw overlay state, settled or not."""
     settled = _btw_pane(
         "    /btw q",
         "",
         "      A",
         "",
-        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        f"    ↑/↓ to scroll · c to copy · f to fork · {close_hint}",
     )
     multiturn = _btw_pane(
         "    /btw q1",
         "    /btw q2",
         "",
         "      A",
-        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+        f"    ←/→ to switch · c to copy · f to fork · x to clear history · {close_hint}",
     )
     generating = _btw_pane(
         "    /btw q",
         "      ✻ Answering…",
-        "    ←/→ to switch · x to clear history · Esc to close",
+        f"    ←/→ to switch · x to clear history · {close_hint}",
     )
     assert claude_native_bridge._btw_overlay_present(settled) is True
     assert claude_native_bridge._btw_overlay_present(multiturn) is True
     assert claude_native_bridge._btw_overlay_present(generating) is True
 
 
-def test_btw_overlay_present_false_on_bare_composer() -> None:
+@pytest.mark.parametrize("quoted_overlay", ["none", "one-row", "wrapped"])
+def test_btw_overlay_present_false_on_bare_composer(quoted_overlay: str) -> None:
     """No /btw footer → no Escape (a blind Escape would cancel a turn)."""
     pane = "\n".join(
         [
@@ -15180,7 +16011,24 @@ def test_btw_overlay_present_false_on_bare_composer() -> None:
             "  Opus 4.8 (1M) │ high │ 0/1M $0.00 │ git:main",
         ]
     )
+    if quoted_overlay != "none":
+        overlay = _WRAPPED_BTW_PANE
+        if quoted_overlay == "one-row":
+            overlay = overlay.replace("Esc to\n    close", "Esc to close")
+        pane = overlay + "\n" + pane
     assert claude_native_bridge._btw_overlay_present(pane) is False
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
+def test_dismiss_btw_overlay_closes_a_wrapped_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing Quick Answer in Chat also closes the narrow terminal panel."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_WRAPPED_BTW_PANE])
+
+    assert claude_native_bridge.dismiss_btw_overlay(bridge_dir) is True
+    assert sends == [["send-keys", "-t", "claude:0.0", "Escape"]]
 
 
 # ---------------------------------------------------------------------------
@@ -15835,3 +16683,334 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
         with claude_native_bridge._usable_composer_height("/tmp/sock", "main"):
             pytest.fail("delivery continued after a failed resize")
     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approved", [True, False])
+async def test_relay_approval_outlives_execution_and_http_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved: bool
+) -> None:
+    """The real HTTP relay stays pending until its own approval is answered."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.15)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_POST_TIMEOUT_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_HEARTBEAT_S", 0.02, raising=False)
+    bridge_dir = prepare_bridge_dir("conv_approval_timeout", workspace=tmp_path)
+    waiting, finished = asyncio.Event(), asyncio.Event()
+    effects: list[str] = []
+
+    async def executor(name: str, arguments: dict[str, object]) -> object:
+        waiting.set()
+        try:
+            allowed = await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_relay_timeout",
+                conversation_id="conv_approval_timeout",
+                publish_event=lambda *_: None,
+                timeout_seconds=5,
+            )
+            if allowed:
+                effects.append(name)
+            return {"approved": allowed}
+        finally:
+            finished.set()
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_scheduled_task_create"}],
+        tool_executor=executor,
+        loop=asyncio.get_running_loop(),
+    )
+    call = asyncio.create_task(
+        asyncio.to_thread(
+            claude_native_bridge._call_relay_tool,
+            bridge_dir,
+            "sys_scheduled_task_create",
+            {},
+        )
+    )
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(call), 0.4)
+        assert effects == []
+        assert pending_approvals.has_pending("conv_approval_timeout")
+        assert pending_approvals.resolve("elicit_relay_timeout", approved)
+        result = await asyncio.wait_for(call, 2)
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"]) == {"approved": approved}
+        assert effects == (["sys_scheduled_task_create"] if approved else [])
+        assert not pending_approvals.has_pending("conv_approval_timeout")
+    finally:
+        pending_approvals.resolve("elicit_relay_timeout", False)
+        await asyncio.wait_for(finished.wait(), 2)
+        await asyncio.wait_for(call, 2)
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_approval_does_not_extend_another_calls_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parked create cannot keep an unrelated stuck shell call alive."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.15)
+    waiting, shell_cancelled = asyncio.Event(), asyncio.Event()
+
+    async def executor(name, arguments):
+        if name == "sys_scheduled_task_create":
+            waiting.set()
+            return {
+                "approved": await pending_approvals.wait_for_user_approval(
+                    elicitation_id="elicit_concurrent",
+                    conversation_id="conv_concurrent",
+                    publish_event=lambda *_: None,
+                    timeout_seconds=3,
+                )
+            }
+        try:
+            await asyncio.Future()
+        finally:
+            shell_cancelled.set()
+
+    loop = asyncio.get_running_loop()
+    approval = asyncio.create_task(
+        asyncio.to_thread(
+            claude_native_bridge._run_relay_tool, executor, loop, "sys_scheduled_task_create", {}
+        )
+    )
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                claude_native_bridge._run_relay_tool, executor, loop, "sys_os_shell", {}
+            ),
+            1,
+        )
+        assert result["isError"]
+        assert "active work" in result["content"][0]["text"]
+        await asyncio.wait_for(shell_cancelled.wait(), 1)
+        assert not approval.done()
+        assert pending_approvals.resolve("elicit_concurrent", False)
+        assert not (await asyncio.wait_for(approval, 1)).get("isError")
+    finally:
+        pending_approvals.resolve("elicit_concurrent", False)
+        await asyncio.wait_for(approval, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["expiry", "approved_then_stuck", "callback_timeout"])
+async def test_relay_reports_approval_expiry_and_execution_outcomes(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Approval expiry denies; after approval a timed-out write stays uncertain."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.05)
+    waiting, finished = asyncio.Event(), asyncio.Event()
+    effects: list[str] = []
+    events: list[dict] = []
+
+    async def executor(name, arguments):
+        try:
+            if outcome == "callback_timeout":
+                raise TimeoutError()
+            waiting.set()
+            approved = await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_outcome",
+                conversation_id="conv_outcome",
+                publish_event=lambda _, event: events.append(event),
+                timeout_seconds=0.2,
+            )
+            if approved:
+                effects.append("saved")
+                await asyncio.Future()
+            return {"approved": approved}
+        finally:
+            finished.set()
+
+    call = asyncio.create_task(
+        asyncio.to_thread(
+            claude_native_bridge._run_relay_tool,
+            executor,
+            asyncio.get_running_loop(),
+            "sys_scheduled_task_update",
+            {},
+        )
+    )
+    if outcome == "approved_then_stuck":
+        await asyncio.wait_for(waiting.wait(), 1)
+        assert pending_approvals.resolve("elicit_outcome", True)
+    result = await asyncio.wait_for(call, 2)
+    await asyncio.wait_for(finished.wait(), 1)
+    if outcome == "expiry":
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"]) == {"approved": False}
+        assert events[-1]["reason"] == "unanswered"
+    else:
+        error = json.loads(result["content"][0]["text"])["error"]
+        assert result["isError"]
+        assert "unknown" in error
+        assert ("TimeoutError" if outcome == "callback_timeout" else "timed out") in error
+    assert effects == (["saved"] if outcome == "approved_then_stuck" else [])
+    assert not pending_approvals.has_pending("conv_outcome")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["notification", "eof", "relay_close"])
+async def test_relay_mcp_cancellation_releases_pending_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, subprocess_bridge_root: Path, stop: str
+) -> None:
+    """A real stdio bridge releases the approval when its caller cancels or leaves."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", Path(tempfile.gettempdir()))
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", subprocess_bridge_root)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_HEARTBEAT_S", 0.02)
+    bridge_dir = prepare_bridge_dir("conv_cancel_relay", workspace=tmp_path)
+    waiting, finished = asyncio.Event(), asyncio.Event()
+    effects: list[str] = []
+    events: list[dict] = []
+
+    async def executor(name, arguments):
+        waiting.set()
+        try:
+            if await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_cancel_relay",
+                conversation_id="conv_cancel_relay",
+                publish_event=lambda _, event: events.append(event),
+                timeout_seconds=10,
+            ):
+                effects.append("saved")
+            return {}
+        finally:
+            finished.set()
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_scheduled_task_create"}],
+        tool_executor=executor,
+        loop=asyncio.get_running_loop(),
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdin is not None
+        _write_json_line(
+            proc.stdin,
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "tools/call",
+                "params": {"name": "sys_scheduled_task_create", "arguments": {}},
+            },
+        )
+        await asyncio.wait_for(waiting.wait(), 8)
+        if stop == "notification":
+            _write_json_line(
+                proc.stdin,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 51},
+                },
+            )
+        elif stop == "eof":
+            proc.stdin.close()
+        else:
+            relay.close()
+        await asyncio.wait_for(finished.wait(), 3)
+        assert effects == []
+        assert events[-1]["reason"] == "unanswered"
+        assert not pending_approvals.has_pending("conv_cancel_relay")
+        assert not pending_approvals.resolve("elicit_cancel_relay", True)
+        if stop == "notification":
+            assert proc.stdout is not None
+            cancelled_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            assert cancelled_result["id"] == 51
+            assert cancelled_result["result"]["isError"]
+            _write_json_line(proc.stdin, {"jsonrpc": "2.0", "id": 52, "method": "ping"})
+            ping_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            assert ping_result == {"jsonrpc": "2.0", "id": 52, "result": {}}
+    finally:
+        pending_approvals.resolve("elicit_cancel_relay", False)
+        if stop != "relay_close":
+            relay.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_relay_keeps_high_descriptor_connections_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid connection above select's fd limit stays pending and completes."""
+    fcntl = pytest.importorskip("fcntl")
+    resource = pytest.importorskip("resource")
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1024:
+        pytest.skip("requires an available descriptor above 1023")
+    original_get_request = ThreadingHTTPServer.get_request
+    descriptors: list[int] = []
+
+    def high_descriptor_request(server):
+        connection, address = original_get_request(server)
+        try:
+            descriptor = fcntl.fcntl(connection, fcntl.F_DUPFD, 1024)
+        finally:
+            connection.close()
+        descriptors.append(descriptor)
+        return socket.socket(fileno=descriptor), address
+
+    monkeypatch.setattr(ThreadingHTTPServer, "get_request", high_descriptor_request)
+    started, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def executor(name, arguments):
+        started.set()
+        try:
+            await release.wait()
+            return {"completed": True}
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    bridge_dir = prepare_bridge_dir("conv_high_descriptor", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_custom"}],
+        tool_executor=executor,
+        loop=asyncio.get_running_loop(),
+    )
+    call = asyncio.create_task(
+        asyncio.to_thread(claude_native_bridge._call_relay_tool, bridge_dir, "sys_custom", {})
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(call), 0.15)
+        assert descriptors and descriptors[0] >= 1024
+        assert not cancelled.is_set()
+        release.set()
+        result = await asyncio.wait_for(call, 2)
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"]) == {"completed": True}
+    finally:
+        release.set()
+        await asyncio.wait_for(call, 2)
+        relay.close()

@@ -4,12 +4,12 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setOmnigentHostConfig } from "@/lib/host";
 import { TasksPage } from "./TasksPage";
 import { useViewerId } from "@/hooks/useViewerId";
 import * as hooks from "@/hooks/useScheduledTasks";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { setOmnigentHostConfig } from "@/lib/host";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
@@ -32,6 +32,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialName,
     initialPrompt,
     initialTrigger,
+    initialTemplateId,
     sessionLink,
     editingTask,
   }: {
@@ -40,6 +41,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialName?: string;
     initialPrompt?: string;
     initialTrigger?: string | null;
+    initialTemplateId?: string;
     sessionLink?: string;
     editingTask?: ScheduledTask | null;
   }) =>
@@ -49,6 +51,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-initial-name={initialName ?? ""}
         data-initial-prompt={initialPrompt ?? ""}
         data-initial-trigger={initialTrigger ?? ""}
+        data-initial-template={initialTemplateId ?? ""}
         data-session-link={sessionLink ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
@@ -105,7 +108,10 @@ function setTasks(
   } as unknown as ReturnType<typeof hooks.useScheduledTasks>);
 }
 
+const analytics = vi.fn();
 beforeEach(() => {
+  analytics.mockReset();
+  setOmnigentHostConfig({ analytics });
   localStorage.clear();
   vi.mocked(useViewerId).mockReturnValue(null);
   mutate.mockReset();
@@ -284,32 +290,36 @@ describe("TasksPage list", () => {
     const suggestions = screen.getByTestId("tasks-suggestions");
     expect(within(suggestions).getByText("Suggested Automations")).toBeInTheDocument();
     const cards = within(suggestions).getAllByTestId(/^suggestion-/);
-    expect(cards).toHaveLength(3);
+    expect(cards).toHaveLength(4);
     expect(cards.map((r) => r.getAttribute("data-testid"))).toEqual([
       "suggestion-trigger-jira",
       "suggestion-trigger-slack",
       "suggestion-trigger-github",
+      "suggestion-trigger-linear",
     ]);
     expect(within(suggestions).getByText("Jira tickets")).toBeInTheDocument();
     expect(within(suggestions).getByText("Slack messages")).toBeInTheDocument();
-    expect(within(suggestions).getByText("GitHub issues")).toBeInTheDocument();
+    expect(within(suggestions).getByText("GitHub")).toBeInTheDocument();
+    expect(within(suggestions).getByText("Linear issues")).toBeInTheDocument();
   });
 
-  it("shows the gallery on Templates instead of below populated lists", () => {
+  it("shows suggestions below populated lists and the full gallery on Templates", () => {
     setTasks([task()]);
     renderPage();
-    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Suggested Automations" })).toBeVisible();
     selectView("Templates");
     expect(screen.queryByTestId("tasks-list")).not.toBeInTheDocument();
     expect(screen.queryByTestId("tasks-search")).not.toBeInTheDocument();
     const suggestions = screen.getByTestId("tasks-suggestions");
     expect(screen.getByRole("tab", { name: "Templates" })).toHaveAttribute("aria-selected", "true");
     const cards = within(suggestions).getAllByTestId(/^suggestion-/);
-    expect(cards).toHaveLength(3);
+    expect(cards).toHaveLength(4);
     expect(cards.map((c) => c.getAttribute("data-testid"))).toEqual([
       "suggestion-trigger-jira",
       "suggestion-trigger-slack",
       "suggestion-trigger-github",
+      "suggestion-trigger-linear",
     ]);
     const jiraCard = within(suggestions).getByTestId("suggestion-trigger-jira");
     expect(jiraCard).toHaveTextContent("Jira tickets");
@@ -322,10 +332,14 @@ describe("TasksPage list", () => {
     );
   });
 
-  it("keeps templates out of populated and filtered-empty lists", () => {
+  it("hides suggestions while filtering or searching and restores them when cleared", () => {
     setTasks([task({ state: "active" })]);
     renderPage();
     expect(screen.getByTestId("tasks-filter-all")).toBeInTheDocument();
+    expect(screen.getByTestId("tasks-suggestions")).toBeVisible();
+
+    fireEvent.click(screen.getByTestId("tasks-filter-active"));
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
     expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("tasks-filter-paused"));
@@ -338,7 +352,15 @@ describe("TasksPage list", () => {
     expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
 
     fireEvent.click(screen.getByTestId("tasks-filter-all"));
+    expect(screen.getByTestId("tasks-suggestions")).toBeVisible();
+    fireEvent.change(screen.getByTestId("tasks-search"), { target: { value: "Nightly" } });
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
     expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("tasks-search"), { target: { value: "missing" } });
+    expect(screen.getByText("No automations found")).toBeVisible();
+    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("tasks-search"), { target: { value: "" } });
+    expect(screen.getByTestId("tasks-suggestions")).toBeVisible();
   });
 });
 
@@ -432,22 +454,31 @@ describe("New automation entry", () => {
 
 describe("automation view navigation", () => {
   it("reports one analytics event per tab change, including pointer focus activation", () => {
-    const analytics = vi.fn();
-    setOmnigentHostConfig({ analytics });
     setTasks([]);
     renderPage();
+    expect(analytics).toHaveBeenCalledWith({ type: "page_view", pageId: "tasks" });
     selectView("Templates");
-    expect(analytics).toHaveBeenCalledExactlyOnceWith({
+    expect(analytics).toHaveBeenCalledWith({ type: "page_view", pageId: "tasks.templates" });
+    expect(analytics).toHaveBeenCalledWith({
       type: "value_change",
       componentId: "tasks.view",
       componentKind: "tabs",
       value: "templates",
     });
     selectView("Templates");
-    expect(analytics).toHaveBeenCalledTimes(1);
+    expect(analytics.mock.calls.filter(([event]) => event.type === "value_change")).toHaveLength(1);
+    expect(analytics.mock.calls.filter(([event]) => event.type === "page_view")).toEqual([
+      [{ type: "page_view", pageId: "tasks" }],
+      [{ type: "page_view", pageId: "tasks.templates" }],
+    ]);
     selectView("Your automations");
-    expect(analytics).toHaveBeenCalledTimes(2);
-    expect(analytics).toHaveBeenLastCalledWith({
+    expect(analytics.mock.calls.filter(([event]) => event.type === "page_view")).toEqual([
+      [{ type: "page_view", pageId: "tasks" }],
+      [{ type: "page_view", pageId: "tasks.templates" }],
+      [{ type: "page_view", pageId: "tasks" }],
+    ]);
+    expect(analytics.mock.calls.filter(([event]) => event.type === "value_change")).toHaveLength(2);
+    expect(analytics).toHaveBeenCalledWith({
       type: "value_change",
       componentId: "tasks.view",
       componentKind: "tabs",
@@ -487,15 +518,24 @@ describe("automation view navigation", () => {
 });
 
 describe("template prefill", () => {
-  it("opens the integration builder with the selected template name", () => {
-    setTasks([]);
-    renderPage();
-    fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
-    const dialog = screen.getByTestId("manual-dialog-open");
-    expect(dialog.getAttribute("data-initial-name")).toBe("Jira tickets");
-    expect(dialog.getAttribute("data-initial-trigger")).toBe("jira");
-    expect(dialog.getAttribute("data-initial-prompt")).toBe("");
-  });
+  it.each(["empty", "active", "paused"] as const)(
+    "opens template setup with an %s list",
+    (state) => {
+      setTasks(state === "empty" ? [] : [task({ state })]);
+      renderPage();
+      fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
+      const dialog = screen.getByTestId("manual-dialog-open");
+      expect(dialog.getAttribute("data-initial-name")).toBe("Jira tickets");
+      expect(dialog.getAttribute("data-initial-trigger")).toBe("jira");
+      expect(dialog.getAttribute("data-initial-prompt")).toBe("");
+      expect(dialog).toHaveAttribute("data-initial-template", "jira");
+      expect(analytics).toHaveBeenCalledWith({
+        type: "click",
+        componentId: "tasks.template.jira",
+        componentKind: "button",
+      });
+    },
+  );
 
   it("reseeds from another card after closing, and starts manual creation empty", () => {
     setTasks([]);
@@ -506,6 +546,10 @@ describe("template prefill", () => {
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
       "Jira tickets",
     );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      "jira",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
     expect(screen.queryByTestId("manual-dialog-open")).not.toBeInTheDocument();
@@ -513,11 +557,16 @@ describe("template prefill", () => {
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
       "Slack messages",
     );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      "slack",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
     // Manual creation must not inherit the previous template.
     fireEvent.click(screen.getByTestId("new-task-button"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe("");
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-template", "");
   });
 });
 
@@ -570,19 +619,31 @@ describe("trigger templates", () => {
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-trigger")).toBe("");
   });
 
-  it.each(["jira", "slack", "github"])("opens the %s builder from its gallery card", (source) => {
-    vi.mocked(useViewerId).mockReturnValue("alice");
-    setTasks([]);
-    renderPage("/tasks?view=templates");
-    expect(
-      screen.queryByRole("dialog", { name: "Introducing Automations" }),
-    ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByTestId(`suggestion-trigger-${source}`));
-    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
-      "data-initial-trigger",
-      source,
-    );
-  });
+  it.each(["jira", "slack", "github", "linear"])(
+    "opens the %s builder from its gallery card",
+    (source) => {
+      vi.mocked(useViewerId).mockReturnValue("alice");
+      setTasks([]);
+      renderPage("/tasks?view=templates");
+      expect(
+        screen.queryByRole("dialog", { name: "Introducing Automations" }),
+      ).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId(`suggestion-trigger-${source}`));
+      expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+        "data-initial-trigger",
+        source,
+      );
+      expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+        "data-initial-template",
+        source,
+      );
+      expect(analytics).toHaveBeenCalledWith({
+        type: "click",
+        componentId: `tasks.template.${source}`,
+        componentKind: "button",
+      });
+    },
+  );
 
   it.each([
     ["can't keep one session per automation", { scheduled_task_session_modes: false }],
