@@ -43,6 +43,7 @@ export interface McpSignInDialogProps {
   serverLabel: string;
   plugin?: string;
   sourceId?: string;
+  /** Called once the sign-in succeeds; the caller closes the dialog. */
   onSignedIn: () => void;
 }
 

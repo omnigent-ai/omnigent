@@ -16,6 +16,7 @@ from cachetools import TTLCache
 from omnigent.host import mcp_tools
 from omnigent.host.mcp_inventory import ConfiguredMcpServer
 from omnigent.host.mcp_tools import HostMcpTools, _effective_config
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 
 SERVER_SCRIPT = """import json, os, subprocess, sys, time
@@ -484,6 +485,47 @@ async def test_sign_in_check_fits_the_response_budget_and_pauses_reaping(monkeyp
     assert loop.time() - started < 2.0 + budget(1.0)
     assert "harness_sign_in" not in result
     assert len(timeouts) == 1
+
+
+async def test_sign_in_checks_share_two_slots_and_a_cancelled_one_frees_its_slot(monkeypatch):
+    entries = [
+        _entry({"type": "http", "url": "https://mcp.example.test/mcp"}, name=str(index))
+        for index in range(3)
+    ]
+    monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: entries)
+
+    async def needs_auth(payload):
+        return mcp_tools._result("needs_auth")
+
+    active = peak = 0
+    finish = asyncio.Event()
+
+    async def status(server, timeout):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await finish.wait()
+            return "available"
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(mcp_tools, "_probe_worker", needs_auth)
+    monkeypatch.setattr(mcp_tools, "harness_sign_in_state", status)
+    discovery = HostMcpTools()
+    first, second = (asyncio.create_task(discovery.probe("claude", name)) for name in "01")
+    await poll_until_async(lambda: active == 2, timeout_s=budget(1.0))
+    queued = asyncio.create_task(discovery.probe("claude", "2"))
+    await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- no third check in window
+    assert active == 2 and not queued.done()
+
+    first.cancel()
+    with suppress(asyncio.CancelledError):
+        await first
+    await poll_until_async(lambda: active == 2, timeout_s=budget(1.0))
+    finish.set()
+    assert [(await task)["harness_sign_in"] for task in (second, queued)] == ["available"] * 2
+    assert peak == 2
 
 
 async def test_sign_in_state_is_cached_until_a_sign_in(monkeypatch):

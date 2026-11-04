@@ -10,7 +10,7 @@ export interface McpServerTools {
   harness_sign_in?: "available" | "signed_in" | null;
 }
 
-/** Matches the host's sign-in status cache, so a sign-in made outside Omnigent shows. */
+/** Matches the host's SIGN_IN_CACHE_SECONDS, so a sign-in made outside Omnigent shows. */
 const SIGN_IN_STALE_MS = 30_000;
 
 export function mcpServerToolsKey(

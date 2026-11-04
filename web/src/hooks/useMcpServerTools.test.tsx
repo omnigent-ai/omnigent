@@ -67,14 +67,15 @@ it("re-probes a needs-auth server once the host's sign-in cache expires", async 
   vi.mocked(authenticatedFetch).mockImplementation(async () =>
     Response.json({ tools: [], connection: "connected", truncated: false }),
   );
-  vi.mocked(authenticatedFetch).mockImplementationOnce(async () =>
-    Response.json({
-      tools: [],
-      connection: "needs_auth",
-      truncated: false,
-      harness_sign_in: "available",
-    }),
-  );
+  for (const harnessSignIn of ["available", "signed_in"])
+    vi.mocked(authenticatedFetch).mockImplementationOnce(async () =>
+      Response.json({
+        tools: [],
+        connection: "needs_auth",
+        truncated: false,
+        harness_sign_in: harnessSignIn,
+      }),
+    );
   const { result, rerender } = renderHook(
     ({ enabled }) => useMcpServerTools("host", "claude", "docs", undefined, { enabled }),
     { wrapper: wrapperFor(new QueryClient()), initialProps: { enabled: true } },
@@ -89,10 +90,14 @@ it("re-probes a needs-auth server once the host's sign-in cache expires", async 
 
   await reopenAfter(29_999);
   expect(authenticatedFetch).toHaveBeenCalledTimes(1);
-  // A sign-in made outside Omnigent shows on the next expand.
+  // A sign-in made outside Omnigent shows on the next expand, while the host
+  // still holds its needs-auth probe.
   await reopenAfter(1);
+  await waitFor(() => expect(result.current.data?.harness_sign_in).toBe("signed_in"));
+  expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+  await reopenAfter(300_000);
   await waitFor(() => expect(result.current.data?.connection).toBe("connected"));
-  expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+  expect(authenticatedFetch).toHaveBeenCalledTimes(3);
   await reopenAfter(60_000);
-  expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+  expect(authenticatedFetch).toHaveBeenCalledTimes(3);
 });
