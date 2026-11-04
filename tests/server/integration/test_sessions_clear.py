@@ -48,11 +48,14 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 from tests._helpers.polling import poll_until_async
 from tests.server.helpers import create_test_agent
 from tests.server.integration._session_continuation import (
+    _COMPACT_INPUT,
     _EDITOR,
     _HOST_ID,
+    _MESSAGE_INPUT,
     _OWNER,
     _READER,
     _RUNNER_ID,
+    _SKILL_INPUT,
     LiveRunner,
     bind_to_host,
     create_placed_session,
@@ -172,14 +175,6 @@ async def test_clear_surfaces_a_failed_injection(
     assert resp.status_code >= 500, resp.text
     assert "Clear failed" in resp.text
     assert captured == [{"type": "clear"}]
-
-
-_SKILL_INPUT = {"type": "slash_command", "data": {"kind": "skill", "name": "review"}}
-_COMPACT_INPUT = {"type": "compact", "data": {}}
-_MESSAGE_INPUT = {
-    "type": "message",
-    "data": {"role": "user", "content": [{"type": "input_text", "text": "Q3"}]},
-}
 
 
 def clear_requests(runner: LiveRunner) -> list[dict[str, Any]]:
