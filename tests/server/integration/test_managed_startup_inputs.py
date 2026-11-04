@@ -444,9 +444,13 @@ async def test_stop_before_host_ready_cancels_all_saved_inputs(
     assert forwarded == []
 
 
-async def test_stop_cancels_local_dispatch_and_clears_saved_input(startup_env: _Env) -> None:
+async def test_stop_cancels_local_dispatch_and_clears_saved_input(
+    startup_env: _Env, scheduled_run_context, caplog
+) -> None:
+    caplog.set_level(logging.INFO)
     env = startup_env
-    session_id = await _create(env)
+    with scheduled_run_scope(scheduled_run_context):
+        session_id = await _create(env)
     startup = env.app.state.startup_inputs
     entry = _bind(env, session_id)
     entered = asyncio.Event()
@@ -469,6 +473,18 @@ async def test_stop_cancels_local_dispatch_and_clears_saved_input(startup_env: _
     assert response.status_code == 202, response.text
     assert stopped.is_set() and delivery.cancelled()
     assert env.conv_store.list_pending_inputs(session_id) == []
+
+    [interrupted] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_interrupted"
+    ]
+    assert interrupted.attributes["run_id"] == scheduled_run_context.run_id
+    assert interrupted.attributes["input_id"] == entry.id
+    assert interrupted.attributes["outcome"] == "not_sent"
+    assert not any(
+        getattr(r, "event_name", None) == "scheduled_run_prompt_sent" for r in caplog.records
+    )
 
 
 async def test_uncertain_native_submission_is_not_retried_on_restart(
@@ -1147,12 +1163,21 @@ async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:
 
 @pytest.mark.parametrize(
     "failed_stage",
-    ["runner_start", "input_claim", "prompt_send", "dispatch_bookkeeping", "post_delivery"],
+    [
+        "runner_start",
+        "input_claim",
+        "prompt_send",
+        "dispatch_bookkeeping",
+        "post_delivery",
+        "post_delivery_cancelled",
+    ],
 )
 async def test_saved_delivery_identifies_failed_boundary(
     startup_env, monkeypatch, scheduled_run_context, caplog, failed_stage
 ):
     caplog.set_level(logging.INFO)
+    cancelled = failed_stage == "post_delivery_cancelled"
+    reported_stage = failed_stage.removesuffix("_cancelled")
     env = startup_env
     with scheduled_run_scope(scheduled_run_context):
         session_id = await _create(env)
@@ -1183,26 +1208,48 @@ async def test_saved_delivery_identifies_failed_boundary(
             "_publish_input_consumed",
             Mock(side_effect=RuntimeError("bookkeeping failed after acceptance")),
         )
-    elif failed_stage == "post_delivery":
+    elif reported_stage == "post_delivery":
         monkeypatch.setattr(
-            env.conv_store, "set_labels", Mock(side_effect=RuntimeError("bookkeeping failed"))
+            env.conv_store,
+            "set_labels",
+            Mock(
+                side_effect=(
+                    asyncio.CancelledError("bookkeeping cancelled")
+                    if cancelled
+                    else RuntimeError("bookkeeping failed")
+                )
+            ),
         )
     try:
-        await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
+        startup = env.app.state.startup_inputs
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError, match="bookkeeping cancelled"):
+                await startup._deliver(env.app, session_id, entry)
+            assert env.conv_store.list_pending_inputs(session_id) == []
+            assert not await startup.retry(session_id)
+            await startup._deliver(env.app, session_id, entry)
+            assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        else:
+            await startup._deliver(env.app, session_id, entry)
     finally:
         await runner.aclose()
-    failures = [
-        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
-    ]
+    failure_event = (
+        "scheduled_run_prompt_dispatch_interrupted" if cancelled else "scheduled_run_stage_failed"
+    )
+    failures = [r for r in caplog.records if getattr(r, "event_name", None) == failure_event]
+    if cancelled:
+        assert not any(
+            getattr(r, "event_name", None) == "scheduled_run_stage_failed" for r in caplog.records
+        )
     assert len(failures) == 1
     assert failures[0].attributes["failure_stage"] == (
-        "prompt_send" if failed_stage == "dispatch_bookkeeping" else failed_stage
+        "prompt_send" if failed_stage == "dispatch_bookkeeping" else reported_stage
     )
     if failed_stage == "dispatch_bookkeeping":
         assert len([event for event in forwarded if event.get("type") == "message"]) == 1
     assert failures[0].attributes["outcome"] == (
         "sent"
-        if failed_stage == "post_delivery"
+        if reported_stage == "post_delivery"
         else "uncertain"
         if failed_stage in {"prompt_send", "dispatch_bookkeeping"}
         else "not_sent"
@@ -1213,4 +1260,4 @@ async def test_saved_delivery_identifies_failed_boundary(
             for r in caplog.records
             if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
         ]
-    ) == int(failed_stage == "post_delivery")
+    ) == int(reported_stage == "post_delivery")
