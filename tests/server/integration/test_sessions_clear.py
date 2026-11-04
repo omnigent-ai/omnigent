@@ -17,7 +17,7 @@ import json
 import threading
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -613,53 +613,38 @@ async def test_claude_sdk_clear_re_addresses_a_runner_that_moved_before_release(
     assert live_runner.superseded == []
 
 
-@pytest.mark.parametrize("failure", ["initialization", "after_initialization"])
 async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize(
     client: httpx.AsyncClient,
     db_uri: str,
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
-    failure: str,
 ) -> None:
-    """A continuation that fails to be placed leaves nothing behind.
+    """A continuation whose runner rejects it leaves nothing behind.
 
     The source's saved inference configuration must be accepted, so an
-    unconfirmed initialization fails the clear; so does a later step, such as
-    detaching the source, after the runner set the new session up. The new
-    session is deleted and dropped from the runner it was sent to (which may
-    have set it up without confirming), was never listed in the owner's tabs,
-    and the source gets no notice or redirect.
+    unconfirmed initialization fails the clear. The new session is deleted
+    and dropped from the runner it was sent to (which may have set it up
+    without confirming), was never listed in the owner's tabs, and the source
+    gets no notice or redirect. A failure after the runner set the session up
+    is shared with ``/rewind`` and covered in ``test_sessions_continuation.py``.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     agent = await create_test_agent(client)
     source = store.create_conversation(
         agent_id=agent["id"],
-        inference_snapshot=(
-            {"runtime_config": {}, "harness": "claude-sdk", "owner_id": "local"}
-            if failure == "initialization"
-            else None
-        ),
+        inference_snapshot={"runtime_config": {}, "harness": "claude-sdk", "owner_id": "local"},
     )
     bind_to_host(store, source.id, "/work/repo")
     store.replace_runner_id(source.id, _RUNNER_ID)
-    if failure == "after_initialization":
-        monkeypatch.setattr(
-            SqlAlchemyConversationStore,
-            "clear_runner_id",
-            Mock(side_effect=OmnigentError("detach failed", code=ErrorCode.INTERNAL_ERROR)),
-        )
     before = len((await client.get("/v1/sessions")).json()["data"])
 
     resp = await client.post(
         f"/v1/sessions/{source.id}/events", json={"type": "clear", "data": {}}
     )
 
-    if failure == "initialization":
-        assert resp.status_code == 503, resp.text
-        assert "did not accept this session's saved inference configuration" in resp.text
-    else:
-        assert resp.status_code == 500, resp.text
+    assert resp.status_code == 503, resp.text
+    assert "did not accept this session's saved inference configuration" in resp.text
     initialized = [
         body["session_id"] for path, body in live_runner.posts if path == "/v1/sessions"
     ]

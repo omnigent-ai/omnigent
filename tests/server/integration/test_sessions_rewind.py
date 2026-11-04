@@ -11,13 +11,11 @@ from __future__ import annotations
 
 import uuid
 from typing import Any
-from unittest.mock import Mock
 
 import httpx
 import pytest
 
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS, MessageData, NewConversationItem
-from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, managed_repo_labels
 from omnigent.stores.conversation_store import (
@@ -287,45 +285,6 @@ async def test_rewind_checks_kept_filesystem_attachments_against_the_session_har
         for part in item.data.content
         if "text" in part
     ] == kept
-
-
-async def test_rewind_removes_a_session_it_could_not_finish_placing(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A rewound session that fails after the runner set it up leaves nothing behind.
-
-    Detaching the original from the runner fails here, after the new session
-    was initialized: it is deleted and dropped from the runner, was never
-    listed in the owner's tabs, and the original gets no notice or redirect.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store)
-    monkeypatch.setattr(
-        SqlAlchemyConversationStore,
-        "clear_runner_id",
-        Mock(side_effect=OmnigentError("detach failed", code=ErrorCode.INTERNAL_ERROR)),
-    )
-    before = len((await client.get("/v1/sessions")).json()["data"])
-
-    resp = await client.post(
-        f"/v1/sessions/{source_id}/rewind", json={"item_id": item_ids(store, source_id)[2]}
-    )
-
-    assert resp.status_code == 500, resp.text
-    initialized = [
-        body["session_id"] for path, body in live_runner.posts if path == "/v1/sessions"
-    ]
-    [new_id] = [session_id for session_id in initialized if session_id != source_id]
-    assert store.get_conversation(new_id) is None
-    assert (f"/v1/sessions/{new_id}", {}) in live_runner.posts
-    assert new_id not in live_runner.announced
-    assert len((await client.get("/v1/sessions")).json()["data"]) == before
-    assert message_texts(store, source_id) == ["Q1", "A1", "Q2", "A2"]
-    assert live_runner.superseded == []
 
 
 async def test_rewind_returns_the_prompt_attachments_as_the_fork_holds_them(
