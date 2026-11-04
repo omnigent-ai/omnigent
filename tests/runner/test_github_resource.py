@@ -362,6 +362,49 @@ def test_resolve_pr_via_commit_skips_checkout_on_up_to_date_base(
     assert github_resource._resolve_pr_via_commit(str(repo)) is None
 
 
+def test_resolve_pr_via_commit_ignores_same_named_repo_on_another_host(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-named repo on another host is not the PR's base, so it can't hide the PR."""
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    _run(["git", "remote", "add", "mirror", "git@gitlab.com:acme/repo.git"], repo)
+    _run(["git", "update-ref", "refs/remotes/upstream/main", "main"], repo)
+    _run(["git", "update-ref", "refs/remotes/mirror/main", "feature"], repo)
+    row = {
+        "number": 270,
+        "state": "open",
+        "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+    }
+    _stub_gh(monkeypatch, {("api",): (0, json.dumps([row]), "")})
+
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+    _run(["git", "checkout", "-q", "main"], repo)
+    assert github_resource._resolve_pr_via_commit(str(repo)) is None
+
+
+@pytest.mark.parametrize(
+    "base_remote",
+    [pytest.param(None, id="no-base-remote"), pytest.param("upstream", id="no-tracking-ref")],
+)
+def test_resolve_pr_via_commit_keeps_open_pr_without_base_tracking_ref(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, base_remote: str | None
+) -> None:
+    """Without a local tracking ref of the PR's base branch, an open row is still accepted."""
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    if base_remote:
+        _run(["git", "remote", "add", base_remote, "git@github.com:acme/repo.git"], repo)
+    _run(["git", "checkout", "-q", "main"], repo)
+    row = {
+        "number": 270,
+        "state": "open",
+        "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+    }
+    _stub_gh(monkeypatch, {("api",): (0, json.dumps([row]), "")})
+
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+
+
 def test_resolve_pr_via_commit_none_without_repo(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

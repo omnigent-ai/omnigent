@@ -70,6 +70,7 @@ from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
+from omnigent.git_providers import host_of
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
@@ -685,15 +686,27 @@ def _commit_lookup_repo(root: str) -> str | None:
     return _remote_nwo(root, "origin")
 
 
-def _contained_in_base_branch(root: str, sha: str, base_repo: str, base_ref: str) -> bool:
-    """Whether a local tracking ref of ``base_repo``'s ``base_ref`` contains ``sha``."""
+def _remotes_by_repo(root: str, lookup_repo: str) -> dict[str, list[str]]:
+    """Remotes keyed by lower-cased ``owner/repo`` on the hosts serving ``lookup_repo``."""
     rc, out, _ = _git(["remote"], cwd=root)
-    if rc != 0:
-        return False
-    for remote in out.split():
-        nwo = _remote_nwo(root, remote)
-        if nwo is None or nwo.lower() != base_repo.lower():
-            continue
+    remotes: list[tuple[str, str | None, str]] = []
+    for remote in out.split() if rc == 0 else []:
+        rc, url, _ = _git(["remote", "get-url", remote], cwd=root)
+        nwo = _owner_repo_from_url(url.strip()) if rc == 0 else None
+        if nwo:
+            remotes.append((remote, host_of(url), nwo.lower()))
+    # A same-named repo on another host, such as a GitLab mirror, is a different repo.
+    hosts = {host for _, host, nwo in remotes if nwo == lookup_repo.lower()}
+    by_repo: dict[str, list[str]] = {}
+    for remote, host, nwo in remotes:
+        if host in hosts:
+            by_repo.setdefault(nwo, []).append(remote)
+    return by_repo
+
+
+def _contained_in_base_branch(root: str, sha: str, remotes: Sequence[str], base_ref: str) -> bool:
+    """Whether the local tracking ref of ``base_ref`` on any of ``remotes`` contains ``sha``."""
+    for remote in remotes:
         tracking_ref = f"refs/remotes/{remote}/{base_ref}"
         rc, _, _ = _git(["merge-base", "--is-ancestor", sha, tracking_ref], cwd=root)
         if rc == 0:
@@ -719,15 +732,18 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     false positives too when the queried fork's default branch lags the base:
     GitHub then lists every open PR that merges the base past the commit. So an
     open row is skipped when the commit is already on that PR's base branch
-    locally (:func:`_contained_in_base_branch`).
+    locally (:func:`_contained_in_base_branch`), read from remotes of the base repo
+    on the queried fork's host.
     """
     shas = _head_commit_shas(root)
     repo = _commit_lookup_repo(root)
     if not shas or not repo:
         return None
+    base_remotes: dict[str, list[str]] | None = None
     on_base_branch: dict[tuple[str, str, str], bool] = {}
 
     def _is_candidate(row: Any, sha: str) -> bool:
+        nonlocal base_remotes
         if not isinstance(row, dict) or str(row.get("state", "")).lower() != "open":
             return False
         base = row.get("base")
@@ -738,7 +754,10 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
             return True
         key = (sha, base_full.lower(), base_ref)
         if key not in on_base_branch:
-            on_base_branch[key] = _contained_in_base_branch(root, sha, base_full, base_ref)
+            if base_remotes is None:
+                base_remotes = _remotes_by_repo(root, repo)
+            remotes = base_remotes.get(base_full.lower(), [])
+            on_base_branch[key] = _contained_in_base_branch(root, sha, remotes, base_ref)
         return not on_base_branch[key]
 
     for sha in shas:
