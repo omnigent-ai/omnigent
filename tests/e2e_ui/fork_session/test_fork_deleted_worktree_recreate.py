@@ -209,7 +209,6 @@ def test_fork_deleted_worktree_same_name_succeeds(
     # ── Open the fork dialog ───────────────────────────────────────────────
 
     assistant.hover()
-    page.get_by_test_id("message-more-actions").first.click()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()

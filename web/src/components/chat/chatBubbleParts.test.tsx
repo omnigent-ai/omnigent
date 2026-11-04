@@ -116,13 +116,11 @@ describe("AssistantBubble fork source", () => {
         </ForkDialogContextProvider>
       </QueryClientProvider>,
     );
-    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
-    const fork = screen.getByRole("menuitem", { name: "Fork from here" });
-    expect(fork).toHaveAttribute("aria-disabled", "true");
-    expect(document.getElementById(fork.getAttribute("aria-describedby")!)).toHaveTextContent(
-      "Forking this sandbox session is not supported yet.",
-    );
+    const fork = screen.getByTestId("fork-from-response");
+    expect(fork).toBeDisabled();
+    expect(fork.parentElement).toHaveAttribute("tabindex", "0");
     fireEvent.click(fork);
+    fireEvent.keyDown(fork.parentElement!, { key: "Enter" });
     expect(openForkDialog).not.toHaveBeenCalled();
   });
 
@@ -152,8 +150,7 @@ describe("AssistantBubble fork source", () => {
       </QueryClientProvider>,
     );
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Fork from here" }));
+    fireEvent.click(screen.getByTestId("fork-from-response"));
 
     expect(openForkDialog).toHaveBeenCalledOnce();
     expect(openForkDialog).toHaveBeenCalledWith(expected);

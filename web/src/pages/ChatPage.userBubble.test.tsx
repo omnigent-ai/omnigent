@@ -472,32 +472,22 @@ describe("AssistantBubble copy-link button", () => {
     vi.unstubAllGlobals();
   });
 
-  it("stamps data-message-id with the responseId and copies its link from More", async () => {
+  it("stamps data-message-id with the responseId and copies that link", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
-    const onToast = vi.fn();
     vi.stubGlobal("navigator", { clipboard: { writeText } });
     vi.stubGlobal("location", {
       href: "https://app.example/c/conv_1",
     });
-    window.addEventListener("omnigent:toast", onToast);
 
-    try {
-      renderBubble(assistantBubble("completed"));
-      expect(screen.getByTestId("message-bubble")).toHaveAttribute(
-        "data-message-id",
-        "codex_turn_123",
-      );
-      fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
-      fireEvent.click(screen.getByRole("menuitem", { name: "Copy link" }));
-      await waitFor(() =>
-        expect(writeText).toHaveBeenCalledWith(
-          "https://app.example/c/conv_1?message=codex_turn_123",
-        ),
-      );
-      expect(onToast).toHaveBeenCalledOnce();
-    } finally {
-      window.removeEventListener("omnigent:toast", onToast);
-    }
+    renderBubble(assistantBubble("completed"));
+    expect(screen.getByTestId("message-bubble")).toHaveAttribute(
+      "data-message-id",
+      "codex_turn_123",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith("https://app.example/c/conv_1?message=codex_turn_123"),
+    );
   });
 });
 

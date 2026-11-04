@@ -185,8 +185,7 @@ def test_oversized_session_turn_and_fork_fail_with_content_length_error(
     # Fork the oversized session from the last response: the fork deep-copies
     # the full over-cap transcript, so it inherits the same failing request.
     last_assistant.hover()
-    last_assistant.get_by_test_id("message-more-actions").click()
-    page.get_by_test_id("fork-from-response").click()
+    last_assistant.get_by_test_id("fork-from-response").click()
     expect(page.get_by_test_id("fork-session-dialog")).to_be_visible()
     with page.expect_response(
         lambda r: r.url.endswith(f"/v1/sessions/{session_id}/fork"),

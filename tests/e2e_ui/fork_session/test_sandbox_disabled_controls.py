@@ -168,9 +168,7 @@ def test_sandbox_fork_enabled_and_switch_host_disabled(
         row.locator(f'a[href="/c/{session_id}"]').click()
 
     assistant.hover()
-    assistant.get_by_test_id("message-more-actions").click()
     expect(page.get_by_test_id("fork-from-response")).to_be_enabled()
-    _close_menu(page)
 
     page.get_by_test_id("composer-host-select").click()
     switch_host = page.get_by_role("menuitem", name="Switch host…")
@@ -230,9 +228,7 @@ def test_arclet_session_forks_onto_connected_hosts_and_a_new_arclet(
     expect(page.get_by_test_id("fork-conversation")).to_be_enabled()
     _close_menu(page)
     assistant.hover()
-    assistant.get_by_test_id("message-more-actions").click()
     expect(page.get_by_test_id("fork-from-response")).to_be_enabled()
-    _close_menu(page)
     page.get_by_test_id("composer-host-select").click()
     _disabled_menu_action(page, page.get_by_role("menuitem", name="Switch host…"), _SWITCH_REASON)
     _close_menu(page)

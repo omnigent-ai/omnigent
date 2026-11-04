@@ -111,8 +111,7 @@ def test_fork_large_session_response_is_not_full_transcript(
 
     # ── Open the fork dialog from the last assistant response ─────────
     last_assistant.hover()
-    last_assistant.get_by_test_id("message-more-actions").click()
-    page.get_by_test_id("fork-from-response").click()
+    last_assistant.get_by_test_id("fork-from-response").click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
     submit = page.get_by_test_id("fork-session-submit")

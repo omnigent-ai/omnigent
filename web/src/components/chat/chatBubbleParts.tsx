@@ -16,7 +16,6 @@ import {
   ArrowUpIcon,
   CheckIcon,
   CopyIcon,
-  EllipsisIcon,
   FileTextIcon,
   FolderIcon,
   ImageIcon,
@@ -52,13 +51,6 @@ import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
@@ -87,7 +79,7 @@ import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routing
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { useOmnigentAnalytics } from "@/lib/analytics";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
@@ -715,10 +707,7 @@ const USER_MESSAGE_REMARK_REHYPE_OPTIONS: MessageResponseProps["remarkRehypeOpti
  *
  * @param messageId - Stable id stamped on the bubble (user itemId / assistant responseId).
  */
-function useCopyMessageLink(
-  messageId: string | null,
-  toastOnSuccess = false,
-): {
+function useCopyMessageLink(messageId: string | null): {
   isLinkCopied: boolean;
   handleCopyLink: () => void;
 } {
@@ -735,7 +724,7 @@ function useCopyMessageLink(
         setIsLinkCopied(true);
         window.clearTimeout(timeoutRef.current);
         timeoutRef.current = window.setTimeout(() => setIsLinkCopied(false), 2000);
-        if (isMobile || toastOnSuccess) {
+        if (isMobile) {
           showToast(<span className="text-ui">Link copied</span>, { duration: 1500 });
         }
       },
@@ -743,7 +732,7 @@ function useCopyMessageLink(
         console.warn("Failed to copy message link", error);
       },
     );
-  }, [messageId, isLinkCopied, isMobile, toastOnSuccess]);
+  }, [messageId, isLinkCopied, isMobile]);
 
   return { isLinkCopied, handleCopyLink };
 }
@@ -1034,12 +1023,11 @@ function AssistantBubble({
     () => collectBubbleMarkdown(bubble.items),
     copyMarkdown,
   );
-  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId, true);
+  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   const foldNarration = useFoldAssistantNarration();
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
-  const { trackClick } = useOmnigentAnalytics();
   const queryClient = useContext(QueryClientContext);
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
@@ -1179,7 +1167,7 @@ function AssistantBubble({
               "flex mobile-app:flex-wrap items-center gap-3 py-1 mobile-app:py-0",
               actionsPersistent
                 ? "opacity-100"
-                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 md:group-has-[[data-testid=message-more-actions][data-state=open]]:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 [@media(pointer:coarse)]:opacity-40",
+                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
             )}
           >
             <MessageActions>
@@ -1193,46 +1181,41 @@ function AssistantBubble({
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
               )}
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
+              {/* Fork from this response: clone the session with history
+                    truncated after this turn. Hidden while streaming and when
+                    the session can't be forked. */}
+              {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
+                  <MessageAction
+                    tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
+                    label="Fork from here"
+                    disabled={!!forkDialog.disabledReason}
                     size="icon-xxs"
-                    aria-label="More actions"
-                    data-testid="message-more-actions"
-                    className="text-muted-foreground hover:text-foreground [@media(pointer:coarse)]:size-8"
+                    data-testid="fork-from-response"
+                    onClick={() =>
+                      forkDialog.openForkDialog({
+                        sourceSessionId: scopedConversationId ?? undefined,
+                        upToResponseId: bubble.responseId,
+                      })
+                    }
+                    componentId="chat.message.fork"
                   >
-                    <EllipsisIcon size={14} />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start">
-                  {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                    <SessionActionMenuItem
-                      disabledReason={forkDialog.disabledReason}
-                      data-testid="fork-from-response"
-                      onSelect={() => {
-                        trackClick("chat.message.fork", "button");
-                        forkDialog.openForkDialog({
-                          sourceSessionId: scopedConversationId ?? undefined,
-                          upToResponseId: bubble.responseId,
-                        });
-                      }}
-                    >
-                      <SplitIcon size={14} />
-                      Fork from here
-                    </SessionActionMenuItem>
-                  )}
-                  <DropdownMenuItem data-testid="copy-message-link" onSelect={handleCopyLink}>
-                    {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
-                    {isLinkCopied ? "Copied!" : "Copy link"}
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+                    <SplitIcon size={14} />
+                  </MessageAction>
+                </DisabledActionTooltip>
+              )}
+              <MessageAction
+                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+                size="icon-xxs"
+                data-testid="copy-message-link"
+                onClick={handleCopyLink}
+              >
+                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+              </MessageAction>
             </MessageActions>
             {ts && (
               <span
-                className="select-none text-[11px] leading-4 text-foreground/56 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 md:group-has-[[data-testid=message-more-actions][data-state=open]]:opacity-100 [@media(pointer:coarse)]:opacity-100"
+                className="select-none text-[11px] leading-4 text-foreground/56"
                 data-testid="message-timestamp"
               >
                 {ts}

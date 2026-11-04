@@ -20,7 +20,6 @@ const assistantBubble: Extract<Bubble, { kind: "assistant" }> = {
   stableId: "response-1",
   lifecycle: "completed",
   error: null,
-  createdAtS: 1_700_000_000,
   items: [{ kind: "text", itemId: "assistant-1", text: "hello back", final: true }],
 };
 
@@ -203,12 +202,6 @@ it("keeps actions visible only on a final assistant message while idle", () => {
   expect(actionFooter(copyButtons[1]!)).not.toHaveClass(
     "md:opacity-0",
     "md:group-hover:opacity-100",
-  );
-  expect(screen.getByRole("button", { name: "More actions" })).toBeInTheDocument();
-  expect(screen.getByTestId("message-timestamp")).toHaveClass(
-    "md:opacity-0",
-    "md:group-hover:opacity-100",
-    "md:group-focus-within:opacity-100",
   );
 
   view.rerender(messageList(bubbles, false, false));

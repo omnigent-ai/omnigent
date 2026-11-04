@@ -833,8 +833,7 @@ def test_fork_from_side_chat_uses_child_and_creates_visible_session(
     response_id = str(reply_items[0]["response_id"])
 
     assistant.hover()
-    assistant.get_by_test_id("message-more-actions").click()
-    page.get_by_test_id("fork-from-response").click()
+    assistant.get_by_test_id("fork-from-response").click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
 

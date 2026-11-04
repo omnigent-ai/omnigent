@@ -136,7 +136,6 @@ def test_fork_switch_agent_carries_history(
     expect(assistant).to_be_visible(timeout=60_000)
 
     assistant.hover()
-    page.get_by_test_id("message-more-actions").first.click()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
@@ -235,7 +234,6 @@ def test_fork_into_pi_labels_model_picker_pi(
 
     # Fork from the response, switching the agent to Pi.
     assistant.hover()
-    page.get_by_test_id("message-more-actions").first.click()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
