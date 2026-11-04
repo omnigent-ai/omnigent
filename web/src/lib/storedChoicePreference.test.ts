@@ -15,6 +15,9 @@ afterEach(() => {
 });
 
 it("stores only a non-default choice and reads only the listed choices", () => {
+  // @ts-expect-error A default outside the choices must not widen them.
+  createStoredChoicePreference(STORAGE_KEY, ["small", "medium", "large"], "huge");
+
   expect(preference.read()).toBe("medium");
   localStorage.setItem(STORAGE_KEY, "huge");
   expect(preference.read()).toBe("medium");

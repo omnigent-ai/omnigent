@@ -282,8 +282,8 @@ describe("Sidebar shift-click selection", () => {
   });
 
   it.each([
-    { pagination: "first-page", selected: 6 },
-    { pagination: "all", selected: 8 },
+    { pagination: "first-page", selected: ["a0", "a1", "a2", "a3", "a4", "b0"] },
+    { pagination: "all", selected: ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "b0"] },
   ])(
     "keeps a projects-scope shift range to the listed rows when folders list $pagination",
     async ({ pagination, selected }) => {
@@ -317,8 +317,13 @@ describe("Sidebar shift-click selection", () => {
 
       // Listing the first page leaves a5 and a6 behind Alpha's Show more, out of the range.
       await waitFor(() => {
-        expect(screen.getByText(`${selected} selected`)).toBeInTheDocument();
+        expect(screen.getByText(`${selected.length} selected`)).toBeInTheDocument();
       });
+      fireEvent.click(screen.getByTestId("bulk-archive"));
+      await waitFor(() => {
+        expect(bulkArchiveMock.mutate).toHaveBeenCalledTimes(1);
+      });
+      expect([...bulkArchiveMock.mutate.mock.calls[0][0].ids].sort()).toEqual(selected);
     },
   );
 

@@ -19,7 +19,7 @@ export interface StoredChoicePreference<Choice extends string> {
 export function createStoredChoicePreference<Choice extends string>(
   storageKey: string,
   choices: readonly Choice[],
-  defaultValue: Choice,
+  defaultValue: NoInfer<Choice>,
 ): StoredChoicePreference<Choice> {
   const changeEvent = `${storageKey}-change`;
 
