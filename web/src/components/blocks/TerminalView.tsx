@@ -132,11 +132,8 @@ interface TerminalViewProps {
   /** When provided, the parent increments this after successful recovery to redial a closed bridge. */
   resumeGeneration?: number;
   /**
-   * False while the surface is mounted but hidden (a pre-warmed attach
-   * kept alive behind the chat view). The session stays connected either
-   * way; on the hidden→visible edge the terminal takes keyboard focus —
-   * the WS-open auto-focus is a browser no-op on a hidden element.
-   * Default true.
+   * False while mounted but hidden; the session stays connected. Revealing
+   * it takes keyboard focus, since WS-open focus is a no-op while hidden.
    */
   active?: boolean;
   /**
@@ -657,14 +654,8 @@ export function TerminalView({
     setConnectAttempt((attempt) => attempt + 1);
   }, [resumeGeneration, disposeActiveSession]);
 
-  // On the hidden→visible edge of a pre-warmed surface: focus the
-  // terminal (the session's WS-open focus is a no-op while the element is
-  // hidden — visibility:hidden elements aren't focusable), and if the
-  // transport dropped while the surface sat in the background — possibly
-  // exhausting the reconnect budget with nobody watching — retry
-  // immediately with a fresh budget. Reveal is a user signal, exactly
-  // like the visibilitychange redial for frozen tabs. Deliberate closes
-  // (4xxx) keep the dead-end overlay as ever.
+  // On reveal: focus (WS-open focus is a no-op while hidden) and redial a
+  // reconnectable close with a fresh budget, since reveal is a user signal.
   const wasActiveRef = useRef(active);
   useEffect(() => {
     if (active && !wasActiveRef.current) {

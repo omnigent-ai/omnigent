@@ -14,7 +14,16 @@
 // shells are opened and created from the rail's tab strip ("+" menu).
 
 import { Loader2Icon, TerminalIcon, XIcon } from "lucide-react";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
@@ -57,12 +66,9 @@ interface MainTerminalViewProps {
    */
   initialTerminalKey?: string | null;
   /**
-   * False while the surface is mounted but hidden behind the chat view
-   * (the pre-warmed overlay in MainAgentSurface). The WS attach and
-   * xterm buffer stay alive so flipping to Terminal is instant; on the
-   * visible→hidden edge a user-shell selection resets to the agent
-   * terminal so the next open targets the agent pane, matching the old
-   * unmount-on-close behavior. Default true.
+   * False while mounted but hidden (a grid cell showing chat). A hidden
+   * attach still resizes the shared tmux window, so ChatPage mounts this
+   * view only while Terminal view is shown. Default true.
    */
   visible?: boolean;
   /** A visible grid cell may be inactive and must not claim keyboard focus. */
@@ -96,6 +102,89 @@ interface MainTerminalViewProps {
   onSurfaceElement?: (element: HTMLElement | null) => void;
   /** Render the session's saved split panes (the main view only, not grid cells). */
   splittable?: boolean;
+  /** Recovery state from a {@link TerminalRecoveryScope}; defaults to this view's own. */
+  recovery?: TerminalRecovery;
+}
+
+interface ResumeState {
+  conversationId: string;
+  phase: "idle" | "resuming" | "connecting";
+  error: string | null;
+}
+
+/** Agent-terminal recovery: the opening's allowance, a pending attempt, and its error. */
+export function useTerminalRecovery(
+  conversationId: string,
+  visible: boolean,
+  runnerOnline: boolean | undefined,
+) {
+  const [resumeState, setResumeState] = useState<ResumeState>({
+    conversationId,
+    phase: "idle",
+    error: null,
+  });
+  const resumePhase = resumeState.conversationId === conversationId ? resumeState.phase : "idle";
+  const resumePending = resumePhase !== "idle";
+  const resumeError = resumeState.conversationId === conversationId ? resumeState.error : null;
+  const [resumeGeneration, setResumeGeneration] = useState(0);
+  const recoveryRef = useRef({ conversationId, attempted: false, pending: false });
+  if (recoveryRef.current.conversationId !== conversationId) {
+    recoveryRef.current = { conversationId, attempted: false, pending: false };
+  }
+  const {
+    terminals,
+    isLoading: terminalsLoading,
+    isFetching: terminalsFetching = false,
+  } = useTerminals(conversationId, { reconcileWhilePending: resumePending });
+  const agentHealthy = findAgentTerminal(terminals) !== null && runnerOnline === true;
+  useEffect(() => {
+    const recovery = recoveryRef.current;
+    if (resumePending) return;
+    if (!visible && resumeError === null) recovery.attempted = false;
+    // Opening a live terminal consumes this opening's recovery allowance.
+    // Later idle reaping must not restart it without another user action.
+    else if (agentHealthy && !terminalsLoading && !terminalsFetching) {
+      if (visible) recovery.attempted = true;
+      if (resumeError !== null) setResumeState({ conversationId, phase: "idle", error: null });
+    }
+  }, [
+    conversationId,
+    visible,
+    resumePending,
+    resumeError,
+    agentHealthy,
+    terminalsLoading,
+    terminalsFetching,
+  ]);
+  return {
+    resumePhase,
+    resumeError,
+    setResumeState,
+    resumeGeneration,
+    setResumeGeneration,
+    recoveryRef,
+  };
+}
+
+export type TerminalRecovery = ReturnType<typeof useTerminalRecovery>;
+
+/**
+ * Renders its terminal only while shown, keeping recovery state across the
+ * unmount so a failed attempt stays manual after a view switch.
+ */
+export function TerminalRecoveryScope({
+  conversationId,
+  shown,
+  runnerOnline,
+  children,
+}: {
+  conversationId: string;
+  shown: boolean;
+  runnerOnline?: boolean;
+  children: (recovery: TerminalRecovery) => ReactNode;
+}) {
+  const recovery = useTerminalRecovery(conversationId, shown, runnerOnline);
+  return shown ? <>{children(recovery)}</> : null;
 }
 
 export function MainTerminalView({
@@ -111,20 +200,18 @@ export function MainTerminalView({
   sandboxOffline = false,
   onSurfaceElement,
   splittable = false,
+  recovery: sharedRecovery,
 }: MainTerminalViewProps) {
-  const [resumeState, setResumeState] = useState<{
-    conversationId: string;
-    phase: "idle" | "resuming" | "connecting";
-    error: string | null;
-  }>({ conversationId, phase: "idle", error: null });
-  const resumePhase = resumeState.conversationId === conversationId ? resumeState.phase : "idle";
+  const ownRecovery = useTerminalRecovery(conversationId, visible, runnerOnline);
+  const {
+    resumePhase,
+    resumeError,
+    setResumeState,
+    resumeGeneration,
+    setResumeGeneration,
+    recoveryRef,
+  } = sharedRecovery ?? ownRecovery;
   const resumePending = resumePhase !== "idle";
-  const resumeError = resumeState.conversationId === conversationId ? resumeState.error : null;
-  const [resumeGeneration, setResumeGeneration] = useState(0);
-  const recoveryRef = useRef({ conversationId, attempted: false, pending: false });
-  if (recoveryRef.current.conversationId !== conversationId) {
-    recoveryRef.current = { conversationId, attempted: false, pending: false };
-  }
   const hostOnline = useSessionHostOnline(conversationId);
   const {
     terminals,
@@ -194,7 +281,7 @@ export function MainTerminalView({
         recovery.pending = false;
       }
     },
-    [conversationId, onResume, resumeTarget],
+    [conversationId, onResume, resumeTarget, recoveryRef, setResumeState, setResumeGeneration],
   );
   // No manual keyboard padding here: this view is flow content inside the
   // app-shell, which useIOSViewportLock sizes to the visual viewport, so the
@@ -213,11 +300,8 @@ export function MainTerminalView({
     if (!stillValid) setActiveKey(agentTerminal ? terminalTabKey(agentTerminal) : "");
   }, [terminals, agentTerminal, activeKey]);
 
-  // While hidden, drop a user-shell selection back to the agent terminal.
-  // The surface used to unmount on close (forgetting the selection), so
-  // reopening always showed the agent pane; the persistent pre-warmed
-  // mount must reproduce that, and it points the background attach at
-  // the pane the next open will actually show.
+  // While hidden, drop a user-shell selection back to the agent terminal so
+  // a reveal shows the agent pane, as a fresh mount would.
   useEffect(() => {
     if (visible || terminals.length === 0) return;
     setActiveKey(agentTerminal ? terminalTabKey(agentTerminal) : "");
@@ -247,26 +331,6 @@ export function MainTerminalView({
     !terminalsFetching &&
     resumeAvailable &&
     !recoveryRef.current.attempted;
-  const agentHealthy = agentTerminal !== null && runnerOnline === true;
-  useEffect(() => {
-    const recovery = recoveryRef.current;
-    if (resumePending) return;
-    if (!visible && resumeError === null) recovery.attempted = false;
-    // Opening a live terminal consumes this opening's recovery allowance.
-    // Later idle reaping must not restart it without another user action.
-    else if (agentHealthy && !terminalsLoading && !terminalsFetching) {
-      if (visible) recovery.attempted = true;
-      if (resumeError !== null) setResumeState({ conversationId, phase: "idle", error: null });
-    }
-  }, [
-    conversationId,
-    visible,
-    resumePending,
-    resumeError,
-    agentHealthy,
-    terminalsLoading,
-    terminalsFetching,
-  ]);
   useEffect(() => {
     if (autoResumeAvailable) void handleResume(true).catch(() => {});
   }, [autoResumeAvailable, handleResume]);
@@ -286,7 +350,7 @@ export function MainTerminalView({
       });
     }, 10_000);
     return () => window.clearTimeout(timeout);
-  }, [conversationId, resumePhase, agentTerminal]);
+  }, [conversationId, resumePhase, agentTerminal, recoveryRef, setResumeState]);
   const serverInfo = useServerInfo();
   const isMobile = useIsMobileViewport();
   // Splits are managed only by desktop owners, so only they see them.
@@ -389,8 +453,7 @@ export function MainTerminalView({
       // Exposed for e2e assertions that an expand targeted the right
       // terminal (not just that the view opened).
       data-active-terminal={activeKey}
-      // Distinguishes the revealed surface from the hidden pre-warmed
-      // mount for tests — both are in the DOM.
+      // Distinguishes a revealed surface from a hidden mount for tests.
       data-visible={visible}
       className={cn("main-terminal-view flex min-h-0 flex-1 flex-col pt-12", className)}
     >

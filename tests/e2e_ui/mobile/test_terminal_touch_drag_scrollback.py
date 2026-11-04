@@ -64,8 +64,7 @@ _DRAG_PX = 240
 _MIN_SLIDER_PX = 2
 
 # Scroll state of the visible terminal, read from xterm's own scrollbar.
-# A hidden pre-warmed terminal surface can also be mounted, so pick the
-# view with a real box. ``sliderTop``/``sliderHeight`` are null until the
+# Pick the view with a real box. ``sliderTop``/``sliderHeight`` are null until the
 # buffer overflows enough for xterm to render the vertical scrollbar.
 _SCROLL_METRICS = """
 () => {

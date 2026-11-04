@@ -11,7 +11,7 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { Session } from "@/lib/types";
 import { updateTerminalSplit } from "./terminalSplitPanesStore";
-import { MainTerminalView } from "./MainTerminalView";
+import { MainTerminalView, type TerminalRecovery, TerminalRecoveryScope } from "./MainTerminalView";
 import type { TerminalFirstContextValue } from "./TerminalFirstContext";
 import { TerminalFirstContextProvider } from "./TerminalFirstContext";
 
@@ -146,6 +146,7 @@ function viewTree({
   sandboxOffline = false,
   isLoading = false,
   isFetching = false,
+  unmountWhenHidden = false,
 }: {
   terminals: TerminalInfo[];
   isNativeWrapper?: boolean;
@@ -161,20 +162,36 @@ function viewTree({
   sandboxOffline?: boolean;
   isLoading?: boolean;
   isFetching?: boolean;
+  /** Mount the view only while visible, as the chat page does. */
+  unmountWhenHidden?: boolean;
 }) {
   useTerminalsMock.mockReturnValue({ terminals, isLoading, isFetching, error: null });
+  const view = (recovery?: TerminalRecovery) => (
+    <MainTerminalView
+      conversationId={conversationId}
+      initialTerminalKey={initialTerminalKey}
+      visible={visible}
+      readOnly={readOnly}
+      runnerOnline={runnerOnline}
+      lastTaskError={lastTaskError}
+      onResume={onResume}
+      sandboxOffline={sandboxOffline}
+      recovery={recovery}
+    />
+  );
   return (
     <TerminalFirstContextProvider value={makeCtx(isNativeWrapper, setView, { terminalStartingUp })}>
-      <MainTerminalView
-        conversationId={conversationId}
-        initialTerminalKey={initialTerminalKey}
-        visible={visible}
-        readOnly={readOnly}
-        runnerOnline={runnerOnline}
-        lastTaskError={lastTaskError}
-        onResume={onResume}
-        sandboxOffline={sandboxOffline}
-      />
+      {unmountWhenHidden ? (
+        <TerminalRecoveryScope
+          conversationId={conversationId}
+          shown={visible}
+          runnerOnline={runnerOnline}
+        >
+          {view}
+        </TerminalRecoveryScope>
+      ) : (
+        view()
+      )}
     </TerminalFirstContextProvider>
   );
 }
@@ -194,34 +211,39 @@ afterEach(() => {
 });
 
 describe("MainTerminalView — automatic recovery", () => {
-  it("reconnects once on a live host and waits for the agent terminal", async () => {
-    hostOnlineMock.mockReturnValue(true);
-    let finishResume!: () => void;
-    const onResume = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          finishResume = resolve;
-        }),
-    );
-    const props = { terminals: [], runnerOnline: false, onResume };
-    const { rerender } = renderView(props);
+  it.each([false, true])(
+    "reconnects once on a live host and waits for the agent terminal (unmountWhenHidden=%s)",
+    async (unmountWhenHidden) => {
+      hostOnlineMock.mockReturnValue(true);
+      let finishResume!: () => void;
+      const onResume = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            finishResume = resolve;
+          }),
+      );
+      const props = { terminals: [], runnerOnline: false, onResume, unmountWhenHidden };
+      const { rerender } = renderView(props);
 
-    expect(onResume).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
-    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
-    rerender(viewTree({ ...props, isFetching: true }));
-    rerender(viewTree({ ...props, visible: false }));
-    rerender(viewTree(props));
-    expect(onResume).toHaveBeenCalledTimes(1);
+      expect(onResume).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
+      expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+      rerender(viewTree({ ...props, isFetching: true }));
+      rerender(viewTree({ ...props, visible: false }));
+      rerender(viewTree(props));
+      expect(onResume).toHaveBeenCalledTimes(1);
 
-    await act(async () => finishResume());
-    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
-    expect(useTerminalsMock).toHaveBeenLastCalledWith("conv_sdk", { reconcileWhilePending: true });
-    rerender(viewTree({ ...props, terminals: [REPL_TERMINAL], runnerOnline: true }));
-    expect(await screen.findByTestId("terminal-view")).toBeInTheDocument();
-    expect(screen.queryByRole("status")).toBeNull();
-    expect(onResume).toHaveBeenCalledTimes(1);
-  });
+      await act(async () => finishResume());
+      expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
+      expect(useTerminalsMock).toHaveBeenLastCalledWith("conv_sdk", {
+        reconcileWhilePending: true,
+      });
+      rerender(viewTree({ ...props, terminals: [REPL_TERMINAL], runnerOnline: true }));
+      expect(await screen.findByTestId("terminal-view")).toBeInTheDocument();
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(onResume).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("does not duplicate recovery during StrictMode effects", async () => {
     hostOnlineMock.mockReturnValue(true);
@@ -292,10 +314,15 @@ describe("MainTerminalView — automatic recovery", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
   });
 
-  it.each([false, true])("keeps failures until external recovery (visible=%s)", async (visible) => {
+  it.each([
+    { visible: false, unmountWhenHidden: false },
+    { visible: true, unmountWhenHidden: false },
+    { visible: false, unmountWhenHidden: true },
+    { visible: true, unmountWhenHidden: true },
+  ])("keeps failures until external recovery (%j)", async ({ visible, unmountWhenHidden }) => {
     hostOnlineMock.mockReturnValue(true);
     const onResume = vi.fn().mockRejectedValueOnce(new Error("private backend details"));
-    const props = { terminals: [REPL_TERMINAL], runnerOnline: false, onResume };
+    const props = { terminals: [REPL_TERMINAL], runnerOnline: false, onResume, unmountWhenHidden };
     const { rerender } = renderView(props);
     expect(await screen.findByText("Couldn't reconnect the terminal automatically.")).toBeVisible();
     expect(screen.queryByText(/private backend details/)).toBeNull();
@@ -806,9 +833,8 @@ describe("MainTerminalView — native wrapper sessions", () => {
 
 describe("MainTerminalView — persistent hidden mount", () => {
   it("toggles inert without remounting the terminal across a hide/show flip", () => {
-    // ChatPage keeps this surface mounted as a hidden overlay while the
-    // user is in chat. A new data-instance after the round-trip means
-    // the flip tore down the xterm + WS it exists to preserve.
+    // A hidden mount keeps its xterm + WS. A new data-instance after the
+    // round-trip means the flip tore them down.
     const { rerender } = renderView({ terminals: [REPL_TERMINAL] });
     const view = screen.getByTestId("terminal-view");
     const instance = view.getAttribute("data-instance");
@@ -844,7 +870,7 @@ describe("MainTerminalView — persistent hidden mount", () => {
     expect(screen.getByTestId("terminal-view").getAttribute("data-instance")).toBe(instance);
   });
 
-  it("makes an initially hidden pre-warmed terminal inert on mount", () => {
+  it("makes an initially hidden terminal inert on mount", () => {
     renderView({ terminals: [REPL_TERMINAL], visible: false });
 
     expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "false");

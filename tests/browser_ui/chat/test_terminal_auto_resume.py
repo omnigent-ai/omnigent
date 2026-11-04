@@ -126,13 +126,8 @@ def test_terminal_view_recovers_on_open(
 
         chat.wait_for_stream()
         if cached_terminal:
-            previous_terminal = page.get_by_test_id("main-terminal-view").get_by_test_id(
-                "terminal-view"
-            )
-            expect(previous_terminal).to_have_attribute("data-state", "connected")
-            attachments[0].close(code=4404, reason="Terminal not found")
-            expect(previous_terminal).to_have_attribute("data-state", "closed")
-            previous_terminal.evaluate("element => element.dataset.recoveryOriginal = 'true'")
+            expect(page.get_by_test_id("main-terminal-view")).to_have_count(0)
+            assert attachments == []
         assert pending == []
         page.screenshot(path=str(artifacts / "before-opening-terminal.png"))
         with page.expect_request(
@@ -154,9 +149,11 @@ def test_terminal_view_recovers_on_open(
         expect(terminal.get_by_role("button", name="Resume session")).to_have_count(0)
         assert len(pending) == 1
         if cached_terminal:
-            expect(terminal.get_by_test_id("terminal-view")).to_have_attribute(
-                "data-recovery-original", "true"
-            )
+            previous_terminal = terminal.get_by_test_id("terminal-view")
+            expect(previous_terminal).to_have_attribute("data-state", "connected")
+            attachments[0].close(code=4404, reason="Terminal not found")
+            expect(previous_terminal).to_have_attribute("data-state", "closed")
+            previous_terminal.evaluate("element => element.dataset.recoveryOriginal = 'true'")
             assert len(attachments) == 1
         page.screenshot(path=str(artifacts / "terminal-restarting.png"))
 
@@ -170,7 +167,7 @@ def test_terminal_view_recovers_on_open(
             expect(resume).to_be_enabled()
             expect(terminal.get_by_role("alert")).to_be_visible()
             assert len(pending) == 1
-            if entry == "grid":
+            if not cached_terminal:
                 surface.get_by_role("button", name="Chat view", exact=True).click()
                 surface.get_by_role("button", name="Terminal view", exact=True).click()
                 expect(terminal.get_by_role("alert")).to_be_visible()

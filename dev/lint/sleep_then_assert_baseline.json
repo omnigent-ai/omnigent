@@ -25,7 +25,6 @@
   "tests/e2e_ui/chat/test_compaction_indicator_lifecycle.py": 2,
   "tests/e2e_ui/chat/test_composer_submit_shortcut.py": 1,
   "tests/e2e_ui/chat/test_draft_survives_incoming_messages.py": 1,
-  "tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py": 1,
   "tests/e2e_ui/chat/test_initial_history_loading.py": 2,
   "tests/e2e_ui/chat/test_queued_strip_docks_on_composer.py": 1,
   "tests/e2e_ui/chat/test_stop_button_interrupts_turn.py": 1,
