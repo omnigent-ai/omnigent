@@ -7,7 +7,7 @@ export const PROJECT_FOLDER_PAGINATION_STORAGE_KEY = "omnigent:project-folder-pa
 
 export const DEFAULT_PROJECT_FOLDER_PAGINATION = true;
 
-// Sessions a paginated folder lists before, and adds per, "Show more".
+// How many sessions a paginated folder shows at first and adds with each Show more click.
 export const PROJECT_FOLDER_PAGE_SIZE = 5;
 
 const preference = createStoredBooleanPreference(
