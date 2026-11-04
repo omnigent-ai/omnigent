@@ -486,6 +486,11 @@ function MenuRowButton({
             "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
             active && "bg-muted dark:bg-muted/50",
           )}
+          // Rows that fit skip Radix's hover timer: an opening it starts and the menu
+          // rejects would still let the next cut-off row skip the delay.
+          onPointerMove={(e) => {
+            if (!isCutOff(descriptionRef.current)) e.preventDefault();
+          }}
           // preventDefault keeps the textarea focused while the user clicks.
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => onSelect(row.name)}

@@ -212,6 +212,20 @@ describe("full skill descriptions", () => {
     expect(tooltip).toHaveClass("max-h-64", "overflow-y-auto", "items-start");
   });
 
+  it("keeps the full hover delay on a cut-off row after resting on a row that fits", () => {
+    render(<SlashCommandMenu {...props} commands={commands} activeIndex={0} />);
+    overflowDescription("review", 200);
+    overflowDescription("triage", 900);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-review"));
+    advanceTimers(500);
+    fireEvent.pointerLeave(screen.getByTestId("slash-menu-item-review"));
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    advanceTimers(399);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    advanceTimers(1);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
+  });
+
   it("shows a cut-off description once the keyboard highlight rests on its row", () => {
     const { rerender } = render(
       <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
