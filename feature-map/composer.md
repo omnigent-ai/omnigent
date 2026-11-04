@@ -154,7 +154,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   while a turn runs or with neither a usable runner nor a saved host binding
   (error under the composer), prompt arriving after the new session opened
   (filled unless the user has typed, cleared or sent a draft there), an
-  attachment that could not be restored (a warning names it).
+  attachment that could not be downloaded into the composer (a warning names
+  it; one whose file is gone, or that the server could not look up, is left
+  out without a warning).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -664,9 +666,11 @@ Other connection providers alone do not enable the managed MCP picker.
   arrives after the redirect are component-covered in
   `web/src/pages/ChatPage.composer.test.tsx`; the picker's older-prompt
   loading, retry and stale replies in `web/src/components/RewindPicker.test.tsx`.
-  Manually, repeat both entry
-  routes (menu click; whole command plus Enter) for SDK `/clear`, SDK
-  `/rewind` and native `/rewind`, and rewind to a prompt with an attachment.
+  Manually, repeat both entry routes (menu click; whole command plus Enter)
+  for SDK `/clear`, SDK `/rewind` and native `/rewind`, and rewind to a prompt
+  with an attachment. Each `/clear` moves the view to an empty chat on the
+  same machine, and the original chat ends with a notice linking to it. The
+  capability gate is also in `web/src/pages/ChatPage.composer.test.tsx`.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,
@@ -676,13 +680,7 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
-  claude-sdk `/clear` from the menu, with a real Claude CLI on the mock model:
-  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`.
-  Manually, in a claude-sdk session with one finished turn, type `/cle` and
-  pick **/clear**, then repeat in a new session by typing `/clear` and pressing
-  Enter. Each time the view moves to an empty chat on the same machine, and the
-  original chat ends with a notice linking to it. Menu and typed entry, and the
-  capability gate, are in `web/src/pages/ChatPage.composer.test.tsx`.
+  claude-sdk `/clear` is in the `/clear` and `slash-rewind` recipe above.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under
