@@ -10369,6 +10369,39 @@ async def _claude_native_bridge_id_for_session(
     return session_id
 
 
+async def _antigravity_native_bridge_id_for_session(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> str:
+    """Resolve the bridge id label for an Antigravity-native session.
+
+    Mirrors :func:`_claude_native_bridge_id_for_session`: Antigravity is one of
+    the :data:`omnigent.harness_plugins._BRIDGE_ID_LABEL_HARNESSES`, so a forked
+    session's bridge id can differ from its own conversation id.
+
+    :param server_client: Omnigent server client used to fetch the session
+        labels.
+    :param session_id: Omnigent session/conversation id, e.g.
+        ``"conv_abc123"``.
+    :returns: Opaque bridge id from
+        ``omnigent.antigravity_native.bridge_id`` when present, otherwise
+        *session_id* for a bridge not shared across a fork.
+    """
+    from omnigent.harnesses.antigravity_native.bridge import (
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+
+    labels = await _session_labels_for_runner_spawn(
+        server_client=server_client,
+        session_id=session_id,
+    )
+    bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
+    if isinstance(bridge_id, str) and bridge_id:
+        return bridge_id
+    return session_id
+
+
 async def _claude_native_bridge_id_with_optional_labels(
     *,
     server_client: httpx.AsyncClient,

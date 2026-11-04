@@ -1892,6 +1892,26 @@ def send_interaction_keys_via_tui(
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
 
 
+def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
+    """
+    Hard-stop the agy session by killing its tmux session outright.
+
+    Terminates ``agy`` and the pane it runs in — the analog of the user
+    manually exiting the attached TUI, for the web UI's "Stop session"
+    affordance. Mirrors
+    :func:`omnigent.harnesses.cursor_native.bridge.kill_session` /
+    :func:`omnigent.harnesses.claude_native.bridge.kill_session`.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param timeout_s: Seconds to wait for ``tmux.json`` to be advertised.
+    :returns: None.
+    :raises RuntimeError: If the tmux target is not advertised in time, or if
+        ``tmux kill-session`` fails.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+
+
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     """Provider ``input_ready_probe``: agy's input footer is rendered (idle or mid-turn).
 

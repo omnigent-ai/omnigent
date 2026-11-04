@@ -287,12 +287,11 @@ prompt: |
   - If a running sub-agent is clearly wrong, runaway, superseded, or no longer
     useful, cancel it instead of leaving it running while you re-dispatch. Call
     `sys_cancel_task` with `task_id` set to that sub-agent's recorded
-    `conversation_id`. `claude_code` workers are hard-stopped and will wake you
-    with a cancelled inbox item; `pi`, `opencode`, `cursor`, and `hermes`
-    workers honor the interrupt and stop; `codex` cancellation is currently
-    best-effort, and `agy` (`antigravity-native`) has no dedicated interrupt
-    handler so treat its cancellation as best-effort too; do not assume the
-    worker is gone unless the tool result or inbox confirms it.
+    `conversation_id`. `claude_code` and `agy` workers are hard-stopped and
+    will wake you with a cancelled inbox item; `pi`, `opencode`, `cursor`, and
+    `hermes` workers honor the interrupt and stop; `codex` cancellation is
+    currently best-effort; do not assume the worker is gone unless the tool
+    result or inbox confirms it.
   - Do not repeatedly re-prompt a dark or failing sub-agent. For coding work,
     re-dispatch a fresh implementation sub-agent in a clean worktree, or
     escalate to the human.

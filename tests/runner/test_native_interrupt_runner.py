@@ -5,8 +5,10 @@ HTTP-path tests in ``test_app_sessions_native_events_lifecycle.py`` /
 ``test_app_sessions_native_supervision.py`` (which POST to ``/events`` and patch
 the bridge-module control functions). The focus here is the registry dispatch
 and the descriptor-collapsed uniform handlers: which harnesses route where, the
-opencode interrupt (native ``/interrupt``) dispatch, the antigravity no-handler
-fall-through contract, and the 503 mapping.
+opencode interrupt (native ``/interrupt``) dispatch, the antigravity
+connect-RPC-cancel/TUI-escape interrupt and tmux-kill stop, the no-handler
+fall-through contract for harnesses that genuinely have none, and the 503
+mapping.
 """
 
 from __future__ import annotations
@@ -126,7 +128,7 @@ def test_native_cancel_capability_follows_stop_registry() -> None:
 
     for agent in NATIVE_CODING_AGENTS:
         capability = native_cancel_capability(agent.wrapper_label)
-        if agent.key == "claude" or agent.key in _UNIFORM_STOP:
+        if agent.key in ("claude", "antigravity") or agent.key in _UNIFORM_STOP:
             assert capability == "stop", agent.key
         else:
             assert capability == "best_effort", agent.key
@@ -138,7 +140,7 @@ def test_native_cancel_capability_follows_stop_registry() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["antigravity-native", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["claude-sdk", None])
 async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
     """Harnesses without an interrupt/stop handler return None (caller falls through)."""
     runner, _ = _make_runner()
@@ -667,3 +669,184 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
     # No optimistic 'cancelled': the outcome is unknown until an edge lands.
     assert captured["wakes"] == []
     assert runner.take_pending_interrupt("conv_cl")[0] is True
+
+
+def _patch_antigravity_bridge_id(monkeypatch: pytest.MonkeyPatch, interrupt_mod: Any) -> None:
+    """Resolve antigravity's bridge id to a fixed, easily asserted value."""
+
+    async def _fake_bridge_id(*, server_client: Any, session_id: str) -> str:
+        del server_client, session_id
+        return "bid-agy"
+
+    monkeypatch.setattr(
+        interrupt_mod, "_antigravity_native_bridge_id_for_session", _fake_bridge_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_antigravity_interrupt_prefers_rpc_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolvable cascade is cancelled over connect-RPC; no TUI Escape is sent."""
+    import omnigent.harnesses.antigravity_native.bridge as agy_bridge
+    import omnigent.harnesses.antigravity_native.rpc as agy_rpc
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_antigravity_bridge_id(monkeypatch, interrupt_mod)
+    monkeypatch.setattr(agy_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(
+        agy_bridge,
+        "read_bridge_state",
+        lambda bridge_dir: SimpleNamespace(
+            session_id="conv_agy", conversation_id="cascade-1", active_turn_id=None
+        ),
+    )
+
+    tui_calls: list[Any] = []
+    monkeypatch.setattr(
+        agy_bridge,
+        "send_interaction_keys_via_tui",
+        lambda bridge_dir, *keys: tui_calls.append((bridge_dir, keys)),
+    )
+
+    rpc_calls: list[tuple[int, str]] = []
+    monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cascade_id: 52548)
+    monkeypatch.setattr(
+        agy_rpc,
+        "cancel_cascade_steps",
+        lambda port, cascade_id: (rpc_calls.append((port, cascade_id)), True)[1],
+    )
+
+    runner, captured = _make_runner()
+    resp = await runner.interrupt("antigravity-native", "conv_agy")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert rpc_calls == [(52548, "cascade-1")]
+    assert tui_calls == []  # RPC cancel succeeded; no TUI fallback needed.
+    # No optimistic 'cancelled': the outcome is unknown until an edge lands.
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_agy")[0] is True
+
+
+@pytest.mark.asyncio
+async def test_antigravity_interrupt_falls_back_to_tui_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No cascade/port yet (pre-mint placeholder) falls back to a TUI Escape."""
+    import omnigent.harnesses.antigravity_native.bridge as agy_bridge
+    import omnigent.harnesses.antigravity_native.rpc as agy_rpc
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_antigravity_bridge_id(monkeypatch, interrupt_mod)
+    monkeypatch.setattr(agy_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(
+        agy_bridge,
+        "read_bridge_state",
+        lambda bridge_dir: SimpleNamespace(
+            session_id="conv_agy", conversation_id="agy_conv_placeholder", active_turn_id=None
+        ),
+    )
+
+    def _fail_port(cascade_id: str) -> int | None:
+        raise AssertionError("must not resolve a port for a placeholder conversation id")
+
+    monkeypatch.setattr(agy_rpc, "resolve_language_server_port", _fail_port)
+
+    escape_calls: list[Any] = []
+    monkeypatch.setattr(
+        agy_bridge,
+        "send_interaction_keys_via_tui",
+        lambda bridge_dir, *keys: escape_calls.append((bridge_dir, keys)),
+    )
+
+    runner, captured = _make_runner()
+    resp = await runner.interrupt("antigravity-native", "conv_agy")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert escape_calls == [("dir/bid-agy", ("Escape",))]
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_agy")[0] is True
+
+
+@pytest.mark.asyncio
+async def test_antigravity_interrupt_returns_503_when_both_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RPC cancel unavailable and a dead TUI pane together are a 503, not a lie."""
+    import omnigent.harnesses.antigravity_native.bridge as agy_bridge
+    import omnigent.harnesses.antigravity_native.rpc as agy_rpc
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_antigravity_bridge_id(monkeypatch, interrupt_mod)
+    monkeypatch.setattr(agy_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(agy_bridge, "read_bridge_state", lambda bridge_dir: None)
+    monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cascade_id: None)
+
+    def _boom(bridge_dir: Any, *keys: str) -> None:
+        raise RuntimeError("the agy terminal is no longer running (the TUI exited)")
+
+    monkeypatch.setattr(agy_bridge, "send_interaction_keys_via_tui", _boom)
+
+    runner, captured = _make_runner()
+    resp = await runner.interrupt("antigravity-native", "conv_agy")
+
+    assert resp is not None and resp.status_code == 503
+    assert json.loads(bytes(resp.body))["error"] == "antigravity_native_interrupt_failed"
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_agy")[0] is False
+
+
+@pytest.mark.asyncio
+async def test_antigravity_stop_kills_tears_down_and_goes_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop kills the agy tmux session, publishes idle, and wakes the parent."""
+    import omnigent.harnesses.antigravity_native.bridge as agy_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_antigravity_bridge_id(monkeypatch, interrupt_mod)
+    monkeypatch.setattr(agy_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    killed: list[Any] = []
+    monkeypatch.setattr(
+        agy_bridge,
+        "kill_session",
+        lambda bridge_dir, *, timeout_s: killed.append((bridge_dir, timeout_s)),
+    )
+
+    runner, captured = _make_runner()
+    # A stop that follows an unresolved interrupt settles it: the kill is
+    # confirmed, so no grace-timer cancel may fire later.
+    runner._pending_interrupts["conv_agy"] = 0.0
+    resp = await runner.stop("antigravity-native", "conv_agy")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert runner.take_pending_interrupt("conv_agy")[0] is False
+    assert killed == [("dir/bid-agy", 1.0)]
+    idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
+    assert idle == [{"type": "session.status", "status": "idle"}]
+    assert captured["wakes"] == [("conv_agy", "cancelled", None)]
+
+
+@pytest.mark.asyncio
+async def test_antigravity_stop_kill_failure_returns_503_without_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed kill returns 503 and does NOT publish idle (no lie to the UI)."""
+    import omnigent.harnesses.antigravity_native.bridge as agy_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_antigravity_bridge_id(monkeypatch, interrupt_mod)
+    monkeypatch.setattr(agy_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+
+    def _boom(bridge_dir: Any, *, timeout_s: float) -> None:
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(agy_bridge, "kill_session", _boom)
+
+    runner, captured = _make_runner()
+    resp = await runner.stop("antigravity-native", "conv_agy")
+
+    assert resp is not None and resp.status_code == 503
+    assert json.loads(bytes(resp.body))["error"] == "antigravity_native_stop_failed"
+    assert captured["wakes"] == []
+    assert [e for _, e in captured["published"] if e.get("status") == "idle"] == []

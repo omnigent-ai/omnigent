@@ -9188,7 +9188,7 @@ async def _cancel_subagent_task(
 
     The cancel event is chosen from ``native_cancel_capability``, which
     mirrors the child runner's ``NativeInterruptRunner.stop`` dispatch
-    (Claude plus the ``_UNIFORM_STOP`` natives):
+    (Claude and Antigravity plus the ``_UNIFORM_STOP`` natives):
 
     * stop-capable natives — POST ``stop_session``: the child runner
       hard-stops the worker, marks the work entry cancelled, delivers a
@@ -9201,10 +9201,10 @@ async def _cancel_subagent_task(
       ``stop_session`` returns 503 is reported as an unconfirmed /
       best-effort cancel: the kill failed and the worker may still be
       running.
-    * best-effort natives (Codex, Pi, Antigravity, OpenCode) and
-      in-process harnesses — POST ``interrupt``. No runner-side
-      hard-stop is wired for them, so the result is reported
-      best-effort rather than implying process termination.
+    * best-effort natives (Codex, Pi, OpenCode) and in-process
+      harnesses — POST ``interrupt``. No runner-side hard-stop is wired
+      for them, so the result is reported best-effort rather than
+      implying process termination.
 
     :param args: Tool arguments containing ``task_id`` or
         ``handle_id``, e.g. ``{"task_id": "conv_child456"}``.
