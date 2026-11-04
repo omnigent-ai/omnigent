@@ -81,8 +81,8 @@ def test_host_mcp_tools(live_server: str, tmp_path: Path) -> None:
         )
         assert response.status_code == 200, response.text
         tools = response.json()
-        # Servers older than harness sign-in omit the field.
-        assert tools.pop("harness_sign_in", None) is None
+        # Only a server that needs auth reports a harness sign-in.
+        assert tools.pop("harness_sign_in") is None
         assert tools == {
             "tools": [{"name": "read_docs", "description": "Read documentation."}],
             "connection": "connected",

@@ -89,70 +89,72 @@ def oauth_mcp_server(title: str = "Demo Issues") -> Iterator[OAuthMcpServer]:
 
     :param title: Name shown on the consent page, e.g. ``"Demo Issues"``.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    base = f"http://127.0.0.1:{sock.getsockname()[1]}"
-    provider = _Provider(base)
-    app = FastMCP(
-        title,
-        auth_server_provider=provider,
-        auth=AuthSettings(
-            issuer_url=base,
-            resource_server_url=f"{base}/mcp",
-            client_registration_options=ClientRegistrationOptions(enabled=True),
-        ),
-    )
-
-    @app.tool()
-    def list_issues() -> str:
-        """List open issues."""
-        return "DEMO-1"
-
-    @app.custom_route("/approve", methods=["GET", "POST"])
-    async def approve(request: Request) -> Response:
-        key = request.query_params.get("request", "")
-        if key not in provider.pending:
-            return HTMLResponse("Unknown sign-in request", status_code=400)
-        if request.method == "GET":
-            client = provider.pending[key][0]
-            return HTMLResponse(
-                f"<title>Authorize {html.escape(title)}</title>"
-                "<body style='font:16px sans-serif;max-width:32rem;margin:4rem auto'>"
-                f"<h1>Authorize {html.escape(title)}</h1>"
-                f"<p>{html.escape(client.client_name or 'An MCP client')} wants to use your"
-                " account. This is a local test OAuth server.</p>"
-                f"<form method=post action='/approve?request={html.escape(key)}'>"
-                "<button type=submit style='font-size:16px;padding:.5rem 1.5rem'>Approve</button>"
-                "</form></body>"
-            )
-        client, params = provider.pending.pop(key)
-        code = secrets.token_hex(16)
-        provider.codes[code] = AuthorizationCode(
-            code=code,
-            scopes=params.scopes or [],
-            expires_at=time.time() + 300,
-            client_id=client.client_id,
-            code_challenge=params.code_challenge,
-            redirect_uri=params.redirect_uri,
-            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
-            resource=params.resource,
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        base = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        provider = _Provider(base)
+        app = FastMCP(
+            title,
+            auth_server_provider=provider,
+            auth=AuthSettings(
+                issuer_url=base,
+                resource_server_url=f"{base}/mcp",
+                client_registration_options=ClientRegistrationOptions(enabled=True),
+            ),
         )
-        target = construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
-        return RedirectResponse(target, status_code=302)
 
-    server = uvicorn.Server(
-        uvicorn.Config(app.streamable_http_app(), log_level="warning", lifespan="on")
-    )
-    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
-    thread.start()
-    try:
-        deadline = time.monotonic() + 10
-        while not server.started:
-            if time.monotonic() > deadline or not thread.is_alive():
-                raise RuntimeError("OAuth MCP server did not start")
-            time.sleep(0.05)
-        yield OAuthMcpServer(f"{base}/mcp", provider)
-    finally:
-        server.should_exit = True
-        thread.join(timeout=10)
-        sock.close()
+        @app.tool()
+        def list_issues() -> str:
+            """List open issues."""
+            return "DEMO-1"
+
+        @app.custom_route("/approve", methods=["GET", "POST"])
+        async def approve(request: Request) -> Response:
+            key = request.query_params.get("request", "")
+            if key not in provider.pending:
+                return HTMLResponse("Unknown sign-in request", status_code=400)
+            if request.method == "GET":
+                client = provider.pending[key][0]
+                return HTMLResponse(
+                    f"<title>Authorize {html.escape(title)}</title>"
+                    "<body style='font:16px sans-serif;max-width:32rem;margin:4rem auto'>"
+                    f"<h1>Authorize {html.escape(title)}</h1>"
+                    f"<p>{html.escape(client.client_name or 'An MCP client')} wants to use your"
+                    " account. This is a local test OAuth server.</p>"
+                    f"<form method=post action='/approve?request={html.escape(key)}'>"
+                    "<button type=submit style='font-size:16px;padding:.5rem 1.5rem'>"
+                    "Approve</button>"
+                    "</form></body>"
+                )
+            client, params = provider.pending.pop(key)
+            code = secrets.token_hex(16)
+            provider.codes[code] = AuthorizationCode(
+                code=code,
+                scopes=params.scopes or [],
+                expires_at=time.time() + 300,
+                client_id=client.client_id,
+                code_challenge=params.code_challenge,
+                redirect_uri=params.redirect_uri,
+                redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+                resource=params.resource,
+            )
+            target = construct_redirect_uri(
+                str(params.redirect_uri), code=code, state=params.state
+            )
+            return RedirectResponse(target, status_code=302)
+
+        server = uvicorn.Server(
+            uvicorn.Config(app.streamable_http_app(), log_level="warning", lifespan="on")
+        )
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10
+            while not server.started:
+                if time.monotonic() > deadline or not thread.is_alive():
+                    raise RuntimeError("OAuth MCP server did not start")
+                time.sleep(0.05)
+            yield OAuthMcpServer(f"{base}/mcp", provider)
+        finally:
+            server.should_exit = True
+            thread.join(timeout=10)
