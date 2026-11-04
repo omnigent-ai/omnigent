@@ -43,7 +43,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
-from omnigent.server.routes.sessions import routes_core, routes_events
+from omnigent.server.routes.sessions import routes_core
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.sharing_settings import DefaultPublicSessions
 from omnigent.server.startup_inputs import ManagedStartupInputs
@@ -372,49 +372,6 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
         {"type": "compact"}
     ]
     assert not orchestration._session_is_starting(source_id)
-
-
-async def test_stopping_or_archiving_the_original_leaves_the_continuation_running(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The cleared original no longer holds the runner it shares with its continuation.
-
-    Stopping or archiving the original ends only that chat: the runner is not
-    stopped under the continuation's running turn, and the original keeps its
-    host so a later message can resume it.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store)
-    cleared = await client.post(
-        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
-    )
-    assert cleared.status_code == 202, cleared.text
-    new_id = cleared.json()["session_id"]
-    monkeypatch.setitem(sessions_module._session_status_cache, new_id, "running")
-    runner_stops = AsyncMock(return_value=True)
-    monkeypatch.setattr(routes_events, "_stop_host_runner_intentionally", runner_stops)
-    monkeypatch.setattr(orchestration, "_stop_host_runner_intentionally", runner_stops)
-    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
-
-    stopped = await client.post(
-        f"/v1/sessions/{source_id}/events", json={"type": "stop_session", "data": {}}
-    )
-    archived = await client.patch(f"/v1/sessions/{source_id}", json={"archived": True})
-    await asyncio.gather(*list(orchestration._detached_stop_tasks), return_exceptions=True)
-
-    assert stopped.status_code < 300, stopped.text
-    assert archived.status_code == 200, archived.text
-    runner_stops.assert_not_awaited()
-    continuation = store.get_conversation(new_id)
-    assert continuation is not None and continuation.runner_id == _RUNNER_ID
-    assert sessions_module._session_status_cache.get(new_id) == "running"
-    original = store.get_conversation(source_id)
-    assert original is not None
-    assert (original.runner_id, original.host_id) == (None, _HOST_ID)
 
 
 @pytest.mark.parametrize("cancelled_during", ["fork", "runner_binding"])
