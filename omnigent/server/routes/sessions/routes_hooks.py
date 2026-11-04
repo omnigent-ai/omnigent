@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import weakref
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from fastapi import (
@@ -118,11 +119,9 @@ from omnigent.stores.policy_store import PolicyStore
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
 
 
-# Per-session locks serializing evaluate_policy's engine builds. A build seeds declared
-# label initial values with a read-then-write that is not atomic on every store (the generic
-# SQL path overwrites an existing value). Builds used to run on the event loop with no
-# ``await``, so builds for one session never overlapped; now they run on worker threads, and
-# this lock restores that ordering. Different sessions still build concurrently.
+# Serializes same-session policy-engine builds: each build seeds declared label initial
+# values with a read-then-write that can overwrite a value an evaluation already updated.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _policy_engine_build_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -144,6 +143,35 @@ def _policy_engine_build_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _policy_engine_build_locks[session_id] = lock
     return lock
+
+
+async def _build_policy_engine_serialized(
+    session_id: str,
+    build: Callable[..., PolicyEngine],
+    *args: Any,
+) -> PolicyEngine:
+    """
+    Run ``build`` on a worker thread while holding the session's build lock.
+
+    The locked build runs in its own task behind :func:`asyncio.shield`, so a
+    cancelled request keeps the lock until its worker thread finishes instead of
+    letting the next same-session build overlap it.
+
+    :param session_id: Omnigent conversation id being evaluated, e.g. ``"conv_abc123"``.
+    :param build: Synchronous engine factory, e.g. the handler's ``_build_engine``.
+    :param args: Positional arguments for ``build``.
+    :returns: The built :class:`PolicyEngine`.
+    """
+
+    async def locked_build() -> PolicyEngine:
+        async with _policy_engine_build_lock(session_id):
+            return await asyncio.to_thread(build, *args)
+
+    task = asyncio.ensure_future(locked_build())
+    # Retrieve the outcome even if the caller was cancelled, so a failure isn't reported as
+    # an unretrieved task exception.
+    task.add_done_callback(lambda done: done.cancelled() or done.exception())
+    return await asyncio.shield(task)
 
 
 def _no_policy_allow_body(
@@ -1016,8 +1044,7 @@ def register_hooks_routes(
             )
 
         # The build makes several synchronous store reads.
-        async with _policy_engine_build_lock(session_id):
-            engine = await asyncio.to_thread(_build_engine, conv)
+        engine = await _build_policy_engine_serialized(session_id, _build_engine, conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
@@ -1071,9 +1098,9 @@ def register_hooks_routes(
                 deciding_policy = result.deciding_policy
                 assert deciding_policy is not None
                 async with _native_ask_gate_lock(session_id, deciding_policy):
-                    # Taken after the gate lock and never held while waiting for it.
-                    async with _policy_engine_build_lock(session_id):
-                        engine = await asyncio.to_thread(_build_engine)
+                    # The build lock is taken after the gate lock and never held
+                    # while waiting for it, so the two can't deadlock.
+                    engine = await _build_policy_engine_serialized(session_id, _build_engine)
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,

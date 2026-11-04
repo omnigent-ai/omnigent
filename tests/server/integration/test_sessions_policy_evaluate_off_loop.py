@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from typing import Any
 
 import httpx
@@ -22,7 +21,7 @@ from omnigent.runtime import get_caps
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.routes.sessions import routes_hooks
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, policy_tool_call_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -112,72 +111,52 @@ def _allow(event: dict[str, Any]) -> dict[str, Any]:
     return {"result": "ALLOW"}
 
 
-_TOOL_CALL_EVENT = {
-    "event": {
-        "type": "PHASE_TOOL_CALL",
-        "target": "",
-        "data": {"name": "Bash", "arguments": {}},
-        "context": {},
-    },
-}
+class _GatedBuilds:
+    """Stand-in for ``build_policy_engine`` whose calls each block until the test releases them."""
+
+    def __init__(self, real_build: Any) -> None:
+        self._real_build = real_build
+        self._entered = threading.Condition()
+        self.releases: list[threading.Event] = []
+
+    def build(self, *args: Any, **kwargs: Any) -> Any:
+        release = threading.Event()
+        with self._entered:
+            self.releases.append(release)
+            self._entered.notify_all()
+        if not release.wait(timeout=10):
+            raise TimeoutError("test never released this build")
+        return self._real_build(*args, **kwargs)
+
+    async def wait_for_started(self, count: int) -> None:
+        """Wait (bounded) until ``count`` builds have started."""
+
+        def wait() -> bool:
+            with self._entered:
+                return self._entered.wait_for(lambda: len(self.releases) >= count, timeout=5)
+
+        assert await asyncio.to_thread(wait), f"expected {count} builds to start"
+
+    async def assert_started_stays(self, count: int) -> None:
+        """Assert no further build starts while the started ones are held."""
+        await asyncio.sleep(0.3)
+        assert len(self.releases) == count
+
+    def release(self, index: int) -> None:
+        self.releases[index].set()
 
 
-async def _max_concurrent_builds(
+async def _setup_sessions(
     auth_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
-    session_ids: list[str],
-    real_build: Any,
-) -> int:
-    """Evaluate one tool call per session id at once; return how many builds overlapped at most."""
-    active = 0
-    peak = 0
-    lock = threading.Lock()
-
-    def slow_build(*args: Any, **kwargs: Any) -> Any:
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
-        try:
-            # Long enough that unserialized builds would overlap.
-            time.sleep(0.3)
-            return real_build(*args, **kwargs)
-        finally:
-            with lock:
-                active -= 1
-
-    monkeypatch.setattr(routes_hooks, "build_policy_engine", slow_build)
-    responses = await asyncio.gather(
-        *(
-            auth_client.post(
-                f"/v1/sessions/{session_id}/policies/evaluate",
-                json=_TOOL_CALL_EVENT,
-                headers={"X-Forwarded-Email": OWNER},
-            )
-            for session_id in session_ids
-        )
-    )
-    for resp in responses:
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
-    return peak
-
-
-async def test_policy_engine_builds_for_one_session_never_overlap(
-    auth_client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Concurrent evaluations of one session build their engines one at a time.
-
-    A build seeds declared label initial values with a non-atomic read-then-write;
-    overlapping builds for one session could write an initial value over a label an
-    evaluation had already updated. Different sessions must still build concurrently.
-    """
+    policy_function: str,
+    count: int,
+) -> tuple[list[str], _GatedBuilds]:
+    """Create ``count`` sessions under a default policy and gate the server's engine builds."""
     policy = FunctionPolicySpec(
-        name="admin__allow",
+        name="admin__under_test",
         on=None,
-        function=FunctionRef(path=f"{__name__}._allow"),
+        function=FunctionRef(path=f"{__name__}.{policy_function}"),
     )
     original_caps = get_caps()
     patched_caps = RuntimeCaps(
@@ -185,10 +164,9 @@ async def test_policy_engine_builds_for_one_session_never_overlap(
         default_policies=[policy],
     )
     monkeypatch.setattr("omnigent.server.routes.sessions.get_caps", lambda: patched_caps)
-
     agent = await create_test_agent(auth_client, user=OWNER)
     session_ids = []
-    for _ in range(2):
+    for _ in range(count):
         resp = await auth_client.post(
             "/v1/sessions",
             json={"agent_id": agent["id"]},
@@ -196,8 +174,97 @@ async def test_policy_engine_builds_for_one_session_never_overlap(
         )
         assert resp.status_code == 201, resp.text
         session_ids.append(resp.json()["id"])
+    gated = _GatedBuilds(routes_hooks.build_policy_engine)
+    monkeypatch.setattr(routes_hooks, "build_policy_engine", gated.build)
+    return session_ids, gated
 
-    real_build = routes_hooks.build_policy_engine
-    same_session = [session_ids[0]] * 3
-    assert await _max_concurrent_builds(auth_client, monkeypatch, same_session, real_build) == 1
-    assert await _max_concurrent_builds(auth_client, monkeypatch, session_ids, real_build) == 2
+
+def _evaluate(auth_client: httpx.AsyncClient, session_id: str) -> asyncio.Task[httpx.Response]:
+    return asyncio.create_task(
+        auth_client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=policy_tool_call_request("Bash"),
+            headers={"X-Forwarded-Email": OWNER},
+        )
+    )
+
+
+async def _assert_allowed(*requests: asyncio.Task[httpx.Response]) -> None:
+    for resp in await asyncio.gather(*requests):
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_same_session_builds_wait_for_each_other(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A second same-session build starts only after the first finishes.
+
+    A build seeds declared label initial values with a non-atomic read-then-write, so
+    overlapping builds for one session could overwrite a label an evaluation updated.
+    """
+    (session_id,), gated = await _setup_sessions(auth_client, monkeypatch, "_allow", 1)
+    first = _evaluate(auth_client, session_id)
+    await gated.wait_for_started(1)
+    second = _evaluate(auth_client, session_id)
+    await gated.assert_started_stays(1)
+    gated.release(0)
+    await gated.wait_for_started(2)
+    gated.release(1)
+    await _assert_allowed(first, second)
+
+
+async def test_different_session_builds_run_concurrently(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The build lock is per session, not global."""
+    session_ids, gated = await _setup_sessions(auth_client, monkeypatch, "_allow", 2)
+    requests = [_evaluate(auth_client, session_id) for session_id in session_ids]
+    # Both builds start while neither has been released.
+    await gated.wait_for_started(2)
+    gated.release(0)
+    gated.release(1)
+    await _assert_allowed(*requests)
+
+
+async def test_ask_gate_rebuild_and_a_first_build_wait_for_each_other(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rebuild inside the native ASK gate takes the same per-session build lock."""
+    _ASK_THEN_ALLOW_CALLS.clear()
+    (session_id,), gated = await _setup_sessions(auth_client, monkeypatch, "_ask_then_allow", 1)
+    asking = _evaluate(auth_client, session_id)
+    # First build, whose engine ASKs; the request then rebuilds inside the ASK gate.
+    await gated.wait_for_started(1)
+    gated.release(0)
+    await gated.wait_for_started(2)
+    # While the ASK-gate rebuild is held, a new request's first build must wait.
+    other = _evaluate(auth_client, session_id)
+    await gated.assert_started_stays(2)
+    gated.release(1)
+    await gated.wait_for_started(3)
+    gated.release(2)
+    await _assert_allowed(asking, other)
+
+
+async def test_cancelled_build_keeps_the_lock_until_its_worker_finishes(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a request mid-build doesn't let the next same-session build overlap it."""
+    (session_id,), gated = await _setup_sessions(auth_client, monkeypatch, "_allow", 1)
+    cancelled = _evaluate(auth_client, session_id)
+    await gated.wait_for_started(1)
+    cancelled.cancel()
+    await asyncio.gather(cancelled, return_exceptions=True)
+    second = _evaluate(auth_client, session_id)
+    # The cancelled request's worker thread is still building.
+    await gated.assert_started_stays(1)
+    gated.release(0)
+    await gated.wait_for_started(2)
+    gated.release(1)
+    await _assert_allowed(second)
