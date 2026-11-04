@@ -15,6 +15,17 @@ to customize.
   filter with no search; searches and Active/Paused filters hide the preview.
 - `create`: a gallery item or suggested automation opens integration setup;
   New automation opens a blank form.
+- `prompt-editing`: the detail page and edit dialog show Your prompt first. System
+  prompt starts collapsed, expands into a read-only preview, and requires Edit
+  system prompt to change it. Done editing system prompt returns to the read-only
+  preview without collapsing. Posting instructions for each session stay in the
+  worker instructions when their text changes. Saving preserves both parts;
+  reopening collapses and locks the system prompt again. Edit as prompt during creation uses the same
+  separation. Unrecognized or ambiguous prompt formats remain fully editable
+  as a single Prompt field. Edits that remove the template signature or add
+  ambiguous section headings show a notice before saving as a single prompt.
+  The detail page also keeps the system prompt collapsed by default, with a
+  bounded read-only preview when expanded; use Edit automation to change it.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
   browsing again; saved paths and sandbox setup are preserved. When the default
@@ -38,8 +49,12 @@ to customize.
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
   failures still allow Default.
-- `capabilities`: Jira, Slack, and GitHub templates require session continuity
+- `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
+- `tools-note`: the form says which tools the agent needs where the task runs,
+  except on an Arclet sandbox, which already has them. Neither the template form
+  nor editing a task saved from one shows the Session choice; templates always
+  keep one session, and editing keeps only the reset to a new session.
 - `responsive`: gallery items have icons, descriptions, hourly polling summaries,
   access requirements, pointer cursors, and keyboard focus indicators. Desktop
   uses two columns; narrow screens use one.
@@ -65,11 +80,16 @@ to customize.
 
 Preconditions: enable session orchestration and scheduled-task session modes.
 Use the isolated environment and dismiss the first-visit introduction. The
-creation round-trip test supplies its own isolated host. No agent turn is needed.
+creation round-trip test supplies its own feature-enabled server and isolated
+host; run it with plain pytest and `--ui-skip-build` after building the SPA.
+No agent turn is needed.
 
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`
   covers the preview and Templates tab with reload. It creates
   a Jira automation and cross-checks the hourly schedule and prompt through REST.
+  It edits the user prompt through the row menu and the system prompt through
+  the detail page, checks persistence through REST, and reopens the editor. The
+  preview entry runs at mobile width; the Templates entry runs at desktop width.
 - `web/src/pages/TasksPage.test.tsx` covers populated and empty lists, search and
   filter preservation, deep links with an embedded mount prefix, load failures,
   capability gating, and both creation buttons' paths.
@@ -78,6 +98,8 @@ creation round-trip test supplies its own isolated host. No agent turn is needed
   saved workspace, and sandbox creation with offline connected hosts. It also
   covers repository/default selections, legacy edits, target switching, and
   continued-session setting locks, plus Random worktree on/off in the shared modal.
+  Prompt coverage includes expansion before explicit editing, preserving the
+  system prompt on user-only edits, discarding canceled edits, and Edit as prompt.
 - `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
   uses its own built-SPA browser contract, with a synthetic provider catalog,
   to cover repository creation, replacement, clearing, and reopening on desktop
