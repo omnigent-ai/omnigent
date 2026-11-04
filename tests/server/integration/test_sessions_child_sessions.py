@@ -2650,3 +2650,144 @@ async def test_side_chat_settings_support_follows_parent_runner_handshake(
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["side_chat_settings_supported"] is True
     assert recovered.json()["reasoning_effort"] == "low"
+
+
+# ── ?descendants=true ────────────────────────────────────
+
+
+def _seed_tree(conv_store: SqlAlchemyConversationStore, root_id: str) -> dict[str, str]:
+    """Seed ``root → a, b``; ``a → a1 → a2 → a3`` and return name → id.
+
+    :param conv_store: Store for the child conversations.
+    :param root_id: Top-level session the tree hangs off.
+    :returns: Ids of the seeded sub-agents by short name.
+    """
+    ids: dict[str, str] = {"root": root_id}
+    for name, parent in [("a", "root"), ("b", "root"), ("a1", "a"), ("a2", "a1"), ("a3", "a2")]:
+        ids[name] = _seed_child(
+            conv_store=conv_store, parent_id=ids[parent], title=f"worker:{name}"
+        ).id
+    return ids
+
+
+async def _walk_levels(
+    client: httpx.AsyncClient, session_id: str, max_depth: int
+) -> list[tuple[str, str]]:
+    """Walk the tree one ``child_sessions`` call per node, like older clients.
+
+    :param client: The test HTTP client.
+    :param session_id: Session to walk below.
+    :param max_depth: Levels to walk.
+    :returns: ``(id, parent_session_id)`` in breadth-first order.
+    """
+    rows: list[tuple[str, str]] = []
+    frontier = [session_id]
+    for _ in range(max_depth):
+        next_frontier: list[str] = []
+        for node in frontier:
+            resp = await client.get(f"/v1/sessions/{node}/child_sessions")
+            assert resp.status_code == 200
+            for row in resp.json()["data"]:
+                rows.append((row["id"], row["parent_session_id"]))
+                next_frontier.append(row["id"])
+        frontier = next_frontier
+    return rows
+
+
+async def test_child_sessions_descendants_returns_the_subtree_in_walk_order(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """One request returns what a per-level walk would, in the same order.
+
+    Failure means the CLI tree, which switches to this request, shows a
+    different hierarchy or order than before.
+    """
+    session = await _create_parent_session(client)
+    ids = _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/child_sessions", params={"descendants": "true"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    rows = [(row["id"], row["parent_session_id"]) for row in body["data"]]
+    assert rows == await _walk_levels(client, session["id"], 3)
+    depths = {row["id"]: row["depth"] for row in body["data"]}
+    # a3 is four levels down, past the default depth of 3.
+    assert depths == {ids["a"]: 1, ids["b"]: 1, ids["a1"]: 2, ids["a2"]: 3}
+    assert body["has_more"] is False
+    assert body["first_id"] == body["data"][0]["id"]
+    assert body["last_id"] == body["data"][-1]["id"]
+
+
+async def test_child_sessions_descendants_from_a_sub_agent_excludes_its_siblings(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Asking below a sub-agent returns only that sub-agent's subtree."""
+    session = await _create_parent_session(client)
+    ids = _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{ids['a']}/child_sessions", params={"descendants": "true"}
+    )
+    assert resp.status_code == 200
+
+    rows = [(row["id"], row["parent_session_id"], row["depth"]) for row in resp.json()["data"]]
+    assert rows == [(ids["a1"], ids["a"], 1), (ids["a2"], ids["a1"], 2), (ids["a3"], ids["a2"], 3)]
+
+
+async def test_child_sessions_descendants_honours_max_depth_and_limit(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``max_depth`` stops the walk; ``limit`` cuts it and reports ``has_more``."""
+    session = await _create_parent_session(client)
+    ids = _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+    url = f"/v1/sessions/{session['id']}/child_sessions"
+
+    shallow = (await client.get(url, params={"descendants": "true", "max_depth": 1})).json()
+    assert {row["id"] for row in shallow["data"]} == {ids["a"], ids["b"]}
+    assert shallow["has_more"] is False
+
+    deep = (await client.get(url, params={"descendants": "true", "max_depth": 10})).json()
+    assert ids["a3"] in {row["id"] for row in deep["data"]}
+
+    cut = (await client.get(url, params={"descendants": "true", "limit": 2})).json()
+    assert len(cut["data"]) == 2
+    assert cut["has_more"] is True
+
+
+async def test_child_sessions_descendants_ignores_other_trees(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Sub-agents of another session never show up in this session's subtree."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    first = await _create_parent_session(client, agent_name="agent-one")
+    second = await _create_parent_session(client, agent_name="agent-two")
+    mine = _seed_child(conv_store=conv_store, parent_id=first["id"], title="worker:mine")
+    _seed_child(conv_store=conv_store, parent_id=second["id"], title="worker:theirs")
+
+    resp = await client.get(
+        f"/v1/sessions/{first['id']}/child_sessions", params={"descendants": "true"}
+    )
+
+    assert [row["id"] for row in resp.json()["data"]] == [mine.id]
+
+
+async def test_child_sessions_without_descendants_leaves_depth_unset(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The default one-level listing has no ``depth``, which is how clients
+    tell a server that ignored ``descendants=true`` apart from one that
+    honoured it."""
+    session = await _create_parent_session(client)
+    _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+
+    assert [row["depth"] for row in resp.json()["data"]] == [None, None]
