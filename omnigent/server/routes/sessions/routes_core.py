@@ -293,6 +293,8 @@ def _require_attachment_compatible_history(
     file_store: FileStore | None,
     *,
     up_to_response_id: str | None = None,
+    before_item_id: str | None = None,
+    target_harness: str | None = None,
 ) -> str | None:
     """Reject a target that cannot replay files in the retained transcript.
 
@@ -301,17 +303,26 @@ def _require_attachment_compatible_history(
     :param conversation_store: Store containing the ordered source history.
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :param before_item_id: Exclusive cutoff, e.g. ``"msg_abc"``.
+    :param target_harness: The harness the target runs when it isn't the
+        agent's declared one, e.g. a continuation's ``"claude-native"`` override.
     :returns: A retained filesystem attachment's name, or ``None``.
     :raises OmnigentError: If the target cannot open a referenced attachment.
     """
     from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
 
     filename = _filesystem_attachment_in_history(
-        session_id, conversation_store, file_store, up_to_response_id=up_to_response_id
+        session_id,
+        conversation_store,
+        file_store,
+        up_to_response_id=up_to_response_id,
+        before_item_id=before_item_id,
     )
     if filename is not None:
-        native = _native_coding_agent_for_agent(target_agent)
-        if native is None or native.harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
+        if target_harness is None:
+            native = _native_coding_agent_for_agent(target_agent)
+            target_harness = native.harness if native is not None else None
+        if target_harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
             raise OmnigentError(
                 f"This history includes '{filename}', which requires "
                 "Claude Code or Codex. Choose one of those harnesses, "
@@ -4201,6 +4212,15 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
 
+        # A continuation keeps running the source's effective harness, which a
+        # per-session override can make native while the agent declares SDK.
+        continuation_harness = (
+            await asyncio.to_thread(
+                _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+            )
+            if continue_source
+            else None
+        )
         await asyncio.to_thread(
             _require_attachment_compatible_history,
             source_id,
@@ -4208,6 +4228,8 @@ def register_core_routes(
             conversation_store,
             file_store,
             up_to_response_id=body.up_to_response_id,
+            before_item_id=before_item_id,
+            target_harness=continuation_harness,
         )
 
         # Cross-user forks copy the agent (bundle under the copy's id) so its owner
@@ -4385,12 +4407,7 @@ def register_core_routes(
             _agent_carries_native_fork_history, base_agent
         )
         if continue_source and not carry_history_into_native:
-            # A continuation runs the source's effective harness, which a
-            # per-session override can make native while the agent declares SDK.
-            effective_harness = await asyncio.to_thread(
-                _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
-            )
-            carry_history_into_native = effective_harness in _FORK_HISTORY_NATIVE_HARNESSES
+            carry_history_into_native = continuation_harness in _FORK_HISTORY_NATIVE_HARNESSES
         # The source's native session id is only resumable by a target in the
         # SAME provider family — a Claude target can't clone a Codex rollout.
         # Cross-family, the store must skip the fork-source directive so the
