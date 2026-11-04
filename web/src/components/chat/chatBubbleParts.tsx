@@ -471,18 +471,25 @@ export function WorkingIndicator() {
   const tick = useWorkingLabelTick();
   // Background shells outliving a finished turn keep the session in progress,
   // but the agent isn't thinking: show a plain spinner instead of the shimmer.
-  // The composer pill already announces count changes, so no live region here.
+  // The main composer's pill announces the count; side chats have no pill.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
     const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
     return (
-      <Message from="assistant" data-testid="background-tasks-indicator">
-        <MessageContent>
-          <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
-            <RunningDot className="size-3.5" />
-            <span className="text-sm font-mono">{label}</span>
-          </div>
-        </MessageContent>
-      </Message>
+      <>
+        {scopedConversationId && (
+          <span role="status" aria-live="polite" className="sr-only">
+            {label}
+          </span>
+        )}
+        <Message from="assistant" data-testid="background-tasks-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
+              <RunningDot className="size-3.5" />
+              <span className="text-sm font-mono">{label}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
     );
   }
   const label = workingIndicatorLabel(tick, blockedOn, {

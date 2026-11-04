@@ -184,6 +184,9 @@ describe("WorkingIndicator", () => {
       "2 background tasks running",
     );
     expect(screen.getByTestId("running-dot")).toBeInTheDocument();
+    // The composer pill owns the announcement; the transcript log must not repeat it.
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.queryByRole("status")).toBeNull();
 
     act(() => useChatStore.setState({ sessionStatus: "running" }));
     rerender(<WorkingIndicator />);
