@@ -26,6 +26,7 @@ import pytest
 from omnigent.runner import mcp_execution_registry as mcp_execution_registry_mod
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
+    MCP_INITIAL_STEP,
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     McpExecutionRegistry,
@@ -95,6 +96,39 @@ def _json_resp(data: dict[str, Any], status: int = 200) -> httpx.Response:
     )
 
 
+def _approval_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
+    """Build the server's policy approval prompt for a tool call.
+
+    :param elicitation_id: Server-issued elicitation id, e.g. ``"elicit_1"``.
+    :param request_state: Opaque state the approved retry must echo.
+    :param rpc_id: JSON-RPC id of the request being answered.
+    :returns: An ``input_required`` JSON-RPC response.
+    """
+    return _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": {
+                "resultType": "input_required",
+                "inputRequests": {
+                    elicitation_id: {
+                        "method": "elicitation/create",
+                        "params": {
+                            "message": "Approve shell command?",
+                            "requestedSchema": {
+                                "type": "object",
+                                "properties": {"approved": {"type": "boolean"}},
+                                "required": ["approved"],
+                            },
+                        },
+                    }
+                },
+                "requestState": request_state,
+            },
+        }
+    )
+
+
 def _make_spec(*names: str) -> AgentSpec:
     """Build an AgentSpec with one HTTP MCPServerConfig per name.
 
@@ -129,17 +163,33 @@ def _make_manager(transport: _StubTransport) -> ProxyMcpManager:
 
 
 class _RetainedOperationTransport(httpx.AsyncBaseTransport):
-    """Proxy whose every request delivers its operation through the runner registry.
+    """Proxy that delivers one tool operation across repeated requests.
 
     :param registry: Registry that deduplicates the operation across requests.
-    :param first_reply: ``"detached"`` answers the first request with the detach
-        error; ``"held"`` leaves it unanswered until ``release_first_reply`` is set.
+    :param first_reply: ``"detached"`` answers the first executed request with the
+        detach error; ``"held"`` leaves it unanswered until ``release_first_reply``
+        is set.
+    :param execution: ``"final"`` retains the tool result on the runner,
+        ``"input_required"`` retains a request for external input, and
+        ``"server"`` runs the tool on the server without a runner entry.
+    :param approval_id: When set, requests without ``requestState`` get a policy
+        approval prompt with this elicitation id instead of executing.
     """
 
-    def __init__(self, registry: McpExecutionRegistry, *, first_reply: str) -> None:
+    def __init__(
+        self,
+        registry: McpExecutionRegistry,
+        *,
+        first_reply: str,
+        execution: str = "final",
+        approval_id: str | None = None,
+    ) -> None:
         self._registry = registry
         self._first_reply = first_reply
+        self._execution = execution
+        self._approval_id = approval_id
         self.calls: list[_Call] = []
+        self.executed_requests = 0
         self.external_invocations = 0
         self.first_request_executed = asyncio.Event()
         self.release_first_reply = asyncio.Event()
@@ -147,19 +197,29 @@ class _RetainedOperationTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.calls.append(_Call(url=str(request.url), body=body))
-        is_first = len(self.calls) == 1
+        params = body["params"]
+        if self._approval_id is not None and "requestState" not in params:
+            return _approval_required(self._approval_id, "approval-state", body["id"])
+        self.executed_requests += 1
+        is_first = self.executed_requests == 1
+        content: dict[str, Any] = {"result": {"output": "retained"}}
+        if self._execution == "input_required":
+            content = {"result": {"input_required": {"inputRequests": {}, "requestState": "s"}}}
 
         async def _retained_work() -> McpExecutionResult:
             self.external_invocations += 1
-            return McpExecutionResult(status_code=200, content={"result": {"output": "retained"}})
+            return McpExecutionResult(status_code=200, content=content)
 
-        await self._registry.execute(
-            session_id="conv_test",
-            operation_id=body["params"][MCP_OPERATION_ID_PARAM],
-            step="initial",
-            params={"name": body["params"]["name"], "arguments": {}},
-            run=_retained_work,
-        )
+        if self._execution == "server":
+            self.external_invocations += 1
+        else:
+            await self._registry.execute(
+                session_id="conv_test",
+                operation_id=params[MCP_OPERATION_ID_PARAM],
+                step=MCP_INITIAL_STEP,
+                params={"name": params["name"], "arguments": {}},
+                run=_retained_work,
+            )
         if is_first:
             self.first_request_executed.set()
             if self._first_reply == "detached":
@@ -436,35 +496,10 @@ async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
     old_elicitation = "elicit_old_server"
     new_elicitation = "elicit_new_server"
 
-    def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
-        return _json_resp(
-            {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": {
-                    "resultType": "input_required",
-                    "inputRequests": {
-                        elicitation_id: {
-                            "method": "elicitation/create",
-                            "params": {
-                                "message": "Approve shell command?",
-                                "requestedSchema": {
-                                    "type": "object",
-                                    "properties": {"approved": {"type": "boolean"}},
-                                    "required": ["approved"],
-                                },
-                            },
-                        }
-                    },
-                    "requestState": request_state,
-                },
-            }
-        )
-
     transport = _StubTransport(
         [
-            _input_required(old_elicitation, "old-state", 1),
-            _input_required(new_elicitation, "new-state", 2),
+            _approval_required(old_elicitation, "old-state", 1),
+            _approval_required(new_elicitation, "new-state", 2),
             _json_resp(
                 {
                     "jsonrpc": "2.0",
@@ -530,11 +565,7 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     pending_approvals.reset_for_tests()
     task = asyncio.create_task(manager.call_tool(None, "github__deploy", {}))
     try:
-        for _ in range(1000):
-            if pending_approvals._server_reconnect_waiters:
-                break
-            await asyncio.sleep(0.001)
-        assert pending_approvals._server_reconnect_waiters
+        await asyncio.wait_for(transport.first_request_executed.wait(), timeout=5.0)
         clock = 2.0
         pending_approvals.notify_server_reconnect()
 
@@ -622,6 +653,56 @@ async def test_call_tool_keeps_reply_that_arrives_after_server_reconnect() -> No
         pending_approvals.reset_for_tests()
 
     assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("execution", "approval_id"),
+    [
+        pytest.param("server", None, id="server-executed"),
+        pytest.param("input_required", None, id="external-input-pending"),
+        pytest.param("final", "elicit_approval", id="approved-retry"),
+    ],
+)
+async def test_call_tool_keeps_server_owned_request_across_server_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    execution: str,
+    approval_id: str | None,
+) -> None:
+    """A reconnect re-issues nothing the runner cannot answer from its own result."""
+    from omnigent.runner import proxy_mcp_manager
+
+    monkeypatch.setattr(proxy_mcp_manager, "_SERVER_REPLY_GRACE_S", 0.0)
+    registry = McpExecutionRegistry()
+    transport = _RetainedOperationTransport(
+        registry, first_reply="held", execution=execution, approval_id=approval_id
+    )
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
+    try:
+        if approval_id is not None:
+            await poll_until_async(lambda: approval_id in pending_approvals._pending)
+            assert pending_approvals.resolve(approval_id, approved=True)
+        await asyncio.wait_for(transport.first_request_executed.wait(), timeout=5.0)
+        pending_approvals.notify_server_reconnect()
+        await poll_until_async(lambda: not pending_approvals._server_reconnect_waiters)
+        transport.release_first_reply.set()
+
+        assert await asyncio.wait_for(task, timeout=5.0) == "first reply"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.executed_requests == 1
+    assert transport.external_invocations == 1
 
 
 @pytest.mark.asyncio

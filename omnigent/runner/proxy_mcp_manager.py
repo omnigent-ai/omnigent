@@ -36,6 +36,7 @@ import httpx
 from omnigent.debug_logging import debug_event
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
+    MCP_INITIAL_STEP,
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     McpExecutionRegistry,
@@ -62,30 +63,36 @@ def _json_object(value: object) -> _JsonObject | None:
 async def _reply_unless_server_replaced(
     request: Awaitable[httpx.Response],
     after_generation: int,
+    runner_holds_final_result: Callable[[], Awaitable[bool]],
 ) -> httpx.Response | None:
     """
     Await a proxy reply, or return ``None`` if it is still missing after a reconnect.
 
     A front door can hold the old server's request open across a restart, so the
-    reconnect alone never ends it. A server that survived the reconnect answers
-    within the grace period, so its reply is kept instead of being re-requested.
+    reconnect alone never ends it. Only a request the runner can answer from its
+    own final result is re-issued, after a grace period for a surviving server.
 
     :param request: The pending proxy POST.
     :param after_generation: Server generation the request was sent to.
+    :param runner_holds_final_result: Waits for the runner's execution of this
+        request and returns whether it produced the final tool result.
     :returns: The reply, or ``None`` when the caller should re-issue the request.
     """
 
-    async def _reconnected_without_reply() -> None:
+    async def _reconnected_without_reply() -> bool:
         await pending_approvals.wait_for_server_reconnect(
             after_generation, timeout_seconds=MCP_PROXY_CALL_TIMEOUT_S
         )
+        if not await runner_holds_final_result():
+            return False
         await asyncio.sleep(_SERVER_REPLY_GRACE_S)
+        return True
 
     reply = asyncio.ensure_future(request)
     replaced = asyncio.ensure_future(_reconnected_without_reply())
     try:
         await asyncio.wait({reply, replaced}, return_when=asyncio.FIRST_COMPLETED)
-        if reply.done() or replaced.exception() is not None:
+        if reply.done() or replaced.exception() is not None or not replaced.result():
             return await reply
         return None
     finally:
@@ -343,6 +350,23 @@ class ProxyMcpManager:
 
         return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures={})
 
+    async def _runner_holds_final_result(self, operation_id: str) -> bool:
+        """Wait for this runner's execution of a call; return whether it finished the tool.
+
+        A call the server executes itself, or one awaiting external input, has
+        no final runner result and stays with the server handling it.
+        """
+        registry = self._execution_registry
+        if registry is None:
+            return False
+        retained = await registry.wait_for_step_result(
+            self._session_id, operation_id, MCP_INITIAL_STEP
+        )
+        if retained is None:
+            return False
+        result = _json_object(retained.content.get("result"))
+        return result is None or "input_required" not in result
+
     async def call_tool(
         self,
         spec: AgentSpec | None,
@@ -520,15 +544,15 @@ class ProxyMcpManager:
                         pool=10.0,
                     ),
                 )
-                registry = self._execution_registry
-                if (
-                    managed
-                    or registry is None
-                    or not registry.has_operation(self._session_id, operation_id)
-                ):
+                # An approved retry carries approval state only its issuing server holds.
+                if managed or self._execution_registry is None or approval_retries:
                     resp = await request
                 else:
-                    resp = await _reply_unless_server_replaced(request, request_generation)
+                    resp = await _reply_unless_server_replaced(
+                        request,
+                        request_generation,
+                        lambda: self._runner_holds_final_result(operation_id),
+                    )
                     if resp is None:
                         _record_failure(
                             None,

@@ -94,6 +94,7 @@ from omnigent.policies.types import (
 )
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.runner.mcp_execution_registry import (
+    MCP_INITIAL_STEP,
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
@@ -12905,7 +12906,7 @@ async def _handle_mcp_tools_call(
                 f"/v1/sessions/{session_id}/mcp/execute",
                 json=_runner_execute_body(
                     {"name": namespaced_name, "arguments": arguments},
-                    step="initial",
+                    step=MCP_INITIAL_STEP,
                 ),
                 # ``sys_session_send`` returns a launch handle immediately; this
                 # timeout now protects ordinary runner proxy hangs.
