@@ -166,22 +166,27 @@ describe("side-chat working indicator", () => {
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
   });
 
-  it("shows and announces the child's background tasks after its turn ends", () => {
+  it.each([
+    { name: "after a reply", blocks: true },
+    { name: "with no visible bubbles", blocks: false },
+  ])("shows and announces the child's background tasks $name", ({ blocks }) => {
     renderPane(<SideChatPane childId={childId} />);
     act(() =>
       conversationRegistry.acquire(childId).setState({
         sessionStatus: "idle",
         backgroundTaskCount: 2,
-        blocks: itemsToBlocks([
-          {
-            id: "started",
-            response_id: "turn_started",
-            type: "message",
-            role: "assistant",
-            status: "completed",
-            content: [{ type: "output_text", text: "Started the build in the background." }],
-          },
-        ]),
+        blocks: blocks
+          ? itemsToBlocks([
+              {
+                id: "started",
+                response_id: "turn_started",
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: "Started the build in the background." }],
+              },
+            ])
+          : [],
       }),
     );
 

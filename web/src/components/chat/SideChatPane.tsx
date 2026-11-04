@@ -304,7 +304,12 @@ export function SideChatPane({
   }, []);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
-  const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
+  const isEmpty =
+    bubbles.length === 0 &&
+    !loadingConversation &&
+    !loadFailed &&
+    !showsWorking &&
+    !showsBackgroundTasks;
 
   const startSideChat = async (text: string) => {
     if (!onStart) return;
