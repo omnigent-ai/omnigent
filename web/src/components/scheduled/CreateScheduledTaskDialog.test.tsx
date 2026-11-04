@@ -2444,7 +2444,8 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     return mutateAsync.mock.calls[0][0].prompt;
   }
 
-  it("replaces the prompt with a trigger builder, runs hourly and keeps one session", () => {
+  it("replaces the prompt with a trigger builder, runs hourly and keeps one session", async () => {
+    const user = userEvent.setup();
     const { onOpenChange } = renderTrigger("jira");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
@@ -2462,9 +2463,14 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.queryByRole("tooltip")).toBeNull();
     expect(screen.getByTestId("task-trigger-untrusted-note")).toBeVisible();
     expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveClass("text-destructive");
-    // Touch focuses the trigger before delivering its click.
     const warningsButton = screen.getByRole("button", { name: "Session instructions warnings" });
+    await user.hover(warningsButton);
+    expect(await screen.findByRole("tooltip")).toBeInTheDocument();
+    fireEvent.keyDown(warningsButton, { key: "Escape" });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    // Focus alone opens it; the following touch click must keep it open.
     fireEvent.focus(warningsButton);
+    expect(screen.getByRole("tooltip")).toBeInTheDocument();
     fireEvent.click(warningsButton);
     expect(screen.getByRole("tooltip")).toBeInTheDocument();
     // The source and account warnings stay visible outside the tooltip.

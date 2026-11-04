@@ -384,6 +384,14 @@ describe("renderTriggerPrompt", () => {
       expect(freeTextOnly).toContain("All of these conditions must match:");
       expect(freeTextOnly).not.toContain("Every top-level message counts.");
       expect(freeTextOnly).not.toContain("Every issue counts.");
+      if (source === "slack") {
+        expect(freeTextOnly).toContain(
+          "Check each message against the free-text conditions below.",
+        );
+      }
+      if (source === "linear") {
+        expect(freeTextOnly).toContain("Check each issue against the free-text conditions below.");
+      }
     },
   );
 
