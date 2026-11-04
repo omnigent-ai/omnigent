@@ -1292,6 +1292,45 @@ class TestProviderManagedProfiles:
         assert replacement is not None
         assert (replacement.sandbox_id != host.sandbox_id) is gone
 
+    async def test_offline_clear_continuation_keeps_the_accepted_profile(
+        self, env: _Env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A claude-sdk ``/clear`` with no live runner hands on the sandbox profile.
+
+        The continuation is bound to the source's host alone, so it must carry
+        the accepted reference itself: after the source is deleted it still
+        wakes the sandbox.
+        """
+        source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+        source = env.conversations.get_conversation(source_id)
+        assert source is not None and source.host_id is not None
+        snapshot = env.catalog.get_session_snapshot(source_id)
+        assert snapshot is not None
+        monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda *_a, **_k: "claude-sdk")
+        monkeypatch.setattr(sessions_routes, "_get_runner_client", AsyncMock(return_value=None))
+
+        cleared = await env.client.post(
+            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+        )
+
+        assert cleared.status_code == 202, cleared.text
+        continuation_id = cleared.json()["session_id"]
+        continuation = env.conversations.get_conversation(continuation_id)
+        assert continuation is not None
+        assert (continuation.host_id, continuation.runner_id) == (source.host_id, None)
+        assert env.catalog.get_session_snapshot(continuation_id) == snapshot
+
+        deleted = await env.client.delete(f"/v1/sessions/{source_id}")
+        assert deleted.status_code == 200, deleted.text
+        env.recording.selections.clear()
+        await env.wake(continuation_id)
+
+        launch = env.app.state.managed_launches.get(continuation_id)
+        assert launch is None, launch.error
+        assert env.recording.selections
+        woken = env.conversations.get_conversation(continuation_id)
+        assert woken is not None and woken.host_id == source.host_id
+
     @pytest.mark.parametrize("failure", ["revoked", "revision-retired", "unavailable"])
     async def test_wake_denial_prevents_resume_and_allocation(
         self, env: _Env, failure: str

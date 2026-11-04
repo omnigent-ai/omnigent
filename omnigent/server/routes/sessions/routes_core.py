@@ -4681,6 +4681,13 @@ def register_core_routes(
                         source.workspace,
                         source.git_branch,
                     )
+                    profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+                    if profile_catalog is not None:
+                        # Adopt and reauthorize the sandbox's accepted profile
+                        # now, so the fork can wake it even with no runner.
+                        await asyncio.to_thread(
+                            profile_catalog.require_session_host, fork.id, source.host_id
+                        )
                 if runner_online:
                     assert source.runner_id is not None and runner_router is not None
                     try:
