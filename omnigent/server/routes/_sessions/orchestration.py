@@ -53,6 +53,7 @@ from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
+    HARNESS_TMUX_UNAVAILABLE,
     HARNESS_VERSION_TOO_LOW,
 )
 from omnigent.harnesses.claude_native import PEER_MESSAGE_WAKE_KIND, PEER_MESSAGE_WAKE_TEXT
@@ -127,6 +128,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
+from omnigent.scheduled_context import scheduled_run_scope
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -439,6 +441,7 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
 
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
@@ -876,9 +879,11 @@ async def _stop_host_runner_intentionally(
             if handle is not None and handle.runner_id != runner_id:
                 continue
             live_status = _session_status_cache.get(related_id, persisted_status)
-            # Completed work and earlier task failures keep their existing outcome.
+            # Earlier task failures keep their outcome. An idle session without a
+            # relay is covered too: the exiting runner can still publish its activity.
             if related_id != session_id and live_status not in (*_MID_TURN_STATUSES, None):
-                continue
+                if live_status != "idle" or handle is not None:
+                    continue
             stop_targets.add(related_id)
             if _intentional_stop_sessions.get(related_id) != runner_id:
                 marked.add(related_id)
@@ -8175,7 +8180,7 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 failure_context=ensure_outcome.failure_context,
             )
-            return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+            return _SessionEventDispatchResult(item_id=item_id, pending_id=None, accepted=False)
         if ensure_outcome.policy_notice is not None:
             # Terminal is up but policy enforcement is off (fail-open). Post
             # a durable, non-fatal banner; the user message still forwards.
@@ -8257,7 +8262,7 @@ async def _dispatch_session_event_to_runner_impl(
         if startup_input is not None and not await startup_input.claim(
             conversation_store, session_id
         ):
-            return _SessionEventDispatchResult(item_id=None, pending_id=None)
+            return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -8474,7 +8479,7 @@ async def _dispatch_session_event_to_runner_impl(
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
-        return _SessionEventDispatchResult(item_id=None, pending_id=None)
+        return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
     item_id = await _forward_event_to_runner(
         session_id,
         conv,
@@ -8514,7 +8519,8 @@ _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 _MID_TURN_STATUSES = ("running", "waiting")
 # A laptop that sleeps or loses its network takes its runner with it and often
 # resumes the turn hours later, so a turn interrupted that way waits this long.
-HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
+# Three days covers a laptop closed over a weekend.
+HOST_OFFLINE_HOLD_S: float = 72 * 3600.0
 # How often a host-offline hold re-checks whether the host came back.
 HOST_OFFLINE_RECHECK_S: float = 60.0
 
@@ -10096,7 +10102,7 @@ def _ensure_runner_relay(
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
     relay_store = cast(ConversationStore, conversation_store)
-    with runner_log_scope(session_id, runner_id):
+    with scheduled_run_scope(None, session_id=session_id), runner_log_scope(session_id, runner_id):
         task = asyncio.create_task(
             _relay_runner_stream(
                 session_id,
@@ -10757,10 +10763,17 @@ def _native_subagent_wrapper_labels(
 
 
 # Host readiness values that mean the native CLI cannot launch. A routed
-# session landing on a missing or unauthenticated binary would fail to open its
-# terminal, so those harnesses are never offered to Smart Routing.
+# session landing on a missing or unauthenticated binary, or on a host without a
+# usable tmux, would fail to open its terminal, so those harnesses are never
+# offered to Smart Routing.
 _NATIVE_UNAVAILABLE_READINESS: frozenset[object] = frozenset(
-    {False, HARNESS_BINARY_MISSING, HARNESS_NEEDS_AUTH, HARNESS_VERSION_TOO_LOW}
+    {
+        False,
+        HARNESS_BINARY_MISSING,
+        HARNESS_NEEDS_AUTH,
+        HARNESS_VERSION_TOO_LOW,
+        HARNESS_TMUX_UNAVAILABLE,
+    }
 )
 
 
@@ -10786,6 +10799,24 @@ def _installed_native_harnesses(host: Host | None) -> list[str]:
         for harness in AUTO_NATIVE_ROUTING_HARNESSES
         if harness in readiness and readiness[harness] not in _NATIVE_UNAVAILABLE_READINESS
     ]
+
+
+def _no_native_candidate_error(host: Host | None) -> str:
+    """Explain why *host* offers Smart Routing no native candidate.
+
+    :param host: The session's target host, or ``None``.
+    :returns: The tmux remedy when an installed CLI is blocked only by tmux,
+        else the generic "no native CLI" message.
+    """
+    from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
+
+    readiness = (getattr(host, "configured_harnesses", None) if host is not None else None) or {}
+    if any(readiness.get(h) == HARNESS_TMUX_UNAVAILABLE for h in AUTO_NATIVE_ROUTING_HARNESSES):
+        return (
+            f"Native CLIs on this host need tmux {MIN_TMUX_VERSION_HINT} or newer. "
+            "Install or upgrade tmux on the host, then check the harness again."
+        )
+    return "No native CLI is installed on this host."
 
 
 def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -> list[str]:
@@ -11402,7 +11433,7 @@ async def _resolve_native_smart_routing(
     backed = not ungatewayed
     installed = _installed_native_harnesses(host)
     if not installed:
-        return None, None, None, "No native CLI is installed on this host."
+        return None, None, None, _no_native_candidate_error(host)
 
     # Choosing BETWEEN native panes belongs to the workspace router: its menu is
     # what ranks two CLIs against one task, and the pick is baked into the
@@ -11474,6 +11505,7 @@ async def _create_session_from_existing_agent(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     project_store: ProjectStore | None = None,
     created_by_session_id: str | None = None,
+    created_by_project_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -11504,6 +11536,8 @@ async def _create_session_from_existing_agent(
         to the runner.
     :param artifact_store: Optional binary content store for the same.
     :param created_by_session_id: Server-authorized source of an independent worker.
+    :param created_by_project_id: That source's project. A worker whose request names
+        no project is filed there, so it sits beside the session that started it.
     :returns: The newly created session snapshot and its conversation row.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -11519,6 +11553,21 @@ async def _create_session_from_existing_agent(
         project_store=project_store,
     )
     body = project_resolution.body
+    project_id = project_resolution.project_id
+    if (
+        project_id is None
+        and created_by_project_id is not None
+        and "project_id" not in body.model_fields_set
+        and project_store is not None
+    ):
+        # Only the filing carries over, not the project's agent or workspace
+        # defaults: the worker keeps the placement its source asked for. A
+        # project deleted since leaves the worker unfiled.
+        source_project = await asyncio.to_thread(
+            project_store.get, created_by_project_id, user_id=user_id
+        )
+        if source_project is not None:
+            project_id = created_by_project_id
     creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
     assert body.agent_id is not None
 
@@ -12143,7 +12192,7 @@ async def _create_session_from_existing_agent(
                 workspace=canonical_workspace,
                 git_branch=git_branch,
                 terminal_launch_args=validated_launch_args,
-                project_id=project_resolution.project_id,
+                project_id=project_id,
                 labels=initial_labels or None,
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
@@ -13424,8 +13473,8 @@ async def _probe_runner_live_status(
     Ask a session's bound runner for its live status, bounded, shared, and backed off.
 
     Concurrent snapshots of one session await the same in-flight probe. A 200
-    records the status in ``_session_status_cache``; a probe that timed out,
-    failed in transport, or answered slowly without a status puts the session
+    fills ``_session_status_cache`` only if no live event has filled it meanwhile.
+    A timeout, transport failure, or slow reply without a status puts the session
     in a skip window that doubles per consecutive slow probe.
 
     :param runner_client: HTTP client pointed at the session's runner.
@@ -13433,8 +13482,9 @@ async def _probe_runner_live_status(
     :param runner_id: The session's bound runner, e.g.
         ``"runner_0123456789abcdef"``. A skip window recorded against a
         different runner is discarded so a rebound session is probed at once.
-    :returns: The runner's raw status, e.g. ``"running"``, or ``None`` when the
-        probe is in backoff, timed out, failed, or returned a non-200.
+    :returns: The newer cached status or the runner's raw status, e.g.
+        ``"running"``, or ``None`` when the probe is in backoff, timed out,
+        failed, or returned a non-200.
     """
     probe = _runner_status_probe_inflight.get(session_id)
     if probe is None:
@@ -13459,7 +13509,8 @@ async def _run_runner_status_probe(
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param runner_id: The session's bound runner, recorded with any skip window.
-    :returns: The runner's raw status on a 200, else ``None``.
+    :returns: The newer cached status or the runner's raw status on a 200,
+        else ``None``.
     """
     started = time.monotonic()
     try:
@@ -13482,6 +13533,12 @@ async def _run_runner_status_probe(
                 except ValueError:
                     payload = None
                 if isinstance(payload, dict):
+                    # Probes fill a cold cache; a turn edge received while the
+                    # request waited takes precedence over its sampled status.
+                    published_status = _session_status_cache.get(session_id)
+                    if published_status is not None:
+                        _runner_status_probe_backoff.pop(session_id, None)
+                        return published_status
                     raw = str(payload.get("status", "idle"))
                     _session_status_cache[session_id] = raw
                     if raw in ("idle", "running", "waiting", "failed"):
@@ -13662,11 +13719,8 @@ async def _get_session_snapshot(
             and _session_status_cache.get(session_id) is None
             and runner_client is not None
         ):
-            if (
-                await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
-                is not None
-            ):
-                status = _session_status_from_cache(session_id)
+            await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
+            status = _session_status_from_cache(session_id, conv.live_status)
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None

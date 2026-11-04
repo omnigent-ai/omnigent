@@ -40,6 +40,7 @@ export function TriggerTemplateFields({
   renderedPrompt,
   onEditAsPrompt,
   onSelectOpenChange,
+  toolsProvided = false,
 }: {
   source: TriggerSource;
   fields: TriggerFields;
@@ -50,6 +51,8 @@ export function TriggerTemplateFields({
   onEditAsPrompt: () => void;
   /** Forwarded to each Select so the dialog's dismiss guard knows one is open. */
   onSelectOpenChange: (open: boolean) => void;
+  /** Where the task runs already gives the agent the service's tools, so skip that warning. */
+  toolsProvided?: boolean;
 }) {
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
@@ -309,16 +312,18 @@ export function TriggerTemplateFields({
         )}
       </div>
 
-      <p
-        className="flex items-start gap-1.5 text-sm text-warning"
-        data-testid="task-trigger-tools-note"
-      >
-        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-        <span>
-          This only works if the agent has {template.toolsExample} where this task runs. Without
-          one, each run stops and says so in its reply.
-        </span>
-      </p>
+      {!toolsProvided && (
+        <p
+          className="flex items-start gap-1.5 text-sm text-warning"
+          data-testid="task-trigger-tools-note"
+        >
+          <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+          <span>
+            This only works if the agent has {template.toolsExample} where this task runs. Without
+            one, each run stops and says so in its reply.
+          </span>
+        </p>
+      )}
 
       <p
         className="flex items-start gap-1.5 text-sm text-warning"

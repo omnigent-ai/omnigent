@@ -21,6 +21,10 @@ on:
         description: Review even if this commit already has a completed review.
         default: false
         type: boolean
+      source_session_id:
+        description: Optional originating Omnigent session for usage attribution.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -119,6 +123,8 @@ jobs:
       cancel-in-progress: false
     env:
       OCR_NO_UPDATE: '1'
+      OMNIGENT_CI_PIPELINE: open-code-review
+      OMNIGENT_CI_SOURCE_SESSION_ID: ${{ inputs.source_session_id }}
     steps:
       - name: Resolve PR and skip reviewed commits
         id: pr
@@ -187,6 +193,13 @@ jobs:
             core.setOutput('base', pr.base.ref);
             core.setOutput('head', pr.head.sha);
 
+      - name: Check out trusted attribution helpers
+        if: steps.pr.outputs.head != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       - name: Check gateway configuration
         if: steps.pr.outputs.head != ''
         id: gateway
@@ -194,17 +207,20 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           REVIEW_MODEL: ${{ vars.OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL || vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OMNIGENT_CI_PR_NUMBER: ${{ needs.request.outputs.pr }}
+          OMNIGENT_CI_REVIEWED_SHA: ${{ steps.pr.outputs.head }}
         run: |
           set -euo pipefail
           : "${LLM_API_KEY:?Set the LLM_API_KEY repository secret}"
           : "${GATEWAY_BASE_URL:?Set the GATEWAY_BASE_URL repository secret}"
           : "${REVIEW_MODEL:?Set OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL or OMNIGENT_CI_ANTHROPIC_MODEL}"
-          gateway="${GATEWAY_BASE_URL%/}"
-          case "$gateway" in
-            */anthropic) ;;
-            *) gateway="${gateway}/anthropic" ;;
-          esac
-          echo "url=$gateway" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from omnigent.databricks_ai_gateway import ci_gateway_base_url
+          from dev.ci_usage import ocr_request_headers
+          print('url=' + ci_gateway_base_url(os.environ['GATEWAY_BASE_URL'], 'anthropic'))
+          print('headers=' + ocr_request_headers())
+          PY
 
       # The action checks out the trusted base and reads PR blobs through Git.
       # It never installs dependencies or executes code from the PR head.
@@ -219,6 +235,7 @@ jobs:
           llm_url: ${{ steps.gateway.outputs.url }}
           llm_auth_token: ${{ secrets.LLM_API_KEY }}
           llm_auth_header: Authorization
+          llm_extra_headers: ${{ steps.gateway.outputs.headers }}
           llm_use_anthropic: 'true'
           # The gateway model requires adaptive thinking; the action defaults to disabled.
           llm_extra_body: '{"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}}'
