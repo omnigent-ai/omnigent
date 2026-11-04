@@ -124,7 +124,10 @@ function scopeTail(rows: Conversation[], cursor: string | null | undefined) {
   try {
     const base64 = cursor.slice(TITLE_CURSOR_PREFIX.length).replace(/-/g, "+").replace(/_/g, "/");
     const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
-    const [key, id] = JSON.parse(new TextDecoder().decode(bytes)) as unknown[];
+    const decoded: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    // Destructuring would also split a string, so accept only a [key, id] pair.
+    if (!Array.isArray(decoded) || decoded.length !== 2) return rows.at(-1);
+    const [key, id] = decoded as unknown[];
     const base = rows.find((row) => row.id === id) ?? rows.at(-1);
     if (typeof key !== "string" || typeof id !== "string") return base;
     // The key is already folded, so titleSortKey(title) reproduces the token's position.

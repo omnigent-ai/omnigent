@@ -219,8 +219,15 @@ it("decodes server-issued Name tokens and ignores malformed ones", () => {
   const mergedIds = (cursor: string) =>
     mergeScopeRows(rows, shared, true, false, cursor, null, "title").rows.map((r) => r.id);
   expect(mergedIds(serverToken)).toEqual(["a", "e"]);
-  // Bad base64, non-JSON and non-string members bound at Mine's last row, like an unknown id.
-  for (const malformed of ["title.!!", "title.bm90IGpzb24", "title.WzEsMl0"]) {
+  // Bad base64, non-JSON, a string or three-member payload, and non-string members bound at
+  // Mine's last row, like an unknown id.
+  for (const malformed of [
+    "title.!!",
+    "title.bm90IGpzb24",
+    "title.ImFiIg",
+    "title.WyIwYSIsIngiLCJ5Il0",
+    "title.WzEsMl0",
+  ]) {
     expect(mergedIds(malformed)).toEqual(["a", "e", "o"]);
   }
 });
