@@ -164,7 +164,8 @@ _SPILL_RECORD_FAILURE = CodexStartupFailure(
 _SPILL_UNSUPPORTED_FAILURE = CodexStartupFailure(
     message="This Codex version cannot preserve a large paste in history; "
     "this message was not sent.",
-    remediation="Upgrade Codex to 0.154.0 or later, or attach the text as a file.",
+    remediation="Upgrade Codex to 0.154.0 or later and restart this native session after "
+    "current work finishes, or attach the text as a file.",
 )
 
 
