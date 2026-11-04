@@ -984,7 +984,7 @@ function ProjectFolderPaginationControl() {
       <SettingsLabel
         label={`Show project sessions ${PROJECT_FOLDER_PAGE_SIZE} at a time`}
         labelId={labelId}
-        description={`An expanded project folder lists its ${PROJECT_FOLDER_PAGE_SIZE} newest sessions and a Show more row for the rest. Turn this off to list every session in the folder, loading more as you scroll.`}
+        description={`An expanded project folder lists its first ${PROJECT_FOLDER_PAGE_SIZE} sessions and a Show more row for the rest. Turn this off to list every session in the folder, loading more as you scroll.`}
       />
       <Switch
         aria-labelledby={labelId}
