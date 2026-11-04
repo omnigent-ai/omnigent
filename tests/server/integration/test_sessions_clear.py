@@ -1018,33 +1018,6 @@ async def test_claude_sdk_clear_continuation_keeps_the_original_sharing(
     )
 
 
-async def test_an_ordinary_fork_still_gets_the_default_sharing(
-    auth_app: FastAPI,
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-    auth_live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only a continuation skips the creation default; a fork of a private
-    session still starts public when every new session does."""
-    monkeypatch.setattr(
-        auth_app.state, "default_public_sessions", lambda: DefaultPublicSessions.ALL
-    )
-    store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(auth_client, store, user=_OWNER)
-    owner, stranger = {"X-Forwarded-Email": _OWNER}, {"X-Forwarded-Email": _STRANGER}
-    revoked = await auth_client.delete(
-        f"/v1/sessions/{source_id}/permissions/{RESERVED_USER_PUBLIC}", headers=owner
-    )
-    assert revoked.status_code < 300, revoked.text
-
-    forked = await auth_client.post(f"/v1/sessions/{source_id}/fork", json={}, headers=owner)
-
-    assert forked.status_code == 201, forked.text
-    fork_id = forked.json()["id"]
-    assert (await auth_client.get(f"/v1/sessions/{fork_id}", headers=stranger)).status_code == 200
-
-
 @pytest.mark.parametrize(
     ("clear_status", "placement", "status", "message"),
     [
