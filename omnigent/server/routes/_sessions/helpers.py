@@ -122,6 +122,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    env_var_is_truthy,
 )
 from omnigent.server.host_registry import (
     HostConnection,
@@ -2195,6 +2196,9 @@ def _record_daily_cost(
         conversation_store.add_daily_cost(owner.user_id, _utc_day(now_epoch()), delta_usd)
 
 
+HIDE_COST_ENV_VAR = "OMNIGENT_HIDE_COST"
+
+
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     """
     Extract ``total_cost_usd`` for client display, or ``None`` when unpriced.
@@ -2203,12 +2207,16 @@ def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     the UI) is distinct from a priced ``$0.00``. The cost-budget policy is
     unaffected — it reads the value with a ``0.0`` default.
 
+    Operators whose catalog and harness costs are both non-authoritative set
+    ``OMNIGENT_HIDE_COST=1`` to report every session as unpriced; token counts
+    and the stored cost that budget policies read are kept.
+
     :param usage: A conversation's ``session_usage`` dict, e.g.
         ``{"input_tokens": 1200, "total_cost_usd": 0.42}`` (priced) or
         ``{"input_tokens": 1200}`` (unpriced — no cost key).
     :returns: The cumulative cost in USD when priced, else ``None``.
     """
-    if "total_cost_usd" not in usage:
+    if "total_cost_usd" not in usage or env_var_is_truthy(HIDE_COST_ENV_VAR):
         return None
     try:
         return float(usage["total_cost_usd"])

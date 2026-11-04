@@ -8040,6 +8040,51 @@ async def test_external_session_usage_unpriced_omits_cost(
     assert "total_cost_usd" not in published[0][1]
 
 
+async def test_hide_cost_setting_keeps_tokens_and_stored_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_HIDE_COST`` reports a priced session as unpriced to clients.
+
+    The agent-info popover renders cost only when ``total_cost_usd`` is
+    present, so the broadcast, per-model breakdown and snapshot must omit it
+    while still carrying token counts. The stored cost is kept for budget
+    policies.
+    """
+    monkeypatch.setenv("OMNIGENT_HIDE_COST", "1")
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {
+                "context_tokens": 1000,
+                "cumulative_input_tokens": 1000,
+                "cumulative_output_tokens": 500,
+                "cumulative_cost_usd": 0.42,
+                "model": "test-model",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert _read_session_usage(db_uri, session["id"])["total_cost_usd"] == 0.42
+    event = published[0][1]
+    assert "total_cost_usd" not in event
+    model_usage = event["usage_by_model"]["test-model"]
+    assert (model_usage["input_tokens"], model_usage["output_tokens"]) == (1000, 500)
+    assert "total_cost_usd" not in model_usage
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["total_cost_usd"] is None
+    assert snapshot["usage_by_model"]["test-model"]["input_tokens"] == 1000
+    assert snapshot["usage_by_model"]["test-model"].get("total_cost_usd") is None
+
+
 async def test_session_snapshot_includes_priced_cost(
     client: httpx.AsyncClient,
 ) -> None:

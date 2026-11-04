@@ -458,6 +458,7 @@ trusts whatever value reaches it.
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
 | `OMNIGENT_BUILTIN_AGENT_DIRS` | unset | Colon-separated paths (in-container) to extra always-available built-in agents, seeded once at startup. See [Extra built-in agents](#extra-built-in-agents). |
 | `OMNIGENT_SEEDED_AGENTS` | unset (keep all) | Comma-separated allowlist of packaged built-in agent names to keep. Empty value keeps none. Never filters `OMNIGENT_BUILTIN_AGENT_DIRS` agents. See [Trimming the packaged built-in agents](#trimming-the-packaged-built-in-agents). |
+| `OMNIGENT_HIDE_COST` | unset (show cost) | `1` reports every session as unpriced in the session view: token counts stay, USD cost is hidden. For deployments where neither the model catalog nor the harness cost is authoritative. Cost-budget policies still enforce against the recorded cost. |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 
 `DATABASE_URL` and `ARTIFACT_DIR` are computed by compose and
