@@ -43,14 +43,11 @@ describe("queryRetryDelay", () => {
     expect(queryRetryDelay(0, new Error("x"))).toBe(QUERY_RETRY_BASE_MS * 1.5);
   });
 
-  it("caps the base so late retries don't wait unboundedly", () => {
-    vi.spyOn(Math, "random").mockReturnValue(0.5);
-    expect(queryRetryDelay(20, new Error("x"))).toBe(QUERY_RETRY_MAX_MS);
-  });
-
-  it("spreads clients that failed together across the window", () => {
-    const delays = new Set(Array.from({ length: 20 }, () => queryRetryDelay(1, new Error("x"))));
-    expect(delays.size).toBeGreaterThan(1);
+  it("caps the base before jittering it", () => {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    expect(queryRetryDelay(20, new Error("x"))).toBe(QUERY_RETRY_MAX_MS / 2);
+    random.mockReturnValue(1);
+    expect(queryRetryDelay(20, new Error("x"))).toBe(QUERY_RETRY_MAX_MS * 1.5);
   });
 
   it("waits the server's Retry-After, bounded", () => {

@@ -431,6 +431,9 @@ export function parseRetryAfterMs(value: string | null, now: number = Date.now()
   if (value === null) return null;
   const trimmed = value.trim();
   if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1_000;
+  // Every HTTP-date form starts with a day name; without this check
+  // Date.parse would read "-1" or "1.5" as a past date and return 0.
+  if (!/^[A-Za-z]{3,9},?\s/.test(trimmed)) return null;
   const date = Date.parse(trimmed);
   return Number.isNaN(date) ? null : Math.max(0, date - now);
 }

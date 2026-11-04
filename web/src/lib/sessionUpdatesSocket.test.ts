@@ -312,6 +312,23 @@ describe("sessionUpdatesSocket visibility-aware reconnect", () => {
     expect(FakeWebSocket.instances.length).toBe(dials + 1);
   });
 
+  it("restarts the ramp from the base once a connection stays up", () => {
+    sessionUpdatesSocket.start();
+    for (let i = 0; i < 5; i += 1) {
+      latestWs().open();
+      latestWs().close();
+      vi.advanceTimersByTime(RECONNECT_MAX_MS);
+    }
+    latestWs().open();
+    vi.advanceTimersByTime(HEALTHY_CONNECTION_MS);
+    const dials = FakeWebSocket.instances.length;
+
+    latestWs().close();
+    // A healthy connection's drop retries within the first base delay again.
+    vi.advanceTimersByTime(RECONNECT_BASE_MS);
+    expect(FakeWebSocket.instances.length).toBe(dials + 1);
+  });
+
   it("drops a pending hidden retry on stop() and ramps from the base after start()", () => {
     setPageHidden(true);
     sessionUpdatesSocket.start();
