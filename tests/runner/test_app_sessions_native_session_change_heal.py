@@ -696,6 +696,8 @@ async def test_failed_recreate_does_not_wait(
         "diagnostics",
         "diagnostic-ready",
         "cancelled",
+        "bridge",
+        "config",
     ],
 )
 async def test_events_model_change_reports_a_terminal_still_starting(
@@ -727,15 +729,33 @@ async def test_events_model_change_reports_a_terminal_still_starting(
         if blocked_stage in {"recreation", "cancelled"}:
             stage_entered.set()
             await release_launch.wait()
-            raise AssertionError("startup must expire before the terminal is recreated")
-        _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+        _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
         return SessionResourceView(
             id="terminal_claude_main", type="terminal", session_id=conv_id, name="claude"
         )
 
     monkeypatch.setattr("omnigent.runner.native.orchestration._launch_claude", _unready_launch)
     monkeypatch.setattr("omnigent.runner.native._launch_claude", _unready_launch)
-    if blocked_stage == "liveness":
+    if blocked_stage == "bridge":
+
+        async def _resolve_bridge(**_kwargs: Any) -> str:
+            stage_entered.set()
+            await release_launch.wait()
+            return conv_id
+
+        monkeypatch.setattr(
+            native_controls, "_claude_native_bridge_id_for_session", _resolve_bridge
+        )
+    elif blocked_stage == "config":
+
+        def _resolve_config(**_kwargs: Any) -> None:
+            stage_entered.set()
+            assert release_capture.wait(3.0), "config lookup was not released"
+
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.main.resolve_native_claude_config", _resolve_config
+        )
+    elif blocked_stage == "liveness":
         terminal = registry.get(conv_id, "claude", "main")
         assert terminal is not None
 
@@ -750,7 +770,7 @@ async def test_events_model_change_reports_a_terminal_still_starting(
         if blocked_stage == "readiness":
             stage_entered.set()
             assert release_capture.wait(3.0), "readiness capture was not released"
-        return False
+        return blocked_stage == "config"
 
     def _diagnostics(capture_bridge_dir: Path) -> str:
         diagnostic_calls.append(capture_bridge_dir)
@@ -802,3 +822,16 @@ async def test_events_model_change_reports_a_terminal_still_starting(
         assert stage_entered.is_set(), f"did not exercise blocked {blocked_stage}"
     if blocked_stage not in {"diagnostics", "diagnostic-ready"}:
         assert diagnostic_calls == [], "expired controls must not capture diagnostics"
+
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", lambda _bridge_dir: True)
+    monkeypatch.setattr(
+        claude_native_bridge, "wait_for_input_ready", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", lambda _bridge_dir: None)
+    async with _runner_client(app) as client:
+        retry = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "claude-opus-4-7"},
+        )
+    assert retry.status_code == 204, retry.text
+    assert typed == ["/model claude-opus-4-7"]

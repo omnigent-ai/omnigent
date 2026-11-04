@@ -1218,7 +1218,7 @@ def build_native_controls(
         produced no pane is not waited on either (inject keeps its own short
         advertisement timeout in both cases).
 
-        :returns: ``False`` when terminal recovery exhausts the readiness deadline;
+        :returns: ``False`` when pane preparation outlasts its deadline;
             every other case is ``True``.
         """
         from omnigent.harnesses.claude_native.bridge import claude_pane_ready
@@ -1390,19 +1390,26 @@ def build_native_controls(
         # The server rolls the pick back after its forward timeout, so no key may
         # reach the terminal past this deadline.
         deadline = _ClaudeControlDeadline()
-        bridge_id = await _claude_native_bridge_id_for_session(
-            server_client=server_client,
-            session_id=conv_id,
-        )
-        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        # The pane heal shares the switch's budget: a terminal that cannot boot
-        # answers "still starting" instead of spending the budget in the prompt wait.
-        pane_ready = await _prepare_claude_native_pane_for_injection(
-            conv_id, bridge_dir, ready_deadline=deadline.at
-        )
-        if not pane_ready or deadline.is_set():
+        bridge_dir: Path | None = None
+        claude_config: ClaudeNativeUcodeConfig | None = None
+        pane_ready = False
+        try:
+            async with asyncio.timeout(deadline.remaining_s()):
+                bridge_id = await _claude_native_bridge_id_for_session(
+                    server_client=server_client,
+                    session_id=conv_id,
+                )
+                bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+                pane_ready = await _prepare_claude_native_pane_for_injection(
+                    conv_id, bridge_dir, ready_deadline=deadline.at
+                )
+                if pane_ready:
+                    claude_config = await _resolve_session_claude_launch_config(conv_id)
+        except TimeoutError:
+            deadline.set()
+        if bridge_dir is None or not pane_ready or deadline.is_set():
             tail = ""
-            if not deadline.is_set():
+            if bridge_dir is not None and not deadline.is_set():
                 try:
                     async with asyncio.timeout(deadline.remaining_s()):
                         tail = await asyncio.to_thread(claude_pane_failure_tail, bridge_dir)
@@ -1417,7 +1424,6 @@ def build_native_controls(
                 content={"error": "claude_native_model_failed", "detail": detail},
             )
         selected_model = model.strip()
-        claude_config = await _resolve_session_claude_launch_config(conv_id)
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
