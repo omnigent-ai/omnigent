@@ -1037,16 +1037,16 @@ def _is_codex_family_harness(canonical: str) -> bool:
 def _with_tmux_requirement(
     canonical: str, availability: HarnessAvailability, tmux_usable: bool
 ) -> HarnessAvailability:
-    """Report a native harness whose CLI is usable as blocked on an unusable tmux.
+    """Report a ready native harness as blocked on an unusable tmux.
 
-    CLI problems keep precedence so the vendor installer/updater still runs
-    first. ``needs-auth`` is overridden: signing in can't make the launch work.
+    Every other state keeps precedence and is fixed first. ``needs-auth``
+    stays so sign-in status stays visible. Because only ``True`` is replaced,
+    ``"tmux-unavailable"`` also means the CLI is installed and signed in, and
+    an older server can be sent ``True`` in its place.
     """
-    if tmux_usable or canonical not in NATIVE_HARNESSES:
+    if tmux_usable or canonical not in NATIVE_HARNESSES or availability is not True:
         return availability
-    if availability is True or availability == HARNESS_NEEDS_AUTH:
-        return HARNESS_TMUX_UNAVAILABLE
-    return availability
+    return HARNESS_TMUX_UNAVAILABLE
 
 
 def configured_harness_map() -> dict[str, HarnessAvailability]:
@@ -1058,7 +1058,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     harnesses map to ``True``; CLI wrappers report local binary/auth readiness; SDK
     harnesses report ``"needs-auth"`` when no local credential source is
     visible. Codex entries distinguish ``"binary-missing"`` from
-    ``"needs-auth"``. Native (tmux-backed) harnesses whose CLI is usable report
+    ``"needs-auth"``. Ready native (tmux-backed) harnesses report
     ``"tmux-unavailable"`` when this host's tmux is missing or too old; tmux is
     probed once per call.
 

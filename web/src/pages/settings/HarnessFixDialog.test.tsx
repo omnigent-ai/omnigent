@@ -575,6 +575,45 @@ describe("HarnessFixDialog", () => {
     );
   });
 
+  it("continues to the tmux step when sign-in leaves tmux as the blocker", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/login") && init?.method === "POST") {
+        return json({
+          login_id: "login/1",
+          verification_url: "https://auth.example.test/device",
+          user_code: "WQ7K-3XPM",
+          expires_at: Math.floor(Date.now() / 1000) + 15 * 60,
+        });
+      }
+      if (url.endsWith("/login/login%2F1")) {
+        return json({
+          status: "succeeded",
+          error: null,
+          configured_harnesses: { "codex-native": "tmux-unavailable" },
+          harness_accounts: {},
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("radio", { name: /Personal subscription/ }));
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Authenticate" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => vi.advanceTimersByTime(2_000));
+
+    expect(screen.getByRole("heading", { name: "Set up tmux on Local laptop" })).toBeVisible();
+    expect(props.onFixed).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
   it("cancels an active Codex device login", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
       const url = String(input);

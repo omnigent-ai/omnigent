@@ -462,6 +462,30 @@ describe("resolveSetupSteps", () => {
     expect(steps[0].command).toBe("omni setup");
   });
 
+  it("adds a tmux step after the done CLI steps when only tmux is missing", () => {
+    const steps = resolveSetupSteps(
+      CODEX_STEPS,
+      "codex-native",
+      hostWith({ "codex-native": "tmux-unavailable" }),
+    );
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([
+      ["install", "done"],
+      ["auth", "done"],
+      ["tmux", "todo"],
+    ]);
+    expect(steps[2].title).toBe("Install tmux 3.3 or newer");
+    expect(steps[2].command).toBe("brew install tmux");
+  });
+
+  it("shows the tmux step even when the server publishes no steps", () => {
+    const steps = resolveSetupSteps(
+      undefined,
+      "codex-native",
+      hostWith({ "codex-native": "tmux-unavailable" }),
+    );
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["tmux", "todo"]]);
+  });
+
   it("returns [] with no descriptor or no harness", () => {
     expect(resolveSetupSteps(undefined, "codex", hostWith({ codex: false }))).toEqual([]);
     expect(resolveSetupSteps(CODEX_STEPS, null, hostWith({ codex: false }))).toEqual([]);

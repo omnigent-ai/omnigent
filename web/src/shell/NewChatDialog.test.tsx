@@ -7495,6 +7495,21 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("harness-credential-form")).toBeTruthy();
   });
 
+  it("managed host: shows a tmux step, not a sign-in form, when only tmux is missing", () => {
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    breakSelectedHarness("a2", "codex-native", "tmux-unavailable", { sandbox_provider: "modal" });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+
+    expect(screen.getByTestId("harness-setup-step-tmux")).toHaveTextContent(
+      "Install tmux 3.3 or newer",
+    );
+    expect(screen.getByTestId("harness-setup-command")).toHaveTextContent("brew install tmux");
+    expect(screen.queryByTestId("harness-setup-add-credential")).toBeNull();
+  });
+
   it("managed host: marks its Install button loading while THIS harness's install is pending", () => {
     // The dialog derives the in-flight indicator from React Query's mutation
     // state via useInstallingHarnesses (observer-independent, so a concurrent

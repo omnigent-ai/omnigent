@@ -1206,12 +1206,12 @@ def test_tmux_unavailable_readiness_survives_hello_and_live_refresh() -> None:
 
 @pytest.mark.parametrize(
     ("server_capabilities", "expected_native"),
-    [(frozenset(), False), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
+    [(frozenset(), True), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
 )
 def test_frame_for_server_down_maps_tmux_for_older_servers(
     server_capabilities: frozenset[str], expected_native: bool | str
 ) -> None:
-    """Only a server that advertises tmux readiness receives the new state."""
+    """An older server gets the pre-tmux-check ``True``; a tmux-aware server gets the new state."""
     frame = HostHarnessReadinessFrame(
         configured_harnesses={"claude-native": "tmux-unavailable", "codex": True}
     )

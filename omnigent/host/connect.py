@@ -65,11 +65,7 @@ from omnigent.harness_aliases import (
     harness_account_key,
     is_claude_sdk_harness_name,
 )
-from omnigent.harness_availability import (
-    HARNESS_BINARY_MISSING,
-    HARNESS_TMUX_UNAVAILABLE,
-    HarnessAvailability,
-)
+from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
@@ -238,7 +234,6 @@ from omnigent.runtime.websocket_metrics import (
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
-from omnigent.util.tmux_compat import tmux_unavailable_reason
 from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
@@ -340,32 +335,10 @@ def _harness_now_configured(harness: str) -> bool:
     return verdict
 
 
-# Quick-probe cache key for the host-wide tmux check; no harness uses this name.
-_TMUX_QUICK_PROBE_KEY = "\0tmux"
-
-
-def _record_tmux_quick_probe(usable: bool) -> None:
-    """Cache a tmux verdict for the quick probe, stamped now."""
-    _quick_probe_cache[_TMUX_QUICK_PROBE_KEY] = time.monotonic()
-    _quick_probe_cached[_TMUX_QUICK_PROBE_KEY] = usable
-
-
-def _tmux_now_usable() -> bool:
-    """tmux_unavailable_reason through the quick-probe TTL cache."""
-    stamp = _quick_probe_cache.get(_TMUX_QUICK_PROBE_KEY)
-    if stamp is not None and time.monotonic() - stamp < HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S:
-        return _quick_probe_cached[_TMUX_QUICK_PROBE_KEY]
-    usable = tmux_unavailable_reason() is None
-    _record_tmux_quick_probe(usable)
-    return usable
-
-
 def _unavailable_harness_became_ready(
     previous: Mapping[str, HarnessAvailability],
 ) -> bool:
-    """Detect newly available binaries or tmux; auth changes wait for the full refresh."""
-    if HARNESS_TMUX_UNAVAILABLE in previous.values() and _tmux_now_usable():
-        return True
+    """Detect newly available binaries; auth and tmux changes wait for the full refresh."""
     return any(
         (availability is False or availability == HARNESS_BINARY_MISSING)
         and _harness_now_configured(harness)
@@ -4614,7 +4587,7 @@ class HostProcess:
     ) -> dict[str, HarnessAvailability] | None:
         """Collect harness readiness without letting a probe break the channel."""
         try:
-            configured = await self._run_host_subprocess_in_thread(configured_harness_map)
+            return await self._run_host_subprocess_in_thread(configured_harness_map)
         except Exception as exc:
             _logger.exception("Host harness readiness probe failed")
             if startup:
@@ -4624,11 +4597,6 @@ class HostProcess:
                     stderr=True,
                 )
             return None
-        if HARNESS_TMUX_UNAVAILABLE in configured.values():
-            # A fresh map is authoritative: a stale "usable" verdict would make
-            # every quick pass re-run the full map until the cache expired.
-            _record_tmux_quick_probe(False)
-        return configured
 
     async def _probe_harness_accounts(self, *, explicit_refresh: bool) -> HarnessAccounts | None:
         """Probe account families concurrently, with one timeout per CLI."""

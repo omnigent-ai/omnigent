@@ -1804,100 +1804,12 @@ def _write_fake_tmux(directory: Path, version_line: str) -> None:
     tmux.chmod(0o755)
 
 
-def test_quick_probe_detects_repaired_tmux(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A tmux-unavailable entry re-probes tmux, not the vendor CLI it already has."""
-    from omnigent.host import connect as connect_mod
-
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    monkeypatch.setenv("PATH", str(bin_dir))
-    # The vendor CLI is installed, so consulting it would always report "ready".
-    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda _h: True)
-    monkeypatch.setattr(connect_mod, "HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
-    connect_mod._invalidate_quick_probe_cache()
-    previous = {"devin-native": "tmux-unavailable", "claude-sdk": True}
-    try:
-        assert connect_mod._unavailable_harness_became_ready(previous) is False
-        _write_fake_tmux(bin_dir, "tmux 3.2")
-        assert connect_mod._unavailable_harness_became_ready(previous) is False
-        _write_fake_tmux(bin_dir, "tmux 3.6a")
-        assert connect_mod._unavailable_harness_became_ready(previous) is True
-    finally:
-        connect_mod._invalidate_quick_probe_cache()
-
-
-async def test_live_host_publishes_ready_after_tmux_repair(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Installing tmux into the host's PATH flips native readiness without a restart."""
-    bin_dir = tmp_path / "bin"
-    _write_fake_tmux(bin_dir, "tmux 3.4")
-    monkeypatch.setenv("PATH", str(bin_dir))
-    readiness = iter(({"devin-native": True},))
-    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
-    monkeypatch.setattr(
-        "omnigent.host.connect.configured_harness_map",
-        lambda: next(readiness),
-    )
-    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S", 0.01)
-    from omnigent.host import connect as connect_mod
-
-    connect_mod._invalidate_quick_probe_cache()
-    host = _make_host_process()
-    host._configured_harnesses = {"devin-native": "tmux-unavailable"}
-    host._harness_accounts = {}
-    host._gateway_inference = {}
-    ws = _RecordingWS()
-
-    task = asyncio.create_task(host._harness_readiness_loop(ws))
-    try:
-        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
-    finally:
-        await _cancel(task)
-        connect_mod._invalidate_quick_probe_cache()
-
-    refresh = decode_host_frame(ws.sent[0])
-    assert isinstance(refresh, HostHarnessReadinessFrame)
-    assert refresh.configured_harnesses == {"devin-native": True}
-    _cleanup_host(host)
-
-
-async def test_full_map_overrides_stale_usable_tmux_verdict(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A fresh map's tmux-unavailable stops the quick loop re-running the full map each pass."""
-    from omnigent.host import connect as connect_mod
-
-    _write_fake_tmux(tmp_path / "bin", "tmux 3.6a")
-    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
-    monkeypatch.setattr(
-        "omnigent.host.connect.configured_harness_map",
-        lambda: {"devin-native": "tmux-unavailable"},
-    )
-    connect_mod._invalidate_quick_probe_cache()
-    host = _make_host_process()
-    try:
-        connect_mod._record_tmux_quick_probe(True)
-        configured = await host._probe_configured_harnesses(startup=False)
-        assert configured == {"devin-native": "tmux-unavailable"}
-        assert connect_mod._unavailable_harness_became_ready(configured) is False
-    finally:
-        connect_mod._invalidate_quick_probe_cache()
-        _cleanup_host(host)
-
-
 async def test_live_host_real_readiness_map_recovers_after_tmux_install(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The real readiness map, re-run by the loop, flips a native harness once tmux appears."""
+    """The periodic full refresh flips a native harness once tmux appears on PATH."""
     import omnigent._platform as platform
-    from omnigent.host import connect as connect_mod
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1909,9 +1821,7 @@ async def test_live_host_real_readiness_map_recovers_after_tmux_install(
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
     monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
-    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
-    connect_mod._invalidate_quick_probe_cache()
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S", 0.01)
     host = _make_host_process()
     host._configured_harnesses = await host._probe_configured_harnesses(startup=False)
     assert host._configured_harnesses is not None
@@ -1926,7 +1836,6 @@ async def test_live_host_real_readiness_map_recovers_after_tmux_install(
         await asyncio.wait_for(ws.first_send.wait(), timeout=10.0)
     finally:
         await _cancel(task)
-        connect_mod._invalidate_quick_probe_cache()
 
     refresh = decode_host_frame(ws.sent[0])
     assert isinstance(refresh, HostHarnessReadinessFrame)
@@ -1941,7 +1850,7 @@ _PRE_TMUX_SERVER_READINESS = (True, False, "binary-missing", "needs-auth", "vers
 
 @pytest.mark.parametrize(
     ("server_capabilities", "expected_native"),
-    [(frozenset(), False), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
+    [(frozenset(), True), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
     ids=["older-server", "tmux-aware-server"],
 )
 async def test_live_readiness_matches_server_vocabulary(
@@ -1976,7 +1885,7 @@ async def test_live_readiness_matches_server_vocabulary(
 
 @pytest.mark.parametrize(
     ("advertise", "expected_native"),
-    [(False, False), (True, "tmux-unavailable")],
+    [(False, True), (True, "tmux-unavailable")],
     ids=["no-capability-header", "capability-header"],
 )
 async def test_hello_readiness_follows_upgrade_capability_header(

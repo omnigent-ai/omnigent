@@ -84,6 +84,10 @@ type Phase =
 // Check again would discard the sign-in the user is in the middle of.
 const AUTH_PHASES: ReadonlySet<Phase> = new Set(["choose", "personal", "isaac", "credentials"]);
 
+// A sign-in on a host without a usable tmux succeeds but leaves tmux as the
+// blocker, so it continues to the tmux step instead of announcing "ready".
+const TMUX_STEP = { mode: "tmux", phase: "tmux" } as const;
+
 type DeviceLoginState =
   { kind: "code"; login: HarnessLoginStart } | { kind: "resuming"; loginId: string } | null;
 
@@ -460,6 +464,10 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   };
 
   const onCredentialStored = (result: StoreCredentialResult) => {
+    if (result.configured_harnesses[harness] === "tmux-unavailable") {
+      enterStep(TMUX_STEP);
+      return;
+    }
     finish({
       configuredHarnesses: result.configured_harnesses,
       announce: false,
@@ -556,6 +564,10 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
           const signedIn = harnessAccounts?.[accountKey];
           const identity = [signedIn?.email, signedIn?.plan].filter(Boolean).join(" · ");
           setDeviceLogin(null);
+          if (configuredHarnesses?.[harness] === "tmux-unavailable") {
+            enterStep(TMUX_STEP);
+            return;
+          }
           finish({
             configuredHarnesses,
             credentialKind: "personal",
@@ -588,7 +600,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
       if (pollAbort.current === controller) pollAbort.current = null;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [accountKey, deviceLogin, finish, harness, harnessLabel, hostId, hostName]);
+  }, [accountKey, deviceLogin, enterStep, finish, harness, harnessLabel, hostId, hostName]);
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>

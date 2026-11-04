@@ -110,7 +110,7 @@ HOST_CAPABILITIES: list[str] = [
 # server sends no frame before the host's hello). Older servers send no header.
 SERVER_CAPABILITIES_HEADER = "X-Omnigent-Server-Capabilities"
 # The server accepts ``"tmux-unavailable"`` readiness. An older server's live
-# readiness decoder rejects the whole frame for it, so hosts down-map it to False.
+# readiness decoder rejects the whole frame for it, so hosts down-map it to True.
 SERVER_CAP_TMUX_READINESS = "tmux_readiness"
 SERVER_CAPABILITIES: list[str] = [SERVER_CAP_TMUX_READINESS]
 
@@ -129,10 +129,15 @@ def parse_server_capabilities(header_value: str | None) -> frozenset[str]:
 def frame_for_server(frame: HostFrame, server_capabilities: frozenset[str]) -> HostFrame:
     """Down-map readiness states the connected server can't decode.
 
+    ``"tmux-unavailable"`` only replaces ``True``, so the older server gets the
+    readiness it saw before tmux was checked. ``False`` would make it offer the
+    CLI installer for a CLI that is already installed; with ``True`` the launch
+    fails with the terminal's own "install tmux" error instead.
+
     :param frame: Any host frame; only frames with a readiness map change.
     :param server_capabilities: Tokens from :func:`parse_server_capabilities`.
     :returns: *frame*, or a copy whose ``"tmux-unavailable"`` entries read
-        ``False`` (not ready) for a server without :data:`SERVER_CAP_TMUX_READINESS`.
+        ``True`` for a server without :data:`SERVER_CAP_TMUX_READINESS`.
     """
     if not isinstance(
         frame,
@@ -153,7 +158,7 @@ def frame_for_server(frame: HostFrame, server_capabilities: frozenset[str]) -> H
     ):
         return frame
     downgraded: dict[str, HarnessAvailability] = {
-        harness: False if availability == HARNESS_TMUX_UNAVAILABLE else availability
+        harness: True if availability == HARNESS_TMUX_UNAVAILABLE else availability
         for harness, availability in configured.items()
     }
     return replace(frame, configured_harnesses=downgraded)

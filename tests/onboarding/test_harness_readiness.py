@@ -17,13 +17,16 @@ import omnigent.onboarding.harness_install as hi
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
+    HARNESS_NEEDS_AUTH,
     HARNESS_TMUX_UNAVAILABLE,
     HARNESS_VERSION_TOO_LOW,
+    HarnessAvailability,
 )
 from omnigent.onboarding.harness_readiness import (
     _READINESS_PROBE_MAX_WORKERS,
     _binary_availability_reason,
     _databricks_credential_source,
+    _with_tmux_requirement,
     configured_harness_map,
     harness_is_configured,
 )
@@ -1652,6 +1655,18 @@ def test_native_readiness_requires_supported_tmux(
     assert result["codex"] == HARNESS_BINARY_MISSING
     # The launch gate stays binary-only; the runner's tmux preflight owns that error.
     assert harness_is_configured("devin-native") is True
+
+
+@pytest.mark.parametrize(
+    "availability",
+    [HARNESS_NEEDS_AUTH, HARNESS_BINARY_MISSING, HARNESS_VERSION_TOO_LOW, False],
+)
+def test_tmux_requirement_keeps_every_state_but_ready(availability: HarnessAvailability) -> None:
+    """Sign-in and CLI problems keep their own state, so the UI still shows what to fix first."""
+    assert _with_tmux_requirement("devin-native", availability, tmux_usable=False) == availability
+    assert (
+        _with_tmux_requirement("devin-native", True, tmux_usable=False) == HARNESS_TMUX_UNAVAILABLE
+    )
 
 
 @pytest.mark.parametrize("broken_tmux", [None, "tmux 3.2"], ids=["missing", "too-old"])
