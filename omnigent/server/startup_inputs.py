@@ -257,10 +257,7 @@ class ManagedStartupInputs:
         launch = tracker.get(conv.id) if tracker is not None else None
         if launch is not None and launch.error is not None:
             return False
-        if any(
-            item.status in ("in_progress", "incomplete")
-            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
-        ):
+        if await self.has_undelivered(conv.id):
             return True
         if state != "pending":
             return False
@@ -276,6 +273,13 @@ class ManagedStartupInputs:
             else None
         )
         return host is not None and host_is_live(host)
+
+    async def has_undelivered(self, session_id: str) -> bool:
+        """Whether a saved input is still to be delivered (or confirmed) here."""
+        return any(
+            item.status in ("in_progress", "incomplete")
+            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        )
 
     async def snapshot(self, session_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """

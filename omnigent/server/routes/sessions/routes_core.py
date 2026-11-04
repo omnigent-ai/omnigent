@@ -4696,7 +4696,7 @@ def register_core_routes(
             # A saved startup input still to be delivered is a turn waiting to
             # start. Checked once moving, so no new one can be saved meanwhile.
             startup = getattr(request.app.state, "startup_inputs", None)
-            if startup is not None and await startup.accepts(source, request.app):
+            if startup is not None and await startup.has_undelivered(source.id):
                 raise OmnigentError(
                     f"Wait for this session's first message to start before running {command}.",
                     code=ErrorCode.INVALID_INPUT,
