@@ -544,6 +544,8 @@ describe("bridge runtime scroll position", () => {
     expect(hide.isConnected).toBe(false);
     vi.advanceTimersToNextFrame();
     expect(scrollTo).toHaveBeenCalledTimes(1);
+    // The offset the page shows is saved even when the input didn't move it.
+    expect(sentScrollOffsets(port)).toEqual([window.scrollY]);
 
     userScrollTo(200);
     vi.advanceTimersToNextFrame();
@@ -579,6 +581,7 @@ describe("bridge runtime scroll position", () => {
 
   interface RuntimePort {
     onmessage: ((event: { data: unknown }) => void) | null;
+    postMessage: ReturnType<typeof vi.fn>;
   }
 
   /** Restore to 640 in a page whose one comment's highlight starts `highlightTop` px down. */
@@ -642,6 +645,7 @@ describe("bridge runtime scroll position", () => {
       const writes = scrollTo.mock.calls.length;
       vi.advanceTimersToNextFrame();
       expect(scrollTo).toHaveBeenCalledTimes(writes);
+      expect(sentScrollOffsets(port)).toEqual([window.scrollY]);
     });
   });
 

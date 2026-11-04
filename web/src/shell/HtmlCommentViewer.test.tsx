@@ -1,3 +1,4 @@
+import { startTransition, Suspense } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EmbeddedProvider } from "@/lib/embedded";
@@ -250,6 +251,50 @@ describe("HtmlCommentViewer scroll position", () => {
     await waitFor(() => expect(getSavedScrollTop(key)).toBe(140));
     rewrite("<body><p>v3</p></body>");
     expect(requestedScrollRestore()).toMatchObject({ top: 140 });
+  });
+
+  it("saves a frame's offset under its own file while navigation to another file suspends", async () => {
+    const key = "html-preview:conv_1:suspended.html";
+    const nextKey = "html-preview:conv_1:next.html";
+    const pending = new Promise<void>(() => {});
+    const attempted = vi.fn();
+    function Suspend({ blocked }: { blocked: boolean }) {
+      if (blocked) {
+        attempted();
+        throw pending;
+      }
+      return null;
+    }
+    const tree = (scrollKey: string, blocked: boolean) => (
+      <Suspense fallback={<div>Loading navigation</div>}>
+        <HtmlCommentViewer
+          conversationId="conv_1"
+          scrollKey={scrollKey}
+          content="<body><p>plan</p></body>"
+          truncated={false}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+        />
+        <Suspend blocked={blocked} />
+      </Suspense>
+    );
+    const view = render(tree(key, false));
+    const { send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+
+    // The viewer renders for the next file, but the navigation never commits.
+    act(() => {
+      startTransition(() => {
+        view.rerender(tree(nextKey, true));
+      });
+    });
+    expect(attempted).toHaveBeenCalled();
+    send({ type: BRIDGE_MSG.scroll, top: 420 });
+    await waitFor(() => expect(getSavedScrollTop(key)).toBe(420));
+    expect(getSavedScrollTop(nextKey)).toBeUndefined();
+    view.rerender(tree(key, false));
   });
 });
 

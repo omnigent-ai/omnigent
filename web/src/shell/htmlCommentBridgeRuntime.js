@@ -241,6 +241,8 @@
     for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
       window.removeEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, true);
     }
+    // Save where the page ended up, so an offset a shorter rewrite can't reach isn't retried.
+    onScroll();
   }
 
   // Keys typed into a form field or editable text move its caret or value, not the page.
@@ -277,8 +279,6 @@
     if (!scrollRestore) return;
     if (performance.now() >= scrollRestore.deadline || readerMovedDuringRestore()) {
       settleScrollRestore();
-      // Save where the page ended up, so an offset a shorter rewrite can't reach isn't retried.
-      onScroll();
       return;
     }
     // "instant" overrides an artifact's `scroll-behavior: smooth`.

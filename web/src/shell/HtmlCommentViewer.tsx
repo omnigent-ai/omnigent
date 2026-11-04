@@ -169,8 +169,6 @@ export function HtmlCommentViewer({
   onSetActiveSelectionRef.current = onSetActiveSelection;
   const activeSelectionRef = useRef(activeSelection);
   activeSelectionRef.current = activeSelection;
-  const scrollKeyRef = useRef(scrollKey);
-  scrollKeyRef.current = scrollKey;
 
   const postState = () => {
     const port = portRef.current;
@@ -260,7 +258,8 @@ export function HtmlCommentViewer({
       if (zoomBadgeTimerRef.current !== null) clearTimeout(zoomBadgeTimerRef.current);
       zoomBadgeTimerRef.current = setTimeout(() => setZoomBadgeVisible(false), ZOOM_BADGE_MS);
     } else if (msg.type === BRIDGE_MSG.scroll) {
-      if (scrollKeyRef.current) saveScrollTop(scrollKeyRef.current, msg.top);
+      // A new scrollKey also changes the nonce, so this closure's key is the sender's.
+      if (scrollKey) saveScrollTop(scrollKey, msg.top);
     }
   };
 
