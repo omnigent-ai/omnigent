@@ -256,6 +256,7 @@ def test_dropped_write_evicts_dedupe_entry_for_retry() -> None:
     the next identical publish re-attempts the write.
     """
     calls: list[tuple[str, str]] = []
+    background_calls: list[tuple[str, int]] = []
 
     class _FlakyStore(_RecordingStore):
         def set_session_live_status(self, conversation_id: str, status: str) -> None:
@@ -263,6 +264,12 @@ def test_dropped_write_evicts_dedupe_entry_for_retry() -> None:
             if len(calls) == 1:
                 raise RuntimeError("boom")  # first attempt fails
             super().set_session_live_status(conversation_id, status)
+
+        def set_background_task_count(self, conversation_id: str, count: int) -> None:
+            background_calls.append((conversation_id, count))
+            if len(background_calls) == 1:
+                raise RuntimeError("boom")
+            super().set_background_task_count(conversation_id, count)
 
     store = _FlakyStore()
     session_live_state.configure(store)  # type: ignore[arg-type]
@@ -280,11 +287,18 @@ def test_dropped_write_evicts_dedupe_entry_for_retry() -> None:
         # a no-op; because the entry was cleared, the retry re-attempts.
         session_live_state.persist_live_status("conv_1", "running")
         _wait_until(lambda: bool(store.status_writes))
+
+        session_live_state.persist_background_task_count("conv_1", 0)
+        _wait_until(lambda: "conv_1" not in session_live_state._last_background)
+        session_live_state.persist_background_task_count("conv_1", 0)
+        _wait_until(lambda: bool(store.background_writes))
     finally:
         session_live_state.configure(None)
 
     assert calls == [("conv_1", "running"), ("conv_1", "running")]
     assert store.status_writes == [("conv_1", "running")], "retry never landed"
+    assert background_calls == [("conv_1", 0), ("conv_1", 0)]
+    assert store.background_writes == [("conv_1", 0)], "background retry never landed"
 
 
 def test_unencodable_status_is_dropped_before_enqueue(

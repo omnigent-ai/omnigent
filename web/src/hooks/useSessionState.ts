@@ -1,5 +1,5 @@
 // Per-row state derivation for the sidebar badge.
-// Priority: awaiting > running > background > error > no badge.
+// Priority: awaiting > running > error > background > no badge.
 //
 // Liveness (runner / host reachability) is no longer a sidebar state:
 // it surfaces in the open-session view (see `useSessionLiveness`), so the
@@ -37,10 +37,12 @@ export function getSessionState(
   const pending = conversation?.pending_elicitations_count ?? 0;
   if (pending > 0) return { kind: "awaiting", count: pending };
   if (conversation?.status === "running") return { kind: "running" };
+  if (latestError === "disconnected") return { kind: "disconnected" };
+  const failed =
+    latestError !== "recovered_disconnect" &&
+    (conversation?.status === "failed" || latestError === "error");
+  if (failed) return { kind: "error" };
   const background = conversation?.background_task_count ?? 0;
   if (background > 0) return { kind: "background", count: background };
-  if (latestError === "disconnected") return { kind: "disconnected" };
-  if (latestError === "recovered_disconnect") return null;
-  if (conversation?.status === "failed" || latestError === "error") return { kind: "error" };
   return null;
 }

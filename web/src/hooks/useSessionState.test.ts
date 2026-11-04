@@ -99,6 +99,16 @@ describe("getSessionState — priority composition", () => {
       ),
     ).toEqual({ kind: "awaiting", count: 1 });
     expect(getSessionState(conv({ status: "idle", background_task_count: 0 }))).toBeNull();
+    // A failure is more actionable than a long-lived shell.
+    expect(getSessionState(conv({ status: "failed", background_task_count: 2 }))).toEqual({
+      kind: "error",
+    });
+    expect(getSessionState(conv({ status: "idle", background_task_count: 2 }), "error")).toEqual({
+      kind: "error",
+    });
+    expect(
+      getSessionState(conv({ status: "idle", background_task_count: 2 }), "recovered_disconnect"),
+    ).toEqual({ kind: "background", count: 2 });
   });
 
   it("returns null when conversation is null (missing record)", () => {

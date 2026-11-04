@@ -3364,9 +3364,9 @@ function projectMarkerState(
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
   if (running) return { kind: "running" };
   if (starting) return { kind: "starting" };
-  if (background > 0) return { kind: "background", count: background };
   if (error) return { kind: "error" };
   if (disconnected) return { kind: "disconnected" };
+  if (background > 0) return { kind: "background", count: background };
   if (unseen) return { kind: "unseen" };
   return null;
 }

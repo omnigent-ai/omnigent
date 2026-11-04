@@ -1297,12 +1297,14 @@ def _build_session_list_item(
             if conv.runner_id is not None
             else pending_count
         ),
-        # Shells run on the bound runner, so count them only while its
-        # liveness stamp is fresh; otherwise nothing would clear the spinner.
+        # Like status: a replica relaying this session's status owns its count
+        # (an explicit zero included); others read the owner's row. Shells run on
+        # the bound runner, so a stale liveness stamp reports none.
         background_task_count=(
-            max(
-                _session_background_task_count_cache.get(conv.id, 0),
-                conv.background_task_count or 0,
+            (
+                _session_background_task_count_cache.get(conv.id, 0)
+                if conv.id in _session_status_cache
+                else conv.background_task_count or 0
             )
             if conv.runner_id is not None and runner_seen_is_fresh(conv.runner_last_seen)
             else 0

@@ -4409,8 +4409,8 @@ async def test_list_sessions_background_count_follows_the_owning_replica(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """The row from the owning replica wins once this replica hands off, and a
-    stale runner stamp hides the count, since nothing could clear it."""
+    """The replica relaying a session's status owns its count; others read the
+    owner's row; a stale runner stamp reports none, since nothing could clear it."""
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions.orchestration import (
         _relinquish_session_live_state,
@@ -4432,11 +4432,21 @@ async def test_list_sessions_background_count_follows_the_owning_replica(
         ]
 
     try:
-        # Another replica's write, with nothing cached here.
+        # Not relayed here: the owner's row is the only source.
+        _relinquish_session_live_state(session_id)
         store.set_background_task_count(session_id, 3)
         assert await listed_count() == 3
 
-        # This replica held 2, then the new owner finished every shell.
+        # Relayed here: the local count wins even before (or if) the row write
+        # lands, including an authoritative zero over a stale positive row.
+        store.set_background_task_count(session_id, 2)
+        sessions_module._session_status_cache[session_id] = "idle"
+        sessions_module._session_background_task_count_cache[session_id] = 1
+        assert await listed_count() == 1
+        sessions_module._session_background_task_count_cache.pop(session_id)
+        assert await listed_count() == 0
+
+        # Handed off: the new owner's row speaks again.
         sessions_module._session_background_task_count_cache[session_id] = 2
         store.set_background_task_count(session_id, 0)
         _relinquish_session_live_state(session_id)
@@ -4446,7 +4456,7 @@ async def test_list_sessions_background_count_follows_the_owning_replica(
         store.clear_runner_liveness("runner_other_replica")
         assert await listed_count() == 0
     finally:
-        sessions_module._session_background_task_count_cache.pop(session_id, None)
+        _relinquish_session_live_state(session_id)
 
 
 async def test_get_session_includes_runner_online(

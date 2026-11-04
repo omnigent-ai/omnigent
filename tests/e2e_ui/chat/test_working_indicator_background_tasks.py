@@ -15,9 +15,14 @@ _MONITOR_TASK = {
 }
 
 
-def _sidebar_badge(page: Page, count: int) -> Locator:
+def _sidebar_row(page: Page, session_id: str) -> Locator:
+    return page.locator(f'[data-sidebar-session-id="{session_id}"]')
+
+
+def _sidebar_badge(page: Page, session_id: str, count: int) -> Locator:
     plural = "" if count == 1 else "s"
-    return page.get_by_role("img", name=f"{count} background task{plural} running", exact=True)
+    name = f"{count} background task{plural} running"
+    return _sidebar_row(page, session_id).get_by_role("img", name=name, exact=True)
 
 
 def _pill_badge(page: Page, count: int) -> Locator:
@@ -72,7 +77,9 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
     page.reload()
     expect(_pill_badge(page, 1)).to_have_attribute("aria-expanded", "false", timeout=15_000)
     # The sidebar row hydrates from the session list after the reload.
-    expect(_sidebar_badge(page, 1).get_by_test_id("running-dot")).to_be_visible(timeout=15_000)
+    expect(_sidebar_badge(page, session_id, 1).get_by_test_id("running-dot")).to_be_visible(
+        timeout=15_000
+    )
     _pill_badge(page, 1).click()
     panel = page.get_by_role("dialog", name="1 background task", exact=True)
     expect(panel.get_by_text(_MONITOR_TASK["description"], exact=True)).to_be_visible()
@@ -80,7 +87,7 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
 
     _publish_status(base_url, session_id, background_task_count=2)
     expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
-    expect(_sidebar_badge(page, 2)).to_be_visible(timeout=15_000)
+    expect(_sidebar_badge(page, session_id, 2)).to_be_visible(timeout=15_000)
     _pill_badge(page, 2).click()
     panel = page.get_by_role("dialog", name="2 background tasks", exact=True)
     expect(panel).to_contain_text("details unavailable")
@@ -88,5 +95,7 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
 
     _publish_status(base_url, session_id, background_task_count=0)
     expect(page.locator(_PILL)).to_have_count(0, timeout=15_000)
-    expect(page.get_by_test_id("session-state-badge")).to_have_count(0, timeout=15_000)
+    expect(_sidebar_row(page, session_id).get_by_test_id("session-state-badge")).to_have_count(
+        0, timeout=15_000
+    )
     expect(panel).to_have_count(0)
