@@ -2940,7 +2940,8 @@ def augment_claude_args(
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Optional raw ``AgentSpec.instructions``
         (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag.
+        Code's native ``--append-system-prompt`` flag, placed before a
+        caller-supplied inline prompt instead of replacing it.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -2983,8 +2984,7 @@ def augment_claude_args(
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    if append_system_prompt:
-        args.extend(["--append-system-prompt", append_system_prompt])
+    args = _merge_append_system_prompt(args, append_system_prompt)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -3069,6 +3069,41 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
         return args
     existing = [tool for tool in args[value_idx].split(",") if tool]
     args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
+    return args
+
+
+def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
+    """Put ``extra`` before the caller's ``--append-system-prompt`` value.
+
+    Claude Code keeps only the last value of the flag, so ``extra`` joins that
+    value in place, or a new flag carries it. The scan stops at a bare ``--``.
+    Other caller tokens, including an ``--append-system-prompt-file``, are left
+    as they are. Claude Code 2.1.295+ applies such a file before the inline
+    prompt; 2.1.161 and 2.1.278 refuse to start with both.
+
+    :param args: Claude CLI argument list to mutate-and-return.
+    :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
+    :returns: ``args`` whose last prompt value carries both prompts.
+    """
+    if not extra:
+        return args
+    flag = "--append-system-prompt"
+    joined_prefix = f"{flag}="
+    location: tuple[int, int] | None = None
+    idx = 0
+    while idx < len(args) and args[idx] != "--":
+        if args[idx].startswith(joined_prefix):
+            location = (idx, len(joined_prefix))
+        elif args[idx] == flag and idx + 1 < len(args):
+            location = (idx + 1, 0)
+            idx += 1
+        idx += 1
+    if location is None:
+        args.extend([flag, extra])
+        return args
+    value_idx, offset = location
+    existing = args[value_idx][offset:]
+    args[value_idx] = args[value_idx][:offset] + (f"{extra}\n\n{existing}" if existing else extra)
     return args
 
 
