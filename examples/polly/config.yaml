@@ -2,7 +2,8 @@ spec_version: 1
 name: polly
 description: >-
   A coding orchestrator that plans and delegates work across a team of coding
-  agents. Best for larger tasks that benefit from independent review.
+  agents. Best for larger tasks, with an independent reviewer double-checking
+  the work before Polly puts it all together.
 
 # Beyond the declared sub-agents (tools.agents below), polly may also spawn
 # child sessions it defines itself: spawn: true registers
