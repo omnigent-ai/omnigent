@@ -226,15 +226,13 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     monkeypatch.setattr(
         codex_native_app_server,
         "_databricks_launch_materialization",
-        lambda *, model, profile, codex_path: (
-            codex_native_app_server._DatabricksLaunchMaterialization(
-                config_overrides=[
-                    'model="databricks-gpt-5-4"',
-                    'model_provider="omnigent_databricks"',
-                ],
-                model="databricks-gpt-5-4",
-                host="https://ws.example",
-            )
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[
+                'model="databricks-gpt-5-4"',
+                'model_provider="omnigent_databricks"',
+            ],
+            model="databricks-gpt-5-4",
+            host="https://ws.example",
         ),
     )
     monkeypatch.setattr(codex_native_app_server, "_clean_codex_env", lambda: {"PATH": "/bin"})
