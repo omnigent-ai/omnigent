@@ -31,6 +31,7 @@ def task() -> ScheduledTask:
         ("ui", "jira", "ui", "jira"),
         ("ui", "slack", "ui", "slack"),
         ("ui", "github", "ui", "github"),
+        ("ui", "linear", "ui", "linear"),
         ("ui", "follow-up-monitor", "ui", "follow-up-monitor"),
         ("ui", "pr-sweep", "ui", "pr-sweep"),
         ("ui", "news-digest", "ui", "news-digest"),

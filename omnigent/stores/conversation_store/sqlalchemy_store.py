@@ -1400,7 +1400,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         }
 
     def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SessionActivity]:
-        """One ``SELECT`` per database for the ids' update times and live statuses."""
+        """One ``SELECT`` per database for the ids' activity and usage."""
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
@@ -1415,12 +1415,21 @@ class SqlAlchemyConversationStore(ConversationStore):
             return {}
         with self._session("get_session_activity") as session:
             meta_rows = session.execute(
-                select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(
+                select(
+                    SqlConversationMetadata.id,
+                    SqlConversationMetadata.live_status,
+                    SqlConversationMetadata.session_usage,
+                ).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id.in_([row.id for row in updated]),
                 )
             ).all()
         statuses = {row.id: row.live_status for row in meta_rows}
+        costs = {
+            row.id: json.loads(row.session_usage).get("total_cost_usd")
+            for row in meta_rows
+            if row.session_usage
+        }
         activity: dict[str, SessionActivity] = {}
         for row in updated:
             status = statuses.get(row.id)
@@ -1429,7 +1438,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             except ValueError:
                 # A newer replica's status must not drop the rest of the batch.
                 live_status = None
-            activity[row.id] = SessionActivity(updated_at=row.updated_at, live_status=live_status)
+            activity[row.id] = SessionActivity(
+                updated_at=row.updated_at,
+                live_status=live_status,
+                total_cost_usd=costs.get(row.id),
+            )
         return activity
 
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:
@@ -3093,6 +3106,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises ValueError: If ``search_scope`` is not a known scope.
+        :raises StaleCursorError: If a cursor names a vanished conversation,
+            or one that ``accessible_by``/``owned_by`` has no grant on.
         """
         from omnigent.server.auth import LEVEL_OWNER
 
@@ -3172,6 +3187,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     qualifying_ids = list(
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
+
+        # A permission-scoped page only lists sessions the viewer has a grant
+        # on, so a cursor without one didn't come from a page. Resolving it
+        # anyway would reveal where that session sorts.
+        cursor_viewer = accessible_by if accessible_by is not None else owned_by
+        if cursor_viewer is not None:
+            for cursor_id in (after, before):
+                if cursor_id:
+                    self._require_cursor_grant(cursor_id, cursor_viewer)
 
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
@@ -3483,6 +3507,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             last_id=convs[-1].id if convs else None,
             has_more=has_more,
         )
+
+    def _require_cursor_grant(self, cursor_id: str, viewer: str) -> None:
+        """
+        Reject a list cursor naming a session the viewer has no grant on.
+
+        Fails the same way as a deleted cursor, so it doesn't reveal whether
+        the session exists.
+
+        :param cursor_id: The ``after`` or ``before`` session ID.
+        :param viewer: The user whose listing the cursor pages.
+        :raises StaleCursorError: If the viewer has no grant on the session.
+        """
+        with self._session("authorize_session_list_cursor") as meta_sess:
+            granted = meta_sess.execute(
+                select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == cursor_id,
+                    SqlSessionPermission.user_id == viewer,
+                )
+            ).first()
+        if granted is None:
+            raise StaleCursorError(cursor_id)
 
     @staticmethod
     def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
