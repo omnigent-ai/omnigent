@@ -335,13 +335,18 @@ describe("Custom session order", () => {
     expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_f", "conv_c"]);
   });
 
-  it("offers no drag or Move up/down while ordered by Name", async () => {
+  it("offers no session drag order or Move up/down under Name, but pins still drag", async () => {
+    mocks.pinned = [
+      conv("conv_a", { labels: { "omnigent.pinned": "1000" } }),
+      conv("conv_b", { labels: { "omnigent.pinned": "2000" } }),
+    ];
+    mocks.pinFn.mockResolvedValue({});
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
     renderSidebar({
       features: { sidebar_grouping_ui: true },
       serverInfo: { session_title_sort: true },
     });
-    expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
+    expect(rowOrder()).toEqual(["conv_a", "conv_b", "conv_c", "conv_d", "conv_e"]);
     fireEvent.contextMenu(link("conv_e"));
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
     expect(screen.queryByTestId("move-session-up")).toBeNull();
@@ -352,8 +357,18 @@ describe("Custom session order", () => {
       expectTarget: false,
       whileOver: () => expect(screen.queryByTestId("session-order-insertion")).toBeNull(),
     });
-    expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
+    expect(rowOrder()).toEqual(["conv_a", "conv_b", "conv_c", "conv_d", "conv_e"]);
     expect(saved()).toEqual({ ordering: "name" });
+
+    // Name turns off only the session-order targets; pins still reorder and take drops.
+    await dropOnto("conv_b", "conv_a");
+    expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_b", pinnedAt: 999 }]);
+    await dropOnto("conv_e", "conv_a");
+    expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
+      id: "conv_e",
+      pinned: true,
+      pinnedAt: 999,
+    });
   });
 
   it.each([

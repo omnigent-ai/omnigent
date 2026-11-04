@@ -223,6 +223,9 @@ def _encode_title_cursor(row: SqlConversation) -> str:
     """
     Return the ``sort_by="title"`` continuation token for a row's position.
 
+    The bundled web sidebar decodes this format (``scopeTail`` in
+    ``web/src/lib/sidebarData.ts``), so change both together.
+
     :param row: A listed conversation row.
     :returns: ``"title."`` plus unpadded base64url JSON of
         ``[title_sort_key, id]``.
