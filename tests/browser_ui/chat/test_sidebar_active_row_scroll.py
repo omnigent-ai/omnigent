@@ -1,10 +1,6 @@
-"""Scrolling the active session row into the sidebar list's view.
+"""Sidebar active-row scrolling, checked against the built SPA in a real browser.
 
-Selecting a session the list already shows must leave the list where it is;
-only an active row the list has off-screen (for example a session opened by
-URL) is scrolled into view. jsdom cannot measure the scroll geometry, so this
-checks it against the built SPA in a real browser.
-"""
+jsdom cannot measure the list's scroll geometry, so these cases need Chromium."""
 
 from __future__ import annotations
 
@@ -35,6 +31,15 @@ _ROW_FULLY_VISIBLE_JS = f"""(args) => {{
     const row = ({_ROW_BOX_JS})(args);
     return !!row && row.top >= 0 && row.bottom <= row.listHeight;
 }}"""
+
+# Scrolls the list as a user would so the row sits one row-height above its bottom edge.
+_SCROLL_ROW_ABOVE_LIST_BOTTOM_JS = """([listSelector, href]) => {
+    const list = document.querySelector(listSelector);
+    const box = list.querySelector(`a[href="${href}"]`).getBoundingClientRect();
+    const listBox = list.getBoundingClientRect();
+    const delta = box.bottom + box.height - listBox.bottom;
+    list.scrollTo({ top: list.scrollTop + delta, behavior: "instant" });
+}"""
 
 
 def _list_open_session_after(chat: ChatSessionContract, newer: int, older: int) -> None:
@@ -72,17 +77,7 @@ def test_clicking_a_visible_session_keeps_the_list_in_place(
     href = f"/c/{chat.session_id}"
     expect(page.locator(f'{_LIST} a[href="{href}"]')).to_be_attached(timeout=15_000)
 
-    # Scroll the list as a user would so the row sits one row-height above its bottom edge.
-    page.evaluate(
-        """([listSelector, href]) => {
-            const list = document.querySelector(listSelector);
-            const box = list.querySelector(`a[href="${href}"]`).getBoundingClientRect();
-            const listBox = list.getBoundingClientRect();
-            const delta = box.bottom + box.height - listBox.bottom;
-            list.scrollTo({ top: list.scrollTop + delta, behavior: "instant" });
-        }""",
-        [_LIST, href],
-    )
+    page.evaluate(_SCROLL_ROW_ABOVE_LIST_BOTTOM_JS, [_LIST, href])
     row = _row_box(page, href)
     assert row["top"] >= row["listHeight"] / 2 and row["bottom"] <= row["listHeight"], row
     scroll_top_before = row["scrollTop"]
