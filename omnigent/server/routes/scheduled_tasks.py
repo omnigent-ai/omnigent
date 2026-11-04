@@ -23,10 +23,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
+from omnigent.entities.scheduled_task import (
+    RUN_OUTCOME_EMOJI_MAX_CHARS,
+    RUN_OUTCOME_TEXT_MAX_CHARS,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -61,6 +65,7 @@ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import AutomationFailure, ScheduledTaskStore
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -126,6 +131,38 @@ class CreateScheduledTaskRequest(BaseModel):
         _validate_worktree_target(
             self.base_branch, self.execution_target, self.host_id, self.workspace
         )
+        return self
+
+
+class RecordRunOutcomeRequest(BaseModel):
+    """Body for ``PUT /v1/scheduled-tasks/run-outcome``.
+
+    Records the outcome on the latest run of ``session_id``: whether the run
+    reached its goal, and a Slack-status-style emoji and a few words.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+    success: StrictBool
+    emoji: str
+    text: str
+
+    @model_validator(mode="after")
+    def _check_status_fields(self) -> RecordRunOutcomeRequest:
+        """Trim and bound ``emoji`` and ``text``; an emoji has no letters, digits or spaces."""
+        emoji = self.emoji.strip()
+        if not emoji or len(emoji) > RUN_OUTCOME_EMOJI_MAX_CHARS:
+            raise ValueError("emoji must be a single emoji")
+        if any(ch.isspace() or (ch.isascii() and ch.isalnum()) for ch in emoji):
+            raise ValueError("emoji must be a single emoji, without letters, digits or spaces")
+        text = " ".join(self.text.split())
+        if not text:
+            raise ValueError("text must not be empty")
+        if len(text) > RUN_OUTCOME_TEXT_MAX_CHARS:
+            raise ValueError(f"text must be at most {RUN_OUTCOME_TEXT_MAX_CHARS} characters")
+        self.emoji = emoji
+        self.text = text
         return self
 
 
@@ -283,11 +320,24 @@ def _run_to_response(
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
+        "outcome": _outcome_to_response(run),
         "conversation_updated_at": conversation_updated_at,
         "conversation_status": conversation_status,
         "viewer_last_seen": viewer_last_seen,
         "viewer_unread": viewer_unread,
         "session_cost_usd": session_cost_usd,
+    }
+
+
+def _outcome_to_response(run: ScheduledTaskRun) -> dict[str, Any] | None:
+    """The outcome the agent recorded for *run*, or ``None`` when it recorded none."""
+    if run.outcome_success is None:
+        return None
+    return {
+        "success": run.outcome_success,
+        "emoji": run.outcome_emoji,
+        "text": run.outcome_text,
+        "recorded_at": run.outcome_recorded_at,
     }
 
 
@@ -900,6 +950,64 @@ def create_scheduled_tasks_router(
                 code=ErrorCode.CONFLICT,
             )
         return {"triggered": True, "id": task.id}
+
+    def _outcome_session(owner: str, session_id: str) -> Conversation:
+        """The session recording an outcome; 404 unless the caller owns it."""
+        if auth_provider is None or owner == RESERVED_USER_LOCAL:
+            session = conversation_store.get_conversation(normalize_uuid(session_id) or "")
+            if session is None:
+                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            return session
+        if permission_store is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        try:
+            return require_owned_session(session_id, owner, conversation_store, permission_store)
+        except OmnigentError as exc:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND) from exc
+
+    @router.put("/scheduled-tasks/run-outcome")
+    async def record_scheduled_task_run_outcome(
+        request: Request,
+        body: RecordRunOutcomeRequest,
+    ) -> dict[str, Any]:
+        """Record whether the calling session's latest run reached its goal.
+
+        The agent tool ``sys_scheduled_task_record_outcome`` calls this from the
+        fired session, so the run history can show more than whether the run
+        finished. The caller must own the session; a runner-marked call must also
+        come from that session's bound runner, which
+        :func:`require_scheduled_task_agent_origin` checks. A session that no
+        scheduled task started is a 404.
+        """
+        owner = _owner(request)
+        source_id = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        if source_id is not None and source_id.strip() != body.session_id:
+            raise OmnigentError(
+                "A session can record only its own run's outcome",
+                code=ErrorCode.FORBIDDEN,
+            )
+        require_scheduled_task_agent_origin(
+            request,
+            owner=owner,
+            auth_provider=auth_provider,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+        )
+        session = await asyncio.to_thread(_outcome_session, owner, body.session_id)
+        run = await asyncio.to_thread(
+            store.record_run_outcome,
+            session.id,
+            success=body.success,
+            emoji=body.emoji,
+            text=body.text,
+            recorded_at=int(datetime.now(UTC).timestamp()),
+        )
+        if run is None:
+            raise OmnigentError(
+                "This session was not started by a scheduled task",
+                code=ErrorCode.NOT_FOUND,
+            )
+        return _run_to_response(run)
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(

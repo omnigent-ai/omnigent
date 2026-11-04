@@ -184,6 +184,10 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
         trigger_key=row.trigger_key,
         host_id=row.host_id,
         lease_expires_at=row.lease_expires_at,
+        outcome_success=row.outcome_success,
+        outcome_emoji=row.outcome_emoji,
+        outcome_text=row.outcome_text,
+        outcome_recorded_at=row.outcome_recorded_at,
     )
 
 
@@ -909,6 +913,51 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return result
 
         return run_write_transaction(self._session_immediate, "update_task_run", write)
+
+    def record_run_outcome(
+        self,
+        conversation_id: str,
+        *,
+        success: bool,
+        emoji: str,
+        text: str,
+        recorded_at: int,
+    ) -> ScheduledTaskRun | None:
+        """Record the agent's outcome on the conversation's latest run.
+
+        Takes the task lock before the run's, like :meth:`update_run`, so it
+        cannot deadlock with a task deletion purging the same run.
+        """
+
+        def write(session: Session) -> ScheduledTaskRun | None:
+            latest = session.execute(
+                select(SqlScheduledTaskRun.id, SqlScheduledTaskRun.scheduled_task_id)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.conversation_id == conversation_id)
+                .order_by(SqlScheduledTaskRun.scheduled_at.desc(), SqlScheduledTaskRun.id.desc())
+                .limit(1)
+            ).first()
+            if latest is None:
+                return None
+            task = session.get(
+                SqlScheduledTask,
+                (current_workspace_id(), latest.scheduled_task_id),
+                with_for_update=True,
+            )
+            if task is None or task.state == encode_scheduled_task_state("deleted"):
+                return None
+            row = session.get(
+                SqlScheduledTaskRun, (current_workspace_id(), latest.id), with_for_update=True
+            )
+            if row is None:
+                return None
+            row.outcome_success = success
+            row.outcome_emoji = emoji
+            row.outcome_text = text
+            row.outcome_recorded_at = recorded_at
+            return _run_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "record_task_run_outcome", write)
 
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """Return the ``running`` run for a conversation, or ``None``.

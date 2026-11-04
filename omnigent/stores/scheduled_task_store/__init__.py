@@ -379,6 +379,38 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def record_run_outcome(
+        self,
+        conversation_id: str,
+        *,
+        success: bool,
+        emoji: str,
+        text: str,
+        recorded_at: int,
+    ) -> ScheduledTaskRun | None:
+        """
+        Record the agent's outcome on the conversation's latest run.
+
+        The latest run is the one whose prompt the conversation's current turn
+        answers: a new-session task has one run per conversation, and a
+        continued session's newest run carries the prompt it last received. A
+        later call overwrites the earlier outcome. ``status`` is left alone, so
+        a run that finished but missed its goal stays ``succeeded`` with
+        ``outcome_success`` ``False``. Workspace-scoped like every other store
+        read.
+
+        :param conversation_id: The fired conversation recording its outcome.
+        :param success: Whether the run reached its goal.
+        :param emoji: The emoji summarizing the outcome, e.g. ``"🚀"``.
+        :param text: A few words on the outcome, e.g. ``"Opened 2 PRs"``.
+        :param recorded_at: Unix epoch seconds of this recording.
+        :returns: The updated :class:`ScheduledTaskRun`, or ``None`` when the
+            conversation has no run (it was not started by a scheduled task) or
+            the run's task is gone.
+        """
+        ...
+
+    @abstractmethod
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """
         Return the ``running`` run for a conversation, or ``None``.

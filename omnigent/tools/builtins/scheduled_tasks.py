@@ -10,12 +10,18 @@ in-process store.
 * ``sys_scheduled_task_list`` — list the caller's tasks.
 * ``sys_scheduled_task_update`` — update a task's mutable fields.
 * ``sys_scheduled_task_delete`` — delete a task.
+* ``sys_scheduled_task_record_outcome`` — record whether the current run
+  reached its goal, shown in the task's run history.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from omnigent.entities.scheduled_task import (
+    RUN_OUTCOME_EMOJI_MAX_CHARS,
+    RUN_OUTCOME_TEXT_MAX_CHARS,
+)
 from omnigent.tools.base import Tool
 
 _RRULE_DESC = (
@@ -394,6 +400,67 @@ class SysScheduledTaskDeleteTool(Tool):
                         },
                     },
                     "required": ["scheduled_task_id"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
+class SysScheduledTaskRecordOutcomeTool(Tool):
+    """Record the current run's outcome. Dispatched to ``PUT /v1/scheduled-tasks/run-outcome``."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_scheduled_task_record_outcome"``."""
+        return "sys_scheduled_task_record_outcome"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Record whether this automation run reached its goal. Only works in a "
+            "session that a scheduled task (automation) started. Call it once, before "
+            "your final reply; a later call replaces the earlier outcome. Judge "
+            "success by the goal in the automation's prompt; when the prompt states no "
+            "goal, by whether you did what it asked. Finishing the run is not success "
+            "by itself. The owner sees the emoji and text in the run history, like a "
+            "status message."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI-format tool schema."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "success": {
+                            "type": "boolean",
+                            "description": (
+                                "true if the run reached its goal, false if it did not "
+                                "(including when it was blocked or did only part of it)."
+                            ),
+                        },
+                        "emoji": {
+                            "type": "string",
+                            "maxLength": RUN_OUTCOME_EMOJI_MAX_CHARS,
+                            "description": (
+                                "One emoji summarizing the outcome, e.g. '🚀', '🧹', '🚧'."
+                            ),
+                        },
+                        "text": {
+                            "type": "string",
+                            "maxLength": RUN_OUTCOME_TEXT_MAX_CHARS,
+                            "description": (
+                                "A few words on the outcome, e.g. 'Opened 2 PRs' or "
+                                "'Blocked: CI is down'."
+                            ),
+                        },
+                    },
+                    "required": ["success", "emoji", "text"],
                     "additionalProperties": False,
                 },
             },

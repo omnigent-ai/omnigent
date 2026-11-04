@@ -438,6 +438,7 @@ _SCHEDULED_TASK_TOOLS = frozenset(
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
+        "sys_scheduled_task_record_outcome",
     }
 )
 
@@ -4880,6 +4881,52 @@ async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> s
     raise ValueError(f"could not create project {trimmed!r}: {created.text[:200]}")
 
 
+async def _record_scheduled_task_run_outcome(
+    server_client: httpx.AsyncClient,
+    args: _JsonObject,
+    *,
+    conversation_id: str | None,
+) -> str:
+    """Send ``sys_scheduled_task_record_outcome`` for the calling session.
+
+    The session is always the caller's own, so the model cannot record an
+    outcome on another session's run. The server validates the emoji and text.
+    """
+    tool_name = "sys_scheduled_task_record_outcome"
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} needs the calling session"})
+    success = args.get("success")
+    if not isinstance(success, bool):
+        return json.dumps({"error": f"{tool_name}: success must be true or false"})
+    emoji, text = args.get("emoji"), args.get("text")
+    if not isinstance(emoji, str) or not isinstance(text, str):
+        return json.dumps({"error": f"{tool_name}: emoji and text must be strings"})
+    resp = await server_client.put(
+        "/v1/scheduled-tasks/run-outcome",
+        json={"session_id": conversation_id, "success": success, "emoji": emoji, "text": text},
+        headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+        timeout=30.0,
+    )
+    if resp.status_code == 405:
+        # An older server routes the path to /scheduled-tasks/{id}, which has no PUT.
+        return json.dumps(
+            {"error": f"{tool_name}: this Omnigent server does not record run outcomes"}
+        )
+    if resp.status_code == 404:
+        return json.dumps(
+            {
+                "error": f"{tool_name}: no automation run to record; this session was not "
+                "started by a scheduled task, or automations are off"
+            }
+        )
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+        )
+    run = resp.json()
+    return json.dumps({"recorded": True, "run_id": run.get("id"), "outcome": run.get("outcome")})
+
+
 async def _execute_scheduled_task_tool(
     tool_name: str,
     arguments: str,
@@ -4942,6 +4989,10 @@ async def _execute_scheduled_task_tool(
                         "projects; retry without project_name or project_id"
                     }
                 )
+        if tool_name == "sys_scheduled_task_record_outcome":
+            return await _record_scheduled_task_run_outcome(
+                server_client, args, conversation_id=conversation_id
+            )
         if tool_name == "sys_scheduled_task_list":
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":

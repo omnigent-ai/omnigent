@@ -63,7 +63,7 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
-import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
+import type { ScheduledTaskRun, ScheduledTaskRunOutcome } from "@/lib/scheduledTasksApi";
 import { cn } from "@/lib/utils";
 
 export function TaskDetailPage() {
@@ -595,8 +595,10 @@ function useRunUnread(run: ScheduledTaskRun): boolean {
  * - LEADING: a single status icon chosen by priority (see `RunStatusIcon`) —
  *   failed triangle > skipped circle-slash > succeeded-unread blue dot >
  *   succeeded-read grey dot — each with an explanatory tooltip.
- * - BODY: the fire timestamp, the duration (muted), and — for skipped/failed —
- *   the stage the fire stopped at and why, derived from `errorCode`.
+ * - BODY: the fire timestamp, the duration (muted), the outcome the agent
+ *   recorded (emoji + a few words, like a status message), and — for
+ *   skipped/failed — the stage the fire stopped at and why, derived from
+ *   `errorCode`.
  *
  * When the run produced a conversation the ENTIRE row is the click target
  * (a real `<Link>`: keyboard-focusable, Enter/Space activate natively) that
@@ -636,6 +638,7 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
             </span>
           )}
         </span>
+        {run.outcome && <RunOutcome outcome={run.outcome} />}
         {failure && (
           <span className="text-xs text-muted-foreground" data-testid="run-failure">
             {failure.stage && (
@@ -653,7 +656,7 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
 
   const commonClassName = cn(
     "flex gap-3 rounded-lg px-2 py-2",
-    failure ? "items-start" : "items-center",
+    failure || run.outcome ? "items-start" : "items-center",
   );
 
   // Clickable when the run has a conversation to open. A real <Link> (anchor)
@@ -686,6 +689,28 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
     >
       {body}
     </li>
+  );
+}
+
+/**
+ * The outcome the agent recorded for a run: its emoji and a few words, like a
+ * status message. A missed goal is announced to screen readers, since the emoji
+ * alone may not say so.
+ */
+function RunOutcome({ outcome }: { outcome: ScheduledTaskRunOutcome }) {
+  return (
+    <span
+      className={cn(
+        "flex min-w-0 items-baseline gap-1.5 text-sm",
+        outcome.success ? "text-foreground" : "text-amber-700 dark:text-amber-400",
+      )}
+      data-testid="run-outcome"
+      data-run-outcome={outcome.success ? "success" : "failure"}
+    >
+      <span aria-hidden>{outcome.emoji}</span>
+      <span className="sr-only">{outcome.success ? "Goal reached: " : "Goal not reached: "}</span>
+      <span className="min-w-0 truncate">{outcome.text}</span>
+    </span>
   );
 }
 

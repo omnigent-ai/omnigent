@@ -140,6 +140,7 @@ function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
     firedAt: 1_700_000_000,
     finishedAt: 1_700_000_102,
     errorCode: null,
+    outcome: null,
     conversationUpdatedAt: 1_700_000_500,
     conversationStatus: "idle",
     viewerLastSeen: null,
@@ -641,6 +642,33 @@ describe("run history", () => {
     expect(screen.getByText(/Runs sharing a session show the same total/)).toBeInTheDocument();
     expect(screen.getByText(/Separate sub-agent sessions are excluded/)).toBeInTheDocument();
   });
+  it.each([
+    [true, "🚀", "Opened 2 PRs", "success", "Goal reached: "],
+    [false, "🚧", "Blocked: CI is down", "failure", "Goal not reached: "],
+  ])(
+    "shows the outcome the agent recorded (success=%s)",
+    (success, emoji, text, state, announced) => {
+      setTask(task());
+      setRuns([
+        run({
+          conversationId: "c_1",
+          outcome: { success, emoji, text, recordedAt: 1_700_000_090 },
+        }),
+      ]);
+      renderPage();
+      const outcome = screen.getByTestId("run-outcome");
+      expect(outcome).toHaveAttribute("data-run-outcome", state);
+      expect(outcome).toHaveTextContent(`${emoji}${announced}${text}`);
+    },
+  );
+
+  it("shows no outcome for a run that recorded none", () => {
+    setTask(task());
+    setRuns([run({ conversationId: "c_1" })]);
+    renderPage();
+    expect(screen.queryByTestId("run-outcome")).toBeNull();
+  });
+
   it("renders the empty state when there are no runs", () => {
     setTask(task());
     setRuns([]);

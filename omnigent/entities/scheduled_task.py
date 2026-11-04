@@ -22,6 +22,11 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict
 
+# Bounds on the outcome an agent records for a run. An emoji can span several
+# code points (skin tones, ZWJ sequences, flags), so its bound is in code points.
+RUN_OUTCOME_EMOJI_MAX_CHARS = 16
+RUN_OUTCOME_TEXT_MAX_CHARS = 80
+
 
 class ScheduledRunLogContext(BaseModel):
     """Occurrence identity retained with a saved prompt across replica changes."""
@@ -150,6 +155,16 @@ class ScheduledTaskRun:
     :param error_code: Short failure classification (e.g. ``"timeout"``,
         ``"rate_limited"``) for future retry logic; ``None`` unless
         ``status == "failed"``.
+    :param outcome_success: Whether the agent reached the run's goal, as it
+        recorded with ``sys_scheduled_task_record_outcome``; ``None`` when it recorded
+        nothing. Independent of ``status``, which only says whether the run
+        finished: a ``succeeded`` run can still have missed its goal.
+    :param outcome_emoji: The emoji the agent chose for the outcome, e.g.
+        ``"🚀"``; ``None`` when no outcome was recorded.
+    :param outcome_text: A few words on the outcome, e.g. ``"Opened 2 PRs"``;
+        ``None`` when no outcome was recorded.
+    :param outcome_recorded_at: Unix epoch seconds the outcome was last
+        recorded, or ``None``.
     """
 
     id: str
@@ -165,3 +180,7 @@ class ScheduledTaskRun:
     trigger_key: str | None = None
     host_id: str | None = None
     lease_expires_at: int | None = None
+    outcome_success: bool | None = None
+    outcome_emoji: str | None = None
+    outcome_text: str | None = None
+    outcome_recorded_at: int | None = None

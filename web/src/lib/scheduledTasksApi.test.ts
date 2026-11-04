@@ -134,7 +134,8 @@ describe("listScheduledTaskRuns", () => {
       firedAt: 1_700_000_005,
       finishedAt: 1_700_000_050,
       errorCode: null,
-      // An older server sends no session read state.
+      // An older server sends no outcome and no session read state.
+      outcome: null,
       conversationUpdatedAt: null,
       conversationStatus: null,
       viewerLastSeen: null,
@@ -172,6 +173,38 @@ describe("listScheduledTaskRuns", () => {
       viewerLastSeen: 1_700_000_055,
       viewerUnread: false,
       sessionCostUsd: 0,
+    });
+  });
+
+  it("maps the outcome the agent recorded", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        runs: [
+          {
+            id: "run_1",
+            scheduled_task_id: "st_1",
+            status: "succeeded",
+            scheduled_at: 1_700_000_000,
+            conversation_id: "conv_1",
+            fired_at: 1_700_000_005,
+            finished_at: 1_700_000_050,
+            error_code: null,
+            outcome: {
+              success: false,
+              emoji: "🚧",
+              text: "Blocked: CI is down",
+              recorded_at: 1_700_000_040,
+            },
+          },
+        ],
+      }),
+    );
+    const [run] = await listScheduledTaskRuns("st_1");
+    expect(run.outcome).toEqual({
+      success: false,
+      emoji: "🚧",
+      text: "Blocked: CI is down",
+      recordedAt: 1_700_000_040,
     });
   });
 });

@@ -36,6 +36,8 @@ _DISPATCH_REVISION = "c8e4f2a6b901"
 _COMPLETED_STATE_REVISION = "9e82957bd115"
 _SESSION_MODE_PREVIOUS = "b2e4f6a8c013"
 _SESSION_MODE_REVISION = "d0a1f879a01d"
+_RUN_OUTCOME_REVISION = "e7c3a1b9d240"
+_RUN_OUTCOME_COLUMNS = {"outcome_success", "outcome_emoji", "outcome_text", "outcome_recorded_at"}
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -143,7 +145,13 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         "trigger_key",
         "host_id",
         "lease_expires_at",
+        "outcome_success",
+        "outcome_emoji",
+        "outcome_text",
+        "outcome_recorded_at",
     }
+    for name in ("outcome_success", "outcome_emoji", "outcome_text", "outcome_recorded_at"):
+        assert columns[name]["nullable"] is True
 
 
 def test_workspace_id_leads_primary_keys(db_engine: Engine) -> None:
@@ -925,3 +933,53 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
             "id",
         ],
     }
+
+
+def test_run_outcome_migration_keeps_existing_runs_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    """Existing runs get no outcome; downgrade drops recorded outcomes but keeps the runs."""
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _SESSION_MODE_REVISION)
+    run_values = {"scheduled_task_id": b"t" * 16, "status": 3, "scheduled_at": 1}
+    before = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, **run_values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _RUN_OUTCOME_REVISION)
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        assert conn.execute(
+            sa.select(runs.c.outcome_success, runs.c.outcome_emoji, runs.c.outcome_text)
+        ).one() == (None, None, None)
+        conn.execute(
+            runs.insert().values(
+                id=b"b" * 16,
+                outcome_success=False,
+                outcome_emoji="🧯",
+                outcome_text="Build still red",
+                outcome_recorded_at=2,
+                **run_values,
+            )
+        )
+        row = conn.execute(
+            sa.select(runs.c.outcome_success, runs.c.outcome_emoji, runs.c.outcome_text).where(
+                runs.c.id == b"b" * 16
+            )
+        ).one()
+        assert (bool(row.outcome_success), row.outcome_emoji, row.outcome_text) == (
+            False,
+            "🧯",
+            "Build still red",
+        )
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _SESSION_MODE_REVISION)
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")}
+    assert not columns & _RUN_OUTCOME_COLUMNS
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2

@@ -370,7 +370,9 @@ UNATTENDED_RUN_NOTE = (
     "independent work that does not depend on those decisions. If an action is denied or "
     "requires unavailable approval, skip that action and explain the blocker. Continue "
     "independent work and permitted alternatives. Do not change permission settings to "
-    "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
+    "get past the restriction. If you have the sys_scheduled_task_record_outcome tool, call "
+    "it once before your final reply to record whether you reached the goal above, with an "
+    "emoji and a few words. Lead your final reply with unresolved decisions and assumptions, "
     "prioritizing those the user is most likely to want to change, then summarize what "
     "you did and anything you couldn't do."
 )

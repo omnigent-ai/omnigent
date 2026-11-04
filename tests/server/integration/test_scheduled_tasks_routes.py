@@ -3258,3 +3258,124 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     )
     assert retry.status_code == 400, retry.text
     assert "Minimum interval is 60 minutes" in retry.text
+
+
+async def _seed_fired_session(
+    auth_client: httpx.AsyncClient, db_uri: str, *, owner_level: int = 4
+) -> tuple[str, str, dict[str, str]]:
+    """A task, a session alice owns bound to a token runner, and a run for it.
+
+    :returns: The run id, the session id, and the headers the session's runner sends.
+    """
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    conversations = SqlAlchemyConversationStore(db_uri)
+    session = conversations.create_conversation()
+    SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", session.id, owner_level)
+    token = "outcome-runner-token"
+    conversations.set_runner_id(session.id, token_bound_runner_id(token))
+    run_id = uuid.uuid4().hex
+    _seed_run(db_uri, created.json()["id"], run_id, status="running", conversation_id=session.id)
+    runner_headers = {
+        **_headers(),
+        ORCHESTRATION_SOURCE_HEADER: session.id,
+        RUNNER_TUNNEL_TOKEN_HEADER: token,
+    }
+    return run_id, session.id, runner_headers
+
+
+async def test_run_outcome_is_recorded_from_the_runner_and_listed(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The session's runner records the outcome; the run list shows it beside the status."""
+    run_id, session_id, runner_headers = await _seed_fired_session(auth_client, db_uri)
+    resp = await auth_client.put(
+        "/v1/scheduled-tasks/run-outcome",
+        json={"session_id": session_id, "success": False, "emoji": " 🚧 ", "text": "Blocked:  CI"},
+        headers=runner_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["id"] == run_id
+    assert body["status"] == "running"
+    assert body["outcome"]["success"] is False
+    assert (body["outcome"]["emoji"], body["outcome"]["text"]) == ("🚧", "Blocked: CI")
+    assert isinstance(body["outcome"]["recorded_at"], int)
+
+    # The owner may also set it from the UI or API, without a runner.
+    resp = await auth_client.put(
+        "/v1/scheduled-tasks/run-outcome",
+        json={"session_id": session_id, "success": True, "emoji": "🚀", "text": "Shipped"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    runs = (
+        await auth_client.get(
+            f"/v1/scheduled-tasks/{body['scheduled_task_id']}/runs", headers=_headers()
+        )
+    ).json()["runs"]
+    assert runs[0]["outcome"]["success"] is True
+    assert runs[0]["outcome"]["text"] == "Shipped"
+
+
+async def test_runs_without_an_outcome_list_null(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    run_id, _, _ = await _seed_fired_session(auth_client, db_uri)
+    tasks = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    task_id = tasks["scheduled_tasks"][0]["id"]
+    runs = (
+        await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    ).json()
+    assert [(r["id"], r["outcome"]) for r in runs["runs"]] == [(run_id, None)]
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_status"),
+    [
+        ("other-source", 403),
+        ("unowned-session", 404),
+        ("no-run", 404),
+        ("letters-in-emoji", 422),
+        ("empty-text", 422),
+        ("long-text", 422),
+        ("non-boolean-success", 422),
+    ],
+)
+async def test_run_outcome_rejections(
+    auth_client: httpx.AsyncClient, db_uri: str, case: str, expected_status: int
+) -> None:
+    """Bad input, a foreign or unowned session, or a session with no run record nothing."""
+    run_id, session_id, headers = await _seed_fired_session(
+        auth_client, db_uri, owner_level=1 if case == "unowned-session" else 4
+    )
+    body: dict[str, object] = {
+        "session_id": session_id,
+        "success": True,
+        "emoji": "✅",
+        "text": "Done",
+    }
+    if case == "other-source":
+        body["session_id"] = uuid.uuid4().hex
+    elif case == "unowned-session":
+        headers = _headers()
+    elif case == "no-run":
+        other = SqlAlchemyConversationStore(db_uri).create_conversation()
+        SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", other.id, 4)
+        body["session_id"] = other.id
+        headers = _headers()
+    elif case == "letters-in-emoji":
+        body["emoji"] = "ok"
+    elif case == "empty-text":
+        body["text"] = "   "
+    elif case == "long-text":
+        body["text"] = "x" * 81
+    elif case == "non-boolean-success":
+        body["success"] = "yes"
+    resp = await auth_client.put("/v1/scheduled-tasks/run-outcome", json=body, headers=headers)
+    assert resp.status_code == expected_status, resp.text
+    run = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(session_id)
+    assert run is not None and run.id == run_id
+    assert run.outcome_success is None

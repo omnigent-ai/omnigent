@@ -1362,6 +1362,114 @@ def test_get_running_run_by_conversation_is_workspace_scoped(
         assert found is not None and found.id == _uid("run_ws")
 
 
+def test_record_run_outcome_sets_outcome_without_touching_status(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """The outcome lands on the run and reads back, and the lifecycle status stays put."""
+    run_id = _seed_running_run(store, "outcome")
+    recorded = store.record_run_outcome(
+        _uid("conv_outcome"),
+        success=False,
+        emoji="🚧",
+        text="Blocked: CI is down",
+        recorded_at=150,
+    )
+    assert recorded is not None and recorded.id == run_id
+    assert recorded.status == "running"
+    store.update_run(run_id, status="succeeded", finished_at=202)
+    [run], _ = store.list_runs(_uid("task_outcome"))
+    assert (run.status, run.outcome_success, run.outcome_emoji, run.outcome_text) == (
+        "succeeded",
+        False,
+        "🚧",
+        "Blocked: CI is down",
+    )
+    assert run.outcome_recorded_at == 150
+
+
+def test_record_run_outcome_replaces_an_earlier_outcome(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A later call overwrites the earlier one."""
+    _seed_running_run(store, "again")
+    store.record_run_outcome(
+        _uid("conv_again"), success=False, emoji="🚧", text="Blocked", recorded_at=150
+    )
+    second = store.record_run_outcome(
+        _uid("conv_again"), success=True, emoji="🚀", text="Unblocked and shipped", recorded_at=160
+    )
+    assert second is not None
+    assert (second.outcome_success, second.outcome_emoji, second.outcome_text) == (
+        True,
+        "🚀",
+        "Unblocked and shipped",
+    )
+    assert second.outcome_recorded_at == 160
+
+
+def test_record_run_outcome_targets_the_latest_run_of_a_continued_session(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A continued session has one run per firing; only the newest gets the outcome."""
+    run_id = _seed_running_run(store, "cont")
+    store.update_run(run_id, status="succeeded", finished_at=105)
+    store.create_run(
+        run_id=_uid("run_cont_2"),
+        scheduled_task_id=_uid("task_cont"),
+        status="running",
+        scheduled_at=200,
+        conversation_id=_uid("conv_cont"),
+        fired_at=201,
+    )
+    recorded = store.record_run_outcome(
+        _uid("conv_cont"), success=True, emoji="🧹", text="Closed 3 stale PRs", recorded_at=250
+    )
+    assert recorded is not None and recorded.id == _uid("run_cont_2")
+    runs, _ = store.list_runs(_uid("task_cont"))
+    assert {r.id: r.outcome_success for r in runs} == {_uid("run_cont_2"): True, run_id: None}
+
+
+def test_record_run_outcome_none_without_a_run(store: SqlAlchemyScheduledTaskStore) -> None:
+    """An interactive session has no run to record on."""
+    assert (
+        store.record_run_outcome(
+            _uid("conv_none"), success=True, emoji="✅", text="Done", recorded_at=1
+        )
+        is None
+    )
+
+
+def test_record_run_outcome_none_once_the_task_is_deleted(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A deleted task's run takes no outcome, whether it is purged or still retained."""
+    _seed_running_run(store, "gone")
+    assert store.delete(_uid("task_gone"))
+    assert (
+        store.record_run_outcome(
+            _uid("conv_gone"), success=True, emoji="✅", text="Done", recorded_at=1
+        )
+        is None
+    )
+
+
+def test_record_run_outcome_is_workspace_scoped(store: SqlAlchemyScheduledTaskStore) -> None:
+    """A run in another workspace is invisible outside its ``workspace_scope``."""
+    with workspace_scope(11):
+        _seed_running_run(store, "ws_outcome")
+    assert (
+        store.record_run_outcome(
+            _uid("conv_ws_outcome"), success=True, emoji="✅", text="Done", recorded_at=1
+        )
+        is None
+    )
+    with workspace_scope(11):
+        recorded = store.record_run_outcome(
+            _uid("conv_ws_outcome"), success=True, emoji="✅", text="Done", recorded_at=1
+        )
+        assert recorded is not None and recorded.outcome_success is True
+
+
 def _due_task(store: SqlAlchemyScheduledTaskStore, seed: str = "dispatch"):
     store.configure_dispatch(True)
     task = store.create(

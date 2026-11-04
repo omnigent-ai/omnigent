@@ -33,6 +33,7 @@ from omnigent.tools.builtins import (
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
+    SysScheduledTaskRecordOutcomeTool,
     SysScheduledTaskUpdateTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
@@ -214,10 +215,10 @@ class ToolManager:
         Auto-register the scheduled-task management builtins.
 
         Registered without spec opt-in so an agent can create, list,
-        update, and delete recurring scheduled tasks at runtime;
-        ``tool_groups.scheduled_tasks: false`` drops all four. The runner
-        dispatches them via the Omnigent server's ``/v1/scheduled-tasks``
-        REST endpoints.
+        update, and delete recurring scheduled tasks at runtime, and record
+        a fired run's outcome; ``tool_groups.scheduled_tasks: false`` drops
+        all five. The runner dispatches them via the Omnigent server's
+        ``/v1/scheduled-tasks`` REST endpoints.
         """
         if not self._spec.tool_groups.scheduled_tasks:
             return
@@ -226,6 +227,7 @@ class ToolManager:
             SysScheduledTaskListTool(),
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
+            SysScheduledTaskRecordOutcomeTool(),
         ):
             self._tools[tool.name()] = tool
 
