@@ -7898,14 +7898,30 @@ async def test_run_starts_and_shuts_down_host_maintenance(
         janitor_roots.append(harness_tmp_parent)
         return janitor
 
+    class _RecordingFlagRefresher:
+        def start(self) -> None:
+            calls.append("flags_start")
+
+        async def aclose(self) -> None:
+            calls.append("flags_close")
+
     monkeypatch.setattr(HostMaintenanceJanitor, "for_host", _for_host)
     host = _host()
     host._lifecycle_lock = _RecordingLifecycleLock()  # type: ignore[assignment]
+    host._runtime_flags = _RecordingFlagRefresher()  # type: ignore[assignment]
     monkeypatch.setattr(host, "_cleanup_runners", lambda: calls.append("cleanup_runners"))
 
     await host.run()
 
-    assert calls == ["acquire", "start", "shutdown", "cleanup_runners", "release"]
+    assert calls == [
+        "acquire",
+        "start",
+        "flags_start",
+        "shutdown",
+        "flags_close",
+        "cleanup_runners",
+        "release",
+    ]
     assert janitor_roots == [host._harness_tmp_parent]
     assert host._maintenance_janitor is None
 

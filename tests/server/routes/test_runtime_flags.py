@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime_flags import MAX_RUNTIME_FLAGS_PER_REQUEST
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes.runtime_flags import RuntimeFlagsRequest, create_runtime_flags_router
@@ -115,6 +116,13 @@ async def test_provider_values_are_filtered_by_query_and_type(db_uri, tmp_path, 
 def test_invalid_request_bodies(body):
     with pytest.raises(ValidationError):
         RuntimeFlagsRequest.model_validate(body)
+
+
+def test_request_accepts_at_most_the_batch_limit():
+    flags = [(f"a.flag{index}", "bool", False) for index in range(MAX_RUNTIME_FLAGS_PER_REQUEST)]
+    assert len(RuntimeFlagsRequest.model_validate(_request(*flags)).flags) == 500
+    with pytest.raises(ValidationError):
+        RuntimeFlagsRequest.model_validate(_request(*flags, ("a.extra", "bool", False)))
 
 
 def _router_app(provider, host_store=None) -> FastAPI:

@@ -222,13 +222,8 @@ def test_float_matcher_rejects_values_a_float_cannot_hold(value) -> None:
 
 
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, 10**400])
-async def test_non_finite_float_defaults_are_rejected(value) -> None:
+def test_non_finite_float_defaults_are_rejected(value) -> None:
     valid = BoolFeatureFlag("test.enabled", False)
     with pytest.raises(ValueError, match="wrong type"):
         FloatFeatureFlag("test.ratio", value)
-    server = _FakeServer(_served({"test.enabled": True}))
-    await RuntimeFlagRefresher(server.post).refresh_once()
-    assert valid.get_current_value() is True
-    assert server.requests[0][1] == {
-        "flags": [{"name": "test.enabled", "type": "bool", "default": False}]
-    }
+    assert runtime_flags.declared_runtime_flags() == (valid,)
