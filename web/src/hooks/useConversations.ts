@@ -58,6 +58,7 @@ import {
 } from "@/shell/sidebarNav";
 import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
+import { isRetryableRequestError } from "@/lib/queryRetry";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
@@ -100,6 +101,20 @@ export const SEARCH_FETCH_TIMEOUT_MS = 10_000;
  */
 function isAbortTimeout(error: unknown): boolean {
   return error instanceof DOMException && error.name === "TimeoutError";
+}
+
+/**
+ * Retry policy for session-list fetches: up to 3 retries, and only for failures
+ * a retry can fix. A client-side search timeout and a stale cursor are
+ * terminal, and so is a 4xx the same request would hit again.
+ */
+export function retryListFetch(failureCount: number, error: unknown): boolean {
+  return (
+    failureCount < 3 &&
+    !isAbortTimeout(error) &&
+    !isStaleCursorError(error) &&
+    isRetryableRequestError(error)
+  );
 }
 
 /**
@@ -719,13 +734,11 @@ export function useConversations(
         }
       : {}),
     // A client-side search timeout is terminal — retrying would just re-arm the
-    // same slow request (default 3×) and prolong the spinner. Any other failure
-    // keeps React Query's default retry behaviour.
+    // same slow request (default 3×) and prolong the spinner.
     // A stale cursor is terminal for that page param too: the row it names is
     // gone, so a retry reissues the same doomed cursor. The restart below
     // recovers it instead.
-    retry: (failureCount, error) =>
-      !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
+    retry: retryListFetch,
     refetchInterval: options.snapshot
       ? false
       : (options.refreshIntervalMs ??
@@ -779,8 +792,7 @@ export function useSessionSearch(
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
     staleTime: 0,
     gcTime: 0,
-    retry: (failureCount, error) =>
-      !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
+    retry: retryListFetch,
     enabled: enabled && searchQuery !== "",
   });
   useRestartOnStaleCursor(queryKey);
@@ -1715,7 +1727,7 @@ async function fetchPinnedScope(
     pinned: "true",
   });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw await apiErrorFromResponse(res);
   const rows = applySessionTombstones((await res.json()) as ConversationsPage, true).data;
   const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
   // Honored iff the server returned nothing, or everything it returned is
@@ -1767,6 +1779,7 @@ export function usePinnedConversations(sharedEnabled = true, limit = sidebarConf
   const viewerId = useViewerId();
   const query = useQuery<PinnedConversationsResult>({
     queryKey: PINNED_CONVERSATIONS_KEY,
+    retry: retryListFetch,
     queryFn: () => fetchPinnedConversations(sharedEnabled, limit),
     select: (data) =>
       sharedEnabled
@@ -2656,7 +2669,7 @@ export function useProjectSessions(
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
-    retry: (failureCount, error) => !isStaleCursorError(error) && failureCount < 3,
+    retry: retryListFetch,
     enabled,
   });
   // A session deleted mid-scroll kills the folder's cursor; reload the folder

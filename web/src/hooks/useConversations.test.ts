@@ -23,6 +23,7 @@ import {
   useBulkDeleteConversations,
   useBulkStopSessions,
   undoArchiveConversations,
+  retryListFetch,
   useConversations,
   useSessionSearch,
   useDeleteProject,
@@ -38,6 +39,7 @@ import {
   useTogglePinnedConversation,
   useReorderPinnedConversations,
   fetchPinnedConversations,
+  usePinnedConversations,
   clearSessionTombstones,
   markRecentlyCreated,
   clearRecentlyCreated,
@@ -48,6 +50,7 @@ import {
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
+import { useScopeCache } from "./useScopeCache";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -385,6 +388,11 @@ describe("useConversations search timeout", () => {
     // A genuine server/network error still retries (up to the default cap).
     expect(retry(0, new Error("500 Internal Server Error"))).toBe(true);
     expect(retry(3, new Error("500 Internal Server Error"))).toBe(false);
+    // Throttling retries; a client error the same request repeats does not.
+    expect(retry(0, new ApiError("slow down", 429, null))).toBe(true);
+    expect(retry(0, new ApiError("unavailable", 503, null))).toBe(true);
+    expect(retry(0, new ApiError("not found", 404, null))).toBe(false);
+    expect(retry(0, new ApiError("forbidden", 403, null))).toBe(false);
   });
 });
 
@@ -443,7 +451,45 @@ describe("useConversations stale cursor", () => {
     // Reissuing the same dead cursor fails identically, so the restart owns
     // the recovery instead.
     expect(retry(0, new ApiError("gone", 400, "stale_cursor"))).toBe(false);
-    expect(retry(0, new ApiError("bad", 400, "invalid_input"))).toBe(true);
+    // Any other 4xx repeats on the same request too, so it isn't retried either.
+    expect(retry(0, new ApiError("bad", 400, "invalid_input"))).toBe(false);
+  });
+});
+
+describe("session-list retry policy", () => {
+  it("allows exactly three retries of a retryable failure", () => {
+    const failure = new ApiError("unavailable", 503, null);
+    expect([0, 1, 2, 3].map((count) => retryListFetch(count, failure))).toEqual([
+      true,
+      true,
+      true,
+      false,
+    ]);
+  });
+
+  it("is shared by every session-list query", () => {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(
+      () => {
+        useConversations("", false);
+        useSessionSearch("linear", "all", { limit: 8 });
+        useProjectSessions("Sprint 42", true);
+        useScopeCache("mine", false);
+        usePinnedConversations();
+      },
+      { wrapper },
+    );
+    const retries = queryClient
+      .getQueryCache()
+      .getAll()
+      .map((query) => (query.options as { retry?: unknown }).retry);
+    expect(retries).toHaveLength(5);
+    for (const retry of retries) expect(retry).toBe(retryListFetch);
   });
 });
 
@@ -2158,6 +2204,37 @@ describe("fetchPinnedConversations filter-honored detection", () => {
 
     expect(result.filterHonored).toBe(true);
     expect(result.conversations.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
+  });
+
+  it("fails with the response's status and Retry-After so the retry policy can read them", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: { code: "rate_limited", message: "slow down" } }), {
+        status: 429,
+        headers: { "Content-Type": "application/json", "Retry-After": "20" },
+      }),
+    );
+
+    const failure = await fetchPinnedConversations(false).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ApiError);
+    expect(failure).toMatchObject({ status: 429, retryAfterMs: 20_000 });
+  });
+
+  it("does not retry a pinned-list client error", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "forbidden", message: "no" } }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const queryClient = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(() => usePinnedConversations(false), { wrapper });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("reports honored for an empty page (a user with no pins)", async () => {
