@@ -209,6 +209,22 @@ it("bounds a Name merge at each token's position after a capped refresh", () => 
   expect(merged.rows.map((r) => r.id)).toEqual(["u0", "u1"]);
 });
 
+it("decodes server-issued Name tokens and ignores malformed ones", () => {
+  const titled = (id: string, title: string) => ({ ...row(id, 0), title });
+  const rows = [titled("a", "Apple"), titled("e", "Éclair \u{1F600}"), titled("o", "Øresund")];
+  // Copied from the server's _encode_title_cursor for rows[1].
+  const serverToken = "title.WyIww4ljbGFpciDwn5iAIiwiZSJd";
+  expect(titleToken(rows[1])).toBe(serverToken);
+  const shared = [titled("u", "Übung")];
+  const mergedIds = (cursor: string) =>
+    mergeScopeRows(rows, shared, true, false, cursor, null, "title").rows.map((r) => r.id);
+  expect(mergedIds(serverToken)).toEqual(["a", "e"]);
+  // Bad base64, non-JSON and non-string members bound at Mine's last row, like an unknown id.
+  for (const malformed of ["title.!!", "title.bm90IGpzb24", "title.WzEsMl0"]) {
+    expect(mergedIds(malformed)).toEqual(["a", "e", "o"]);
+  }
+});
+
 it("keys names like the server: folded case, untitled last", () => {
   expect(["beta", null, "Alpha", "ab", "a-c", ""].map(titleSortKey).sort()).toEqual([
     "0a-c",
