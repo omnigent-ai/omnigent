@@ -305,7 +305,7 @@ class _Login:
     finished_at: float | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     watcher: asyncio.Task[None] | None = None
-    delivering: bool = False
+    delivered: bool = False
 
     def terminal(self) -> int:
         """The CLI's terminal, or -1 once this sign-in has ended."""
@@ -529,14 +529,16 @@ class HostMcpLogins:
             raise LoginError("invalid", "This sign-in is no longer waiting")
         if not valid_callback(callback_url, login.redirect):
             raise LoginError("invalid", "That isn't the address the sign-in page redirected to")
-        if login.delivering:
+        if login.delivered:
             raise LoginError("invalid", "This sign-in is already finishing")
         # A second delivery would reuse the address's one-time code.
-        login.delivering = True
+        login.delivered = True
         try:
             await _deliver_callback(login.terminal, callback_url)
-        finally:
-            login.delivering = False
+        except BaseException:
+            # The code went unused, so the user may paste it again.
+            login.delivered = False
+            raise
         return login.status()
 
     async def cancel(self, login_id: str) -> LoginStatus:

@@ -346,6 +346,32 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
     await logins.close()
 
 
+async def test_redirect_is_resent_only_after_a_failed_delivery(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    delivered: list[str] = []
+
+    async def deliver(terminal: Callable[[], int], callback_url: str) -> None:
+        delivered.append(callback_url)
+        if len(delivered) == 1:
+            raise LoginError("failed", "Couldn't hand the address to the harness")
+
+    monkeypatch.setattr(mcp_login, "_deliver_callback", deliver)
+    logins = HostMcpLogins()
+    started = await logins.start(_server())
+    callback = f"{_CALLBACK}abc&state=s"
+    with pytest.raises(LoginError) as failed:
+        await logins.submit(started["login_id"], callback)
+    assert failed.value.status == "failed"
+    assert (await logins.submit(started["login_id"], callback))["state"] == "pending"
+    # The CLI is still exchanging the code, so a later Finish must not resend it.
+    with pytest.raises(LoginError) as repeated:
+        await logins.submit(started["login_id"], callback)
+    assert repeated.value.status == "invalid"
+    assert delivered == [callback, callback]
+    await logins.close()
+
+
 @pytest.mark.parametrize(
     "mode,state,error",
     [
