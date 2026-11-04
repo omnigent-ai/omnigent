@@ -42,9 +42,8 @@ def test_inaccessible_ancestor_git_metadata_preserves_file_tracking(
 
     registry = create_filesystem_registry(workspace)
     assert isinstance(registry, AgentEditFilesystemRegistry)
-    (workspace / "sample.txt").write_text("sample\n")
     registry.record_change("sample.txt", "created", "synthetic-session")
-    changes = registry.list_changed_files("synthetic-session", limit=10, check_disk=True)
+    changes = registry.list_changed_files("synthetic-session", limit=10)
     assert [entry["path"] for entry in changes] == ["sample.txt"]
 
     records = [

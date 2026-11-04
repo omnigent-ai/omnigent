@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import json
 import logging
@@ -33,7 +32,6 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
-from omnigent.inner.async_utils import finish_before_cancellation
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
@@ -78,7 +76,6 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.entities.environment_filesystem import FilesystemEntry
-    from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.runner.environment_filesystem import CallerProcessFilesystem
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
@@ -1024,43 +1021,6 @@ def register_resource_routes(
             )
         return spec
 
-    def _changes_visible_on_disk(
-        session_id: str,
-        environment_id: str,
-        spec: AgentSpec | None,
-        registry: FilesystemRegistry,
-    ) -> bool:
-        """Whether edits in *environment_id* land in the files under *registry*'s root.
-
-        Copy-on-write environments write into an overlay the runner cannot read,
-        forked ones write into a private copy of the workspace, and ones started
-        in scratch write relative paths into the scratch dir; the session spec or
-        the environment's own spec can enable each. Without a live environment
-        rooted at *registry*'s root, nothing shows where the edits landed.
-        """
-        from omnigent.sandbox.copy_on_write import has_copy_on_write
-
-        def _writes_elsewhere(os_env_spec: OSEnvSpec | None) -> bool:
-            return bool(
-                has_copy_on_write(os_env_spec)
-                or getattr(os_env_spec, "fork", False)
-                or getattr(os_env_spec, "start_in_scratch", False)
-            )
-
-        if _writes_elsewhere(getattr(spec, "os_env", None)):
-            return False
-        if resource_registry.uses_copy_on_write(session_id):
-            return False
-        environment = resource_registry.live_environment(session_id, environment_id)
-        root = getattr(environment, "cwd", None)
-        if (
-            root is None
-            or _writes_elsewhere(getattr(environment, "spec", None))
-            or getattr(getattr(environment, "sandbox", None), "copy_on_write_roots", None)
-        ):
-            return False
-        return Path(root).resolve() == registry.cwd
-
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem")
     async def list_environment_root(
         session_id: str,
@@ -1277,9 +1237,6 @@ def register_resource_routes(
                     session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
-                    check_disk=_changes_visible_on_disk(
-                        session_id, environment_id, agent_spec, session_registry
-                    ),
                 )
                 if session_registry is not None
                 else []
@@ -1355,14 +1312,7 @@ def register_resource_routes(
             # Offloaded like list_filesystem_changes: get_changed_file shells out
             # to git (status + show) synchronously, so keep it off the loop.
             record = (
-                await run_slow_io(
-                    session_registry.get_changed_file,
-                    session_id,
-                    relative_path,
-                    check_disk=_changes_visible_on_disk(
-                        session_id, environment_id, agent_spec, session_registry
-                    ),
-                )
+                await run_slow_io(session_registry.get_changed_file, session_id, relative_path)
                 if session_registry is not None
                 else None
             )
@@ -1812,78 +1762,40 @@ def register_resource_routes(
             follow_outward_links=follow_outward_links,
         )
 
-    async def _read_original(fs: CallerProcessFilesystem, relative_path: str) -> str | None:
-        """Return *relative_path*'s complete UTF-8 text before an editor save, if it has one."""
-        if filesystem_registry is None:
-            return None
+    async def _read_editor_text(fs: CallerProcessFilesystem, relative_path: str) -> str | None:
+        """Return *relative_path*'s complete UTF-8 text, or ``None`` when it has none."""
         try:
             existing = await fs.read(relative_path, limit=None)
         except Exception:  # noqa: BLE001
-            return None  # a new or unreadable file has no original to keep
-        # Only strict UTF-8 re-encodes to the bytes Changes later compares with the disk.
+            return None  # a new or unreadable file has no text to keep
         if existing.encoding != "utf-8" or existing.truncated:
             return None
-        try:
-            return existing.data.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
+        return existing.data.decode("utf-8")
 
-    def _change_lock(relative_path: str) -> contextlib.AbstractAsyncContextManager[None]:
-        """Return the lock an editor save holds from reading its original to recording it."""
-        if filesystem_registry is None:
-            return contextlib.nullcontext()
-        return filesystem_registry.change_lock(relative_path)
-
-    def _record_editor_change(
-        session_id: str,
-        environment_id: str,
-        agent_spec: AgentSpec | None,
-        relative_path: str,
-        original: str | None,
-        operation: str,
+    async def _seed_editor_original(
+        fs: CallerProcessFilesystem, relative_path: str, session_id: str
     ) -> None:
-        """Record a successful editor save, seeding the *original* it replaced first."""
+        """Seed the original an editor save replaces, when it is complete text."""
         if filesystem_registry is None:
             return
+        original = await _read_editor_text(fs, relative_path)
         if original is not None:
-            # A file read under another root must not decide reverts in this one.
-            on_disk = _changes_visible_on_disk(
-                session_id, environment_id, agent_spec, filesystem_registry
-            )
-            filesystem_registry.seed_snapshot(
-                relative_path, original, session_id=session_id if on_disk else None
-            )
-        filesystem_registry.record_change(relative_path, operation, session_id)
+            filesystem_registry.seed_snapshot(relative_path, original, session_id=session_id)
 
-    async def _save_and_record[SaveResult](
-        session_id: str,
-        environment_id: str,
-        agent_spec: AgentSpec | None,
-        fs: CallerProcessFilesystem,
-        relative_path: str,
-        save: Callable[[], Awaitable[SaveResult]],
-        operation: Callable[[SaveResult], str],
-    ) -> SaveResult:
-        """Run an editor *save* under the change lock and record it with the original it replaced.
-
-        A cancelled request keeps the lock until a started save is recorded.
-        """
-        async with _change_lock(relative_path):
-            original = await _read_original(fs, relative_path)
-
-            async def save_and_record() -> SaveResult:
-                result = await save()
-                _record_editor_change(
-                    session_id,
-                    environment_id,
-                    agent_spec,
-                    relative_path,
-                    original,
-                    operation(result),
-                )
-                return result
-
-            return await finish_before_cancellation(save_and_record())
+    async def _record_editor_change(
+        fs: CallerProcessFilesystem, relative_path: str, operation: str, session_id: str
+    ) -> None:
+        """Record an editor save, passing its text when it may restore the original."""
+        if filesystem_registry is None:
+            return
+        current_text = (
+            await _read_editor_text(fs, relative_path)
+            if filesystem_registry.can_detect_revert(relative_path, session_id=session_id)
+            else None
+        )
+        filesystem_registry.record_change(
+            relative_path, operation, session_id, current_text=current_text
+        )
 
     @app.put(
         "/v1/sessions/{session_id}/resources/environments"
@@ -1909,15 +1821,13 @@ def register_resource_routes(
         encoding = body.get("encoding", "utf-8")
         create_parents = body.get("create_parents", True)
         content_bytes = content_str.encode(encoding)
-        result = await _save_and_record(
-            session_id,
-            environment_id,
-            agent_spec,
-            fs,
+        await _seed_editor_original(fs, relative_path, session_id)
+        result = await fs.write(
             relative_path,
-            lambda: fs.write(relative_path, content_bytes, create_parents=create_parents),
-            lambda written: "created" if written.created else "modified",
+            content_bytes,
+            create_parents=create_parents,
         )
+        await _record_editor_change(fs, relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -1950,21 +1860,15 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
+        await _seed_editor_original(fs, relative_path, session_id)
         body = await request.json()
         edit_req = TextEditRequest(
             old_text=body.get("old_text"),
             new_text=body.get("new_text"),
             replace_all=body.get("replace_all", False),
         )
-        result = await _save_and_record(
-            session_id,
-            environment_id,
-            agent_spec,
-            fs,
-            relative_path,
-            lambda: fs.edit_text(relative_path, edit_req),
-            lambda edited: edited.operation,
-        )
+        result = await fs.edit_text(relative_path, edit_req)
+        await _record_editor_change(fs, relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={

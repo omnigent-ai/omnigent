@@ -12,7 +12,6 @@ filesystem service.
 from __future__ import annotations
 
 import base64
-import errno
 import os
 import re
 import stat
@@ -205,49 +204,6 @@ _BENEATH_SUPPORTED = (
 )
 
 
-def _open_parent_beneath(
-    root: Path, rel: str, root_identity: tuple[int, int] | None = None
-) -> tuple[int, str]:
-    """Open the parent of *root*/*rel* without following a symlinked component.
-
-    :param root: Absolute directory the path is relative to.
-    :param rel: ``/``-separated path relative to *root*.
-    :param root_identity: ``(st_dev, st_ino)`` the opened *root* must have, or
-        ``None`` to accept whatever directory *root* names now.
-    :returns: A descriptor for the parent, which the caller closes, and the
-        leaf name.
-    :raises OSError: ``ESTALE`` when *root* is missing or no longer
-        *root_identity*, ``ELOOP`` when a parent is a symlink, otherwise the
-        error from opening a component.
-    """
-    *parents, leaf = rel.split("/")
-    try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    except (FileNotFoundError, NotADirectoryError):
-        if root_identity is None:
-            raise
-        raise OSError(errno.ESTALE, "Directory was replaced", str(root)) from None
-    try:
-        if root_identity is not None:
-            root_stat = os.fstat(fd)
-            if (root_stat.st_dev, root_stat.st_ino) != root_identity:
-                raise OSError(errno.ESTALE, "Directory was replaced", str(root))
-        for name in parents:
-            try:
-                next_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
-            except NotADirectoryError:
-                # Linux reports a symlinked directory as ENOTDIR under O_DIRECTORY.
-                if stat.S_ISLNK(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
-                    raise OSError(errno.ELOOP, "Symbolic link in path", name) from None
-                raise
-            os.close(fd)
-            fd = next_fd
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd, leaf
-
-
 def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
     """``lstat`` *root*/*rel* without letting any component be a symlink.
 
@@ -262,6 +218,7 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
     :returns: The leaf's own ``stat`` result, or ``None`` when any component
         is missing, is a symlink, or cannot be opened.
     """
+    parts = rel.split("/")
     if not _BENEATH_SUPPORTED:
         full = root / rel
         real_root = os.path.realpath(root)
@@ -273,85 +230,19 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
         except OSError:
             return None
     try:
-        fd, leaf = _open_parent_beneath(root, rel)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
         return None
     try:
-        return os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+        for name in parts[:-1]:
+            nfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
     except OSError:
         return None
     finally:
         os.close(fd)
-
-
-FileVersion = tuple[int, int, int, int, int]
-
-
-def file_version(file_stat: os.stat_result) -> FileVersion:
-    """Identify one version of a file's content by inode, size and change times.
-
-    ``st_ctime_ns`` changes on every write and cannot be set back, so a file
-    rewritten in place and given its old ``st_mtime`` is still a new version.
-    """
-    return (
-        file_stat.st_dev,
-        file_stat.st_ino,
-        file_stat.st_size,
-        file_stat.st_mtime_ns,
-        file_stat.st_ctime_ns,
-    )
-
-
-def compare_file_beneath(
-    root: Path,
-    rel: str,
-    expected: bytes | None,
-    *,
-    root_identity: tuple[int, int],
-    known: tuple[FileVersion, bool] | None = None,
-) -> tuple[os.stat_result, bool]:
-    """Stat *root*/*rel* and report whether it is a regular file holding *expected*.
-
-    Like :func:`_lstat_beneath`, no component is followed if it is a symlink,
-    and the opened *root* must still be the directory *root_identity* names,
-    so a workspace or ancestor swapped for a symlink is never read through.
-    Only a regular file is opened, without blocking, so a FIFO or device at
-    the path cannot stall the caller, and only a file of the expected size
-    is read. Platforms without ``dir_fd`` support raise without looking the
-    path up, since a parent swapped for a symlink after any check could
-    redirect the lookup.
-
-    :param root: Absolute directory the path is relative to.
-    :param rel: ``/``-separated path relative to *root*, e.g. ``"src/foo.py"``.
-    :param expected: Content to compare against, or ``None`` to only stat.
-    :param root_identity: ``(st_dev, st_ino)`` of *root* when it was trusted.
-    :param known: A :func:`file_version` and whether it held *expected*; a
-        file still at that version is not read again.
-    :returns: The leaf's own ``stat`` result and whether its content equals
-        *expected*.
-    :raises FileNotFoundError: When the path does not exist.
-    :raises NotADirectoryError: When a parent component is not a directory.
-    :raises OSError: When *root* is missing or was replaced, a parent is a
-        symlink, the path cannot be read, or the platform lacks ``dir_fd``
-        support.
-    """
-    if not _BENEATH_SUPPORTED:
-        raise OSError(errno.ENOTSUP, "Cannot look up a path without following symlinks", rel)
-    dir_fd, leaf = _open_parent_beneath(root, rel, root_identity)
-    try:
-        leaf_stat = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)
-        if expected is None or not stat.S_ISREG(leaf_stat.st_mode):
-            return leaf_stat, False
-        if known is not None and known[0] == file_version(leaf_stat):
-            return leaf_stat, known[1]
-        file_fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-    finally:
-        os.close(dir_fd)
-    with os.fdopen(file_fd, "rb") as handle:
-        file_stat = os.fstat(handle.fileno())
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size != len(expected):
-            return file_stat, False
-        return file_stat, handle.read(len(expected) + 1) == expected
 
 
 def search_indexed_paths(

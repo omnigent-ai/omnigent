@@ -49,7 +49,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, cast
-from unittest.mock import DEFAULT, AsyncMock
 
 import httpx
 import pytest
@@ -2715,356 +2714,108 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
         assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
 
 
-@pytest.mark.asyncio
-async def test_runner_os_env_writes_over_a_binary_file_stay_in_changes(tmp_path: Path) -> None:
-    """A binary original has no text snapshot, and no later version replaces it."""
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.runner.tool_dispatch import _execute_os_env_tool
-    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
-    from omnigent.spec.types import AgentSpec
-
-    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\xff")
-    spec = AgentSpec(
-        spec_version=1,
-        os_env=OSEnvSpec(
-            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
-        ),
-    )
-    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
-
-    for content in ("", "X", ""):
-        await _execute_os_env_tool(
-            "sys_os_write",
-            {"path": "logo.png", "content": content},
-            agent_spec=spec,
-            conversation_id="conv_binary_truncate",
-            filesystem_registry=filesystem_registry,
-        )
-        listed = filesystem_registry.list_changed_files(
-            "conv_binary_truncate", limit=10, check_disk=True
-        )
-        assert [(r["path"], r["status"], r["bytes"]) for r in listed] == [
-            ("logo.png", "modified", len(content))
-        ]
-
-    assert (tmp_path / "logo.png").read_bytes() == b""
-
-
-@pytest.mark.asyncio
-async def test_runner_os_env_edit_of_a_crlf_file_reverted_outside_leaves_changes(
-    tmp_path: Path,
-) -> None:
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.runner.tool_dispatch import _execute_os_env_tool
-    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
-    from omnigent.spec.types import AgentSpec
-
-    original = b"one\r\ntwo\r\n"
-    (tmp_path / "notes.txt").write_bytes(original)
-    spec = AgentSpec(
-        spec_version=1,
-        os_env=OSEnvSpec(
-            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
-        ),
-    )
-    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
-
-    await _execute_os_env_tool(
-        "sys_os_edit",
-        {"path": "notes.txt", "oldText": "two", "newText": "three"},
-        agent_spec=spec,
-        conversation_id="conv_crlf_revert",
-        filesystem_registry=filesystem_registry,
-    )
-    listed = filesystem_registry.list_changed_files("conv_crlf_revert", limit=10, check_disk=True)
-    assert [(r["path"], r["status"]) for r in listed] == [("notes.txt", "modified")]
-    assert filesystem_registry.get_baseline("notes.txt") == original.decode()
-
-    (tmp_path / "notes.txt").write_bytes(original)
-
-    assert (
-        filesystem_registry.list_changed_files("conv_crlf_revert", limit=10, check_disk=True) == []
-    )
-
-
-@pytest.mark.asyncio
-async def test_runner_os_env_failed_edit_does_not_choose_the_original(tmp_path: Path) -> None:
-    """The original is what the first successful write replaced, not what a failed edit saw."""
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.runner.tool_dispatch import _execute_os_env_tool
-    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
-    from omnigent.spec.types import AgentSpec
-
-    notes = tmp_path / "notes.txt"
-    notes.write_text("before the failed edit\n")
-    spec = AgentSpec(
-        spec_version=1,
-        os_env=OSEnvSpec(
-            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
-        ),
-    )
-    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
-
-    failed = await _execute_os_env_tool(
-        "sys_os_edit",
-        {"path": "notes.txt", "oldText": "absent", "newText": "edited"},
-        agent_spec=spec,
-        conversation_id="conv_failed_edit",
-        filesystem_registry=filesystem_registry,
-    )
-    assert "error" in json.loads(failed)
-    assert (
-        filesystem_registry.list_changed_files("conv_failed_edit", limit=10, check_disk=False)
-        == []
-    )
-
-    notes.write_text("changed by a shell\n")
-    await _execute_os_env_tool(
-        "sys_os_write",
-        {"path": "notes.txt", "content": "written\n"},
-        agent_spec=spec,
-        conversation_id="conv_failed_edit",
-        filesystem_registry=filesystem_registry,
-    )
-    assert filesystem_registry.get_baseline("notes.txt") == "changed by a shell\n"
-
-    notes.write_text("before the failed edit\n")
-    listed = filesystem_registry.list_changed_files("conv_failed_edit", limit=10, check_disk=True)
-    assert [(r["path"], r["status"]) for r in listed] == [("notes.txt", "modified")]
-
-    notes.write_text("changed by a shell\n")
-    assert (
-        filesystem_registry.list_changed_files("conv_failed_edit", limit=10, check_disk=True) == []
-    )
-
-
-@pytest.mark.asyncio
-async def test_runner_os_env_concurrent_writes_keep_the_first_original(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A write that starts while another is in flight keeps the original the first replaced."""
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.os_env import CallerProcessOSEnvironment, OpResult
-    from omnigent.runner.tool_dispatch import _execute_os_env_tool
-    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
-    from omnigent.spec.types import AgentSpec
-
-    notes = tmp_path / "notes.txt"
-    notes.write_text("initial\n")
-    spec = AgentSpec(
-        spec_version=1,
-        os_env=OSEnvSpec(
-            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
-        ),
-    )
-    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
-    first_written = asyncio.Event()
-    release_first = asyncio.Event()
-    write = CallerProcessOSEnvironment.write
-
-    async def hold_the_first_write_result(
-        self: CallerProcessOSEnvironment, path: str, content: str
-    ) -> OpResult:
-        result = await write(self, path, content)
-        if content == "intermediate\n":
-            first_written.set()
-            await release_first.wait()
-        return result
-
-    monkeypatch.setattr(CallerProcessOSEnvironment, "write", hold_the_first_write_result)
-    second_waits = asyncio.Event()
-    change_lock = filesystem_registry.change_lock
-
-    def signal_a_wait_for_the_held_lock(path: str) -> asyncio.Lock:
-        lock = change_lock(path)
-        if lock.locked():
-            second_waits.set()
-        return lock
-
-    monkeypatch.setattr(filesystem_registry, "change_lock", signal_a_wait_for_the_held_lock)
-
-    def write_notes(content: str) -> asyncio.Task[str]:
-        return asyncio.create_task(
-            _execute_os_env_tool(
-                "sys_os_write",
-                {"path": "notes.txt", "content": content},
-                agent_spec=spec,
-                conversation_id="conv_concurrent",
-                filesystem_registry=filesystem_registry,
-            )
-        )
-
-    writes = [write_notes("intermediate\n")]
-    try:
-        await asyncio.wait_for(first_written.wait(), timeout=5)
-        writes.append(write_notes("final\n"))
-        await asyncio.wait_for(second_waits.wait(), timeout=5)
-        finished, _ = await asyncio.wait({writes[1]}, timeout=0.1)
-        assert not finished
-    finally:
-        release_first.set()
-        await asyncio.wait_for(asyncio.gather(*writes), timeout=5)
-
-    assert notes.read_text() == "final\n"
-    assert filesystem_registry.get_baseline("notes.txt") == "initial\n"
-    notes.write_text("intermediate\n")
-    listed = filesystem_registry.list_changed_files("conv_concurrent", limit=10, check_disk=True)
-    assert [(r["path"], r["status"]) for r in listed] == [("notes.txt", "modified")]
-    notes.write_text("initial\n")
-    assert (
-        filesystem_registry.list_changed_files("conv_concurrent", limit=10, check_disk=True) == []
-    )
-
-
-class _InProcessReads:
-    """Answer ``OSEnvironment.read`` from the files under *root* without a helper process."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-
-    async def read(
-        self, path: str, offset: int = 1, limit: int | None = None, max_bytes: int | None = None
-    ) -> dict[str, Any]:
-        from omnigent.inner.os_env import _read_impl
-
-        return _read_impl(self.root / path, offset, limit, max_bytes)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure",
+    "original,calls,statuses,read_cap",
     [
-        pytest.param({"error": "write failed"}, id="error-result"),
-        pytest.param(OSError("write failed"), id="raises"),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            [],
+            None,
+            id="edit-reverted",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            [],
+            None,
+            id="write-reverted",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_edit", {"oldText": "one", "newText": "uno"}),
+                ("sys_os_edit", {"oldText": "two", "newText": "dos"}),
+                ("sys_os_edit", {"oldText": "uno", "newText": "one"}),
+            ],
+            ["modified"],
+            None,
+            id="partially-reverted",
+        ),
+        pytest.param(
+            b"one\r\ntwo\r\n",
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            ["modified"],
+            None,
+            id="line-endings-changed",
+        ),
+        pytest.param(
+            b"\x89PNG\r\n\x1a\n\x00\xff",
+            [("sys_os_write", {"content": ""}), ("sys_os_write", {"content": ""})],
+            ["modified"],
+            None,
+            id="binary-original",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            ["modified"],
+            4,
+            id="original-beyond-read-cap",
+        ),
     ],
 )
-async def test_tracked_mutation_that_fails_records_nothing(
-    tmp_path: Path, failure: dict[str, str] | OSError
-) -> None:
-    """A write that returns an error or raises neither sets an original nor records a change."""
-    from omnigent.inner.os_env import OpResult, OSEnvironment
-    from omnigent.runner.tool_dispatch import _run_tracked_os_env_mutation
-    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
-
-    async def failing_write() -> OpResult:
-        if isinstance(failure, OSError):
-            raise failure
-        return failure
-
-    (tmp_path / "notes.txt").write_text("original\n")
-    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
-    mutation = _run_tracked_os_env_mutation(
-        cast(OSEnvironment, _InProcessReads(tmp_path)),
-        "notes.txt",
-        failing_write,
-        filesystem_registry,
-        "conv_failed_write",
-    )
-    if isinstance(failure, OSError):
-        with pytest.raises(OSError, match="write failed"):
-            await mutation
-    else:
-        assert await mutation == failure
-
-    assert filesystem_registry.get_baseline("notes.txt") is None
-    assert (
-        filesystem_registry.list_changed_files("conv_failed_write", limit=10, check_disk=False)
-        == []
-    )
-
-
 @pytest.mark.asyncio
-async def test_a_cancelled_tracked_mutation_keeps_its_lock_until_it_is_recorded(
-    tmp_path: Path,
-) -> None:
-    """A cancelled write holds the lock until it is recorded, keeping the original it replaced."""
-    from omnigent.inner.os_env import OpResult, OSEnvironment
-    from omnigent.runner.tool_dispatch import _run_tracked_os_env_mutation
-    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
-
-    notes = tmp_path / "notes.txt"
-    notes.write_text("A\n")
-    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
-    reads = cast(OSEnvironment, _InProcessReads(tmp_path))
-    written = asyncio.Event()
-    release = asyncio.Event()
-    held_writes: list[asyncio.Task[OpResult]] = []
-
-    async def write_then_hold() -> OpResult:
-        async def run() -> OpResult:
-            notes.write_text("B\n")
-            written.set()
-            await release.wait()
-            return {}
-
-        # Like a helper process, the write runs on after its caller is cancelled.
-        held_writes.append(asyncio.create_task(run()))
-        return await asyncio.shield(held_writes[-1])
-
-    mutation = asyncio.create_task(
-        _run_tracked_os_env_mutation(
-            reads, "notes.txt", write_then_hold, filesystem_registry, "conv"
-        )
-    )
-    try:
-        await asyncio.wait_for(written.wait(), timeout=5)
-        mutation.cancel()
-        finished, _ = await asyncio.wait({mutation}, timeout=0.1)
-        assert not finished
-        assert filesystem_registry.change_lock("notes.txt").locked()
-    finally:
-        release.set()
-        await asyncio.gather(*held_writes)
-    with pytest.raises(asyncio.CancelledError):
-        await mutation
-
-    async def write_c() -> OpResult:
-        notes.write_text("C\n")
-        return {}
-
-    await _run_tracked_os_env_mutation(reads, "notes.txt", write_c, filesystem_registry, "conv")
-    assert filesystem_registry.get_baseline("notes.txt") == "A\n"
-    notes.write_text("B\n")
-    listed = filesystem_registry.list_changed_files("conv", limit=10, check_disk=True)
-    assert [(entry["path"], entry["status"]) for entry in listed] == [("notes.txt", "modified")]
-    notes.write_text("A\n")
-    assert filesystem_registry.list_changed_files("conv", limit=10, check_disk=True) == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("original", "complete_read_fails", "expected_byte_caps", "baseline"),
-    [
-        pytest.param(b"\x89PNG\x00\xff", False, [1], None, id="binary"),
-        pytest.param(b"0123456789\n", False, [1, 8], None, id="larger-than-the-read-cap"),
-        pytest.param(b"0123456\n", False, [1, 8], "0123456\n", id="exactly-the-read-cap"),
-        pytest.param(b"a\r\nb\r\n", False, [1, 8], "a\r\nb\r\n", id="complete-text"),
-        pytest.param(b"text\n", True, [1, 8], None, id="complete-read-fails"),
-    ],
-)
-async def test_runner_os_env_snapshot_reads_only_a_complete_text_original(
+async def test_runner_os_env_change_restoring_the_original_leaves_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     original: bytes,
-    complete_read_fails: bool,
-    expected_byte_caps: list[int],
-    baseline: str | None,
+    calls: list[tuple[str, dict[str, str]]],
+    statuses: list[str],
+    read_cap: int | None,
 ) -> None:
-    """Binary files are probed, not read, and only complete text becomes an original."""
-    from omnigent.inner.os_env import OSEnvironment
-    from omnigent.runner import environment_filesystem
-    from omnigent.runner.tool_dispatch import _read_os_env_original
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+    from omnigent.spec.types import AgentSpec
 
-    reads = _InProcessReads(tmp_path)
-    read = AsyncMock(wraps=reads.read)
-    if complete_read_fails:
-        read.side_effect = [DEFAULT, OSError("read failed")]
-    monkeypatch.setattr(reads, "read", read)
-    monkeypatch.setattr(environment_filesystem, "_MAX_READ_BYTES", 8)
-    (tmp_path / "notes").write_bytes(original)
+    if read_cap is not None:
+        monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", read_cap)
+    (tmp_path / "file.txt").write_bytes(original)
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
 
-    assert await _read_os_env_original(cast(OSEnvironment, reads), "notes") == baseline
-    assert [call.kwargs["max_bytes"] for call in read.await_args_list] == expected_byte_caps
+    for step, (tool_name, args) in enumerate(calls, start=1):
+        result = await _execute_os_env_tool(
+            tool_name,
+            {"path": "file.txt", **args},
+            agent_spec=spec,
+            conversation_id="conv_revert",
+            filesystem_registry=filesystem_registry,
+        )
+        assert "error" not in json.loads(result)
+        if step < len(calls):
+            assert filesystem_registry.list_changed_files("conv_revert", limit=10)
+
+    listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
+    assert [entry["status"] for entry in listed] == statuses
 
 
 @pytest.mark.asyncio

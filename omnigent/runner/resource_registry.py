@@ -1047,16 +1047,6 @@ class SessionResourceRegistry:
                 getattr(getattr(environment, "sandbox", None), "copy_on_write_roots", None)
             )
 
-    def live_environment(self, session_id: str, environment_id: str) -> OSEnvironment | None:
-        """Return the environment *environment_id* names without creating the primary one."""
-        if environment_id == DEFAULT_ENVIRONMENT_ID:
-            with self._lock:
-                return self._primary_envs.get(session_id)
-        try:
-            return self.resolve_environment(session_id, environment_id)
-        except ValueError:
-            return None
-
     def _resolve_terminal_environment(self, session_id: str, spec: OSEnvSpec) -> OSEnvironment:
         """Resolve the environment shared by inherited terminals and file tools."""
         return self._resolve_primary(session_id, None, os_env_spec=spec)

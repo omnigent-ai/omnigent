@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import dataclasses
 import json
 import logging
 import os
@@ -25,29 +23,18 @@ from fastapi import FastAPI
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.environment_filesystem import (
     DirectoryNotEmpty,
-    FileContent,
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
-    WriteFileResult,
 )
-from omnigent.entities.session_resources import terminal_environment_resource_id
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import (
-    CallerProcessFilesystem,
-    compare_file_beneath,
-    search_indexed_paths,
-)
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
-from omnigent.runtime.filesystem_registry import (
-    GitFilesystemRegistry,
-    MultiRepositoryFilesystemRegistry,
-)
-from omnigent.terminals.registry import TerminalRegistry
-from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
+from tests.runner.helpers import NullServerClient
 
 
 @pytest.fixture
@@ -448,6 +435,70 @@ async def test_edit_file(
     assert body["object"] == "session.environment.filesystem.edit_result"
     assert body["replacements"] == 1
     assert (workspace / "hello.txt").read_text() == "goodbye world"
+
+
+@pytest.mark.parametrize(
+    "saves,statuses",
+    [
+        pytest.param(
+            [
+                ("PATCH", {"old_text": "hello", "new_text": "goodbye"}),
+                ("PATCH", {"old_text": "goodbye", "new_text": "hello"}),
+            ],
+            [],
+            id="edit-reverted",
+        ),
+        pytest.param(
+            [("PUT", {"content": "changed"}), ("PUT", {"content": "hello world"})],
+            [],
+            id="save-reverted",
+        ),
+        pytest.param(
+            [
+                ("PUT", {"content": "one two"}),
+                ("PATCH", {"old_text": "one", "new_text": "hello"}),
+            ],
+            ["modified"],
+            id="partially-reverted",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_editor_save_restoring_the_original_leaves_changes(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    request: pytest.FixtureRequest,
+    saves: list[tuple[str, dict[str, str]]],
+    statuses: list[str],
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    for step, (method, body) in enumerate(saves, start=1):
+        response = await client.request(method, f"{base}/filesystem/hello.txt", json=body)
+        assert response.status_code == 200, response.text
+        if step < len(saves):
+            assert (await client.get(f"{base}/changes")).json()["data"]
+
+    response = await client.get(f"{base}/changes")
+    assert [entry["status"] for entry in response.json()["data"]] == statuses
+
+
+@pytest.mark.asyncio
+async def test_editor_save_of_a_truncated_original_stays_in_changes(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 5)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    response = await client.put(f"{base}/filesystem/hello.txt", json={"content": "hello"})
+    assert response.status_code == 200, response.text
+
+    changes = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(entry["path"], entry["status"]) for entry in changes] == [("hello.txt", "modified")]
+    assert (await client.get(f"{base}/diff/hello.txt")).json()["before"] is None
 
 
 @pytest.mark.asyncio
@@ -1732,6 +1783,46 @@ async def test_diff_endpoint_returns_before_and_after_for_modified_file(
 
 
 @pytest.mark.asyncio
+async def test_diff_endpoint_returns_null_before_for_new_file(
+    registry: SessionResourceRegistry,
+    workspace: Path,
+) -> None:
+    """GET /diff/hello.txt returns before=None when the file is new (created event, no snapshot).
+
+    A 'created' event with no seed_snapshot means no baseline exists;
+    ``get_baseline`` should return ``None`` which flows through as ``before: null``.
+
+    :param registry: Session resource registry backed by the test workspace.
+    :param workspace: Test workspace; hello.txt on disk contains 'hello world'.
+    """
+    app = create_runner_app(
+        resource_registry=registry,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reg = app.state.filesystem_registry
+    # Inject a 'created' event but deliberately skip seed_snapshot so before=None.
+    reg.record_change("hello.txt", "created", "conv_test")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/conv_test/resources/environments"
+            f"/{DEFAULT_ENVIRONMENT_ID}/diff/hello.txt"
+        )
+
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}. Body: {resp.text}"
+    body = resp.json()
+    # No snapshot → before must be null; a non-null value means a phantom
+    # baseline was produced.
+    assert body["before"] is None, (
+        f"Expected before=None for a new file with no snapshot, got {body['before']!r}."
+    )
+    # File exists on disk → after must be its content.
+    assert body["after"] == "hello world", f"Expected after='hello world', got {body['after']!r}."
+
+
+@pytest.mark.asyncio
 async def test_diff_endpoint_returns_null_after_for_deleted_file(
     client_with_registry: httpx.AsyncClient,
 ) -> None:
@@ -1779,557 +1870,6 @@ async def test_diff_endpoint_returns_404_when_file_not_in_registry(
     assert body["error"]["code"] == "not_found", (
         f"Expected error.code='not_found', got {body['error']['code']!r}."
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failed_edit_first", [False, True], ids=["saved", "after-a-failed-edit"])
-async def test_changes_drop_a_file_saved_back_to_its_original_content(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    workspace: Path,
-    failed_edit_first: bool,
-) -> None:
-    """Saving a file's original content again leaves nothing to review."""
-    assert type(app.state.filesystem_registry) is MultiRepositoryFilesystemRegistry
-    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    original = "hello world"
-    if failed_edit_first:
-        failed = await client.patch(
-            f"{base}/filesystem/hello.txt", json={"old_text": "absent", "new_text": "edited"}
-        )
-        assert failed.is_error, failed.text
-        assert (await client.get(f"{base}/changes")).json()["data"] == []
-        original = "changed outside the app"
-        (workspace / "hello.txt").write_text(original)
-
-    edited = await client.put(
-        f"{base}/filesystem/hello.txt", json={"content": "edited", "encoding": "utf-8"}
-    )
-    assert edited.status_code == 200, edited.text
-    listed = (await client.get(f"{base}/changes")).json()["data"]
-    assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
-    diff = await client.get(f"{base}/diff/hello.txt")
-    assert diff.status_code == 200, diff.text
-    assert (diff.json()["before"], diff.json()["after"]) == (original, "edited")
-    if failed_edit_first:
-        # The content the failed edit saw is not the original of the save that followed.
-        (workspace / "hello.txt").write_text("hello world")
-        listed = (await client.get(f"{base}/changes")).json()["data"]
-        assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
-
-    reverted = await client.put(
-        f"{base}/filesystem/hello.txt", json={"content": original, "encoding": "utf-8"}
-    )
-    assert reverted.status_code == 200, reverted.text
-
-    assert (await client.get(f"{base}/changes")).json()["data"] == []
-    assert (await client.get(f"{base}/diff/hello.txt")).status_code == 404
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("method", "body"),
-    [
-        ("PUT", {"content": "final\n"}),
-        ("PATCH", {"old_text": "intermediate", "new_text": "final"}),
-    ],
-)
-async def test_a_save_during_another_keeps_the_original_the_first_replaced(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    method: str,
-    body: dict[str, str],
-) -> None:
-    """A save started while another is in flight cannot take its result as the original."""
-    first_written = asyncio.Event()
-    release_first = asyncio.Event()
-    write = CallerProcessFilesystem.write
-
-    async def hold_the_first_write_result(
-        self: CallerProcessFilesystem, path: str, content: bytes, *, create_parents: bool = True
-    ) -> WriteFileResult:
-        result = await write(self, path, content, create_parents=create_parents)
-        if content == b"intermediate\n":
-            first_written.set()
-            await release_first.wait()
-        return result
-
-    monkeypatch.setattr(CallerProcessFilesystem, "write", hold_the_first_write_result)
-    second_waits = asyncio.Event()
-    change_lock = app.state.filesystem_registry.change_lock
-
-    def signal_a_wait_for_the_held_lock(path: str) -> asyncio.Lock:
-        lock = change_lock(path)
-        if lock.locked():
-            second_waits.set()
-        return lock
-
-    monkeypatch.setattr(
-        app.state.filesystem_registry, "change_lock", signal_a_wait_for_the_held_lock
-    )
-    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    url = f"{base}/filesystem/hello.txt"
-    saves = [asyncio.create_task(client.put(url, json={"content": "intermediate\n"}))]
-    try:
-        await asyncio.wait_for(first_written.wait(), timeout=5)
-        saves.append(asyncio.create_task(client.request(method, url, json=body)))
-        await asyncio.wait_for(second_waits.wait(), timeout=5)
-        finished, _ = await asyncio.wait({saves[1]}, timeout=0.1)
-        assert not finished
-    finally:
-        release_first.set()
-        saved = await asyncio.wait_for(asyncio.gather(*saves), timeout=5)
-
-    assert [response.status_code for response in saved] == [200, 200], [r.text for r in saved]
-    assert (workspace / "hello.txt").read_text() == "final\n"
-    (workspace / "hello.txt").write_text("intermediate\n")
-    listed = (await client.get(f"{base}/changes")).json()["data"]
-    assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
-    (workspace / "hello.txt").write_text("hello world")
-    assert (await client.get(f"{base}/changes")).json()["data"] == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("method", "operation", "body"),
-    [
-        ("PUT", "write", {"content": "B\n"}),
-        ("PATCH", "edit_text", {"old_text": "hello world", "new_text": "B\n"}),
-    ],
-)
-async def test_a_cancelled_save_keeps_its_lock_until_it_is_recorded(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    method: str,
-    operation: str,
-    body: dict[str, str],
-) -> None:
-    """A cancelled save holds the lock until it is recorded, keeping the original it replaced."""
-    saved = asyncio.Event()
-    release = asyncio.Event()
-    held_saves: list[asyncio.Task[object]] = []
-    save = getattr(CallerProcessFilesystem, operation)
-
-    async def save_then_hold(
-        self: CallerProcessFilesystem, *args: object, **kwargs: object
-    ) -> object:
-        async def run() -> object:
-            result = await save(self, *args, **kwargs)
-            saved.set()
-            await release.wait()
-            return result
-
-        # Like a helper process, the save runs on after its request is cancelled.
-        held_saves.append(asyncio.create_task(run()))
-        return await asyncio.shield(held_saves[-1])
-
-    monkeypatch.setattr(CallerProcessFilesystem, operation, save_then_hold)
-    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    url = f"{base}/filesystem/hello.txt"
-    request = asyncio.create_task(client.request(method, url, json=body))
-    try:
-        await asyncio.wait_for(saved.wait(), timeout=5)
-        request.cancel()
-        finished, _ = await asyncio.wait({request}, timeout=0.1)
-        assert not finished
-        assert app.state.filesystem_registry.change_lock("hello.txt").locked()
-    finally:
-        release.set()
-        await asyncio.gather(*held_saves)
-    with pytest.raises(asyncio.CancelledError):
-        await request
-
-    resaved = await client.put(url, json={"content": "C\n"})
-    assert resaved.status_code == 200, resaved.text
-    (workspace / "hello.txt").write_text("B\n")
-    listed = (await client.get(f"{base}/changes")).json()["data"]
-    assert [(e["path"], e["status"]) for e in listed] == [("hello.txt", "modified")]
-    (workspace / "hello.txt").write_text("hello world")
-    assert (await client.get(f"{base}/changes")).json()["data"] == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("original", "method", "body", "after"),
-    [
-        pytest.param(
-            b"AAAAAAAATAIL", "PUT", {"content": "AAAAAAAA"}, "AAAAAAAA", id="prefix-saved"
-        ),
-        pytest.param(
-            b"AAAAAAAATAIL",
-            "PATCH",
-            {"old_text": "TAIL", "new_text": ""},
-            "AAAAAAAA",
-            id="prefix-edited",
-        ),
-        pytest.param(b"\x89PNG\x00\xff", "PUT", {"content": "text\n"}, "text\n", id="binary"),
-        pytest.param(b"\x89PNG\x00\xff", "PUT", {"content": ""}, "", id="binary-emptied"),
-    ],
-)
-async def test_changes_keep_a_save_over_an_original_the_editor_cannot_read_whole(
-    client: httpx.AsyncClient,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    original: bytes,
-    method: str,
-    body: dict[str, str],
-    after: str,
-) -> None:
-    """A capped or binary read is not the whole original, so saving over it is still a change."""
-    monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 8)
-    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    (workspace / "saved").write_bytes(original)
-
-    saved = await client.request(method, f"{base}/filesystem/saved", json=body)
-    assert saved.status_code == 200, saved.text
-
-    listed = (await client.get(f"{base}/changes")).json()["data"]
-    assert [(e["path"], e["status"]) for e in listed] == [("saved", "modified")]
-    diff = (await client.get(f"{base}/diff/saved")).json()
-    assert (diff["before"], diff["after"], diff["baseline_state"]) == (None, after, "unknown")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("reported_encoding", "saved"),
-    [
-        pytest.param("latin-1", "caf\u00e9\n", id="other-encoding"),
-        pytest.param("utf-8", "caf\ufffd\n", id="invalid-utf-8"),
-    ],
-)
-async def test_changes_keep_a_save_over_an_original_that_is_not_strict_utf_8(
-    client: httpx.AsyncClient,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    reported_encoding: str,
-    saved: str,
-) -> None:
-    """Saving the text a non-UTF-8 original decodes to still changes the file's bytes."""
-    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    (workspace / "menu.txt").write_bytes(b"caf\xe9\n")
-    read = CallerProcessFilesystem.read
-
-    async def read_as_text(
-        self: CallerProcessFilesystem,
-        path: str,
-        *,
-        max_bytes: int | None = None,
-        limit: int | None = None,
-    ) -> FileContent:
-        content = await read(self, path, max_bytes=max_bytes, limit=limit)
-        return dataclasses.replace(content, encoding=reported_encoding)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(CallerProcessFilesystem, "read", read_as_text)
-        response = await client.put(f"{base}/filesystem/menu.txt", json={"content": saved})
-    assert response.status_code == 200, response.text
-
-    listed = (await client.get(f"{base}/changes")).json()["data"]
-    assert [(e["path"], e["status"]) for e in listed] == [("menu.txt", "modified")]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("path", "status", "original", "before"),
-    [
-        pytest.param("src/main.py", "modified", "print('hi')", "print('hi')", id="edited-file"),
-        pytest.param("notes.txt", "created", "", None, id="new-file"),
-    ],
-)
-async def test_changes_follow_a_saved_file_deleted_outside_the_session(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    workspace: Path,
-    path: str,
-    status: str,
-    original: str,
-    before: str | None,
-) -> None:
-    """A saved file removed from a shell shows as deleted, unless the session created it."""
-    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    saved = await client.put(
-        f"{base}/filesystem/{path}", json={"content": "new", "encoding": "utf-8"}
-    )
-    assert saved.status_code == 200, saved.text
-    listed = (await client.get(f"{base}/changes")).json()["data"]
-    assert [(e["path"], e["status"]) for e in listed] == [(path, status)]
-    assert app.state.filesystem_registry.get_baseline(path) == original
-    diff = await client.get(f"{base}/diff/{path}")
-    assert diff.status_code == 200, diff.text
-    assert (diff.json()["before"], diff.json()["after"]) == (before, "new")
-
-    (workspace / path).unlink()
-
-    listed = (await client.get(f"{base}/changes")).json()["data"]
-    diff = await client.get(f"{base}/diff/{path}")
-    if status == "created":
-        assert listed == []
-        assert diff.status_code == 404, diff.text
-    else:
-        assert [(e["path"], e["status"]) for e in listed] == [(path, "deleted")]
-        assert diff.status_code == 200, diff.text
-        assert (diff.json()["before"], diff.json()["after"]) == (before, None)
-
-
-@pytest.mark.asyncio
-async def test_changes_keep_edits_made_in_a_forked_copy_of_the_workspace(workspace: Path) -> None:
-    """A forked session edits a private copy, so the original tree cannot confirm a revert."""
-    forked = create_os_environment(
-        OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            fork=True,
-            sandbox=OSEnvSandboxSpec(type="none"),
-        ),
-    )
-    assert forked is not None
-    registry = SessionResourceRegistry()
-    registry._primary_envs["conv_test"] = forked
-    app = create_runner_app(
-        resource_registry=registry,
-        runner_workspace=workspace,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-    transport = httpx.ASGITransport(app=app)
-    try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
-            for path, content in (("hello.txt", "edited"), ("notes.txt", "new")):
-                written = await client.put(
-                    f"{base}/filesystem/{path}", json={"content": content, "encoding": "utf-8"}
-                )
-                assert written.status_code == 200, written.text
-            listed = (await client.get(f"{base}/changes")).json()["data"]
-            diff = await client.get(f"{base}/diff/notes.txt")
-    finally:
-        forked.close()
-
-    assert (workspace / "hello.txt").read_text() == "hello world"
-    assert not (workspace / "notes.txt").exists()
-    assert sorted((e["path"], e["status"]) for e in listed) == [
-        ("hello.txt", "modified"),
-        ("notes.txt", "created"),
-    ]
-    assert diff.status_code == 200, diff.text
-    assert diff.json()["after"] == "new"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "edits_land_in",
-    [
-        "copy-on-write-spec",
-        "forked-spec",
-        "scratch-spec",
-        "copy-on-write-environment",
-        "no-primary-environment",
-    ],
-)
-async def test_changes_keep_recorded_edits_the_runner_cannot_see(
-    registry: SessionResourceRegistry,
-    workspace: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    edits_land_in: str,
-) -> None:
-    """Writes the runner's tree cannot see must keep their recorded Changes entries."""
-    from omnigent.inner.datamodel import WritePathSpec
-
-    os_env = OSEnvSpec(
-        type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none")
-    )
-    if edits_land_in == "copy-on-write-spec":
-        os_env = OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=[WritePathSpec(".", True)]),
-        )
-    elif edits_land_in == "forked-spec":
-        os_env = OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            fork=True,
-            sandbox=OSEnvSandboxSpec(type="none"),
-        )
-    elif edits_land_in == "scratch-spec":
-        os_env = OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            start_in_scratch=True,
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
-        )
-    elif edits_land_in == "copy-on-write-environment":
-        monkeypatch.setitem(
-            registry._primary_envs,
-            "conv_test",
-            SimpleNamespace(
-                cwd=workspace, sandbox=SimpleNamespace(copy_on_write_roots=[workspace])
-            ),
-        )
-    else:
-        monkeypatch.delitem(registry._primary_envs, "conv_test")
-
-    async def _session_handler(request: httpx.Request) -> httpx.Response:
-        """Return the session snapshot that points at the agent under test."""
-        if request.url.path != "/v1/sessions/conv_test":
-            return httpx.Response(404)
-        return httpx.Response(200, json={"id": "conv_test", "agent_id": "ag_test"})
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> object:
-        """Return the agent spec whose os_env decides where edits land."""
-        return SimpleNamespace(os_env=os_env)
-
-    server_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(_session_handler), base_url="http://server"
-    )
-    app = create_runner_app(
-        resource_registry=registry,
-        runner_workspace=workspace,
-        server_client=server_client,
-        spec_resolver=_resolver,
-    )
-    changes = app.state.filesystem_registry
-    changes.seed_snapshot("hello.txt", "hello world", session_id="conv_test")
-    changes.record_change("hello.txt", "modified", "conv_test")
-    changes.record_change("notes.txt", "created", "conv_test")
-    transport = httpx.ASGITransport(app=app)
-    async with (
-        server_client,
-        httpx.AsyncClient(transport=transport, base_url="http://runner") as client,
-    ):
-        resp = await client.get(
-            f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
-        )
-
-    assert resp.status_code == 200, resp.text
-    assert sorted((e["path"], e["status"]) for e in resp.json()["data"]) == [
-        ("hello.txt", "modified"),
-        ("notes.txt", "created"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
-    app: FastAPI,
-    client: httpx.AsyncClient,
-    registry: SessionResourceRegistry,
-    workspace: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A terminal rooted elsewhere, in an overlay, or in scratch keeps unconfirmable edits.
-
-    A terminal rooted at the workspace checks them against the disk, as the primary one does.
-    """
-    terminal_root = tmp_path / "terminal"
-    terminal_root.mkdir()
-    (terminal_root / "notes.txt").write_text("new")
-    (terminal_root / "shared.txt").write_text("terminal text")
-    (workspace / "shared.txt").write_text("workspace text")
-    terminal_env = create_os_environment(
-        OSEnvSpec(
-            type="caller_process", cwd=str(terminal_root), sandbox=OSEnvSandboxSpec(type="none")
-        ),
-    )
-    assert terminal_env is not None
-    workspace_env = create_os_environment(
-        OSEnvSpec(
-            type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none")
-        ),
-    )
-    assert workspace_env is not None
-    terminals = TerminalRegistry()
-    overlay_env = SimpleNamespace(
-        cwd=str(workspace), sandbox=SimpleNamespace(copy_on_write_roots=[workspace])
-    )
-    scratch_env = SimpleNamespace(
-        cwd=str(workspace),
-        sandbox=SimpleNamespace(copy_on_write_roots=None),
-        spec=OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            start_in_scratch=True,
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
-        ),
-    )
-    terminals._by_conversation["conv_test"] = {
-        ("bash", "s1"): make_test_terminal_instance("bash", "s1", tmp_path, os_env=terminal_env),
-        ("bash", "s2"): make_test_terminal_instance(
-            "bash",
-            "s2",
-            tmp_path,
-            os_env=overlay_env,  # type: ignore[arg-type]
-        ),
-        ("bash", "s3"): make_test_terminal_instance(
-            "bash",
-            "s3",
-            tmp_path,
-            os_env=scratch_env,  # type: ignore[arg-type]
-        ),
-        ("bash", "s4"): make_test_terminal_instance("bash", "s4", tmp_path, os_env=workspace_env),
-    }
-    monkeypatch.setattr(registry, "_terminal_registry", terminals)
-    changes = app.state.filesystem_registry
-    changes.seed_snapshot("hello.txt", "hello world", session_id="conv_test")
-    changes.record_change("hello.txt", "modified", "conv_test")
-    changes.record_change("notes.txt", "created", "conv_test")
-    environment_id = terminal_environment_resource_id("bash", "s1")
-    base = f"/v1/sessions/conv_test/resources/environments/{environment_id}"
-    primary = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
-
-    in_terminal = await client.put(f"{base}/filesystem/shared.txt", json={"content": "edited"})
-    # The workspace copy now matches the terminal's original, not its own.
-    in_workspace = await client.put(
-        f"{primary}/filesystem/shared.txt", json={"content": "terminal text"}
-    )
-    listed = await client.get(f"{base}/changes")
-    diff = await client.get(f"{base}/diff/notes.txt")
-    listed_in_workspace = await client.get(f"{primary}/changes")
-    overlay = terminal_environment_resource_id("bash", "s2")
-    listed_in_overlay = await client.get(
-        f"/v1/sessions/conv_test/resources/environments/{overlay}/changes"
-    )
-    scratch = terminal_environment_resource_id("bash", "s3")
-    listed_in_scratch = await client.get(
-        f"/v1/sessions/conv_test/resources/environments/{scratch}/changes"
-    )
-    same_root = terminal_environment_resource_id("bash", "s4")
-    listed_in_same_root = await client.get(
-        f"/v1/sessions/conv_test/resources/environments/{same_root}/changes"
-    )
-
-    assert (in_terminal.status_code, in_workspace.status_code) == (200, 200)
-    assert listed.status_code == 200, listed.text
-    assert sorted((e["path"], e["status"]) for e in listed.json()["data"]) == [
-        ("hello.txt", "modified"),
-        ("notes.txt", "created"),
-        ("shared.txt", "modified"),
-    ]
-    assert listed_in_overlay.status_code == 200, listed_in_overlay.text
-    assert sorted((e["path"], e["status"]) for e in listed_in_overlay.json()["data"]) == [
-        ("hello.txt", "modified"),
-        ("notes.txt", "created"),
-        ("shared.txt", "modified"),
-    ]
-    assert listed_in_scratch.status_code == 200, listed_in_scratch.text
-    assert sorted((e["path"], e["status"]) for e in listed_in_scratch.json()["data"]) == [
-        ("hello.txt", "modified"),
-        ("notes.txt", "created"),
-        ("shared.txt", "modified"),
-    ]
-    assert diff.status_code == 200, diff.text
-    assert (diff.json()["before"], diff.json()["after"]) == (None, "new")
-    assert listed_in_workspace.status_code == 200, listed_in_workspace.text
-    assert [(e["path"], e["status"]) for e in listed_in_workspace.json()["data"]] == [
-        ("shared.txt", "modified")
-    ]
-    assert listed_in_same_root.status_code == 200, listed_in_same_root.text
-    assert [(e["path"], e["status"]) for e in listed_in_same_root.json()["data"]] == [
-        ("shared.txt", "modified")
-    ]
 
 
 @pytest.mark.asyncio
@@ -3618,57 +3158,6 @@ def test_search_indexed_paths_never_describes_a_symlink(tmp_path: Path) -> None:
     entries = search_indexed_paths(root, ["b-link", "a/b.txt", "b-docs", "real/b.md"], "b")
 
     assert [(e.path, e.type, e.bytes) for e in entries] == [("real/b.md", "file", 2)]
-
-
-@pytest.mark.parametrize(
-    ("on_disk", "grows_by", "requested_sizes", "matches"),
-    [
-        pytest.param(b"another size\n", 0, [], False, id="different-size"),
-        pytest.param(b"original\n", 0, [10], True, id="same-content"),
-        pytest.param(b"original\n", 4, [10], False, id="grows-while-compared"),
-    ],
-)
-def test_compare_file_beneath_reads_at_most_one_byte_past_the_original(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    on_disk: bytes,
-    grows_by: int,
-    requested_sizes: list[int],
-    matches: bool,
-) -> None:
-    """Only a file of the original's size is read, and never past one extra byte."""
-    target = tmp_path / "notes.md"
-    target.write_bytes(on_disk)
-    root = os.stat(tmp_path)
-    reads: list[int] = []
-    fdopen = os.fdopen
-
-    class _RecordedReads:
-        def __init__(self, handle: BinaryIO) -> None:
-            self._handle = handle
-
-        def __enter__(self) -> _RecordedReads:
-            return self
-
-        def __exit__(self, *exc_info: object) -> None:
-            self._handle.close()
-
-        def fileno(self) -> int:
-            return self._handle.fileno()
-
-        def read(self, size: int = -1) -> bytes:
-            with target.open("ab") as growth:
-                growth.write(b"x" * grows_by)
-            reads.append(size)
-            return self._handle.read(size)
-
-    monkeypatch.setattr(os, "fdopen", lambda fd, mode: _RecordedReads(fdopen(fd, mode)))
-
-    _, same = compare_file_beneath(
-        tmp_path, "notes.md", b"original\n", root_identity=(root.st_dev, root.st_ino)
-    )
-
-    assert (same, reads) == (matches, requested_sizes)
 
 
 @pytest.mark.asyncio

@@ -5252,6 +5252,14 @@ def create_runner_app(
             from omnigent.runner.slow_io import run_slow_io
             from omnigent.runner.tool_dispatch import _maybe_signal_changed_files
 
+            async def _read_text(path: str) -> str | None:
+                environment = resource_registry.resolve_environment(
+                    _captured_session_id, "default", relay_spec
+                )
+                result = await environment.read(path, max_bytes=1_048_576, regular_only=True)
+                content = result.get("content")
+                return content if not result.get("error") and isinstance(content, str) else None
+
             try:
                 changes = native_file_changes(payload)
                 if not changes:
@@ -5261,44 +5269,47 @@ def create_runner_app(
                     return
                 async with _native_file_changes_lock:
                     for change in changes:
-                        # Editor and tool saves hold this lock until they record their original.
-                        async with registry.change_lock(change.path):
-                            try:
-                                if registry.needs_snapshot(
-                                    change.path, session_id=_captured_session_id
-                                ):
-                                    current = None
-                                    if change.patch is not None:
-                                        environment = resource_registry.resolve_environment(
-                                            _captured_session_id, "default", relay_spec
-                                        )
-                                        result = await environment.read(
-                                            change.move_path or change.path,
-                                            max_bytes=1_048_576,
-                                            regular_only=True,
-                                        )
-                                        if not result.get("error") and isinstance(
-                                            result.get("content"), str
-                                        ):
-                                            current = result["content"]
-                                    original = await run_slow_io(
-                                        resolve_native_original, change, current
+                        try:
+                            if registry.needs_snapshot(change.path):
+                                current = (
+                                    await _read_text(change.move_path or change.path)
+                                    if change.patch is not None
+                                    else None
+                                )
+                                original = await run_slow_io(
+                                    resolve_native_original, change, current
+                                )
+                                if original is not None:
+                                    registry.seed_snapshot(
+                                        change.path, original, session_id=_captured_session_id
                                     )
-                                    if original is not None:
-                                        registry.seed_snapshot(
-                                            change.path, original, session_id=_captured_session_id
-                                        )
+                        except Exception:
+                            _logger.warning(
+                                "native original recovery failed for session=%s path=%r",
+                                _captured_session_id,
+                                change.path,
+                                exc_info=True,
+                                extra={"session_id": _captured_session_id},
+                            )
+                        current_text = None
+                        if change.operation != "deleted" and registry.can_detect_revert(
+                            change.path, session_id=_captured_session_id
+                        ):
+                            try:
+                                current_text = await _read_text(change.path)
                             except Exception:
-                                _logger.warning(
-                                    "native original recovery failed for session=%s path=%r",
-                                    _captured_session_id,
+                                _logger.debug(
+                                    "could not read %r after a native edit",
                                     change.path,
                                     exc_info=True,
                                     extra={"session_id": _captured_session_id},
                                 )
-                            registry.record_change(
-                                change.path, change.operation, _captured_session_id
-                            )
+                        registry.record_change(
+                            change.path,
+                            change.operation,
+                            _captured_session_id,
+                            current_text=current_text,
+                        )
                 _maybe_signal_changed_files(
                     _captured_session_id,
                     _publish_event,

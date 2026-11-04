@@ -8,10 +8,8 @@ import logging
 import queue as sync_queue
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from typing import Any
-
-from ._subprocess_lifecycle import await_cleanup_task
 
 _logger = logging.getLogger(__name__)
 
@@ -57,31 +55,6 @@ async def run_sync_on_thread(  # type: ignore[explicit-any]
             return payload
     finally:
         thread.join(timeout=0)
-
-
-async def finish_before_cancellation[Result](work: Awaitable[Result]) -> Result:
-    """Await *work* to completion, then propagate any caller cancellation.
-
-    For work that holds a lock or records a result its caller must not abandon
-    while an operation it started is still running.
-
-    :param work: The started operation, e.g. a write and its recording.
-    :returns: The result of *work*.
-    :raises asyncio.CancelledError: After *work* finishes when the caller was
-        cancelled, including when cancellation was requested repeatedly. A
-        failure of *work* after the cancellation is logged.
-    """
-    task = asyncio.ensure_future(work)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        try:
-            await await_cleanup_task(task)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            _logger.exception("Work failed after its caller was cancelled")
-        raise
 
 
 async def run_sync_cleanup(  # type: ignore[explicit-any]
