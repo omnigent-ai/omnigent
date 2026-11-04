@@ -72,10 +72,10 @@ the header menu), and each place is a separate entry point.
   starts at five again, the open session stays listed once the sidebar has
   loaded it, and Show more carries the badge of a hidden session that needs
   attention or is unread. Filing a session into the folder leaves its listed
-  rows as they are, so an older one lands behind Show more. Settings →
-  Appearance → Sidebar → "Show project sessions 5 at a time" (on by
-  default, per device) turns this off: folders then list every loaded session
-  and load more as the sidebar scrolls, with no Show more row.
+  rows as they are, so an older one lands behind Show more. The Projects
+  header's "…" menu → Sessions per project chooses First 5 (the default, per
+  device) or All: with All, folders list every loaded session and load more as
+  the sidebar scrolls, with no Show more row.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,
   unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
@@ -263,8 +263,8 @@ choose Rename project. Start typing as soon as the dialog opens.
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
 the ⌘K / Ctrl+K palette or a link also lists down to that session, once the
-sidebar has loaded it. To list every session instead, turn off Settings →
-Appearance → Sidebar → "Show project sessions 5 at a time".
+sidebar has loaded it. To list every session instead, choose All from the
+Projects header's "…" menu → Sessions per project.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -1069,19 +1069,21 @@ plain `uv run pytest`, which starts a private server for the test.
   reveal, row-menu filing leaving the listed rows as they are, the
   hidden-session badge, and the ⌘[ / ⌘] hotkey;
   `web/src/shell/Sidebar.shiftSelect.test.tsx` covers shift ranges, bulk
-  actions, and bulk filing. The Settings switch is covered by the Sidebar tests
-  "lists every session and auto-loads more pages when pagination is turned
-  off" and "lists and reorders every member of a Custom-order folder when
-  pagination is turned off", `web/src/pages/SettingsPage.test.tsx` (reset), and
-  `web/src/lib/settingsPortability.test.ts` (export/import). By hand: create a
-  project (`POST /v1/projects`), file six or more sessions into it with
-  `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
-  orders them, then expand the folder and click Show more. For the switch, file
-  more than 20 sessions (one server page) and turn it off: the open folder lists
-  every loaded session with no Show more, and scrolling to its end loads the next
+  actions, and bulk filing. The Sessions per project menu is covered by the
+  Sidebar tests "switches folders between the first page and all sessions from
+  the Projects menu", "lists every session and auto-loads more pages when
+  folders list all sessions" and "lists and reorders every member of a
+  Custom-order folder listing all sessions", `web/src/pages/SettingsPage.test.tsx`
+  (reset), and `web/src/lib/settingsPortability.test.ts` (export/import). By
+  hand: create a project (`POST /v1/projects`), file six or more sessions into
+  it with `PATCH /v1/sessions/{id}` and `project_id`, one second apart so
+  `updated_at` orders them, then expand the folder and click Show more. For the
+  menu, file more than 20 sessions (one server page) and choose All from the
+  Projects header's "…" menu → Sessions per project: the open folder lists every
+  loaded session with no Show more, and scrolling to its end loads the next
   page. Load more stays under the folder while pages remain; after three
-  automatic loads (the default budget), further pages need a click on it. Turn
-  the switch back on for five rows plus Show more.
+  automatic loads (the default budget), further pages need a click on it.
+  Choose First 5 again for five rows plus Show more.
 
 For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and

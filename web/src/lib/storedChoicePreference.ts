@@ -1,32 +1,33 @@
-// A per-device on/off preference in localStorage that mounted readers follow,
-// including writes from other windows. Only the non-default value is stored.
+// A per-device choice in localStorage that mounted readers follow, including
+// writes from other windows. Only a non-default choice is stored.
 
 import { useSyncExternalStore } from "react";
 
-export interface StoredBooleanPreference {
+export interface StoredChoicePreference<Choice extends string> {
   readonly storageKey: string;
-  readonly defaultValue: boolean;
+  readonly defaultValue: Choice;
   /** Read the preference; storage errors and unknown values mean the default. */
-  read: () => boolean;
+  read: () => Choice;
   /** Persist the preference and notify readers already on screen. */
-  write: (value: boolean) => void;
+  write: (value: Choice) => void;
   /** Re-read after a same-tab storage write that bypassed `write` (import, reset). */
   notifyChanged: () => void;
   /** Live value of the preference. */
-  use: () => boolean;
+  use: () => Choice;
 }
 
-export function createStoredBooleanPreference(
+export function createStoredChoicePreference<Choice extends string>(
   storageKey: string,
-  defaultValue: boolean,
-): StoredBooleanPreference {
+  choices: readonly Choice[],
+  defaultValue: Choice,
+): StoredChoicePreference<Choice> {
   const changeEvent = `${storageKey}-change`;
-  const storedValue = String(!defaultValue);
 
   const read = () => {
     if (typeof window === "undefined") return defaultValue;
     try {
-      return window.localStorage.getItem(storageKey) === storedValue ? !defaultValue : defaultValue;
+      const stored = window.localStorage.getItem(storageKey);
+      return choices.find((choice) => choice === stored) ?? defaultValue;
     } catch {
       return defaultValue;
     }
@@ -36,13 +37,13 @@ export function createStoredBooleanPreference(
     if (typeof window !== "undefined") window.dispatchEvent(new Event(changeEvent));
   };
 
-  const write = (value: boolean) => {
+  const write = (value: Choice) => {
     if (typeof window === "undefined") return;
     try {
       if (value === defaultValue) {
         window.localStorage.removeItem(storageKey);
       } else {
-        window.localStorage.setItem(storageKey, storedValue);
+        window.localStorage.setItem(storageKey, value);
       }
     } catch {
       // Ignore storage failures (quota, privacy mode); the stored value is left as it was.

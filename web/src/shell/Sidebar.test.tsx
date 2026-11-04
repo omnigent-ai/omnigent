@@ -33,7 +33,11 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
-import { writeProjectFolderPagination } from "@/lib/projectFolderPaginationPreferences";
+import {
+  PROJECT_FOLDER_PAGE_SIZE,
+  type ProjectFolderPagination,
+  writeProjectFolderPagination,
+} from "@/lib/projectFolderPaginationPreferences";
 import * as sessionsApi from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
@@ -300,6 +304,13 @@ function openProjectsMenu() {
     button: 0,
     ctrlKey: false,
   });
+}
+
+/** Pick how many sessions expanded folders list from the Projects header menu. */
+function chooseFolderPagination(choice: ProjectFolderPagination) {
+  openProjectsMenu();
+  fireEvent.keyDown(screen.getByTestId("project-folder-pagination-menu"), { key: "ArrowRight" });
+  fireEvent.click(screen.getByTestId(`project-folder-pagination-${choice}`));
 }
 
 /** Close an open dropdown menu (Radix marks the rest of the tree aria-hidden
@@ -2746,16 +2757,16 @@ describe("Sidebar project Show more", () => {
     expect(folderRowIds()).toEqual(moved);
   });
 
-  it("lists and reorders every member of a Custom-order folder when pagination is turned off", () => {
+  it("lists and reorders every member of a Custom-order folder listing all sessions", () => {
     localStorage.setItem(
       "omnigent:sidebar-view",
       JSON.stringify({ ordering: "custom", custom: { base: "updated", since: 1000, ids: [] } }),
     );
-    writeProjectFolderPagination(false);
     projectsMock.push("Customer X");
     mockConversations([conv("conv_unfiled", "Claude Code")]);
     projectSessionsMock.current["Customer X"] = filedSessions(7);
     renderGroupingSidebar();
+    chooseFolderPagination("all");
     toggleFolder();
     expect(folderRowIds()).toEqual(filedIds(7));
     expect(screen.queryByTestId("project-show-more")).toBeNull();
@@ -2770,6 +2781,39 @@ describe("Sidebar project Show more", () => {
       "conv_filed_4",
       "conv_filed_6",
     ]);
+  });
+
+  it("switches folders between the first page and all sessions from the Projects menu", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(7));
+    renderSidebar();
+    toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(PROJECT_FOLDER_PAGE_SIZE));
+
+    // The trigger shows the current choice, labelled from the page size.
+    openProjectsMenu();
+    const trigger = screen.getByTestId("project-folder-pagination-menu");
+    expect(within(trigger).getByText("Sessions per project")).toBeInTheDocument();
+    expect(within(trigger).getByText(`First ${PROJECT_FOLDER_PAGE_SIZE}`)).toBeInTheDocument();
+    fireEvent.keyDown(trigger, { key: "ArrowRight" });
+    expect(screen.getByTestId("project-folder-pagination-first-page")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(screen.getByTestId("project-folder-pagination-all"));
+    expect(folderRowIds()).toEqual(filedIds(7));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+    expect(localStorage.getItem("omnigent:project-folder-pagination")).toBe("all");
+
+    openProjectsMenu();
+    expect(
+      within(screen.getByTestId("project-folder-pagination-menu")).getByText("All"),
+    ).toBeInTheDocument();
+    closeProjectsMenu();
+    chooseFolderPagination("first-page");
+    expect(folderRowIds()).toEqual(filedIds(PROJECT_FOLDER_PAGE_SIZE));
+    expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
+    expect(localStorage.getItem("omnigent:project-folder-pagination")).toBeNull();
   });
 
   it("lists five more sessions per click until none remain", () => {
@@ -2874,7 +2918,7 @@ describe("Sidebar project Show more", () => {
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
   });
 
-  it("lists every session and auto-loads more pages when pagination is turned off", async () => {
+  it("lists every session and auto-loads more pages when folders list all sessions", async () => {
     const observer = stubIntersectionObserver();
     onTestFinished(() => {
       vi.unstubAllGlobals();
@@ -2890,8 +2934,8 @@ describe("Sidebar project Show more", () => {
     toggleFolder();
     expect(folderRowIds()).toEqual(filedIds(5));
 
-    // Turning pagination off applies to the open folder without a reload.
-    act(() => writeProjectFolderPagination(false));
+    // Listing all sessions applies to the open folder without a reload.
+    act(() => writeProjectFolderPagination("all"));
     expect(folderRowIds()).toEqual(filedIds(12));
     expect(screen.queryByTestId("project-show-more")).toBeNull();
     // The folder's end is watched within the sidebar's own scroll container.
@@ -2907,13 +2951,13 @@ describe("Sidebar project Show more", () => {
     refresh();
     expect(folderRowIds()).toEqual(filedIds(15));
 
-    // Turning it back on returns the open folder to one page.
-    act(() => writeProjectFolderPagination(true));
+    // Going back to the first page returns the open folder to one page.
+    act(() => writeProjectFolderPagination("first-page"));
     expect(folderRowIds()).toEqual(filedIds(5));
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
 
-    // The switch-off right after that page reset still lists every loaded row.
-    act(() => writeProjectFolderPagination(false));
+    // Listing all right after that page reset still lists every loaded row.
+    act(() => writeProjectFolderPagination("all"));
     expect(folderRowIds()).toEqual(filedIds(15));
     expect(screen.queryByTestId("project-show-more")).toBeNull();
   });
@@ -2977,13 +3021,12 @@ describe("Sidebar project Show more", () => {
   });
 
   it.each([
-    { pagination: "on", next: "conv_other_folder" },
-    { pagination: "off", next: "conv_filed_5" },
-  ])(
-    "steps the session hotkey past the fifth folder row with pagination $pagination",
+    { pagination: "first-page", next: "conv_other_folder" },
+    { pagination: "all", next: "conv_filed_5" },
+  ] as const)(
+    "steps the session hotkey past the fifth folder row when folders list $pagination",
     ({ pagination, next }) => {
-      // With pagination on, the sixth and seventh rows sit behind Show more.
-      writeProjectFolderPagination(pagination === "on");
+      // Listing the first page leaves the sixth and seventh rows behind Show more.
       projectsMock.push("Customer X", "Customer Y");
       mockConversations([
         ...filedSessions(7),
@@ -2997,6 +3040,7 @@ describe("Sidebar project Show more", () => {
         JSON.stringify(["Customer X", "Customer Y"]),
       );
       renderOnSession("conv_filed_4");
+      chooseFolderPagination(pagination);
 
       fireEvent.keyDown(window, {
         code: "BracketRight",

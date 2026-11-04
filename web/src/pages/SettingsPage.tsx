@@ -204,9 +204,7 @@ import {
 } from "@/lib/foldNarrationPreferences";
 import {
   DEFAULT_PROJECT_FOLDER_PAGINATION,
-  PROJECT_FOLDER_PAGE_SIZE,
   PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
-  useProjectFolderPagination,
   writeProjectFolderPagination,
 } from "@/lib/projectFolderPaginationPreferences";
 import {
@@ -975,29 +973,6 @@ function FoldAssistantNarrationControl() {
   );
 }
 
-/** On by default: expanded project folders list a page of sessions behind "Show more". */
-function ProjectFolderPaginationControl() {
-  const enabled = useProjectFolderPagination();
-  const labelId = useId();
-  return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label={`Show project sessions ${PROJECT_FOLDER_PAGE_SIZE} at a time`}
-        labelId={labelId}
-        description={`An expanded project folder lists its first ${PROJECT_FOLDER_PAGE_SIZE} sessions and a Show more row for the rest. Turn this off to list every session in the folder, loading more as you scroll.`}
-      />
-      <Switch
-        aria-labelledby={labelId}
-        checked={enabled}
-        onCheckedChange={writeProjectFolderPagination}
-        data-testid="project-folder-pagination-toggle"
-        className="mt-0.5 shrink-0"
-        componentId="settings.appearance.project_folder_pagination"
-      />
-    </div>
-  );
-}
-
 function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
@@ -1139,10 +1114,6 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <WorkspaceTabsControl />
             </div>
-          </SettingsGroup>
-
-          <SettingsGroup title="Sidebar" testId="settings-group-sidebar">
-            <ProjectFolderPaginationControl />
           </SettingsGroup>
 
           <SettingsGroup title="Interface typography" testId="settings-group-interface-type">

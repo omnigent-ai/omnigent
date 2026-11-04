@@ -152,20 +152,20 @@ it("carries hidden picker entries through export and import and tells an open pi
 });
 
 it("carries project folder pagination through export and import and updates mounted readers", () => {
-  localStorage.setItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY, "false");
+  localStorage.setItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY, "all");
   const exported = collectSettings()!;
-  expect(exported.settings[PROJECT_FOLDER_PAGINATION_STORAGE_KEY]).toBe("false");
+  expect(exported.settings[PROJECT_FOLDER_PAGINATION_STORAGE_KEY]).toBe("all");
   const { result } = renderHook(() => useProjectFolderPagination());
-  expect(result.current).toBe(false);
+  expect(result.current).toBe("all");
 
   act(() => {
     applyImportedSettings({ version: 1, settings: {} });
   });
   expect(localStorage.getItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY)).toBeNull();
-  expect(result.current).toBe(true);
+  expect(result.current).toBe("first-page");
   act(() => {
     applyImportedSettings(exported);
   });
-  expect(localStorage.getItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY)).toBe("false");
-  expect(result.current).toBe(false);
+  expect(localStorage.getItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY)).toBe("all");
+  expect(result.current).toBe("all");
 });

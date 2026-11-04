@@ -9,7 +9,6 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as IdentityModule from "@/lib/identity";
-import { writeProjectFolderPagination } from "@/lib/projectFolderPaginationPreferences";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
 import { computeShiftSelectRange } from "./Sidebar";
@@ -283,12 +282,11 @@ describe("Sidebar shift-click selection", () => {
   });
 
   it.each([
-    { pagination: "on", selected: 6 },
-    { pagination: "off", selected: 8 },
+    { pagination: "first-page", selected: 6 },
+    { pagination: "all", selected: 8 },
   ])(
-    "keeps a projects-scope shift range to the listed rows with pagination $pagination",
+    "keeps a projects-scope shift range to the listed rows when folders list $pagination",
     async ({ pagination, selected }) => {
-      writeProjectFolderPagination(pagination === "on");
       projectsMock.push("Alpha", "Beta");
       mockConversations([
         ...Array.from({ length: 7 }, (_, i) =>
@@ -302,15 +300,22 @@ describe("Sidebar shift-click selection", () => {
       );
       renderSidebar();
 
-      fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-        button: 0,
-        ctrlKey: false,
+      const openProjectsMenu = () =>
+        fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+          button: 0,
+          ctrlKey: false,
+        });
+      openProjectsMenu();
+      fireEvent.keyDown(await screen.findByTestId("project-folder-pagination-menu"), {
+        key: "ArrowRight",
       });
+      fireEvent.click(await screen.findByTestId(`project-folder-pagination-${pagination}`));
+      openProjectsMenu();
       fireEvent.click(await screen.findByTestId("projects-select-sessions"));
       fireEvent.click(await screen.findByRole("link", { name: "a0" }));
       fireEvent.click(screen.getByRole("link", { name: "b0" }), { shiftKey: true });
 
-      // With pagination on, a5 and a6 sit behind Alpha's Show more and stay out of the range.
+      // Listing the first page leaves a5 and a6 behind Alpha's Show more, out of the range.
       await waitFor(() => {
         expect(screen.getByText(`${selected} selected`)).toBeInTheDocument();
       });

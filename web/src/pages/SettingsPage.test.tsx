@@ -5,7 +5,16 @@
 
 import { Fragment, type ReactNode } from "react";
 import { EmbeddedProvider } from "@/lib/embedded";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -14,6 +23,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import { useProjectFolderPagination } from "@/lib/projectFolderPaginationPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
 import { MESSAGE_FONT_SIZE_MOBILE_QUERY, UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
@@ -545,7 +555,6 @@ describe("SettingsPage", () => {
     for (const testId of [
       "settings-group-theme",
       "settings-group-chat",
-      "settings-group-sidebar",
       "settings-group-interface-type",
       "settings-group-code-type",
       "settings-group-data",
@@ -1142,7 +1151,10 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("fold-assistant-narration-toggle"));
-    fireEvent.click(screen.getByTestId("project-folder-pagination-toggle"));
+    // Chosen from the sidebar's Projects menu; Reset appearance still clears it.
+    localStorage.setItem("omnigent:project-folder-pagination", "all");
+    const folderPagination = renderHook(() => useProjectFolderPagination());
+    expect(folderPagination.result.current).toBe("all");
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -1169,11 +1181,6 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("fold-assistant-narration-toggle")).toHaveAttribute(
       "aria-checked",
       "true",
-    );
-    expect(localStorage.getItem("omnigent:project-folder-pagination")).toBe("false");
-    expect(screen.getByTestId("project-folder-pagination-toggle")).toHaveAttribute(
-      "aria-checked",
-      "false",
     );
 
     // Open the confirmation dialog and confirm the reset.
@@ -1227,11 +1234,8 @@ describe("SettingsPage", () => {
       "false",
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
-    expect(screen.getByTestId("project-folder-pagination-toggle")).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
     expect(localStorage.getItem("omnigent:project-folder-pagination")).toBeNull();
+    expect(folderPagination.result.current).toBe("first-page");
     expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 

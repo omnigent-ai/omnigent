@@ -5,20 +5,20 @@ import {
   writeProjectFolderPagination,
 } from "./projectFolderPaginationPreferences";
 
-// Storage failures and live updates are covered by storedBooleanPreference.test.ts.
+// Storage failures and live updates are covered by storedChoicePreference.test.ts.
 afterEach(() => {
   localStorage.clear();
 });
 
-it("is on by default and only off for the exact persisted value", () => {
-  expect(readProjectFolderPagination()).toBe(true);
-  localStorage.setItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY, "no");
-  expect(readProjectFolderPagination()).toBe(true);
+it("lists the first page by default and stores only the All choice", () => {
+  expect(readProjectFolderPagination()).toBe("first-page");
+  localStorage.setItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY, "false");
+  expect(readProjectFolderPagination()).toBe("first-page");
 
-  writeProjectFolderPagination(false);
-  expect(localStorage.getItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY)).toBe("false");
-  expect(readProjectFolderPagination()).toBe(false);
+  writeProjectFolderPagination("all");
+  expect(localStorage.getItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY)).toBe("all");
+  expect(readProjectFolderPagination()).toBe("all");
 
-  writeProjectFolderPagination(true);
+  writeProjectFolderPagination("first-page");
   expect(localStorage.getItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY)).toBeNull();
 });
