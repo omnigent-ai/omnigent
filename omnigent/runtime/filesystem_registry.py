@@ -794,7 +794,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         return self._list_observed_files(conversation_id, limit=limit)
 
     def _list_observed_files(
-        self, conversation_id: str, *, limit: int, excluded_roots: Collection[str] = ()
+        self, conversation_id: str, *, limit: int, excluded_directories: Collection[Path] = ()
     ) -> list[dict[str, Any]]:
         with self._lock:
             events = list(self._session_events.get(conversation_id, []))
@@ -804,10 +804,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         last_op: dict[str, str] = {}
         by_path: dict[str, _FileEvent] = {}
         for e in events:
-            parts = Path(e.path).parts
-            if "" in excluded_roots or any(
-                "/".join(parts[:depth]) in excluded_roots for depth in range(1, len(parts) + 1)
-            ):
+            if Path(e.path).parent in excluded_directories:
                 continue
             # Ephemeral artifacts are filtered here as a second line of defence
             # (events injected without record_change, e.g. in tests). Harness
@@ -1497,10 +1494,12 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
         reader._run_repository_git = bounded_run
         return reader
 
-    def _repository_roots(self, conversation_id: str) -> dict[str, Path]:
+    def _repository_roots(self, conversation_id: str) -> tuple[dict[str, Path], set[Path]]:
+        """Return repositories and the recorded directories whose Git status replaces events."""
         if (self._cwd / ".git").exists() and _is_git_repo(self._cwd):
-            return {"": self._cwd}
+            return {"": self._cwd}, set()
         roots = {}
+        owned_directories: set[Path] = set()
         deadline = time.monotonic() + 0.25
         try:
             with os.scandir(self._cwd) as entries:
@@ -1510,26 +1509,38 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
                     if entry.name in _SKIP_DIRS or not entry.is_dir(follow_symlinks=False):
                         continue
                     root = Path(entry.path)
-                    if (root / ".git").exists():
+                    if _is_git_repo(root):
                         roots[entry.name] = root
                         if len(roots) > 32:
                             raise GitStatusUnavailable("Workspace exceeds 32 repositories")
             # Deeper repositories are found only from files this session changed.
             with self._lock:
                 events = list(self._session_events.get(conversation_id, []))
+            top_level = set(roots)
+            directories = sorted({Path(event.path).parent for event in events})
             checked: dict[Path, tuple[str, Path] | None] = {}
-            for directory in sorted({Path(event.path).parent for event in events}):
+            for index, directory in enumerate(directories):
                 try:
                     owner = self._nearest_repository(directory, checked, deadline)
                 except TimeoutError:
-                    break  # Repositories not yet found keep their recorded changes.
-                if owner is not None and owner[0] not in roots:
+                    # Unresolved directories stay with an enclosing top-level repository;
+                    # the rest keep their recorded changes.
+                    owned_directories.update(
+                        pending
+                        for pending in directories[index:]
+                        if pending.parts and pending.parts[0] in top_level
+                    )
+                    break
+                if owner is None:
+                    continue
+                owned_directories.add(directory)
+                if owner[0] not in roots:
                     roots[owner[0]] = owner[1]
                     if len(roots) > 32:
                         raise GitStatusUnavailable("Workspace exceeds 32 repositories")
         except OSError as exc:
             raise GitStatusUnavailable("Repository discovery could not complete") from exc
-        return roots
+        return roots, owned_directories
 
     def _owner(self, path: str) -> tuple[str, Path] | None:
         norm = _normalize_path(path, self._cwd)
@@ -1560,7 +1571,11 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
             visited.append(prefix)
             root = self._cwd / prefix
             # A symlinked component can lead outside the workspace, where Git cannot run.
-            if (root / ".git").exists() and _normalize_path(str(prefix), self._cwd) == str(prefix):
+            if (
+                (root / ".git").exists()
+                and _normalize_path(str(prefix), self._cwd) == str(prefix)
+                and _is_git_repo(root)
+            ):
                 owner = "/".join(parts[:depth]), root
                 break
         checked.update(dict.fromkeys(visited, owner))
@@ -1583,22 +1598,33 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
         )
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
-        roots = self._repository_roots(conversation_id)
-        records = self._list_observed_files(conversation_id, limit=10_001, excluded_roots=roots)
+        roots, owned_directories = self._repository_roots(conversation_id)
+        records = (
+            []
+            if "" in roots
+            else self._list_observed_files(
+                conversation_id, limit=10_001, excluded_directories=owned_directories
+            )
+        )
         for prefix, root in sorted(roots.items()):
+            nested = tuple(f"{other}/" for other in roots if other.startswith(f"{prefix}/"))
             try:
-                records.extend(
+                reported = [
                     self._prefix(record, prefix)
                     for record in self._reader(root).list_changed_files(
                         conversation_id, limit=10_001
                     )
-                )
+                ]
             except GitStatusUnavailable as exc:
                 raise GitStatusUnavailable(
                     f"Repository {prefix or root.name!r}: {exc.reason}"
                 ) from exc
+            # A path inside a deeper repository belongs to that repository alone.
+            records.extend(record for record in reported if not record["path"].startswith(nested))
             if len(records) > 10_000:
                 raise GitStatusUnavailable("Workspace exceeds 10000 changed files")
+        # Git status wins over a recorded event that discovery could not resolve in time.
+        records = list({record["path"]: record for record in records}.values())
         records.sort(key=lambda record: (record["modified_at"] or 0, record["path"]), reverse=True)
         return records[:limit]
 

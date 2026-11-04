@@ -1653,6 +1653,43 @@ def test_nested_discovery_skips_repositories_reached_through_symlinked_directori
     ]
 
 
+def test_directories_with_invalid_git_entries_keep_recorded_changes(tmp_path: Path) -> None:
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    paths = ["group/vendor/x.txt", "notes.txt", "vendor/y.txt"]
+    for path in paths:
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text("edited\n")
+        registry.record_change(path, "modified", "session")
+    (tmp_path / "group" / "vendor" / ".git").mkdir()
+    (tmp_path / "vendor" / ".git").mkdir()
+    reader = registry.with_git_runner(lambda *_args: pytest.fail("ran Git outside a repository"))
+    changes = reader.list_changed_files("session", limit=100)
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == [
+        (path, None) for path in paths
+    ]
+    record = reader.get_changed_file("session", "group/vendor/x.txt")
+    assert record is not None and "repository_root" not in record
+
+
+def test_overlapping_repositories_list_each_path_under_its_nearest_repository(
+    tmp_path: Path,
+) -> None:
+    outer = tmp_path / "outer"
+    (outer / "inner").mkdir(parents=True)
+    _init_git_with_commit(outer, "inner/file.txt", "original\n")
+    _init_git_with_commit(outer / "inner", "file.txt", "original\n")
+    (outer / "inner" / "file.txt").write_text("edited\n")
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    registry.record_change("outer/inner/file.txt", "modified", "session")
+    reader = registry.with_git_runner(_trusted_test_git)
+    changes = reader.list_changed_files("session", limit=100)
+    assert [(r["path"], r["status"], r.get("repository_root")) for r in changes] == [
+        ("outer/inner/file.txt", "modified", "outer/inner")
+    ]
+    record = reader.get_changed_file("session", "outer/inner/file.txt")
+    assert record is not None and record["repository_root"] == "outer/inner"
+
+
 @pytest.mark.parametrize("repository_count", [1, 4, 8])
 def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repository_count: int
@@ -1700,10 +1737,10 @@ def test_multi_repo_discovery_bounds_fail_without_partial_results(
     )
     for index in range(33):
         if boundary == "nested_repositories":
-            (tmp_path / "group" / str(index) / ".git").mkdir(parents=True)
+            _init_fake_git_repo(tmp_path / "group" / str(index))
             reader.record_change(f"group/{index}/file.txt", "modified", "session")
         else:
-            (tmp_path / str(index) / ".git").mkdir(parents=True)
+            _init_fake_git_repo(tmp_path / str(index))
     with monkeypatch.context() as patches:
         patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: 0)
         if boundary == "entries":
@@ -1724,24 +1761,35 @@ def test_multi_repo_discovery_bounds_fail_without_partial_results(
 def test_nested_discovery_deadline_keeps_recorded_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = tmp_path / "group" / "repo"
-    (repo / "src").mkdir(parents=True)
-    _init_git_with_commit(repo, "src/file.txt", "original\n")
-    (repo / "src" / "file.txt").write_text("edited\n")
+    outer, top = tmp_path / "group" / "outer", tmp_path / "top"
+    (outer / "inner").mkdir(parents=True)
+    (top / "src").mkdir(parents=True)
+    _init_git_with_commit(outer, ".gitignore", "inner/\n")
+    _init_git_with_commit(outer / "inner", "file.txt", "original\n")
+    _init_git_with_commit(top, "src/file.txt", "original\n")
     registry = MultiRepositoryFilesystemRegistry(tmp_path)
-    registry.record_change("group/repo/src/file.txt", "modified", "session")
-    reader = registry.with_git_runner(lambda *_args: pytest.fail("discovery should have stopped"))
-    # The deadline passes after the first ancestor probe of the recorded directory.
-    clock = itertools.chain([0, 0, 0], itertools.repeat(0.251))
+    for path, status in (
+        ("group/outer/new.txt", "created"),
+        ("group/outer/inner/file.txt", "modified"),
+        ("top/src/file.txt", "modified"),
+    ):
+        (tmp_path / path).write_text("edited\n")
+        registry.record_change(path, status, "session")
+    _trusted_test_git(["commit", "-am", "edit"], top, 5).check_returncode()
+    reader = registry.with_git_runner(_trusted_test_git)
+    # The deadline passes after the outer repository is found, before its ignored child.
+    clock = itertools.chain([0, 0, 0, 0], itertools.repeat(0.251))
     with monkeypatch.context() as patches:
         patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: next(clock))
         changes = reader.list_changed_files("session", limit=100)
-    assert [(r["path"], r["status"], r.get("repository_root")) for r in changes] == [
-        ("group/repo/src/file.txt", "modified", None)
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == [
+        ("group/outer/inner/file.txt", None),
+        ("group/outer/new.txt", "group/outer"),
     ]
     changes = registry.with_git_runner(_trusted_test_git).list_changed_files("session", limit=100)
-    assert [(r["path"], r.get("repository_root")) for r in changes] == [
-        ("group/repo/src/file.txt", "group/repo")
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == [
+        ("group/outer/inner/file.txt", "group/outer/inner"),
+        ("group/outer/new.txt", "group/outer"),
     ]
 
 
@@ -1793,7 +1841,8 @@ def test_multi_repo_baseline_failures_are_not_missing_originals(
 
 
 def test_multi_repo_requires_runner_and_surfaces_failed_repository(tmp_path: Path) -> None:
-    (tmp_path / "broken" / ".git").mkdir(parents=True)
+    _init_fake_git_repo(tmp_path / "broken")
+    (tmp_path / "broken" / ".git" / "HEAD").write_text("not a ref\n", encoding="utf-8")
     registry = MultiRepositoryFilesystemRegistry(tmp_path)
     with pytest.raises(GitStatusUnavailable, match="session runner"):
         registry.list_changed_files("session", limit=100)
