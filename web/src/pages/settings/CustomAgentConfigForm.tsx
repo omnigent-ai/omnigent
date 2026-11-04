@@ -140,7 +140,7 @@ export function CustomAgentConfigForm({
         componentId="settings.custom_agents.back"
       />
       <div className="mb-6 flex items-start justify-between gap-4">
-        <h1 className="min-w-0 break-words text-2xl font-semibold">{name}</h1>
+        <h1 className="settings-page-title min-w-0 break-words text-2xl font-medium">{name}</h1>
         <Button
           variant="ghost"
           size="icon"

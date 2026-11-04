@@ -2205,6 +2205,35 @@ describe("Sidebar across the md breakpoint", () => {
       });
   }
 
+  it("leaves the session without closing a selected file in a responsive-hidden rail", () => {
+    const resize = mockViewportWidth(1280);
+    let requestCloseTab: (() => void) | undefined;
+    const closeWindow = vi.fn();
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      setCloseTabSupported: vi.fn(),
+      onCloseTabRequest: (callback: () => void) => {
+        requestCloseTab = callback;
+        return () => {
+          requestCloseTab = undefined;
+        };
+      },
+      closeWindow,
+    });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc?file=README.md");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+
+    resize(740);
+    act(() => requestCloseTab?.());
+    expect(screen.getByText("home", { exact: true })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_abc").openFiles).toContain("README.md");
+    expect(closeWindow).not.toHaveBeenCalled();
+  });
+
   it("closes an open sidebar when the window narrows and reopens it on widening", () => {
     const resize = mockViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
@@ -4437,8 +4466,8 @@ describe("Mobile session menu", () => {
 
 describe("AppShell clone/fork action", () => {
   it.each([false, true])(
-    "resolves a scoped recovery source's own restrictions under a blocked parent (child blocked=%s)",
-    (childBlocked) => {
+    "opens a scoped recovery under a managed parent (child managed=%s)",
+    (childManaged) => {
       const parent = sessionSnapshot({
         id: "conv_parent",
         labels: { "omnigent.host_type": "managed" },
@@ -4447,7 +4476,7 @@ describe("AppShell clone/fork action", () => {
         id: "conv_side_child",
         workspace: "/missing/child",
         hostId: "host_a",
-        labels: childBlocked ? { "omnigent.host_type": "managed" } : {},
+        labels: childManaged ? { "omnigent.host_type": "managed" } : {},
       });
       mockConversations([{ id: "conv_parent", permission_level: 4 }]);
       useSessionMock.mockImplementation((sessionId) => ({
@@ -4472,70 +4501,12 @@ describe("AppShell clone/fork action", () => {
       fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
 
       expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
-      if (childBlocked) {
-        expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
-          "Forking this sandbox session is not supported yet.",
-        );
-        expect(screen.queryByTestId("workspace-path-input")).not.toBeInTheDocument();
-        expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
-      } else {
-        expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
-        expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
-        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
-      }
+      expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
       expect(forkSessionMock).not.toHaveBeenCalled();
     },
   );
-
-  it("disables directory recovery for an Arclet session that forks only onto a new Arclet", async () => {
-    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
-    useSessionMock.mockReturnValue({
-      session: sessionSnapshot({
-        id: "conv_arclet",
-        workspace: "/missing/repo",
-        hostId: "host_arclet",
-        labels: { "omnigent.host_type": "managed" },
-      }),
-      isLoading: false,
-      error: null,
-    });
-    useHostsMock.mockReturnValue({
-      data: [
-        {
-          host_id: "host_arclet",
-          name: "Arclet",
-          owner: "owner",
-          status: "online",
-          sandbox_provider: "arclet",
-        },
-      ],
-    } as ReturnType<typeof useHosts>);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <CapabilitiesProvider
-        info={serverInfo({ managed_sandboxes_enabled: true, sandbox_providers: ["arclet"] })}
-      >
-        {sessionShellTree(
-          client,
-          "/c/conv_arclet",
-          <ConversationScopeContext.Provider value="conv_arclet">
-            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
-          </ConversationScopeContext.Provider>,
-        )}
-      </CapabilitiesProvider>,
-    );
-
-    const recover = screen.getByRole("button", { name: "Continue in another directory…" });
-    expect(recover).toBeDisabled();
-    fireEvent.focus(screen.getByRole("group", { name: "Continue in another directory…" }));
-    await waitFor(() =>
-      expect(screen.getByRole("tooltip")).toHaveTextContent(
-        "This sandbox session can only be cloned onto a new sandbox.",
-      ),
-    );
-    fireEvent.click(recover);
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
-  });
 
   it("opens workspace recovery and resets it before a later normal fork", async () => {
     const source = sessionSnapshot({
@@ -4569,7 +4540,7 @@ describe("AppShell clone/fork action", () => {
     );
   });
 
-  it("blocks direct current-session fork openers for an unsupported managed session", () => {
+  it("opens direct current-session fork openers for a managed session", () => {
     mockConversations([{ id: "conv_managed", permission_level: 4 }]);
     useSessionMock.mockReturnValue({
       session: sessionSnapshot({
@@ -4581,7 +4552,63 @@ describe("AppShell clone/fork action", () => {
     });
     renderShell("/c/conv_managed");
     fireEvent.click(screen.getByTestId("fork-probe-open"));
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Fork from this response/ })).toBeVisible();
+    expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+  });
+
+  it("offers directory recovery for an Arclet session onto a connected host", () => {
+    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({
+        id: "conv_arclet",
+        workspace: "/missing/repo",
+        hostId: "host_arclet",
+        labels: { "omnigent.host_type": "managed" },
+      }),
+      isLoading: false,
+      error: null,
+    });
+    const hosts = [
+      {
+        host_id: "host_arclet",
+        name: "Arclet",
+        owner: "owner",
+        status: "online",
+        sandbox_provider: "arclet",
+      },
+      { host_id: "host_laptop", name: "Laptop", owner: "owner", status: "online" },
+    ];
+    // Pickers never see server-managed sandbox hosts, as in fetchHosts.
+    useHostsMock.mockImplementation(
+      (options) =>
+        ({
+          data: options?.includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider),
+        }) as ReturnType<typeof useHosts>,
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        client,
+        "/c/conv_arclet",
+        <ConversationScopeContext.Provider value="conv_arclet">
+          <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+        </ConversationScopeContext.Provider>,
+      ),
+    );
+
+    const recover = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(recover).toBeEnabled();
+    fireEvent.click(recover);
+    expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
+    expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+    const hostSelect = screen.getByTestId("fork-session-host-select");
+    fireEvent.pointerDown(hostSelect, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostSelect);
+    // Recovery continues in an existing directory, so it offers connected hosts only.
+    expect(screen.getByTestId("fork-session-host-option-host_laptop")).toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-host-option-host_arclet")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-sandbox-option")).not.toBeInTheDocument();
+    expect(forkSessionMock).not.toHaveBeenCalled();
   });
 
   it("exposes canFork to a read-only collaborator on a top-level session", () => {

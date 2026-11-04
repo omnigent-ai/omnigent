@@ -17,6 +17,7 @@ import { NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY } from "@/lib/newChatProjectPromptP
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
+import { MESSAGE_FONT_SIZE_MOBILE_QUERY, UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -274,6 +275,7 @@ afterEach(() => {
   // tests don't leak state into each other.
   localStorage.clear();
   document.documentElement.style.removeProperty("--desktop-ui-font-size");
+  document.documentElement.style.removeProperty("--mobile-message-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
@@ -551,7 +553,9 @@ describe("SettingsPage", () => {
       "md:hidden",
     );
     expect(
-      screen.getByText("Set text across the interface. Icons and spacing stay fixed."),
+      screen.getByText(
+        "Sets interface text. Conversation text is larger on touch devices and narrow screens. Icons and spacing stay fixed.",
+      ),
     ).toHaveClass("max-md:hidden");
     expect(screen.getByText("Choose how Omnigent looks on this device.")).toHaveClass(
       "max-md:hidden",
@@ -997,6 +1001,92 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("14");
     // The discrete desktop size is applied live to the document root.
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("14px");
+  });
+
+  it("keeps touch message sizes stable through rotation and untouched field blur", () => {
+    let narrow = true;
+    let coarse = true;
+    const widthChanges = new Set<() => void>();
+    const pointerChanges = new Set<() => void>();
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      get matches() {
+        return query === UI_FONT_SIZE_MOBILE_QUERY
+          ? narrow
+          : query === MESSAGE_FONT_SIZE_MOBILE_QUERY && (narrow || coarse);
+      },
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+      addEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChanges.add(callback as () => void);
+        if (query === MESSAGE_FONT_SIZE_MOBILE_QUERY) pointerChanges.add(callback as () => void);
+      },
+      removeEventListener: (_type: unknown, callback: unknown) => {
+        widthChanges.delete(callback as () => void);
+        pointerChanges.delete(callback as () => void);
+      },
+    }));
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-size-input");
+    expect(screen.getByText("Interface 14px · Messages 16px")).toBeInTheDocument();
+    expect(screen.getByText("Interface 14px · Messages 16px")).toHaveAttribute("role", "status");
+    expect(input).toHaveAccessibleDescription("Interface 14px · Messages 16px");
+    act(() => {
+      narrow = false;
+      widthChanges.forEach((callback) => callback());
+    });
+    expect(input).toHaveValue(13);
+    expect(screen.getByText("Interface 13px · Messages 16px")).toBeInTheDocument();
+    act(() => {
+      coarse = false;
+      pointerChanges.forEach((callback) => callback());
+    });
+    expect(screen.getByText("Interface 13px · Messages 13px")).toBeInTheDocument();
+    act(() => {
+      coarse = true;
+      pointerChanges.forEach((callback) => callback());
+    });
+    fireEvent.focus(input);
+    fireEvent.blur(input);
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
+    expect(screen.getByText("Interface 13px · Messages 16px")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    expect(screen.getByText("Interface 14px · Messages 16px")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    expect(screen.getByText("Interface 15px · Messages 17px")).toBeInTheDocument();
+  });
+
+  it("reports the applied message size when saving a font choice fails", () => {
+    localStorage.setItem("omnigent:ui-font-size", "18");
+    let widthChange = () => {};
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      matches: query === MESSAGE_FONT_SIZE_MOBILE_QUERY,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChange = callback as () => void;
+      },
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    renderPage("/settings/appearance");
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    fireEvent.click(screen.getByTestId("ui-font-size-dec"));
+    expect(screen.getByText("Interface 17px · Messages 19px")).toBeInTheDocument();
+    expect(document.documentElement.style.getPropertyValue("--mobile-message-font-size")).toBe(
+      "19px",
+    );
+    act(() => widthChange());
+    expect(screen.getByText("Interface 17px · Messages 19px")).toBeInTheDocument();
+    cleanup();
+    renderPage("/settings/appearance");
+    expect(screen.getByText("Interface 17px · Messages 19px")).toBeInTheDocument();
   });
 
   it("disables the steppers at the min and max bounds", () => {

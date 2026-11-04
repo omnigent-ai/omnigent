@@ -6373,6 +6373,7 @@ async def _launch_runner_on_host_locked(
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.scheduled_context import current_scheduled_run
 
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
@@ -6428,14 +6429,11 @@ async def _launch_runner_on_host_locked(
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         request_id = secrets.token_hex(8)
-        launch_future: asyncio.Future[HostLaunchResult] = (
-            asyncio.get_running_loop().create_future()
-        )
-        host_conn.pending_launches[request_id] = launch_future
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
                 binding_token=binding_token,
+                scheduled_run=current_scheduled_run(),
                 workspace=conv.workspace,
                 session_id=conv.id,
                 # Canonical harness (see _resolve_harness) so the host runs the
@@ -6450,22 +6448,40 @@ async def _launch_runner_on_host_locked(
                 superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
             )
         )
-        try:
-            host_registry.send_text(host_conn, launch_frame)
-        except ConnectionError:
-            host_conn.pending_launches.pop(request_id, None)
-            _logger.warning(
-                "Host %s connection lost while launching runner for %s",
-                conv.host_id,
-                conv.id,
-                extra=debug_event(
-                    "runner_launch_failed",
-                    session_id=conv.id,
-                    stage="runner_launch",
-                    error_code="host_launch_failed",
-                ),
+        for enqueue_attempt in range(2):
+            launch_future: asyncio.Future[HostLaunchResult] = (
+                asyncio.get_running_loop().create_future()
             )
-            return _HostLaunchAttempt(runner_id=new_runner_id)
+            host_conn.pending_launches[request_id] = launch_future
+            try:
+                host_registry.send_text(host_conn, launch_frame)
+            except ConnectionError:
+                host_conn.pending_launches.pop(request_id, None)
+                launch_future.cancel()
+                replacement = host_registry.get(host_conn.host_id)
+                if (
+                    enqueue_attempt == 0
+                    and replacement is not None
+                    and replacement is not host_conn
+                ):
+                    # send_text rejected before enqueue; reuse this binding and frame once.
+                    await host_registry.admit_launch(replacement, conv.id)
+                    host_conn = replacement
+                    continue
+                _logger.warning(
+                    "Host %s connection lost while launching runner for %s",
+                    conv.host_id,
+                    conv.id,
+                    extra=debug_event(
+                        "runner_launch_failed",
+                        session_id=conv.id,
+                        stage="runner_launch",
+                        error_code="host_launch_failed",
+                        enqueue_attempt=enqueue_attempt + 1,
+                    ),
+                )
+                return _HostLaunchAttempt(runner_id=new_runner_id)
+            break
         try:
             result = await asyncio.wait_for(
                 launch_future,
@@ -6474,7 +6490,6 @@ async def _launch_runner_on_host_locked(
         except TimeoutError:
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
-            host_conn.pending_launches.pop(request_id, None)
             # A slow host, not a refusal: the launch may still land.
             _logger.warning(
                 "Host launch acknowledgement timed out",
@@ -6488,6 +6503,10 @@ async def _launch_runner_on_host_locked(
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
+        finally:
+            host_conn.pending_launches.pop(request_id, None)
+            if not launch_future.done():
+                launch_future.cancel()
         if result.get("status") == "failed":
             refusal_code = result.get("error_code")
             # Unmapped codes (spawn failures) are attributed on the host's own row.
@@ -10760,10 +10779,15 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
-    for key in (SCHEDULED_TASK_ORIGIN_LABEL_KEY, CREATED_BY_SESSION_LABEL_KEY):
+    for key in (
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        CREATED_BY_SESSION_LABEL_KEY,
+    ):
         if key in labels:
             raise OmnigentError(
                 f"label {key!r} is server-internal and cannot be set by clients",

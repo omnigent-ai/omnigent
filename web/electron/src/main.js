@@ -1366,6 +1366,9 @@ function applyDockIcon() {
  *   double-counted), then sums across origins.
  * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
  *   Per-conversation embedded-browser view registry for this window.
+ * @property {boolean} [closeTabSupported] True while the loaded SPA handles
+ *   Close Tab (CmdOrCtrl+W) itself; cleared on every main-frame navigation so
+ *   an older web bundle or the setup page gets the plain window close.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -2662,6 +2665,25 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
+  win.webContents.on("did-navigate", () => {
+    const state = windows.get(win);
+    if (state) {
+      state.closeTabSupported = false;
+      state.closeTabUnresponsive = false;
+    }
+  });
+  win.webContents.on("render-process-gone", () => {
+    const state = windows.get(win);
+    if (state) state.closeTabSupported = false;
+  });
+  win.webContents.on("unresponsive", () => {
+    const state = windows.get(win);
+    if (state) state.closeTabUnresponsive = true;
+  });
+  win.webContents.on("responsive", () => {
+    const state = windows.get(win);
+    if (state) state.closeTabUnresponsive = false;
+  });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
   // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
@@ -3661,9 +3683,21 @@ function buildMenu() {
       },
     },
     { type: "separator" },
-    // `role: "close"` carries the standard CmdOrCtrl+W shortcut and closes
-    // the focused window. There is no File menu, so Close lives under Server.
-    { role: "close", label: "Close Window" },
+    // There is no File menu, so the close items live under Server. A menu
+    // accelerator fires even while an embedded Browser view has focus, so
+    // CmdOrCtrl+W reaches the SPA from anywhere in the window.
+    {
+      id: "close_tab",
+      label: "Close Tab",
+      accelerator: "CmdOrCtrl+W",
+      click: () => closeTabOrWindow(BrowserWindow.getFocusedWindow()),
+    },
+    {
+      id: "close_window",
+      label: "Close Window",
+      accelerator: "CmdOrCtrl+Shift+W",
+      click: () => BrowserWindow.getFocusedWindow()?.close(),
+    },
   ];
 
   // Our custom Server menu, inserted right after the leftmost menu — index 1
@@ -4594,6 +4628,25 @@ function registerIpc() {
     void loadSetupPage(win, params.toString());
   });
 
+  // SPA → it handles Close Tab itself (see closeTabOrWindow).
+  ipcMain.on("omnigent:set-close-tab-supported", (event, supported) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] set-close-tab-supported from untrusted sender dropped");
+      return;
+    }
+    // isPinnedOriginSender guarantees the sender window is tracked.
+    windows.get(BrowserWindow.fromWebContents(event.sender)).closeTabSupported = supported === true;
+  });
+
+  // SPA → Close Tab found nothing to close, so close the sending window.
+  ipcMain.on("omnigent:close-window", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] close-window from untrusted sender dropped");
+      return;
+    }
+    BrowserWindow.fromWebContents(event.sender)?.close();
+  });
+
   // Find bar → run/continue a search in its parent window. Empty text
   // clears the highlight and zeroes the counter (findInPage rejects empty
   // queries, so it never reaches it).
@@ -5392,6 +5445,28 @@ function focusAndRestore(win) {
   if (!win || win.isDestroyed()) return;
   if (win.isMinimized()) win.restore();
   win.focus();
+}
+
+/**
+ * Close Tab: let a capable SPA close its selected tab (or leave the session),
+ * otherwise close the focused window like the standard Close role. Windows the
+ * shell doesn't track (find bar, About) and pages that never advertised
+ * support always close.
+ *
+ * @param {BrowserWindow | null | undefined} win
+ */
+function closeTabOrWindow(win) {
+  if (!win || win.isDestroyed()) return;
+  const state = windows.get(win);
+  if (state?.closeTabSupported && !state.closeTabUnresponsive && state.origin) {
+    try {
+      win.webContents.send("omnigent:close-tab");
+      return;
+    } catch {
+      // Renderer torn down between the check and the send; close instead.
+    }
+  }
+  win.close();
 }
 
 /**
