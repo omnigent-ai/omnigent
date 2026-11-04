@@ -37,6 +37,7 @@ from omnigent.util.proxy_bearer import (
     PROXY_BEARER_FILE_ENV_VAR,
     PROXY_BEARER_SERVER_URL_ENV_VAR,
 )
+from omnigent.version import VERSION as _OMNIGENT_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -327,13 +328,17 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             token, host = self._resolve_owner()
             with self._owner_lock:
                 self._owner_token = (token, time.monotonic())
-            self._client = WorkspaceClient(
-                config=Config(
-                    host=host,
-                    credentials_strategy=_owner_token_strategy(self._owner_access_token),
-                    http_timeout_seconds=_EXEC_HTTP_TIMEOUT_S,
-                )
+            # Attribute sandbox CRUD + exec traffic to the Omnigent Databricks
+            # integration. This is deterministic, unlike the meta-harness/omnigent
+            # User-Agent marker, which is set only inside the in-sandbox runner
+            # (runner/_entry.py) and so is absent from these server-side calls.
+            config = Config(
+                host=host,
+                credentials_strategy=_owner_token_strategy(self._owner_access_token),
+                http_timeout_seconds=_EXEC_HTTP_TIMEOUT_S,
             )
+            config.with_user_agent_extra("omnigent-databricks", _OMNIGENT_VERSION)
+            self._client = WorkspaceClient(config=config)
         return self._client
 
     def _sandboxes(self) -> Any:
