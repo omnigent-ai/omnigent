@@ -54,10 +54,6 @@ _logger = logging.getLogger(__name__)
 _ENV_MODEL = "HARNESS_GOOSE_MODEL"
 _ENV_PROVIDER = "HARNESS_GOOSE_PROVIDER"
 _ENV_CWD = "HARNESS_GOOSE_CWD"
-_ENV_GOOSE_PATH = "OMNIGENT_GOOSE_PATH"
-# Deprecated alias — read via resolve_harness_path() which warns on use.
-# Remove this constant and the HARNESS_GOOSE_PATH read in v0.8.0.
-_LEGACY_ENV_GOOSE_PATH = "HARNESS_GOOSE_PATH"
 _ENV_BUILTINS = "HARNESS_GOOSE_BUILTINS"
 _ENV_OS_ENV = "HARNESS_GOOSE_OS_ENV"
 

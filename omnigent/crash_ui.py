@@ -33,7 +33,6 @@ from typing import TextIO
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
-_AMBER = "\033[33m"
 _AMBER_BOLD = "\033[33;1m"
 _GRAY = "\033[90m"
 

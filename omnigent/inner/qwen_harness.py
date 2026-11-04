@@ -62,10 +62,6 @@ _logger = logging.getLogger(__name__)
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_QWEN_MODEL"
 _ENV_CWD = "HARNESS_QWEN_CWD"
-_ENV_QWEN_PATH = "OMNIGENT_QWEN_PATH"
-# Deprecated alias — read via resolve_harness_path() which warns on use.
-# Remove this constant and the HARNESS_QWEN_PATH read in v0.8.0.
-_LEGACY_ENV_QWEN_PATH = "HARNESS_QWEN_PATH"
 _ENV_OS_ENV = "HARNESS_QWEN_OS_ENV"
 # Generic-provider / gateway routing: an OpenAI-compatible base URL plus a
 # shell command that prints a bearer token. Emitted by the spawn-env builder

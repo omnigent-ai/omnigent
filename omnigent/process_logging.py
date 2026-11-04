@@ -109,7 +109,6 @@ _LEVEL_COLORS = {
     logging.CRITICAL: "\x1b[91m",
 }
 _REDACTED = "[REDACTED]"
-_QUOTED_OR_NONSPACE_VALUE = r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\S+)'
 _AUTHORIZATION_VALUE = r'(?:(?:"[^"\r\n]*"|\'[^\'\r\n]*\')|(?:bearer\s+)?\S+)'
 _AUTHORIZATION_PATTERN = re.compile(
     rf"(?i)(\bauthorization\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"

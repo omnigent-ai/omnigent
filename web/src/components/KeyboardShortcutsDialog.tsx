@@ -50,7 +50,7 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-// Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
+// Glyphs match the in-app shortcut tooltips.
 const UP = "↑";
 const DOWN = "↓";
 const BRACKET_LEFT = "[";

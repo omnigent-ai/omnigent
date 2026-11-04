@@ -298,10 +298,6 @@ export function setEmbedScopeRoot(el: HTMLElement | null): void {
   embedScopeRoot = el;
 }
 
-export function getEmbedScopeRoot(): HTMLElement | null {
-  return embedScopeRoot;
-}
-
 /**
  * The element preference CSS custom properties are set on (UI font size/family,
  * `--custom-*` theme variables): the embed scope root when embedded, else the

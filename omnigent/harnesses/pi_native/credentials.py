@@ -35,7 +35,6 @@ from urllib.parse import urlparse
 from omnigent._platform import default_shell_argv
 from omnigent.databricks_ai_gateway import (
     DATABRICKS_AI_GATEWAY_LABEL,
-    DATABRICKS_TRUSTED_HOST_SUFFIXES,
     PI_AGENT,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
@@ -137,7 +136,6 @@ _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX = "/anthropic"
 # Aliases for the canonical Databricks Unity Gateway predicate and its constants,
 # which live in :mod:`omnigent.databricks_ai_gateway` so every surface that must
 # recognize the gateway agrees.
-_DATABRICKS_TRUSTED_HOST_SUFFIXES = DATABRICKS_TRUSTED_HOST_SUFFIXES
 _DATABRICKS_AI_GATEWAY_LABEL = DATABRICKS_AI_GATEWAY_LABEL
 _is_databricks_ai_gateway_url = is_databricks_ai_gateway_url
 

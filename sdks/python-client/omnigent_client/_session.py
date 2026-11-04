@@ -173,7 +173,6 @@ class Session:
             if steer_resp.id == self._current_response_id:
                 # Case 1: steering delivered. Nothing to yield.
                 return
-                yield
 
             # Case 2: agent finished — server created a new response.
             # Stream it like a normal turn. The input was already

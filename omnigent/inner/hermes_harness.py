@@ -63,10 +63,6 @@ _logger = logging.getLogger(__name__)
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_HERMES_MODEL"
 _ENV_CWD = "HARNESS_HERMES_CWD"
-_ENV_HERMES_PATH = "OMNIGENT_HERMES_PATH"
-# Deprecated alias — read via resolve_harness_path() which warns on use.
-# Remove this constant and the HARNESS_HERMES_PATH read in v0.8.0.
-_LEGACY_ENV_HERMES_PATH = "HARNESS_HERMES_PATH"
 _ENV_OS_ENV = "HARNESS_HERMES_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_HERMES_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_HERMES_BUNDLE_DIR"

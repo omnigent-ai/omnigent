@@ -63,7 +63,6 @@ _EXTERNAL_SUBAGENT_START = "external_subagent_start"
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
 _STATUS_FAILED = "failed"
-_MESSAGE_ABORTED_ERROR = "MessageAbortedError"
 
 # Appended to a failed edge's output when opencode reports a provider-auth
 # error so the web surface can prompt a re-auth.
@@ -1965,27 +1964,6 @@ class OpenCodeNativeForwarder:
                 await self._on_permission_asked(_synthetic_event("permission.asked", request))
             for form in forms:
                 await self._on_form_created(_synthetic_event("form.created", {"form": form}))
-
-
-def opencode_tool_output_text(state: _JsonMapping) -> str:
-    """
-    Extract shared durable output from a completed OpenCode tool state.
-
-    :param state: The opencode tool part ``state`` (``output`` /
-        ``metadata.output``).
-    :returns: A string suitable for ``function_call_output``.
-    """
-    output = state.get("output")
-    if isinstance(output, str) and output:
-        return output
-    metadata = state.get("metadata")
-    if isinstance(metadata, Mapping):
-        meta_out = metadata.get("output")
-        if isinstance(meta_out, str) and meta_out:
-            return meta_out
-    if output is not None and not isinstance(output, str):
-        return json.dumps(output, ensure_ascii=True)
-    return ""
 
 
 # Event type -> handler. Keys are v2 ``/api/event`` ``type`` discriminators

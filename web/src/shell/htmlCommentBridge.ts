@@ -28,9 +28,6 @@ import bridgeRuntime from "./htmlCommentBridgeRuntime.js?raw";
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
 import { type HtmlPreviewZoomAction, isHtmlPreviewZoomAction } from "./htmlPreviewZoom";
 
-/** Protocol version — bump on any breaking change to the message shapes. */
-export const BRIDGE_VERSION = 1;
-
 /** Tag stamped on every message so we ignore unrelated postMessage traffic. */
 export const BRIDGE_SOURCE = "omni-html-comment";
 

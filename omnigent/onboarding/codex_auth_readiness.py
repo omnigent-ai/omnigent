@@ -58,22 +58,6 @@ def effective_codex_model_provider(config: dict[str, object]) -> str | None:
     return None
 
 
-def effective_custom_provider_table(
-    config: dict[str, object],
-) -> tuple[str, dict[str, object]] | None:
-    """Return the effective custom provider id and table, when both exist."""
-    provider_id = effective_codex_model_provider(config)
-    if provider_id is None or provider_id in CODEX_BUILTIN_PROVIDERS:
-        return None
-    providers = config.get("model_providers")
-    if not isinstance(providers, dict):
-        return None
-    table = providers.get(provider_id)
-    if not isinstance(table, dict):
-        return None
-    return provider_id, table
-
-
 def effective_self_sufficient_builtin_provider(config: dict[str, object]) -> str | None:
     """Return the selected built-in provider id when Codex needs no login for it.
 

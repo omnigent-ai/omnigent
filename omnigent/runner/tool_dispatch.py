@@ -1277,38 +1277,6 @@ async def _execute_uc_function_tool(
     )
 
 
-@dataclass(frozen=True)
-class _SubagentLabel:
-    """
-    Human-facing identity fields for a child session.
-
-    :param agent: Sub-agent tool name, e.g. ``"claude"``. ``None`` means the
-        server row did not include a valid tool name.
-    :param title: Child session title, e.g. ``"issue-1756"``. ``None`` means
-        the server row did not include a valid session title.
-    """
-
-    agent: str | None
-    title: str | None
-
-
-def _subagent_label(child: _JsonObject) -> _SubagentLabel:
-    """
-    Extract child identity fields from a child-session summary.
-
-    :param child: One object from
-        ``GET /v1/sessions/{parent}/child_sessions``, e.g.
-        ``{"tool": "claude", "session_name": "issue-1"}``.
-    :returns: Named child identity fields.
-    """
-    agent = child.get("tool")
-    title = child.get("session_name")
-    return _SubagentLabel(
-        agent=agent if isinstance(agent, str) and agent else None,
-        title=title if isinstance(title, str) and title else None,
-    )
-
-
 def _session_wrapper_label(session_payload: _JsonObject) -> str | None:
     """
     Extract the native terminal wrapper label from a session payload.

@@ -76,12 +76,6 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 _COMPLETED_TOOL_CALL_STATUS = "completed"
 
 
-# Prefix for Claude SDK MCP-registered tool names (e.g. ``mcp__omnigent__sys_terminal_launch``).
-# Inline observed events are emitted at ToolCallRequest; the ``tool_use_id`` is queued so the
-# post-stream dispatch reuses the same ``call_id``, letting BlockStream dedupe the two renders.
-_MCP_TOOL_NAME_PREFIX = "mcp__"
-
-
 # Interrupt and reap use SEPARATE budgets: the short slice keeps a wedged interrupt from
 # starving the reap (subprocess-backed executors terminate only in close/close_session).
 # _INTERRUPT_SLICE_S must exceed _PiRpcSession.close()'s inner 2.0s process.wait() so the

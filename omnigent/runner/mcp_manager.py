@@ -630,26 +630,6 @@ class RunnerMcpManager:
             and any(td.name == bare_name for td in ref.entry.tools)
         )
 
-    def _resolve_owning_server(
-        self,
-        spec: AgentSpec,
-        tool_name: str,
-    ) -> _SharedServerEntry | None:
-        """
-        Find the server entry that owns *tool_name*.
-
-        Used by the MRTR retry path in ``/mcp/execute`` to access
-        the ``McpServerConnection`` directly for
-        ``call_tool_with_elicitation``.
-
-        :param spec: Agent spec whose MCP servers to search.
-        :param tool_name: Namespaced or bare MCP tool name.
-        :returns: The owning shared server entry, or ``None`` if the
-            tool is not found.
-        """
-        route = self._resolve_tool_route(spec, tool_name)
-        return None if route is None else route[0]
-
     async def shutdown(self) -> None:
         """Best-effort close of every active MCP connection."""
         async with self._lock:

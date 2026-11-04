@@ -837,42 +837,6 @@ def _translate_function_policy_yaml(
     return out
 
 
-def _resolve_profile_to_connection(profile: str) -> dict[str, str] | None:
-    """
-    Resolve a Databricks profile name to a
-    ``{base_url, api_key}`` dict by reading ``~/.databrickscfg``.
-
-    Used at spec-translation time to make omnigent LLMConfig
-    self-contained — Omnigent' LLM adapters take credentials
-    via explicit ``connection:`` fields (per the "spec
-    self-containment" design principle) and do not read env vars.
-    Meanwhile omnigent declares Databricks creds via the
-    ``profile:`` convenience shortcut. The translator closes the
-    gap by resolving profile → connection once at load time.
-
-    :param profile: Profile name in ``~/.databrickscfg``, e.g.
-        ``"<your-profile>"``.
-    :returns: ``{"base_url": "<host>/serving-endpoints", "api_key":
-        "<token>"}`` when the profile is readable and has both
-        host + token; ``None`` when the profile is missing or
-        malformed (callers treat ``None`` as "skip injection" —
-        the policy then falls back to whatever connection the
-        YAML declared explicitly, or errors loud at call time).
-    """
-    # Import locally to avoid a top-level dependency on omnigent
-    # runtime details from the spec module — only this single
-    # translator path needs it.
-    from omnigent.inner.databricks_executor import _read_databrickscfg
-
-    creds = _read_databrickscfg(profile)
-    if creds is None:
-        return None
-    return {
-        "base_url": creds.host.rstrip("/") + "/serving-endpoints",
-        "api_key": creds.token,
-    }
-
-
 def _translate_prompt_policy_yaml(
     raw_entry: dict[str, Any],
     *,

@@ -407,12 +407,6 @@ def _process_start_identity(pid: int) -> str | None:
     return f"ps:{started_at}" if proc.returncode == 0 and started_at else None
 
 
-def _process_cmdline_has_tag(pid: int, session_tag: str) -> bool:
-    needle = codex_native_session_tag_cmdline_arg(session_tag)
-    cmdline = _process_cmdline(pid)
-    return needle in cmdline
-
-
 def _process_cmdline(pid: int) -> str:
     proc_cmdline = Path("/proc") / str(pid) / "cmdline"
     with contextlib.suppress(OSError):
