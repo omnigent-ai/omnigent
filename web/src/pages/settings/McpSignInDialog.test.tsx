@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { copyText } from "@/lib/clipboard";
 import { cancelMcpLogin, isSafeSignInUrl, type McpLogin } from "@/lib/mcpLoginApi";
 import { authenticatedFetch } from "@/lib/identity";
 import {
@@ -110,7 +111,10 @@ describe("McpSignInDialog", () => {
     const link = screen.getByRole("link", { name: /Open sign-in page/ });
     expect(link.getAttribute("href")).toBe(AUTH_URL);
     expect(link.getAttribute("target")).toBe("_blank");
-    expect(screen.getByRole("button", { name: "Copy sign-in link" })).toBeTruthy();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Copy sign-in link" })),
+    );
+    expect(copyText).toHaveBeenCalledWith(AUTH_URL);
     expect(screen.getByText("Waiting for you to finish in the browser…")).toBeTruthy();
 
     await tick();

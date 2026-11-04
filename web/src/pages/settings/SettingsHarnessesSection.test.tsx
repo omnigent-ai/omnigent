@@ -1298,6 +1298,8 @@ it.each([
   expect(status.firstElementChild).toHaveClass(color);
   expect(screen.getByText(detail)).toBeTruthy();
   expect(screen.queryByText(/· 0 tools/)).toBeNull();
+  // Without harness_sign_in (an older host), there is nothing to sign in with.
+  expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
 });
 
 it("offers the harness sign-in for a server that needs it", () => {

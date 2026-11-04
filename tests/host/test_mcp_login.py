@@ -467,6 +467,37 @@ async def test_cli_without_a_sign_in_page_fails_start(
     await _assert_gone(json.loads(fake_cli.read_text())["pid"])
 
 
+async def test_cli_that_fails_to_launch_leaves_nothing_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pty
+
+    script = tmp_path / "broken-cli"
+    script.write_text("#!/nonexistent/interpreter\n")
+    script.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_PATH", str(script))
+    logins = HostMcpLogins()
+    stat = script.stat()
+    # Skip the flag check so the launch of the sign-in itself fails.
+    logins._no_browser_support[(str(script), stat.st_mtime_ns, stat.st_size)] = True
+    opened: list[int] = []
+    real_openpty = pty.openpty
+
+    def openpty() -> tuple[int, int]:
+        opened.extend(real_openpty())
+        return opened[0], opened[1]
+
+    monkeypatch.setattr(pty, "openpty", openpty)
+    with pytest.raises(OSError):
+        await logins.start(_server())
+    assert len(opened) == 2
+    for fd in opened:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    assert logins._logins == {}
+    assert not logins._start_lock.locked()
+
+
 async def test_queued_starts_finish_within_the_start_budget(
     fake_cli: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

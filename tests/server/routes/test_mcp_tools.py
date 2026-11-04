@@ -24,6 +24,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.mcp_login import START_TIMEOUT_SECONDS
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.routes import _host_launch
 from omnigent.server.routes import mcp_tools as mcp_tools_routes
 from omnigent.server.routes.mcp_tools import (
     create_mcp_tools_router,
@@ -366,6 +367,20 @@ async def test_mcp_login_requests_rejected_before_the_host(
         )
     assert response.status_code == status
     assert conn.outbound_queue.empty()
+
+
+# A live host absent from this replica's registry is re-addressed only when sharded.
+@pytest.mark.parametrize(("sharded", "status"), [(True, 400), (False, 409)])
+async def test_mcp_login_for_a_host_on_another_replica(
+    tools_app, monkeypatch: pytest.MonkeyPatch, sharded: bool, status: int
+) -> None:
+    app, _, _ = tools_app
+    monkeypatch.setattr(_host_launch, "_deployment_is_sharded", lambda: sharded)
+    async with _client(app) as client:
+        response = await client.post(
+            _LOGIN_URL, json={"harness": "claude", "server": "docs"}, headers=_OWNER
+        )
+    assert response.status_code == status
 
 
 @pytest.mark.parametrize("outcome,status", [("timeout", 504), ("disconnect", 502)])
