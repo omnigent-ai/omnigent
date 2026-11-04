@@ -14,7 +14,7 @@ from typing import Any
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.runtime import get_caps
-from omnigent.spec import AgentSpec
+from omnigent.spec import AgentSpec, spec_dispatches_subagents
 from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
 from omnigent.tools.base import Tool, ToolContext, is_valid_tool_name
@@ -246,15 +246,19 @@ class ToolManager:
           by handle id; thin alias over the always-registered
           ``sys_cancel_task`` (11a.iii).
 
-        When the spec sets ``async: false`` explicitly, none of
-        the async-namespace builtins register — the flag is the
-        kill-switch for agents that want a minimal-tools surface.
+        When the spec sets ``async: false`` explicitly, the async
+        namespace is suppressed — except ``sys_read_inbox`` for a
+        spec that can dispatch sub-agents
+        (:func:`omnigent.spec.spec_dispatches_subagents`), which
+        needs that one drain to collect their results.
 
         See ``designs/SERVER_HARNESS_CONTRACT.md`` §Async work +
         inbox for the design rationale (including why the default
         flipped to ``True`` post-step-11a.iii).
         """
         if not self._spec.async_enabled:
+            if spec_dispatches_subagents(self._spec):
+                self._tools[SysReadInboxTool.name()] = SysReadInboxTool()
             return
         self._tools[SysCallAsyncTool.name()] = SysCallAsyncTool()
         self._tools[SysReadInboxTool.name()] = SysReadInboxTool()
