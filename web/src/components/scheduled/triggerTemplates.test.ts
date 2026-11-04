@@ -77,6 +77,17 @@ describe("saved trigger prompts", () => {
     expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "New user prompt.", systemPrompt });
   });
 
+  it.each(["", "  \n"])("preserves intentionally cleared posting instructions (%j)", (posting) => {
+    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields(), CTX));
+    const [manager] = parts.systemPrompt!.split("\n\nPosting instructions for each session:\n");
+    const systemPrompt = `${manager}\n\nPosting instructions for each session:\n${posting}`;
+    const saved = combineTriggerPrompt(parts.userPrompt, systemPrompt);
+    expect(saved).toBe(
+      `${manager}\n\nInstructions for each session:\n${parts.userPrompt}\n\nPosting instructions for each session:\n${posting}`,
+    );
+    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: parts.userPrompt, systemPrompt });
+  });
+
   it("preserves an independently specified saved template", () => {
     const saved =
       'This automation watches Jira issues.\n\nEach run:\nStart a session for each match.\n\nInstructions for each session:\nTriage the ticket.\nAnything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "Sent with Omnigent", since it posts with the owner\'s account.';

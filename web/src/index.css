@@ -876,6 +876,9 @@ aside[aria-label="Workspace"][data-maximized] {
 html[data-electron-mac] {
   --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
   --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
+  /* Grayscale antialiasing gives the thinner, crisper text of native Mac apps;
+   * Chromium's default draws heavier glyphs. Inherited, so portals get it too. */
+  -webkit-font-smoothing: antialiased;
 }
 @media (min-width: 48rem) {
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
