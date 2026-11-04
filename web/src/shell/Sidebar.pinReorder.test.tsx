@@ -63,7 +63,11 @@ function rowCenter(id: string) {
   return { clientX: 50, clientY: index * ROW_HEIGHT + ROW_HEIGHT / 2 };
 }
 
-async function dropOnto(sourceId: string, targetId: string, { expectTarget = true } = {}) {
+async function dropOnto(
+  sourceId: string,
+  targetId: string,
+  { expectTarget = true, whileOver = () => {} } = {},
+) {
   const source = screen.getByRole("link", { name: sourceId }).closest("li")!;
   const start = rowCenter(sourceId);
   const target = rowCenter(targetId);
@@ -73,6 +77,7 @@ async function dropOnto(sourceId: string, targetId: string, { expectTarget = tru
     fireEvent.mouseMove(document, target);
   });
   expect(screen.queryByTestId("pin-order-insertion") !== null).toBe(expectTarget);
+  whileOver();
   await act(async () => {
     fireEvent.mouseUp(document, target);
   });
@@ -237,5 +242,144 @@ describe("unpinning from a sidebar row", () => {
       expect(mocks.pinFn).toHaveBeenLastCalledWith({ id: "conv_a", pinned: true, pinnedAt: 1000 }),
     );
     await waitFor(() => expect(pill).not.toBeInTheDocument());
+  });
+});
+
+describe("Custom session order", () => {
+  const rowOrder = () =>
+    [...document.querySelectorAll("li[data-sidebar-session-id]")].map((row) =>
+      row.getAttribute("data-sidebar-session-id"),
+    );
+  const saved = () => JSON.parse(localStorage.getItem("omnigent:sidebar-view") ?? "{}");
+  const link = (id: string) => screen.getByRole("link", { name: id });
+  const renderGrouping = () => renderSidebar({ features: { sidebar_grouping_ui: true } });
+  const listRows = (...extra: ReturnType<typeof conv>[]) =>
+    vi
+      .mocked(useConversations)
+      .mockImplementation(() =>
+        conversationPage([
+          conv("conv_c", { created_at: 3, updated_at: 10 }),
+          conv("conv_d", { created_at: 2, updated_at: 30, status: "running" }),
+          conv("conv_e", { created_at: 1, updated_at: 20 }),
+          ...extra,
+        ]),
+      );
+
+  beforeEach(() => {
+    mocks.pinned = [];
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "created" }));
+    listRows();
+  });
+  afterEach(() => {
+    localStorage.clear();
+  });
+  // The pinned-style line marks the slot: above the target when dragging up, below when down.
+  const expectLine = (id: string, edge: "top" | "bottom") => {
+    const line = screen.getByTestId("session-order-insertion");
+    expect(link(id).closest("li")).toContainElement(line);
+    expect(line).toHaveAttribute("style", `${edge}: 0px;`);
+  };
+
+  it("starts from the order on screen on drop, not hover, and never follows the row's link", async () => {
+    renderGrouping();
+    expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
+
+    await dropOnto("conv_e", "conv_c", {
+      expectTarget: false,
+      whileOver: () => {
+        expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
+        expectLine("conv_c", "top");
+      },
+    });
+
+    expect(rowOrder()).toEqual(["conv_e", "conv_c", "conv_d"]);
+    expect(saved()).toMatchObject({
+      ordering: "custom",
+      custom: { base: "created", since: 30, ids: ["conv_e", "conv_c", "conv_d"] },
+    });
+    // dnd-kit hides the drag's trailing click from React; only the next press may navigate.
+    const row = link("conv_e").closest("li")!;
+    expect(fireEvent.click(row, { detail: 1 })).toBe(false);
+    fireEvent.pointerDown(row);
+    expect(fireEvent.click(row, { detail: 1 })).toBe(true);
+  });
+
+  it("only takes drops from the dragged session's own group, including onto shared rows", async () => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ grouping: "status", ordering: "created" }),
+    );
+    localStorage.setItem("omnigent:session-filter", "all");
+    listRows(conv("conv_f", { created_at: 0, updated_at: 0, owner: "other@example.com" }));
+    renderGrouping();
+    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e", "conv_f"]);
+    // A shared row holds a place in the order but can't be moved itself.
+    fireEvent.contextMenu(link("conv_f"));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("move-session-up")).toBeNull();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    await dropOnto("conv_e", "conv_d", {
+      expectTarget: false,
+      whileOver: () => expect(screen.queryByTestId("session-order-insertion")).toBeNull(),
+    });
+    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e", "conv_f"]);
+    expect(saved().ordering).toBe("created");
+
+    await dropOnto("conv_e", "conv_c", { expectTarget: false });
+    expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_c", "conv_f"]);
+    await dropOnto("conv_c", "conv_f", {
+      expectTarget: false,
+      whileOver: () => expectLine("conv_f", "bottom"),
+    });
+    expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_f", "conv_c"]);
+  });
+
+  it("offers no drag or Move up/down while ordered by Name", async () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+    renderSidebar({
+      features: { sidebar_grouping_ui: true },
+      serverInfo: { session_title_sort: true },
+    });
+    expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
+    fireEvent.contextMenu(link("conv_e"));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("move-session-up")).toBeNull();
+    expect(screen.queryByTestId("move-session-down")).toBeNull();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    await dropOnto("conv_e", "conv_c", {
+      expectTarget: false,
+      whileOver: () => expect(screen.queryByTestId("session-order-insertion")).toBeNull(),
+    });
+    expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
+    expect(saved()).toEqual({ ordering: "name" });
+  });
+
+  it.each([
+    [
+      "row menu",
+      (id: string) =>
+        fireEvent.pointerDown(
+          link(id).closest("li")!.querySelector('[data-testid="conversation-actions"]')!,
+          { button: 0 },
+        ),
+    ],
+    ["right-click menu", (id: string) => fireEvent.contextMenu(link(id))],
+  ])("moves a session down and up from its %s", (_menu, openMenu) => {
+    // A just-created row has no server id yet, so it is never a Move target.
+    listRows(conv("temp:new", { created_at: 99, updated_at: 99, provisional: true }));
+    renderGrouping();
+
+    openMenu("conv_c");
+    expect(screen.getByTestId("move-session-up")).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(screen.getByTestId("move-session-down"));
+    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e"]);
+
+    openMenu("conv_e");
+    expect(screen.getByTestId("move-session-down")).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(screen.getByTestId("move-session-up"));
+    expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_c"]);
+    expect(saved().custom.ids).toEqual(["conv_d", "conv_e", "conv_c"]);
   });
 });

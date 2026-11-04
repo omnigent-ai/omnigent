@@ -139,27 +139,24 @@ def _stub_github(page: Page, *, pr_count: int = 1) -> None:
     at the query/string boundary, so they never swallow ``/github/changes`` or
     the per-file ``/github/diff/<path>``.
     """
-    info = _INFO
-    if pr_count > 1:
-        info = {
-            **_INFO,
-            "tracking_available": True,
-            "selected_pr_url": _INFO["pr"]["url"],
-            "prs": [
-                {
-                    "url": f"https://example.com/pr/{_PR_NUMBER + index}",
-                    "host": "example.com",
-                    "repository": "acme/app",
-                    "number": _PR_NUMBER + index,
-                    "relationship": "created",
-                }
-                for index in range(pr_count)
-            ],
-        }
+    info = {
+        **_INFO,
+        "tracking_available": True,
+        "selected_pr_url": _INFO["pr"]["url"],
+        "prs": [
+            {
+                "url": f"https://example.com/pr/{_PR_NUMBER + index}",
+                "host": "example.com",
+                "repository": "acme/app",
+                "number": _PR_NUMBER + index,
+                "relationship": "created",
+            }
+            for index in range(pr_count)
+        ],
+    }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda r: r.fulfill(json=info))
-    if pr_count > 1:
-        # The server's stored list matches the live payload it would have answered.
-        stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
+    # The server's stored list matches the live payload it would have answered.
+    stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.route(re.compile(r"/resources/github/changes"), lambda r: r.fulfill(json=_CHANGES))
     page.route(re.compile(r"/resources/github/diff(?:\?|$)"), lambda r: r.fulfill(json=_PR_DIFF))
     page.route(
@@ -175,21 +172,31 @@ def _stub_github(page: Page, *, pr_count: int = 1) -> None:
     )
 
 
+@pytest.mark.parametrize("entry", ["rail", "canvas"])
 def test_github_tab_shows_summary_checks_and_file_tree(
     page: Page,
     seeded_session: tuple[str, str],
+    entry: str,
 ) -> None:
     """The Pull Requests tab lands on Summary; Comments and Changes are one click away."""
     base_url, session_id = seeded_session
     _stub_github(page)
-    page.goto(f"{base_url}/c/{session_id}")
+    if entry == "canvas":
+        from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
 
-    open_right_rail(page)
+        _stub_server_info(page, canvas=True, session_pull_requests=True)
+    page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="Pull Requests").click()
+    if entry == "canvas":
+        page.get_by_test_id("composer-pr-link").click()
+    else:
+        open_right_rail(page)
+        rail.get_by_role("tab", name="Pull Requests").click()
 
     # PR header (shared across both inner tabs): title, number, and state.
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_role("list", name="Pull requests")).to_have_count(0)
+    expect(rail.get_by_role("button", name=re.compile("All pull requests"))).to_have_count(0)
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
     expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
     expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
@@ -426,6 +433,11 @@ def test_composer_pr_link_opens_github_tab(
         ).to_be_visible()
         if pr_count > 1:
             expect(panel.get_by_role("button", name="All pull requests (2)")).to_be_visible()
+        else:
+            expect(panel.get_by_role("list", name="Pull requests")).to_have_count(0)
+            expect(
+                panel.get_by_role("button", name=re.compile("All pull requests"))
+            ).to_have_count(0)
     finally:
         page.screenshot(path=tmp_path / "composer-pr-link-after-click.png", animations="disabled")
 
@@ -440,21 +452,37 @@ def test_composer_pr_link_opens_github_tab(
             f"{test_id} should use the caption size at {font_size}px preference: {font_sizes}"
         )
     reference_center = centers["composer-workspace-dir.icon"]
-    expected_bar_height = 28 if is_mobile else 37
-    expected_center_offset = 14 if is_mobile else 19
-    assert bar_bounds["height"] == pytest.approx(expected_bar_height, abs=0.1)
-    assert reference_center == pytest.approx(bar_bounds["y"] + expected_center_offset, abs=0.5)
+    pr_center = centers["composer-pr-link.icon"]
+    if not is_mobile:
+        assert bar_bounds["height"] == pytest.approx(37, abs=0.1)
+        assert reference_center == pytest.approx(bar_bounds["y"] + 19, abs=0.5)
+        assert pr_center == pytest.approx(reference_center, abs=0.5)
     for name, center in centers.items():
-        assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
+        row_center = (
+            pr_center
+            if name.startswith(("composer-pr-link.", "composer-context-ring."))
+            else reference_center
+        )
+        assert center == pytest.approx(row_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
         assert pair_gap == pytest.approx(4, abs=0.1), (name, pair_gaps)
     directory_bounds = page.get_by_test_id("composer-workspace-dir").bounding_box()
     branch_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
     assert directory_bounds is not None and branch_bounds is not None
-    selector_gaps = (
+    selector_gaps = [
         branch_bounds["x"] - directory_bounds["x"] - directory_bounds["width"],
-        pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"],
-    )
+    ]
+    if abs(pr_center - reference_center) <= 0.5:
+        selector_gaps.append(pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"])
+    else:
+        assert is_mobile
+        assert pr_bounds["y"] >= branch_bounds["y"] + branch_bounds["height"]
+        assert pr_bounds["x"] == pytest.approx(directory_bounds["x"], abs=0.5)
+    for rect in (directory_bounds, branch_bounds, pr_bounds, context_bounds):
+        assert rect["x"] >= bar_bounds["x"]
+        assert rect["x"] + rect["width"] <= bar_bounds["x"] + bar_bounds["width"]
+        assert rect["y"] >= bar_bounds["y"]
+        assert rect["y"] + rect["height"] <= bar_bounds["y"] + bar_bounds["height"]
     expected_selector_gap = 2 if is_mobile else 8
     for gap in selector_gaps:
         assert gap == pytest.approx(expected_selector_gap, abs=0.1), selector_gaps
@@ -534,11 +562,11 @@ def test_no_pr_keeps_linking_when_another_provider_discovery_fails(
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_be_visible()
 
 
-@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile", "canvas"])
 def test_post_top_level_pr_comment(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
 ) -> None:
-    """The same composer posts and retains drafts through every PR-panel entry point."""
+    """Comments and push history share a feed through every PR-panel entry point."""
     base_url, session_id = seeded_session
     _stub_github(page, pr_count=2)
     pr_url = _INFO["pr"]["url"]
@@ -547,6 +575,7 @@ def test_post_top_level_pr_comment(
             **_INFO["pr"]["comments"][0],
             "body": f"Earlier comment {index + 1}",
             "url": f"{pr_url}#comment-{index}",
+            "created_at": "2026-10-25T06:00:00Z" if index == 29 else "2026-09-05T07:32:02Z",
         }
         for index in range(30)
     ]
@@ -556,7 +585,30 @@ def test_post_top_level_pr_comment(
         "selected_pr_url": pr_url,
         "capabilities": {"comment_posting": True},
         "selected_account": "octocat",
-        "pr": {**_INFO["pr"], "comments": comments},
+        "pr": {
+            **_INFO["pr"],
+            "comments": comments,
+            "timeline_events": [
+                {
+                    "id": "commit-1",
+                    "kind": "commit",
+                    "author": "octocat",
+                    "created_at": "2026-10-24T12:00:00Z",
+                    "url": "https://example.com/acme/app/commit/" + "a" * 40,
+                    "sha": "a" * 40,
+                    "message": "Address review feedback",
+                },
+                {
+                    "id": "force-push-1",
+                    "kind": "force_push",
+                    "author": "octocat",
+                    "created_at": "2026-10-25T12:00:00Z",
+                    "url": "https://example.com/acme/app/commit/" + "b" * 40,
+                    "sha": "b" * 40,
+                    "previous_sha": "a" * 40,
+                },
+            ],
+        },
     }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
     posts = []
@@ -575,7 +627,11 @@ def test_post_top_level_pr_comment(
     page.route(re.compile(r"/resources/github/comments$"), post_comment)
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
-    page.goto(f"{base_url}/c/{session_id}")
+    if entry == "canvas":
+        from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
+
+        _stub_server_info(page, canvas=True, session_pull_requests=True)
+    page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
     panel = (
         page.get_by_test_id("github-panel-drawer")
         if mobile
@@ -600,6 +656,20 @@ def test_post_top_level_pr_comment(
     composer_top = textbox.evaluate("el => el.getBoundingClientRect().top")
     feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     expect(panel.get_by_text("Earlier comment 30", exact=True)).to_be_in_viewport()
+    rows = feed.get_by_role("listitem")
+    expect(rows).to_have_count(32)
+    expect(rows.nth(29)).to_contain_text("committed")
+    expect(rows.nth(29)).to_contain_text("Address review feedback")
+    expect(
+        rows.nth(29).get_by_role("link", name="Open commit aaaaaaa on GitHub", exact=True)
+    ).to_have_attribute("href", "https://example.com/acme/app/commit/" + "a" * 40)
+    expect(rows.nth(30)).to_contain_text("Earlier comment 30")
+    expect(rows.nth(31)).to_contain_text("force-pushed")
+    expect(rows.nth(31)).to_contain_text("bbbbbbb")
+    expect(
+        rows.nth(31).get_by_role("link", name="Open commit bbbbbbb on GitHub", exact=True)
+    ).to_have_attribute("href", "https://example.com/acme/app/commit/" + "b" * 40)
+    page.screenshot(path=str(tmp_path / f"push-history-{entry}.png"))
     assert textbox.evaluate("el => el.getBoundingClientRect().top") == pytest.approx(
         composer_top, abs=1
     )
@@ -630,6 +700,9 @@ def test_post_top_level_pr_comment(
     expect(textbox).to_have_value("")
     panel.get_by_role("button", name="Refresh", exact=True).click()
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    expect(rows).to_have_count(33)
+    expect(rows.nth(31)).to_contain_text("force-pushed")
+    expect(rows.nth(32)).to_contain_text("Thanks for reviewing!")
     feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_in_viewport()
     expect(post_button).to_be_in_viewport()

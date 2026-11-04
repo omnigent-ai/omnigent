@@ -40,9 +40,22 @@ import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { Profiler, type ProfilerOnRenderCallback } from "react";
-import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
+import { Profiler, type ProfilerOnRenderCallback, useCallback } from "react";
+import {
+  createPath,
+  MemoryRouter,
+  type NavigateOptions,
+  type To,
+  useLocation,
+  useNavigate,
+} from "react-router-dom";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import {
+  basenamedRouting,
+  reactRouterRouting,
+  RoutingProvider,
+  type RoutingApi,
+} from "@/lib/routing";
 
 import {
   composeSandboxWorkspace,
@@ -1367,11 +1380,24 @@ function LandingNavigationProbe() {
   );
 }
 
+function useHostNavigate(): ReturnType<typeof useNavigate> {
+  const navigate = useNavigate();
+  // Embedded hosts serialize partial paths; createPath defaults a missing pathname to "/".
+  return useCallback(
+    (to: To | number, options?: NavigateOptions) => {
+      if (typeof to === "number") return navigate(to);
+      return navigate(typeof to === "string" ? to : createPath(to), options);
+    },
+    [navigate],
+  );
+}
+
 function renderLanding(
   infoOverrides: Partial<ServerInfo> | "loading" = {},
   route = "/",
   onRender?: ProfilerOnRenderCallback,
   strictMode = false,
+  routing: RoutingApi = reactRouterRouting,
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -1388,14 +1414,16 @@ function renderLanding(
       >
         <TooltipProvider>
           <MemoryRouter initialEntries={[route]}>
-            <LandingNavigationProbe />
-            {onRender ? (
-              <Profiler id="landing" onRender={onRender}>
+            <RoutingProvider value={routing}>
+              <LandingNavigationProbe />
+              {onRender ? (
+                <Profiler id="landing" onRender={onRender}>
+                  <NewChatLandingScreen />
+                </Profiler>
+              ) : (
                 <NewChatLandingScreen />
-              </Profiler>
-            ) : (
-              <NewChatLandingScreen />
-            )}
+              )}
+            </RoutingProvider>
           </MemoryRouter>
         </TooltipProvider>
       </CapabilitiesProvider>
@@ -1448,6 +1476,22 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
 
 describe("prompt URL handoff", () => {
   beforeEach(setupLandingMocks);
+
+  it.each(["/omnigent", "/omnigent/", "/tools/omnigent"])(
+    "keeps an embedded prompt link under %s with host navigation",
+    (pathname) => {
+      const routing = basenamedRouting(pathname.replace(/\/$/, ""), {
+        ...reactRouterRouting,
+        useNavigate: useHostNavigate,
+      });
+      renderLanding({}, `${pathname}?o=123&prompt=sdffsdff#composer`, undefined, false, routing);
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("sdffsdff");
+      expect(screen.getByTestId("landing-location")).toHaveTextContent(
+        `${pathname}?o=123#composer`,
+      );
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("prefills prompt without starting a session", () => {
     const prompt = 'src/example.ts\nExplain a + b & fix "λ" <script> as plain text';
@@ -7281,6 +7325,15 @@ describe("NewChatLandingScreen", () => {
       readiness: "version-too-low",
       badgeName: "outdated",
       warning: "Pi has an outdated CLI on machine-1 — run omni setup",
+    },
+    {
+      id: "a_opencode",
+      name: "opencode-native-ui",
+      displayName: "OpenCode",
+      harness: "opencode-native",
+      readiness: "version-too-low",
+      badgeName: "outdated",
+      warning: "OpenCode needs OpenCode 2.0 on machine-1 — run npm i -g @opencode/cli@2.0.32",
     },
     {
       id: "a_polly",

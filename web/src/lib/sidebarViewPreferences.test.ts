@@ -1,12 +1,15 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  customOrderBase,
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
+  sidebarBaseOrdering,
   writeSidebarViewPreferences,
 } from "./sidebarViewPreferences";
 
 afterEach(() => {
   localStorage.clear();
+  vi.restoreAllMocks();
 });
 
 describe("sidebarViewPreferences", () => {
@@ -27,6 +30,15 @@ describe("sidebarViewPreferences", () => {
     const view = { grouping: "default", ordering: "name", show: [] } as const;
     writeSidebarViewPreferences(view);
     expect(readSidebarViewPreferences()).toEqual(view);
+  });
+
+  it("starts Custom from Updated when leaving Name", () => {
+    const view = { ...DEFAULT_SIDEBAR_VIEW, ordering: "name" } as const;
+    expect(sidebarBaseOrdering(view)).toBe("name");
+    expect(customOrderBase(view)).toBe("updated");
+    expect(customOrderBase({ ...view, ordering: "created" })).toBe("created");
+    const custom = { base: "created", since: 1, ids: [] } as const;
+    expect(customOrderBase({ ...view, ordering: "custom", custom })).toBe("created");
   });
 
   it("restores saved Status grouping while preserving ordering and metadata", () => {
@@ -54,6 +66,38 @@ describe("sidebarViewPreferences", () => {
 
     localStorage.setItem("omnigent:sidebar-view", "{not json");
     expect(readSidebarViewPreferences()).toEqual(DEFAULT_SIDEBAR_VIEW);
+  });
+
+  it("round-trips a Custom order and drops a malformed one", () => {
+    const custom = { base: "created", since: 100, ids: ["b", "a"] } as const;
+    writeSidebarViewPreferences({ grouping: "status", ordering: "custom", show: [], custom });
+    expect(readSidebarViewPreferences()).toMatchObject({ ordering: "custom", custom });
+
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ ordering: "custom", custom: { base: "custom", since: 1, ids: [] } }),
+    );
+    expect(readSidebarViewPreferences()).toEqual(DEFAULT_SIDEBAR_VIEW);
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({
+        ordering: "custom",
+        custom: { base: "updated", since: 1, ids: ["a", 2, "a"] },
+      }),
+    );
+    expect(readSidebarViewPreferences().custom?.ids).toEqual(["a"]);
+  });
+
+  it("treats unreadable or full storage as defaults without throwing", () => {
+    const getItem = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new DOMException("Storage is disabled", "SecurityError");
+    });
+    expect(readSidebarViewPreferences()).toEqual(DEFAULT_SIDEBAR_VIEW);
+    expect(getItem).toHaveBeenCalledWith("omnigent:sidebar-view");
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    expect(() => writeSidebarViewPreferences(DEFAULT_SIDEBAR_VIEW)).not.toThrow();
   });
 
   it("normalizes show fields to menu order", () => {

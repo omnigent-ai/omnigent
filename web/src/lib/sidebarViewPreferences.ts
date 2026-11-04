@@ -3,13 +3,26 @@
 const STORAGE_KEY = "omnigent:sidebar-view";
 
 export type SidebarGrouping = "default" | "status" | "harness" | "created" | "updated";
-export type SidebarOrdering = "updated" | "created" | "name";
+export type SidebarOrdering = "updated" | "created" | "name" | "custom";
+/** An ordering the server sorts by itself. */
+export type SidebarBaseOrdering = Exclude<SidebarOrdering, "custom">;
 export type SidebarShowField = "updated" | "environment" | "repo" | "branch";
+
+/** Saved positions on top of the automatic order Custom started from. */
+export interface SidebarCustomOrder {
+  base: "updated" | "created";
+  /** Newest server timestamp when Custom started: later-created rows are new. */
+  since: number;
+  /** Rows the user placed (or saw when Custom started), top to bottom. */
+  ids: readonly string[];
+}
 
 export interface SidebarViewPreferences {
   grouping: SidebarGrouping;
   ordering: SidebarOrdering;
   show: readonly SidebarShowField[];
+  /** Kept while another ordering is selected, so Custom can be restored. */
+  custom?: SidebarCustomOrder;
 }
 
 export const SIDEBAR_GROUPINGS: readonly SidebarGrouping[] = [
@@ -19,7 +32,12 @@ export const SIDEBAR_GROUPINGS: readonly SidebarGrouping[] = [
   "created",
   "updated",
 ];
-export const SIDEBAR_ORDERINGS: readonly SidebarOrdering[] = ["updated", "created", "name"];
+export const SIDEBAR_ORDERINGS: readonly SidebarOrdering[] = [
+  "updated",
+  "created",
+  "name",
+  "custom",
+];
 export const SIDEBAR_SHOW_FIELDS: readonly SidebarShowField[] = [
   "updated",
   "environment",
@@ -53,12 +71,38 @@ export function readSidebarViewPreferences(): SidebarViewPreferences {
     return DEFAULT_SIDEBAR_VIEW;
   }
   const show = Array.isArray(stored.show) ? stored.show : [];
+  const custom = parseCustomOrder(stored.custom);
+  const ordering = pick(SIDEBAR_ORDERINGS, stored.ordering, DEFAULT_SIDEBAR_VIEW.ordering);
   return {
     grouping: pick(SIDEBAR_GROUPINGS, stored.grouping, DEFAULT_SIDEBAR_VIEW.grouping),
-    ordering: pick(SIDEBAR_ORDERINGS, stored.ordering, DEFAULT_SIDEBAR_VIEW.ordering),
+    ordering: ordering === "custom" && !custom ? DEFAULT_SIDEBAR_VIEW.ordering : ordering,
     // Keep the menu's field order so equal selections compare equal.
     show: SIDEBAR_SHOW_FIELDS.filter((field) => show.includes(field)),
+    ...(custom && { custom }),
   };
+}
+
+function parseCustomOrder(value: unknown): SidebarCustomOrder | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { base, since, ids } = value as Record<string, unknown>;
+  if ((base !== "updated" && base !== "created") || !Number.isFinite(since) || !Array.isArray(ids))
+    return undefined;
+  return {
+    base,
+    since: since as number,
+    ids: [...new Set(ids.filter((id): id is string => typeof id === "string"))],
+  };
+}
+
+/** The server sort behind the selected ordering; Custom sorts its unsaved rows by its base. */
+export function sidebarBaseOrdering(view: SidebarViewPreferences): SidebarBaseOrdering {
+  return view.ordering === "custom" ? (view.custom?.base ?? "updated") : view.ordering;
+}
+
+/** The base a new Custom order keeps. Name can't be reordered, so Custom starts from Updated. */
+export function customOrderBase(view: SidebarViewPreferences): SidebarCustomOrder["base"] {
+  const base = sidebarBaseOrdering(view);
+  return base === "name" ? "updated" : base;
 }
 
 /** Persist the view options. Swallows quota/access errors. */

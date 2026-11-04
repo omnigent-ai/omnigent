@@ -13,11 +13,12 @@ import { isFeatureEnabled, sessionTitleSortSupported } from "@/lib/capabilities"
 import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
+  sidebarBaseOrdering,
   writeSidebarViewPreferences,
-  type SidebarOrdering,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
-import { parseProjectSessionsQueryKey } from "@/lib/sessionListCache";
+import { parseProjectSessionsQueryKey, recentlyCreatedSessions } from "@/lib/sessionListCache";
+import { customSortOrder, sidebarSortBy } from "@/shell/sidebarNav";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import { dedupeSessionRows, mergeScopeRows, sessionRowsPage } from "@/lib/sidebarData";
 import {
@@ -29,6 +30,7 @@ import {
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { useIdentityReady, useViewerId } from "./useViewerId";
 import { sumPendingApprovals } from "@/lib/inbox";
+import { useAutomationInbox } from "./useAutomationInbox";
 import { useCommentInbox } from "./useCommentInbox";
 import {
   usePinnedConversations,
@@ -43,12 +45,6 @@ export type SidebarListQuery = Pick<
   ReturnType<typeof useConversations>,
   "data" | "error" | "isError" | "isLoading" | "isFetching" | "isFetchingNextPage" | "hasNextPage"
 > & { fetchNextPage: () => unknown; refetch?: () => unknown };
-
-const SESSION_SORT_BY_ORDERING: Record<SidebarOrdering, SessionSortBy> = {
-  updated: "updated_at",
-  created: "created_at",
-  name: "title",
-};
 
 /**
  * The view the sidebar lists by. A server that rejects sort_by=title lists by
@@ -76,13 +72,18 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     () => effectiveSidebarView(storedView, groupingUi, titleSort),
     [groupingUi, titleSort, storedView],
   );
-  const sortBy = SESSION_SORT_BY_ORDERING[view.ordering];
+  const sortBy: SessionSortBy = sidebarSortBy(sidebarBaseOrdering(view));
+  const customOrder = useMemo(
+    () => (view.ordering === "custom" && view.custom ? customSortOrder(view.custom) : null),
+    [view],
+  );
   const updateView = useCallback(
     (patch: Partial<SidebarViewPreferences>) => {
       const next = { ...storedView, ...patch };
       writeSidebarViewPreferences(next);
-      const nextOrdering = effectiveSidebarView(next, groupingUi, titleSort).ordering;
-      if (nextOrdering !== view.ordering) {
+      const nextBase = sidebarBaseOrdering(effectiveSidebarView(next, groupingUi, titleSort));
+      if (nextBase !== sidebarBaseOrdering(view)) {
+        const nextSortBy = sidebarSortBy(nextBase);
         // Clear the destination snapshots before observers switch to the selected order.
         for (const queryKey of [["conversations", "", false, null], ["project-sessions"]]) {
           void client.invalidateQueries({ queryKey, refetchType: "none" });
@@ -91,15 +92,14 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
             predicate: ({ queryKey: key }) =>
               (key[0] === "conversations"
                 ? (key[5] ?? "updated_at")
-                : parseProjectSessionsQueryKey(key).sortBy) ===
-              SESSION_SORT_BY_ORDERING[nextOrdering],
+                : parseProjectSessionsQueryKey(key).sortBy) === nextSortBy,
           });
         }
         void client.resetQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
       }
       setView(next);
     },
-    [storedView, view.ordering, groupingUi, titleSort, client],
+    [storedView, view, groupingUi, titleSort, client],
   );
   const [selectedView, registerView] = useState<SessionFilter | null>(null);
   const viewNeedsShared = selectedView === "all" || selectedView === "shared";
@@ -155,6 +155,20 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       ]).filter((row) => !row.archived),
     [mineRows, sharedRows, pinnedRows, folders, sharedActive, viewerId],
   );
+  // A session created in Custom's cutoff second looks like history by its
+  // timestamp, so save it at the top while this tab still knows it is new.
+  useLayoutEffect(() => {
+    const order = view.ordering === "custom" ? view.custom : undefined;
+    if (!order || !customOrder) return;
+    const arrivals = loadedRows.filter(
+      (row) =>
+        row.created_at === order.since &&
+        recentlyCreatedSessions.has(row.id) &&
+        !customOrder.positions.has(row.id),
+    );
+    if (arrivals.length > 0)
+      updateView({ custom: { ...order, ids: [...arrivals.map((row) => row.id), ...order.ids] } });
+  }, [view, customOrder, loadedRows, updateView]);
   const inboxRows = useMemo(
     () =>
       config.inboxIncludesShared
@@ -163,7 +177,9 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     [loadedRows, config.inboxIncludesShared, viewerId],
   );
   const comments = useCommentInbox(inboxRows);
-  const inboxCount = sumPendingApprovals(inboxRows) + comments.items.length;
+  const automationInbox = useAutomationInbox(identityReady);
+  const inboxCount =
+    sumPendingApprovals(inboxRows) + comments.items.length + automationInbox.items.length;
   const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
@@ -230,6 +246,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     view,
     updateView,
     sortBy,
+    customOrder,
     identityReady,
     sharedAvailable: config.sharedAvailable,
     sharedActive,
@@ -245,7 +262,9 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     loadedData,
     inboxRows,
     inboxCount,
+    inboxCountIncomplete: automationInbox.hasNextPage,
     comments,
+    automationInbox,
     watchedIds,
     registerFolder,
     watermark: merged.watermark,

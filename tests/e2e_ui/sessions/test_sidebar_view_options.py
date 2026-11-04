@@ -20,6 +20,7 @@ from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
 
 from tests._helpers.polling import poll_until
 from tests.e2e_ui.collaboration._multi_user_server import create_user_session
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
 
 _RUNNING = f"{1:032x}"
 _AWAITING = f"{2:032x}"
@@ -79,23 +80,11 @@ def _serve_sessions(route: Route) -> None:
     )
 
 
-def _enable_grouping_ui(page: Page, enabled: bool = True) -> None:
-    """Advertise the ``sidebar_grouping_ui`` release flag on the live server's info."""
-
-    def serve_info(route: Route) -> None:
-        response = route.fetch()
-        info = response.json()
-        info["features"] = {**info.get("features", {}), "sidebar_grouping_ui": enabled}
-        route.fulfill(response=response, json=info)
-
-    page.route("**/v1/info", serve_info)
-
-
 @pytest.fixture
 def stubbed_sidebar(page: Page, request: pytest.FixtureRequest) -> str:
     """Open the home page with the stubbed session list; return the base URL."""
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
-    _enable_grouping_ui(page)
+    enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.goto(base_url)
@@ -297,7 +286,7 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
 
     # Register every route BEFORE navigating, so an eager fetch during mount is
     # counted — otherwise the empty-request assertion can't detect it.
-    _enable_grouping_ui(page)
+    enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.route("**/v1/sessions/*/resources/github*", serve_github)
@@ -380,7 +369,7 @@ def test_created_ordering_persists_and_flag_off_uses_updated(
     page.keyboard.press("Escape")
     page.reload()
     expect(links).to_have_text(["Idle session", "Awaiting session", "Running session"])
-    _enable_grouping_ui(page, enabled=False)
+    enable_grouping_ui(page, enabled=False)
     requests.clear()
     page.reload()
     expect(links).to_have_text(["Idle session", "Running session", "Awaiting session"])
@@ -474,7 +463,7 @@ def test_name_ordering_lists_live_sessions_a_to_z_and_persists(
         "request",
         lambda req: requests.append(req.url) if "/v1/sessions?" in req.url else None,
     )
-    _enable_grouping_ui(page)
+    enable_grouping_ui(page)
     page.goto(named_sessions.base_url)
     folder_header = page.locator(f'button[data-project-order-name="{named_sessions.project}"]')
     expect(folder_header).to_be_visible(timeout=30_000)

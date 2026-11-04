@@ -404,6 +404,23 @@ describe("Composer session drafts", () => {
     expect(getSessionDraft("conv_real")?.text).toBe("draft during startup");
   });
 
+  it("focuses the composer on a switch unless an inline rename has focus", () => {
+    render(<Composer {...composerProps()} />);
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(textarea()).toHaveFocus();
+
+    const rename = document.createElement("input");
+    rename.setAttribute("data-inline-rename", "");
+    document.body.append(rename);
+    try {
+      rename.focus();
+      act(() => useChatStore.setState({ conversationId: "conv_draft" }));
+      expect(rename).toHaveFocus();
+    } finally {
+      rename.remove();
+    }
+  });
+
   it("restores attached files when switching back to a conversation", async () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
@@ -3269,6 +3286,138 @@ describe("Composer permission-mode shortcut", () => {
     expect(pressShiftTab(textarea())).toBe(true);
     expect(setMode).not.toHaveBeenCalled();
   });
+
+  describe("/permissions", () => {
+    function renderPermissionSession(harness: string, props: Parameters<typeof composerProps>[0]) {
+      useChatStore.setState({
+        conversationId: `permissions-${harness}`,
+        sessionHarness: harness,
+        claudePermissionMode: harness === "devin-native" ? "normal" : "default",
+        codexApprovalMode: "ask-for-approval",
+      });
+      const onSend = vi.fn();
+      renderWithTooltips(<Composer {...composerProps({ onSend, ...props })} />);
+      return onSend;
+    }
+    const renderCodexSession = (props: Parameters<typeof composerProps>[0] = {}) =>
+      renderPermissionSession("codex-native", { showCodexApprovalMode: true, ...props });
+
+    const sendButton = () => screen.getByRole("button", { name: "Send" });
+
+    it("opens the Codex approval-mode control on submit without sending", async () => {
+      const setMode = spyClaudeSetter();
+      const setApproval = vi
+        .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+        .mockResolvedValue(undefined);
+      const onSend = renderCodexSession();
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      // Send skips the slash menu, which would otherwise take the Enter.
+      fireEvent.click(sendButton());
+
+      expect(onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("");
+      expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+      fireEvent.click(screen.getByTestId("composer-permission-option-full-access"));
+      await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
+      expect(setMode).not.toHaveBeenCalled();
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("lists /permissions and opens the control from the slash menu", async () => {
+      const onSend = renderCodexSession();
+      fireEvent.change(textarea(), { target: { value: "/perm" } });
+      expect(screen.getByTestId("slash-menu-item-permissions")).toHaveTextContent(
+        "/permissionsChange the approval mode for this session",
+      );
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+      expect(textarea()).toHaveValue("");
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("refuses to reopen the control while a change is in flight", async () => {
+      let finish: () => void = () => {};
+      const setApproval = vi
+        .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+        .mockImplementation(
+          () =>
+            new Promise<void>((resolve) => {
+              finish = resolve;
+            }),
+        );
+      const onSend = renderCodexSession();
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      fireEvent.click(await screen.findByTestId("composer-permission-option-approve-for-me"));
+      await waitFor(() => expect(screen.getByTestId("composer-permission-chip")).toBeDisabled());
+
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      expect(screen.getByText("The permission mode can't be changed right now")).toBeVisible();
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(setApproval).toHaveBeenCalledTimes(1);
+      finish();
+      await waitFor(() => expect(screen.getByTestId("composer-permission-chip")).toBeEnabled());
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+      expect(textarea()).toHaveValue("");
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    // Claude's /permissions edits tool rules, not the mode; Devin has no confirmed equivalent.
+    it.each([
+      {
+        name: "claude-native",
+        harness: "claude-native",
+        props: { showClaudePermissionMode: true },
+      },
+      {
+        name: "devin-native",
+        harness: "devin-native",
+        props: { showClaudePermissionMode: true, modelPickerKind: "devin" as const },
+      },
+      { name: "claude-sdk", harness: "claude-sdk", props: {} },
+    ])("is not listed, and stays plain text, on $name", ({ harness, props }) => {
+      const setMode = spyClaudeSetter();
+      const onSend = renderPermissionSession(harness, props);
+      fireEvent.change(textarea(), { target: { value: "/" } });
+      expect(screen.getByTestId("slash-menu-item-help")).toBeInTheDocument();
+      expect(screen.queryByTestId("slash-menu-item-permissions")).toBeNull();
+
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      expect(onSend).toHaveBeenCalledWith("/permissions", undefined);
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(setMode).not.toHaveBeenCalled();
+    });
+
+    it("explains why a non-owner can't open the control and sends nothing", () => {
+      const onSend = renderCodexSession({ permissionLevel: 3 });
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(
+        screen.getByText("Only the session owner can change the permission mode"),
+      ).toBeVisible();
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects arguments without opening the control or sending", () => {
+      const onSend = renderCodexSession();
+      fireEvent.change(textarea(), { target: { value: "/permissions full-access" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(screen.getByText("/permissions does not accept arguments")).toBeVisible();
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("Composer background tasks", () => {
@@ -5374,6 +5523,48 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue("resend me, but edited");
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
   });
+
+  it.each<[string, StoredReplyDraft | undefined, string]>([
+    ["a message", undefined, "also check the docs\n\nrun the linter next"],
+    [
+      "a reply",
+      {
+        version: 1,
+        quotes: [{ before: "", text: "the failing test" }],
+        text: "run the linter next",
+      },
+      "also check the docs\n\n> the failing test\n\nrun the linter next",
+    ],
+  ])(
+    "adds %s recovered on load after the draft the reload kept, sending neither",
+    async (_, replyDraft, joined) => {
+      setSessionDraft("conv_test", { text: "also check the docs", files: [] });
+      const props = composerProps();
+      render(<Composer {...props} />);
+      expect(textarea()).toHaveValue("also check the docs");
+
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: replyDraft ? serializeReplyDraft(replyDraft) : "run the linter next",
+            files: [],
+            stableId: "stable_queued",
+            ...(replyDraft ? { replyDraft } : {}),
+            serverRefused: false,
+            recovered: true,
+          },
+        }),
+      );
+
+      expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(replyDraft ? 1 : 0);
+      expect(props.onSend).not.toHaveBeenCalled();
+      // The joined text is a new message, kept for another reload.
+      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe(joined));
+    },
+  );
 
   it("drops a failed-send draft whose message already committed under its stable id", () => {
     const stableId = "e".repeat(32);
