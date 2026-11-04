@@ -984,8 +984,9 @@ Cross-harness journeys:
   From both card and gear entry points, expand a standalone and a plugin server;
   verify the left chevron, immediate expansion, names, count and status dot.
   Collapsed rows must not send probes or start processes. Reopen within five
-  minutes to reuse results. Test an HTTP 401, a hanging stdio process and a
-  missing executable; expect auth, timeout and unreachable states.
+  minutes to reuse results; a needs-auth result is probed again after 30
+  seconds. Test an HTTP 401, a hanging stdio process and a missing executable;
+  expect auth, timeout and unreachable states.
   If both probe slots are occupied, an expired queued request reports that the
   host is busy; collapse and reopen after capacity frees to retry immediately.
   A 501 shows an update hint; inject a 404 from the tools route to retain plain

@@ -249,8 +249,9 @@ interruptions for claude-native are tracked as scenario rows in
 header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost
-budgets, MCP servers, sandbox provider lifecycle beyond profile configuration,
-and smart routing. Smart routing's per-worker model lists, which `sys_list_models`
+budgets, MCP servers (except sign-in from Settings → Harnesses, in
+`tests/e2e_ui/settings/`), sandbox provider lifecycle beyond profile
+configuration, and smart routing. Smart routing's per-worker model lists, which `sys_list_models`
 also returns, are covered by component tests: `tests/test_model_catalog.py` for
 the worker rows and `tests/host/test_connect.py` for the host's
 `GET /v1/hosts/{id}/harnesses/claude-sdk/model-options` answer. A Claude Code or
