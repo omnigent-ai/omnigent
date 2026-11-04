@@ -58,6 +58,9 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
         {(0, index.to_bytes(16, "big")): f"Batch {index}" for index in range(2 * batch_size + 1)}
     )
     original[(17, bytes([1]) * 16)] = "Other Workspace"
+    child_id = bytes([98]) * 16
+    original[(0, child_id)] = "Child Task"
+    parents = {(0, child_id): bytes([1]) * 16}
     legacy_id = bytes([99]) * 16
     try:
         with engine.begin() as connection:
@@ -71,6 +74,7 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
                         "created_at": 1,
                         "updated_at": 2,
                         "title": title,
+                        "parent_conversation_id": parents.get((workspace_id, row_id)),
                     }
                     for (workspace_id, row_id), title in original.items()
                 ],
@@ -94,9 +98,12 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
             sa.event.remove(engine, "before_cursor_execute", interrupt_second_batch)
         assert sum(key != "1" for key in _keys(engine).values()) == batch_size
         _migrate(engine, _REVISION)
-        expected = {key: title_sort_key(title) for key, title in original.items()}
+        expected = {
+            key: title_sort_key(title, sub_agent=key in parents) for key, title in original.items()
+        }
         assert _keys(engine) == expected
         assert expected[(0, bytes([6]) * 16)] == "0" + "q" * 511
+        assert expected[(0, child_id)] == "20child task"
         indexes = {
             index["name"]: index["column_names"]
             for index in sa.inspect(engine).get_indexes("conversations")

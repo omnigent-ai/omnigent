@@ -1,8 +1,9 @@
 """Store and index the key that orders sessions by Name.
 
 ``conversations.title_sort_key`` is ``"0"`` plus the title with only A-Z
-lowercased, cut to 512 code points, or ``"1"`` for an untitled session. A binary
-collation makes every backend compare it by code point, and
+lowercased, or ``"1"`` for an untitled session. A sub-agent's key has ``"2"`` in
+front, so it sorts after every top-level key. Keys are cut to 512 code points. A
+binary collation makes every backend compare them by code point, and
 ``ix_conversations_archived_title`` lets a Name page read only the rows it
 returns instead of sorting every session first.
 
@@ -10,11 +11,12 @@ Deployment: additive. The backfill commits per batch, and on PostgreSQL the
 index builds ``CONCURRENTLY``, so sessions stay writable during the upgrade.
 Builds from before this revision ignore the column; until the rollout finishes,
 sessions they title keep the ``"1"`` default or their earlier key, so Name
-ordering lists them as untitled or under their old name until the next rename.
-After the last older build stops, recompute those keys with Alembic: ``stamp
-d0a1f879a01d``, ``upgrade e413195738fb``, then stamp the revision the database
-was at before. The backfill skips rows renamed while it runs. Downgrade drops
-the index and the column.
+ordering lists them as untitled or under their old name until the next rename,
+and sub-agents they create are missing from sub-agent Name pages. After the last
+older build stops, recompute those keys with Alembic: ``stamp d0a1f879a01d``,
+``upgrade e413195738fb``, then stamp the revision the database was at before.
+The backfill skips rows renamed while it runs. Downgrade drops the index and the
+column.
 """
 
 from __future__ import annotations
@@ -49,11 +51,10 @@ _SORT_KEY_TYPE = (
 _ASCII_LOWERCASE = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 
-def _sort_key(title: str | None) -> str:
+def _sort_key(title: str | None, sub_agent: bool) -> str:
     # Kept here so later application changes cannot alter this backfill.
-    if not title:
-        return "1"
-    return ("0" + title.translate(_ASCII_LOWERCASE))[:_MAX_CHARS]
+    key = "0" + title.translate(_ASCII_LOWERCASE) if title else "1"
+    return (("2" + key) if sub_agent else key)[:_MAX_CHARS]
 
 
 def _publish(bind: sa.Connection) -> None:
@@ -69,6 +70,7 @@ def _backfill(bind: sa.Connection) -> None:
         sa.column("workspace_id", sa.BigInteger()),
         sa.column("id"),
         sa.column("title", sa.Text()),
+        sa.column("parent_conversation_id"),
         sa.column(_COLUMN, _SORT_KEY_TYPE),
     )
     # Skip rows renamed since the read; upgraded builds write their key with the title.
@@ -85,7 +87,11 @@ def _backfill(bind: sa.Connection) -> None:
     cursor: tuple[int, Any] | None = None
     while True:
         query = sa.select(
-            table.c.workspace_id, table.c.id, table.c.title, table.c[_COLUMN]
+            table.c.workspace_id,
+            table.c.id,
+            table.c.title,
+            table.c.parent_conversation_id,
+            table.c[_COLUMN],
         ).order_by(table.c.workspace_id, table.c.id)
         if cursor is not None:
             if bind.dialect.name == "mysql":
@@ -110,7 +116,8 @@ def _backfill(bind: sa.Connection) -> None:
                 "sort_key": key,
             }
             for row in rows
-            if (key := _sort_key(row.title)) != row.title_sort_key
+            if (key := _sort_key(row.title, row.parent_conversation_id is not None))
+            != row.title_sort_key
         ]
         if changed:
             bind.execute(update, changed)

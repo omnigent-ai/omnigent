@@ -970,7 +970,8 @@ class ConversationStore(ABC):
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Sort key: ``"created_at"``, ``"updated_at"``,
             or ``"title"`` (ignores ASCII letter case, untitled last
-            when ascending).
+            when ascending). Without a kind filter, ascending title
+            order lists sub-agents after every top-level conversation.
         :param search_query: Case-insensitive substring filter on
             the conversation title OR conversation item content
             (``search_text``). ``None`` or empty string disables

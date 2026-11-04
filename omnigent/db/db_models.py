@@ -56,23 +56,29 @@ _TITLE_SORT_KEY = (
     )
 )
 _ASCII_LOWERCASE = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+# Sub-agent keys start here, after every top-level key, so a top-level Name
+# page reads only keys below it.
+SUB_AGENT_TITLE_SORT_KEY_PREFIX = "2"
 
 
-def title_sort_key(title: str | None) -> str:
+def title_sort_key(title: str | None, *, sub_agent: bool = False) -> str:
     """
     Return the stored Name-ordering key for a conversation title.
 
-    The key is ``"0"`` plus the title with only ASCII letters lowercased,
-    truncated to :data:`TITLE_SORT_KEY_MAX_CHARS` code points, or ``"1"``
-    when untitled so untitled conversations sort after titled ones. The web
-    client's ``titleSortKey`` mirrors this exactly.
+    The key is ``"0"`` plus the title with only ASCII letters lowercased, or
+    ``"1"`` when untitled so untitled conversations sort after titled ones.
+    A sub-agent's key adds :data:`SUB_AGENT_TITLE_SORT_KEY_PREFIX` in front.
+    Keys are truncated to :data:`TITLE_SORT_KEY_MAX_CHARS` code points. The
+    web client's ``titleSortKey`` mirrors the top-level keys exactly.
 
     :param title: Conversation title; empty or ``None`` when untitled.
+    :param sub_agent: Whether the conversation has a parent.
     :returns: The key stored in ``conversations.title_sort_key``.
     """
-    if not title:
-        return "1"
-    return ("0" + title.translate(_ASCII_LOWERCASE))[:TITLE_SORT_KEY_MAX_CHARS]
+    key = "0" + title.translate(_ASCII_LOWERCASE) if title else "1"
+    if sub_agent:
+        key = SUB_AGENT_TITLE_SORT_KEY_PREFIX + key
+    return key[:TITLE_SORT_KEY_MAX_CHARS]
 
 
 class Uuid16(TypeDecorator[str]):
@@ -853,7 +859,7 @@ class SqlConversation(ConversationBase):
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(768), nullable=False, server_default="")
-    # title_sort_key(title), written by the store with every title. The default
+    # title_sort_key(), written by the store with every title. The default
     # keeps inserts from builds that predate the column valid.
     title_sort_key: Mapped[str] = mapped_column(
         _TITLE_SORT_KEY, nullable=False, server_default="1"

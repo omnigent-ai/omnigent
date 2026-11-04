@@ -3192,6 +3192,40 @@ def test_list_conversations_sort_by_title(
         assert [c.id for c in preceding.data] == full_ids[:index], index
 
 
+def test_title_listings_keep_each_kind_in_its_own_key_range(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Sub-agents sort after every top-level session, and Name pages of each kind walk."""
+    top_level = [
+        conversation_store.create_conversation(title=title).id
+        for title in ("alpha", "Middle", "Zulu", None)
+    ]
+    parent_id = top_level[1]
+    children = [
+        conversation_store.create_conversation(
+            kind="sub_agent", title=title, parent_conversation_id=parent_id
+        ).id
+        for title in ("Beta", "", "yankee")
+    ]
+
+    def walk(kind: str | None, order: str) -> list[str]:
+        walked: list[str] = []
+        after: str | None = None
+        while True:
+            page = conversation_store.list_conversations(
+                limit=1, after=after, sort_by="title", order=order, kind=kind
+            )
+            walked.extend(c.id for c in page.data)
+            if not page.has_more:
+                return walked
+            after = page.last_id
+
+    assert walk("default", "asc") == top_level
+    assert walk("sub_agent", "asc") == children
+    assert walk(None, "asc") == top_level + children
+    assert walk(None, "desc") == list(reversed(top_level + children))
+
+
 def _stored_title_sort_keys(store: SqlAlchemyConversationStore, ids: list[str]) -> dict[str, str]:
     """Read the stored ``title_sort_key`` of each conversation in *ids*."""
     from sqlalchemy import select
@@ -3214,27 +3248,45 @@ def test_title_sort_key_follows_every_title_write(
     child = conversation_store.create_conversation(
         kind="sub_agent", parent_conversation_id=created.id
     )
+    bundled_child = conversation_store.create_session_with_agent(
+        agent_id="5d0c3b1f2e4a4c6b8d9e0f1a2b3c4d5e",
+        agent_name="bundled-child-agent",
+        agent_bundle_location="5d0c3b1f2e4a4c6b8d9e0f1a2b3c4d5e/bundle1",
+        agent_description=None,
+        title="Scout",
+        parent_conversation_id=created.id,
+    ).conversation
     renamed = conversation_store.create_conversation(title="old")
     conversation_store.update_conversation(renamed.id, title="Q" * 600)
+    renamed_child = conversation_store.create_conversation(
+        kind="sub_agent", title="Worker", parent_conversation_id=created.id
+    )
+    conversation_store.update_conversation(renamed_child.id, title="Lead")
     cleared = conversation_store.create_conversation(title="temporary")
     conversation_store.update_conversation(cleared.id, title="")
     swapped = conversation_store.create_conversation(title="Draft")
     assert conversation_store.rename_conversation_if_title_matches(swapped.id, "Draft", "Final")
+    swapped_child = conversation_store.create_conversation(
+        kind="sub_agent", title="Draft", parent_conversation_id=created.id
+    )
+    assert conversation_store.rename_conversation_if_title_matches(
+        swapped_child.id, "Draft", "Final"
+    )
     fork = conversation_store.fork_conversation(created.id, title="Fork Of Plan")
 
-    keys = _stored_title_sort_keys(
-        conversation_store,
-        [created.id, untitled.id, child.id, renamed.id, cleared.id, swapped.id, fork.id],
-    )
-    assert keys == {
+    expected = {
         created.id: "0plan b",
         untitled.id: "1",
-        child.id: f"0untitled:{child.id}",
+        child.id: f"20untitled:{child.id}",
+        bundled_child.id: "20scout",
         renamed.id: "0" + "q" * 511,
+        renamed_child.id: "20lead",
         cleared.id: "1",
         swapped.id: "0final",
+        swapped_child.id: "20final",
         fork.id: "0fork of plan",
     }
+    assert _stored_title_sort_keys(conversation_store, list(expected)) == expected
 
 
 def test_title_cursor_survives_renaming_the_boundary_row(
@@ -3312,7 +3364,14 @@ def test_title_cursor_tokens_are_validated(
 
     malformed = ["title.", "title.!!", "title.bm90IGpzb24", "title.WzEsMl0", "title.WyJ4IiwiYiJd"]
     # Keys the store never issues, and a lone surrogate no driver can bind.
-    malformed += [token(""), token("2a"), token("0a\ud800")]
+    malformed += [token(""), token("2"), token("2a"), token("0a\ud800")]
+    # Nesting this deep exhausts the JSON parser's recursion limit.
+    malformed.append("title." + base64.urlsafe_b64encode(b"[" * 9997).decode().rstrip("="))
+    # Sub-agent keys are valid positions, after every top-level session.
+    sub_agent_page = conversation_store.list_conversations(
+        after=token("20a"), sort_by="title", order="asc", kind=None
+    )
+    assert sub_agent_page.data == []
     nul_key = token("0a\x00")
     if is_postgresql_family(conversation_store._conv_engine.dialect.name):
         malformed.append(nul_key)
@@ -8376,6 +8435,7 @@ def _bulk_seed_conversations_and_grants(
     count: int,
     granted_ratio: float,
     tie_size: int = 1,
+    parent_conversation_id: str | None = None,
 ) -> None:
     """Insert *count* conversations (and grants for a fraction of them).
 
@@ -8386,6 +8446,8 @@ def _bulk_seed_conversations_and_grants(
         default of 1 gives every row a distinct timestamp; a larger value
         creates ties, which is what makes the cursor's tiebreaker term
         load-bearing (without ties, dropping it changes nothing).
+    :param parent_conversation_id: Parent to seed sub-agents under, or ``None``
+        for top-level rows.
     """
     import uuid as _uuid
 
@@ -8408,9 +8470,11 @@ def _bulk_seed_conversations_and_grants(
                 "created_at": stamp,
                 "updated_at": stamp,
                 "title": f"seed-{i // tie_size}",
-                "title_sort_key": title_sort_key(f"seed-{i // tie_size}"),
-                "parent_conversation_id": None,
-                "root_conversation_id": cid,
+                "title_sort_key": title_sort_key(
+                    f"seed-{i // tie_size}", sub_agent=parent_conversation_id is not None
+                ),
+                "parent_conversation_id": parent_conversation_id,
+                "root_conversation_id": parent_conversation_id or cid,
                 "next_position": 0,
                 # The endpoint filters has_agent_id=True, so an all-NULL
                 # agent_id seed would exclude every row and the plan under
@@ -8648,7 +8712,7 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
     """
     ACL and cursor contracts against a realistically sized table.
 
-    Two contracts share one seed because seeding is the expensive part:
+    Three contracts share one seed because seeding is the expensive part:
 
     1. The default listing pushes the ACL into a correlated EXISTS, with no id
        round-trip through Python.
@@ -8659,6 +8723,8 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
        filter, so a deep cursor reads and discards every row above it, at a
        cost that grows with cursor depth. MySQL is the reverse, so it gets the
        OR form.
+    3. A top-level Name page reads one title index range per archived state,
+       without sorting, and skips sub-agents that share every title.
 
     The SQL shape is asserted for every sort. The PLAN assertion is limited to
     ``updated_at`` and ``title``, which have compatible indexes; a
@@ -8870,6 +8936,81 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
     assert walked == expected_ids, (
         f"paged walk lost or reordered rows: {len(walked)} of {len(expected_ids)}"
     )
+
+    # ── 4. Name pages: interleaved sub-agents and both archived states ──
+    from omnigent.db.db_models import title_sort_key
+
+    # Sub-agents reuse the seed titles, so they sit between top-level rows of
+    # the same title unless their keys keep them out of the scanned range.
+    _bulk_seed_conversations_and_grants(
+        conversation_store,
+        "alice@example.com",
+        count=_PLAN_SEED_ROWS,
+        granted_ratio=0.5,
+        tie_size=4,
+        parent_conversation_id=expected_ids[0],
+    )
+    for include_archived in (False, True):
+        for order in ("asc", "desc"):
+            listing: dict[str, Any] = {
+                "accessible_by": "alice@example.com",
+                "has_agent_id": True,
+                "kind": "default",
+                "sort_by": "title",
+                "order": order,
+                "include_archived": include_archived,
+            }
+            full = conversation_store.list_conversations(limit=_PLAN_SEED_ROWS * 2, **listing)
+            assert not full.has_more
+            assert [c.id for c in full.data] == [
+                c.id
+                for c in sorted(
+                    full.data,
+                    key=lambda c: (title_sort_key(c.title), c.id),
+                    reverse=order == "desc",
+                )
+            ]
+            assert {c.archived for c in full.data} == {False, include_archived}
+            full_ids = [c.id for c in full.data]
+            deep = int(len(full_ids) * 0.7)
+            cursor = conversation_store.list_conversations(limit=deep, **listing).last_id
+            assert cursor is not None
+            pages: list[tuple[str, dict[str, str], list[str]]] = [
+                ("first", {}, full_ids[:20]),
+                ("after", {"after": cursor}, full_ids[deep : deep + 20]),
+                ("before", {"before": cursor}, full_ids[:20]),
+            ]
+            for direction, cursor_kwargs, expected_page in pages:
+                where = f"title/{order}/{direction}/include_archived={include_archived}"
+                with _capture_driver_sql(conversation_store) as driver_captured:
+                    page = conversation_store.list_conversations(
+                        limit=20, **cursor_kwargs, **listing
+                    )
+                assert [c.id for c in page.data] == expected_page, where
+                listings = [
+                    (statement, parameters)
+                    for statement, parameters in driver_captured
+                    if "order by conversations.title_sort_key" in statement.lower()
+                ]
+                assert len(listings) == (2 if include_archived else 1), where
+                for statement, parameters in listings:
+                    assert "conversations.title_sort_key < " in statement, (where, statement)
+                    plan = _explain_driver(conversation_store, statement, parameters)
+                    if dialect == "postgresql":
+                        index_conds, rows_filtered = _index_conds_and_filtered(plan)
+                        assert any("title_sort_key" in c for c in index_conds), (where, plan)
+                        assert all(r == 0 for r in rows_filtered), (where, plan)
+                        assert "Sort Key" not in plan, (where, plan)
+                    elif dialect == "mysql":
+                        scan = (
+                            "Index range scan on conversations using "
+                            "ix_conversations_archived_title"
+                        )
+                        assert scan in plan, (where, plan)
+                        assert "Sort:" not in plan, (where, plan)
+                    else:
+                        assert "USING INDEX ix_conversations_archived_title" in plan, (where, plan)
+                        assert "TEMP B-TREE" not in plan, (where, plan)
 
 
 @pytest.mark.parametrize("order", ["desc", "asc"])

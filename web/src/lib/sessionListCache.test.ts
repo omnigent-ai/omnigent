@@ -503,7 +503,7 @@ describe("project-folder cache membership", () => {
     const qc = new QueryClient();
     const row = conv("a", { archived: true });
     qc.setQueryData(archivedKey, data([row]));
-    const liveKey = ["project-sessions", "proj", "updated_at", false];
+    const liveKey = ["project-sessions", "proj", archivedKey[2], false];
     qc.setQueryData(liveKey, data([row]));
 
     overlayTitleIntoCaches(qc, "a", "Renamed");

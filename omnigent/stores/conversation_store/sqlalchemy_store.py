@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import heapq
+import itertools
 import json
 import logging
 from collections.abc import Iterator, Mapping
@@ -16,6 +18,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    case,
     delete,
     desc,
     false,
@@ -39,6 +42,7 @@ from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
+    SUB_AGENT_TITLE_SORT_KEY_PREFIX,
     TITLE_SORT_KEY_MAX_CHARS,
     SqlAgent,
     SqlComment,
@@ -211,6 +215,8 @@ def _like_contains_pattern(query: str) -> str:
 # Name-ordering page cursors carry the boundary row's sort key, so renaming that
 # row between page fetches cannot move the cursor and skip sessions.
 _TITLE_CURSOR_PREFIX = "title."
+# json.dumps spends at most six bytes per key character, and base64 adds a third.
+_TITLE_CURSOR_MAX_CHARS = 8 * TITLE_SORT_KEY_MAX_CHARS + 128
 
 
 def _encode_title_cursor(row: SqlConversation) -> str:
@@ -240,6 +246,8 @@ def _decode_title_cursor(cursor: str, dialect: str) -> tuple[str, str] | None:
         return None
     encoded = cursor.removeprefix(_TITLE_CURSOR_PREFIX)
     try:
+        if len(encoded) > _TITLE_CURSOR_MAX_CHARS:
+            raise ValueError("cursor is too long")
         sort_key, conversation_id = json.loads(
             base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
         )
@@ -247,14 +255,15 @@ def _decode_title_cursor(cursor: str, dialect: str) -> tuple[str, str] | None:
             raise ValueError("cursor position must be strings")
         if len(sort_key) > TITLE_SORT_KEY_MAX_CHARS:
             raise ValueError("cursor sort key is too long")
-        if sort_key != "1" and not sort_key.startswith("0"):
+        top_level_key = sort_key.removeprefix(SUB_AGENT_TITLE_SORT_KEY_PREFIX)
+        if top_level_key != "1" and not top_level_key.startswith("0"):
             raise ValueError("cursor sort key was not issued by the store")
         # Lone surrogates can't be bound, and PostgreSQL-family text never holds NUL.
         sort_key.encode("utf-8")
         if is_postgresql_family(dialect) and "\x00" in sort_key:
             raise ValueError("cursor sort key contains NUL")
         uuid_to_bytes(conversation_id)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise OmnigentError(
             "Malformed session list cursor; pass first_id or last_id unchanged.",
             code=ErrorCode.INVALID_INPUT,
@@ -415,7 +424,7 @@ def _new_session_conversation_row(
         created_at=now,
         updated_at=now,
         title=title or "",  # None → '' for top-level conversations
-        title_sort_key=title_sort_key(title),
+        title_sort_key=title_sort_key(title, sub_agent=parent_conversation_id is not None),
         parent_conversation_id=parent_conversation_id,
         # Top-level row: ``root_conversation_id`` mirrors the
         # primary key so tree-scoped lookups treat it as its own
@@ -1244,7 +1253,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     created_at=now,
                     updated_at=now,
                     title=title or "",
-                    title_sort_key=title_sort_key(title),
+                    title_sort_key=title_sort_key(
+                        title, sub_agent=parent_conversation_id is not None
+                    ),
                     parent_conversation_id=parent_conversation_id,
                     root_conversation_id=root_id,
                     agent_id=agent_id,
@@ -3319,6 +3330,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.parent_conversation_id.is_not(None))
             elif kind_requires_parent is False:
                 stmt = stmt.where(SqlConversation.parent_conversation_id.is_(None))
+            # The title index has no parent column, so bound the scan to this
+            # kind's key range instead of filtering the other kind row by row.
+            if sort_by == "title" and kind_requires_parent is not None:
+                sub_agent_keys = SqlConversation.title_sort_key >= SUB_AGENT_TITLE_SORT_KEY_PREFIX
+                stmt = stmt.where(sub_agent_keys if kind_requires_parent else ~sub_agent_keys)
 
             # archived lives on the AP conversations table, so exclude it inline
             # (no metadata prefetch, no post-fetch filtering). MySQL can seek the
@@ -3509,7 +3525,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                 sort_fn(sort_col),
                 sort_fn(tiebreaker_col),
             ).limit(limit + 1)
-            rows = list(session.execute(stmt).scalars().all())
+            if sort_by == "title" and include_archived and not archived_only:
+                # The title index leads with archived, so read each state in
+                # index order and merge the two bounded pages.
+                partitions = [
+                    session.execute(stmt.where(SqlConversation.archived == state)).scalars().all()
+                    for state in (false(), true())
+                ]
+                merged = heapq.merge(
+                    *partitions, key=lambda row: (row.title_sort_key, row.id), reverse=is_desc
+                )
+                rows = list(itertools.islice(merged, limit + 1))
+            else:
+                rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
@@ -3798,7 +3826,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ap_changed = False
             if title is not None:
                 row.title = title or ""
-                row.title_sort_key = title_sort_key(title)
+                row.title_sort_key = title_sort_key(
+                    title, sub_agent=row.parent_conversation_id is not None
+                )
                 ap_changed = True
             # This pure JSON merge stays beside the locked read so partial updates
             # preserve keys changed by another writer. It is deterministic on replay.
@@ -4070,7 +4100,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     .values(
                         title=title,
-                        title_sort_key=title_sort_key(title),
+                        title_sort_key=case(
+                            (
+                                SqlConversation.parent_conversation_id.is_(None),
+                                title_sort_key(title),
+                            ),
+                            else_=title_sort_key(title, sub_agent=True),
+                        ),
                         updated_at=updated_at,
                     )
                 ),

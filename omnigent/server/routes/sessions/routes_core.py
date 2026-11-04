@@ -1839,6 +1839,8 @@ def register_core_routes(
         :param sort_by: Sort key, ``"created_at"``, ``"updated_at"``,
             or ``"title"``. ``"title"`` ignores ASCII letter case and
             lists untitled sessions last with ``order=asc`` (A to Z).
+            With ``kind=any``, ``order=asc`` lists sub-agent sessions
+            after every top-level session.
         :param search_query: Case-insensitive substring filter on
             the session title or conversation content. ``None``
             or empty string disables the filter. A session
