@@ -76,6 +76,16 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     repos = ["https://github.com/acme/api"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
     store.set_labels(source_id, sandbox_labels)
+    listed_files: list[str] = []
+    list_files = SqlAlchemyFileStore.list
+
+    def record_listing(
+        self: SqlAlchemyFileStore, session_id: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        listed_files.append(session_id)
+        return list_files(self, session_id, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyFileStore, "list", record_listing)
 
     resp = await client.post(
         f"/v1/sessions/{source_id}/rewind", json={"item_id": items[item_index]}
@@ -84,6 +94,8 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     assert resp.status_code == 200, resp.text
     new_id = resp.json()["session_id"]
     assert resp.json()["prompt"] == prompt
+    # A text-only prompt has no attachments to look up among the fork's files.
+    assert (resp.json()["attachments"], new_id in listed_files) == ([], False)
     assert message_texts(store, new_id) == kept
     fork = store.get_conversation(new_id)
     assert fork is not None
