@@ -470,7 +470,8 @@ async def test_sign_in_check_fits_the_response_budget_and_pauses_reaping(monkeyp
     assert result["harness_sign_in"] == "available"
     # The probe used 1.0 of the 2.0 budget and 0.2 is held back for cleanup.
     assert len(timeouts) == 1 and timeouts[0] <= 0.8
-    assert loop.time() - started < 2.0 + 1.0
+    # Only the slack for a loaded runner scales; the 2.0 budget is the code's own.
+    assert loop.time() - started < 2.0 + budget(1.0)
     assert guarded == 0
     # A shortened check is a guess, so it isn't cached.
     assert not discovery._sign_in_cache
@@ -480,7 +481,7 @@ async def test_sign_in_check_fits_the_response_budget_and_pauses_reaping(monkeyp
     async with discovery._sign_in_slots, discovery._sign_in_slots:
         started = loop.time()
         result = await discovery.probe("claude", "docs")
-    assert loop.time() - started < 2.0 + 1.0
+    assert loop.time() - started < 2.0 + budget(1.0)
     assert "harness_sign_in" not in result
     assert len(timeouts) == 1
 
