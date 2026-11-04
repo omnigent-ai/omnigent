@@ -6246,6 +6246,129 @@ async def test_claude_native_mirror_matches_pending_text_and_reports_lost_input(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original",
+    [
+        [{"type": "input_text", "text": "complete synthetic report"}],
+        [
+            {"type": "input_file", "file_id": "file_report", "filename": "report.txt"},
+            {"type": "input_text", "text": "summarize the report"},
+        ],
+    ],
+    ids=["paste", "text-upload"],
+)
+async def test_codex_spilled_input_persists_its_exact_pending_content(
+    original: list[dict[str, Any]],
+) -> None:
+    """A generated file reference settles only the delivery that produced it."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "older message still in flight"}],
+        created_by="older@example.com",
+    )
+    target = pending_inputs.record(sid, original, created_by="sender@example.com")
+    identity = pending_inputs.delivery_attributes_for(sid, target)
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "[Attached file: /tmp/omnigent-generated-paste.txt]",
+                    }
+                ],
+            },
+            "response_id": "codex:spilled-input",
+            "source_id": "thread:turn:item",
+            "native_input_identity": {
+                "pending_id": identity["pending_id"],
+                "delivery_attempt_id": identity["delivery_attempt_id"],
+            },
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+        assert len(store.appended_items) == 1
+        persisted = store.appended_items[0]
+        assert persisted.data.content == original
+        assert persisted.created_by == "sender@example.com"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_codex_spilled_input_with_wrong_attempt_changes_nothing() -> None:
+    """A stale or forged spill receipt cannot drain by text or FIFO position."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    target = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "complete synthetic report"}],
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "[Attached file: /tmp/omnigent-generated-paste.txt]",
+                    }
+                ],
+            },
+            "response_id": "codex:spilled-input",
+            "source_id": "thread:turn:item",
+            "native_input_identity": {
+                "pending_id": target,
+                "delivery_attempt_id": "f" * 32,
+            },
+        },
+    )
+
+    try:
+        with pytest.raises(OmnigentError) as exc_info:
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                body,
+                store,  # type: ignore[arg-type]
+            )
+
+        assert exc_info.value.code == ErrorCode.CONFLICT
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [target]
+        assert store.appended_items == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry() -> None:
     """A mirror whose text the transcript reformatted still drains by position.
 

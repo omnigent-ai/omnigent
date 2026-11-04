@@ -14,6 +14,39 @@ from websockets.asyncio.server import ServerConnection, serve
 from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
 
 
+@pytest.mark.parametrize(
+    ("user_agent", "expected"),
+    [
+        ("omnigent/0.153.9", False),
+        ("omnigent/0.154.0", True),
+        ("omnigent-probe/0.166.0", True),
+        ("other-client/0.166.0", False),
+        (None, False),
+    ],
+)
+async def test_initialize_detects_user_message_identity_support(
+    user_agent: str | None,
+    expected: bool,
+) -> None:
+    """Only verified Codex versions may echo generated spill delivery IDs."""
+
+    async def handle(websocket: ServerConnection) -> None:
+        async for raw in websocket:
+            message = json.loads(raw)
+            if message["method"] == "initialize":
+                result = {"userAgent": user_agent} if user_agent is not None else {}
+                await websocket.send(json.dumps({"id": message["id"], "result": result}))
+
+    async with serve(handle, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        client = CodexAppServerClient(ws_url=f"ws://127.0.0.1:{port}")
+        try:
+            await client.connect()
+            assert client.supports_user_message_ids is expected
+        finally:
+            await client.close()
+
+
 @pytest.mark.parametrize("outcome", ["normal", "abrupt", "malformed", "reply_then_close"])
 async def test_pending_rpc_finishes_when_reader_exits(outcome: str) -> None:
     """A disconnected reader cannot leave its caller awaiting a response forever."""

@@ -288,25 +288,44 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         return None
     raw_bytes, filename = decoded
 
+    return _materialize_bytes(raw_bytes, filename, attachment_cache_dir(bridge_dir))
+
+
+def materialize_text(text: str, bridge_dir: Path) -> Path | None:
+    """Write generated text into the session attachment cache."""
+    try:
+        raw_bytes = text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
+    return _materialize_bytes(
+        raw_bytes,
+        f"omnigent_paste_{digest}.txt",
+        attachment_cache_dir(bridge_dir),
+    )
+
+
+def _materialize_bytes(raw_bytes: bytes, filename: str, cache_dir: Path) -> Path | None:
+    """Place bytes in a no-follow session cache, reusing identical content."""
+
     if filename in (".", "..") or os.sep in filename:
         return None
 
-    attachments_dir = attachment_cache_dir(bridge_dir)
     try:
-        attachments_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        root_fd = os.open(attachments_dir.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        cache_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_fd = os.open(cache_dir.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             with contextlib.suppress(FileExistsError):
-                os.mkdir(attachments_dir.name, mode=0o700, dir_fd=root_fd)
+                os.mkdir(cache_dir.name, mode=0o700, dir_fd=root_fd)
             dir_fd = os.open(
-                attachments_dir.name,
+                cache_dir.name,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                 dir_fd=root_fd,
             )
         finally:
             os.close(root_fd)
     except OSError:
-        _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
+        _logger.warning("Refusing to materialize into %s", cache_dir, exc_info=True)
         return None
     try:
         stem, suffix = os.path.splitext(filename)
@@ -314,10 +333,10 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         for name in (filename, f"{stem}_{digest}{suffix}"):
             outcome = _place_no_follow(dir_fd, name, raw_bytes)
             if outcome == "symlink":
-                _logger.warning("Refusing to write through symlink %s", attachments_dir / name)
+                _logger.warning("Refusing to write through symlink %s", cache_dir / name)
                 return None
             if outcome == "placed":
-                return attachments_dir / name
+                return cache_dir / name
         _logger.warning("Attachment names for %s already hold other content", filename)
         return None
     except OSError:

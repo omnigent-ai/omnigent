@@ -77,6 +77,48 @@ async def test_post_user_message_text_posts_input_text() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stable_id", [None, "c" * 32])
+async def test_post_user_message_carries_generated_spill_identity(
+    stable_id: str | None,
+) -> None:
+    """Only an Omnigent spill receipt can select queued content server-side."""
+    client = _RecordingClient()
+    pending_id = f"pending_{'a' * 32}"
+    attempt_id = "b" * 32
+    client_id = f"omnigent-spill:{pending_id}:{attempt_id}:{stable_id or 'none'}"
+    item = {
+        "type": "userMessage",
+        "clientId": client_id,
+        "content": [{"type": "text", "text": "[Attached file: /tmp/generated.txt]"}],
+    }
+
+    await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
+
+    _url, body = client.posts[0]
+    assert body["data"]["native_input_identity"] == {
+        "pending_id": pending_id,
+        "delivery_attempt_id": attempt_id,
+        **({"input_stable_id": stable_id} if stable_id is not None else {}),
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_user_message_does_not_trust_a_literal_or_malformed_spill_id() -> None:
+    """Ordinary native text cannot manufacture a queued-input receipt."""
+    for client_id in (None, "omnigent-spill:not-an-id"):
+        client = _RecordingClient()
+        item = {
+            "type": "userMessage",
+            "clientId": client_id,
+            "content": [{"type": "text", "text": "[Attached file: /tmp/literal.txt]"}],
+        }
+
+        await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
+
+        assert "native_input_identity" not in client.posts[0][1]["data"]
+
+
+@pytest.mark.asyncio
 async def test_post_user_message_truly_empty_is_skipped() -> None:
     """
     A ``userMessage`` with neither text nor a file block is not posted.

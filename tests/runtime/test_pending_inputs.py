@@ -180,6 +180,57 @@ def test_lifecycle_without_client_id_requires_its_exact_delivery_attempt(
     )
 
 
+def test_resolve_delivery_attempt_selects_only_its_exact_pending_input() -> None:
+    """A native receipt cannot drain an older queued input or a different attempt."""
+    older = pending_inputs.record("conv", [_text_block("older")])
+    target = pending_inputs.record("conv", [_text_block("target")])
+    identity = pending_inputs.delivery_attributes_for("conv", target)
+
+    assert pending_inputs.resolve_delivery_attempt("conv", target, "f" * 32, hold=True) is None
+    assert (
+        pending_inputs.resolve_delivery_attempt(
+            "conv",
+            target,
+            str(identity["delivery_attempt_id"]),
+            stable_id="f" * 32,
+            hold=True,
+        )
+        is None
+    )
+    drained = pending_inputs.resolve_delivery_attempt(
+        "conv",
+        target,
+        str(identity["delivery_attempt_id"]),
+        hold=True,
+    )
+
+    assert drained is not None and drained.pending_id == target
+    assert (
+        pending_inputs.resolve_delivery_attempt(
+            "conv", target, str(identity["delivery_attempt_id"])
+        )
+        is None
+    )
+    pending_inputs.release("conv", drained)
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv")] == [older]
+
+
+def test_resolve_delivery_attempt_accepts_a_restored_stable_input() -> None:
+    """A stable client ID survives a server restart that minted a new attempt ID."""
+    stable_id = "a" * 32
+    target = pending_inputs.record("conv", [_text_block("target")], stable_id=stable_id)
+
+    drained = pending_inputs.resolve_delivery_attempt(
+        "conv",
+        target,
+        "f" * 32,
+        stable_id=stable_id,
+    )
+
+    assert drained is not None and drained.pending_id == target
+    assert pending_inputs.snapshot_for("conv") == []
+
+
 @pytest.fixture(autouse=True)
 def _clean_pending_inputs_index() -> Iterator[None]:
     """

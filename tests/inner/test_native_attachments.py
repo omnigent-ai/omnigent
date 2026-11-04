@@ -24,6 +24,7 @@ from omnigent.inner.native_attachments import (
     has_unresolved_file_id,
     inline_filesystem_attachment_name,
     materialize_attachment,
+    materialize_text,
     parse_data_uri,
     requires_filesystem,
     resize_notice,
@@ -243,6 +244,21 @@ def test_materialize_attachment_reuses_identical_existing_file(tmp_path: Path) -
     assert second == first
     assert third is not None and third != first
     assert len(list((attachment_cache_dir(tmp_path)).iterdir())) == 2
+
+
+def test_materialize_text_reuses_private_utf8_file(tmp_path: Path) -> None:
+    """Generated text is stored exactly once in the session attachment cache."""
+    text = "first line\nUnicode snowman: ☃\n"
+
+    first = materialize_text(text, tmp_path)
+    second = materialize_text(text, tmp_path)
+
+    assert first is not None
+    assert second == first
+    assert first.parent == attachment_cache_dir(tmp_path)
+    assert first.name.startswith("omnigent_paste_")
+    assert first.read_text(encoding="utf-8") == text
+    assert first.stat().st_mode & 0o177 == 0
 
 
 def test_materialize_attachment_same_name_collision_is_bounded(tmp_path: Path) -> None:

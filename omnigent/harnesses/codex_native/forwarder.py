@@ -306,6 +306,9 @@ _CODEX_OUTPUT_LIMIT_HINT = (
     "The model reached its response length limit. Ask it to continue or split "
     "the request into smaller parts."
 )
+_SPILLED_INPUT_CLIENT_ID = re.compile(
+    r"omnigent-spill:(pending_[0-9a-f]{32}):([0-9a-f]{32}):([0-9a-f]{32}|none)"
+)
 # Budget/quota exhaustion from the AI gateway: the gateway returns HTTP 403 +
 # PERMISSION_DENIED for these, which looks like auth to the generic checks —
 # it isn't. Re-authenticating cannot resolve a spending limit.
@@ -6696,6 +6699,7 @@ async def _post_user_message(
             session_id,
             _source_id(params, item),
         )
+    native_input_identity = _spilled_input_identity(item.get("clientId"))
     return await _post_external_item(
         client,
         session_id,
@@ -6703,7 +6707,21 @@ async def _post_user_message(
         item_data=item_data,
         response_id=_response_id(params),
         source_id=source_id or _source_id(params, item),
+        native_input_identity=native_input_identity,
     )
+
+
+def _spilled_input_identity(client_id: object) -> _JsonObject | None:
+    """Decode an Omnigent-generated large-input delivery receipt."""
+    match = _SPILLED_INPUT_CLIENT_ID.fullmatch(client_id) if isinstance(client_id, str) else None
+    if match is None:
+        return None
+    pending_id, delivery_attempt_id, stable_id = match.groups()
+    return {
+        "pending_id": pending_id,
+        "delivery_attempt_id": delivery_attempt_id,
+        **({"input_stable_id": stable_id} if stable_id != "none" else {}),
+    }
 
 
 async def _post_agent_message(
@@ -7334,6 +7352,7 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
+    native_input_identity: _JsonObject | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -7349,6 +7368,7 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
+    :param native_input_identity: Exact queued-input receipt for a generated spill.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {
@@ -7360,6 +7380,8 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
+    if native_input_identity is not None:
+        data["native_input_identity"] = native_input_identity
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(

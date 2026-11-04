@@ -73,6 +73,7 @@ class _FakeCodexNativeClient:
     created: list[tuple[Path | None, str | None, str]] = []
     next_turn = 1
     native_active_turn_id: str | None = None
+    supports_user_message_ids = True
 
     def __init__(
         self,
@@ -2011,6 +2012,193 @@ def test_input_file_text_is_inlined_as_a_text_item(
     # No image channel item for a file, and no uploads dir written.
     assert all(item["type"] != "localImage" for item in items)
     assert not (attachment_cache_dir(tmp_path)).exists()
+
+
+def test_oversized_text_is_sent_as_a_session_owned_file_reference(tmp_path: Path) -> None:
+    """Text beyond Codex's aggregate limit is kept out of the native request."""
+    text = "synthetic log line\n" * 70_000
+    identity = {
+        "pending_id": f"pending_{'a' * 32}",
+        "delivery_attempt_id": "b" * 32,
+    }
+
+    with input_delivery_scope(identity):
+        items = codex_native_executor._content_to_input_items(text, tmp_path)
+
+    assert len(items) == 1
+    reference = items[0]["text"]
+    assert isinstance(reference, str)
+    assert reference.startswith("[Attached file: ")
+    assert reference.endswith("]")
+    path = Path(reference.removeprefix("[Attached file: ").removesuffix("]"))
+    assert path.parent == attachment_cache_dir(tmp_path)
+    assert path.read_text(encoding="utf-8") == text
+    assert text not in reference
+
+
+@pytest.mark.parametrize(
+    "input_kind",
+    ["paste", "aggregate", "text-upload", "unicode"],
+)
+def test_oversized_input_forms_fit_the_native_text_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    input_kind: str,
+) -> None:
+    """Pastes, aggregate blocks, and text uploads use bounded file references."""
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 500)
+    texts: list[str]
+    if input_kind == "paste":
+        texts = ["p" * 800]
+        content: object = texts[0]
+    elif input_kind == "aggregate":
+        texts = ["a" * 400, "b" * 400]
+        content = [{"type": "input_text", "text": text} for text in texts]
+    elif input_kind == "text-upload":
+        texts = ["file line\n" * 100]
+        encoded = base64.b64encode(texts[0].encode()).decode()
+        content = [
+            {
+                "type": "input_file",
+                "filename": "report.txt",
+                "file_data": f"data:text/plain;base64,{encoded}",
+            }
+        ]
+    else:
+        texts = ["雪" * 800]
+        content = texts[0]
+    identity = {
+        "input_stable_id": "c" * 32,
+        "pending_id": f"pending_{'a' * 32}",
+        "delivery_attempt_id": "b" * 32,
+    }
+
+    items = codex_native_executor._content_to_input_items(
+        content,
+        tmp_path,
+        input_identity=identity,
+    )
+
+    inline = [item["text"] for item in items if item.get("type") == "text"]
+    assert sum(len(text) for text in inline if isinstance(text, str)) <= 500
+    references = [
+        text for text in inline if isinstance(text, str) and text.startswith("[Attached file: ")
+    ]
+    assert references
+    stored = [
+        Path(reference.removeprefix("[Attached file: ").removesuffix("]")).read_text(
+            encoding="utf-8"
+        )
+        for reference in references
+    ]
+    assert set(stored) <= set(texts)
+    assert isinstance(items, codex_native_executor._SpilledInputItems)
+    assert items.client_message_id == (f"omnigent-spill:pending_{'a' * 32}:{'b' * 32}:{'c' * 32}")
+
+
+def test_oversized_turn_uses_the_spill_receipt_on_native_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generated receipt reaches Codex with the file-reference request."""
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 250)
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    identity = {
+        "input_stable_id": "c" * 32,
+        "pending_id": f"pending_{'a' * 32}",
+        "delivery_attempt_id": "b" * 32,
+    }
+
+    with input_delivery_scope(identity):
+        events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "x" * 600)
+
+    assert [type(event) for event in events] == [TurnComplete]
+    method, params = _FakeCodexNativeClient.requests[-1]
+    assert method == "turn/start"
+    assert params["clientUserMessageId"] == (
+        f"omnigent-spill:pending_{'a' * 32}:{'b' * 32}:{'c' * 32}"
+    )
+    assert params["input"][0]["text"].startswith("[Attached file: ")
+
+
+@pytest.mark.asyncio
+async def test_oversized_steer_uses_the_spill_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mid-turn oversized input keeps the same identity and bounded wire shape."""
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 250)
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+    identity = {
+        "pending_id": f"pending_{'a' * 32}",
+        "delivery_attempt_id": "b" * 32,
+    }
+
+    with input_delivery_scope(identity):
+        accepted = await CodexNativeExecutor(bridge_dir=tmp_path).enqueue_session_message(
+            "main", "x" * 600
+        )
+
+    assert accepted is True
+    method, params = _FakeCodexNativeClient.requests[-1]
+    assert method == "turn/steer"
+    assert params["clientUserMessageId"] == (f"omnigent-spill:pending_{'a' * 32}:{'b' * 32}:none")
+    assert params["input"][0]["text"].startswith("[Attached file: ")
+
+
+@pytest.mark.parametrize("failure", ["missing-identity", "old-codex"])
+def test_oversized_input_refuses_before_native_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Unsafe spill delivery fails without changing settings or starting a turn."""
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 250)
+
+    class UnsupportedClient(_FakeCodexNativeClient):
+        requests = []
+        created = []
+        supports_user_message_ids = False
+
+    client = UnsupportedClient if failure == "old-codex" else _FakeCodexNativeClient
+    client.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        client,
+    )
+    _start_state(tmp_path)
+    scope = (
+        input_delivery_scope(
+            {
+                "pending_id": f"pending_{'a' * 32}",
+                "delivery_attempt_id": "b" * 32,
+            }
+        )
+        if failure == "old-codex"
+        else contextlib.nullcontext()
+    )
+
+    with scope:
+        [event] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "x" * 600)
+
+    assert isinstance(event, ExecutorError)
+    assert event.code == "input_too_large"
+    assert event.undelivered is True
+    assert all(
+        method not in {"thread/settings/update", "turn/start", "turn/steer"}
+        for method, _ in client.requests
+    )
 
 
 def test_input_file_binary_is_materialized_and_referenced_by_path(

@@ -644,6 +644,50 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         return _drained_input(entry) if entry is not None else None
 
 
+def resolve_delivery_attempt(
+    conversation_id: str,
+    pending_id: str,
+    delivery_attempt_id: str,
+    *,
+    stable_id: str | None = None,
+    hold: bool = False,
+) -> DrainedInput | None:
+    """Resolve the queued input identified by a native delivery receipt."""
+    identity = input_attributes(
+        {
+            "pending_id": pending_id,
+            "delivery_attempt_id": delivery_attempt_id,
+            "input_stable_id": stable_id,
+        }
+    )
+    if (
+        identity.get("pending_id") != pending_id
+        or identity.get("delivery_attempt_id") != delivery_attempt_id
+    ):
+        return None
+    if stable_id is not None and identity.get("input_stable_id") != stable_id:
+        return None
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if entries is None:
+            return None
+        entry = entries.get(pending_id)
+        if entry is None or entry.held:
+            return None
+        if stable_id is not None and entry.stable_id != stable_id:
+            return None
+        if entry.delivery_attempt_id != delivery_attempt_id and stable_id is None:
+            return None
+        if hold:
+            entry.held = True
+        else:
+            entries.pop(pending_id)
+            if not entries:
+                _pending.pop(conversation_id, None)
+        return _drained_input(entry)
+
+
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.

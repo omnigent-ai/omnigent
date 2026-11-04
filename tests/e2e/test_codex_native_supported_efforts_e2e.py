@@ -140,6 +140,75 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
                 pass
 
 
+def test_oversized_input_survives_real_codex_transport(codex_effort_rig: _Rig) -> None:
+    """A real Codex thread receives a file reference while history keeps the full paste."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        end_marker = f"END_OF_LARGE_INPUT_{uuid.uuid4().hex}"
+        text = "synthetic input line\n" * 55_000 + end_marker
+        _json(rig.model.post("/mock/reset"))
+
+        response = rig.api.post(
+            f"/v1/sessions/{session.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "stable_id": uuid.uuid4().hex,
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            user_matches = [
+                item
+                for item in items
+                if item.get("role") == "user"
+                and item.get("content") == [{"type": "input_text", "text": text}]
+            ]
+            state = read_bridge_state(session.bridge)
+            if user_matches and state is not None:
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail(
+                f"Oversized input did not complete.\n{session.tmux('capture-pane', '-p')}\n"
+                f"{rig.stack.log_tail()}"
+            )
+
+        async def read_thread() -> dict[str, Any]:
+            client = client_for_transport(state.socket_path, client_name="spill-e2e-observer")
+            await client.connect()
+            try:
+                result = await client.request(
+                    "thread/read", {"threadId": state.thread_id, "includeTurns": True}
+                )
+                return result["result"]["thread"]
+            finally:
+                await client.close()
+
+        thread = asyncio.run(read_thread())
+        native_user_items = [
+            item
+            for turn in thread["turns"]
+            for item in turn.get("items", [])
+            if item.get("type") == "userMessage"
+            and str(item.get("clientId", "")).startswith("omnigent-spill:")
+        ]
+        wire = json.dumps(native_user_items)
+        assert len(user_matches) == 1
+        assert len(native_user_items) == 1
+        assert "omnigent_paste_" in wire
+        assert end_marker not in wire
+
+
 pytestmark = [
     pytest.mark.posix_only,
     pytest.mark.timeout(240),

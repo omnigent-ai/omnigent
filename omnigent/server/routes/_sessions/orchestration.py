@@ -3123,7 +3123,72 @@ async def _persist_external_conversation_item_unlocked(
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
-    if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
+    raw_native_input_identity = body.data.get("native_input_identity")
+    if raw_native_input_identity is not None:
+        native_input_identity = (
+            input_attributes(raw_native_input_identity)
+            if isinstance(raw_native_input_identity, dict)
+            else {}
+        )
+        required_identity = {"pending_id", "delivery_attempt_id"}
+        allowed_identity = required_identity | {"input_stable_id"}
+        if set(native_input_identity) != set(raw_native_input_identity) or not (
+            required_identity <= set(native_input_identity) <= allowed_identity
+        ):
+            raise OmnigentError(
+                "external conversation item carries an invalid native input identity",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        pending_id = native_input_identity["pending_id"]
+        delivery_attempt_id = native_input_identity["delivery_attempt_id"]
+        stable_id = native_input_identity.get("input_stable_id")
+        if not (
+            isinstance(pending_id, str)
+            and isinstance(delivery_attempt_id, str)
+            and (stable_id is None or isinstance(stable_id, str))
+        ):
+            raise OmnigentError(
+                "external conversation item carries an invalid native input identity",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        drained = pending_inputs.resolve_delivery_attempt(
+            session_id,
+            pending_id,
+            delivery_attempt_id,
+            stable_id=stable_id,
+            hold=True,
+        )
+        if drained is None:
+            raise OmnigentError(
+                "The mirrored native input no longer matches its queued delivery.",
+                code=ErrorCode.CONFLICT,
+            )
+        if not (
+            drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData)
+        ):
+            pending_inputs.restore(session_id, drained)
+            raise OmnigentError(
+                "native input identity requires a mirrored user message",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        cleared_pending_id = drained.pending_id
+        match_method = "native_input_identity"
+        item = item.model_copy(
+            update={
+                "data": item.data.model_copy(update={"content": drained.content}),
+                **(
+                    {"created_by": drained.created_by}
+                    if drained.created_by is not None and item.created_by is None
+                    else {}
+                ),
+            }
+        )
+    if (
+        drains_pending_inputs
+        and item.type == "message"
+        and isinstance(item.data, MessageData)
+        and drained is None
+    ):
         # Match the mirror to its entry by text: a pasted message the TUI never
         # recorded leaves a stale head entry, and draining by position would
         # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).

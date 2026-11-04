@@ -9,6 +9,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -80,6 +81,7 @@ from omnigent.inner.native_attachments import (
     attachment_reference_line,
     codex_resize_metadata_path,
     materialize_attachment,
+    materialize_text,
     parse_data_uri,
     unresolved_attachment_marker,
     uses_filesystem_delivery,
@@ -125,6 +127,23 @@ _CODEX_SHELL_AUTHORIZATION_REQUIRED = CodexStartupFailure(
     "as the session owner.",
 )
 
+_MAX_INLINE_TEXT_CHARS = 900_000
+_SPILLED_INPUT_ID = re.compile(
+    r"omnigent-spill:(pending_[0-9a-f]{32}):([0-9a-f]{32}):([0-9a-f]{32}|none)"
+)
+_SPILL_RECORD_FAILURE = CodexStartupFailure(
+    message="The large input could not be stored safely, so it was not sent.",
+    code="input_too_large",
+    title="Large input could not be prepared",
+    remediation="Check local disk space and retry, or attach the text as a smaller file.",
+)
+_SPILL_UNSUPPORTED_FAILURE = CodexStartupFailure(
+    message="This Codex version cannot safely receive the large input, so it was not sent.",
+    code="input_too_large",
+    title="Codex needs an update",
+    remediation="Upgrade Codex to 0.154.0 or later, then retry.",
+)
+
 
 class _CodexNativeInputUndelivered(RuntimeError):
     """Delivery stopped after a proven refusal and before any resubmission."""
@@ -133,6 +152,14 @@ class _CodexNativeInputUndelivered(RuntimeError):
         self.failure = failure
         self.preserve_session = preserve_session
         super().__init__(failure.message)
+
+
+class _SpilledInputItems(list[dict[str, object]]):
+    """Native input whose generated file references require an echoed delivery ID."""
+
+    def __init__(self, items: list[dict[str, object]], client_message_id: str) -> None:
+        super().__init__(items)
+        self.client_message_id = client_message_id
 
 
 async def _wait_for_bridge_state(
@@ -399,13 +426,22 @@ async def _native_delivery_request_once(
     thread_id = requested_thread if isinstance(requested_thread, str) else None
     # Only turn input carries an idempotency key; a shell command's receipt has
     # no userMessage item, so a lost shell ack stays ambiguous without a probe.
+    input_items = params.get("input")
     client_message_id = (
-        current_input_attributes().get("delivery_attempt_id")
+        input_items.client_message_id
+        if isinstance(input_items, _SpilledInputItems)
+        else current_input_attributes().get("delivery_attempt_id")
         if method in ("turn/start", "turn/steer")
         else None
     )
     if isinstance(client_message_id, str) and client_message_id and thread_id == state.thread_id:
-        params = {**params, "clientUserMessageId": client_message_id}
+        params = {
+            **params,
+            "input": list(input_items)
+            if isinstance(input_items, _SpilledInputItems)
+            else input_items,
+            "clientUserMessageId": client_message_id,
+        }
     else:
         client_message_id = None
     log_input_event(
@@ -812,6 +848,10 @@ async def _inject_codex_turn_once(
     settings_overrides: Mapping[str, object],
 ) -> None:
     """Steer an active turn or start one, recovering one proven stale steer."""
+    if isinstance(input_items, _SpilledInputItems) and not getattr(
+        client, "supports_user_message_ids", False
+    ):
+        raise _CodexNativeInputUndelivered(_SPILL_UNSUPPORTED_FAILURE)
     if state.active_turn_id is None:
         await _start_codex_turn(
             client,
@@ -909,7 +949,16 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when Codex accepted the steering message.
         """
         del session_key
-        input_items = _content_to_input_items(content, self._bridge_dir)
+        try:
+            input_items = await asyncio.to_thread(
+                _content_to_input_items,
+                content,
+                self._bridge_dir,
+                input_identity=current_input_attributes(),
+            )
+        except _CodexNativeInputUndelivered:
+            _logger.warning("Codex native could not prepare an oversized steering input")
+            return False
         if not input_items:
             return False
         # Serialized against run_turn so the read-decide-RPC-write below
@@ -1085,11 +1134,27 @@ class CodexNativeExecutor(Executor):
             if length_error is not None:
                 yield ExecutorError(message=length_error)
                 return
-        input_items: list[dict[str, object]] = (
-            [{"type": "text", "text": goal_objective}]
-            if goal_objective is not None
-            else _content_to_input_items(latest_user_content, self._bridge_dir)
-        )
+        try:
+            input_items: list[dict[str, object]] = (
+                [{"type": "text", "text": goal_objective}]
+                if goal_objective is not None
+                else await asyncio.to_thread(
+                    _content_to_input_items,
+                    latest_user_content,
+                    self._bridge_dir,
+                    input_identity=current_input_attributes(),
+                )
+            )
+        except _CodexNativeInputUndelivered as exc:
+            yield ExecutorError(
+                message=exc.failure.message,
+                code=exc.failure.code,
+                title=exc.failure.title,
+                remediation=exc.failure.remediation,
+                undelivered=True,
+                preserve_session=True,
+            )
+            return
         if not input_items:
             yield ExecutorError(message="Codex native turn had no user input to send")
             return
@@ -1408,7 +1473,12 @@ def _latest_user_content(messages: list[Message]) -> object:
     return None
 
 
-def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
+def _content_to_input_items(
+    content: object,
+    bridge_dir: Path,
+    *,
+    input_identity: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
     """
     Normalize executor content into Codex app-server input items.
 
@@ -1418,17 +1488,20 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     URI inline as text would blow past the app-server's 1 MiB input
     limit. Files inline their decoded text when they are textual;
     binary files are materialized and referenced by path in a text
-    item so the model can open them with its tools.
+    item so the model can open them with its tools. When the aggregate
+    text exceeds Codex's limit, the largest text items use the same
+    file-reference path.
 
     :param content: Message content, e.g. a string or a list of content
         blocks like ``{"type": "input_text", "text": "..."}`` and
         ``{"type": "input_image", "image_url": "data:image/png;base64,..."}``.
     :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param input_identity: Server-issued pending and delivery IDs for this input.
     :returns: Codex input item dicts.
     """
     if isinstance(content, str):
-        return [{"type": "text", "text": content}] if content else []
-    if isinstance(content, list):
+        items = [{"type": "text", "text": content}] if content else []
+    elif isinstance(content, list):
         items: list[dict[str, object]] = []
         for raw_block in content:
             block = _json_object(raw_block)
@@ -1462,10 +1535,64 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
                 file_item = _file_block_to_input_item(block, bridge_dir)
                 if file_item is not None:
                     items.append(file_item)
+    elif content is None:
+        items = []
+    else:
+        items = [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+    return _spill_oversized_text(
+        items,
+        bridge_dir,
+        input_identity=input_identity or current_input_attributes(),
+    )
+
+
+def _spill_oversized_text(
+    items: list[dict[str, object]],
+    bridge_dir: Path,
+    *,
+    input_identity: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Move enough text to session-owned files to stay below Codex's limit."""
+    text_items = {
+        index: text
+        for index, item in enumerate(items)
+        if item.get("type") == "text" and isinstance((text := item.get("text")), str) and text
+    }
+    total_chars = sum(len(text) for text in text_items.values())
+    if total_chars <= _MAX_INLINE_TEXT_CHARS:
         return items
-    if content is None:
-        return []
-    return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+
+    pending_id = input_identity.get("pending_id")
+    delivery_attempt_id = input_identity.get("delivery_attempt_id")
+    stable_id = input_identity.get("input_stable_id")
+    stable_token = stable_id if isinstance(stable_id, str) else "none"
+    client_message_id = f"omnigent-spill:{pending_id}:{delivery_attempt_id}:{stable_token}"
+    if (
+        not isinstance(pending_id, str)
+        or not isinstance(delivery_attempt_id, str)
+        or not (_SPILLED_INPUT_ID.fullmatch(client_message_id))
+    ):
+        raise _CodexNativeInputUndelivered(_SPILL_RECORD_FAILURE)
+
+    prepared = list(items)
+    for index, text in sorted(text_items.items(), key=lambda entry: -len(entry[1])):
+        if total_chars <= _MAX_INLINE_TEXT_CHARS:
+            break
+        path = materialize_text(text, bridge_dir)
+        if path is None:
+            continue
+        reference = f"[Attached file: {path}]"
+        if len(reference) >= len(text):
+            continue
+        prepared[index] = {"type": "text", "text": reference}
+        total_chars -= len(text) - len(reference)
+        _logger.info(
+            "Codex native stored oversized input text in the session cache",
+            extra=debug_event("codex_native_text_spilled", chars=len(text)),
+        )
+    if total_chars > _MAX_INLINE_TEXT_CHARS:
+        raise _CodexNativeInputUndelivered(_SPILL_RECORD_FAILURE)
+    return _SpilledInputItems(prepared, client_message_id)
 
 
 def _requires_filesystem(block: Mapping[str, object]) -> bool:
