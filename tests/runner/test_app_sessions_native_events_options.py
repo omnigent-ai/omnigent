@@ -4064,9 +4064,22 @@ async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
             ),
             timeout=5,
         )
+        followed = await asyncio.wait_for(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={**message, "content": [{"type": "input_text", "text": "after the clear"}]},
+            ),
+            timeout=5,
+        )
+        turn = app.state.active_turns.get(sid)
+        if turn is not None:
+            await asyncio.wait_for(asyncio.shield(turn), timeout=5)
 
     assert later.status_code == 200, later.text
     assert sid in pm.released
+    # A message after it still reaches the harness.
+    assert followed.status_code < 300, followed.text
+    assert any("after the clear" in json.dumps(body) for body in pm._client.posted_bodies)
 
 
 @pytest.mark.asyncio
