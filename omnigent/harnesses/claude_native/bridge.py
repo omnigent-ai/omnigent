@@ -3063,141 +3063,14 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
-# Required-value options of Claude Code 2.1.161-2.1.317. Claude consumes the next token
-# as the value even when it starts with a dash (``--system-prompt --append-system-prompt``).
-_CLAUDE_VALUE_FLAGS = frozenset(
-    {
-        "-n",
-        "--add-dir",
-        "--advisor",
-        "--agent",
-        "--agent-color",
-        "--agent-id",
-        "--agent-name",
-        "--agent-type",
-        "--agents",
-        "--allowed-tools",
-        "--allowedTools",
-        "--append-subagent-system-prompt",
-        "--append-subagent-system-prompt-file",
-        "--append-system-prompt",
-        "--append-system-prompt-file",
-        "--attach-serve",
-        "--autocompact",
-        "--betas",
-        "--channels",
-        "--client-data-url",
-        "--correlation-id",
-        "--dangerously-load-development-channels",
-        "--debug-file",
-        "--deep-link-cwd-b64",
-        "--deep-link-last-fetch",
-        "--deep-link-repo",
-        "--disallowed-tools",
-        "--disallowedTools",
-        "--effort",
-        "--environment",
-        "--fallback-model",
-        "--fast-mode",
-        "--file",
-        "--forward-home-settings",
-        "--inherit-permission-mode",
-        "--input-format",
-        "--json-schema",
-        "--managed-settings",
-        "--max-budget-usd",
-        "--max-thinking-tokens",
-        "--max-turns",
-        "--mcp-config",
-        "--messaging-socket-path",
-        "--model",
-        "--name",
-        "--on-branch",
-        "--output-format",
-        "--parent-session-id",
-        "--permission-mode",
-        "--permission-prompt-tool",
-        "--permission-prompts",
-        "--plan-mode-instructions",
-        "--plugin-dir",
-        "--plugin-dir-no-mcp",
-        "--plugin-url",
-        "--pool",
-        "--prefill",
-        "--prefill-b64",
-        "--proactivity",
-        "--project-config-root",
-        "--ref",
-        "--remote-control-session-name-prefix",
-        "--resume-drops-turn",
-        "--resume-session-at",
-        "--rewind-files",
-        "--runner-declares",
-        "--sdk-url",
-        "--session-began-as-copy",
-        "--session-id",
-        "--setting-sources",
-        "--settings",
-        "--system-prompt",
-        "--system-prompt-file",
-        "--system-prompt-snapshot",
-        "--task-budget",
-        "--team-name",
-        "--teammate-mode",
-        "--thinking",
-        "--thinking-display",
-        "--tools",
-        "--watch-artifact",
-        "--watch-artifact-no-autoreact",
-        "--workload",
-    }
-)
-
-
-# Boolean short options of Claude Code 2.1.161-2.1.317 (``-n`` requires a value;
-# ``-d``, ``-r`` and ``-w`` take an optional one).
-_CLAUDE_SHORT_BOOLEAN_FLAGS = frozenset({"-c", "-h", "-p", "-v"})
-
-
-def _locate_claude_option_value(args: list[str], flag: str) -> tuple[int, int] | None:
-    """Locate the last value Claude Code parses for ``flag``.
-
-    Tokens owned by another required-value option are skipped, e.g. the
-    literal ``--append-system-prompt`` in ``--system-prompt --append-system-prompt``.
-    An unconsumed ``--`` ends the options, so later tokens are positional.
-
-    :param args: Claude CLI arguments, e.g. ``["--append-system-prompt=Be brief."]``.
-    :param flag: Required-value option to read, e.g. ``"--append-system-prompt"``.
-    :returns: ``(index, offset)`` where ``args[index][offset:]`` is the value, which may
-        be empty, or ``None`` when Claude parses no value for ``flag``.
-    """
-    location: tuple[int, int] | None = None
-    idx = 0
-    while idx < len(args):
-        arg = args[idx]
-        # Claude reads ``-pn`` as ``-p -n``; a value-taking letter keeps the rest as its value.
-        while len(arg) > 2 and arg[:2] in _CLAUDE_SHORT_BOOLEAN_FLAGS:
-            arg = f"-{arg[2:]}"
-        if arg == "--":
-            break
-        name, joined, joined_value = arg.partition("=")
-        if joined and name == flag:
-            location = (idx, len(args[idx]) - len(joined_value))
-        elif arg in _CLAUDE_VALUE_FLAGS:
-            if arg == flag and idx + 1 < len(args):
-                location = (idx + 1, 0)
-            idx += 1
-        idx += 1
-    return location
-
-
 def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
     """Put ``extra`` before the caller's ``--append-system-prompt`` value.
 
     Claude Code keeps only the last value of the flag, so ``extra`` joins that
-    value in place, or a new flag carries it. Other caller tokens, including an
-    ``--append-system-prompt-file``, are left as they are. Claude Code 2.1.295+
-    applies such a file before the inline prompt; 2.1.161 and 2.1.278 refuse to start with both.
+    value in place, or a new flag carries it. The scan stops at a bare ``--``.
+    Other caller tokens, including an ``--append-system-prompt-file``, are left
+    as they are. Claude Code 2.1.295+ applies such a file before the inline
+    prompt; 2.1.161 and 2.1.278 refuse to start with both.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
@@ -3205,13 +3078,23 @@ def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]
     """
     if not extra:
         return args
-    location = _locate_claude_option_value(args, "--append-system-prompt")
+    flag = "--append-system-prompt"
+    joined_prefix = f"{flag}="
+    location: tuple[int, int] | None = None
+    idx = 0
+    while idx < len(args) and args[idx] != "--":
+        if args[idx].startswith(joined_prefix):
+            location = (idx, len(joined_prefix))
+        elif args[idx] == flag and idx + 1 < len(args):
+            location = (idx + 1, 0)
+            idx += 1
+        idx += 1
     if location is None:
-        args.extend(["--append-system-prompt", extra])
+        args.extend([flag, extra])
         return args
-    idx, offset = location
-    existing = args[idx][offset:]
-    args[idx] = args[idx][:offset] + (f"{extra}\n\n{existing}" if existing else extra)
+    value_idx, offset = location
+    existing = args[value_idx][offset:]
+    args[value_idx] = args[value_idx][:offset] + (f"{extra}\n\n{existing}" if existing else extra)
     return args
 
 

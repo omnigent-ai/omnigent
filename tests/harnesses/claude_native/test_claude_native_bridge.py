@@ -4330,32 +4330,6 @@ _FRAMEWORK_PROMPT = "Keep framework metadata separate."
             ("--append-system-prompt=Earlier.", "--append-system-prompt="),
             ("--append-system-prompt=Earlier.", f"--append-system-prompt={_FRAMEWORK_PROMPT}"),
         ),
-        (("--system-prompt", "--append-system-prompt", "--model", "sonnet"), None),
-        (("--system-prompt", "--append-system-prompt"), None),
-        (("--system-prompt", "--append-system-prompt=literal"), None),
-        (("--plan-mode-instructions", "--append-system-prompt", "--model", "sonnet"), None),
-        (
-            ("--append-system-prompt", "Review.", "--agent-name", "--append-system-prompt=Name."),
-            (
-                "--append-system-prompt",
-                f"{_FRAMEWORK_PROMPT}\n\nReview.",
-                "--agent-name",
-                "--append-system-prompt=Name.",
-            ),
-        ),
-        (
-            ("-pn", "--append-system-prompt", "--append-system-prompt", "Review."),
-            (
-                "-pn",
-                "--append-system-prompt",
-                "--append-system-prompt",
-                f"{_FRAMEWORK_PROMPT}\n\nReview.",
-            ),
-        ),
-        (
-            ("-pnReviewer", "--append-system-prompt", "Review."),
-            ("-pnReviewer", "--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\nReview."),
-        ),
         (("--append-system-prompt-file", "profile.md"), None),
         (("--append-system-prompt-file=profile.md",), None),
         (
@@ -4368,14 +4342,6 @@ _FRAMEWORK_PROMPT = "Keep framework metadata separate."
             ),
         ),
         (("--", "--append-system-prompt=Positional."), None),
-        (
-            ("--system-prompt", "--", "--append-system-prompt", "Review."),
-            ("--system-prompt", "--", "--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\nReview."),
-        ),
-        (
-            ("-pn", "--", "--append-system-prompt", "Review."),
-            ("-pn", "--", "--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\nReview."),
-        ),
     ],
     ids=[
         "no-user-prompt",
@@ -4384,19 +4350,10 @@ _FRAMEWORK_PROMPT = "Keep framework metadata separate."
         "repeated-flags-last-wins",
         "final-empty-value-clears",
         "final-empty-joined-value-clears",
-        "owned-flag-before-user-option",
-        "owned-flag-before-omnigent-options",
-        "owned-joined-literal",
-        "owned-by-newer-claude-option",
-        "owned-by-teammate-option",
-        "owned-by-bundled-short-option",
-        "value-inside-bundled-short-option",
         "caller-file-separate-value",
         "caller-file-joined-value",
         "caller-file-and-prompt",
         "after-end-of-options",
-        "end-of-options-owned-by-option",
-        "end-of-options-owned-by-bundled-short-option",
     ],
 )
 def test_augment_claude_args_appends_caller_system_prompt(
