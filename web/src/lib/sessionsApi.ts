@@ -420,6 +420,9 @@ export class ApiError extends Error {
   }
 }
 
+const IMF_FIXDATE =
+  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
 /**
  * Parse a `Retry-After` header, either delta-seconds or an HTTP date.
  *
@@ -431,9 +434,10 @@ export function parseRetryAfterMs(value: string | null, now: number = Date.now()
   if (value === null) return null;
   const trimmed = value.trim();
   if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1_000;
-  // Every HTTP-date form starts with a day name; without this check
-  // Date.parse would read "-1" or "1.5" as a past date and return 0.
-  if (!/^[A-Za-z]{3,9},?\s/.test(trimmed)) return null;
+  // Only IMF-fixdate, the form RFC 9110 requires senders to use. Date.parse
+  // accepts far more ("-1", "Mon 1", "January 1, 2027"), and a misread hint
+  // would skip or stretch the backoff; anything else falls back to it.
+  if (!IMF_FIXDATE.test(trimmed)) return null;
   const date = Date.parse(trimmed);
   return Number.isNaN(date) ? null : Math.max(0, date - now);
 }

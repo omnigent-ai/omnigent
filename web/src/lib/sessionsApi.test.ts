@@ -112,6 +112,10 @@ describe("parseRetryAfterMs", () => {
     expect(parseRetryAfterMs("-1", now)).toBeNull();
     expect(parseRetryAfterMs("1.5", now)).toBeNull();
     expect(parseRetryAfterMs("2026-11-04", now)).toBeNull();
+    // Looser date forms Date.parse would accept, read as "now" or a far-off wait.
+    expect(parseRetryAfterMs("Mon 1", now)).toBeNull();
+    expect(parseRetryAfterMs("January 1, 2027", now)).toBeNull();
+    expect(parseRetryAfterMs("Wednesday, 04-Nov-26 00:00:05 GMT", now)).toBeNull();
   });
 });
 
