@@ -508,7 +508,7 @@ def test_changes_never_read_through_a_symlink_out_of_the_workspace(
         ]
 
 
-@pytest.mark.parametrize("change", ["rewritten-in-place", "replaced-at-the-same-size-and-time"])
+@pytest.mark.parametrize("change", ["rewritten-in-place", "replaced"])
 def test_changes_read_a_file_again_only_after_it_may_have_changed(
     registry: AgentEditFilesystemRegistry,
     monkeypatch: pytest.MonkeyPatch,
@@ -542,9 +542,12 @@ def test_changes_read_a_file_again_only_after_it_may_have_changed(
     assert len(opened) == 3
 
     compared = os.stat(target)
+    # Both keep the size and modification time; only ctime or the inode shows the change.
     if change == "rewritten-in-place":
-        target.write_text("changed!\n")
-        os.utime(target, ns=(compared.st_atime_ns, compared.st_mtime_ns + 1_000_000_000))
+        # Coarse timestamps can repeat within a clock tick, so rewrite until ctime moves.
+        while os.stat(target).st_ctime_ns == compared.st_ctime_ns:
+            target.write_text("changed!\n")
+            os.utime(target, ns=(compared.st_atime_ns, compared.st_mtime_ns))
     else:
         replacement = registry.cwd / "replacement"
         replacement.write_text("changed!\n")

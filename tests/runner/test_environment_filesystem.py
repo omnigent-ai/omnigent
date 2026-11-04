@@ -1859,6 +1859,8 @@ async def test_changes_keep_a_file_saved_as_the_readable_prefix_of_its_original(
 
     listed = (await client.get(f"{base}/changes")).json()["data"]
     assert [(e["path"], e["status"]) for e in listed] == [("big.txt", "modified")]
+    diff = (await client.get(f"{base}/diff/big.txt")).json()
+    assert (diff["before"], diff["after"], diff["baseline_state"]) == (None, "AAAAAAAA", "unknown")
 
 
 @pytest.mark.asyncio
