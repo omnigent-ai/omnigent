@@ -143,6 +143,9 @@ def prepare_managed_pi_agent_dir(
     *managed_dir*, applies *overlay* (e.g. Omnigent retry policy), and
     links supported resources, and preserves their relative settings paths.
     Linked resources are writable shared state; Pi may update MCP OAuth tokens.
+    MCP servers the host configures for Claude Code, Codex, or Cursor are added
+    through a managed ``mcp.json`` copy when the user's file lacks them (see
+    :func:`omnigent.inner.pi_mcp.sync_managed_pi_mcp_config`).
     Global context files (``AGENTS.md`` et al.) are linked so Pi applies them
     unless ``--no-context-files`` is set; ``SYSTEM.md``, ``APPEND_SYSTEM.md``
     and model credentials are not linked.
@@ -179,3 +182,6 @@ def prepare_managed_pi_agent_dir(
         return
 
     _symlink_agent_resources(managed_dir, agent_root)
+    from omnigent.inner.pi_mcp import sync_managed_pi_mcp_config
+
+    sync_managed_pi_mcp_config(managed_dir, agent_root)

@@ -27,6 +27,9 @@ implements them separately, so a fix for one harness does not reach the others.
   and New Chat only: the scheduled-task and project-settings pickers are untouched.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
+- `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
+  Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
+  and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
 - `gateway-attribution`: Unity Gateway requests name the coding agent and the
@@ -957,6 +960,14 @@ Cross-harness journeys:
   A 501 shows an update hint; inject a 404 from the tools route to retain plain
   rows without expansion. Confirm no raw config, schemas or synthetic secrets
   appear in responses/logs and no probe processes survive cancellation/timeout.
+- **`pi-host-mcp`:** run `tests/inner/test_pi_mcp.py` and, with Pi 0.99 or newer
+  on `PATH` or in `OMNIGENT_PI_PATH`, `tests/e2e/test_pi_native_host_mcp_e2e.py`
+  (it skips on older Pi). Manually, add a server to `~/.claude.json` only, start
+  `omnigent pi` with an Omnigent provider, and run `/mcp`: the server is listed
+  and connected. A same-name entry in `~/.pi/agent/mcp.json` replaces it, and
+  `{"name": {"enabled": false}}` there turns it off. `~/.pi/agent` stays unchanged.
+  A server whose env or headers use `${VAR}` connects only when the runner gets
+  that variable, for example through `OMNIGENT_RUNNER_ENV_PASSTHROUGH=VAR`.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.

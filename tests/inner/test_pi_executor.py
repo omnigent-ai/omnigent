@@ -2144,6 +2144,45 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
 
+def test_gateway_managed_dir_adds_host_mcp_servers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pi_host_mcp_servers: None,
+) -> None:
+    """The gateway's temporary agent dir merges host MCP servers into a private copy."""
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.inner import pi_mcp
+
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(global_agent))
+    host_server = ConfiguredMcpServer(
+        summary={"name": "docs", "harness": "codex"}, config={"command": "docs-mcp"}
+    )
+    monkeypatch.setattr(pi_mcp, "_host_mcp_servers", lambda: [host_server])
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+        _run(executor._get_gateway_token())
+
+    config = executor._build_env_and_dir(
+        [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
+    )
+    try:
+        managed_config = Path(config.env["PI_CODING_AGENT_DIR"]) / "mcp.json"
+        assert json.loads(managed_config.read_text(encoding="utf-8")) == {
+            "mcpServers": {"docs": {"command": "docs-mcp"}}
+        }
+        assert not (global_agent / "mcp.json").exists()
+    finally:
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Pi tool allowlist (--no-tools + --tools) tests — function-based per
 # the project's testing rules. ``--no-tools`` alone disables every tool
