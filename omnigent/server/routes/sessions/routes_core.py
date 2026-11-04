@@ -4519,6 +4519,7 @@ def register_core_routes(
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
+                side_chat_parent_id=source.id if body.side_chat else None,
             )
         except LookupError as exc:
             await drop_unused_copy()

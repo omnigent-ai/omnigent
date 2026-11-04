@@ -283,6 +283,11 @@ export interface BackgroundTaskInfo {
 export interface Session {
   sandboxProfile?: SandboxProfile | null;
   projectId?: string | null;
+  /**
+   * The session whose Workspace rail lists this one as a side chat; `null` for
+   * anything else, including side chats from before the rail was server-listed.
+   */
+  sideChatParentId?: string | null;
   id: string;
   agentId: string;
   /**

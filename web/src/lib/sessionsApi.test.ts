@@ -210,6 +210,7 @@ describe("createSession", () => {
       contextWindow: undefined,
       labels: undefined,
       projectId: null,
+      sideChatParentId: null,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       usageIncluded: true,

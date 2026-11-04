@@ -9040,6 +9040,17 @@
             "title": "Share Workspace Files",
             "type": "boolean"
           },
+          "side_chat_parent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Side Chat Parent Id"
+          },
           "side_chat_settings_supported": {
             "default": false,
             "title": "Side Chat Settings Supported",
@@ -9906,6 +9917,88 @@
           }
         },
         "title": "SetSharingRequest",
+        "type": "object"
+      },
+      "SideChatList": {
+        "description": "Paginated list of side chats; `data` is a page of `SideChatSummary`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SideChatSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SideChatList",
+        "type": "object"
+      },
+      "SideChatSummary": {
+        "description": "A side chat listed in its parent session's Workspace rail.",
+        "properties": {
+          "closed": {
+            "default": false,
+            "description": "Whether the side chat was closed, so its tab should close.",
+            "title": "Closed",
+            "type": "boolean"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds when the side chat was created.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Side-chat session id, e.g. `\"conv_side123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "object": {
+            "const": "side_chat",
+            "default": "side_chat",
+            "description": "Fixed resource type, always `\"side_chat\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "created_at"
+        ],
+        "title": "SideChatSummary",
         "type": "object"
       },
       "SkillContentResponse": {
@@ -19446,6 +19539,80 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/side_chats": {
+      "get": {
+        "description": "List the side chats shown as tabs in a session's Workspace rail.\n\nLists only the side chats the caller owns, in id order, so a reader of\na shared session learns nothing about anyone else's. Closed side chats\nare included, so other devices can close their tabs.\n\n**Returns:** A `PaginatedList` of `SideChatSummary`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
+        "operationId": "list_side_chats_v1_sessions__session_id__side_chats_get",
+        "parameters": [
+          {
+            "description": "Parent session id, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum side chats to return (1-1000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: the previous page's `last_id`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SideChatList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Side Chats",
+        "tags": [
+          "sessions"
         ]
       }
     },

@@ -11,6 +11,7 @@ from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
+    Exists,
     LargeBinary,
     Select,
     and_,
@@ -104,6 +105,7 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SIDE_CHAT_COPY_ID_PREFIX_LEN,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -335,6 +337,7 @@ def _to_conversation(
         background_work_running=meta.background_work_running if meta else None,
         blocked_on=meta.blocked_on if meta else None,
         project_id=meta.project_id if meta else None,
+        side_chat_parent_id=meta.side_chat_parent_id if meta else None,
     )
 
 
@@ -1068,6 +1071,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cost_control_mode_override: str | None = None,
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
+        side_chat_parent_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1235,6 +1239,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     terminal_launch_args=encoded_terminal_launch_args,
                     inference_snapshot=encoded_inference_snapshot,
                     project_id=project_id,
+                    side_chat_parent_id=side_chat_parent_id,
                 )
                 meta_sess.add(meta)
                 return meta
@@ -1598,6 +1603,76 @@ class SqlAlchemyConversationStore(ConversationStore):
                     ).limit(limit)
                 ).all()
             ]
+
+    def list_side_chat_ids(
+        self,
+        parent_id: str,
+        *,
+        owned_by: str | None,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> list[str]:
+        from omnigent.server.auth import LEVEL_OWNER
+
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        meta = SqlConversationMetadata
+        stmt = select(meta.id).where(
+            meta.workspace_id == current_workspace_id(),
+            meta.side_chat_parent_id == parent_id,
+        )
+        if after is not None:
+            stmt = stmt.where(meta.id > after)
+        if owned_by is not None:
+
+            def owns(conversation_id: QueryableAttribute[str] | str) -> Exists:
+                return (
+                    select(SqlSessionPermission.conversation_id)
+                    .where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == owned_by,
+                        SqlSessionPermission.conversation_id == conversation_id,
+                        SqlSessionPermission.level >= LEVEL_OWNER,
+                    )
+                    .exists()
+                )
+
+            # ponytail: reads the parent's side chats of every user to find the
+            # caller's; fine while a parent has a handful.
+            stmt = stmt.where(
+                or_(
+                    owns(meta.id),
+                    and_(meta.kind == encode_conversation_kind("sub_agent"), owns(parent_id)),
+                )
+            )
+        with self._session("list_side_chat_ids") as session:
+            return list(session.scalars(stmt.order_by(meta.id).limit(limit)))
+
+    def get_created_at_and_label(
+        self, conversation_ids: list[str], key: str
+    ) -> dict[str, tuple[int, str | None]]:
+        if not conversation_ids:
+            return {}
+        stmt = (
+            select(SqlConversation.id, SqlConversation.created_at, SqlConversationLabel.value)
+            .outerjoin(
+                SqlConversationLabel,
+                and_(
+                    SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
+                    SqlConversationLabel.conversation_id == SqlConversation.id,
+                    SqlConversationLabel.key == key,
+                ),
+            )
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id.in_(conversation_ids),
+            )
+        )
+        with self._conv_session("get_created_at_and_label") as ap_sess:
+            return {
+                conv_id: (created_at, value)
+                for conv_id, created_at, value in ap_sess.execute(stmt).all()
+            }
 
     def set_labels(
         self,
@@ -5353,6 +5428,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
         conversation_id: str | None = None,
+        side_chat_parent_id: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -5497,6 +5573,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: Id for the fork, chosen by a caller that must
             be able to remove it even if this call is interrupted; ``None``
             generates one.
+        :param side_chat_parent_id: The session whose Workspace rail lists the
+            fork as a side chat, e.g. ``"conv_abc123"``; written with the fork's
+            metadata. Its copied items get ids starting with the fork's first
+            ``SIDE_CHAT_COPY_ID_PREFIX_LEN`` id characters, so the side chat can
+            hide them.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -5532,6 +5613,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             project_id=project_id,
             file_id_map=file_id_map,
             created_by=created_by,
+            side_chat_parent_id=side_chat_parent_id,
         )
 
     def _fork_conversation_with_id(
@@ -5564,6 +5646,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        side_chat_parent_id: str | None = None,
     ) -> Conversation:
         """Body of :meth:`fork_conversation` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -5725,8 +5808,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Compaction cursors refer to item IDs. Since every copied item gets
             # a fresh ID, build the complete mapping before copying any payloads
             # so compaction records can point at the fork's boundary item.
+            copy_prefix = (
+                new_conv_id[:SIDE_CHAT_COPY_ID_PREFIX_LEN]
+                if side_chat_parent_id is not None
+                else ""
+            )
             copied_item_ids = {
-                src_item.id: generate_item_id(decode_item_type(src_item.type))
+                src_item.id: copy_prefix
+                + generate_item_id(decode_item_type(src_item.type))[len(copy_prefix) :]
                 for src_item in source_items
             }
 
@@ -6036,6 +6125,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     source_meta_ref.inference_snapshot if source_meta_ref else None
                 ),
                 project_id=project_id,
+                side_chat_parent_id=side_chat_parent_id,
             )
             if continue_source:
                 current = meta_sess.get(

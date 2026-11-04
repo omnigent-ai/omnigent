@@ -45,9 +45,12 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
+    SideChatList,
+    SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 # ``?descendants=true`` depth: the default matches the CLI tree and the web
 # Agents rail; the cap bounds the in-memory walk.
@@ -309,4 +312,70 @@ def register_items_routes(
             first_id=data[0].id if data else None,
             last_id=data[-1].id if data else None,
             has_more=start + limit < len(ordered),
+        )
+
+    # ── GET /sessions/{session_id}/side_chats ────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/side_chats",
+        response_model=None,
+        responses={200: {"model": SideChatList}},
+    )
+    async def list_side_chats(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None),
+    ) -> PaginatedList:
+        """
+        List the side chats shown as tabs in a session's Workspace rail.
+
+        Lists only the side chats the caller owns, in id order, so a reader of
+        a shared session learns nothing about anyone else's. Closed side chats
+        are included, so other devices can close their tabs.
+
+        :param request: Inbound HTTP request; carries the caller identity.
+        :param session_id: Parent session id, e.g. ``"conv_abc123"``.
+        :param limit: Maximum side chats to return (1-1000, default 100).
+        :param after: Cursor: the previous page's ``last_id``.
+        :returns: A :class:`PaginatedList` of :class:`SideChatSummary`.
+        :raises OmnigentError: 403 if the caller lacks READ on
+            ``session_id``; 404 if no session exists there.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        if access.conversation is None and (
+            await asyncio.to_thread(conversation_store.get_conversation, session_id) is None
+        ):
+            raise _session_not_found()
+        if auth_provider is not None and user_id is None:
+            # A signed-out reader of a public session owns no side chats.
+            return PaginatedList(data=[], has_more=False)
+        ids = await asyncio.to_thread(
+            conversation_store.list_side_chat_ids,
+            session_id,
+            owned_by=user_id,
+            after=after,
+            limit=limit + 1,
+        )
+        has_more = len(ids) > limit
+        ids = ids[:limit]
+        rows = await asyncio.to_thread(
+            conversation_store.get_created_at_and_label, ids, CLOSED_LABEL_KEY
+        )
+        return PaginatedList(
+            data=[
+                SideChatSummary(
+                    id=side_id,
+                    created_at=rows[side_id][0],
+                    closed=rows[side_id][1] == CLOSED_LABEL_VALUE,
+                )
+                for side_id in ids
+                if side_id in rows
+            ],
+            first_id=ids[0] if ids else None,
+            last_id=ids[-1] if ids else None,
+            has_more=has_more,
         )

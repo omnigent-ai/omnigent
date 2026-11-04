@@ -1486,6 +1486,25 @@ describe("WorkspacePanel browser tab", () => {
   });
 });
 
+describe("WorkspacePanel restored side chats", () => {
+  it("leaves a restored Codex side chat writable; the server seals dead ones", () => {
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    try {
+      // Restored from storage, e.g. on another device or after a reload.
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["conv_codex_side"],
+        selectedSideChatId: "conv_codex_side",
+      });
+      renderWorkspace({ rightRailTab: "sidechat" });
+
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "false");
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+});
+
 describe("WorkspacePanel mobile side chats", () => {
   const openTabs = () =>
     writeSessionWorkspaceState("conv_ws", {
