@@ -3915,6 +3915,34 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 
+  it("keeps a same-text send posted while a reopened session's first failed-input read is out", async () => {
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+    let answer: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      const response = defaultFetchHandler(input, init);
+      if (answer !== undefined || String(input) !== "/v1/sessions/conv_real/failed-inputs")
+        return response;
+      return new Promise<Response>((resolve) => {
+        answer = () => resolve(response);
+      });
+    });
+    await useChatStore.getState().switchTo("conv_real");
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    const newer: PendingUserMessage = {
+      tempId: "tmp_newer",
+      content: [{ type: "input_text", text: "saved on server" }],
+      posted: true,
+    };
+    useChatStore.setState({ pendingUserMessages: [newer] });
+
+    answer!();
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().failedSendDraft?.text).toBe("saved on server"),
+    );
+    expect(useChatStore.getState().pendingUserMessages).toEqual([newer]);
+  });
+
   it.each(["after", "before"])(
     "leaves out the failed startup inputs a reloaded draft already holds, cleared %s they're read",
     async (cleared) => {

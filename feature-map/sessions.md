@@ -236,6 +236,8 @@ only the grid, leaving sessions untouched. Unknown local grids show a recovery l
 Grids wait for account identity; if it is unavailable, use Reload to retry.
 Failed sends restore text and supported attachments unless the cell has a newer draft.
 Messages a failed launch or a reload hands back go after that draft instead.
+When they can't be read back, the cell's notice offers Retry, which reads them
+again; it does not relaunch the sandbox.
 Quoted replies recover as serialized text.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
