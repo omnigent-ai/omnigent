@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
@@ -285,6 +286,48 @@ describe("UserBubble literal text", () => {
     expect(screen.getByText("<code>").tagName).toBe("CODE");
     expect(screen.getAllByRole("listitem")).toHaveLength(2);
     expect(screen.getByTestId("message-bubble")).toHaveTextContent("<exact lines>");
+  });
+});
+
+describe("UserBubble message source", () => {
+  it.each([
+    ["conv_parent", "/c/conv_child", "/c/conv_parent"],
+    ["conv/../settings?tab=1#x", "/c/conv_child", "/c/conv%2F..%2Fsettings%3Ftab%3D1%23x"],
+    ["conv_parent", "/c/conv_child?debug=1&file=a.ts", "/c/conv_parent?debug=1"],
+  ])("names and links the agent session %s from %s", (sessionId, current, href) => {
+    render(
+      <MemoryRouter initialEntries={[current]}>
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_sent",
+            content: [{ type: "input_text", text: "Run the tests" }],
+            source: { sessionId, agentName: "Claude" },
+          }}
+          isLastAssistant={false}
+        />
+      </MemoryRouter>,
+    );
+
+    const label = screen.getByTestId("message-source");
+    expect(label).toHaveTextContent("From Claude");
+    expect(label).toHaveAttribute("href", href);
+    expect(screen.getByTestId("message-bubble")).toContainElement(label);
+  });
+
+  it("shows no sender on a message a person typed", () => {
+    render(
+      <BubbleView
+        bubble={{
+          kind: "user",
+          itemId: "user_typed",
+          content: [{ type: "input_text", text: "Run the tests" }],
+        }}
+        isLastAssistant={false}
+      />,
+    );
+
+    expect(screen.queryByTestId("message-source")).toBeNull();
   });
 });
 

@@ -42,6 +42,10 @@ export interface MessageItem extends BaseItem {
   stream_message_id?: string;
   /** Assistant-only harness label as stored, e.g. Codex `commentary`; may be newer than this client. */
   phase?: string;
+  /** Parent session whose agent sent this user message; server-verified. */
+  source_session_id?: string;
+  /** Display name of that sending agent, e.g. "Claude Code". */
+  source_agent_name?: string;
 }
 
 /** Codex `MessagePhase`: progress narration vs. (partial or final) answer text. */

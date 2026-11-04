@@ -74,3 +74,23 @@ def test_function_call_output_is_persisted() -> None:
     )
     assert result is not None
     assert result.type == "function_call_output"
+
+
+def test_streamed_message_cannot_claim_another_sender() -> None:
+    """Runner output cannot label a message as sent by another session's agent."""
+    result = _extract_persistent_item_from_sse(
+        _output_item_done(
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "from the parent"}],
+                "source_session_id": "conv_parent",
+                "source_agent_name": "planner",
+            }
+        )
+    )
+    assert result is not None
+    assert result.data.role == "user"
+    assert result.data.source_session_id is None
+    assert result.data.source_agent_name is None

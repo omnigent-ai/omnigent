@@ -3872,6 +3872,7 @@ async def test_sys_session_send_reuses_existing_child_session(
     assert "continued ok" not in payload["message"]
     assert event_posts[0]["created_by"] == "bob@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "continue"
+    assert event_posts[0]["data"]["source_session_id"] == "conv_parent"
     # The new turn's dispatch id is stamped on the child before its message
     # is posted, so a restart can tell this turn from the drained one.
     [stamp] = dispatch_stamps
@@ -3944,6 +3945,7 @@ async def test_sys_session_send_named_child_retries_without_rejected_actor(
     assert len(event_posts) == 2
     assert event_posts[0]["created_by"] == "bob@example.com"
     assert "created_by" not in event_posts[1]
+    assert [post["data"]["source_session_id"] for post in event_posts] == ["conv_parent_retry"] * 2
     assert delete_posts == 0
 
 
@@ -4009,6 +4011,9 @@ async def test_sys_session_send_existing_child_retries_without_rejected_actor(
     assert len(event_posts) == 2
     assert event_posts[0]["created_by"] == "bob@example.com"
     assert "created_by" not in event_posts[1]
+    assert [post["data"]["source_session_id"] for post in event_posts] == [
+        "conv_parent_existing"
+    ] * 2
 
 
 def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
@@ -8340,6 +8345,7 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
     assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
+    assert captured["initial_items"][0]["data"]["source_session_id"] == "conv_caller"
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child"
     assert handle["agent_id"] == "ag_x"
@@ -8491,6 +8497,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     # this is what starts the child's turn (same pattern as named send).
     assert len(event_bodies) == 1
     assert event_bodies[0]["data"]["content"][0]["text"] == "start"
+    assert event_bodies[0]["data"]["source_session_id"] == "conv_caller"
 
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child"
