@@ -566,7 +566,12 @@ it("keeps the lists when Updated is picked while a stored Name ordering lists by
   const { result } = renderHook(useSidebarData, { wrapper });
   await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
   fetchMock.mockClear();
-  act(() => result.current.updateView({ ordering: "updated" }));
+  await act(async () => {
+    result.current.updateView({ ordering: "updated" });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
   expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("updated");
   expect(result.current.mine.data).toBeDefined();
   expect(result.current.shared.data).toBeDefined();

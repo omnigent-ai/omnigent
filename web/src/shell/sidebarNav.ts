@@ -224,10 +224,8 @@ export function customSortOrder(order: SidebarCustomOrder): CustomSortOrder {
   return { since: order.since, positions: new Map(order.ids.map((id, index) => [id, index])) };
 }
 
-// Newest first; equal timestamps fall back to id, so arrival order never shows.
-// Freeze update timestamps for the active chat and hovered list; creation
-// timestamps stay immutable, including when the selected order changes. Name
-// sorts by the live title, A to Z.
+// Newest first, ties by id. Update times freeze for the active chat and hovered
+// list; creation times never move. Name sorts by title A to Z, without a freeze.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,

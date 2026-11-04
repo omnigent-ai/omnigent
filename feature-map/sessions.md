@@ -23,7 +23,8 @@ the header menu), and each place is a separate entry point.
   another row of the same list, project or group (or use Move up/down) to switch
   Ordering to Custom. Positions are saved on this device and new sessions appear
   above them; a drop on another project's row still files the session there.
-  Name ordering offers no reordering; choosing Custom from it starts from Updated.
+  Name ordering offers no reordering; choosing Custom from it restores saved
+  positions, or starts from Updated when there are none.
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
@@ -162,7 +163,7 @@ the header menu), and each place is a separate entry point.
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
   (Updated / Created / Name (A to Z) / Custom) and Show (Updated / Environment / Repo /
   Branch) submenus, saved per device. Created ordering keeps sessions newest-created
-  first as messages arrive; Name orders by title A to Z, ignoring case, with untitled
+  first as messages arrive; Name orders by title A to Z, ignoring ASCII letter case, with untitled
   sessions (“New session”) last;
   requests, pagination, and project folders use that order too. A server that
   can't sort by title lists Name as Updated and keeps the saved choice. Switching order
@@ -273,8 +274,9 @@ that slot.
 another row in the same list, project or group and release it; a line like the
 Pinned section's marks where it lands. Move up and Move down in the row menu or
 right-click menu do the same. On mobile, press and hold a row in the sidebar
-drawer, then drag it. Ordering → Custom in the filter menu keeps the order shown,
-except from Name, where it starts from Updated.
+drawer, then drag it. Ordering → Custom in the filter menu restores saved
+positions. Without them it keeps the order shown, or starts from Updated when
+leaving Name.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (mark as read or unread, archive, unarchive, delete).

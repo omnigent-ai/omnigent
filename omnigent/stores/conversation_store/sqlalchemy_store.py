@@ -3107,8 +3107,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Sort key: ``"created_at"``, ``"updated_at"``,
-            or ``"title"`` (case-insensitive, untitled last when
-            ascending).
+            or ``"title"`` (ignoring ASCII letter case, untitled last
+            when ascending).
         :param search_query: Case-insensitive substring filter on
             the session title OR conversation item content.
             ``None`` or empty string disables the filter;
