@@ -237,6 +237,13 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "status",
         "id",
     ]
+    assert runs_idx_cols["ix_scheduled_task_runs_conversation_status_scheduled"] == [
+        "workspace_id",
+        "conversation_id",
+        "status",
+        "scheduled_at",
+        "id",
+    ]
     unique_keys = {
         key["name"]: key["column_names"]
         for key in insp.get_unique_constraints("scheduled_task_runs")
@@ -938,7 +945,7 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
 def test_run_outcome_migration_keeps_existing_runs_and_round_trips(
     dispatch_migration_engine: Engine,
 ) -> None:
-    """Existing runs get no outcome; downgrade drops recorded outcomes but keeps the runs."""
+    """Existing runs get no outcome; downgrade drops recorded outcomes and the index, not runs."""
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
     with engine.begin() as conn:
@@ -981,5 +988,14 @@ def test_run_outcome_migration_keeps_existing_runs_and_round_trips(
         command.downgrade(config, _SESSION_MODE_REVISION)
     columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")}
     assert not columns & _RUN_OUTCOME_COLUMNS
+    assert "ix_scheduled_task_runs_conversation_status_scheduled" not in _conversation_indexes(
+        engine
+    )
     with engine.begin() as conn:
         assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _RUN_OUTCOME_REVISION)
+    assert _conversation_indexes(engine)[
+        "ix_scheduled_task_runs_conversation_status_scheduled"
+    ] == ["workspace_id", "conversation_id", "status", "scheduled_at", "id"]

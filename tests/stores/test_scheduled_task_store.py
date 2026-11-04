@@ -1421,12 +1421,77 @@ def test_record_run_outcome_targets_the_latest_run_of_a_continued_session(
         conversation_id=_uid("conv_cont"),
         fired_at=201,
     )
+    # Later firings that never delivered their prompt don't take the outcome.
+    for later, status, at in (("failed", "failed", 300), ("skipped", "skipped", 400)):
+        store.create_run(
+            run_id=_uid(f"run_cont_{later}"),
+            scheduled_task_id=_uid("task_cont"),
+            status=status,
+            scheduled_at=at,
+            conversation_id=_uid("conv_cont"),
+            fired_at=at + 1,
+            finished_at=at + 2,
+        )
     recorded = store.record_run_outcome(
-        _uid("conv_cont"), success=True, emoji="🧹", text="Closed 3 stale PRs", recorded_at=250
+        _uid("conv_cont"), success=True, emoji="🧹", text="Closed 3 stale PRs", recorded_at=450
     )
     assert recorded is not None and recorded.id == _uid("run_cont_2")
     runs, _ = store.list_runs(_uid("task_cont"))
-    assert {r.id: r.outcome_success for r in runs} == {_uid("run_cont_2"): True, run_id: None}
+    assert {r.id: r.outcome_success for r in runs} == {
+        _uid("run_cont_skipped"): None,
+        _uid("run_cont_failed"): None,
+        _uid("run_cont_2"): True,
+        run_id: None,
+    }
+    # Once the newer run's turn is done its prompt still counts as delivered.
+    store.update_run(_uid("run_cont_2"), status="succeeded", finished_at=460)
+    store.create_run(
+        run_id=_uid("run_cont_3"),
+        scheduled_task_id=_uid("task_cont"),
+        status="succeeded",
+        scheduled_at=500,
+        conversation_id=_uid("conv_cont"),
+        fired_at=501,
+        finished_at=502,
+    )
+    newest = store.record_run_outcome(
+        _uid("conv_cont"), success=False, emoji="🚧", text="CI is down", recorded_at=510
+    )
+    assert newest is not None and newest.id == _uid("run_cont_3")
+
+
+def test_record_run_outcome_reads_one_indexed_row_per_status(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Each lookup is a LIMIT 1 walk of the session's status index, never a sort of its history."""
+    from sqlalchemy import event
+
+    _seed_running_run(store, "plan_outcome")
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT") and "FROM scheduled_task_runs" in statement:
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        store.record_run_outcome(
+            _uid("conv_plan_outcome"), success=True, emoji="✅", text="Done", recorded_at=1
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    lookups = [(st, p) for st, p in queries if "ORDER BY" in st]
+    assert len(lookups) == 2
+    assert all("LIMIT" in statement for statement, _ in lookups)
+    if store._engine.dialect.name != "sqlite":
+        return
+    with store._engine.connect() as connection:
+        for statement, parameters in lookups:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            assert "ix_scheduled_task_runs_conversation_status_scheduled" in plan
+            assert "SEARCH" in plan and "TEMP B-TREE" not in plan
 
 
 def test_record_run_outcome_none_without_a_run(store: SqlAlchemyScheduledTaskStore) -> None:

@@ -11,7 +11,7 @@ from operator import ge, gt, le, lt
 from typing import Any, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
-from sqlalchemy.engine import CursorResult
+from sqlalchemy.engine import CursorResult, Row
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -77,6 +77,13 @@ _PENDING_RUN_FILTER = (
     SqlScheduledTaskRun.lease_expires_at.is_(None),
     SqlScheduledTaskRun.trigger_key.is_not(None),
 )
+
+
+# Run statuses whose prompt reached the session: a new session's run is
+# ``running`` until its turn ends, and a continued session's run is
+# ``succeeded`` once its prompt is delivered. ``scheduled``/``starting`` runs
+# and runs that failed or were skipped before delivery never carried a prompt.
+_DELIVERED_RUN_STATUSES = ("running", "succeeded")
 
 
 def _purge_finished_deleted_task(
@@ -923,22 +930,38 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         text: str,
         recorded_at: int,
     ) -> ScheduledTaskRun | None:
-        """Record the agent's outcome on the conversation's latest run.
+        """Record the agent's outcome on the conversation's latest delivered run.
 
-        Takes the task lock before the run's, like :meth:`update_run`, so it
-        cannot deadlock with a task deletion purging the same run.
+        One single-row read per delivered status, each a backward walk of
+        ``ix_scheduled_task_runs_conversation_status_scheduled``, so a continued
+        session's run history is never scanned. Takes the task lock before the
+        run's, like :meth:`update_run`, so it cannot deadlock with a task
+        deletion purging the same run.
         """
 
-        def write(session: Session) -> ScheduledTaskRun | None:
-            latest = session.execute(
-                select(SqlScheduledTaskRun.id, SqlScheduledTaskRun.scheduled_task_id)
+        def newest(session: Session, status: str) -> Row[tuple[str, str, int]] | None:
+            return session.execute(
+                select(
+                    SqlScheduledTaskRun.id,
+                    SqlScheduledTaskRun.scheduled_task_id,
+                    SqlScheduledTaskRun.scheduled_at,
+                )
                 .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
                 .where(SqlScheduledTaskRun.conversation_id == conversation_id)
+                .where(SqlScheduledTaskRun.status == encode_scheduled_task_run_status(status))
                 .order_by(SqlScheduledTaskRun.scheduled_at.desc(), SqlScheduledTaskRun.id.desc())
                 .limit(1)
             ).first()
-            if latest is None:
+
+        def write(session: Session) -> ScheduledTaskRun | None:
+            delivered = [
+                row
+                for row in (newest(session, status) for status in _DELIVERED_RUN_STATUSES)
+                if row is not None
+            ]
+            if not delivered:
                 return None
+            latest = max(delivered, key=lambda row: (row.scheduled_at, row.id))
             task = session.get(
                 SqlScheduledTask,
                 (current_workspace_id(), latest.scheduled_task_id),

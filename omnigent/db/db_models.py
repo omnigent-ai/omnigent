@@ -1713,4 +1713,15 @@ class SqlScheduledTaskRun(OmnigentBase):
             "status",
             "id",
         ),
+        # A session's newest run in one status, read backward: recording an
+        # outcome looks up the latest delivered run of a continued session,
+        # which collects one run per firing.
+        Index(
+            "ix_scheduled_task_runs_conversation_status_scheduled",
+            "workspace_id",
+            "conversation_id",
+            "status",
+            "scheduled_at",
+            "id",
+        ),
     )

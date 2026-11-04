@@ -365,6 +365,18 @@ async def test_agent_mutations_validate_origin_at_http_boundary(
         assert updated.status_code == expected_status, updated.text
         stored = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
         assert stored.json()["state"] == ("paused" if expected_status == 200 else "active")
+        # Recording a run's outcome takes the same runner-origin check.
+        run_id = uuid.uuid4().hex
+        _seed_run(db_uri, task_id, run_id, status="running", conversation_id=source.id)
+        outcome = await client.put(
+            "/v1/scheduled-tasks/run-outcome",
+            json={"session_id": source.id, "success": True, "emoji": "✅", "text": "Done"},
+            headers=headers,
+        )
+        assert outcome.status_code == expected_status, outcome.text
+        recorded = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(source.id)
+        assert recorded is not None
+        assert recorded.outcome_success is (True if expected_status == 200 else None)
 
 
 async def test_automations_gate_is_checked_per_request(
@@ -1766,6 +1778,8 @@ async def test_list_runs_returns_history_for_owned_task(
     assert newest["scheduled_task_id"] == task_id
     # The free-text error blob is not exposed on the run list.
     assert "error" not in newest
+    # No agent recorded an outcome for either run.
+    assert [r["outcome"] for r in runs] == [None, None]
     # The run's session doesn't exist, so it carries no session read state.
     assert newest["conversation_updated_at"] is None
     assert newest["conversation_status"] is None
@@ -3320,34 +3334,25 @@ async def test_run_outcome_is_recorded_from_the_runner_and_listed(
     assert runs[0]["outcome"]["text"] == "Shipped"
 
 
-async def test_runs_without_an_outcome_list_null(
-    auth_client: httpx.AsyncClient, db_uri: str
-) -> None:
-    run_id, _, _ = await _seed_fired_session(auth_client, db_uri)
-    tasks = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
-    task_id = tasks["scheduled_tasks"][0]["id"]
-    runs = (
-        await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
-    ).json()
-    assert [(r["id"], r["outcome"]) for r in runs["runs"]] == [(run_id, None)]
-
-
 @pytest.mark.parametrize(
     ("case", "expected_status"),
     [
         ("other-source", 403),
         ("unowned-session", 404),
         ("no-run", 404),
-        ("letters-in-emoji", 422),
-        ("empty-text", 422),
+        ("failed-before-delivery", 404),
         ("long-text", 422),
-        ("non-boolean-success", 422),
     ],
 )
 async def test_run_outcome_rejections(
     auth_client: httpx.AsyncClient, db_uri: str, case: str, expected_status: int
 ) -> None:
-    """Bad input, a foreign or unowned session, or a session with no run record nothing."""
+    """A foreign or unowned session, no delivered run, or a bad body records nothing.
+
+    Field-level validation is covered against ``RecordRunOutcomeRequest`` in
+    ``tests/server/routes/test_scheduled_task_run_outcome_request.py``; one case
+    here checks a rejected body never reaches the store.
+    """
     run_id, session_id, headers = await _seed_fired_session(
         auth_client, db_uri, owner_level=1 if case == "unowned-session" else 4
     )
@@ -3366,16 +3371,17 @@ async def test_run_outcome_rejections(
         SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", other.id, 4)
         body["session_id"] = other.id
         headers = _headers()
-    elif case == "letters-in-emoji":
-        body["emoji"] = "ok"
-    elif case == "empty-text":
-        body["text"] = "   "
+    elif case == "failed-before-delivery":
+        SqlAlchemyScheduledTaskStore(db_uri).update_run(
+            run_id, status="failed", finished_at=1003, error_code="launch_failed"
+        )
     elif case == "long-text":
         body["text"] = "x" * 81
-    elif case == "non-boolean-success":
-        body["success"] = "yes"
     resp = await auth_client.put("/v1/scheduled-tasks/run-outcome", json=body, headers=headers)
     assert resp.status_code == expected_status, resp.text
-    run = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(session_id)
-    assert run is not None and run.id == run_id
-    assert run.outcome_success is None
+    tasks = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    task_id = tasks["scheduled_tasks"][0]["id"]
+    runs = (
+        await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    ).json()
+    assert [(r["id"], r["outcome"]) for r in runs["runs"]] == [(run_id, None)]

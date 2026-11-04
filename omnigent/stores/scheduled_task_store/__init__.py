@@ -389,13 +389,18 @@ class ScheduledTaskStore(ABC):
         recorded_at: int,
     ) -> ScheduledTaskRun | None:
         """
-        Record the agent's outcome on the conversation's latest run.
+        Record the agent's outcome on the conversation's latest delivered run.
 
-        The latest run is the one whose prompt the conversation's current turn
-        answers: a new-session task has one run per conversation, and a
-        continued session's newest run carries the prompt it last received. A
-        later call overwrites the earlier outcome. ``status`` is left alone, so
-        a run that finished but missed its goal stays ``succeeded`` with
+        A delivered run is one whose prompt reached the session: ``running``
+        (a new session's run until its turn ends) or ``succeeded`` (also a
+        continued session's run once its prompt is delivered). Of those, the
+        newest by ``scheduled_at`` gets the outcome, so a later firing that is
+        still starting, or that failed or was skipped before delivering its
+        prompt, does not take an earlier turn's outcome. If a continued
+        session receives the next firing's prompt while still working on the
+        previous one, the outcome lands on the newer run. A later call
+        overwrites the earlier outcome. ``status`` is left alone, so a run that
+        finished but missed its goal stays ``succeeded`` with
         ``outcome_success`` ``False``. Workspace-scoped like every other store
         read.
 
@@ -405,8 +410,8 @@ class ScheduledTaskStore(ABC):
         :param text: A few words on the outcome, e.g. ``"Opened 2 PRs"``.
         :param recorded_at: Unix epoch seconds of this recording.
         :returns: The updated :class:`ScheduledTaskRun`, or ``None`` when the
-            conversation has no run (it was not started by a scheduled task) or
-            the run's task is gone.
+            conversation has no delivered run (for example, it was not started
+            by a scheduled task) or the run's task is gone.
         """
         ...
 

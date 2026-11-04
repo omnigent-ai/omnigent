@@ -346,11 +346,14 @@ in its prompt. The agent records that separately with the
 `PUT /v1/scheduled-tasks/run-outcome`. The note added to every fired prompt asks
 the agent to call it once, before its final reply.
 
-- The outcome is a boolean `success`, one emoji, and a few words (at most 80
-  characters), e.g. `🚀 Opened 2 PRs`. The run list returns it as `outcome`,
+- The outcome is a boolean `success`, exactly one emoji, and a few words (at
+  most 80 characters), e.g. `🚀 Opened 2 PRs`. The run list returns it as `outcome`,
   or `null` when the agent recorded none.
-- It goes on the calling session's latest run: a new-session task's only run,
-  or a continued session's newest. A later call replaces the earlier outcome.
+- It goes on the calling session's newest delivered run: `running` or
+  `succeeded`, newest by `scheduled_at`. A new-session task has one such run;
+  a continued session has one per delivered firing. A firing still starting,
+  or failed or skipped before delivery, never takes the outcome. A later call
+  replaces the earlier outcome.
 - The runner always sends its own session, so an agent cannot record on
   another session's run. Like task changes from an agent, the server checks
   that the session's bound runner sent the call. The owner can also set it
