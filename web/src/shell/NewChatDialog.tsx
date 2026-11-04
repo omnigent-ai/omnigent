@@ -150,6 +150,7 @@ import {
   isCodexHarness,
   isNativeCursorHarness,
   isNativeOpenCodeHarness,
+  MIN_TMUX_VERSION,
   skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
@@ -889,6 +890,17 @@ function harnessWarningMessage(
         {agentName} needs OpenCode 2.0 on {hostName} — run{" "}
         <code>npm i -g @opencode/cli@2.0.32</code> (after <code>npm rm -g opencode-ai</code>) or{" "}
         <code>omni setup</code> on that machine.
+      </>
+    );
+  }
+  // Native harnesses run in tmux on the host. The desktop app keeps the PATH it
+  // started with, so a tmux installed later may need an app restart to be seen.
+  if (reason === "tmux-unavailable") {
+    return (
+      <>
+        {agentName} needs tmux {MIN_TMUX_VERSION} or newer on {hostName}. Install it (macOS:{" "}
+        <code>brew install tmux</code>), then check again. If Omnigent still can&apos;t find it,
+        quit and reopen the Omnigent app.
       </>
     );
   }
@@ -2294,10 +2306,10 @@ export function NewChatLandingScreen() {
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
     navigate(
-      { search: remaining.toString(), hash: location.hash },
+      { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [linkedPrompt, searchParams, location.hash, location.state, navigate]);
+  }, [linkedPrompt, searchParams, location.pathname, location.hash, location.state, navigate]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -6361,7 +6373,9 @@ export function NewChatLandingScreen() {
           gutters) keeps the composer from feeling cramped against the
           viewport edges on phones. */}
       <div className="flex min-h-0 w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-[max(20px,env(safe-area-inset-bottom))] md:pb-16 md:select-none">
-        <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 md:flex-none">
+        {/* On phones the heading yields its height first, so a long draft cannot
+            push Send below the keyboard. */}
+        <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 max-md:min-h-0 max-md:overflow-hidden md:flex-none">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
             // icon — the default pink folder, or a chosen emoji — and name the

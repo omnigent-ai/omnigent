@@ -418,7 +418,7 @@ function TemplateGallery({
               key={template.id}
               type="button"
               aria-label={template.title}
-              aria-describedby={`${detailsId}-description ${detailsId}-schedule ${detailsId}-requirements`}
+              aria-describedby={`${detailsId}-description ${detailsId}-requirements`}
               onClick={() => onPick(template.id)}
               data-testid={template.testId}
               className="flex cursor-pointer items-start gap-4 rounded-xl p-4 text-left text-ui transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -430,13 +430,6 @@ function TemplateGallery({
                 <span className="font-medium">{template.title}</span>
                 <span id={`${detailsId}-description`} className="text-muted-foreground">
                   {template.description}
-                </span>
-                <span
-                  id={`${detailsId}-schedule`}
-                  className="flex items-center gap-2 text-muted-foreground"
-                >
-                  <ClockIcon className="size-4 shrink-0" />
-                  Checks every hour
                 </span>
                 <span id={`${detailsId}-requirements`} className="text-xs text-muted-foreground">
                   {template.needs}

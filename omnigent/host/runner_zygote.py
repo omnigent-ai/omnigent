@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import BinaryIO
 
+import psutil
+
 from omnigent.inner import _proc
 from omnigent.process_logging import child_logging_popen_kwargs
 from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
@@ -65,7 +67,7 @@ class ZygoteRunnerProc:
     """A ``subprocess.Popen``-shaped handle for a zygote-forked runner.
 
     Implements only the surface the daemon uses on a runner handle: ``pid``,
-    ``poll()``, ``returncode``, ``wait()``, ``terminate()``, ``kill()``. Exit
+    ``poll()``, ``returncode``, ``wait()``, ``terminate()``, ``kill()``, ``stop()``. Exit
     status comes from the zygote (the real parent); signals go to the pid.
 
     :param pid: The forked runner's process id.
@@ -82,6 +84,10 @@ class ZygoteRunnerProc:
             manager._generation if zygote_generation is None else zygote_generation
         )
         self.returncode: int | None = None
+        try:
+            self._process: psutil.Process | None = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            self._process = None
 
     def poll(self) -> int | None:
         """Return the exit code if the runner has exited, else ``None``.
@@ -120,6 +126,29 @@ class ZygoteRunnerProc:
         """Send ``SIGKILL`` to the runner (best-effort)."""
         self._signal(getattr(signal, "SIGKILL", signal.SIGTERM))
 
+    def stop(self, timeout: float = 5.0) -> None:
+        """Terminate without waiting for forkserver IPC, then escalate after *timeout*.
+
+        The captured process identity protects against PID reuse. Only the
+        forkserver poller may consume and cache this child's actual exit code.
+        """
+        process = self._process
+        if self.returncode is not None or process is None:
+            return
+        with contextlib.suppress(psutil.NoSuchProcess):
+            for send_signal in (process.terminate, process.kill):
+                if not process.is_running() or not _proc.process_alive(self.pid):
+                    return
+                send_signal()
+                deadline = time.monotonic() + timeout
+                while process.is_running() and _proc.process_alive(self.pid):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.05, remaining))
+                else:
+                    return
+
     def _signal(self, sig: int) -> None:
         """Signal the runner pid, ignoring an already-exited process.
 
@@ -132,8 +161,7 @@ class ZygoteRunnerProc:
 class ZygoteManager:
     """Owns the daemon's connection to the runner zygote forkserver.
 
-    Thread-safe: ``fork_runner`` is typically driven from ``asyncio.to_thread``
-    while ``poll`` runs on the event-loop thread, so every control exchange is
+    Thread-safe: all fork and poll control exchanges are synchronous and
     serialized under one lock.
 
     :param python_executable: Interpreter to launch the zygote with; defaults
@@ -259,6 +287,9 @@ class ZygoteManager:
                 stderr=log_fh,
                 # Avoid pinning the daemon's potentially transient cwd.
                 cwd="/",
+                # Own session, inherited by every fork: a hangup of the daemon's
+                # terminal must not reach runners or harnesses mid-turn.
+                **_proc.spawn_kwargs(),
             )
 
     def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> ZygoteRunnerProc:
