@@ -27,6 +27,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from sqlalchemy import update
+from starlette.datastructures import Headers
 
 import omnigent.runtime
 from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
@@ -44,6 +45,8 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import routes_core, routes_events
+from omnigent.server.schemas import SessionEventInput
+from omnigent.server.startup_inputs import ManagedStartupInputs
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
@@ -901,6 +904,7 @@ async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize
         (200, "starting", 400, "Stop the current turn"),
         (200, "skill_starting", 400, "Stop the current turn"),
         (200, "failed_starting", 400, "Stop the current turn"),
+        (200, "startup_pending", 400, "Wait for this session's first message"),
         (200, "none", 503, "runner is offline"),
         (200, "editor", 403, ""),
         (200, "sub_agent", 400, "only available in a top-level session"),
@@ -908,6 +912,7 @@ async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize
     ],
 )
 async def test_claude_sdk_clear_refusals_create_no_session(
+    auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
     db_uri: str,
     auth_live_runner: LiveRunner,
@@ -919,8 +924,9 @@ async def test_claude_sdk_clear_refusals_create_no_session(
 ) -> None:
     """A refused ``clear`` creates, initializes and supersedes nothing.
 
-    A busy, failing or unreachable runner, a running turn or one still
-    reaching its runner, no placement, a non-owner, a sub-agent or a side chat refuses it.
+    A busy, failing or unreachable runner, a running turn, one still reaching
+    its runner or saved for startup, no placement, a non-owner, a sub-agent or
+    a side chat refuses it.
     The caller and session checks run before the runner frees the client, so
     only a runner refusal reaches the runner.
     """
@@ -964,6 +970,13 @@ async def test_claude_sdk_clear_refusals_create_no_session(
             )
         )
         await asyncio.wait_for(recovering.wait(), timeout=10)
+    elif placement == "startup_pending":
+        # A saved first message the startup service has yet to deliver.
+        startup = ManagedStartupInputs(store, auth_app.state.host_registry)
+        monkeypatch.setattr(auth_app.state, "startup_inputs", startup)
+        await startup.enqueue(
+            source_id, SessionEventInput(**_MESSAGE_INPUT), user_id=_OWNER, headers=Headers()
+        )
     elif placement == "running":
         monkeypatch.setitem(sessions_module._session_status_cache, source_id, "running")
     elif placement == "editor":

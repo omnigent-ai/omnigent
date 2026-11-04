@@ -512,6 +512,8 @@ class ManagedStartupInputs:
             )
             raise
         except Exception as exc:
+            if await self._waits_out_session_move(session_id, exc):
+                return
             log_delivery(
                 "scheduled_run_stage_failed",
                 session_id=session_id,
@@ -549,6 +551,23 @@ class ManagedStartupInputs:
             )
         finally:
             self._deliveries.pop(key, None)
+
+    async def _waits_out_session_move(self, session_id: str, exc: Exception) -> bool:
+        """Whether *exc* refused delivery only while ``/clear`` moves the session.
+
+        The input stays queued; the host worker delivers it once the move
+        ends, as after any other transient wait.
+        """
+        from omnigent.server.routes._sessions.orchestration import _session_is_moving
+
+        if not (
+            isinstance(exc, OmnigentError)
+            and exc.code == ErrorCode.CONFLICT
+            and _session_is_moving(session_id)
+        ):
+            return False
+        _logger.info("Saved message for session %s waits for /clear to finish", session_id)
+        return True
 
     async def retry(self, session_id: str) -> bool:
         changed = False

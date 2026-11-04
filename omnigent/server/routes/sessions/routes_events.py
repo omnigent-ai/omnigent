@@ -1311,14 +1311,15 @@ def register_events_routes(
             await _require_access_and_level(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
+        # Checked and marked with no await between, so an input and a
+        # ``/clear`` moving the session cannot both proceed. Covers saved
+        # startup inputs too, which are dispatched without ``in_flight``.
+        if body.type in _TURN_STARTING_EVENT_TYPES and _session_is_moving(session_id):
+            raise OmnigentError(
+                "This chat is moving to a new session; send the message there.",
+                code=ErrorCode.CONFLICT,
+            )
         if in_flight is not None:
-            # Checked and marked with no await between, so a message and a
-            # ``/clear`` moving the session cannot both proceed.
-            if _session_is_moving(session_id):
-                raise OmnigentError(
-                    "This chat is moving to a new session; send the message there.",
-                    code=ErrorCode.CONFLICT,
-                )
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.
             in_flight.enter_context(_mark_dispatch_in_flight(session_id))

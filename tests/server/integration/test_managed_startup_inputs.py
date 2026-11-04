@@ -669,6 +669,38 @@ async def test_native_mirror_retry_does_not_consume_next_identical_input(
     assert len([item for item in snapshot["items"] if item["type"] == "message"]) == 2
 
 
+async def test_saved_input_waits_while_clear_moves_the_session(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved input delivered while ``/clear`` moves the session stays queued.
+
+    It is neither run in the session being moved nor marked failed; the next
+    delivery attempt after the move sends it.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    env = startup_env
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        session_id = await _create(env)
+        saved = _bind(env, session_id)
+        startup = env.app.state.startup_inputs
+
+        with orchestration._mark_session_moving(session_id):
+            await startup._deliver(env.app, session_id, saved)
+
+        [pending] = env.conv_store.list_pending_inputs(session_id)
+        assert (pending.id, pending.status) == (saved.id, "in_progress")
+        assert env.conv_store.list_items(session_id).data == []
+        assert not [event for event in forwarded if event.get("type") == "message"]
+
+        await startup._deliver(env.app, session_id, saved)
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+    finally:
+        await runner.aclose()
+
+
 async def test_pending_input_retains_request_options_on_service_restart(startup_env: _Env) -> None:
     env = startup_env
     event = {**_INPUT, "model_override": "chosen-model", "tools": []}
