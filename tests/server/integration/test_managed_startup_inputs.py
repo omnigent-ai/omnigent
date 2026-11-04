@@ -1067,22 +1067,25 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
         "omnigent.server.routes.sessions.routes_events._evaluate_input_policy", evaluate
     )
 
-    async def send(sender: str, text: str, replaces: list[str] | None = None) -> httpx.Response:
+    async def send(
+        sender: str, text: str, replaces: list[str] | None = None, stable_id: str | None = None
+    ) -> httpx.Response:
         auth_client.headers["X-Forwarded-Email"] = sender
         event: dict[str, Any] = {
             "type": "message",
             "data": {
                 "role": "user",
                 "content": [{"type": "input_text", "text": text}],
-                "stable_id": uuid4().hex,
+                "stable_id": stable_id or uuid4().hex,
             },
         }
         if replaces is not None:
             event["replaces_failed_inputs"] = replaces
         return await auth_client.post(f"/v1/sessions/{session_id}/events", json=event)
 
+    stable_ids = {text: uuid4().hex for text in ("first", "from bob", "second")}
     for sender, text in (("alice", "first"), ("bob", "from bob"), ("alice", "second")):
-        response = await send(sender, text)
+        response = await send(sender, text, stable_id=stable_ids[text])
         assert response.status_code == 202, response.text
     url = f"/v1/sessions/{session_id}/failed-inputs"
     auth_client.headers["X-Forwarded-Email"] = "alice"
@@ -1114,6 +1117,10 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     # One saved input per page, so another sender's leaves an empty page.
     assert await read_all("alice") == (["first", "second"], 3)
     assert await read_all("bob") == (["from bob"], 3)
+    # Each names its saved item, so a client can match it to the send it made.
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    entries = sorted((await auth_client.get(url)).json()["data"], key=lambda e: e["position"])
+    assert [entry["item_id"] for entry in entries] == [stable_ids["first"], stable_ids["second"]]
     for cursor in ("-1", "x", "A" * 32, "0" * 31):
         response = await auth_client.get(url, params={"after": cursor})
         assert response.status_code == 422, response.text
@@ -1123,7 +1130,8 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     response = await send("alice", "first", replaces=[pending_ids["first"]])
     assert response.status_code == 503, response.text
     assert await read_all("alice") == (["first", "second"], 3)
-    runner = _stub_runner(monkeypatch)
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
     try:
         # An accepted send that names no inputs, or names another sender's, leaves them.
         response = await send("alice", "unrelated")
@@ -1143,6 +1151,7 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
         response = await send("alice", "first", replaces=[pending_ids["first"]])
         assert response.status_code == 202, response.text
         assert await read_all("alice") == (["second"], 2)
+        assert forwarded and all("replaces_failed_inputs" not in event for event in forwarded)
 
         async def store_unavailable(*_: Any) -> None:
             raise RuntimeError("store unavailable")

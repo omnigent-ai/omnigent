@@ -22,6 +22,7 @@ import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitles
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
+  FailedInput,
   ModelUsage,
   NativeModelOption,
   NestedSessionItem,
@@ -108,6 +109,7 @@ interface PendingInputWire {
 
 interface FailedInputWire extends PendingInputWire {
   position: number;
+  item_id?: string;
 }
 
 const MAX_FAILED_INPUT_PAGES = 10;
@@ -1277,7 +1279,7 @@ export async function getSessionSlim(
 export async function listFailedInputs(
   sessionId: string,
   options: { signal?: AbortSignal } = {},
-): Promise<PendingInput[]> {
+): Promise<FailedInput[]> {
   const entries: FailedInputWire[] = [];
   let after: string | null = null;
   // Sequential: each request needs the previous page's cursor.
@@ -1300,7 +1302,12 @@ export async function listFailedInputs(
   }
   /* oxlint-enable no-await-in-loop */
   // Pages follow item ids, so positions restore the order the messages were sent in.
-  return entries.sort((a, b) => a.position - b.position).map(pendingInputFromWire);
+  return entries
+    .sort((a, b) => a.position - b.position)
+    .map((entry) => ({
+      ...pendingInputFromWire(entry),
+      ...(entry.item_id !== undefined ? { itemId: entry.item_id } : {}),
+    }));
 }
 
 export interface SessionSignInLink {

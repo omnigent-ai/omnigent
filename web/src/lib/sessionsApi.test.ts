@@ -1488,6 +1488,7 @@ describe("listFailedInputs", () => {
               pending_id: "pending_1",
               content: [{ type: "input_text", text: "second" }],
               created_by: "user_1",
+              item_id: "a1",
               position: 7,
             },
           ],
@@ -1527,6 +1528,7 @@ describe("listFailedInputs", () => {
         pendingId: "pending_1",
         content: [{ type: "input_text", text: "second" }],
         createdBy: "user_1",
+        itemId: "a1",
       },
     ]);
   });

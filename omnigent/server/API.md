@@ -830,7 +830,7 @@ already includes usage, so clients should not issue the separate request.
 ```
 GET /v1/sessions/{session_id}/failed-inputs[?limit=100&after=<next_cursor>]
 
-200 OK — {"data": [{pending_id, content, position}], "next_cursor": string|null}
+200 OK — {"data": [{pending_id, item_id, content, position}], "next_cursor": string|null}
 404 Not Found — no session with that id is visible to the caller
 422 Unprocessable Entity — `after` is not a valid cursor (32 lowercase hex characters)
 ```
@@ -838,7 +838,8 @@ GET /v1/sessions/{session_id}/failed-inputs[?limit=100&after=<next_cursor>]
 Returns the caller's own startup inputs that a failed managed launch
 (`omnigent.startup` label `failed`) could not deliver, shaped like the
 snapshot's `pending_inputs`, so clients can offer them back to the composer for
-resending. The list is empty for any other startup state and once a runner is
+resending. `item_id` is the saved item's id, the `stable_id` a follow-up was
+posted with, so a client can tell which of its unanswered sends the server holds. The list is empty for any other startup state and once a runner is
 bound to the session. A message or skill command from the caller that
 is accepted discards the entries whose `pending_id` it lists in
 `replaces_failed_inputs` (see Post Event), since that send carries what the

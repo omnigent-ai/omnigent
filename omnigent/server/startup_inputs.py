@@ -303,7 +303,7 @@ class ManagedStartupInputs:
             self.conversations.list_pending_inputs_by_id, conv.id, after=after, limit=limit
         )
         return [
-            {**_snapshot_entry(conv.id, item), "position": position}
+            {**_snapshot_entry(conv.id, item), "item_id": item.id, "position": position}
             for item, position in items
             if item.status == "failed" and item.created_by == viewer_id
         ], cursor
