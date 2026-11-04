@@ -30,6 +30,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests._helpers.host import Host, isolated_host
+from tests._helpers.live_server import terminate_process
 
 
 def _builtin_agent_id(base_url: str, name: str) -> str:
@@ -1126,3 +1127,57 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page.goto(f"{live_server}/tasks")
     page.get_by_test_id("suggestion-trigger-slack").click()
     expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
+
+
+def test_ten_minute_host_schedule_round_trip(
+    page: Page, automations_v2_server: str, automations_v2_host: Host
+) -> None:
+    """Host tasks save and round-trip minute schedules in either session mode."""
+    name = f"Ten minute schedule {uuid.uuid4().hex[:8]}"
+    _open_automations_page(page, automations_v2_server)
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill(name)
+    page.get_by_test_id("task-prompt-input").fill("Check for updates.")
+    _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
+    _pick_select_option(page, "custom-freq-trigger", "Minutes")
+    interval = page.get_by_label("Repeat every", exact=True)
+    expect(interval).to_have_value("10")
+    interval.fill("9")
+    expect(page.get_by_role("button", name="Apply", exact=True)).to_be_disabled()
+    interval.fill("10")
+    page.get_by_role("button", name="Apply", exact=True).click()
+    expect(page.get_by_test_id("custom-schedule-trigger")).to_have_text("Every 10 minutes")
+    # Stop the pinned host before creation, so even a boundary cannot launch an agent.
+    terminate_process(automations_v2_host.proc)
+    assert automations_v2_host.proc.poll() is not None
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
+    response = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks", timeout=10.0)
+    response.raise_for_status()
+    task = next(task for task in response.json()["scheduled_tasks"] if task["name"] == name)
+    assert (task["rrule"], task["session_mode"]) == ("FREQ=MINUTELY;INTERVAL=10", "new")
+    assert task["host_id"] == automations_v2_host.host_id
+    assert task["session_id"] is None
+    # An offline-host occurrence is harmless; pause the task before editing.
+    httpx.patch(
+        f"{automations_v2_server}/v1/scheduled-tasks/{task['id']}",
+        json={"state": "paused"},
+        timeout=10,
+    ).raise_for_status()
+    row = _row_by_name(page, name)
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    expect(page.get_by_test_id("custom-schedule-trigger")).to_have_text("Every 10 minutes")
+    page.get_by_test_id("task-session-mode-trigger").click()
+    page.get_by_test_id("task-session-mode-continue").click()
+    expect(page.get_by_test_id("custom-schedule-trigger")).to_have_text("Every 10 minutes")
+    expect(page.get_by_test_id("create-scheduled-task-submit")).to_be_enabled()
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
+    updated = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks/{task['id']}", timeout=10)
+    updated.raise_for_status()
+    assert (updated.json()["rrule"], updated.json()["session_mode"]) == (
+        "FREQ=MINUTELY;INTERVAL=10",
+        "continue",
+    )

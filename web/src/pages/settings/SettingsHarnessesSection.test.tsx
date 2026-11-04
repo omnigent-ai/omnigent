@@ -767,6 +767,20 @@ describe("Harness details", () => {
     expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "update");
   });
 
+  it("uses Set up tmux when the host has no usable tmux", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "tmux-unavailable" } }];
+    renderHarnesses("codex-native");
+
+    expect(
+      screen.getByText(
+        "Codex needs tmux 3.3 or newer on my-laptop. Install or upgrade tmux so new sessions can use Codex.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Set up tmux" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "tmux");
+  });
+
   it("uses Set up for a not-installed Cursor harness", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
     renderHarnesses("cursor-native");

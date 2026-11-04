@@ -37,6 +37,7 @@ import {
   HARNESS_CREDENTIAL_COPY,
   harnessInstallableOnHost,
   harnessWarningBadgeText,
+  MIN_TMUX_VERSION,
   missingHarnessCredentialCopy,
   type HarnessCredentialKind,
 } from "@/lib/harnessSetup";
@@ -843,16 +844,21 @@ function HarnessWarning({
   const copy =
     reason === "readiness-error"
       ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
-      : mode === "update"
-        ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
-        : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
-  const action = !installable
-    ? "Set up"
-    : mode === "update"
-      ? "Update"
-      : mode === "install"
-        ? "Install"
-        : "Reconfigure";
+      : mode === "tmux"
+        ? `${entry.name} needs tmux ${MIN_TMUX_VERSION} or newer on ${host.name}. Install or upgrade tmux so new sessions can use ${entry.name}.`
+        : mode === "update"
+          ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
+          : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
+  const action =
+    mode === "tmux"
+      ? "Set up tmux"
+      : !installable
+        ? "Set up"
+        : mode === "update"
+          ? "Update"
+          : mode === "install"
+            ? "Install"
+            : "Reconfigure";
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-ui">
       <div className="flex min-w-0 flex-1 items-start gap-3">

@@ -24,6 +24,9 @@ to customize.
   separation. Unrecognized or ambiguous prompt formats remain fully editable
   as a single Prompt field. Edits that remove the template signature or add
   ambiguous section headings show a notice before saving as a single prompt.
+  Your prompt must contain text; clearing it shows a required-field message.
+  Explicitly clearing only the posting-rule body in System prompt is supported
+  and preserves the separate prompts when saved and reopened.
   The detail page also keeps the system prompt collapsed by default, with a
   bounded read-only preview when expanded; use Edit automation to change it.
 - `workspace`: connected-host setup disables workspace browsing while the
@@ -49,15 +52,19 @@ to customize.
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
   failures still allow Default.
+- `schedule`: the shared modal supports ten-minute connected-host schedules in
+  either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
 - `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `tools-note`: the form says which tools the agent needs where the task runs,
   except on an Arclet sandbox, which already has them. Neither the template form
   nor editing a task saved from one shows the Session choice; templates always
   keep one session, and editing keeps only the reset to a new session.
-- `responsive`: gallery items have icons, descriptions, hourly polling summaries,
-  access requirements, pointer cursors, and keyboard focus indicators. Desktop
-  uses two columns; narrow screens use one.
+- `responsive`: gallery items have icons, descriptions, access requirements,
+  pointer cursors, and keyboard focus indicators; cadence is chosen in the form.
+  Host occupies a full row above Schedule. Project and Workspace (or Repository)
+  share a row on desktop and stack on narrow screens. Gallery cards use two
+  columns on desktop and one on narrow screens.
 
 ## How to get to it (user POV)
 
@@ -66,6 +73,8 @@ to customize.
 - **Your automations:** select a suggestion beneath the saved automations or
   empty-state message, with All selected and the search cleared.
 - **Creation modal:** click New automation on either tab to start from scratch.
+  With `automations_v2` on a server supporting sub-hour schedules, use Custom schedule → Minutes
+  for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
   preserve a continued session when the repository is unchanged or a legacy
@@ -83,6 +92,7 @@ Use the isolated environment and dismiss the first-visit introduction. The
 creation round-trip test supplies its own feature-enabled server and isolated
 host; run it with plain pytest and `--ui-skip-build` after building the SPA.
 No agent turn is needed.
+Minute-schedule checks use the server’s advertised sub-hour capability and `automations_v2`.
 
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`
   covers the preview and Templates tab with reload. It creates
@@ -90,6 +100,13 @@ No agent turn is needed.
   It edits the user prompt through the row menu and the system prompt through
   the detail page, checks persistence through REST, and reopens the editor. The
   preview entry runs at mobile width; the Templates entry runs at desktop width.
+- `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
+  covers new-session host creation, nine-minute rejection, reopening, and switching
+  to continuation while preserving ten minutes. In either edit entry point, also
+  select a sandbox with Continue in the same session: ten minutes is valid;
+  selecting New session each run blocks saving until the interval reaches sixty.
+  Repeat through the row menu and detail page. Without sub-hour support, the
+  editor keeps the hourly minimum and displays saved minute rules without rewriting them.
 - `web/src/pages/TasksPage.test.tsx` covers populated and empty lists, search and
   filter preservation, deep links with an embedded mount prefix, load failures,
   capability gating, and both creation buttons' paths.

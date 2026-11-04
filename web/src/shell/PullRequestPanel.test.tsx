@@ -82,6 +82,8 @@ const state = vi.hoisted(() => ({
   serveable: undefined as boolean | undefined,
 }));
 
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
+
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
   const original = await importOriginal<typeof UsePullRequestsModule>();
   return {
@@ -208,6 +210,7 @@ import {
   LARGE_DIFF_THRESHOLD,
 } from "./PullRequestPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { viewedStorageKey } from "@/lib/pullRequestViewed";
 
 const FORGE_DISPLAY = {
   id: "example_forge",
@@ -1481,6 +1484,28 @@ describe("PullRequestPanel", () => {
     expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
     // Checks live on the Summary tab, so they're gone once Changes is active.
     expect(screen.queryByText("Checks")).toBeNull();
+  });
+
+  it("keys viewed marks by the selected PR's identity and pinned head", async () => {
+    const url = state.info!.data!.pr!.url;
+    const selected = {
+      url,
+      host: "example.com",
+      repository: "acme/app",
+      number: 6000,
+      relationship: "created" as const,
+    };
+    state.info!.data!.pr!.head_sha = "head";
+    state.info!.data!.selected_pr_url = url;
+    state.info!.data!.prs = [selected];
+    // The list's head is pinned, so the mock carries it as an extra field.
+    Object.assign(state.changes!.data!, { head_sha: "head" });
+    state.diff = { ...state.diff!, head_sha: "head" };
+    renderChanges();
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Viewed hello.py" }));
+    const key = viewedStorageKey(window.location.origin, "alice", selected, "head");
+    expect(localStorage.getItem(key)).toContain("hello.py");
   });
 
   it("stacks a diff section per changed file", async () => {

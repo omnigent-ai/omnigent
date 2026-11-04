@@ -1179,6 +1179,7 @@ def test_composer_growth_reflows_without_covering_output(
         assert touch["settledScrollTop"] < touch["initialScrollTop"], touch
         assert "pointercancel" in touch["events"] and "scroll" in touch["events"], touch
         assert touch["events"].index("pointercancel") < touch["events"].index("scroll"), touch
+        assert touch["events"][-1] == "scrollend", touch
         touch_settled = settled_geometry(page)
         assert touch_settled["distanceFromBottom"] == pytest.approx(
             touch["settledDistance"], abs=8

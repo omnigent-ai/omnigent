@@ -21,6 +21,8 @@ from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
+    SERVER_CAP_TMUX_READINESS,
+    SERVER_CAPABILITIES_HEADER,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
@@ -37,6 +39,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    parse_server_capabilities,
 )
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -801,6 +804,22 @@ async def test_host_tunnel_accepts_and_registers(
     conn = registry.get(_HOST_ID)
     assert conn is not None
     assert conn.hello.name == "test-laptop"
+
+
+async def test_host_tunnel_upgrade_advertises_server_capabilities(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """Hosts learn on the upgrade, before their hello, which readiness states this server takes."""
+    app, _registry, _store = host_app
+    communicator = ApplicationCommunicator(app, _websocket_scope(_TUNNEL_PATH))
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+
+    assert accepted["type"] == "websocket.accept"
+    headers = dict(accepted.get("headers") or [])
+    advertised = headers[SERVER_CAPABILITIES_HEADER.lower().encode("ascii")].decode("ascii")
+    assert SERVER_CAP_TMUX_READINESS in parse_server_capabilities(advertised)
+    await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
 @pytest.mark.parametrize("code,reason", [(1000, "done"), (1006, ""), (1012, "restart")])

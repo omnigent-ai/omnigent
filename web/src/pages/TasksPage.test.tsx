@@ -308,7 +308,9 @@ describe("TasksPage list", () => {
     renderPage();
     expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Suggested Automations" })).toBeVisible();
+    expect(screen.queryByText("Checks every hour")).not.toBeInTheDocument();
     selectView("Templates");
+    expect(screen.queryByText("Checks every hour")).not.toBeInTheDocument();
     expect(screen.queryByTestId("tasks-list")).not.toBeInTheDocument();
     expect(screen.queryByTestId("tasks-search")).not.toBeInTheDocument();
     const suggestions = screen.getByTestId("tasks-suggestions");
@@ -325,10 +327,9 @@ describe("TasksPage list", () => {
     expect(jiraCard).toHaveTextContent("Jira tickets");
     expect(jiraCard).toHaveTextContent("Watch for matching tickets");
     expect(jiraCard).toHaveTextContent("Requires a Jira MCP server.");
-    expect(jiraCard).toHaveTextContent("Checks every hour");
     expect(screen.queryByRole("button", { name: /Show all/ })).not.toBeInTheDocument();
     expect(jiraCard).toHaveAccessibleDescription(
-      "Watch for matching tickets and start a session to investigate or work on each one. Checks every hour Requires a Jira MCP server.",
+      "Watch for matching tickets and start a session to investigate or work on each one. Requires a Jira MCP server.",
     );
   });
 
