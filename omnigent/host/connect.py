@@ -1619,18 +1619,19 @@ class HostProcess:
         return await asyncio.shield(task)
 
     def _alive_runner_ids(self) -> list[str]:
-        """Return IDs of runners that are still alive.
+        """Return runner IDs without waiting for forkserver control replies.
 
-        Cleans up dead entries as a side effect.
-
-        :returns: List of alive runner ID strings.
+        :returns: IDs whose exit has not yet been observed.
         """
-        dead = [rid for rid, handle in self._runners.items() if handle.proc.poll() is not None]
-        for rid in dead:
-            self._runners.pop(rid)
-        if dead:
-            self._trigger_maintenance("runner_exited_during_reconnect")
-        return list(self._runners.keys())
+        alive = []
+        for runner_id, handle in self._runners.items():
+            proc = handle.proc
+            # Hello cannot wait for forkserver IPC. The watcher owns polling,
+            # removal and exit reporting, including exits observed during hello.
+            code = proc.returncode if isinstance(proc, ZygoteRunnerProc) else proc.poll()
+            if code is None:
+                alive.append(runner_id)
+        return alive
 
     def _tunnel_url(self) -> str:
         """Build the WebSocket tunnel URL.
@@ -2206,6 +2207,10 @@ class HostProcess:
             )
             try:
                 proc, log_path = await asyncio.shield(spawn)
+                # A runner now exists and may connect on its own.
+                self._spawned_launch_requests.add(frame.request_id)
+                # Forkserver polls block on control IPC, just like spawning.
+                returncode = await asyncio.to_thread(proc.poll)
             except asyncio.CancelledError:
                 task = asyncio.create_task(
                     self._stop_abandoned_spawn(spawn),
@@ -2215,15 +2220,14 @@ class HostProcess:
                 task.add_done_callback(self._runner_stop_tasks.discard)
                 raise
             except OSError as exc:
+                if frame.request_id in self._spawned_launch_requests:
+                    raise
                 return self._launch_failed(
                     frame,
                     f"failed to spawn runner: {exc}",
                 )
-        # A runner now exists and may connect on its own.
-        self._spawned_launch_requests.add(frame.request_id)
-
-        if proc.poll() is not None:
-            # The runner died before Popen returned — its actual error
+        if returncode is not None:
+            # The runner exited before launch acknowledgement — its actual error
             # is in the captured log, so ship the tail with the result
             # instead of making the user go find the file on the host.
             error = _runner_exit_error(proc.returncode, log_path)

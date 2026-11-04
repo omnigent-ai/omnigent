@@ -161,8 +161,7 @@ class ZygoteRunnerProc:
 class ZygoteManager:
     """Owns the daemon's connection to the runner zygote forkserver.
 
-    Thread-safe: ``fork_runner`` is typically driven from ``asyncio.to_thread``
-    while ``poll`` runs on the event-loop thread, so every control exchange is
+    Thread-safe: all fork and poll control exchanges are synchronous and
     serialized under one lock.
 
     :param python_executable: Interpreter to launch the zygote with; defaults
