@@ -34,7 +34,7 @@ from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.managed_hosts import (
     REQUESTED_HOST_ID_LABEL_KEY,
     ManagedSandboxConfig,
@@ -169,6 +169,7 @@ _MESSAGE_INPUT = {
 }
 _OWNER = "alice@example.com"
 _EDITOR = "bob@example.com"
+_READER = "carol@example.com"
 _HOST_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
 
@@ -892,6 +893,44 @@ async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize
     assert len((await client.get("/v1/sessions")).json()["data"]) == before
     assert message_texts(store, source.id) == []
     assert live_runner.superseded == []
+
+
+async def test_claude_sdk_clear_continuation_keeps_the_original_sharing(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    auth_live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Viewers the original was shared with can open the session it continues in.
+
+    Live viewers of the original are all redirected to the new session, which
+    continues the same conversation, so it carries the original's grants.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(auth_client, store, user=_OWNER)
+    owner, reader = {"X-Forwarded-Email": _OWNER}, {"X-Forwarded-Email": _READER}
+    shared = await auth_client.put(
+        f"/v1/sessions/{source_id}/permissions",
+        json={"user_id": _READER, "level": LEVEL_READ},
+        headers=owner,
+    )
+    assert shared.status_code < 300, shared.text
+
+    cleared = await auth_client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}, headers=owner
+    )
+
+    assert cleared.status_code == 202, cleared.text
+    new_id = cleared.json()["session_id"]
+    assert auth_live_runner.superseded == [(source_id, new_id, "clear")]
+    opened = await auth_client.get(f"/v1/sessions/{new_id}", headers=reader)
+    assert opened.status_code == 200, opened.text
+    # Read-only, as on the original.
+    renamed = await auth_client.patch(
+        f"/v1/sessions/{new_id}", json={"title": "mine"}, headers=reader
+    )
+    assert renamed.status_code == 403, renamed.text
 
 
 @pytest.mark.parametrize(

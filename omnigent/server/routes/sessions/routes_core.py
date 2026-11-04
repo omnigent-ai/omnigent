@@ -526,6 +526,24 @@ def register_core_routes(
             await _delete_unreturned_session(session_id)
             raise
 
+    async def _copy_session_grants(source_id: str, target_id: str) -> None:
+        """Give *target_id* every grant on *source_id*, never lowering one it has."""
+        if permission_store is None:
+            return
+        after: str | None = None
+        while True:
+            grants, after = await asyncio.to_thread(
+                permission_store.list_for_session, source_id, limit=500, after_user_id=after
+            )
+            for grant in grants:
+                current = await asyncio.to_thread(permission_store.get, grant.user_id, target_id)
+                if current is None or current.level < grant.level:
+                    await asyncio.to_thread(
+                        permission_store.grant, grant.user_id, target_id, grant.level
+                    )
+            if after is None:
+                return
+
     async def _release_unreturned_fork_host(request: Request, host_id: str | None) -> None:
         """Tear down a deleted fork's managed sandbox if nothing else uses it.
 
@@ -4716,6 +4734,9 @@ def register_core_routes(
             )
             runner_bound = runner_online
             try:
+                # The same conversation continues there, and every live viewer
+                # of the source is redirected to it, so it keeps the sharing.
+                await _copy_session_grants(source.id, fork.id)
                 if host_bound:
                     assert source.host_id is not None
                     # The fork was born on the host under its row lock, so a
