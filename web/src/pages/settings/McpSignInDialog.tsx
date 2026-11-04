@@ -27,7 +27,11 @@ export const MCP_LOGIN_POLL_MS = 1500;
 export const MAX_POLL_FAILURES = 3;
 
 type Phase =
-  { kind: "starting" } | { kind: "pending"; login: McpLogin } | { kind: "error"; message: string };
+  | { kind: "starting" }
+  | { kind: "pending"; login: McpLogin }
+  | { kind: "error"; message: string; unsupported?: boolean };
+
+const SERVER_UPDATE_MESSAGE = "Update the Omnigent server to sign in to MCP servers from here.";
 
 export interface McpSignInDialogProps {
   open: boolean;
@@ -49,7 +53,17 @@ function endedMessage(login: McpLogin): string {
   return "The sign-in didn't complete.";
 }
 
+/** An older server answers the sign-in routes with its unmatched-route 404. */
+function isMissingRoute(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 404 &&
+    (error.code === "not_found" || error.message === "Not Found")
+  );
+}
+
 function requestErrorMessage(error: unknown, hostName: string): string {
+  if (isMissingRoute(error)) return SERVER_UPDATE_MESSAGE;
   if (!(error instanceof ApiError) || error.status === 504) return `Couldn't reach ${hostName}.`;
   if (error.status === 501) return `Update ${hostName} to sign in to MCP servers from here.`;
   if ((error.status < 500 || error.status === 503) && error.message) return error.message;
@@ -107,10 +121,18 @@ export function McpSignInDialog({
     };
     const fail = (error: unknown) => {
       if (!active || controller.signal.aborted) return;
-      setPhase({ kind: "error", message: requestErrorMessage(error, hostNameRef.current) });
+      const unsupported = isMissingRoute(error);
+      // An older server can't cancel the sign-in either.
+      if (unsupported) loginId = null;
+      const message = requestErrorMessage(error, hostNameRef.current);
+      setPhase({ kind: "error", message, unsupported });
     };
     const pollFailed = (error: unknown) => {
       if (!active || controller.signal.aborted) return;
+      if (isMissingRoute(error)) {
+        fail(error);
+        return;
+      }
       if (error instanceof ApiError && error.status === 404) {
         loginId = null;
         setPhase({ kind: "error", message: "This sign-in ended on the host." });
@@ -172,7 +194,7 @@ export function McpSignInDialog({
           >
             {phase.kind === "error" ? "Close" : "Cancel"}
           </Button>
-          {phase.kind === "error" && (
+          {phase.kind === "error" && !phase.unsupported && (
             <Button onClick={() => setAttempt((count) => count + 1)}>Try again</Button>
           )}
         </DialogFooter>

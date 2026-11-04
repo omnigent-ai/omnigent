@@ -241,7 +241,8 @@ Probes run only on expansion.
 
 **MCP sign-in:** the same path to a needs-auth server → Sign in → Open sign-in
 page (or Copy sign-in link), approve, and return; or paste the redirect address
-and click Finish. A failed or expired attempt offers Try again.
+and click Finish. A failed or expired attempt offers Try again; a server without
+the sign-in routes asks for a server update instead.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
@@ -956,8 +957,9 @@ Cross-harness journeys:
   `codex` CLIs installed, `tests/e2e_ui/settings/test_mcp_sign_in.py` signs in to
   a local OAuth MCP server through a user server, a plugin server, and Codex's
   paste path (run it with Codex 0.142 too, via `OMNIGENT_CODEX_PATH`). By hand,
-  check timeout, cancel, a rejected paste, and an older
-  host (the row shows Needs auth with no Sign in button).
+  check timeout, cancel, a rejected paste, an older
+  host (the row shows Needs auth with no Sign in button), and a switch to an
+  older server while the dialog is open (it asks for a server update).
 
 - **`mcp-tools`:** run `tests/host/test_mcp_tools.py`,
   `tests/server/routes/test_mcp_tools.py`, and the real-host test

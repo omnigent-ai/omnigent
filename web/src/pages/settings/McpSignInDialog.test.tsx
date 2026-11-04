@@ -15,6 +15,7 @@ vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn().mockResolvedValue(undefine
 
 const AUTH_URL = "https://auth.example.test/authorize?client_id=c&redirect_uri=x";
 const BASE = "/v1/hosts/host%2F1/mcp-servers/login";
+const SERVER_UPDATE = "Update the Omnigent server to sign in to MCP servers from here.";
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -282,6 +283,39 @@ describe("McpSignInDialog", () => {
     await renderDialog();
     expect(screen.getByRole("alert").textContent).toBe(message);
     expect(screen.queryByText("private host text")).toBeNull();
+  });
+
+  it.each([
+    ["the web UI's", { error: { code: "not_found", message: "Not found" } }],
+    ["an API-only", { detail: "Not Found" }],
+  ])("asks for a server update on %s missing-route 404", async (_server, body) => {
+    on("POST", BASE, () => json(body, 404));
+    await renderDialog();
+    expect(screen.getByRole("alert").textContent).toBe(SERVER_UPDATE);
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("stops a pending sign-in once the server lacks the sign-in routes", async () => {
+    const missing = () => json({ error: { code: "not_found", message: "Not found" } }, 404);
+    on("POST", BASE, () => json(login()));
+    on("POST", `${BASE}/L1/callback`, missing);
+    on("GET", `${BASE}/L1`, missing);
+    await renderDialog();
+
+    fireEvent.change(screen.getByLabelText(/paste it here/), {
+      target: { value: "http://localhost:9/callback?code=c&state=s" },
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Finish" })));
+    expect(screen.getByRole("alert").textContent).toBe(SERVER_UPDATE);
+
+    await tick();
+    expect(screen.getByRole("alert").textContent).toBe(SERVER_UPDATE);
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await tick();
+    expect(calls("GET", `${BASE}/L1`)).toHaveLength(1);
+    cleanup();
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(0);
   });
 
   it("reports a sign-in that disappeared from the host", async () => {
