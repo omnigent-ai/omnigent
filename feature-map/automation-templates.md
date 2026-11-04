@@ -17,8 +17,10 @@ to customize.
   New automation opens a blank form.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
   prompt starts collapsed, expands into a read-only preview, and requires Edit
-  system prompt to change it. Saving preserves both parts; reopening collapses
-  and locks the system prompt again. Edit as prompt during creation uses the same
+  system prompt to change it. Done editing system prompt returns to the read-only
+  preview without collapsing. Posting instructions for each session stay in the
+  worker instructions when their text changes. Saving preserves both parts;
+  reopening collapses and locks the system prompt again. Edit as prompt during creation uses the same
   separation. Unrecognized or ambiguous prompt formats remain fully editable
   as a single Prompt field. Edits that remove the template signature or add
   ambiguous section headings show a notice before saving as a single prompt.

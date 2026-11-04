@@ -2579,10 +2579,9 @@ describe("editing template prompts", () => {
     fireEvent.click(toggle);
     expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    const systemPrompt = splitTriggerPrompt(original).systemPrompt!.replace(
-      'project = "ENG"',
-      'project = "OPS"',
-    );
+    const systemPrompt =
+      splitTriggerPrompt(original).systemPrompt!.replace('project = "ENG"', 'project = "OPS"') +
+      "\n";
     fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
       target: { value: "  \n" },
     });

@@ -562,7 +562,7 @@ export function CreateScheduledTaskDialog({
       }
       const input = {
         name: name.trim(),
-        prompt: effectivePrompt.trim(),
+        prompt: systemPrompt === null ? effectivePrompt.trim() : effectivePrompt,
         rrule: buildRRule(schedule),
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),

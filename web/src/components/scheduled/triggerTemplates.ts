@@ -292,6 +292,7 @@ const DELIVERY_PENDING = "Delivery pending:";
 export const OMNIGENT_ATTRIBUTION = "Sent with Omnigent";
 
 const SESSION_INSTRUCTIONS = "\n\nInstructions for each session:\n";
+const SESSION_POSTING_INSTRUCTIONS = "\n\nPosting instructions for each session:\n";
 const POSTING_INSTRUCTIONS = `Anything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "${OMNIGENT_ATTRIBUTION}", since it posts with the owner's account.`;
 
 /** Separate saved template instructions without guessing at free-form prompts. */
@@ -312,14 +313,24 @@ export function splitTriggerPrompt(prompt: string): {
     return unsplit;
   }
   const [systemPrompt, instructions] = sections;
-  // Templates append posting instructions after the user's text; show them with the system prompt.
   const suffix = `\n${POSTING_INSTRUCTIONS}`;
-  const parts = instructions.endsWith(suffix)
-    ? {
-        userPrompt: instructions.slice(0, -suffix.length),
-        systemPrompt: `${systemPrompt}\n\n${POSTING_INSTRUCTIONS}`,
-      }
-    : { userPrompt: instructions, systemPrompt };
+  const postingSections = instructions.split(SESSION_POSTING_INSTRUCTIONS);
+  let userPrompt: string;
+  let postingInstructions: string;
+  if (postingSections.length === 2) {
+    // A legacy prompt may contain the new heading inside the user's instructions.
+    if (instructions.endsWith(suffix)) return unsplit;
+    [userPrompt, postingInstructions] = postingSections;
+  } else if (postingSections.length === 1 && instructions.endsWith(suffix)) {
+    userPrompt = instructions.slice(0, -suffix.length);
+    postingInstructions = POSTING_INSTRUCTIONS;
+  } else {
+    return unsplit;
+  }
+  const parts = {
+    userPrompt,
+    systemPrompt: `${systemPrompt}${SESSION_POSTING_INSTRUCTIONS}${postingInstructions}`,
+  };
   // Unfamiliar layouts must not be reordered on an unrelated save.
   return parts.userPrompt.trim() !== "" &&
     combineTriggerPrompt(parts.userPrompt, parts.systemPrompt) === prompt
@@ -330,10 +341,13 @@ export function splitTriggerPrompt(prompt: string): {
 /** Keep existing template prompts byte-for-byte when neither part changed. */
 export function combineTriggerPrompt(userPrompt: string, systemPrompt: string | null): string {
   if (systemPrompt === null) return userPrompt;
-  const suffix = `\n\n${POSTING_INSTRUCTIONS}`;
-  return systemPrompt.endsWith(suffix)
-    ? `${systemPrompt.slice(0, -suffix.length)}${SESSION_INSTRUCTIONS}${userPrompt}\n${POSTING_INSTRUCTIONS}`
-    : `${systemPrompt}${SESSION_INSTRUCTIONS}${userPrompt}`;
+  const sections = systemPrompt.split(SESSION_POSTING_INSTRUCTIONS);
+  if (sections.length !== 2) return `${systemPrompt}${SESSION_INSTRUCTIONS}${userPrompt}`;
+  const [managerInstructions, postingInstructions] = sections;
+  // Keep legacy text unchanged; edited worker rules retain an explicit boundary.
+  const postingSeparator =
+    postingInstructions === POSTING_INSTRUCTIONS ? "\n" : SESSION_POSTING_INSTRUCTIONS;
+  return `${managerInstructions}${SESSION_INSTRUCTIONS}${userPrompt}${postingSeparator}${postingInstructions}`;
 }
 
 const SERVICE_NAMES: Record<TriggerSource, string> = {

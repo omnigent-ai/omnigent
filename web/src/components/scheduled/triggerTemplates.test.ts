@@ -50,13 +50,39 @@ describe("saved trigger prompts", () => {
     );
   });
 
-  it.each([true, false])("reopens edited attribution with link-back %s", (linkBack) => {
+  it.each(
+    [true, false].flatMap((linkBack) =>
+      ["replace attribution", "append text", "trailing newline"].map((edit) => ({
+        linkBack,
+        edit,
+      })),
+    ),
+  )("preserves worker posting scope with link-back $linkBack: $edit", ({ linkBack, edit }) => {
     const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields({ linkBack }), CTX));
-    const systemPrompt = parts.systemPrompt!.replace("Sent with Omnigent", "Automated reply");
-    expect(splitTriggerPrompt(combineTriggerPrompt("New user prompt.", systemPrompt))).toEqual({
-      userPrompt: "New user prompt.",
-      systemPrompt,
-    });
+    const [manager, posting] = parts.systemPrompt!.split(
+      "\n\nPosting instructions for each session:\n",
+    );
+    const editedPosting =
+      edit === "replace attribution"
+        ? posting.replace("Sent with Omnigent", "Automated reply")
+        : posting + (edit === "append text" ? "\nInclude a summary." : "\n");
+    const systemPrompt = `${manager}\n\nPosting instructions for each session:\n${editedPosting}`;
+    const saved = combineTriggerPrompt("New user prompt.", systemPrompt);
+    const [savedManager, workerInstructions] = saved.split("\n\nInstructions for each session:\n");
+    expect(savedManager).toBe(manager);
+    expect(workerInstructions).toBe(
+      `New user prompt.\n\nPosting instructions for each session:\n${editedPosting}`,
+    );
+    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "New user prompt.", systemPrompt });
+  });
+
+  it("preserves an independently specified saved template", () => {
+    const saved =
+      'This automation watches Jira issues.\n\nEach run:\nStart a session for each match.\n\nInstructions for each session:\nTriage the ticket.\nAnything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "Sent with Omnigent", since it posts with the owner\'s account.';
+    const systemPrompt =
+      'This automation watches Jira issues.\n\nEach run:\nStart a session for each match.\n\nPosting instructions for each session:\nAnything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "Sent with Omnigent", since it posts with the owner\'s account.';
+    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "Triage the ticket.", systemPrompt });
+    expect(combineTriggerPrompt("Triage the ticket.", systemPrompt)).toBe(saved);
   });
 
   it.each([
@@ -71,6 +97,11 @@ describe("saved trigger prompts", () => {
     renderTriggerPrompt(
       "jira",
       fields({ instructions: "Include\n\nInstructions for each session:\nan agenda." }),
+      CTX,
+    ),
+    renderTriggerPrompt(
+      "jira",
+      fields({ instructions: "Include\n\nPosting instructions for each session:\nan agenda." }),
       CTX,
     ),
   ])("keeps an unrecognized or ambiguous prompt intact", (prompt) => {
