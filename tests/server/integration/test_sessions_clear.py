@@ -12,6 +12,7 @@ SDK client.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import threading
@@ -61,6 +62,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import FakeSandboxLauncher, create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
@@ -733,6 +735,71 @@ async def test_deleting_the_original_during_the_handoff_never_strands_the_contin
     assert continuation is not None and continuation.host_id == _HOST_ID
     assert host_store.get_host(_HOST_ID) is not None
     assert launcher.terminated == []
+
+
+@pytest.mark.parametrize("cancelled_during", ["fork", "runner_binding"])
+async def test_a_cancelled_clear_request_still_finishes_the_move(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    cancelled_during: str,
+) -> None:
+    """Cancelling the request (e.g. a client disconnect) mid-move leaves no half-made session.
+
+    Once allowed, the move runs to its end on its own: exactly one new session
+    is placed and announced, a retry is refused while it runs, and the original
+    is superseded but can still be resumed.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    before = len((await client.get("/v1/sessions")).json()["data"])
+    loop = asyncio.get_running_loop()
+    paused, resume = asyncio.Event(), threading.Event()
+    if cancelled_during == "fork":
+        fork = SqlAlchemyConversationStore.fork_conversation
+
+        def fork_after_cancel(self: Any, *args: Any, **kwargs: Any) -> Any:
+            loop.call_soon_threadsafe(paused.set)
+            assert resume.wait(timeout=10)
+            return fork(self, *args, **kwargs)
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "fork_conversation", fork_after_cancel)
+    else:
+        resolve_runner = sessions_module._get_runner_client
+
+        async def bind_after_cancel(session_id: str, *args: Any, **kwargs: Any) -> Any:
+            if session_id != source_id and not paused.is_set():
+                paused.set()
+                await asyncio.to_thread(resume.wait, 10)
+            return await resolve_runner(session_id, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", bind_after_cancel)
+    clearing = asyncio.create_task(
+        client.post(f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}})
+    )
+    await asyncio.wait_for(paused.wait(), timeout=10)
+
+    clearing.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await clearing
+    retried = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+    resume.set()
+    await poll_until_async(lambda: bool(live_runner.superseded), timeout_s=10)
+
+    assert retried.status_code == 409, retried.text
+    [(_, new_id, _)] = live_runner.superseded
+    continuation = store.get_conversation(new_id)
+    assert continuation is not None
+    assert (continuation.runner_id, continuation.host_id) == (_RUNNER_ID, _HOST_ID)
+    assert new_id in live_runner.announced
+    assert len((await client.get("/v1/sessions")).json()["data"]) == before + 1
+    assert not orchestration._session_is_moving(source_id)
+    resumed = await client.post(f"/v1/sessions/{source_id}/events", json=_MESSAGE_INPUT)
+    assert resumed.status_code < 300, resumed.text
 
 
 async def test_a_continuation_that_cannot_be_shared_leaves_no_host_reference(

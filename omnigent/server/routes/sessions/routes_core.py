@@ -4653,6 +4653,15 @@ def register_core_routes(
 
     # ── Continuing a session's work in another session ──────────
 
+    # Moves into a continuation still running after their request was cancelled.
+    _continuation_tasks: set[asyncio.Task[str]] = set()
+
+    def _forget_continuation(done: asyncio.Task[str]) -> None:
+        """Drop a finished move; its failure was reported to a waiting request."""
+        _continuation_tasks.discard(done)
+        if not done.cancelled():
+            done.exception()  # Retrieved, so an abandoned request's failure is not re-logged.
+
     async def _continue_session_in_fork(
         request: Request,
         source: Conversation,
@@ -4724,177 +4733,192 @@ def register_core_routes(
             )
         # Held, with no await since the checks above, until viewers are
         # redirected: messages arriving meanwhile are refused, not run here.
-        with _mark_session_moving(source.id):
-            from omnigent.server.routes.sessions.routes_events import (
-                _raise_if_runner_on_another_replica,
-            )
+        moving = contextlib.ExitStack()
+        moving.enter_context(_mark_session_moving(source.id))
 
-            # A saved startup input still to be delivered is a turn waiting to
-            # start. Checked once moving, so no new one can be saved meanwhile.
-            startup = getattr(request.app.state, "startup_inputs", None)
-            if startup is not None and await startup.has_undelivered(source.id):
-                raise OmnigentError(
-                    f"Wait for this session's first message to start before running {command}.",
-                    code=ErrorCode.INVALID_INPUT,
+        async def move() -> str:
+            with moving:
+                from omnigent.server.routes.sessions.routes_events import (
+                    _raise_if_runner_on_another_replica,
                 )
-            runner_online = (
-                source.runner_id is not None
-                and runner_router is not None
-                and runner_router.runner_is_online(source.runner_id)
-            )
-            if not runner_online and source.runner_id is not None:
-                # A runner live on another replica is not offline: re-address there
-                # rather than continue without it.
-                await _raise_if_runner_on_another_replica(
-                    source, request.app.state, conversation_store
-                )
-            host_bound = source.host_id is not None and source.workspace is not None
-            runner_offline = OmnigentError(
-                f"Can't run {command} while this session's runner is offline. "
-                "Reconnect the session (send a message to wake it), then try again.",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            )
-            if not runner_online and not host_bound:
-                raise runner_offline
-            if prepare is not None:
-                await prepare()
 
-            # Chosen up front so a failure anywhere after the fork is written,
-            # inside the fork call included, can remove it by id.
-            fork_id = generate_conversation_id()
-            runner_bound = runner_online
-            runner_initialized = False
-            try:
-                fork = await _fork_session(
-                    request,
-                    source.id,
-                    SessionForkRequest(title=title),
-                    before_item_id=before_item_id,
-                    keep_sandbox_labels=True,
-                    copy_history=copy_history,
-                    continue_source=True,
-                    fork_id=fork_id,
+                # A saved startup input still to be delivered is a turn waiting to
+                # start. Checked once moving, so no new one can be saved meanwhile.
+                startup = getattr(request.app.state, "startup_inputs", None)
+                if startup is not None and await startup.has_undelivered(source.id):
+                    raise OmnigentError(
+                        f"Wait for this session's first message to start before running {command}.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                runner_online = (
+                    source.runner_id is not None
+                    and runner_router is not None
+                    and runner_router.runner_is_online(source.runner_id)
                 )
-                # The same conversation continues there, and every live viewer
-                # of the source is redirected to it, so it shares exactly as
-                # the source does (no creation default was applied).
-                await _mirror_session_grants(source.id, fork.id)
-                if host_bound:
-                    assert source.host_id is not None
-                    # The fork was born on the host under its row lock, so a
-                    # delete of the source from here on keeps it; a host torn
-                    # down first was not copied and leaves the fork unplaced.
-                    if fork.host_id != source.host_id:
-                        raise OmnigentError(
-                            f"This session's host went away during {command}; try again.",
-                            code=ErrorCode.CONFLICT,
-                        )
-                    profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
-                    if profile_catalog is not None:
-                        # Adopt and reauthorize the sandbox's accepted profile
-                        # now, so the fork can wake it even with no runner.
-                        await asyncio.to_thread(
-                            profile_catalog.require_session_host, fork.id, source.host_id
-                        )
-                if runner_online:
-                    assert source.runner_id is not None and runner_router is not None
-                    try:
-                        await _update_session(
-                            request,
-                            fork.id,
-                            UpdateSessionRequest(runner_id=source.runner_id),
-                            include_usage=False,
-                        )
-                    except Exception:
-                        if runner_router.runner_is_online(source.runner_id):
-                            raise
-                        runner_bound = False
-                    else:
-                        runner_initialized = True
-                        # The bind tolerates a runner gone before its client
-                        # lookup, so confirm the placement it reports.
-                        runner_bound = runner_router.runner_is_online(source.runner_id)
-                    if not runner_bound:
-                        # The runner left after the check. One now on another
-                        # replica is re-addressed; a host-bound fork otherwise
-                        # relaunches on its host, as with an offline runner.
-                        await _raise_if_runner_on_another_replica(
-                            source, request.app.state, conversation_store
-                        )
-                        if not host_bound:
-                            raise runner_offline
-                        if runner_initialized:
-                            # Drop the binding to the vanished runner, so the
-                            # fork relaunches on its host like an offline one.
-                            await asyncio.to_thread(conversation_store.clear_runner_id, fork.id)
-                if runner_bound and host_bound:
-                    # As native /clear does: the fork now holds the runner, so
-                    # stopping or archiving the source must not stop it. The
-                    # source keeps its host and resumes on a relaunched runner.
-                    try:
-                        await _update_session(
-                            request,
-                            source.id,
-                            UpdateSessionRequest(runner_id=""),
-                            include_usage=False,
-                        )
-                    except OmnigentError as exc:
-                        # A source deleted meanwhile has nothing left to detach.
-                        if exc.code != ErrorCode.NOT_FOUND:
-                            raise
-            except Exception:
-                # Leave no fork for a retry to duplicate, nor its runner session.
-                if runner_initialized:
-                    await _release_unreturned_runner_session(fork_id)
-                await _delete_unreturned_session(fork_id)
-                await _release_unreturned_fork_host(
-                    request, source.host_id if host_bound else None
+                if not runner_online and source.runner_id is not None:
+                    # A runner live on another replica is not offline: re-address there
+                    # rather than continue without it.
+                    await _raise_if_runner_on_another_replica(
+                        source, request.app.state, conversation_store
+                    )
+                host_bound = source.host_id is not None and source.workspace is not None
+                runner_offline = OmnigentError(
+                    f"Can't run {command} while this session's runner is offline. "
+                    "Reconnect the session (send a message to wake it), then try again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-                raise
-            # Placed and shared as the source is: now the owner's tabs list it.
-            _announce_session_added(user_id, fork.id)
+                if not runner_online and not host_bound:
+                    raise runner_offline
+                if prepare is not None:
+                    await prepare()
 
-            # Best-effort, as for native supersession: the fork already holds the
-            # work, so a lost notice must not strand it unreturned.
-            try:
-                await _persist_external_conversation_item(
-                    source.id,
-                    source,
-                    SessionEventInput(
-                        type=_EXTERNAL_CONVERSATION_ITEM_TYPE,
-                        data={
-                            "item_type": "message",
-                            "item_data": {
-                                "role": "assistant",
-                                "agent": fork.agent_name or "assistant",
-                                "content": [{"type": "output_text", "text": notice(fork.id)}],
+                # Chosen up front so a failure anywhere after the fork is
+                # written, inside the fork call included, can remove it by id.
+                fork_id = generate_conversation_id()
+                runner_bound = runner_online
+                runner_initialized = False
+                try:
+                    fork = await _fork_session(
+                        request,
+                        source.id,
+                        SessionForkRequest(title=title),
+                        before_item_id=before_item_id,
+                        keep_sandbox_labels=True,
+                        copy_history=copy_history,
+                        continue_source=True,
+                        fork_id=fork_id,
+                    )
+                    # The same conversation continues there, and every live viewer
+                    # of the source is redirected to it, so it shares exactly as
+                    # the source does (no creation default was applied).
+                    await _mirror_session_grants(source.id, fork.id)
+                    if host_bound:
+                        assert source.host_id is not None
+                        # The fork was born on the host under its row lock, so a
+                        # delete of the source from here on keeps it; a host torn
+                        # down first was not copied and leaves the fork unplaced.
+                        if fork.host_id != source.host_id:
+                            raise OmnigentError(
+                                f"This session's host went away during {command}; try again.",
+                                code=ErrorCode.CONFLICT,
+                            )
+                        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+                        if profile_catalog is not None:
+                            # Adopt and reauthorize the sandbox's accepted profile
+                            # now, so the fork can wake it even with no runner.
+                            await asyncio.to_thread(
+                                profile_catalog.require_session_host, fork.id, source.host_id
+                            )
+                    if runner_online:
+                        assert source.runner_id is not None and runner_router is not None
+                        try:
+                            await _update_session(
+                                request,
+                                fork.id,
+                                UpdateSessionRequest(runner_id=source.runner_id),
+                                include_usage=False,
+                            )
+                        except Exception:
+                            if runner_router.runner_is_online(source.runner_id):
+                                raise
+                            runner_bound = False
+                        else:
+                            runner_initialized = True
+                            # The bind tolerates a runner gone before its client
+                            # lookup, so confirm the placement it reports.
+                            runner_bound = runner_router.runner_is_online(source.runner_id)
+                        if not runner_bound:
+                            # The runner left after the check. One now on another
+                            # replica is re-addressed; a host-bound fork otherwise
+                            # relaunches on its host, as with an offline runner.
+                            await _raise_if_runner_on_another_replica(
+                                source, request.app.state, conversation_store
+                            )
+                            if not host_bound:
+                                raise runner_offline
+                            if runner_initialized:
+                                # Drop the binding to the vanished runner, so the
+                                # fork relaunches on its host like an offline one.
+                                await asyncio.to_thread(
+                                    conversation_store.clear_runner_id, fork.id
+                                )
+                    if runner_bound and host_bound:
+                        # As native /clear does: the fork now holds the runner, so
+                        # stopping or archiving the source must not stop it. The
+                        # source keeps its host and resumes on a relaunched runner.
+                        try:
+                            await _update_session(
+                                request,
+                                source.id,
+                                UpdateSessionRequest(runner_id=""),
+                                include_usage=False,
+                            )
+                        except OmnigentError as exc:
+                            # A source deleted meanwhile has nothing left to detach.
+                            if exc.code != ErrorCode.NOT_FOUND:
+                                raise
+                except Exception:
+                    # Leave no fork for a retry to duplicate, nor its runner session.
+                    if runner_initialized:
+                        await _release_unreturned_runner_session(fork_id)
+                    await _delete_unreturned_session(fork_id)
+                    await _release_unreturned_fork_host(
+                        request, source.host_id if host_bound else None
+                    )
+                    raise
+                # Placed and shared as the source is: now the owner's tabs list it.
+                _announce_session_added(user_id, fork.id)
+
+                # Best-effort, as for native supersession: the fork already holds the
+                # work, so a lost notice must not strand it unreturned.
+                try:
+                    await _persist_external_conversation_item(
+                        source.id,
+                        source,
+                        SessionEventInput(
+                            type=_EXTERNAL_CONVERSATION_ITEM_TYPE,
+                            data={
+                                "item_type": "message",
+                                "item_data": {
+                                    "role": "assistant",
+                                    "agent": fork.agent_name or "assistant",
+                                    "content": [{"type": "output_text", "text": notice(fork.id)}],
+                                },
                             },
-                        },
-                    ),
-                    conversation_store,
-                )
-            except Exception:
-                _logger.warning(
-                    "Failed to persist the %s supersession notice; old_session=%s new_session=%s",
+                        ),
+                        conversation_store,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "Failed to persist the %s supersession notice; old_session=%s new_session=%s",
+                        command,
+                        source.id,
+                        fork.id,
+                        exc_info=True,
+                        extra={"session_id": source.id},
+                    )
+                _publish_session_superseded(source.id, fork.id, reason=reason)
+                _logger.info(
+                    "Session superseded by %s",
                     command,
-                    source.id,
-                    fork.id,
-                    exc_info=True,
-                    extra={"session_id": source.id},
+                    extra=debug_event(
+                        "session_superseded",
+                        session_id=source.id,
+                        target_session_id=fork.id,
+                        command=command,
+                        runner_bound=runner_bound,
+                    ),
                 )
-            _publish_session_superseded(source.id, fork.id, reason=reason)
-            _logger.info(
-                "Session superseded by %s",
-                command,
-                extra=debug_event(
-                    "session_superseded",
-                    session_id=source.id,
-                    target_session_id=fork.id,
-                    command=command,
-                    runner_bound=runner_bound,
-                ),
-            )
-            return fork.id
+                return fork.id
+
+        # Shielded: once allowed, the move runs to its end (placed, or rolled
+        # back) even if the request is cancelled, e.g. by a client disconnect,
+        # so a cancellation never strands a half-made successor; meanwhile the
+        # move guard refuses a retry.
+        task = asyncio.create_task(move(), name=f"continue-{source.id}")
+        _continuation_tasks.add(task)
+        task.add_done_callback(_forget_continuation)
+        return await asyncio.shield(task)
 
     async def clear_session_into_fresh_session(
         request: Request,
