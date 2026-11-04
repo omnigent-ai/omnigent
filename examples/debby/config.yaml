@@ -17,7 +17,7 @@
 # or export ANTHROPIC_API_KEY and OPENAI_API_KEY).
 
 spec_version: 1
-name: debby
+name: Debby
 description: >-
   A two-headed brainstorming partner that brings you Claude and GPT perspectives.
   Use the `debate` skill for critiques and a final synthesis.

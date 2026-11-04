@@ -56,7 +56,7 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
     is a bundle: a regression that drops the harness into a flat key would
     leave ``config.harness`` empty and fail here.
     """
-    assert polly_spec.name == "polly"
+    assert polly_spec.name == "Polly"
     ex = polly_spec.executor
     assert ex.config.get("harness") == "claude-sdk"
     # No model pin — the configured provider's default Claude model is used.
