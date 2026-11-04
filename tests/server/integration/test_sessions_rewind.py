@@ -10,6 +10,7 @@ transport (shared with the claude-sdk ``/clear`` tests).
 from __future__ import annotations
 
 import contextlib
+import uuid
 from typing import Any
 
 import httpx
@@ -391,6 +392,9 @@ async def test_rewind_still_returns_the_new_session_when_its_attachments_fail(
         ("openai-agents", 2, "runner", 400, "/rewind is not available"),
         ("claude-sdk", 1, "runner", 400, "needs one of this session's prompts"),
         ("claude-sdk", None, "runner", 400, "needs one of this session's prompts"),
+        # Well-formed ids: another session's prompt, and one no item has.
+        ("claude-sdk", 2, "foreign_prompt", 400, "needs one of this session's prompts"),
+        ("claude-sdk", 2, "unknown_item", 400, "needs one of this session's prompts"),
         ("claude-sdk", 2, "none", 503, "runner is offline"),
         ("claude-sdk", 2, "running", 400, "Stop the current turn"),
         # A message still on its way to the runner counts as a running turn.
@@ -454,6 +458,12 @@ async def test_rewind_refusals_create_no_session(
         )
         source_id = side_chat.id
         items = item_ids(store, source_id)
+    item_id = items[item_index] if item_index is not None else "msg_bogus"
+    if placement == "foreign_prompt":
+        other_id = await create_placed_session(auth_client, store, user=_OWNER)
+        item_id = item_ids(store, other_id)[2]
+    elif placement == "unknown_item":
+        item_id = uuid.uuid4().hex
     headers = {"X-Forwarded-Email": caller}
     before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
 
@@ -464,7 +474,7 @@ async def test_rewind_refusals_create_no_session(
     ):
         resp = await auth_client.post(
             f"/v1/sessions/{source_id}/rewind",
-            json={"item_id": items[item_index] if item_index is not None else "msg_bogus"},
+            json={"item_id": item_id},
             headers=headers,
         )
 
