@@ -293,6 +293,20 @@ describe("pinOrderWrites", () => {
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "missing")).toEqual([]);
   });
 
+  it("reorders family representatives without pinning their context rows", () => {
+    const rows = pins(100, 200, undefined);
+    const family = { id: "family", representative_id: "conv_1", pinned: true, pinned_at: "200" };
+    rows[1].family = family;
+    rows[2].family = family;
+    expect(pinOrderWrites(rows, "conv_0", "conv_1")).toEqual([{ id: "conv_0", pinnedAt: 201 }]);
+    rows[0].labels = { "omnigent.pinned": "200" };
+    expect(pinOrderWrites(rows, "new", "conv_1")).toEqual([
+      { id: "new", pinnedAt: 201 },
+      { id: "conv_1", pinnedAt: 202 },
+    ]);
+    expect(pinOrderWrites(rows, "conv_0", "conv_2")).toEqual([]);
+  });
+
   it("produces values that orderByPinnedTimestamp sorts into the dragged order", () => {
     const rows = pins(1000, 2000, 3000, 4000);
     const writes = new Map(pinOrderWrites(rows, "conv_3", "conv_1").map((w) => [w.id, w.pinnedAt]));

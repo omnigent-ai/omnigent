@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from itertools import batched
 
 from fastapi import Request
 
@@ -18,6 +19,8 @@ from omnigent.stores.conversation_store import (
     family_pinned_label_key,
 )
 from omnigent.stores.permission_store import PermissionStore
+
+_FAMILY_GRANT_BATCH_SIZE = 1000
 
 
 def authorize_sibling_source(
@@ -83,30 +86,29 @@ def project_families(
     candidates = [item for item in sessions if item.family_id is not None]
     if permissions is not None and user_id is None:
         return sessions, {}
-    grants = (
-        permissions.list_for_sessions([item.id for item in candidates], user_id=user_id)
-        if permissions
-        else {}
-    )
+
+    def owned_ids(session_ids: list[str]) -> set[str]:
+        if permissions is None:
+            return set(session_ids)
+        return {
+            grant.conversation_id
+            for batch in batched(session_ids, _FAMILY_GRANT_BATCH_SIZE)
+            for grants in permissions.list_for_sessions(list(batch), user_id=user_id).values()
+            for grant in grants
+            if grant.level == LEVEL_OWNER and grant.user_id == user_id
+        }
+
+    candidate_owners = owned_ids([item.id for item in candidates])
     family_ids = list(
         dict.fromkeys(
             item.family_id
             for item in candidates
-            if item.family_id is not None
-            and (
-                permissions is None
-                or any(grant.level == LEVEL_OWNER for grant in grants.get(item.id, []))
-            )
+            if item.family_id is not None and item.id in candidate_owners
         )
     )
     members_by_family = conversations.get_session_families(family_ids) if family_ids else {}
-    member_grants = (
-        permissions.list_for_sessions(
-            [member.id for members in members_by_family.values() for member in members],
-            user_id=user_id,
-        )
-        if permissions
-        else {}
+    member_owners = owned_ids(
+        [member.id for members in members_by_family.values() for member in members]
     )
     result = {item.id: item for item in sessions}
     families: dict[str, SessionFamily] = {}
@@ -115,25 +117,11 @@ def project_families(
     for item in candidates:
         family_id = item.family_id
         assert family_id is not None
-        if family_id in seen or (
-            permissions is not None
-            and not any(
-                grant.user_id == user_id and grant.level == LEVEL_OWNER
-                for grant in grants.get(item.id, [])
-            )
-        ):
+        if family_id in seen or item.id not in candidate_owners:
             continue
         seen.add(family_id)
         members = members_by_family.get(family_id, [])
-        owned = [
-            member
-            for member in members
-            if permissions is None
-            or any(
-                grant.user_id == user_id and grant.level == LEVEL_OWNER
-                for grant in member_grants.get(member.id, [])
-            )
-        ]
+        owned = [member for member in members if member.id in member_owners]
         active = [member for member in owned if not member.archived]
         info = SessionFamily(
             id=family_id,

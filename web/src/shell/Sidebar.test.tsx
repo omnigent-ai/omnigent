@@ -2063,8 +2063,9 @@ describe("Sidebar sections", () => {
     const family = { id: "family", representative_id: "conv_parent", pinned: false };
     mockConversations([
       conv("conv_parent", "Claude Code", { family }),
-      conv("conv_sibling", "Codex", { family }),
+      conv("conv_sibling", "Codex", { family, labels: { "omnigent.pinned": "1" } }),
     ]);
+    seedPins(["conv_sibling"]);
     renderSidebar();
 
     const link = screen.getByText("conv_parent").closest("a")!;
@@ -2073,7 +2074,51 @@ describe("Sidebar sections", () => {
     expect(surface).toHaveClass("relative");
     expect(surface).toContainElement(chevron);
     expect(link).not.toContainElement(chevron);
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
+      "data-sibling-session",
+    );
+    expect(
+      within(pinnedSection).queryByRole("button", { name: "Collapse session family" }),
+    ).toBeNull();
   });
+
+  it.each([false, true])(
+    "keeps the representative in the first display page (project: %s)",
+    (inProject) => {
+      const family = { id: "family", representative_id: "conv_0", pinned: false };
+      if (inProject) projectsMock.push("Customer X");
+      mockConversations(
+        Array.from({ length: 6 }, (_, index) =>
+          conv(`conv_${index}`, "Claude Code", {
+            created_at: index,
+            updated_at: index,
+            family,
+            labels: inProject ? { omni_project: "Customer X" } : {},
+          }),
+        ),
+      );
+      renderSidebar(true, "/", undefined, undefined, [], vi.fn(), {
+        ...sidebarConfig,
+        displayPageSize: 5,
+      });
+      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+      expect(screen.getByText("conv_0")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Collapse session family" })).toBeInTheDocument();
+      for (let index = 1; index < 5; index++) {
+        expect(screen.getByText(`conv_${index}`).closest("li")).toHaveAttribute(
+          "data-sibling-session",
+          "true",
+        );
+      }
+      expect(screen.queryByText("conv_5")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: inProject ? /Show more/ : "Load more" }));
+      expect(screen.getByText("conv_5").closest("li")).toHaveAttribute(
+        "data-sibling-session",
+        "true",
+      );
+    },
+  );
 });
 
 // The sidebar splits sessions across two tabs: "My sessions" (owned, with the
@@ -2546,9 +2591,11 @@ describe("Sidebar project sections", () => {
 
   it("moves a pinned project session out into the global Pinned section", () => {
     projectsMock.push("Customer X");
+    const family = { id: "family", representative_id: "conv_pinned", pinned: true };
     mockConversations([
       conv("conv_plain", "Claude Code", { labels: { omni_project: "Customer X" } }),
-      conv("conv_pinned", "Claude Code", { labels: { omni_project: "Customer X" } }),
+      conv("conv_pinned", "Claude Code", { labels: { omni_project: "Customer X" }, family }),
+      conv("conv_peer", "Codex", { labels: { omni_project: "Customer X" }, family }),
     ]);
     // Pin one of the filed sessions via localStorage (client-side pins).
     seedPins(["conv_pinned"]);
@@ -2558,12 +2605,17 @@ describe("Sidebar project sections", () => {
     // project and renders in the flat global Pinned section.
     const pinnedSection = screen.getByText("Pinned").closest("section")!;
     expect(within(pinnedSection).getByText("conv_pinned")).toBeInTheDocument();
+    expect(within(pinnedSection).getByText("conv_peer").closest("li")).toHaveAttribute(
+      "data-sibling-session",
+      "true",
+    );
 
     // The project folder keeps only its non-pinned session.
     fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_plain")).toBeInTheDocument();
     expect(within(projectSection).queryByText("conv_pinned")).toBeNull();
+    expect(within(projectSection).queryByText("conv_peer")).toBeNull();
   });
 
   it("does not render a project section when useProjects returns nothing", () => {

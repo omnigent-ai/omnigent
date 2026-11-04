@@ -454,6 +454,11 @@ export interface PinOrderWrite {
   pinnedAt: number;
 }
 
+/** A pinned family moves as one unit; nested rows only provide context. */
+export function isPinOrderUnit(conversation: Conversation): boolean {
+  return !conversation.family?.pinned || conversation.family.representative_id === conversation.id;
+}
+
 /**
  * The pin label writes that move `fromId` into `toId`'s slot of the (already
  * pin-ordered) Pinned list. A `fromId` that isn't pinned yet is inserted just
@@ -464,17 +469,19 @@ export interface PinOrderWrite {
  * are skipped). Returns `[]` for a no-op.
  */
 export function pinOrderWrites(
-  pinned: readonly Conversation[],
+  rows: readonly Conversation[],
   fromId: string,
   toId: string,
 ): PinOrderWrite[] {
+  const pinned = rows.filter(isPinOrderUnit);
   const from = pinned.findIndex((c) => c.id === fromId);
   const to = pinned.findIndex((c) => c.id === toId);
   if (to < 0 || from === to) return [];
   const moved = [...pinned];
   const [row] = from < 0 ? [{ id: fromId } as Conversation] : moved.splice(from, 1);
   moved.splice(to, 0, row);
-  const value = (c: Conversation | undefined): number => Number(c?.labels?.[PINNED_LABEL_KEY]);
+  const value = (c: Conversation | undefined): number =>
+    Number(c?.family?.pinned_at ?? c?.labels?.[PINNED_LABEL_KEY]);
   const prev = value(moved[to - 1]);
   const next = value(moved[to + 1]);
   let pinnedAt = prev + (next - prev) / 2;

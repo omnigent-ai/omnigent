@@ -8,7 +8,8 @@ import dataclasses
 import json
 import secrets
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from itertools import batched
 from typing import Any
 
 import httpx
@@ -274,6 +275,7 @@ from omnigent.version import VERSION
 ClearSessionIntoFreshSession = Callable[
     [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
 ]
+_SESSION_LIST_BATCH_SIZE = 1000
 
 
 def _require_attachment_compatible_history(
@@ -1986,7 +1988,7 @@ def register_core_routes(
     # ── GET /sessions ───────────────────────────────────────────
 
     def _session_agent_metadata(
-        conversations: list[Conversation],
+        conversations: Sequence[Conversation],
     ) -> tuple[dict[str, str], dict[str, str | None]]:
         """Resolve list metadata off the event loop with one batched agent read."""
         agents = agent_store.get_many(
@@ -2200,127 +2202,127 @@ def register_core_routes(
             include_archived=include_archived_param,
             archived_only=archived_only_param,
         )
-        # list_conversations may return rows with agent_id=None for
-        # legacy conversations; skip them before building the batch IDs.
-        conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
-        if not conv_ids:
-            return PaginatedList(
-                data=[],
-                first_id=page.first_id,
-                last_id=page.last_id,
-                has_more=page.has_more,
-            )
-        # Batch-fetch permissions and agent metadata concurrently.
-        # The tasks table has been removed — status comes exclusively from
-        # the relay-fed ``_session_status_cache``.
-        perms_by_conv: dict[str, list[SessionPermission]]
-        if permission_store is not None:
-            perms_by_conv, agent_metadata, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
-                asyncio.to_thread(_session_agent_metadata, page.data),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
-            )
-            user_is_admin = (
-                await asyncio.to_thread(permission_store.is_admin, user_id)
-                if user_id is not None
-                else False
-            )
-        else:
-            agent_metadata, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(_session_agent_metadata, page.data),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
-            )
-            perms_by_conv = {}
-            user_is_admin = False
-        agent_names_by_id, harnesses_by_id = agent_metadata
-        # In-memory lookup — no I/O, so batching avoids re-acquiring
-        # the index's lock per row but otherwise has no DB cost.
-        pending_counts = pending_elicitations.counts_for(conv_ids)
-        comments_fingerprints = await _comments_fingerprints_for(conv_ids)
-        pull_requests = await _pull_requests_for(conv_ids)
-        # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
-        # A session whose persisted live_status is still running/waiting but
-        # whose runner is confirmed gone — a replica that restarted and
-        # outlived its runner, a crashed host, a graceful disconnect
-        # mid-turn — would otherwise read "running" forever: no executor is
-        # left to emit the terminal edge that clears it. Settle that exact
-        # subset here so the sidebar (and every other reader) stops showing a
-        # turn that isn't happening. The list still does NOT compute liveness
-        # for the general case (see the note below the item build): the probe
-        # is bounded to a tiny suspect set so the common path pays nothing.
-        #
-        # Suspect = a row that (a) still says running/waiting, (b) has a bound
-        # runner, (c) has NO live entry in this replica's status cache — i.e.
-        # its "running" came from the cross-replica DB mirror, not a runner
-        # this replica is actively relaying — and (d) has a stale/absent
-        # runner_last_seen heartbeat. The freshness check reads the stamp
-        # already carried on the list row (no extra query): a runner up on
-        # another replica keeps it fresh, so such a session is filtered out
-        # here and never reaches the probe. Only stamp-stale candidates fall
-        # through to liveness_lookup, which additionally rules out a runner
-        # whose tunnel is live on THIS replica before we settle.
-        if liveness_lookup is not None:
-            orphan_suspects = [
-                conv
-                for conv in page.data
-                if conv.agent_id is not None
-                and conv.runner_id is not None
-                and conv.live_status in ("running", "waiting")
-                and _session_status_cache.get(conv.id) is None
-                and not runner_seen_is_fresh(conv.runner_last_seen)
-                and (
-                    permission_store is None
-                    or _permission_level_from_grants(
-                        user_id,
-                        perms_by_conv.get(conv.id, []),
-                        user_is_admin,
-                    )
-                    == LEVEL_OWNER
+        items: list[SessionListItem] = []
+        # Expanded families can contain many more rows than the source page.
+        for list_batch in batched(page.data, _SESSION_LIST_BATCH_SIZE):
+            # list_conversations may return rows with agent_id=None for
+            # legacy conversations; skip them before building the batch IDs.
+            conv_ids = [conv.id for conv in list_batch if conv.agent_id is not None]
+            if not conv_ids:
+                continue
+            # Batch-fetch permissions and agent metadata concurrently.
+            # The tasks table has been removed — status comes exclusively from
+            # the relay-fed ``_session_status_cache``.
+            perms_by_conv: dict[str, list[SessionPermission]]
+            if permission_store is not None:
+                perms_by_conv, agent_metadata, child_ids_by_parent = await asyncio.gather(
+                    asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
+                    asyncio.to_thread(_session_agent_metadata, list_batch),
+                    asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_by_parent,
+                        conv_ids,
+                    ),
                 )
-            ]
-            if orphan_suspects:
-                orphan_liveness = await asyncio.to_thread(
-                    liveness_lookup, [conv.id for conv in orphan_suspects]
+                user_is_admin = (
+                    await asyncio.to_thread(permission_store.is_admin, user_id)
+                    if user_id is not None
+                    else False
                 )
-                for conv in orphan_suspects:
-                    result = orphan_liveness.get(conv.id)
-                    # runner_online is False only once the runner is gone from
-                    # every replica (no tunnel anywhere AND runner_last_seen
-                    # stale past the TTL), so this fires for a genuinely
-                    # orphaned runner, never one mid-reconnect within grace.
-                    if result is not None and not result.runner_online:
-                        await asyncio.to_thread(
-                            reconcile_orphaned_running_status,
-                            conv.id,
-                            conversation_store,
-                            int(time.time()) - RUNNER_LIVENESS_TTL_S,
+            else:
+                agent_metadata, child_ids_by_parent = await asyncio.gather(
+                    asyncio.to_thread(_session_agent_metadata, list_batch),
+                    asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_by_parent,
+                        conv_ids,
+                    ),
+                )
+                perms_by_conv = {}
+                user_is_admin = False
+            agent_names_by_id, harnesses_by_id = agent_metadata
+            # In-memory lookup — no I/O, so batching avoids re-acquiring
+            # the index's lock per row but otherwise has no DB cost.
+            pending_counts = pending_elicitations.counts_for(conv_ids)
+            comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+            pull_requests = await _pull_requests_for(conv_ids)
+            # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
+            # A session whose persisted live_status is still running/waiting but
+            # whose runner is confirmed gone — a replica that restarted and
+            # outlived its runner, a crashed host, a graceful disconnect
+            # mid-turn — would otherwise read "running" forever: no executor is
+            # left to emit the terminal edge that clears it. Settle that exact
+            # subset here so the sidebar (and every other reader) stops showing a
+            # turn that isn't happening. The list still does NOT compute liveness
+            # for the general case (see the note below the item build): the probe
+            # is bounded to a tiny suspect set so the common path pays nothing.
+            #
+            # Suspect = a row that (a) still says running/waiting, (b) has a bound
+            # runner, (c) has NO live entry in this replica's status cache — i.e.
+            # its "running" came from the cross-replica DB mirror, not a runner
+            # this replica is actively relaying — and (d) has a stale/absent
+            # runner_last_seen heartbeat. The freshness check reads the stamp
+            # already carried on the list row (no extra query): a runner up on
+            # another replica keeps it fresh, so such a session is filtered out
+            # here and never reaches the probe. Only stamp-stale candidates fall
+            # through to liveness_lookup, which additionally rules out a runner
+            # whose tunnel is live on THIS replica before we settle.
+            if liveness_lookup is not None:
+                orphan_suspects = [
+                    conv
+                    for conv in list_batch
+                    if conv.agent_id is not None
+                    and conv.runner_id is not None
+                    and conv.live_status in ("running", "waiting")
+                    and _session_status_cache.get(conv.id) is None
+                    and not runner_seen_is_fresh(conv.runner_last_seen)
+                    and (
+                        permission_store is None
+                        or _permission_level_from_grants(
+                            user_id,
+                            perms_by_conv.get(conv.id, []),
+                            user_is_admin,
                         )
-        # Build items after reconciliation so each settled row reads its new
-        # status straight from the (now-updated) cache.
-        items: list[SessionListItem] = [
-            _build_session_list_item(
-                conv,
-                agent_names_by_id=agent_names_by_id,
-                harness=harnesses_by_id.get(conv.id),
-                grants=perms_by_conv.get(conv.id, []),
-                user_id=user_id,
-                user_is_admin=user_is_admin,
-                permissions_enabled=permission_store is not None,
-                pending_count=pending_counts.get(conv.id, 0),
-                child_session_ids=child_ids_by_parent[conv.id],
-                comments_fingerprint=comments_fingerprints.get(conv.id),
-                pull_request=pull_requests.get(conv.id, (None, None))[0],
-                pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
+                        == LEVEL_OWNER
+                    )
+                ]
+                if orphan_suspects:
+                    orphan_liveness = await asyncio.to_thread(
+                        liveness_lookup, [conv.id for conv in orphan_suspects]
+                    )
+                    for conv in orphan_suspects:
+                        result = orphan_liveness.get(conv.id)
+                        # runner_online is False only once the runner is gone from
+                        # every replica (no tunnel anywhere AND runner_last_seen
+                        # stale past the TTL), so this fires for a genuinely
+                        # orphaned runner, never one mid-reconnect within grace.
+                        if result is not None and not result.runner_online:
+                            await asyncio.to_thread(
+                                reconcile_orphaned_running_status,
+                                conv.id,
+                                conversation_store,
+                                int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                            )
+            # Build items after reconciliation so each settled row reads its new
+            # status straight from the (now-updated) cache.
+            items.extend(
+                [
+                    _build_session_list_item(
+                        conv,
+                        agent_names_by_id=agent_names_by_id,
+                        harness=harnesses_by_id.get(conv.id),
+                        grants=perms_by_conv.get(conv.id, []),
+                        user_id=user_id,
+                        user_is_admin=user_is_admin,
+                        permissions_enabled=permission_store is not None,
+                        pending_count=pending_counts.get(conv.id, 0),
+                        child_session_ids=child_ids_by_parent[conv.id],
+                        comments_fingerprint=comments_fingerprints.get(conv.id),
+                        pull_request=pull_requests.get(conv.id, (None, None))[0],
+                        pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
+                    )
+                    for conv in list_batch
+                    if conv.agent_id is not None
+                ]
             )
-            for conv in page.data
-            if conv.agent_id is not None
-        ]
         for item in items:
             item.family = family_info.get(item.id)
             if item.family and item.family.pinned and item.family.representative_id == item.id:
@@ -3264,10 +3266,11 @@ def register_core_routes(
                     conversation_store.get_session_family, session_id
                 )
                 active = [member for member in members if not member.archived]
+                retained = active or members
                 family_pin_key = family_pinned_label_key(user_id)
                 if (
-                    active
-                    and active[0].id == session_id
+                    retained
+                    and retained[0].id == session_id
                     and (
                         family_pin_key in pin_source.labels
                         or pinned_label_key(user_id) not in pin_source.labels

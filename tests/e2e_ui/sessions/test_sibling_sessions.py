@@ -278,6 +278,30 @@ async def _drive(rig: ManagedReplicas) -> None:
                         "project_id"
                     ] == filed["project_id"]
                     await page.screenshot(path=str(evidence / "family-project.png"))
+                    # Pinning an expanded folder's family removes every row from that folder.
+                    project_header = page.get_by_role("button", name="Sibling demo", exact=True)
+                    if await project_header.get_attribute("aria-expanded") == "false":
+                        await project_header.click()
+                    project_section = project_header.locator("xpath=ancestor::section[1]")
+                    for pinned in (True, False):
+                        representative = page.locator(
+                            f'li[data-sidebar-session-id="{sibling_id}"]'
+                        )
+                        await representative.hover()
+                        await representative.get_by_test_id("quick-pin-conversation").click()
+                        await _poll(
+                            client,
+                            f"{rig.a}/v1/sessions/{sibling_id}",
+                            lambda row, expected=pinned: (
+                                row.get("family", {}).get("pinned") is expected
+                            ),
+                        )
+                        for member_id in (sibling_id, fresh_id):
+                            selector = f'li[data-sidebar-session-id="{member_id}"]'
+                            await expect(page.locator(selector)).to_have_count(1)
+                            await expect(project_section.locator(selector)).to_have_count(
+                                0 if pinned else 1
+                            )
                     # Ordinary Fork stays standalone and can reuse this sandbox.
                     await menu(sibling_id)
                     await page.get_by_test_id("fork-conversation").click()

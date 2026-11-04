@@ -9760,7 +9760,7 @@ def test_spawn_tree_read_examines_rows_through_the_root_index(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("split_database", [False, True])
 @pytest.mark.parametrize("user_id", ["alice", "a" * 112])
-async def test_sibling_family_lifecycle(tmp_path, split_database, user_id):
+async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
     from omnigent.db.db_models import workspace_scope
@@ -9854,7 +9854,23 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id):
     another = store.create_conversation()
     another_sibling = store.create_conversation()
     store.add_new_sibling(another.id, another_sibling.id, user_id=user_id)
-    families = store.get_session_families([source.id, another.id])
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store._FAMILY_READ_BATCH_SIZE", 1
+    )
+    query_sizes = []
+
+    def capture_size(_conn, _cursor, _statement, parameters, _context, _many):
+        query_sizes.append(len(parameters))
+
+    engines = {store._engine, store._conv_engine}
+    for engine in engines:
+        event.listen(engine, "before_cursor_execute", capture_size)
+    try:
+        families = store.get_session_families([source.id, another.id])
+    finally:
+        for engine in engines:
+            event.remove(engine, "before_cursor_execute", capture_size)
+    assert query_sizes and max(query_sizes) <= 4
     assert [member.id for member in families[source.id]] == [first.id, second.id, later.id]
     assert [member.id for member in families[another.id]] == [another.id, another_sibling.id]
 

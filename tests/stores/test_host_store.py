@@ -92,7 +92,12 @@ async def test_session_delete_keeps_shared_sandbox_until_last_binding(
 
 @pytest.mark.parametrize("split_database", [False, True])
 @pytest.mark.parametrize("uploaded_agent", [False, True])
-def test_last_session_delete_races_new_binding(tmp_path, split_database, uploaded_agent):
+def test_last_session_delete_races_new_binding(
+    tmp_path, split_database, uploaded_agent, monkeypatch
+):
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "_DELETE_METADATA_BATCH_SIZE", 2)
     uri = f"sqlite:///{tmp_path / 'metadata.db'}"
     conversations = SqlAlchemyConversationStore(
         uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
@@ -109,7 +114,24 @@ def test_last_session_delete_races_new_binding(tmp_path, split_database, uploade
         token_expires_at=now_epoch() + 1000,
     )
     first = conversations.create_conversation(host_id=host_id, workspace="/work")
+    for _ in range(3):
+        conversations.create_conversation(
+            parent_conversation_id=first.id, host_id=host_id, workspace="/work"
+        )
     barrier = threading.Barrier(2)
+    batches = 0
+
+    def observe_batches(maker, operation, write):
+        nonlocal batches
+        result = run_write_transaction(maker, operation, write)
+        if operation == "delete_conversation_metadata":
+            batches += 1
+            if batches == 1:
+                assert hosts.get_host(host_id) is not None
+                barrier.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(sqlalchemy_store, "run_write_transaction", observe_batches)
 
     def admit(*, race=True):
         if race:
@@ -133,7 +155,6 @@ def test_last_session_delete_races_new_binding(tmp_path, split_database, uploade
             return None
 
     def remove():
-        barrier.wait(timeout=5)
         assert asyncio.run(conversations.delete_conversation(first.id))
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -141,6 +162,7 @@ def test_last_session_delete_races_new_binding(tmp_path, split_database, uploade
         removed = pool.submit(remove)
         survivor = admitted.result(timeout=15)
         removed.result(timeout=15)
+    assert batches == 2
     remaining = conversations.list_conversations(limit=10).data
     assert [row.id for row in remaining] == ([survivor] if survivor else [])
     if survivor:
@@ -2229,10 +2251,16 @@ def test_recovery_fences_expired_attempts_and_connected_hosts(host_store: HostSt
 
 
 @pytest.mark.asyncio
-async def test_deleted_automation_session_retains_reusable_sandbox(db_uri: str) -> None:
+async def test_deleted_automation_session_retains_reusable_sandbox(
+    db_uri: str, monkeypatch
+) -> None:
     from omnigent.server.scheduled.schedule import continued_sandbox_host_id
     from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store._DELETE_METADATA_BATCH_SIZE", 2
+    )
 
     tasks = SqlAlchemyScheduledTaskStore(db_uri)
     task = tasks.create(
@@ -2262,6 +2290,10 @@ async def test_deleted_automation_session_retains_reusable_sandbox(db_uri: str) 
         workspace="/work",
         labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
     )
+    for _ in range(2):
+        conversations.create_conversation(
+            parent_conversation_id=session.id, host_id=host_id, workspace="/work"
+        )
     assert await conversations.delete_conversation(session.id)
     assert host_store.delete_host(host_id, keep_if_bound=True) is None
     assert host_store.get_host(host_id) is not None

@@ -3420,6 +3420,9 @@ async def test_relaunch_does_not_recreate_deleted_host(
     assert exc.value.status_code == 409
     assert fake.terminated == (["sb-deleted-old", "sb-fake-1"] if during_provision else [])
     assert host_store.get_host(host.host_id) is None
+    if not during_provision:
+        tombstone = host_store.get_host(host.host_id, include_deleted=True)
+        assert tombstone is not None and tombstone.sandbox_id == "sb-deleted-old"
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:

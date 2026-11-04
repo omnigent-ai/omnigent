@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
+from itertools import batched
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
 
@@ -142,6 +143,9 @@ from omnigent.stores.sandbox_profile_store import (
 )
 
 _logger = logging.getLogger(__name__)
+
+_DELETE_METADATA_BATCH_SIZE = 100
+_FAMILY_READ_BATCH_SIZE = 10
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
 _RUNNER_BINDING_LIMIT = 200
@@ -1845,20 +1849,21 @@ class SqlAlchemyConversationStore(ConversationStore):
         families: dict[str, list[Conversation]] = {family_id: [] for family_id in family_ids}
         if not families:
             return families
-        with self._session("read_session_families") as session:
-            rows = session.execute(
-                select(SqlConversationMetadata.id, SqlConversationMetadata.family_id)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.family_id.in_(families),
-                )
-                .order_by(SqlConversationMetadata.family_id, SqlConversationMetadata.id)
-                .limit(len(families) * MAX_SESSION_FAMILY_MEMBERS + 1)
-            ).all()
-        members = self.get_conversations([row.id for row in rows])
-        for row in rows:
-            if row.id in members:
-                families[row.family_id].append(members[row.id])
+        for family_batch in batched(families, _FAMILY_READ_BATCH_SIZE):
+            with self._session("read_session_families") as session:
+                rows = session.execute(
+                    select(SqlConversationMetadata.id, SqlConversationMetadata.family_id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.family_id.in_(family_batch),
+                    )
+                    .order_by(SqlConversationMetadata.family_id, SqlConversationMetadata.id)
+                    .limit(len(family_batch) * MAX_SESSION_FAMILY_MEMBERS + 1)
+                ).all()
+            members = self.get_conversations([row.id for row in rows])
+            for row in rows:
+                if row.id in members:
+                    families[row.family_id].append(members[row.id])
         for family_id, family in families.items():
             if len(family) > MAX_SESSION_FAMILY_MEMBERS:
                 raise OmnigentError("Session family is too large", code=ErrorCode.CONFLICT)
@@ -6590,6 +6595,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Agent rows are never deleted here: agents outlive the sessions using them
         # and only an explicit agent removal deletes one.
 
+        from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+
         def delete_ap(ap_sess: Session) -> tuple[list[str], dict[str, str]] | None:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
@@ -6608,20 +6615,23 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.parent_conversation_id == cte.c.id,
                 )
             )
-            subtree_ids = [
-                cast(str, result[0]) for result in ap_sess.execute(select(cte.c.id)).fetchall()
-            ]
-            origins = dict(
-                ap_sess.execute(
-                    select(SqlConversationLabel.conversation_id, SqlConversationLabel.value).where(
+            # Keep origin capture in the same snapshot as the existing subtree deletion.
+            entries = ap_sess.execute(
+                select(cte.c.id, SqlConversationLabel.value).outerjoin(
+                    SqlConversationLabel,
+                    and_(
                         SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.conversation_id.in_(subtree_ids),
+                        SqlConversationLabel.conversation_id == cte.c.id,
                         SqlConversationLabel.key == SCHEDULED_TASK_ORIGIN_LABEL_KEY,
-                    )
+                    ),
                 )
-                .tuples()
-                .all()
-            )
+            ).all()
+            subtree_ids = [entry[0] for entry in entries]
+            retained_tasks = {
+                continued_sandbox_host_id(task_id, current_workspace_id()): task_id
+                for _, task_id in entries
+                if task_id is not None
+            }
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
             ap_sess.execute(
                 delete(SqlConversationItem).where(
@@ -6643,7 +6653,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             ap_sess.delete(row)
-            return subtree_ids, origins
+            return subtree_ids, retained_tasks
 
         ap_result = run_write_transaction(
             self._conv_session_immediate,
@@ -6652,14 +6662,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if ap_result is None:
             return False
-        subtree_ids, task_origins = ap_result
+        subtree_ids, retained_tasks = ap_result
 
-        def delete_metadata(session: Session) -> None:
+        def delete_metadata(session: Session, batch_ids: tuple[str, ...]) -> None:
             host_ids = session.scalars(
                 select(SqlConversationMetadata.host_id)
                 .where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id.in_(subtree_ids),
+                    SqlConversationMetadata.id.in_(batch_ids),
                     SqlConversationMetadata.host_id.is_not(None),
                 )
                 .distinct()
@@ -6676,38 +6686,36 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.execute(
                 delete(SqlComment).where(
                     SqlComment.workspace_id == current_workspace_id(),
-                    SqlComment.conversation_id.in_(subtree_ids),
+                    SqlComment.conversation_id.in_(batch_ids),
                 )
             )
             session.execute(
                 delete(SqlPolicy).where(
                     SqlPolicy.workspace_id == current_workspace_id(),
-                    SqlPolicy.session_id.in_(subtree_ids),
+                    SqlPolicy.session_id.in_(batch_ids),
                 )
             )
             session.execute(
                 delete(SqlSessionPermission).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.conversation_id.in_(subtree_ids),
+                    SqlSessionPermission.conversation_id.in_(batch_ids),
                 )
             )
             session.execute(
                 delete(SqlConversationMetadata).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id.in_(subtree_ids),
+                    SqlConversationMetadata.id.in_(batch_ids),
                 )
             )
 
-            from omnigent.server.scheduled.schedule import continued_sandbox_host_id
-
-            for task_id in task_origins.values():
-                retained_id = continued_sandbox_host_id(task_id, current_workspace_id())
-                if retained_id in host_ids:
+            for host in hosts:
+                task_id = retained_tasks.get(host.host_id)
+                if task_id is not None:
                     session.merge(
                         SqlPreference(
                             workspace_id=current_workspace_id(),
                             user_id="__host_lifecycle__",
-                            key="retained_sandbox:" + retained_id,
+                            key="retained_sandbox:" + host.host_id,
                             value=task_id,
                         )
                     )
@@ -6715,10 +6723,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             for host in hosts:
                 delete_unused_host_in_session(session, host)
 
-        run_write_transaction(
-            self._session_immediate,
-            "delete_conversation_metadata",
-            delete_metadata,
-        )
+        for batch_ids in batched(subtree_ids, _DELETE_METADATA_BATCH_SIZE):
+            run_write_transaction(
+                self._session_immediate,
+                "delete_conversation_metadata",
+                lambda session, batch=batch_ids: delete_metadata(session, batch),
+            )
 
         return True

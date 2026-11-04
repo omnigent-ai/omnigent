@@ -1254,7 +1254,7 @@ async def test_same_host_creation_across_replicas(
 
 @pytest.mark.parametrize("bundled", [False, True])
 async def test_siblings_are_private_roots_and_owner_only_in_lists(
-    auth_client, auth_app, peers, db_uri, bundled
+    auth_client, auth_app, peers, db_uri, bundled, monkeypatch
 ):
     from omnigent.server.sharing_settings import DefaultPublicSessions
     from tests.server.integration.test_sessions_permissions import build_agent_bundle
@@ -1345,6 +1345,57 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     assert response.status_code == 422, response.text
     assert response.json()["detail"][0]["loc"] == ["body", "family_id"]
     assert store.get_conversation(source["id"]).family_id == source["id"]
+
+    host_id = uuid4().hex
+    auth_app.state.host_store.register_managed_host(
+        host_id=host_id,
+        name="Other sandbox",
+        user_id="alice",
+        token="test-token",
+        provider="modal",
+        sandbox_id="other-sandbox",
+        token_expires_at=2_000_000_000,
+    )
+    refused = await auth_client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": source["agent_id"],
+            **metadata,
+            "host_id": host_id,
+            "workspace": "/work",
+        },
+    )
+    assert refused.status_code == 403, refused.text
+    assert "Only the source session's sandbox" in refused.text
+    side = await auth_client.post(f"/v1/sessions/{source['id']}/fork", json={"side_chat": True})
+    assert side.status_code == 201, side.text
+    from_side = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": source["agent_id"], "sibling_source_id": side.json()["id"]},
+    )
+    assert from_side.status_code == 201, from_side.text
+    assert store.get_conversation(from_side.json()["id"]).family_id == source["id"]
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.routes_core._SESSION_LIST_BATCH_SIZE", 2)
+    monkeypatch.setattr("omnigent.server.session_families._FAMILY_GRANT_BATCH_SIZE", 2)
+    list_grants = SqlAlchemyPermissionStore.list_for_sessions
+    grant_sizes = []
+
+    def bounded_grants(self, ids, *, user_id=None):
+        grant_sizes.append(len(ids))
+        assert len(ids) <= 2
+        return list_grants(self, ids, user_id=user_id)
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "list_for_sessions", bounded_grants)
+    expanded = await auth_client.get("/v1/sessions", params={"expand_families": True})
+    assert expanded.status_code == 200, expanded.text
+    assert {row["id"] for row in expanded.json()["data"]} == {
+        source["id"],
+        peers[1]["id"],
+        sibling_id,
+        from_side.json()["id"],
+    }
+    assert grant_sizes.count(2) >= 3
     permissions.grant("reader", source["id"], LEVEL_EDIT)
     response = await auth_client.post(
         "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
@@ -1379,6 +1430,8 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
     assert response.status_code == 201, response.text
     sibling_id = response.json()["id"]
     store = SqlAlchemyConversationStore(db_uri)
+    pinned = await auth_client.patch(f"/v1/sessions/{source['id']}", json={"family_pinned": True})
+    assert pinned.status_code == 200, pinned.text
     store.set_conversation_project(source["id"], "a" * 32)
     refused = await auth_client.patch(f"/v1/sessions/{sibling_id}", json={"project_id": ""})
     assert refused.status_code == 409, refused.text
@@ -1397,3 +1450,14 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
     store.update_conversation(sibling_id, archived=True)
     snapshot = (await auth_client.get(f"/v1/sessions/{source['id']}")).json()
     assert snapshot["family"]["representative_id"] == source["id"]
+
+    unpinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": ""}}
+    )
+    assert unpinned.status_code == 200, unpinned.text
+    for session_id in (source["id"], sibling_id):
+        snapshot = (await auth_client.get(f"/v1/sessions/{session_id}")).json()
+        assert not snapshot["family"]["pinned"]
+        store.update_conversation(session_id, archived=False)
+    snapshot = (await auth_client.get(f"/v1/sessions/{source['id']}")).json()
+    assert not snapshot["family"]["pinned"]

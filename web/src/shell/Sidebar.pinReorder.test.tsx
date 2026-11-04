@@ -107,6 +107,9 @@ afterEach(async () => {
 
 describe("dropping an unpinned session onto a pinned row", () => {
   it("pins it into that slot and renumbers the existing pins", async () => {
+    const family = { id: "family", representative_id: "conv_b", pinned: true, pinned_at: "1000" };
+    mocks.pinned[1].family = family;
+    mocks.pinned.push(conv("conv_peer", { family }));
     mocks.pinFn.mockResolvedValue({});
     renderSidebar();
 
@@ -120,6 +123,9 @@ describe("dropping an unpinned session onto a pinned row", () => {
     await waitFor(() =>
       expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_b", pinnedAt: 1002 }]),
     );
+    await dropOnto("conv_a", "conv_peer", { expectTarget: false });
+    expect(mocks.pinFn).toHaveBeenCalledOnce();
+    expect(mocks.reorderPins).toHaveBeenCalledOnce();
   });
 
   it("leaves the existing pins alone when the new pin is rejected (e.g. at the pin cap)", async () => {

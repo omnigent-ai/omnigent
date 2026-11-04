@@ -19,10 +19,6 @@ describe("session families", () => {
     const promoted = [member("c", 3, "b"), member("b", 2, "b")];
     expect(orderSessionFamilies(promoted).map((row) => row.id)).toEqual(["b", "c"]);
     expect(isIndentedSibling(promoted[1])).toBe(false);
-  });
-
-  it("retains an individually pinned shortcut when its representative is outside this section", () => {
-    const b = member("b", 2);
     expect(orderSessionFamilies([b])).toEqual([b]);
   });
 });
