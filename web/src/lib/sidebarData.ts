@@ -12,8 +12,20 @@ export type ScopeCacheData = ConversationsInfiniteData & {
   boundary?: ScopeBoundary;
 };
 
+/**
+ * The row a scope's completeness is measured against: the cursor row, or the
+ * last loaded row when the server filtered the cursor row out of the page
+ * (e.g. side chats) but kept it as the cursor.
+ */
+export function scopeBoundaryRow<T extends ScopeBoundary>(
+  rows: readonly T[],
+  cursor: string | null | undefined,
+): T | undefined {
+  return rows.find((row) => row.id === cursor) ?? rows.at(-1);
+}
+
 function boundaryOf(page: ConversationsPage): ScopeBoundary | undefined {
-  const row = page.data.find((session) => session.id === page.last_id);
+  const row = scopeBoundaryRow(page.data, page.last_id);
   return row && { id: row.id, updated_at: row.updated_at, created_at: row.created_at };
 }
 
@@ -115,10 +127,7 @@ export function mergeScopeRows(
     rows: Conversation[],
     cursor?: string | null,
     boundary?: ScopeBoundary,
-  ): ScopeBoundary | undefined =>
-    boundary && boundary.id === cursor
-      ? boundary
-      : (rows.find((row) => row.id === cursor) ?? rows.at(-1));
+  ): ScopeBoundary | undefined => boundary ?? scopeBoundaryRow(rows, cursor);
   const mineTail = tailOf(mine, mineCursor, mineBoundary);
   const sharedTail = tailOf(shared, sharedCursor, sharedBoundary);
   const tails = [mineHasMore ? mineTail : undefined, sharedHasMore ? sharedTail : undefined]

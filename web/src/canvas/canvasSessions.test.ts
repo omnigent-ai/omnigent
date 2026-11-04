@@ -665,6 +665,13 @@ describe("useCanvasSessions", () => {
         await Promise.resolve();
       });
       await waitFor(() => expect(identity.authenticatedFetch).toHaveBeenCalledTimes(2));
+      // A tab coming back into view after another interval also refreshes.
+      now.mockReturnValue(Date.now() + SESSION_POLL_INTERVAL_MS);
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(identity.authenticatedFetch).toHaveBeenCalledTimes(3));
     } finally {
       now.mockRestore();
     }

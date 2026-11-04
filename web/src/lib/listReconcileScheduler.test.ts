@@ -132,6 +132,16 @@ describe("createListReconcileScheduler", () => {
     expect(run).toHaveBeenCalledTimes(2);
   });
 
+  it("never runs a round requested before disposal", async () => {
+    const run = vi.fn(async () => {});
+    const scheduler = createListReconcileScheduler(run);
+
+    scheduler.schedule();
+    scheduler.dispose();
+    await vi.advanceTimersByTimeAsync(RECONCILE_MAX_GAP_MS);
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("drops pending work once disposed", async () => {
     const { run, finish } = controllableRun();
     const scheduler = createListReconcileScheduler(run);

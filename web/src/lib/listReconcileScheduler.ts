@@ -11,7 +11,11 @@ export const RECONCILE_DEBOUNCE_MS = 250;
 export const RECONCILE_MIN_GAP_MS = 2_000;
 /** Upper bound on the spacing, however slow the last round was. */
 export const RECONCILE_MAX_GAP_MS = 30_000;
-/** A round that hasn't settled by now stops holding back the next one. */
+/**
+ * A round that hasn't settled by now stops holding back the next one. Its
+ * callback isn't cancelled; the next round's invalidation cancels the queries
+ * it was waiting on.
+ */
 export const RECONCILE_ROUND_TIMEOUT_MS = 60_000;
 
 export interface ListReconcileScheduler {

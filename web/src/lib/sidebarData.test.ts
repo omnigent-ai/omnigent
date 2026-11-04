@@ -71,6 +71,26 @@ describe("scope merge", () => {
     );
     expect(appended.boundary).toMatchObject({ id: "c", updated_at: 10 });
   });
+  it("falls back to the last loaded row when the cursor row was filtered out", () => {
+    const page = { ...sessionRowsPage([row("a", 30), row("b", 20)], true), last_id: "side_chat" };
+    const window = refreshScopeWindow(undefined, page, 30);
+    expect(window.boundary).toMatchObject({ id: "b", updated_at: 20 });
+    // b's agent becomes active; the merge still measures against b as fetched.
+    const bumped = [row("a", 30), row("b", 90)];
+    expect(
+      mergeScopeRows(
+        bumped,
+        [row("s1", 25), row("s2", 10)],
+        true,
+        true,
+        "side_chat",
+        "s2",
+        "updated_at",
+        window.boundary,
+        { id: "s2", updated_at: 10, created_at: 0 },
+      ).rows.map((r) => r.id),
+    ).toEqual(["b", "a", "s1"]);
+  });
   it("ignores exhausted and disabled scopes as pagination boundaries", () => {
     expect(
       mergeScopeRows([row("m", 20)], [row("s", 100)], true, false).rows.map((r) => r.id),

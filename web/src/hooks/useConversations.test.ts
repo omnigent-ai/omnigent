@@ -18,6 +18,7 @@ import {
   fetchProjectSessionIds,
   renameConversation,
   useArchiveConversation,
+  useArchivedProjectNames,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
   useBulkStopSessions,
@@ -486,6 +487,30 @@ describe("superseded list fetches", () => {
     await act(() => queryClient.cancelQueries({ queryKey: ["project-sessions"] }));
 
     expect(signals[0].aborted).toBe(true);
+  });
+
+  it("stops the archived-project-names walk when its query is cancelled mid-walk", async () => {
+    // Page 1 answers with more to come; page 2 hangs until cancelled.
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: "c1", has_more: true }),
+      )
+      .mockImplementation(
+        (_url: string, init?: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError")),
+            );
+          }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderHook(() => useArchivedProjectNames(), { wrapper: wrapperFor(queryClient) });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    await act(() => queryClient.cancelQueries({ queryKey: ["archived-project-names"] }));
+
+    expect((fetchMock.mock.calls[1][1] as RequestInit).signal?.aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("stops the archived-project-names walk when aborted", async () => {

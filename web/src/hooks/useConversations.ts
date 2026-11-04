@@ -684,9 +684,7 @@ export function useConversations(
           : ["conversations", searchQuery, includeArchived];
   const query = useInfiniteQuery({
     queryKey,
-    // Reading `signal` lets a superseded or unmounted fetch abort, and stops an
-    // infinite query's page walk; without it each refetch round left the
-    // previous one running.
+    // `signal` aborts a superseded or unmounted fetch and its remaining page walk.
     queryFn: async ({ pageParam, signal }) => {
       const fetchPage = () =>
         fetchConversationsPage({

@@ -238,6 +238,16 @@ describe("mergeItemsIntoPages", () => {
 
     expect(bump("b")).toBe(true);
     expect(bump("a")).toBe(false);
+    // A cursor the server filtered out of the page (a side chat) falls back to
+    // the last loaded row, as the sidebar's boundary does.
+    const filtered = { ...before, pages: [{ ...before.pages[0], last_id: "side_chat" }] };
+    expect(
+      mergeItemsIntoPages(
+        filtered,
+        new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 9 }]]),
+        DEFAULT_FILTERS,
+      ).needsRefetch,
+    ).toBe(true);
     // With no further page there is no cursor to protect.
     const complete = { ...before, pages: [{ ...before.pages[0], has_more: false }] };
     expect(

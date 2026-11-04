@@ -10,6 +10,7 @@
 // the chat store's `session.title` handler (a terminal-side `/rename`).
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
+import { scopeBoundaryRow } from "@/lib/sidebarData";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 
@@ -275,11 +276,11 @@ export function mergeItemsIntoPages(
   if (!data) return { data, found, needsRefetch: false };
   let anyPageChanged = false;
   let needsRefetch = false;
-  // The row the next page is fetched after. Moving it up leaves a stale cursor
-  // ("load more" would restart near the top) and lifts the sidebar's
-  // completeness watermark, hiding every row below it, so it reconciles.
+  // The row the next page is fetched after, or the last loaded row when the
+  // server filtered the cursor row out (the sidebar's same fallback). Moving it
+  // up leaves "load more" restarting near the top, so it reconciles.
   const tail = data.pages.at(-1);
-  const cursorId = tail?.has_more ? tail.last_id : null;
+  const cursorId = tail?.has_more ? scopeBoundaryRow(tail.data, tail.last_id)?.id : null;
   const pages = data.pages.map((page) => {
     let rowChanged = false;
     const nextData: Conversation[] = [];
