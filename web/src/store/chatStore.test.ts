@@ -7317,6 +7317,19 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().redirectToConversationId).toBeNull();
     });
 
+    it("keeps a live redirect still pending when the clear is acknowledged", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      const acknowledge = answerClear({ queued: false, session_id: "conv_new" });
+
+      const clearing = useChatStore.getState().clearContext();
+      // The live redirect lands first and has not been followed yet.
+      useChatStore.setState({ redirectToConversationId: "conv_pending" });
+      acknowledge();
+      await clearing;
+
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_pending");
+    });
+
     it("leaves a native clear, which names no session, to its live redirect", async () => {
       useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
       answerClear({ queued: false })();
