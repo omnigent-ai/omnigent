@@ -54,6 +54,7 @@ import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
+  claimComposerStartupInputs,
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
   holdsInitialDraft,
@@ -840,8 +841,12 @@ function SideChatComposer({
     const skill = routeLocally
       ? matchSlashCommandInvocation(trimmed, Object.keys(skillCommands))
       : null;
-    const runSkill = (match: { command: string; args: string }) => {
+    const clearForSend = () => {
+      claimComposerStartupInputs(childId);
       clearComposer(childId);
+    };
+    const runSkill = (match: { command: string; args: string }) => {
+      clearForSend();
       onSend();
       void sendSlashCommand(match.command.slice(1), match.args, agentId, {
         pinnedConversationId: childId,
@@ -879,14 +884,14 @@ function SideChatComposer({
         holdsInitialDraft(child),
       )
     ) {
-      clearComposer(childId);
+      clearForSend();
       onSend();
       enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
       return;
     }
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
-    clearComposer(childId);
+    clearForSend();
     onSend();
     void send(message, agentId, outgoing, { pinnedConversationId: childId }).finally(refreshLabels);
   };

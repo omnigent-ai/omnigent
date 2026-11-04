@@ -7845,6 +7845,24 @@ function failedStartupInputsReplacedBy(
   };
 }
 
+/**
+ * Count the failed startup inputs a grid or side-chat composer holds as handed
+ * back before it clears them for a send, so the send names them after a reopen.
+ *
+ * @param conversationId - The session the composer belongs to.
+ */
+export function claimComposerStartupInputs(conversationId: string): void {
+  const ids = useChatStore.getState().sideChatComposers[conversationId]?.startupInputIds ?? [];
+  const entry = conversationRegistry.peek(conversationId);
+  if (ids.length === 0 || entry === undefined || entry.disposed) return;
+  entrySetter(entry)((state) => {
+    const added = ids.filter((id) => !state.returnedStartupInputs.includes(id));
+    return added.length === 0
+      ? {}
+      : { returnedStartupInputs: [...state.returnedStartupInputs, ...added] };
+  });
+}
+
 /** Stop treating startup inputs as handed back: the server dropped them, or a later read may offer them. */
 function forgetReturnedStartupInputs(
   state: Pick<ConversationState, "returnedStartupInputs">,

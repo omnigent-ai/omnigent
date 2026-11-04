@@ -1733,54 +1733,62 @@ it.each([false, true])(
   },
 );
 
-it("adds a failed launch's recovered message after the grid composer's newer draft", async () => {
-  const entry = conversationRegistry.acquire(childId);
-  entry.setState({
-    sessionStatus: "idle",
-    abortController: new AbortController(),
-    returnedStartupInputs: ["pending_first"],
-  });
-  useChatStore.setState({ send: initialStoreState.send });
-  renderPane(<SideChatPane childId={childId} fullSession />);
-  act(() =>
-    useChatStore.getState().updateSideChatComposer(childId, () => ({
-      text: "newer",
-      files: [],
-      quotes: [{ id: "new", before: "", text: "New quote" }],
-    })),
-  );
-  act(() =>
+it.each([
+  { sent: "after the reopened session reads its inputs again", readFirst: true },
+  { sent: "before the reopened session reads its inputs", readFirst: false },
+])(
+  "adds a failed launch's recovered message after the grid composer's newer draft and names it in a send $sent",
+  async ({ readFirst }) => {
+    const entry = conversationRegistry.acquire(childId);
     entry.setState({
-      failedSendDraft: {
-        conversationId: childId,
-        text: "saved on server",
+      sessionStatus: "idle",
+      abortController: new AbortController(),
+      returnedStartupInputs: ["pending_first"],
+    });
+    useChatStore.setState({ send: initialStoreState.send });
+    renderPane(<SideChatPane childId={childId} fullSession />);
+    act(() =>
+      useChatStore.getState().updateSideChatComposer(childId, () => ({
+        text: "newer",
         files: [],
-        startupInputIds: ["pending_first"],
-        recovered: true,
-      },
-    }),
-  );
+        quotes: [{ id: "new", before: "", text: "New quote" }],
+      })),
+    );
+    act(() =>
+      entry.setState({
+        failedSendDraft: {
+          conversationId: childId,
+          text: "saved on server",
+          files: [],
+          startupInputIds: ["pending_first"],
+          recovered: true,
+        },
+      }),
+    );
 
-  expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
-  expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("New quote");
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("New quote");
 
-  // Evicted while the composer holds the input, the reopened session doesn't add it again.
-  const { sessionHarness, boundAgentId } = entry.getState();
-  act(() => conversationRegistry.release(childId));
-  conversationRegistry.acquire(childId).setState({
-    sessionHarness,
-    boundAgentId,
-    sessionStatus: "idle",
-    loadingConversation: false,
-    abortController: new AbortController(),
-  });
-  vi.spyOn(sessionsApi, "listFailedInputs").mockResolvedValue([
-    { pendingId: "pending_first", content: [{ type: "input_text", text: "saved on server" }] },
-  ]);
-  await act(() => retryFailedStartupLookup(childId));
-  expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
-  const post = vi.spyOn(sessionsApi, "postEvent").mockResolvedValue({ queued: true });
-  fireEvent.click(screen.getByTestId("side-chat-send"));
-  await waitFor(() => expect(post).toHaveBeenCalledOnce());
-  expect(post.mock.calls[0][1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
-});
+    // Evicted while the composer holds the input, the reopened session doesn't add it again.
+    const { sessionHarness, boundAgentId } = entry.getState();
+    act(() => conversationRegistry.release(childId));
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness,
+      boundAgentId,
+      sessionStatus: "idle",
+      loadingConversation: false,
+      abortController: new AbortController(),
+    });
+    vi.spyOn(sessionsApi, "listFailedInputs").mockResolvedValue([
+      { pendingId: "pending_first", content: [{ type: "input_text", text: "saved on server" }] },
+    ]);
+    if (readFirst) await act(() => retryFailedStartupLookup(childId));
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
+    const post = vi.spyOn(sessionsApi, "postEvent").mockResolvedValue({ queued: true });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    await waitFor(() => expect(post).toHaveBeenCalledOnce());
+    expect(post.mock.calls[0][1]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
+    await act(() => retryFailedStartupLookup(childId));
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("");
+  },
+);
