@@ -2106,7 +2106,10 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A terminal rooted elsewhere, in an overlay, or in scratch keeps unconfirmable edits."""
+    """A terminal rooted elsewhere, in an overlay, or in scratch keeps unconfirmable edits.
+
+    A terminal rooted at the workspace checks them against the disk, as the primary one does.
+    """
     terminal_root = tmp_path / "terminal"
     terminal_root.mkdir()
     (terminal_root / "notes.txt").write_text("new")
@@ -2118,6 +2121,12 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
         ),
     )
     assert terminal_env is not None
+    workspace_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    assert workspace_env is not None
     terminals = TerminalRegistry()
     overlay_env = SimpleNamespace(
         cwd=str(workspace), sandbox=SimpleNamespace(copy_on_write_roots=[workspace])
@@ -2146,6 +2155,7 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
             tmp_path,
             os_env=scratch_env,  # type: ignore[arg-type]
         ),
+        ("bash", "s4"): make_test_terminal_instance("bash", "s4", tmp_path, os_env=workspace_env),
     }
     monkeypatch.setattr(registry, "_terminal_registry", terminals)
     changes = app.state.filesystem_registry
@@ -2172,6 +2182,10 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     listed_in_scratch = await client.get(
         f"/v1/sessions/conv_test/resources/environments/{scratch}/changes"
     )
+    same_root = terminal_environment_resource_id("bash", "s4")
+    listed_in_same_root = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{same_root}/changes"
+    )
 
     assert (in_terminal.status_code, in_workspace.status_code) == (200, 200)
     assert listed.status_code == 200, listed.text
@@ -2196,6 +2210,10 @@ async def test_changes_in_a_terminal_rooted_elsewhere_keep_their_recorded_edits(
     assert (diff.json()["before"], diff.json()["after"]) == (None, "new")
     assert listed_in_workspace.status_code == 200, listed_in_workspace.text
     assert [(e["path"], e["status"]) for e in listed_in_workspace.json()["data"]] == [
+        ("shared.txt", "modified")
+    ]
+    assert listed_in_same_root.status_code == 200, listed_in_same_root.text
+    assert [(e["path"], e["status"]) for e in listed_in_same_root.json()["data"]] == [
         ("shared.txt", "modified")
     ]
 
