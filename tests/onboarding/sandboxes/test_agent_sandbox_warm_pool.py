@@ -957,7 +957,9 @@ def test_exec_errors_never_surface_remote_stderr_credentials(
     connection.close.assert_called_once()
 
 
-@pytest.mark.parametrize("change", ["image", "privilege", "identity", "classifier"])
+@pytest.mark.parametrize(
+    "change", ["image", "privilege", "identity", "classifier", "bootstrap_resources"]
+)
 def test_runtime_pod_profile_is_checked_before_delivering_credentials(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
@@ -968,6 +970,14 @@ def test_runtime_pod_profile_is_checked_before_delivering_credentials(
         pod_spec["securityContext"]["runAsNonRoot"] = False
     elif change == "identity":
         pod_spec["containers"][1]["env"].append({"name": HOST_TOKEN_ENV_VAR, "value": "stale"})
+    elif change == "bootstrap_resources":
+        quantity = types.ModuleType("kubernetes.utils.quantity")
+        quantity.parse_quantity = str  # type: ignore[attr-defined]  # exact spellings only
+        monkeypatch.setitem(sys.modules, "kubernetes.utils.quantity", quantity)
+        # Earlier bootstrap resources under the current profile digest match neither rendering.
+        pod_spec["containers"][0]["resources"] = copy.deepcopy(
+            pod_spec["containers"][1]["resources"]
+        )
     else:
         harness.pod.raw["metadata"]["labels"][k8s._AGENT_LABEL] = "another-agent"
     execute = MagicMock()

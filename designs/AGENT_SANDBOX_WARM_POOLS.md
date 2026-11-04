@@ -126,7 +126,9 @@ configured requests equal limits. Templates from earlier releases, whose
 bootstrap reserves the configured requests, remain valid for existing pools and
 allocations; generate a new versioned pool to reduce the reservation. Earlier
 servers reject the new template, so finish the server upgrade before selecting
-the new pool and keep the earlier pool until rollback is no longer needed.
+the new pool and keep the earlier pool until rollback is no longer needed. The
+earlier pool serves only new allocations after a rollback; an earlier server
+also rejects Pods already allocated from the new pool before starting a host.
 
 The image must include `omnigent.host.warm_bootstrap`. The initial activation
 protocol is version 1 and includes the actual Pod UID, generation, host ID/name,
