@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import itertools
 import secrets
 import time
@@ -1084,6 +1085,24 @@ def register_events_routes(
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
     ) -> dict[str, bool | str]:
+        """Submit a session event, then run the steps that wait for its acceptance."""
+        on_accepted: list[Callable[[], Awaitable[None]]] = []
+        result = await _submit_event(request, session_id, body, in_flight, on_accepted)
+        for step in on_accepted:
+            # The event is already accepted, so a failed follow-up mustn't report it refused.
+            try:
+                await step()
+            except Exception:
+                _logger.exception("Follow-up to an accepted event failed for %s", session_id)
+        return result
+
+    async def _submit_event(
+        request: Request | _RunnerEventContext | StartupInputContext,
+        session_id: str,
+        body: SessionEventInput,
+        in_flight: contextlib.ExitStack | None,
+        on_accepted: list[Callable[[], Awaitable[None]]],
+    ) -> dict[str, bool | str]:
         """
         Submit a session event (input message, tool output,
         approval, or interrupt).
@@ -1166,6 +1185,7 @@ def register_events_routes(
         :param in_flight: When given, the session is marked as having a
             dispatch in flight once the caller is authorized, for the rest
             of the request.
+        :param on_accepted: Steps the caller runs once this returns without raising.
         :returns: ``{"queued": True, "item_id": "..."}`` for
             item-typed events, where ``item_id`` is the persisted
             conversation item id also emitted by
@@ -1469,8 +1489,12 @@ def register_events_routes(
             and body.replaces_failed_inputs
             and conv.labels.get(STARTUP_LABEL) == "failed"
         ):
-            # The sender resends what the failed launch handed back to their composer.
-            await startup.discard_failed(session_id, user_id, set(body.replaces_failed_inputs))
+            # The resend carries what the failed launch handed back; drop those once it's accepted.
+            on_accepted.append(
+                functools.partial(
+                    startup.discard_failed, session_id, user_id, set(body.replaces_failed_inputs)
+                )
+            )
         if startup_input and await startup.accepts(conv, request.app):
             if peer_message:
                 await asyncio.to_thread(

@@ -5128,10 +5128,6 @@ async function bindStream(
             return countEndsWith(committedUserTexts, text) === 0;
           })
         : candidatePending;
-      const unsentDraftPatch =
-        unsentDraft !== null && state.failedSendDraft === null
-          ? { failedSendDraft: unsentDraft }
-          : {};
       const syntheticError: ErrorBlock | null =
         session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
           ? {
@@ -5147,7 +5143,9 @@ async function bindStream(
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
-        ...unsentDraftPatch,
+        ...(unsentDraft !== null && state.failedSendDraft === null
+          ? { failedSendDraft: unsentDraft }
+          : {}),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
         oldestItemId,
@@ -8008,6 +8006,9 @@ async function settleFailedStartup(conversationId: string): Promise<void> {
   entrySetter(entry)({ startupPending: session !== null && startupPendingIn(session) });
   if (session !== null && startupFailedIn(session)) {
     await restoreFailedStartupInputs(conversationId);
+  } else if (session !== null) {
+    // A relaunch replaced the failed launch, so its later failures aren't startup's.
+    failedLaunchEntries.delete(entry);
   }
 }
 

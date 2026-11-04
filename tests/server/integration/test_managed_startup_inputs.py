@@ -1048,6 +1048,7 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
     startup_permissions: SqlAlchemyPermissionStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     auth_client.headers["X-Forwarded-Email"] = "alice"
     agent = await create_test_agent(auth_client)
@@ -1110,21 +1111,36 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
         assert response.status_code == 422, response.text
     response = await send("alice", "first", replaces=["pending_first"])
     assert response.status_code == 422, response.text
-    # A send that names no inputs, or names another sender's, leaves them to return.
-    response = await send("alice", "unrelated")
-    assert response.status_code == 503, response.text
-    response = await send("bob", "again", replaces=[pending_ids["first"], pending_ids["second"]])
-    assert response.status_code == 503, response.text
-    assert await read_all("alice") == (["first", "second"], 3)
-    # A resend names the handed-back inputs it carries, so only those are dropped,
-    # even when the resend itself fails and returns to the composer.
+    # A refused resend leaves the inputs it names, so they aren't lost with it.
     response = await send("alice", "first", replaces=[pending_ids["first"]])
     assert response.status_code == 503, response.text
+    assert await read_all("alice") == (["first", "second"], 3)
+    runner = _stub_runner(monkeypatch)
+    try:
+        # An accepted send that names no inputs, or names another sender's, leaves them.
+        response = await send("alice", "unrelated")
+        assert response.status_code == 202, response.text
+        response = await send(
+            "bob", "again", replaces=[pending_ids["first"], pending_ids["second"]]
+        )
+        assert response.status_code == 202, response.text
+        assert await read_all("alice") == (["first", "second"], 3)
+        # An accepted resend drops only the inputs it names.
+        response = await send("alice", "first", replaces=[pending_ids["first"]])
+        assert response.status_code == 202, response.text
+        assert await read_all("alice") == (["second"], 2)
+
+        async def store_unavailable(*_: Any) -> None:
+            raise RuntimeError("store unavailable")
+
+        # The send is accepted before the discard fails, so it isn't reported as refused.
+        monkeypatch.setattr(startup, "discard_failed", store_unavailable)
+        response = await send("alice", "second", replaces=[pending_ids["second"]])
+        assert response.status_code == 202, response.text
+    finally:
+        await runner.aclose()
     assert await read_all("alice") == (["second"], 2)
-    response = await send("alice", "second", replaces=[pending_ids["second"]])
-    assert response.status_code == 503, response.text
-    assert await read_all("alice") == ([], 1)
-    assert await read_all("bob") == (["from bob"], 1)
+    assert await read_all("bob") == (["from bob"], 2)
     startup.conversations.set_runner_id(session_id, uuid4().hex)
     assert await read_all("bob") == ([], 1)
 

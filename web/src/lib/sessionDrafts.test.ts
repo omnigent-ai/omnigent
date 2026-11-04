@@ -83,7 +83,7 @@ describe("session drafts", () => {
       await import("./sessionDrafts");
     addSessionDraftStartupInputs("conversation", "first", ["pending_first"]);
     setSessionDraft("conversation", { text: "first, edited", files: [] });
-    addSessionDraftStartupInputs("conversation", "second", ["pending_second"]);
+    addSessionDraftStartupInputs("conversation", "second", ["pending_first", "pending_second"]);
     expect(getSessionDraft("conversation")).toEqual({
       text: "first, edited",
       files: [],

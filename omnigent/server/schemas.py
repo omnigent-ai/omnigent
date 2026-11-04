@@ -1402,8 +1402,8 @@ class SessionEventInput(BaseModel):
         originated events that are triggered by a prior human turn.
     :param replaces_failed_inputs: Pending ids of the sender's failed
         startup inputs that this message or skill command replaces, e.g.
-        ``["pending_<32 hex>"]``. The events route discards those inputs;
-        the ids are never forwarded or saved with the event.
+        ``["pending_<32 hex>"]``. The events route discards those inputs
+        once the send succeeds; the ids are never forwarded or saved with it.
     """
 
     type: str

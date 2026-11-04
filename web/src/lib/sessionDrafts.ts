@@ -111,7 +111,7 @@ export function addSessionDraftStartupInputs(
   const draft = sessionDrafts.get(conversationId) ?? { text, files: [] };
   setSessionDraft(conversationId, {
     ...draft,
-    startupInputIds: [...(draft.startupInputIds ?? []), ...ids],
+    startupInputIds: [...new Set([...(draft.startupInputIds ?? []), ...ids])],
   });
 }
 

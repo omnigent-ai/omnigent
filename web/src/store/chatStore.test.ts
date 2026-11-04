@@ -3885,15 +3885,14 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       expect(takeFailedSendDraft("conv_real", false, true)?.text).toBe("saved on server");
       expect(useChatStore.getState().returnedStartupInputs).toEqual(["pending_first"]);
 
-      // Sending empties the composer. The server drops the failed input a resend
-      // names before refusing it, as no runner takes it.
+      // Sending empties the composer. A refused resend leaves the failed input it
+      // names on the server.
       setSessionDraft("conv_real", { text: "", files: [] });
       let resend: unknown;
       fetchMock.mockImplementation((input, init) => {
         if (String(input).endsWith("/v1/sessions/conv_real/events") && init?.method === "POST") {
           if (!reachesServer) return Promise.reject(new TypeError("Failed to fetch"));
           resend = JSON.parse(String(init.body));
-          sessionFailedInputs.delete("conv_real");
           return mockResponse(
             { error: { code: "runner_unavailable", message: "No runner bound for session" } },
             { ok: false, status: 503 },
@@ -4179,6 +4178,24 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       startupInputIds: ["pending_first"],
       recovered: true,
     });
+
+    // Once a relaunch replaces the failed launch, a later failure reads no snapshot for it.
+    sessionLabels.set("conv_real", { "omnigent.startup": "ready" });
+    const snapshotReads = () =>
+      fetchMock.mock.calls.filter(([input]) =>
+        String(input).startsWith("/v1/sessions/conv_real?include_items=false"),
+      ).length;
+    const readsAfterFailure = async () => {
+      const before = snapshotReads();
+      handleSessionEvent(
+        { type: "session_status", conversationId: "conv_real", status: "failed" },
+        "conv_real",
+      );
+      await settle();
+      return snapshotReads() - before;
+    };
+    expect(await readsAfterFailure()).toBe(1);
+    expect(await readsAfterFailure()).toBe(0);
   });
 
   it("B1: a failed first message settles to idle (not stuck streaming)", async () => {
