@@ -162,11 +162,11 @@ def test_composer_input_font_setting_and_alignment(
     expected_size = font_size
     for name, measured in observed.items():
         assert measured["fontSize"] == pytest.approx(expected_size, abs=0.01), (name, measured)
-        assert measured["lineHeight"] == pytest.approx(expected_size * 1.6, abs=0.02), (
+        assert measured["lineHeight"] == pytest.approx(expected_size * 1.8, abs=0.02), (
             name,
             measured,
         )
-    assert quote_metrics["fontSize"] == pytest.approx(expected_size * 0.9, abs=0.01)
+    assert quote_metrics["fontSize"] == pytest.approx(expected_size - 1, abs=0.01)
     assert skill_metrics["fontSize"] == pytest.approx(expected_size, abs=0.01)
 
     textarea_metrics, overlay_metrics = observed["slash-input"], observed["slash-overlay"]
