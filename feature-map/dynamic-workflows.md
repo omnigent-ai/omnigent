@@ -32,10 +32,13 @@ need no environment; the process scenario owns its isolated server and host. Rea
 
 - Graphs, scheduling and expansion: `tests/workflows/test_workflows.py`.
 - Candidate review, outputs, consultation and repair: `tests/workflows/test_ownership.py`.
-- Checkpoints and reconciliation: `tests/workflows/test_recovery.py`.
+- Checkpoints and reconciliation: `tests/workflows/test_recovery.py`, including
+  workflow/root identifiers surviving repair and older checkpoints without them.
 - Local checks: `tests/workflows/test_gates.py`.
 - Opt-in and module CLI: `tests/workflows/test_cli.py`.
 - Session transport, native output and isolation: `tests/workflows/test_sessions.py`.
+  Embedding-supplied workflow/root identifiers reach every member's labels without
+  changing its session parent or execution placement.
 - Runtime selection and shared login: `tests/workflows/test_execution.py`.
 - Real local processes with scripted models: `tests/e2e/test_remote_url_chat_fresh_session_2437.py`,
   `test_run_launches_a_runner_on_this_machines_host`, variants `workflow`,

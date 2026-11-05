@@ -125,7 +125,11 @@ async def test_sessions_are_isolated_per_member_and_lead_reuses_session(
             if request.url.path.endswith(("/events", "/stream")):
                 assert "X-Databricks-Omnigent-Slice-Key" not in request.headers
         if request.url.path == "/v1/sessions":
-            creates.append(json.loads(request.content))
+            payload = json.loads(request.content)
+            assert payload["labels"]["omnigent.workflow.id"] == "workflow-design"
+            assert payload["labels"]["omnigent.workflow.root_session"] == "root-session"
+            assert "parent_session_id" not in payload
+            creates.append(payload)
             return httpx.Response(
                 200,
                 json={
@@ -261,7 +265,12 @@ async def test_sessions_are_isolated_per_member_and_lead_reuses_session(
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
     async def run(member_executor):
-        runner = WorkflowRunner(workflow, member_executor)
+        runner = WorkflowRunner(
+            workflow,
+            member_executor,
+            workflow_id="workflow-design",
+            root_session_id="root-session",
+        )
         await runner.run()
         if owner:
             assert runner.status == "waiting"

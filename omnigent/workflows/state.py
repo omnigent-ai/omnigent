@@ -113,6 +113,8 @@ class ExecutionBinding(Definition):
 class Checkpoint(State):
     schema_version: Literal[2] = 2
     run_id: str
+    workflow_id: str | None = None
+    root_session_id: str | None = None
     status: Status
     workflow: Workflow
     nodes: dict[str, NodeRun]
