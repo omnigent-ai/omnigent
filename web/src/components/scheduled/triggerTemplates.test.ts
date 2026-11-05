@@ -135,6 +135,10 @@ describe("triggerFieldsComplete", () => {
   it.each<[string, Partial<TriggerFields>, boolean]>([
     ["scope and instructions, no conditions", { conditions: [] }, true],
     ["blank scope", { scope: "  " }, false],
+    ["equals matches one scope", { scopeOperator: "is", scope: "ES" }, true],
+    ["equals rejects lists", { scopeOperator: "is", scope: "ES, OPS" }, false],
+    ["in accepts one scope", { scopeOperator: "in", scope: "ES" }, true],
+    ["in accepts multiple scopes", { scopeOperator: "in", scope: "ES, OPS" }, true],
     // Commas alone parse to no entries, which would drop GitHub's repo filter.
     ["comma-only scope", { scope: " , ," }, false],
     ["a condition with no value", { conditions: [{ ...LABEL_OMNIGENT, value: " " }] }, false],
@@ -163,6 +167,12 @@ describe("splitJqlOrderBy", () => {
 });
 
 describe("compileJiraJql", () => {
+  it.each(["is", "in"] as const)("compiles an explicit %s scope operator", (scopeOperator) => {
+    expect(compileJiraJql(fields({ scopeOperator, scope: "ES", conditions: [] }))).toBe(
+      scopeOperator === "is" ? 'project = "ES"' : 'project in ("ES")',
+    );
+  });
+
   const jql = (scope: string, ...conditions: TriggerCondition[]) =>
     compileJiraJql(fields({ scope, conditions }));
 

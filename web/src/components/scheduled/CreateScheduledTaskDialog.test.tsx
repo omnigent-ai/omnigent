@@ -2619,7 +2619,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");
-    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("in project");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where project");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every hour");
     // The trigger always keeps one session, so the form doesn't ask.
     expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
@@ -2722,6 +2722,23 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     fillJira();
     expect(submit).toBeEnabled();
     expect(screen.getByTestId("task-trigger-preview")).toHaveTextContent('project = "ES"');
+
+    expect(screen.getByTestId("task-trigger-scope-operator")).toHaveTextContent("equals");
+    type("task-trigger-scope", "ES, OPS");
+    expect(submit).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Equals matches one value");
+    const scopeOperator = screen.getByTestId("task-trigger-scope-operator");
+    fireEvent.pointerDown(
+      scopeOperator,
+      new MouseEvent("pointerdown", { bubbles: true, button: 0 }),
+    );
+    fireEvent.click(scopeOperator);
+    fireEvent.click(screen.getByRole("option", { name: "in" }));
+    expect(submit).toBeEnabled();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByTestId("task-trigger-preview")).toHaveTextContent(
+      'project in ("ES", "OPS")',
+    );
 
     // A new row starts empty and blocks saving until it's filled in or removed.
     fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
@@ -2836,7 +2853,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     renderTrigger("linear");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Linear issues");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue created");
-    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("in team");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where team");
     expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
       "Anyone who can create an issue in this team may direct the agent",
     );

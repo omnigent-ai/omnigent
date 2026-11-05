@@ -39,6 +39,8 @@ export interface TriggerFields {
   event: string;
   /** Jira: project keys. Slack: channels. GitHub: `owner/repo`. Linear: team keys. Comma-separated. */
   scope: string;
+  /** Omitted by older callers, which infer membership from the number of values. */
+  scopeOperator?: "is" | "in";
   conditions: TriggerCondition[];
   /** What each started session should do with its item. */
   instructions: string;
@@ -96,7 +98,7 @@ export interface TriggerTemplate {
    * names who can write what the event watches, e.g. "create a ticket in this project".
    */
   events: { id: string; label: string; authorAction: string }[];
-  /** Words between the event and the scope, e.g. "in project". */
+  /** Scope field, e.g. "project", compared by the selected operator. */
   scopeLabel: string;
   scopePlaceholder: string;
   fields: TriggerConditionField[];
@@ -121,8 +123,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     events: [
       { id: "created", label: "Ticket created", authorAction: "create a ticket in this project" },
     ],
-    scopeLabel: "in project",
-    scopePlaceholder: "ES",
+    scopeLabel: "project",
+    scopePlaceholder: "ES, OPS",
     fields: [
       { id: "label", label: "Label", operators: ["is", "is_not"], placeholder: "omnigent" },
       { id: "issuetype", label: "Issue type", operators: ["is", "is_not"], placeholder: "Bug" },
@@ -156,8 +158,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
       "Watch channels for matching messages and start a session to respond or investigate.",
     name: "Slack messages",
     events: [{ id: "posted", label: "Message posted", authorAction: "post in this channel" }],
-    scopeLabel: "in channel",
-    scopePlaceholder: "#eng-support",
+    scopeLabel: "channel",
+    scopePlaceholder: "eng-support, bugs",
     fields: [
       { id: "text", label: "Text", operators: ["contains", "not_contains"], placeholder: "error" },
       {
@@ -194,8 +196,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         authorAction: "open an issue or pull request in this repository",
       },
     ],
-    scopeLabel: "in repo",
-    scopePlaceholder: "owner/repo",
+    scopeLabel: "repo",
+    scopePlaceholder: "owner/repo, owner/other",
     fields: [
       { id: "label", label: "Label", operators: ["is", "is_not"], placeholder: "bug" },
       { id: "author", label: "Author", operators: ["is", "is_not"], placeholder: "octocat" },
@@ -229,8 +231,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     events: [
       { id: "created", label: "Issue created", authorAction: "create an issue in this team" },
     ],
-    scopeLabel: "in team",
-    scopePlaceholder: "ENG",
+    scopeLabel: "team",
+    scopePlaceholder: "ENG, OPS",
     fields: [
       { id: "label", label: "Label", operators: ["is", "is_not"], placeholder: "Bug" },
       { id: "status", label: "Status", operators: ["is", "is_not"], placeholder: "Triage" },
@@ -268,6 +270,7 @@ export function emptyTriggerFields(source: TriggerSource): TriggerFields {
   return {
     event: TRIGGER_TEMPLATES[source].events[0].id,
     scope: "",
+    scopeOperator: "is",
     conditions: [],
     instructions: "",
     linkBack: true,
@@ -410,6 +413,7 @@ export function triggerFieldsComplete(fields: TriggerFields): boolean {
   const instructions = fields.instructions.trim();
   return (
     scopeList(fields.scope).length > 0 &&
+    (fields.scopeOperator !== "is" || !fields.scope.includes(",")) &&
     fields.conditions.every((c) => VALUELESS_OPERATORS.has(c.operator) || c.value.trim() !== "") &&
     instructions !== "" &&
     instructions.length <= MAX_INSTRUCTIONS_CHARS
@@ -432,7 +436,7 @@ function jqlString(value: string): string {
 export function compileJiraJql(fields: TriggerFields): string {
   const projects = scopeList(fields.scope);
   const clauses = [
-    projects.length === 1
+    fields.scopeOperator !== "in" && projects.length === 1
       ? `project = ${jqlString(projects[0])}`
       : `project in (${projects.map(jqlString).join(", ")})`,
   ];
