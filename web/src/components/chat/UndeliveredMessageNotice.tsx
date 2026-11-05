@@ -75,7 +75,7 @@ export function UndeliveredMessageNotice({
       <Button
         variant="link"
         size="xs"
-        className="h-auto px-1 text-[11px]"
+        className="h-auto px-1 text-[11px] text-destructive underline underline-offset-2"
         disabled={starting}
         onClick={() => void startNewSession()}
       >
