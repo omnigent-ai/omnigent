@@ -1206,6 +1206,101 @@ def test_unlink_if_empty_sweeps_only_empty_files(tmp_path: Path) -> None:
     assert written.exists()
 
 
+@pytest.mark.skipif(not IS_POSIX, reason="inherited append descriptors require POSIX")
+def test_process_log_keeps_recent_records_without_growing_forever(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(process_logging, "_PROCESS_LOG_MAX_BYTES", 1024)
+    path = tmp_path / "runner.log"
+    handler = process_logging._ProcessLogFileHandler(path, encoding="utf-8")
+    try:
+        for index in range(100):
+            handler.handle(_record("record %03d %s", index, "é" * 80))
+            assert path.stat().st_size < 1300
+    finally:
+        handler.close()
+
+    content = path.read_text()
+    assert "Older process log entries discarded" in content
+    assert "record 099 " + "é" * 80 in content
+    assert "record 000" not in content
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="inherited append descriptors require POSIX")
+def test_process_log_retains_a_complete_record_larger_than_the_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(process_logging, "_PROCESS_LOG_MAX_BYTES", 1024)
+    path = tmp_path / "runner.log"
+    handler = process_logging._ProcessLogFileHandler(path, encoding="utf-8")
+    message = "é" * 2000
+    try:
+        handler.handle(_record(message))
+        assert path.read_text() == message + "\n"
+        handler.handle(_record("next record"))
+        assert path.stat().st_size < 1024
+        assert path.read_text().endswith("next record\n")
+    finally:
+        handler.close()
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="inherited append descriptors require POSIX")
+def test_process_log_rollover_preserves_inherited_child_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(process_logging, "_PROCESS_LOG_MAX_BYTES", 1024)
+    path, capture = process_logging.open_process_log_file("runner", root=tmp_path)
+    handler = process_logging._ProcessLogFileHandler(path, encoding="utf-8")
+    inode = path.stat().st_ino
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; [print(line.rstrip(), flush=True) for line in sys.stdin]",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=capture,
+        stderr=capture,
+        text=True,
+    )
+    capture.close()
+    try:
+        handler.handle(_record("x" * 2048))
+        handler.handle(_record("after rollover"))
+        child.communicate("child still appends\n", timeout=30)
+        assert child.returncode == 0
+        assert path.stat().st_ino == inode
+        assert path.stat().st_size < 1024
+        assert path.read_text().endswith("after rollover\nchild still appends\n")
+        assert "\0" not in path.read_text()
+    finally:
+        handler.close()
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=30)
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="inherited append descriptors require POSIX")
+def test_process_log_rollover_failure_still_writes_current_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(process_logging, "_PROCESS_LOG_MAX_BYTES", 1)
+    path = tmp_path / "runner.log"
+    handler = process_logging._ProcessLogFileHandler(path, encoding="utf-8")
+    try:
+        handler.handle(_record("previous record"))
+        assert handler.stream is not None
+
+        def fail_truncation(*args: object) -> None:
+            raise OSError("filesystem refuses truncation")
+
+        monkeypatch.setattr(handler.stream, "truncate", fail_truncation)
+        handler.handle(_record("current record"))
+        assert path.read_text() == "previous record\ncurrent record\n"
+    finally:
+        handler.close()
+
+
 def test_configure_registers_the_empty_log_sweep_for_self_allocated_paths(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
