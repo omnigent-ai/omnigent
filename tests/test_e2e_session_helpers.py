@@ -8,6 +8,20 @@ import pytest
 from tests.e2e import conftest as helpers
 
 
+class _PollingClock:
+    """Keep poll progress independent of real worker scheduling."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        # A zero-delay poll still advances time so non-completion remains bounded.
+        self.now += max(seconds, 0.1)
+
+
 def _item(role: str, text: str, response_id: str, *, nested: bool) -> dict:
     data = {"role": role, "content": [{"type": "output_text", "text": text}]}
     return {"type": "message", "response_id": response_id, **({"data": data} if nested else data)}
@@ -34,6 +48,7 @@ def test_poll_waits_for_the_requested_turn(monkeypatch, nested, observe_running)
         return httpx.Response(200, json=snapshots[len(requests) - 1])
 
     monkeypatch.setattr(helpers, "POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(helpers, "time", _PollingClock())
     with httpx.Client(transport=httpx.MockTransport(handle), base_url="http://test") as client:
         result = helpers.poll_session_until_terminal(
             client, session_id="session", response_id="input-new", timeout=1
@@ -41,6 +56,31 @@ def test_poll_waits_for_the_requested_turn(monkeypatch, nested, observe_running)
     assert requests == ["/v1/sessions/session"] * len(snapshots)
     assert result["status"] == "completed"
     assert [item["content"][0]["text"] for item in result["output"]] == ["new reply"]
+
+
+def test_poll_timeout_does_not_accept_previous_turn(monkeypatch) -> None:
+    pending = [
+        _item("user", "old", "input-old", nested=False),
+        _item("assistant", "old reply", "native-old", nested=False),
+        _item("user", "new", "input-new", nested=False),
+    ]
+    requests = []
+
+    def handle(request):
+        requests.append(request.url.path)
+        assert len(requests) <= 2, "poll continued beyond the scripted deadline"
+        return httpx.Response(200, json={"status": "idle", "items": pending})
+
+    clock = _PollingClock()
+    monkeypatch.setattr(helpers, "POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(helpers, "time", clock)
+    with httpx.Client(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        with pytest.raises(AssertionError, match=r"did not become terminal within 0\.5s"):
+            helpers.poll_session_until_terminal(
+                client, session_id="session", response_id="input-new", timeout=0.5
+            )
+    assert requests == ["/v1/sessions/session"] * 2
+    assert clock.monotonic() == 0.5
 
 
 def test_tool_poll_does_not_reuse_previous_turn_calls() -> None:
@@ -73,6 +113,7 @@ def test_poll_waits_past_resource_events_and_missing_input(monkeypatch) -> None:
         ]
     )
     monkeypatch.setattr(helpers, "POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(helpers, "time", _PollingClock())
     with httpx.Client(
         transport=httpx.MockTransport(lambda _: httpx.Response(200, json=next(snapshots))),
         base_url="http://test",
@@ -101,6 +142,7 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
         ]
     )
     monkeypatch.setattr(helpers, "POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(helpers, "time", _PollingClock())
     with httpx.Client(
         transport=httpx.MockTransport(lambda _: httpx.Response(200, json=next(snapshots))),
         base_url="http://test",

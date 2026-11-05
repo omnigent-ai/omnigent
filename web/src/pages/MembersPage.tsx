@@ -209,9 +209,8 @@ export function MembersPage() {
       </div>
 
       {!manageable && (
-        <p className="mb-4 text-ui text-muted-foreground">
-          Users are provisioned automatically on first sign-in through your identity provider. This
-          list is read-only.
+        <p className="mb-4 text-sm text-muted-foreground">
+          Users are added on first sign-in through your identity provider. This list is read-only.
         </p>
       )}
 

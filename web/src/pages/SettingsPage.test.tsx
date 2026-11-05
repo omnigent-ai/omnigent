@@ -16,6 +16,7 @@ import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTi
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
+import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -419,9 +420,9 @@ describe("SettingsPage", () => {
     const select = screen.getByTestId("terminal-clipboard-preference-select");
     expect(select).toHaveValue("ask");
     expect(screen.getByText("Copying from terminals")).toBeInTheDocument();
-    expect(screen.getByText(/Controls copying text from all sessions/)).toBeInTheDocument();
+    expect(screen.getByText(/Control copying from all sessions/)).toBeInTheDocument();
     expect(
-      screen.getByText(/Allowing copying also lets terminal programs silently replace/),
+      screen.getByText(/Allowing it lets terminal programs silently replace/),
     ).toBeInTheDocument();
     expect(screen.getByText(/all sessions and terminals on this server/)).toBeInTheDocument();
     expect(screen.getByText(/this browser or app/)).toBeInTheDocument();
@@ -533,7 +534,7 @@ describe("SettingsPage", () => {
       "md:hidden",
     );
     expect(
-      screen.getByText("Set text across the interface. Icons and spacing stay fixed."),
+      screen.getByText("Sets interface and conversation text. Icons and spacing stay fixed."),
     ).toHaveClass("max-md:hidden");
     expect(screen.getByText("Choose how Omnigent looks on this device.")).toHaveClass(
       "max-md:hidden",
@@ -969,16 +970,91 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
-    // No stored preference → 13px default.
-    expect(input.value).toBe("13");
+    // No stored preference uses the 14px desktop default.
+    expect(input.value).toBe("14");
+    expect(screen.queryByText(/^Interface \d+px · Messages/)).not.toBeInTheDocument();
     expect(screen.getByTestId("ui-font-size-inc").querySelector("svg")).toHaveClass("ui-icon");
 
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
-    expect(input.value).toBe("14");
+    expect(input.value).toBe("15");
     // The choice is persisted so it survives a refresh.
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("14");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     // The discrete desktop size is applied live to the document root.
-    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("14px");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("15px");
+  });
+
+  it("keeps the applied font size current through rotation and edits", () => {
+    let narrow = true;
+    const widthChanges = new Set<() => void>();
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      get matches() {
+        return query === UI_FONT_SIZE_MOBILE_QUERY && narrow;
+      },
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+      addEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChanges.add(callback as () => void);
+      },
+      removeEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChanges.delete(callback as () => void);
+      },
+    }));
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-size-input");
+    expect(input).toHaveValue(15);
+    act(() => {
+      narrow = false;
+      widthChanges.forEach((callback) => callback());
+    });
+    expect(input).toHaveValue(14);
+    fireEvent.focus(input);
+    fireEvent.blur(input);
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
+    expect(input).toHaveValue(14);
+    act(() => {
+      narrow = true;
+      widthChanges.forEach((callback) => callback());
+    });
+    expect(input).toHaveValue(15);
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    expect(input).toHaveValue(16);
+    act(() => {
+      narrow = false;
+      widthChanges.forEach((callback) => callback());
+    });
+    expect(input).toHaveValue(16);
+  });
+
+  it("retains the applied font size when saving a font choice fails", () => {
+    localStorage.setItem("omnigent:ui-font-size", "18");
+    let widthChange = () => {};
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      matches: query === UI_FONT_SIZE_MOBILE_QUERY,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChange = callback as () => void;
+      },
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    renderPage("/settings/appearance");
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    fireEvent.click(screen.getByTestId("ui-font-size-dec"));
+    expect(screen.getByTestId("ui-font-size-input")).toHaveValue(17);
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("17px");
+    act(() => widthChange());
+    expect(screen.getByTestId("ui-font-size-input")).toHaveValue(17);
+    cleanup();
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("ui-font-size-input")).toHaveValue(17);
   });
 
   it("disables the steppers at the min and max bounds", () => {
@@ -1070,7 +1146,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("16");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBe("true");
@@ -1087,7 +1163,7 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("system");
 
     // Fonts are back to their defaults.
-    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("13");
+    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("14");
     expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
     expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
@@ -1182,7 +1258,7 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("code-font-size-input") as HTMLInputElement;
-    // No stored preference → 13px default, matching the interface default.
+    // The code font keeps its own 13px default.
     expect(input.value).toBe("13");
 
     fireEvent.click(screen.getByTestId("code-font-size-inc"));

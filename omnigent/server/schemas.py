@@ -356,6 +356,10 @@ class AgentObject(BaseModel):
         built-in template and native agents are read-only.
     :param mcp_registry_editable: Whether this caller owns the session and can
         select managed MCP services independently of agent ownership.
+    :param loads_user_settings: Whether a claude-sdk session for this agent loads
+        the user's Claude settings and user-scope MCP servers. ``False`` when the
+        spec's ``skills: none`` runs the CLI with no setting sources; ``True``
+        when the bundle cannot be loaded.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -397,6 +401,7 @@ class AgentObject(BaseModel):
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
+    loads_user_settings: bool = True
     mcp_registry_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
@@ -923,6 +928,9 @@ class ChildSessionSummary(BaseModel):
         ``RoutingDecisionData.decision_id``. Read from the child's
         ``omnigent.routing.decision_id`` label, stamped when routing pins
         the model. ``None`` when the child was not routed.
+    :param depth: Levels below the queried session, ``1`` for a direct
+        child. Set only by ``?descendants=true``, so a client can tell the
+        server returned the whole subtree; ``None`` otherwise.
     """
 
     id: str
@@ -946,6 +954,7 @@ class ChildSessionSummary(BaseModel):
     pending_elicitations_count: int = 0
     routed_model: str | None = None
     routing_decision_id: str | None = None
+    depth: int | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
@@ -1896,6 +1905,11 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         ``"xhigh"``, ``"max"``, and ``"ultra"``. Provider-specific support is
         validated when a turn executes. ``None`` means use the agent
         default.
+    :param model_override: Optional per-session LLM model override, e.g.
+        ``"databricks-claude-sonnet-4-6"``; the same session-level field as
+        the JSON create's ``model_override``, so the bundle's model stays
+        its default. Validated against the shared model-id charset.
+        ``None`` means use the agent default.
     :param host_id: Optional host to launch the runner on, e.g.
         ``"host_a1b2c3d4..."``. When set, the server generates a
         binding token, writes the expected runner_id to the session
@@ -1940,6 +1954,7 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     project_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    model_override: str | None = None
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2367,6 +2382,11 @@ class SessionResponse(BaseModel):
         Ordinary native sends use the in-memory
         :mod:`omnigent.runtime.pending_inputs` index; startup inputs also
         survive server restart in the conversation store.
+    :param failed_inputs: Durable managed-startup inputs that were never
+        delivered, e.g. because the sandbox host did not come online. Same
+        shape as ``pending_inputs``, in submission order; their file blocks
+        keep ids that still resolve under this session. Empty when nothing
+        failed.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. Set when the
         session was bound to a host workspace at create-time, or
@@ -2467,6 +2487,8 @@ class SessionResponse(BaseModel):
     # Durable startup inputs plus ordinary native inputs awaiting a receipt.
     # Each {"pending_id", "content"} restores a pending bubble on reconnect.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
+    # Startup inputs that were never delivered, shown as undelivered messages.
+    failed_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
@@ -2489,6 +2511,12 @@ class SessionResponse(BaseModel):
     # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
     # ``GET /v1/sessions?project=``.
     project_id: str | None = None
+    # The session whose Workspace rail lists this one as a side chat; ``None``
+    # otherwise, including side chats from before the rail was server-listed.
+    side_chat_parent_id: str | None = None
+    # Whether the viewer may start side chats here: only the owner of the
+    # session's root can. ``None`` where the response doesn't compute it.
+    side_chat_allowed: bool | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -3115,6 +3143,16 @@ class SessionListItem(BaseModel):
         passing through ``session_stream`` and decrements when a
         verdict is dispatched. ``0`` when the session has no
         outstanding elicitations.
+    :param background_work_running: ``True`` while work outlives the
+        session's ended turn, such as a background shell or a Codex goal that
+        keeps running between turns. The sidebar shows such a session as
+        working; ``status`` stays as reported, so the session still takes a new
+        message. ``False`` while the session's runner is offline.
+    :param blocked_on: Why the session's agent is parked on a terminal prompt,
+        e.g. ``"permission prompt"``, from the last status edge, truncated to
+        128 characters. The sidebar shows such a session as needing input even
+        when no web card exists for the prompt. ``None`` when it is not parked
+        or its runner is offline.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. ``None`` for
         sessions that haven't been bound to a host workspace.
@@ -3185,6 +3223,8 @@ class SessionListItem(BaseModel):
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
+    background_work_running: bool = False
+    blocked_on: str | None = None
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
@@ -3217,6 +3257,32 @@ class ChildSessionList(BaseModel):
 
     object: Literal["list"] = "list"
     data: list[ChildSessionSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class SideChatSummary(BaseModel):
+    """
+    A side chat listed in its parent session's Workspace rail.
+
+    :param id: Side-chat session id, e.g. ``"conv_side123"``.
+    :param object: Fixed resource type, always ``"side_chat"``.
+    :param created_at: Unix epoch seconds when the side chat was created.
+    :param title: The side chat's title, when available.
+    """
+
+    id: str
+    object: Literal["side_chat"] = "side_chat"
+    created_at: int
+    title: str | None = None
+
+
+class SideChatList(BaseModel):
+    """Paginated list of side chats; ``data`` is a page of ``SideChatSummary``."""
+
+    object: Literal["list"] = "list"
+    data: list[SideChatSummary] = Field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
@@ -3695,6 +3761,30 @@ class SessionCodexApprovalModeEvent(_SSEEventBase):
     approval_mode: str
 
 
+class SessionBackgroundTasksEvent(_SSEEventBase):
+    """
+    Background tasks of a session changed between its turns.
+
+    Emitted when a codex-native forwarder's listing of its thread's background
+    terminals changes. Claude's shells ride on its turn's ``session.status``
+    edge instead, because Claude reports them only when a turn ends.
+
+    :param type: Always ``"session.background_tasks"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param background_task_count: Background tasks still running, e.g. ``1``.
+        ``0`` clears the composer's indicator.
+    :param background_tasks: Detail for each counted task, e.g. its command.
+
+    Category: **transient** (SSE-only). The session snapshot carries the same
+    tally, so reconnecting clients restore it.
+    """
+
+    type: Literal["session.background_tasks"]
+    conversation_id: str
+    background_task_count: int
+    background_tasks: list[BackgroundTaskInfo] = Field(default_factory=list)
+
+
 class SessionAgentChangedEvent(_SSEEventBase):
     """
     The session's bound agent changed.
@@ -4058,6 +4148,10 @@ class SessionCreatedEvent(_SSEEventBase):
     parent_session_id: str | None = None
 
 
+# Why a session's work moved to another session (``session.superseded``).
+SupersessionReason = Literal["clear"]
+
+
 class SessionSupersededEvent(_SSEEventBase):
     """
     This conversation was superseded by another and clients should
@@ -4095,7 +4189,7 @@ class SessionSupersededEvent(_SSEEventBase):
     type: Literal["session.superseded"]
     conversation_id: str
     target_conversation_id: str
-    reason: Literal["clear"] = "clear"
+    reason: SupersessionReason = "clear"
 
 
 class SessionBtwSidechatEvent(_SSEEventBase):
@@ -5125,6 +5219,7 @@ ServerStreamEvent = Annotated[
     | SessionCollaborationModeEvent
     | SessionPermissionModeEvent
     | SessionCodexApprovalModeEvent
+    | SessionBackgroundTasksEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent

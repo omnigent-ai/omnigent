@@ -26,63 +26,34 @@
 
 import { createPortal } from "react-dom";
 import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
-import { PullRequestCommentComposer, PullRequestCommentForm } from "./PullRequestCommentComposer";
-import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
+import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
-import {
-  PULL_REQUEST_DIFF_THEME,
-  reviewThreadAnnotations,
-  reviewSelection,
-  type ReviewThread,
-} from "@/lib/pullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeftIcon,
   CopyIcon,
   EllipsisIcon,
-  ChevronDownIcon,
-  ChevronUpIcon,
-  ChevronRightIcon,
-  ChevronsDownUpIcon,
-  ChevronsUpDownIcon,
   AlertCircleIcon,
   BanIcon,
   CircleCheckIcon,
   CircleDotIcon,
   CircleMinusIcon,
   CircleXIcon,
-  Columns2Icon,
   DownloadIcon,
   ExternalLinkIcon,
-  FileDiffIcon,
-  FileMinusIcon,
-  FilePlusIcon,
-  FileSymlinkIcon,
-  FolderIcon,
   GitBranchIcon,
+  GitCommitHorizontalIcon,
   GitPullRequestIcon,
   KeyRoundIcon,
   Loader2Icon,
-  MessageSquareIcon,
   type LucideIcon,
-  PanelLeftCloseIcon,
-  PanelLeftOpenIcon,
   PlusIcon,
   RefreshCwIcon,
-  Rows2Icon,
   ServerOffIcon,
   TerminalIcon,
   Trash2Icon,
-  XIcon,
 } from "lucide-react";
-import { FileDiff } from "@pierre/diffs/react";
-import {
-  parsePatchFiles,
-  type FileDiffMetadata,
-  type DiffLineAnnotation,
-  type SelectedLineRange,
-} from "@pierre/diffs";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
@@ -108,10 +79,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useCanEdit } from "@/hooks/usePermissions";
-import { useResizableColumn } from "@/hooks/useResizableColumn";
 import {
   RunnerOfflineError,
   useWorkspaceAsleep,
@@ -126,26 +94,23 @@ import {
   useUnlinkSessionPr,
 } from "@/hooks/useSessionPullRequests";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy, type GitProviderCopy } from "@/lib/gitProviders";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
-  fetchPullRequestFileContents,
   normalizePullRequestInfo,
   usePullRequestChangedFiles,
   usePullRequestDiff,
   usePullRequestInfo,
-  usePullRequestReviewThreadComposer,
   useSetPullRequestPreference,
   useUpdateSessionPr,
   type NormalizedPullRequestInfo,
   type PullRequestAssociation,
-  type PullRequestChangedFile,
   type PullRequestCheckRun,
   type PullRequestChecks,
   type PullRequestComment,
   type PullRequestInfo,
+  type PullRequestTimelineEvent,
 } from "@/hooks/usePullRequests";
 import {
   PULL_REQUEST_MARKDOWN_COMPONENTS,
@@ -155,15 +120,10 @@ import {
 import { PullRequestLabels } from "./PullRequestLabels";
 import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
+import { PanelMessage, PullRequestChangesTab } from "./PullRequestChangesTab";
+import { IconButton } from "./PullRequestFileSection";
 
-/** Centered muted message filling the panel — the shared loading/transient shell. */
-function PanelMessage({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-ui text-muted-foreground">
-      {children}
-    </div>
-  );
-}
+export { LARGE_DIFF_THRESHOLD } from "./PullRequestFileSection";
 
 /** Full-panel empty state: an icon, a title, optional hint and note lines, and
  *  optional children below (the account/remote selectors). Used for every "no PR
@@ -332,40 +292,6 @@ export function derivePullRequestPanelState(info: {
   return { kind: "ready" };
 }
 
-/** A ghost icon button with a tooltip; the toolbar's shared control element.
- *  No-delay is set by the surrounding TooltipProvider. */
-function IconButton({
-  label,
-  onClick,
-  disabled,
-  className,
-  children,
-}: {
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-  className?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          aria-label={label}
-          onClick={onClick}
-          disabled={disabled}
-          className={cn("shrink-0", className)}
-        >
-          {children}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
-  );
-}
-
 /** The request's provider, shown beside its title: a glyph, named on hover and for
  *  screen readers. A session rarely spans providers, so it stays this quiet. */
 function PullRequestProviderIcon({ copy }: { copy: GitProviderCopy }) {
@@ -409,390 +335,6 @@ function PullRequestStatus({ state, isDraft = false }: { state: string; isDraft?
     >
       {visual.label}
     </Badge>
-  );
-}
-
-// GitHub-style status icons (a file glyph carrying the change kind) instead of
-// bare A/M/D/R letters — quicker to recognize at a glance.
-const STATUS_META: Record<
-  PullRequestChangedFile["status"],
-  { label: string; className: string; Icon: LucideIcon }
-> = {
-  created: { label: "Added", className: "text-green-600 dark:text-green-400", Icon: FilePlusIcon },
-  modified: {
-    label: "Modified",
-    className: "text-amber-600 dark:text-amber-400",
-    Icon: FileDiffIcon,
-  },
-  deleted: { label: "Deleted", className: "text-red-600 dark:text-red-400", Icon: FileMinusIcon },
-  renamed: {
-    label: "Renamed",
-    className: "text-blue-600 dark:text-blue-400",
-    Icon: FileSymlinkIcon,
-  },
-};
-
-/** Diffstat (+adds −removes) shared by the sidebar row and the section header. */
-function DiffStat({ file }: { file: PullRequestChangedFile }) {
-  if (file.lines_added === null && file.lines_removed === null) return null;
-  return (
-    <span className="shrink-0 font-mono text-xs tabular-nums">
-      {file.lines_added !== null && (
-        <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
-      )}{" "}
-      {file.lines_removed !== null && (
-        <span className="text-red-600 dark:text-red-400">−{file.lines_removed}</span>
-      )}
-    </span>
-  );
-}
-
-/** Split a path into its directory prefix (with trailing slash) and basename. */
-function splitPath(path: string): { dir: string; name: string } {
-  const i = path.lastIndexOf("/");
-  return i === -1
-    ? { dir: "", name: path }
-    : { dir: path.slice(0, i + 1), name: path.slice(i + 1) };
-}
-
-/** Conversations and a draft can share the same diff annotation. */
-interface ReviewAnnotation {
-  threads: ReviewThread[];
-  newThread?: boolean;
-}
-type DiffOptions = React.ComponentProps<typeof FileDiff<ReviewAnnotation>>["options"];
-
-/**
- * Files with more unified diff lines than this wait for "Show diff": FileDiff
- * tokenizes on the main thread (disableWorkerPool), so a huge file freezes the app.
- */
-export const LARGE_DIFF_THRESHOLD = 2000;
-
-/**
- * One file's section in the stacked diff: a sticky grey header (chevron + status
- * + path + diffstat) and the file's rendered diff. Clicking the header toggles
- * the diff open/closed. The diff mounts lazily once the section nears the
- * viewport (a big PR doesn't build every diff at once).
- */
-function PullRequestFileSection({
-  file,
-  fileDiff,
-  options,
-  registerRef,
-  collapsed,
-  onToggleCollapsed,
-  threads,
-  threadContext,
-  matchingRevision,
-}: {
-  file: PullRequestChangedFile;
-  /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
-  fileDiff: FileDiffMetadata | undefined;
-  options: DiffOptions;
-  registerRef: (path: string, el: HTMLElement | null) => void;
-  /** Whether this file's diff is hidden. Lifted so the toolbar can drive all. */
-  collapsed: boolean;
-  onToggleCollapsed: () => void;
-  threads: ReviewThread[];
-  threadContext: ReviewThreadContext;
-  matchingRevision: boolean;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [seen, setSeen] = useState(false);
-  const [showLargeDiff, setShowLargeDiff] = useState(false);
-  const composer = usePullRequestReviewThreadComposer(
-    threadContext.conversationId,
-    threadContext.prUrl,
-    file.path,
-    threadContext.headSha ?? "",
-    threadContext.baseSha ?? "",
-  );
-  const revision = `${threadContext.baseSha}:${threadContext.headSha}`;
-  const [selection, setSelection] = useState<{
-    revision: string;
-    range: SelectedLineRange | null;
-  }>();
-  // Restore the committed range when a pointer gesture is canceled.
-  const [selectionPreview, setSelectionPreview] = useState<typeof selection>();
-  const selectedLines = selection?.revision === revision ? selection.range : null;
-  const previewSelection = useCallback(
-    (range: SelectedLineRange | null) => setSelectionPreview({ revision, range }),
-    [revision],
-  );
-  const commitSelection = useCallback(
-    (range: SelectedLineRange | null) => {
-      setSelection({ revision, range });
-      setSelectionPreview(undefined);
-    },
-    [revision],
-  );
-  const [selectionError, setSelectionError] = useState<string>();
-  const startConversation = (range: SelectedLineRange) => {
-    if (!threadContext.canCreate || !fileDiff || composer.draft.pending) return;
-    const lines = reviewSelection(range, fileDiff);
-    if (!lines) {
-      setSelectionError("Select lines within one diff hunk, on the same side.");
-      return;
-    }
-    setSelectionError(undefined);
-    composer.selectLines(lines);
-  };
-
-  useEffect(() => {
-    registerRef(file.path, ref.current);
-    return () => registerRef(file.path, null);
-  }, [file.path, registerRef]);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el || seen) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) setSeen(true);
-      },
-      { rootMargin: "400px 0px" },
-    );
-    io.observe(el);
-    return () => io.disconnect();
-  }, [seen]);
-
-  const meta = STATUS_META[file.status];
-  const StatusIcon = meta.Icon;
-  const { dir, name } = splitPath(file.path);
-  const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
-  // A rename carries its old path in the parsed patch; a pure rename (100%
-  // similarity) has no hunks, so show a note instead of an empty diff.
-  const renamedFrom =
-    fileDiff?.prevName && fileDiff.prevName !== file.path ? fileDiff.prevName : null;
-  const pureRename = fileDiff?.type === "rename-pure";
-  const renderingDiff =
-    !!fileDiff &&
-    !pureRename &&
-    seen &&
-    (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
-  const anchor = composer.draft.anchor;
-  const showGutterUtility = !!threadContext.canCreate && (!anchor || composer.stale);
-  const showDraftInline = !!anchor && !composer.stale && renderingDiff;
-  const { annotations, unplaced } = useMemo(() => {
-    const { annotations: threadAnnotations, unplaced: unplacedThreads } = reviewThreadAnnotations(
-      threads,
-      renderingDiff ? fileDiff : undefined,
-      matchingRevision,
-    );
-    const inlineAnnotations: DiffLineAnnotation<ReviewAnnotation>[] = threadAnnotations.map(
-      (annotation) => ({ ...annotation, metadata: { threads: annotation.metadata } }),
-    );
-    if (showDraftInline) {
-      const side = anchor.side === "LEFT" ? "deletions" : "additions";
-      const existing = inlineAnnotations.find(
-        (item) => item.side === side && item.lineNumber === anchor.line,
-      );
-      if (existing) existing.metadata.newThread = true;
-      else
-        inlineAnnotations.push({
-          side,
-          lineNumber: anchor.line,
-          metadata: { threads: [], newThread: true },
-        });
-    }
-    return { annotations: inlineAnnotations, unplaced: unplacedThreads };
-  }, [threads, renderingDiff, fileDiff, matchingRevision, anchor, showDraftInline]);
-  const newConversation = anchor && (
-    <section
-      aria-label="New review conversation"
-      className="pull-request-comment-surface my-2 min-w-0 rounded-md border text-foreground font-sans text-ui [white-space:normal]"
-    >
-      <div className="flex items-center justify-between gap-2 px-3 py-2">
-        <span>
-          New conversation · {anchor.side === "LEFT" ? "Old" : "New"}{" "}
-          {anchor.start_line ? `lines ${anchor.start_line}–${anchor.line}` : `line ${anchor.line}`}
-        </span>
-        <IconButton
-          label="Close comment composer"
-          disabled={composer.draft.pending}
-          onClick={composer.cancel}
-        >
-          <XIcon className="size-4" aria-hidden="true" />
-        </IconButton>
-      </div>
-      {composer.stale && (
-        <p role="status" className="px-3 pb-2">
-          The pull request changed. Your draft is saved; select its lines again before posting.
-        </p>
-      )}
-      {!threadContext.canCreate && (
-        <p role="status" className="px-3 pb-2">
-          Your draft is saved. Commenting is currently unavailable.
-        </p>
-      )}
-      <PullRequestCommentForm
-        {...composer}
-        account={threadContext.account}
-        inline
-        newThread
-        disabled={composer.stale || !threadContext.canCreate}
-      />
-    </section>
-  );
-
-  return (
-    <div ref={ref} data-github-file={file.path}>
-      <button
-        type="button"
-        onClick={onToggleCollapsed}
-        aria-expanded={!collapsed}
-        title={renamedFrom ? `${renamedFrom} → ${file.path}` : file.path}
-        className="group sticky top-0 z-10 flex w-full cursor-pointer items-center gap-2 border-b border-border bg-secondary px-3 py-1.5 text-left dark:bg-muted"
-      >
-        <ToggleIcon
-          aria-hidden="true"
-          className="size-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground"
-        />
-        <StatusIcon aria-hidden className={cn("size-3.5 shrink-0", meta.className)} />
-        <span className="min-w-0 flex-1 truncate text-ui">
-          {renamedFrom ? (
-            <>
-              <span className="text-muted-foreground">{renamedFrom}</span>
-              <span className="text-muted-foreground"> → </span>
-              <span className="font-medium">{file.path}</span>
-            </>
-          ) : (
-            <>
-              {dir && <span className="text-muted-foreground">{dir}</span>}
-              <span className="font-medium">{name}</span>
-            </>
-          )}
-        </span>
-        <DiffStat file={file} />
-        {threads.length > 0 && (
-          <span
-            className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground"
-            title={`${threads.length} conversation${threads.length === 1 ? "" : "s"}`}
-          >
-            <MessageSquareIcon className="size-3" />
-            {threads.length}
-          </span>
-        )}
-      </button>
-      {!collapsed && (
-        <>
-          {selectionError && (
-            <p role="alert" className="px-3 py-2 text-ui">
-              {selectionError}
-            </p>
-          )}
-          {!showDraftInline && newConversation && <div className="px-3">{newConversation}</div>}
-        </>
-      )}
-      {!collapsed && unplaced.length > 0 && (
-        <div className="px-3">
-          {unplaced.map((thread) => (
-            <PullRequestReviewThread
-              key={thread.id}
-              thread={thread}
-              context={threadContext}
-              fileDiff={matchingRevision ? fileDiff : undefined}
-              showContext
-            />
-          ))}
-        </div>
-      )}
-      {collapsed ? null : pureRename ? (
-        <div className="p-4 text-ui text-muted-foreground">File renamed without changes.</div>
-      ) : !seen ? (
-        <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
-          <Loader2Icon className="size-4 animate-spin" />
-          Loading diff…
-        </div>
-      ) : fileDiff && fileDiff.unifiedLineCount > LARGE_DIFF_THRESHOLD && !showLargeDiff ? (
-        <div className="flex items-center gap-3 p-4 text-ui text-muted-foreground">
-          Large diff — {fileDiff.unifiedLineCount.toLocaleString()} lines
-          <button
-            type="button"
-            className="text-foreground underline-offset-2 hover:underline"
-            onClick={() => setShowLargeDiff(true)}
-          >
-            Show diff
-          </button>
-        </div>
-      ) : fileDiff ? (
-        <div className="overflow-x-auto" onPointerCancel={() => setSelectionPreview(undefined)}>
-          <div
-            style={{
-              minWidth: annotations.length && options?.diffStyle === "split" ? 720 : undefined,
-            }}
-          >
-            <FileDiff
-              fileDiff={fileDiff}
-              options={{
-                ...options,
-                enableLineSelection: !!threadContext.canCreate,
-                enableGutterUtility: showGutterUtility,
-                onLineSelectionStart: previewSelection,
-                onLineSelectionChange: previewSelection,
-                onLineSelectionEnd: commitSelection,
-              }}
-              selectedLines={
-                selectionPreview?.revision === revision ? selectionPreview.range : selectedLines
-              }
-              disableWorkerPool
-              renderGutterUtility={
-                showGutterUtility
-                  ? (getHoveredLine) => (
-                      <button
-                        type="button"
-                        aria-label="Start a new review conversation"
-                        title="Start a new review conversation"
-                        className="absolute -right-px top-1/2 z-10 flex size-5 -translate-y-1/2 translate-x-1/2 cursor-pointer items-center justify-center rounded bg-primary text-primary-foreground"
-                        disabled={composer.draft.pending}
-                        onClick={() => {
-                          const hovered = getHoveredLine();
-                          const withinSelection =
-                            hovered &&
-                            selectedLines &&
-                            selectedLines.side === hovered.side &&
-                            (!selectedLines.endSide || selectedLines.endSide === hovered.side) &&
-                            hovered.lineNumber >=
-                              Math.min(selectedLines.start, selectedLines.end) &&
-                            hovered.lineNumber <= Math.max(selectedLines.start, selectedLines.end);
-                          const range = withinSelection
-                            ? selectedLines
-                            : hovered && {
-                                start: hovered.lineNumber,
-                                end: hovered.lineNumber,
-                                side: hovered.side,
-                              };
-                          if (range) startConversation(range);
-                        }}
-                      >
-                        <PlusIcon className="size-4" />
-                      </button>
-                    )
-                  : undefined
-              }
-              lineAnnotations={annotations}
-              renderAnnotation={(annotation) => (
-                <div className="min-w-0 px-3">
-                  {annotation.metadata.newThread && newConversation}
-                  {annotation.metadata.threads.map((thread) => (
-                    <PullRequestReviewThread
-                      key={thread.id}
-                      thread={thread}
-                      context={threadContext}
-                      fileDiff={matchingRevision ? fileDiff : undefined}
-                    />
-                  ))}
-                </div>
-              )}
-            />
-          </div>
-        </div>
-      ) : (
-        <div className="p-4 text-ui text-muted-foreground">
-          No text diff available for this file.
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -984,6 +526,61 @@ function PullRequestCommentCard({
   );
 }
 
+function PullRequestTimelineRow({
+  event,
+  providerLabel,
+}: {
+  event: PullRequestTimelineEvent;
+  providerLabel: string;
+}) {
+  const timestamp = event.created_at ? Date.parse(event.created_at) : NaN;
+  const time = relativeTime(timestamp);
+  const forcePush = event.kind === "force_push";
+  const Icon = forcePush ? GitBranchIcon : GitCommitHorizontalIcon;
+  const url = event.url && parseHttpUrl(event.url);
+  return (
+    <li className="flex gap-2 px-3 py-2 text-xs text-muted-foreground">
+      <Icon aria-hidden className="mt-0.5 size-4 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-baseline gap-x-1">
+          <span className="font-medium text-foreground">{event.author ?? "unknown"}</span>
+          <span>{forcePush ? "force-pushed" : "committed"}</span>
+          {forcePush && event.previous_sha && (
+            <span>
+              from <code title={event.previous_sha}>{event.previous_sha.slice(0, 7)}</code>
+            </span>
+          )}
+          {forcePush && <span>{event.sha ? "to" : "the branch"}</span>}
+          {url ? (
+            <a
+              href={url.href}
+              target="_blank"
+              rel="noreferrer"
+              aria-label={`Open commit ${event.sha?.slice(0, 7) ?? ""} on ${providerLabel}`}
+              className="font-mono text-foreground hover:underline"
+              title={event.sha ?? undefined}
+            >
+              {event.sha?.slice(0, 7) ?? "View event"}
+            </a>
+          ) : (
+            event.sha && <code title={event.sha}>{event.sha.slice(0, 7)}</code>
+          )}
+          {time && (
+            <time dateTime={event.created_at!} title={absoluteTime(timestamp)} className="ml-auto">
+              {time}
+            </time>
+          )}
+        </div>
+        {event.message && (
+          <p className="mt-1 truncate" title={event.message}>
+            {event.message}
+          </p>
+        )}
+      </div>
+    </li>
+  );
+}
+
 function PullRequestCheckCounts({
   checks,
   compact = false,
@@ -1104,21 +701,53 @@ function PullRequestSummaryTab({
   );
 }
 
-/** The Comments tab body: the PR's conversation comments in order. A partial
- *  list keeps what loaded and says the rest is missing rather than empty. */
+/** Comments and commit activity share a chronological feed. */
 function PullRequestCommentsTab({
   comments,
   commentsPartial,
+  events,
+  timelinePartial,
+  prUrl,
   providerLabel,
   hasComposer,
 }: {
   comments: PullRequestComment[];
   hasComposer: boolean;
   commentsPartial?: boolean;
+  events?: PullRequestTimelineEvent[];
+  timelinePartial?: boolean;
+  prUrl: string;
   providerLabel: string;
 }) {
   const commentKeys = listKeys(comments, (c) => [c.url, c.created_at, c.author_id ?? c.author]);
   const authorHues = useMemo(() => pullRequestAuthorHues(comments), [comments]);
+  const prHref = parseHttpUrl(prUrl)?.href;
+  const entries = [
+    ...comments.map((comment, index) => ({
+      created_at: comment.created_at,
+      element: (
+        <PullRequestCommentCard
+          key={commentKeys[index]}
+          comment={comment}
+          providerLabel={providerLabel}
+          authorHue={authorHues.get(comment.author?.toLowerCase() ?? "")}
+        />
+      ),
+    })),
+    ...(events ?? []).map((event) => ({
+      created_at: event.created_at,
+      element: (
+        <PullRequestTimelineRow key={event.id} event={event} providerLabel={providerLabel} />
+      ),
+    })),
+  ];
+  if (events?.length) {
+    const timestamp = (value: string | null) => {
+      const parsed = Date.parse(value ?? "");
+      return Number.isFinite(parsed) ? parsed : Infinity;
+    };
+    entries.sort((left, right) => timestamp(left.created_at) - timestamp(right.created_at));
+  }
   return (
     <div className={cn("space-y-2 p-3", !hasComposer && "pb-16")}>
       {commentsPartial && (
@@ -1126,177 +755,23 @@ function PullRequestCommentsTab({
           Some comments are unavailable.
         </p>
       )}
-      {comments.length === 0 ? (
-        !commentsPartial && <p className="text-ui text-muted-foreground">No comments yet.</p>
+      {timelinePartial && (
+        <p role="status" className="text-ui text-muted-foreground">
+          Some commit and push history is unavailable.{" "}
+          {prHref && (
+            <a href={prHref} target="_blank" rel="noreferrer" className="underline">
+              View on {providerLabel}
+            </a>
+          )}
+        </p>
+      )}
+      {entries.length === 0 ? (
+        !commentsPartial &&
+        !timelinePartial && <p className="text-ui text-muted-foreground">No comments yet.</p>
       ) : (
-        <ul className="space-y-2">
-          {comments.map((c, i) => (
-            <PullRequestCommentCard
-              key={commentKeys[i]}
-              comment={c}
-              providerLabel={providerLabel}
-              authorHue={authorHues.get(c.author?.toLowerCase() ?? "")}
-            />
-          ))}
-        </ul>
+        <ul className="space-y-2">{entries.map((entry) => entry.element)}</ul>
       )}
     </div>
-  );
-}
-
-// ── Sidebar file tree ────────────────────────────────────────────────────
-// The changed files group into a folder tree. A single-child directory chain
-// collapses into one row (VS Code "compact folders"): a lone change under
-// omnigent/runner/x.py shows an "omnigent/runner" row, not two nested folders.
-// Files are leaves that jump the diff scroll to their section; folders toggle.
-
-interface TreeFileNode {
-  type: "file";
-  name: string;
-  file: PullRequestChangedFile;
-}
-interface TreeDirNode {
-  type: "dir";
-  /** Display name, possibly a compacted chain like "a/b/c". */
-  name: string;
-  /** Full path of the deepest folder in the chain — the collapse key. */
-  path: string;
-  children: SidebarTree[];
-}
-type SidebarTree = TreeFileNode | TreeDirNode;
-
-/** Directories before files, each group kept in first-encounter order. */
-function dirsFirst(nodes: SidebarTree[]): SidebarTree[] {
-  return [...nodes.filter((n) => n.type === "dir"), ...nodes.filter((n) => n.type === "file")];
-}
-
-/** Fold single-dir-child chains into one node (children are compacted first,
- *  so one merge per level suffices). */
-function compactNode(node: SidebarTree): SidebarTree {
-  if (node.type === "file") return node;
-  const children = node.children.map(compactNode);
-  if (children.length === 1 && children[0].type === "dir") {
-    const only = children[0];
-    return {
-      type: "dir",
-      name: `${node.name}/${only.name}`,
-      path: only.path,
-      children: only.children,
-    };
-  }
-  return { type: "dir", name: node.name, path: node.path, children: dirsFirst(children) };
-}
-
-/** Build the compacted folder tree for the changed-files sidebar. */
-function buildSidebarTree(files: PullRequestChangedFile[]): SidebarTree[] {
-  const root: TreeDirNode = { type: "dir", name: "", path: "", children: [] };
-  for (const file of files) {
-    const parts = file.path.split("/");
-    let node = root;
-    for (let i = 0; i < parts.length - 1; i++) {
-      const part = parts[i];
-      let dir = node.children.find((c): c is TreeDirNode => c.type === "dir" && c.name === part);
-      if (!dir) {
-        dir = { type: "dir", name: part, path: parts.slice(0, i + 1).join("/"), children: [] };
-        node.children.push(dir);
-      }
-      node = dir;
-    }
-    node.children.push({ type: "file", name: parts[parts.length - 1], file });
-  }
-  return dirsFirst(root.children.map(compactNode));
-}
-
-// VS Code–style tree indentation, tuned for the narrow sidebar.
-const TREE_INDENT_STEP = 10;
-const TREE_BASE_PAD = 8;
-const treeIndent = (depth: number) => depth * TREE_INDENT_STEP + TREE_BASE_PAD;
-
-/**
- * One node in the sidebar file tree — a collapsible folder or a file leaf.
- * Names truncate on the LEFT (rtl) so the end of the path — the most specific
- * part — stays visible; the name isn't `flex-1`, so short names still sit
- * beside their icon rather than drifting right.
- */
-function SidebarNode({
-  node,
-  depth,
-  activePath,
-  onSelectFile,
-  collapsedDirs,
-  onToggleDir,
-}: {
-  node: SidebarTree;
-  depth: number;
-  activePath: string | null;
-  onSelectFile: (path: string) => void;
-  collapsedDirs: ReadonlySet<string>;
-  onToggleDir: (path: string) => void;
-}) {
-  if (node.type === "file") {
-    const meta = STATUS_META[node.file.status];
-    const StatusIcon = meta.Icon;
-    return (
-      <button
-        type="button"
-        onClick={() => onSelectFile(node.file.path)}
-        title={node.file.path}
-        style={{ paddingLeft: `${treeIndent(depth)}px` }}
-        className={cn(
-          "flex w-full items-center gap-1.5 py-1 pr-2 text-left text-ui hover:bg-muted/60",
-          node.file.path === activePath && "bg-muted",
-        )}
-      >
-        {/* Empty chevron column so the status icon lines up under a sibling
-            folder's icon. */}
-        <span className="size-3.5 shrink-0" aria-hidden />
-        <StatusIcon aria-hidden className={cn("size-3.5 shrink-0", meta.className)} />
-        <span className="min-w-0 truncate [direction:rtl]">
-          <bdi>{node.name}</bdi>
-        </span>
-        <span className="ml-auto flex shrink-0 items-center">
-          <DiffStat file={node.file} />
-        </span>
-      </button>
-    );
-  }
-
-  const open = !collapsedDirs.has(node.path);
-  return (
-    <>
-      <button
-        type="button"
-        onClick={() => onToggleDir(node.path)}
-        aria-expanded={open}
-        title={node.path}
-        style={{ paddingLeft: `${treeIndent(depth)}px` }}
-        className="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-ui hover:bg-muted/60"
-      >
-        <ChevronRightIcon
-          aria-hidden
-          className={cn(
-            "size-3.5 shrink-0 text-muted-foreground transition-transform",
-            open && "rotate-90",
-          )}
-        />
-        <FolderIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 truncate font-medium [direction:rtl]">
-          <bdi>{node.name}</bdi>
-        </span>
-      </button>
-      {open &&
-        node.children.map((child) => (
-          <SidebarNode
-            key={child.type === "file" ? child.file.path : child.path}
-            node={child}
-            depth={depth + 1}
-            activePath={activePath}
-            onSelectFile={onSelectFile}
-            collapsedDirs={collapsedDirs}
-            onToggleDir={onToggleDir}
-          />
-        ))}
-    </>
   );
 }
 
@@ -1500,6 +975,14 @@ function PullRequestListRow({
   );
 }
 
+interface PullRequestPanelView {
+  selected?: string;
+  showingDetails: boolean;
+  subtab: PullRequestSubtab;
+}
+
+const DEFAULT_PANEL_VIEW: PullRequestPanelView = { showingDetails: false, subtab: "summary" };
+
 export function PullRequestPanel({
   conversationId,
   active = true,
@@ -1510,30 +993,52 @@ export function PullRequestPanel({
 }) {
   const mobileHeaderTarget = useMobilePanelHeaderTarget();
   const inMobileDrawer = mobileHeaderTarget !== undefined;
-  const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
-  const [detailsSession, setDetailsSession] = useState<string>();
-  const showingDetails = detailsSession === conversationId;
+  const queryClient = useQueryClient();
+  const viewKey = ["pull-request-panel-view", conversationId];
+  const { data: cachedView = DEFAULT_PANEL_VIEW } = useQuery<PullRequestPanelView>({
+    queryKey: viewKey,
+    queryFn: skipToken,
+    initialData: DEFAULT_PANEL_VIEW,
+    gcTime: 30 * 60_000,
+  });
+  // Keep interactions synchronous; the shared entry restores the view on navigation.
+  const [localView, setLocalView] = useState({ conversationId, view: cachedView });
+  if (localView.conversationId !== conversationId) {
+    setLocalView({ conversationId, view: cachedView });
+  }
+  const view = localView.conversationId === conversationId ? localView.view : cachedView;
+  const selected = view.selected;
+  const showingDetails = view.showingDetails;
+  const activeTab = view.subtab;
+  const updateView = useCallback(
+    (update: Partial<typeof view>) => {
+      const next = queryClient.setQueryData<typeof view>(
+        ["pull-request-panel-view", conversationId],
+        (current) => ({
+          showingDetails: false,
+          subtab: "summary",
+          ...current,
+          ...update,
+        }),
+      );
+      setLocalView({ conversationId, view: next! });
+    },
+    [queryClient, conversationId],
+  );
+  const changeSelection = useCallback(
+    (next?: string) => updateView({ selected: next, subtab: "summary" }),
+    [updateView],
+  );
+  const setActiveTab = (value: PullRequestSubtab) => updateView({ subtab: value });
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
-  const selected = selection?.sessionId === conversationId ? selection.url : undefined;
-  const [subtab, setSubtab] = useState<{
-    sessionId: string;
-    prUrl?: string;
-    value: PullRequestSubtab;
-  }>();
-  const activeTab =
-    subtab?.sessionId === conversationId && subtab.prUrl === selected ? subtab.value : "summary";
-  const setActiveTab = (value: PullRequestSubtab) =>
-    setSubtab({ sessionId: conversationId, prUrl: selected, value });
   const info = usePullRequestInfo(conversationId, {
     poll: active ? (selected && !showingDetails ? "list" : true) : false,
     prUrl: selected,
   });
   const showPullRequestList = () => {
-    setDetailsSession(undefined);
-    setActiveTab("summary");
+    updateView({ showingDetails: false, subtab: "summary" });
   };
-  const queryClient = useQueryClient();
   // Re-enabling the poll only restarts its timer; refresh stale info as the rail reopens.
   const wasActive = useRef(active);
   useEffect(() => {
@@ -1624,13 +1129,15 @@ export function PullRequestPanel({
   const unlink = useUnlinkSessionPr(conversationId);
   useEffect(() => {
     if (linked !== undefined && selected && !linked.some((pr) => pr.url === selected)) {
-      setSelection({ sessionId: conversationId, url: associations?.selected_pr_url });
+      changeSelection(associations?.selected_pr_url);
     } else if (!selected && associations?.selected_pr_url) {
-      setSelection({ sessionId: conversationId, url: associations.selected_pr_url });
+      changeSelection(associations.selected_pr_url);
     }
-  }, [conversationId, selected, associations?.selected_pr_url, linked]);
-  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
+  }, [selected, associations?.selected_pr_url, linked, changeSelection]);
   const prs = associations?.prs ?? [];
+  useEffect(() => {
+    if (prs.length === 1) updateView({ showingDetails: true });
+  }, [updateView, prs.length]);
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const detailsInfo =
     linked?.length === 0 && info.data
@@ -1758,7 +1265,7 @@ export function PullRequestPanel({
       {mobileHeaderTarget?.actions && createPortal(headerActions, mobileHeaderTarget.actions)}
       {mobileHeaderTarget?.title &&
         showingDetails &&
-        prs.length > 0 &&
+        prs.length > 1 &&
         createPortal(
           <div data-mobile-panel-title>
             <Button
@@ -1776,9 +1283,9 @@ export function PullRequestPanel({
       {showTrackingControls ? (
         !inMobileDrawer && (
           <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails} />}
+            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails || prs.length <= 1} />}
             <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
-              {prs.length > 0 && showingDetails && (
+              {prs.length > 1 && showingDetails && (
                 <Button variant="ghost" size="sm" onClick={showPullRequestList}>
                   <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
                 </Button>
@@ -1814,7 +1321,7 @@ export function PullRequestPanel({
         </p>
       ) : null}
       <div className="min-h-0 flex-1">
-        {prs.length > 0 && !showingDetails ? (
+        {prs.length > 1 && !showingDetails ? (
           <ul aria-label="Pull requests" className="h-full overflow-y-auto">
             {prs.map((pr) => (
               <PullRequestListRow
@@ -1832,8 +1339,7 @@ export function PullRequestPanel({
                 unlinkPending={unlink.isPending}
                 onUnlink={associations?.tracking_available ? () => unlinkPr(pr.url) : undefined}
                 onSelect={() => {
-                  changeSelection(pr.url);
-                  setDetailsSession(conversationId);
+                  updateView({ selected: pr.url, showingDetails: true, subtab: "summary" });
                 }}
               />
             ))}
@@ -1996,6 +1502,8 @@ function PullRequestPanelDetails({
 }) {
   const baseRef = info.data?.base_ref ?? undefined;
   const prUrl = info.data?.selected_pr_url;
+  // The server's association carries the PR identity; `storedPr` is set only while offline.
+  const identity = info.data?.prs?.find((association) => association.url === prUrl) ?? null;
   const headSha = info.data?.pr?.head_sha;
   const baseSha = info.data?.pr?.base_sha;
   const revision = `${baseSha ?? ""}:${headSha ?? ""}`;
@@ -2005,7 +1513,6 @@ function PullRequestPanelDetails({
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
   const canEdit = useCanEdit(conversationId);
-  const mobile = useIsMobileViewport();
 
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
   // Summary is the landing tab — like GitHub's PR page opening on the
@@ -2022,193 +1529,6 @@ function PullRequestPanelDetails({
       !!info.data?.capabilities?.review_threads &&
       hasPr,
   );
-
-  const themeType = useResolvedThemeMode();
-  // Diff layout is the app-global FileViewer preference (unified/split); seed
-  // from the persisted value and write toggles back so the choice carries over.
-  const [diffStyle, setDiffStyle] = useState<"unified" | "split">(() =>
-    !mobile && readFileViewPreferences().diffLayout === "split" ? "split" : "unified",
-  );
-  const toggleDiffStyle = useCallback(() => {
-    setDiffStyle((prev) => {
-      const next = prev === "split" ? "unified" : "split";
-      writeFileViewPreferences({ ...readFileViewPreferences(), diffLayout: next });
-      return next;
-    });
-  }, []);
-
-  const files = useMemo<PullRequestChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
-  // The sidebar groups the flat file list into a compacted folder tree (the
-  // diff scroll below stays linear, in file order).
-  const fileTree = useMemo(() => buildSidebarTree(files), [files]);
-
-  // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
-  // drive every section; a path in the set is collapsed.
-  const [collapsedPaths, setCollapsedPaths] = useState<ReadonlySet<string>>(() => new Set());
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(mobile);
-  // Collapsed folders in the sidebar tree (empty = all expanded).
-  const [collapsedDirs, setCollapsedDirs] = useState<ReadonlySet<string>>(() => new Set());
-  const toggleDir = useCallback((path: string) => {
-    setCollapsedDirs((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }, []);
-
-  // Drag-to-resize the file sidebar via a handle on its right edge.
-  const {
-    width: sidebarWidth,
-    containerRef: bodyRef,
-    handleProps: sidebarHandleProps,
-  } = useResizableColumn(192, 140, 560);
-
-  const toggleOne = useCallback((path: string) => {
-    setCollapsedPaths((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }, []);
-
-  const allCollapsed = files.length > 0 && files.every((f) => collapsedPaths.has(f.path));
-  const toggleAll = useCallback(() => {
-    setCollapsedPaths((prev) => {
-      const everyCollapsed = files.length > 0 && files.every((f) => prev.has(f.path));
-      return everyCollapsed ? new Set<string>() : new Set(files.map((f) => f.path));
-    });
-  }, [files]);
-
-  // Parse the one whole-PR patch into per-file diffs, keyed by path.
-  const { filesByPath, parseError } = useMemo(() => {
-    const map = new Map<string, FileDiffMetadata>();
-    const patch = prDiff.data?.patch;
-    if (patch) {
-      try {
-        for (const parsed of parsePatchFiles(patch)) {
-          for (const f of parsed.files) map.set(f.name, f);
-        }
-      } catch {
-        return {
-          filesByPath: map,
-          parseError: "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
-        };
-      }
-    }
-    return { filesByPath: map, parseError: undefined };
-  }, [prDiff.data]);
-
-  // Expand-context loader: fetch a file's full old/new content on demand when
-  // the reader expands unchanged regions.
-  const loadDiffFiles = useCallback(
-    async (fd: FileDiffMetadata) => {
-      const { before, after } = prUrl
-        ? await fetchPullRequestFileContents(conversationId, fd.name, baseRef, {
-            pr_url: prUrl,
-            previous_path: fd.prevName,
-            head_sha: headSha,
-            base_sha: baseSha,
-          })
-        : await fetchPullRequestFileContents(conversationId, fd.name, baseRef);
-      return {
-        oldFile: { name: fd.prevName ?? fd.name, contents: before ?? "" },
-        newFile: { name: fd.name, contents: after ?? "" },
-      };
-    },
-    [conversationId, baseRef, prUrl, headSha, baseSha],
-  );
-
-  const diffOptions = useMemo<DiffOptions>(
-    () => ({
-      theme: PULL_REQUEST_DIFF_THEME,
-      themeType,
-      diffStyle,
-      unsafeCSS: `
-        [data-selected-line] { background-color: var(--sidebar-active); }
-        [data-column-number][data-selected-line], [data-gutter-buffer][data-selected-line] {
-          color: var(--sidebar-active-foreground);
-          box-shadow: inset -3px 0 var(--sidebar-active-foreground);
-        }
-      `,
-      // The section renders its own header; the diff body has none.
-      disableFileHeader: true,
-      // Expand unchanged context 10 lines at a time (default is 100). The
-      // unchanged lines aren't in the patch, so expansion (and the exact
-      // trailing-region count) is served by loadDiffFiles on demand.
-      expansionLineCount: 10,
-      loadDiffFiles,
-    }),
-    [themeType, diffStyle, loadDiffFiles],
-  );
-
-  // The stacked diff scrolls as one; the sidebar highlights the file at the top
-  // of the viewport and jumps to a file on click.
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const sectionEls = useRef<Map<string, HTMLElement>>(new Map());
-  const [activePath, setActivePath] = useState<string | null>(null);
-
-  const registerRef = useCallback((path: string, el: HTMLElement | null) => {
-    if (el) sectionEls.current.set(path, el);
-    else sectionEls.current.delete(path);
-  }, []);
-
-  const rafRef = useRef<number | null>(null);
-  const recomputeActive = useCallback(() => {
-    const container = scrollRef.current;
-    if (!container) return;
-    const top = container.getBoundingClientRect().top;
-    let current: string | null = null;
-    for (const [path, el] of sectionEls.current) {
-      if (el.getBoundingClientRect().top - top <= 8) current = path;
-    }
-    setActivePath((prev) => current ?? prev);
-  }, []);
-  const onScroll = useCallback(() => {
-    if (rafRef.current !== null) return;
-    rafRef.current = requestAnimationFrame(() => {
-      rafRef.current = null;
-      recomputeActive();
-    });
-  }, [recomputeActive]);
-
-  useEffect(() => {
-    setActivePath((prev) =>
-      prev && files.some((f) => f.path === prev) ? prev : (files[0]?.path ?? null),
-    );
-  }, [files]);
-
-  // Jumping to a collapsed file also expands it, so the click lands on its diff.
-  const jumpTo = useCallback((path: string) => {
-    setActivePath(path);
-    setCollapsedPaths((prev) => {
-      if (!prev.has(path)) return prev;
-      const next = new Set(prev);
-      next.delete(path);
-      return next;
-    });
-    sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
-  }, []);
-
-  const [focusedThread, setFocusedThread] = useState<{ id: string } | null>(null);
-  useEffect(() => {
-    const container = scrollRef.current;
-    if (!container || !focusedThread || activeTab !== "changes") return;
-    const focusThread = () => {
-      const element = container.querySelector<HTMLElement>(
-        `[data-review-thread="${CSS.escape(focusedThread.id)}"]`,
-      );
-      if (!element || !element.getClientRects().length) return;
-      element.scrollIntoView({ block: "center" });
-      element.focus({ preventScroll: true });
-      observer.disconnect();
-    };
-    const observer = new MutationObserver(focusThread);
-    observer.observe(container, { childList: true, subtree: true });
-    focusThread();
-    return () => observer.disconnect();
-  }, [focusedThread, activeTab]);
 
   // Mutation responses seed the query cache raw, so normalize before reading.
   const normalized = info.data && normalizePullRequestInfo(info.data);
@@ -2391,62 +1711,6 @@ function PullRequestPanelDetails({
   const checks = pr.checks;
   const comments = pr.comments ?? [];
   const canPostComment = !!(canEdit && data.capabilities.comment_posting && data.selected_pr_url);
-  const threadContext: ReviewThreadContext = {
-    conversationId,
-    prUrl: data.selected_pr_url ?? pr.url,
-    account: data.auth.selected_account,
-    canReply: !!(canEdit && data.capabilities.review_thread_replies),
-    canCreate: !!(
-      canEdit &&
-      data.capabilities.review_thread_creation &&
-      pr.state === "OPEN" &&
-      pr.head_sha &&
-      pr.base_sha &&
-      pr.head_sha === prDiff.data?.head_sha &&
-      pr.base_sha === prDiff.data?.base_sha &&
-      reviews.page
-    ),
-    headSha: pr.head_sha,
-    baseSha: pr.base_sha,
-    loadComments: reviews.loadComments,
-    loadingComments: reviews.loadingComments,
-  };
-  const threads = reviews.page?.data ?? [];
-  const matchingRevision =
-    !!reviews.page &&
-    reviews.page.head_sha === prDiff.data?.head_sha &&
-    reviews.page.base_sha === prDiff.data?.base_sha;
-  const canShowFiles =
-    !changes.error &&
-    !prDiff.error &&
-    !parseError &&
-    !prDiff.data?.unavailable_reason &&
-    files.length > 0 &&
-    !prDiff.isLoading;
-  const threadsByFile = new Map<string, ReviewThread[]>();
-  const earlierThreads: ReviewThread[] = [];
-  for (const thread of threads) {
-    const file =
-      canShowFiles &&
-      files.find(
-        (entry) =>
-          entry.path === thread.path || filesByPath.get(entry.path)?.prevName === thread.path,
-      );
-    if (file) threadsByFile.set(file.path, [...(threadsByFile.get(file.path) ?? []), thread]);
-    else earlierThreads.push(thread);
-  }
-  const unresolved = threads.filter((thread) => !thread.resolved);
-  const navigateThread = (direction: number) => {
-    const index = unresolved.findIndex((thread) => thread.id === focusedThread?.id);
-    const start = index < 0 ? (direction > 0 ? -1 : 0) : index;
-    const next = unresolved[(start + direction + unresolved.length) % unresolved.length];
-    if (!next) return;
-    const file = files.find(
-      (entry) => entry.path === next.path || filesByPath.get(entry.path)?.prevName === next.path,
-    );
-    if (file) jumpTo(file.path);
-    setFocusedThread({ id: next.id });
-  };
 
   return (
     <TooltipProvider delayDuration={0}>
@@ -2583,6 +1847,9 @@ function PullRequestPanelDetails({
               comments={comments}
               hasComposer={canPostComment}
               commentsPartial={pr.comments_partial}
+              events={pr.timeline_events}
+              timelinePartial={pr.timeline_partial}
+              prUrl={pr.url}
               providerLabel={copy.label}
             />
           </div>
@@ -2596,236 +1863,18 @@ function PullRequestPanelDetails({
           )}
         </TabsContent>
 
-        {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
-            of all files' diffs. */}
-        <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
-          {data.capabilities.review_threads &&
-            (reviews.page?.has_more ||
-              reviews.historyStale ||
-              reviews.page?.warning ||
-              reviews.error) && (
-              <div className="flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1 text-ui">
-                {reviews.page?.has_more && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={reviews.loadingMore}
-                    onClick={reviews.loadMore}
-                  >
-                    {reviews.loadingMore ? "Loading…" : "Load more conversations"}
-                  </Button>
-                )}
-                {reviews.historyStale && (
-                  <span className="text-muted-foreground">
-                    Older pages may have changed.{" "}
-                    <button type="button" className="underline" onClick={reviews.refreshHistory}>
-                      Reload conversations
-                    </button>
-                  </span>
-                )}
-                {(reviews.page?.warning || reviews.error) && (
-                  <span role="status" className="text-destructive">
-                    {reviews.error ?? reviews.page?.warning}
-                  </span>
-                )}
-              </div>
-            )}
-          {(changes.data?.has_more || changes.data?.warning) && (
-            <p
-              role="status"
-              className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
-            >
-              {changes.data.warning || "The changed-file list is incomplete."}
-            </p>
-          )}
-          {(files.length > 0 || unresolved.length > 0 || reviews.isFetching) && (
-            <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
-              <div className="flex items-center gap-0.5">
-                {files.length > 0 && (
-                  <IconButton
-                    label={sidebarCollapsed ? "Show file list" : "Hide file list"}
-                    onClick={() => setSidebarCollapsed((v) => !v)}
-                    className="size-5 text-muted-foreground"
-                  >
-                    {sidebarCollapsed ? (
-                      <PanelLeftOpenIcon className="size-3.5" />
-                    ) : (
-                      <PanelLeftCloseIcon className="size-3.5" />
-                    )}
-                  </IconButton>
-                )}
-                {unresolved.length > 0 && (
-                  <>
-                    <IconButton
-                      label="Previous unresolved conversation"
-                      onClick={() => navigateThread(-1)}
-                      className="size-5 text-muted-foreground"
-                    >
-                      <ChevronUpIcon className="size-3.5" />
-                    </IconButton>
-                    <IconButton
-                      label="Next unresolved conversation"
-                      onClick={() => navigateThread(1)}
-                      className="size-5 text-muted-foreground"
-                    >
-                      <ChevronDownIcon className="size-3.5" />
-                    </IconButton>
-                  </>
-                )}
-              </div>
-              <div className="flex items-center gap-0.5">
-                {reviews.isFetching && (
-                  <span
-                    role="status"
-                    className="mr-1 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground"
-                  >
-                    Loading review threads
-                    <Loader2Icon className="size-3 animate-spin" aria-hidden="true" />
-                  </span>
-                )}
-                {files.length > 0 && (
-                  <>
-                    <IconButton
-                      label={
-                        diffStyle === "split" ? "Switch to unified view" : "Switch to split view"
-                      }
-                      onClick={toggleDiffStyle}
-                      className="size-5 text-muted-foreground"
-                    >
-                      {diffStyle === "split" ? (
-                        <Rows2Icon className="size-3.5" />
-                      ) : (
-                        <Columns2Icon className="size-3.5" />
-                      )}
-                    </IconButton>
-                    <IconButton
-                      label={allCollapsed ? "Expand all diffs" : "Collapse all diffs"}
-                      onClick={toggleAll}
-                      className="size-5 text-muted-foreground"
-                    >
-                      {allCollapsed ? (
-                        <ChevronsUpDownIcon className="size-3.5" />
-                      ) : (
-                        <ChevronsDownUpIcon className="size-3.5" />
-                      )}
-                    </IconButton>
-                  </>
-                )}
-              </div>
-            </div>
-          )}
-          <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
-            {!sidebarCollapsed && (
-              <div
-                style={{ width: `${sidebarWidth}px` }}
-                className="relative shrink-0 overflow-y-auto border-r border-border pb-1"
-              >
-                {/* Drag the right edge to resize the file list. */}
-                <div
-                  {...sidebarHandleProps}
-                  aria-label="Resize file list"
-                  className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
-                />
-                {changes.isLoading ? (
-                  <div className="flex items-center justify-center p-4 text-muted-foreground">
-                    <Loader2Icon className="size-4 animate-spin" />
-                  </div>
-                ) : changes.error ? (
-                  <p className="px-2 py-1 text-ui text-muted-foreground">
-                    {changes.error instanceof RunnerOfflineError
-                      ? "Runner offline."
-                      : (changes.error as Error).message}
-                  </p>
-                ) : files.length === 0 ? (
-                  <p className="px-2 py-1 text-ui text-muted-foreground">
-                    {changes.data?.available === false ||
-                    changes.data?.has_more ||
-                    changes.data?.warning
-                      ? "Changed files are unavailable."
-                      : "No changes vs base."}
-                  </p>
-                ) : (
-                  fileTree.map((node) => (
-                    <SidebarNode
-                      key={node.type === "file" ? node.file.path : node.path}
-                      node={node}
-                      depth={0}
-                      activePath={activePath}
-                      onSelectFile={jumpTo}
-                      collapsedDirs={collapsedDirs}
-                      onToggleDir={toggleDir}
-                    />
-                  ))
-                )}
-              </div>
-            )}
-            <div
-              ref={scrollRef}
-              onScroll={onScroll}
-              className="github-diff-stack min-w-0 flex-1 overflow-y-auto"
-            >
-              {changes.error || prDiff.error || parseError ? (
-                <PanelMessage>
-                  <p role="alert">
-                    {parseError || ((changes.error || prDiff.error) as Error).message}
-                  </p>
-                </PanelMessage>
-              ) : prDiff.data?.unavailable_reason ? (
-                <PanelMessage>
-                  {prDiff.data.message ||
-                    (prDiff.data.unavailable_reason === "pr_outside_workspace"
-                      ? "Diff unavailable for a PR outside this workspace's repository"
-                      : "Diff unavailable. Refresh or open the request on its provider.")}
-                </PanelMessage>
-              ) : files.length === 0 || prDiff.isLoading ? (
-                <PanelMessage>
-                  {changes.isLoading || prDiff.isLoading ? (
-                    <>
-                      <Loader2Icon className="size-5 animate-spin" />
-                      Loading changes…
-                    </>
-                  ) : changes.data?.available === false ||
-                    changes.data?.has_more ||
-                    changes.data?.warning ? (
-                    "Changed files are unavailable."
-                  ) : (
-                    "No changes vs base."
-                  )}
-                </PanelMessage>
-              ) : (
-                files.map((file) => (
-                  <PullRequestFileSection
-                    key={file.path}
-                    file={file}
-                    fileDiff={filesByPath.get(file.path)}
-                    options={diffOptions}
-                    registerRef={registerRef}
-                    collapsed={collapsedPaths.has(file.path)}
-                    onToggleCollapsed={() => toggleOne(file.path)}
-                    threads={threadsByFile.get(file.path) ?? []}
-                    threadContext={threadContext}
-                    matchingRevision={matchingRevision}
-                  />
-                ))
-              )}
-              {earlierThreads.length > 0 && (
-                <div className="p-3">
-                  <p className="text-ui font-medium">Earlier conversations and unavailable diffs</p>
-                  {earlierThreads.map((thread) => (
-                    <div key={thread.id}>
-                      <p className="mt-3 break-all text-xs text-muted-foreground">{thread.path}</p>
-                      <PullRequestReviewThread
-                        thread={thread}
-                        context={threadContext}
-                        showContext
-                      />
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        </TabsContent>
+        <PullRequestChangesTab
+          conversationId={conversationId}
+          data={data}
+          pr={pr}
+          prUrl={prUrl}
+          canEdit={canEdit}
+          selected={activeTab === "changes"}
+          changes={changes}
+          prDiff={prDiff}
+          reviews={reviews}
+          identity={identity}
+        />
       </Tabs>
     </TooltipProvider>
   );

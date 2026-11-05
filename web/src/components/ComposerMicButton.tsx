@@ -529,10 +529,11 @@ export const ComposerMicButton = ({
       aria-pressed={isListening}
       aria-busy={connecting}
       aria-label={a11yLabel}
+      data-composer-action="microphone"
       data-server-dictation-available={serverAvailable}
       title={tooltip}
       className={cn(
-        "size-9 md:size-8",
+        "size-9 mobile-touch-target md:size-8",
         isListening &&
           "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
         error && "text-destructive",
