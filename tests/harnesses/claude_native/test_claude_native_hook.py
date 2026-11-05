@@ -1401,26 +1401,35 @@ def test_permission_request_hook_question_answer_survives_a_server_outage(
         assert len(client.calls) == cap + 1, "other prompts keep the hard-failure cap"
 
 
+@pytest.mark.parametrize("last_retry", ["5xx", "ok"], ids=["outage-continues", "answer-claimed"])
 def test_permission_request_hook_moves_a_question_to_chat_after_its_answer_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    last_retry: str,
 ) -> None:
     """
     An outage that outlasts the server's stored answer moves the question to chat.
 
     The last re-POST still lands before the server drops an answer submitted
-    when the poll was lost, and the hook then denies instead of exiting silently.
+    when the poll was lost and can claim it; after that the hook denies instead
+    of exiting silently.
     """
     held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
-    script = [("severed", held), ("5xx", 0.0)]
+    # Retries at +1, 3, 7, 15, 31 s, then every 30 s until the window closes at +270 s.
+    retries_in_window = 13
+    script = [("severed", held)] + [("5xx", 0.0)] * (retries_in_window - 1) + [(last_retry, 0.0)]
 
     client = _run_scripted_permission_hook(
         tmp_path, monkeypatch, tool_name="AskUserQuestion", script=script
     )
 
-    _assert_chat_fallback(capsys.readouterr().out)
-    assert len(client.calls) > claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES + 1
+    stdout = capsys.readouterr().out
+    if last_retry == "ok":
+        assert json.loads(stdout) == {"ok": True}
+    else:
+        _assert_chat_fallback(stdout)
+    assert len(client.calls) == 1 + retries_in_window
     last_retry_after_loss = client.calls[-1] - held
     assert last_retry_after_loss < PRE_RESOLVED_ELICITATION_TTL_S
     assert last_retry_after_loss == pytest.approx(
@@ -2872,14 +2881,16 @@ def test_reattach_held_poll_sever_resets_backoff(monkeypatch: pytest.MonkeyPatch
     assert sleeps == [initial, initial * 2, initial * 4, initial, initial]
 
 
+@pytest.mark.parametrize("answer_window_s", [None, 270.0], ids=["approval", "question"])
 def test_reattach_parked_wait_rides_out_a_host_network_outage(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, answer_window_s: float | None
 ) -> None:
-    """A parked approval keeps retrying while the host cannot reach the server.
+    """A parked prompt keeps retrying while the host cannot reach the server.
 
     The server already published the card; giving up after a few unreachable
     connects left Claude's prompt blocking the session with no card to answer,
-    so web messages stayed buffered until the turn failed.
+    so web messages stayed buffered until the turn failed. A question's answer
+    window doesn't end this wait, since reconnecting re-publishes its card.
     """
     cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
     held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
@@ -2894,10 +2905,11 @@ def test_reattach_parked_wait_rides_out_a_host_network_outage(
         headers={},
         payload={"hook_event_name": "PreToolUse"},
         hook_label="permission",
+        answer_window_s=answer_window_s,
     )
 
     assert resp is not None and resp.status_code == 200, (
-        "a parked approval fail-asked during a network outage"
+        "a parked prompt fail-asked during a network outage"
     )
     assert len(client.calls) == cap * 3 + 2
 

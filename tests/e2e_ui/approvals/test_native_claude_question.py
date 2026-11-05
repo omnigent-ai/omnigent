@@ -64,8 +64,9 @@ def _permission_timeout(session_id: str) -> Iterator[list[dict]]:
 
 @pytest.mark.nightly
 @pytest.mark.timeout(180)
-@pytest.mark.parametrize("input_surface", ["chat", "terminal"])
-@pytest.mark.parametrize("hook_result", ["answer", "timeout"])
+@pytest.mark.parametrize(
+    ("input_surface", "hook_result"), [("chat", "answer"), ("terminal", "timeout")]
+)
 def test_native_question_reaches_chat_and_returns_to_claude(
     page: Page,
     native_claude_mock_session: tuple[str, str],

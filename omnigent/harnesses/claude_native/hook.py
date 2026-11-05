@@ -815,8 +815,10 @@ def _post_hook_with_reattach(
 
     The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling bounds the total wait on
     every path, matching the day-long human-answer window. It ends
-    :data:`_PERMISSION_DEADLINE_MARGIN_S` early, and no request or backoff runs
-    past it, so the hook returns before Claude's own hook timeout kills it.
+    :data:`_PERMISSION_DEADLINE_MARGIN_S` early: no request or backoff starts
+    past it, and each request phase is clipped to the time left. The margin
+    absorbs a final connect ahead of a full-length read, so the hook returns
+    before Claude's own hook timeout kills it.
 
     :param url: Absolute hook endpoint URL, e.g.
         ``"http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request"``.
