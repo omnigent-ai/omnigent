@@ -14,10 +14,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearSessionTombstones,
   useArchiveConversation,
+  useConversations,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
-import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -30,6 +32,8 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
     stop: vi.fn(),
     setWatched: (...args: unknown[]) => setWatched(...args),
     subscribe: (fn: () => void) => subscribe(fn),
+    subscribeStatus: () => () => {},
+    isConnected: () => false,
   },
 }));
 
@@ -115,6 +119,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
+  clearRecentlyCreated();
+  vi.unstubAllGlobals();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -228,6 +234,198 @@ function frameHandler(): (frame: unknown) => void {
 function wireItem(id: string, commentsCount: number, commentsUpdatedAt: number | null) {
   return { ...conv(id), comments_count: commentsCount, comments_updated_at: commentsUpdatedAt };
 }
+
+describe("SessionUpdatesProvider new-row insertion", () => {
+  const sharedKey = ["conversations", "", false, null, "shared"];
+
+  function sharedIds(client: QueryClient): string[] {
+    return client
+      .getQueryData<ConversationsInfiniteData>(sharedKey)!
+      .pages[0].data.map((c) => c.id);
+  }
+
+  function seedShared(client: QueryClient): void {
+    client.setQueryData(sharedKey, {
+      pages: [
+        {
+          data: [{ ...conv("listed"), owner: "bob" }],
+          first_id: "listed",
+          last_id: "listed",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    } satisfies ConversationsInfiniteData);
+  }
+
+  it("does not add another user's open session to the Shared list", () => {
+    // Opened by link; the server leaves it out of Shared (e.g. shared only with a
+    // group), so a snapshot of the open session must not insert it.
+    const client = new QueryClient();
+    seedShared(client);
+    renderProvider(client, ["/c/link-shared"]);
+
+    act(() =>
+      frameHandler()({
+        type: "snapshot",
+        items: [{ ...conv("link-shared"), owner: "alice", permission_level: 1 }],
+      }),
+    );
+
+    expect(sharedIds(client)).toEqual(["listed"]);
+  });
+
+  it("adds a session newly shared with the viewer while it is not open", () => {
+    const client = new QueryClient();
+    seedShared(client);
+    renderProvider(client, ["/"]);
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("new-share"), owner: "alice", permission_level: 1 }],
+      }),
+    );
+
+    expect(sharedIds(client)).toEqual(["new-share", "listed"]);
+  });
+
+  it("reconciles the lists when the open session is then shared directly", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedShared(client);
+      renderProvider(client, ["/c/link-shared"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const linkRead = { ...conv("link-shared"), owner: "alice", permission_level: 1 };
+
+      act(() => frameHandler()({ type: "snapshot", items: [linkRead] }));
+      act(() => frameHandler()({ type: "changed", items: [{ ...linkRead, updated_at: 5 }] }));
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+      expect(sharedIds(client)).toEqual(["listed"]);
+      expect(invalidate).not.toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: ["conversations"] }),
+      );
+
+      // Alice grants bob edit access directly; the server sends only a changed row.
+      act(() => frameHandler()({ type: "changed", items: [{ ...linkRead, permission_level: 2 }] }));
+      act(() => vi.advanceTimersByTime(300));
+      expect(sharedIds(client)).toEqual(["listed"]);
+      expect(invalidate).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: ["conversations"] }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Fetch the Shared list in a fresh client while the server returns nothing,
+  // so only the module-level keep-alive could put a row back.
+  async function sharedFetchIds(): Promise<string[]> {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({
+          object: "list",
+          data: [],
+          first_id: null,
+          last_id: null,
+          has_more: false,
+        }),
+      })),
+    );
+    const fresh = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useConversations("", false, {}, undefined, "shared"), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={fresh}>{children}</QueryClientProvider>
+      ),
+    });
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    return result.current.data!.pages[0].data.map((c) => c.id);
+  }
+
+  it("keeps a share revoked right after discovery out of the next Shared fetch", async () => {
+    const client = new QueryClient();
+    seedShared(client);
+    renderProvider(client, ["/"]);
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("revoked"), owner: "alice", permission_level: 1 }],
+      }),
+    );
+    act(() => frameHandler()({ type: "removed", ids: ["revoked"] }));
+
+    expect(await sharedFetchIds()).toEqual([]);
+  });
+
+  it("keeps a direct share downgraded to link access out of the next Shared fetch", async () => {
+    // Alice's session is readable by link and shared with bob directly at edit.
+    // Revoking the direct share leaves link access, so the stream sends a
+    // permission downgrade rather than a removed frame.
+    let navigate: ReturnType<typeof useNavigate> | null = null;
+    function CaptureNavigate() {
+      navigate = useNavigate();
+      return null;
+    }
+    const client = new QueryClient();
+    seedShared(client);
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/"]}>
+          <CaptureNavigate />
+          <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const directEdit = { ...conv("downgraded"), owner: "alice", permission_level: 2 };
+    act(() => frameHandler()({ type: "changed", items: [directEdit] }));
+    expect(sharedIds(client)).toEqual(["downgraded", "listed"]);
+
+    act(() => navigate?.("/c/downgraded"));
+    act(() => frameHandler()({ type: "snapshot", items: [directEdit, conv("listed")] }));
+    act(() => frameHandler()({ type: "changed", items: [{ ...directEdit, permission_level: 1 }] }));
+
+    expect(await sharedFetchIds()).toEqual([]);
+  });
+
+  it("keeps a direct share downgraded while not open out of the next Shared fetch", async () => {
+    const client = new QueryClient();
+    seedShared(client);
+    renderProvider(client, ["/"]);
+    const directEdit = { ...conv("downgraded"), owner: "alice", permission_level: 2 };
+    act(() => frameHandler()({ type: "changed", items: [directEdit] }));
+    act(() => frameHandler()({ type: "changed", items: [{ ...directEdit, permission_level: 1 }] }));
+
+    expect(await sharedFetchIds()).toEqual([]);
+  });
+
+  it("reconciles the lists on access_changed without inserting the open session", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedShared(client);
+      renderProvider(client, ["/c/link-shared"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const linkRead = { ...conv("link-shared"), owner: "alice", permission_level: 1 };
+      act(() => frameHandler()({ type: "snapshot", items: [linkRead] }));
+
+      // Alice shares it with bob directly at the same level: the row is unchanged.
+      act(() => frameHandler()({ type: "access_changed", ids: ["link-shared"] }));
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      expect(sharedIds(client)).toEqual(["listed"]);
+      expect(invalidate).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: ["conversations"] }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("SessionUpdatesProvider host changes", () => {
   it("invalidates cached session agents so shell inventories refresh", () => {
@@ -485,6 +683,127 @@ describe("SessionUpdatesProvider list invalidation", () => {
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["archived-project-names"] });
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  // Any refetch of the session lists, as opposed to e.g. a comments refresh.
+  function listInvalidations(invalidate: { mock: { calls: unknown[][] } }) {
+    return invalidate.mock.calls.filter(([filters]: unknown[]) => {
+      const key = (filters as { queryKey?: unknown[] } | undefined)?.queryKey?.[0];
+      return (
+        key === "conversations" || key === "project-sessions" || key === "archived-project-names"
+      );
+    });
+  }
+
+  it("patches a background session's updated_at bump without refetching the lists", () => {
+    // Running agents bump updated_at on every tick; each list view sorts its
+    // own rows, so a refetch would only re-read every list for nothing.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ id: "conv_b", updated_at: 5 }] }));
+      act(() => vi.advanceTimersByTime(5_000));
+
+      expect(listInvalidations(invalidate)).toEqual([]);
+      const rows = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+      expect(rows?.pages[0].data.find((row) => row.id === "conv_b")?.updated_at).toBe(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still reconciles the lists once a minute while frames keep arriving", () => {
+    // Each frame's cache write restarts the lists' own polls, so a steadily
+    // running session would otherwise keep new and out-of-window sessions
+    // from ever appearing.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+      const tick = (updatedAt: number) => {
+        act(() => handler({ type: "changed", items: [{ id: "conv_b", updated_at: updatedAt }] }));
+        act(() => vi.advanceTimersByTime(10_000));
+      };
+
+      // Frames at 0 s … 50 s.
+      for (let t = 1; t <= 6; t += 1) tick(t);
+      expect(listInvalidations(invalidate)).toEqual([]);
+
+      tick(7); // 60 s
+      expect(invalidate).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: ["conversations"] }),
+      );
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+      const firstRound = listInvalidations(invalidate).length;
+
+      // 70 s … 110 s: within a minute of that round.
+      for (let t = 8; t <= 12; t += 1) tick(t);
+      expect(listInvalidations(invalidate)).toHaveLength(firstRound);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not treat a watched sub-agent child as a new session", () => {
+    // Children are watched for their tree views but never appear in a list,
+    // so their changes must not trigger a list refetch.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("child_1"), parent_session_id: "conv_a", status: "running" }],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(5_000));
+
+      expect(listInvalidations(invalidate)).toEqual([]);
+      // Its tree view still refreshes.
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_a") });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still reconciles the lists when a watched top-level session is missing from them", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("conv_new"), labels: { omni_project: "Sprint 42" } }],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      expect(invalidate).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: ["conversations"] }),
+      );
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+    } finally {
+      vi.useRealTimers();
+      clearRecentlyCreated();
     }
   });
 });

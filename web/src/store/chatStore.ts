@@ -61,6 +61,12 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import {
+  acknowledgeLocalElicitationResolution,
+  affectedSessionIds,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+} from "@/lib/localElicitationResolutions";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import {
   ApiError,
@@ -1134,6 +1140,9 @@ export interface ConversationState {
 export interface SideChatComposerDraft {
   settings?: SideChatModelSettings;
   starting?: boolean;
+  /** Focus the input once it accepts text; set by a `+` that opened the tab,
+   *  consumed by the composer. */
+  autoFocus?: boolean;
   quotes?: ReplyQuote[];
   text: string;
   files: File[];
@@ -1240,6 +1249,8 @@ export interface ChatActions {
     childSessionId: string,
     mutate: (current: SideChatComposerDraft) => SideChatComposerDraft,
   ) => void;
+  /** Ask a side chat's composer to take focus once it accepts text. */
+  requestSideChatFocus: (childSessionId: string) => void;
   /** Drop a side chat's unsent composer state (sent, or the tab was closed). */
   clearSideChatComposer: (childSessionId: string) => void;
   /**
@@ -2580,6 +2591,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       },
     }));
   },
+  requestSideChatFocus: (childSessionId) => {
+    useChatStore
+      .getState()
+      .updateSideChatComposer(childSessionId, (current) => ({ ...current, autoFocus: true }));
+  },
   clearSideChatComposer: (childSessionId) => {
     useChatStore.setState((s) => {
       if (!(childSessionId in s.sideChatComposers)) return {};
@@ -3473,6 +3489,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           : b,
       ),
     }));
+    // Sidebar counts drop now, before the server confirms the verdict.
+    const holdToken = beginLocalElicitationResolution(
+      elicitationId,
+      affectedSessionIds(
+        [sessionId, targetSessionId],
+        (knownSessionId) =>
+          queryClient?.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+      ),
+      { nativeDelivery: Boolean(originalBlock?.nativeDelivery) },
+    );
     // Human-in-the-loop decision: accept = granted, decline = rejected, cancel =
     // dismissed without deciding. Fires on the user's action (live only).
     emitInteractionPhase({
@@ -3489,11 +3515,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
+      acknowledgeLocalElicitationResolution(elicitationId, holdToken);
       clearAskUserQuestionDraft(elicitationId);
       if (elicitationRechecksAfterVerdict.delete(elicitationId)) {
         void recheckAnsweredElicitation(sessionId, elicitationId);
       }
     } catch {
+      cancelLocalElicitationResolution(elicitationId, holdToken);
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
       // reappear and the user can try again.
@@ -8263,6 +8291,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Guard by conversation id so a late frame from an aborted stream
       // cannot paint Plan mode onto the newly-opened conversation.
       applyToNamedConversation(event.conversationId, { codexPlanMode: event.mode === "plan" });
+      return;
+    case "session_background_tasks":
+      // Tasks that changed between turns (codex-native background terminals).
+      // The count is authoritative, as on a `session.status` edge.
+      applyToNamedConversation(event.conversationId, {
+        backgroundTaskCount: event.backgroundTaskCount,
+        backgroundTasks: event.backgroundTasks,
+      });
       return;
     case "session_codex_approval_mode":
       // A Codex approval switch made in the web picker or the native TUI's

@@ -22,7 +22,11 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
     flags = resolve_feature_flags(environ)
 
     assert flags.enabled_features == frozenset(
-        {Feature.CLAUDE_OSC_STATUS, Feature.CODEX_PLAN_AT_LAUNCH, Feature.SESSION_ORCHESTRATION}
+        {
+            Feature.CLAUDE_OSC_STATUS,
+            Feature.CODEX_PLAN_AT_LAUNCH,
+            Feature.SESSION_ORCHESTRATION,
+        }
     )
     assert flags.frontend_dict() == {
         "sandbox_profiles": False,

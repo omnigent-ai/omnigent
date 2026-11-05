@@ -275,6 +275,60 @@ def test_ask_on_os_tools_asks_for_codex_in_process_shell_tool() -> None:
     assert "rm -rf /" in result["reason"]
 
 
+# ── ask_on_os_tools: Omnigent sys_terminal_* tools ───────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "expected_preview"),
+    [
+        ("sys_terminal_launch", {"terminal": "bash", "session": "s1"}, "bash/s1"),
+        (
+            "sys_terminal_launch",
+            {"terminal": "bash", "session": "s1", "cwd": "/repo"},
+            "bash/s1 cwd='/repo'",
+        ),
+        (
+            "sys_terminal_send",
+            {"terminal": "bash", "session": "s1", "text": "make test"},
+            "bash/s1 text='make test' keys='Enter'",
+        ),
+        (
+            "sys_terminal_send",
+            {"terminal": "bash", "session": "s1", "text": "make test", "keys": ""},
+            "bash/s1 text='make test' keys=''",
+        ),
+        (
+            "sys_terminal_send",
+            {"terminal": "bash", "session": "s1", "keys": "C-c"},
+            "bash/s1 keys='C-c'",
+        ),
+        ("sys_terminal_read", {"terminal": "bash", "session": "s1"}, "bash/s1"),
+        ("sys_terminal_close", {"terminal": "bash", "session": "s1"}, "bash/s1"),
+    ],
+    ids=["launch", "launch-cwd", "send-text", "send-no-keys", "send-keys", "read", "close"],
+)
+def test_ask_on_os_tools_asks_for_sys_terminal_tools(
+    tool: str, args: dict[str, str], expected_preview: str
+) -> None:
+    """Terminal tools that run, read, or stop a process trigger ASK.
+
+    ``sys_terminal_launch`` and ``sys_terminal_send`` run commands like
+    ``sys_os_shell``, so without them in the OS-tool set the policy would let
+    an agent run commands through a terminal with no approval prompt. The
+    preview names the target terminal and, for a send, the typed text and the
+    keys pressed after it (``Enter`` when omitted, as the tool does).
+    """
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    assert f"{tool}({expected_preview!r})" in result["reason"]
+
+
+def test_ask_on_os_tools_allows_sys_terminal_list() -> None:
+    """``sys_terminal_list`` only names terminals, so it passes through."""
+    result = ask_on_os_tools(tc("sys_terminal_list", {}))
+    assert result["result"] == "ALLOW"
+
+
 def test_ask_on_os_tools_allows_non_os_tool() -> None:
     """A tool that is not a file/shell operation passes through.
 
@@ -736,6 +790,9 @@ def test_ask_on_scheduled_task_change_bounds_the_preview(
     assert reason.count("v" * 58) == 0
     assert "Settings: name=" in reason
     assert f"timezone=UTC, permission_mode=None, {expected}" in reason
+    settings = reason.split("Settings: ", 1)[1].split("\nFull automation instructions:", 1)[0]
+    # These known fields use at most 102 characters; extras have a 200-character budget.
+    assert len(settings) <= 302
 
 
 def test_ask_on_scheduled_task_change_names_missing_identifiers() -> None:

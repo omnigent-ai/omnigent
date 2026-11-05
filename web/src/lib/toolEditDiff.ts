@@ -5,6 +5,7 @@
 
 import { stripOmnigentPrefix } from "@/lib/toolTitle";
 import { firstLine, isRecord, parseToolOutput } from "@/lib/toolValue";
+import type { FileEditRequest } from "@/lib/types";
 
 /** One file's part of an edit. */
 export interface FileDiffSection {
@@ -31,6 +32,8 @@ export interface FileEditDiff {
    * change too large to compare is a whole-block replacement, which can overstate it.
    */
   countsAreInexact: boolean;
+  /** Some edit replaces every occurrence of its text, which the diff shows only once. */
+  replacesAll: boolean;
 }
 
 interface EditPair {
@@ -62,6 +65,14 @@ const WRITE_TOOLS = new Set(["Write", "sys_os_write", "write"]);
 // Outputs that say a write created its file: Claude, and OpenCode's newer write
 // tool. Pi's and OpenCode's released writes do not say.
 const WRITE_CREATED_RE = /^(?:File created successfully at|Created file successfully): /;
+
+/** An approval's `file_edit` extra, or `null` when it is absent or malformed. */
+export function fileEditRequestFromWire(raw: unknown): FileEditRequest | null {
+  if (!isRecord(raw) || typeof raw.tool_name !== "string" || !isRecord(raw.tool_input)) {
+    return null;
+  }
+  return { toolName: raw.tool_name, toolInput: raw.tool_input };
+}
 
 /** Tool names whose calls `getFileEditDiff` understands. */
 export const FILE_EDIT_TOOL_NAMES: readonly string[] = [
@@ -117,6 +128,7 @@ function writeDiff(args: Record<string, unknown>, created: boolean): FileEditDif
     removals: 0,
     countsArePerMatch: false,
     countsAreInexact: false,
+    replacesAll: false,
   };
 }
 
@@ -161,6 +173,7 @@ function pairsDiff(pairs: EditPair[], path: string): FileEditDiff | null {
     removals,
     countsArePerMatch: perMatch,
     countsAreInexact: budget.exceeded || (!perMatch && pairs.some((pair) => pair.replaceAll)),
+    replacesAll: pairs.some((pair) => pair.replaceAll),
   };
 }
 
@@ -214,6 +227,7 @@ function patchChangesDiff(changes: unknown): FileEditDiff | null {
     removals: files.reduce((sum, file) => sum + file.removals, 0),
     countsArePerMatch: false,
     countsAreInexact: false,
+    replacesAll: false,
   };
 }
 
