@@ -138,6 +138,12 @@ async def test_confirmed_web_edit_updates_the_queued_message_and_publishes_it(
             ErrorCode.RUNNER_UNAVAILABLE,
             "Couldn't edit the queued message in the terminal.",
         ),
+        (
+            204,
+            {},
+            ErrorCode.RUNNER_UNAVAILABLE,
+            "Couldn't edit the queued message in the terminal.",
+        ),
     ],
     ids=[
         "no-longer-queued",
@@ -146,6 +152,7 @@ async def test_confirmed_web_edit_updates_the_queued_message_and_publishes_it(
         "old-runner-without-harness",
         "old-runner-harness-rejected",
         "runner-rejected",
+        "runner-without-the-session",
     ],
 )
 async def test_refused_web_edit_keeps_the_queued_message(

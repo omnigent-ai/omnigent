@@ -411,6 +411,10 @@ class _QueueMirror:
     planned_edits: dict[str, str] = field(default_factory=dict)
     # pending id -> when its web edit was sent to the pane, until confirmed or refused
     edits_in_flight: dict[str, float] = field(default_factory=dict)
+    # Whether the current Up batch is a web edit's, which queues each popped prompt again
+    web_batch: bool = False
+    # When a web edit was confirmed before its Up records were reported
+    unreported_web_edit_at: float | None = None
 
 
 _queue_mirrors: WorkspaceScopedCache[str, _QueueMirror] = WorkspaceScopedCache(
@@ -1171,6 +1175,8 @@ def confirm_queued_edit(conversation_id: str, pending_id: str) -> QueueEdit | No
         entry = _pending.get(conversation_id, {}).get(pending_id)
         if replacement is None or entry is None:
             return None
+        if all(pid != pending_id for _text, pid in mirror.popped):
+            mirror.unreported_web_edit_at = _now()
         mirror.popped = [item for item in mirror.popped if item[1] != pending_id]
         entry.content = _with_text(entry.content, replacement)
         return QueueEdit(pending_id=pending_id, content=copy.deepcopy(entry.content))
@@ -1183,12 +1189,13 @@ def apply_queue_operations(
     Mirror Claude Code's queued-prompt edits onto the pending entries.
 
     Up logs one ``popAll`` per queued prompt it moves into the composer, each
-    with its own timestamp, and submitting the draft logs one ``enqueue`` of
-    the combined text. An ``enqueue`` equal to a popped prompt puts it back
-    unchanged; any other ``enqueue`` after a pop is the edited draft, so the
-    oldest popped entry takes its text and the other popped entries are
-    merged into it. A planned web edit (:func:`plan_queued_edit`) instead
-    edits only its own entry. Records already applied are skipped.
+    with its own timestamp, and submitting the draft in the terminal logs one
+    ``enqueue`` of the whole draft. An ``enqueue`` equal to a popped entry
+    means the other popped prompts were deleted; any other text is the edited
+    draft, which the oldest popped entry takes. Either way the other popped
+    entries are merged into that one. A web edit (:func:`plan_queued_edit`)
+    queues each popped prompt again on its own, so its records edit only the
+    planned entry. Records already applied are skipped.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param operations: Queue records in transcript order.
@@ -1226,6 +1233,11 @@ def apply_queue_operations(
             if operation.operation == "popAll" and not mirror.popping:
                 # Up pops everything queued, so prompts left over from an earlier pop are gone.
                 mirror.popped.clear()
+                confirmed_at = mirror.unreported_web_edit_at
+                mirror.web_batch = (
+                    confirmed_at is not None and now - confirmed_at <= _PLANNED_EDIT_TTL_S
+                )
+                mirror.unreported_web_edit_at = None
             mirror.popping = operation.operation == "popAll"
             popped_ids = {pid for _text, pid in mirror.popped if pid is not None}
             live = [
@@ -1235,23 +1247,13 @@ def apply_queue_operations(
             ]
             if operation.operation in {"popAll", "popOne"}:
                 match = next((entry for entry in live if _queued_text_matches(entry, text)), None)
+                if match is not None and match.pending_id in mirror.planned_edits:
+                    mirror.web_batch = True
                 mirror.popped.append((text, match.pending_id if match else None))
                 continue
             if operation.operation != "enqueue":
                 continue
-            returned = next(
-                (index for index, (popped, _pid) in enumerate(mirror.popped) if popped == text),
-                None,
-            )
-            if returned is not None:
-                mirror.popped.pop(returned)
-                continue
-            if any(_queued_text_matches(entry, text) for entry in live):
-                continue
             popped_entries = [pid for _text, pid in mirror.popped if pid in entries]
-            if not popped_entries:
-                mirror.popped.clear()
-                continue
             planned = next(
                 (
                     pid
@@ -1260,22 +1262,40 @@ def apply_queue_operations(
                 ),
                 None,
             )
+            returned = next(
+                (index for index, (popped, _pid) in enumerate(mirror.popped) if popped == text),
+                None,
+            )
             if planned is not None:
                 target, merged = planned, []
                 mirror.planned_edits.pop(planned, None)
                 mirror.edits_in_flight.pop(planned, None)
                 mirror.popped = [item for item in mirror.popped if item[1] != planned]
-            else:
-                target, merged = popped_entries[0], popped_entries[1:]
+            elif returned is not None and mirror.web_batch:
+                mirror.popped.pop(returned)
+                continue
+            elif returned is None and any(_queued_text_matches(entry, text) for entry in live):
+                continue
+            elif not popped_entries:
                 mirror.popped.clear()
+                continue
+            else:
+                kept = mirror.popped[returned][1] if returned is not None else None
+                target = kept if kept is not None and kept in entries else popped_entries[0]
+                merged = [pid for pid in popped_entries if pid != target]
+                mirror.popped.clear()
+                if kept == target and not merged:
+                    continue
             entry = entries[target]
             for merged_id in merged:
                 merged_entry = entries.pop(merged_id)
-                entry.content.extend(
-                    block
-                    for block in merged_entry.content
-                    if isinstance(block, dict) and block.get("type") in _ATTACHMENT_BLOCK_TYPES
-                )
+                # A prompt deleted from the draft takes its files with it.
+                if returned is None:
+                    entry.content.extend(
+                        block
+                        for block in merged_entry.content
+                        if isinstance(block, dict) and block.get("type") in _ATTACHMENT_BLOCK_TYPES
+                    )
             entry.content = _with_text(entry.content, operation.content)
             edits.append(
                 QueueEdit(

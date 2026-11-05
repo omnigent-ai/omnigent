@@ -2805,6 +2805,10 @@ class _QueuedPromptPane:
         # The clear that publishes late pop records then leaves the composer full.
         self.late_clear_refused = False
         self._late_records: list[str] = []
+        # Seconds between Up's pop records when Claude writes them slowly.
+        self.pop_record_gap_s = 0.0
+        self._slow_records: list[tuple[float, str]] = []
+        self.clock = _VirtualClock()
         self.resizes = 0
         transcript.write_text(_queue_record("popAll", "an earlier edit") + "\n", encoding="utf-8")
 
@@ -2827,7 +2831,14 @@ class _QueuedPromptPane:
         monkeypatch.setattr(
             claude_native_bridge, "_usable_composer_height", self._usable_composer_height
         )
-        monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+        monkeypatch.setattr(self.clock, "sleep", self._sleep)
+        monkeypatch.setattr(claude_native_bridge, "time", self.clock)
+
+    def _sleep(self, seconds: float) -> None:
+        self.clock.now += seconds
+        due = [record for at, record in self._slow_records if at <= self.clock.now]
+        self._slow_records = self._slow_records[len(due) :]
+        self._append(due)
 
     @contextmanager
     def _usable_composer_height(self, *_args: object) -> Iterator[bool]:
@@ -2850,6 +2861,12 @@ class _QueuedPromptPane:
         ]
         if self.late_pop:
             self._late_records = records
+        elif self.pop_record_gap_s:
+            self._append(records[:1])
+            self._slow_records = [
+                (self.clock.now + self.pop_record_gap_s * index, record)
+                for index, record in enumerate(records[1:], start=1)
+            ]
         else:
             self._append(records)
         self.composer = "\n".join(self.queued)
@@ -2927,6 +2944,23 @@ def test_edit_queued_user_message_requeues_prompts_whose_pop_records_were_late(
 
     assert pane.up_presses == 1
     assert pane.queued == ["First", "Then summarize the logs"]
+
+
+def test_edit_queued_user_message_waits_for_pop_records_written_slowly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir, pane = _queued_prompt_pane(
+        tmp_path, monkeypatch, ["First", "Then summarize", "Last"]
+    )
+    # Each record lands inside the settle window, but the batch outlasts one window.
+    pane.pop_record_gap_s = claude_native_bridge._QUEUE_POP_SETTLE_S * 0.9
+
+    claude_native_bridge.edit_queued_user_message(
+        bridge_dir, original="Then summarize", replacement="Then summarize the logs"
+    )
+
+    assert pane.up_presses == 1
+    assert pane.queued == ["First", "Then summarize the logs", "Last"]
 
 
 @pytest.mark.parametrize(
@@ -3041,6 +3075,7 @@ def test_edit_queued_user_message_refuses_before_up_without_time_to_requeue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge_dir, pane = _queued_prompt_pane(tmp_path, monkeypatch, ["Then summarize"])
+    pane.composer = "a draft typed in the terminal"
     deadline = claude_native_bridge._QUEUED_EDIT_MIN_BUDGET_S - 1.0
 
     with pytest.raises(claude_native_bridge.ClaudeInjectionCancelled):
@@ -3052,6 +3087,7 @@ def test_edit_queued_user_message_refuses_before_up_without_time_to_requeue(
         )
 
     assert pane.up_presses == 0
+    assert pane.composer == "a draft typed in the terminal"
     assert pane.queued == ["Then summarize"]
 
 

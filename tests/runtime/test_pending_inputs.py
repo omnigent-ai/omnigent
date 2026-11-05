@@ -1201,15 +1201,37 @@ def test_terminal_edit_of_two_queued_messages_merges_them_into_the_first(
     assert pending_inputs.pending_ids("conv") == [first]
 
 
+@pytest.mark.parametrize("kept", ["first", "second"])
+def test_terminal_draft_cut_to_one_queued_message_retires_the_others(kept: str) -> None:
+    ids = {
+        text: pending_inputs.record("conv", [_text_block(text)]) for text in ("first", "second")
+    }
+    [deleted] = [text for text in ids if text != kept]
+
+    [edit] = pending_inputs.apply_queue_operations(
+        "conv",
+        _queue_ops(("popAll", "first", "t1"), ("popAll", "second", "t1"), ("enqueue", kept, "t2")),
+    )
+
+    assert edit == pending_inputs.QueueEdit(ids[kept], [_text_block(kept)], [ids[deleted]])
+    later = _queue_ops(("enqueue", "typed later", "t3"))
+    assert pending_inputs.apply_queue_operations("conv", later) == []
+    match = pending_inputs.resolve_matching_text("conv", kept)
+    assert match.matched is not None
+    assert match.matched.pending_id == ids[kept]
+    assert match.skipped == []
+
+
 def test_a_later_up_press_forgets_prompts_left_from_an_earlier_one() -> None:
-    pending_inputs.record("conv", [_text_block("first")])
+    first = pending_inputs.record("conv", [_text_block("first")])
     second = pending_inputs.record("conv", [_text_block("second")])
-    pending_inputs.apply_queue_operations(
+    assert pending_inputs.apply_queue_operations(
         "conv",
         _queue_ops(
             ("popAll", "first", "t1"), ("popAll", "second", "t1"), ("enqueue", "second", "t2")
         ),
-    )
+    ) == [pending_inputs.QueueEdit(second, [_text_block("second")], [first])]
+    assert pending_inputs.pending_ids("conv") == [second]
 
     [edit] = pending_inputs.apply_queue_operations(
         "conv", _queue_ops(("popAll", "second", "t3"), ("enqueue", "second!", "t4"))
@@ -1260,7 +1282,7 @@ def test_queue_records_reported_twice_apply_once() -> None:
     assert pending_inputs.snapshot_for("conv")[0]["content"] == [_text_block("two")]
 
 
-@pytest.mark.parametrize("plan_state", ["unsettled", "refused", "expired"])
+@pytest.mark.parametrize("plan_state", ["unsettled", "confirmed", "refused", "expired"])
 def test_web_edit_resubmitted_one_by_one_edits_only_its_message(
     monkeypatch: pytest.MonkeyPatch, plan_state: str
 ) -> None:
@@ -1273,12 +1295,15 @@ def test_web_edit_resubmitted_one_by_one_edits_only_its_message(
     assert (
         pending_inputs.plan_queued_edit("conv", second, "second edited", author=None) == "second"
     )
-    if plan_state == "refused":
+    edits: list[pending_inputs.QueueEdit | None] = []
+    if plan_state == "confirmed":
+        edits.append(pending_inputs.confirm_queued_edit("conv", second))
+    elif plan_state == "refused":
         pending_inputs.cancel_queued_edit("conv", second)
     elif plan_state == "expired":
         clock["t"] += pending_inputs._PLANNED_EDIT_TTL_S + 1
 
-    [edit] = pending_inputs.apply_queue_operations(
+    edits += pending_inputs.apply_queue_operations(
         "conv",
         _queue_ops(
             ("popAll", "first", "t1"),
@@ -1290,7 +1315,7 @@ def test_web_edit_resubmitted_one_by_one_edits_only_its_message(
         ),
     )
 
-    assert edit == pending_inputs.QueueEdit(second, [_text_block("second edited")])
+    assert edits == [pending_inputs.QueueEdit(second, [_text_block("second edited")])]
     assert pending_inputs.pending_ids("conv") == [first, second, third]
     assert pending_inputs.confirm_queued_edit("conv", second) is None
 

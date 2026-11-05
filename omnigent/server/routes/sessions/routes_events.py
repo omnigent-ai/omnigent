@@ -735,8 +735,8 @@ def _queue_operations_from_event(data: Mapping[str, Any]) -> list[pending_inputs
             or not isinstance(timestamp, str)
         ):
             raise OmnigentError(
-                "external_queue_operations entries require string operation, "
-                "content and timestamp",
+                "external_queue_operations entries require string operation and "
+                "content, and an optional string timestamp",
                 code=ErrorCode.INVALID_INPUT,
             )
         operations.append(
@@ -844,9 +844,10 @@ async def _edit_queued_native_message(
         )
     error = _runner_reply_field(result.body, "error")
     old_runner = result.status_code == 422 or error in _PRE_EDIT_RUNNER_ERRORS
+    # A 204 is a runner without this claude-native session, which never touched the pane.
     if (
         old_runner
-        or 400 <= result.status_code < 500
+        or result.status_code < 500
         or error == "claude_native_queued_message_edit_failed"
     ):
         pending_inputs.cancel_queued_edit(session_id, pending_id)

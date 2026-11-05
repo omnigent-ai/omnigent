@@ -559,6 +559,7 @@ _EDIT = {"original": "Then summarize", "replacement": "Then list"}
 )
 async def test_events_queued_message_edit_drives_the_claude_native_pane(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     harness: str,
     body: dict[str, str],
     pane_error: Exception | None,
@@ -603,6 +604,9 @@ async def test_events_queued_message_edit_drives_the_claude_native_pane(
     assert edits == expected_edits
     # The edit has the same time left as the deadline that stops its keys.
     assert all(passed == bound for passed, bound in deadlines)
+    if isinstance(pane_error, claude_native_bridge.ClaudeQueuedEditIncomplete):
+        assert "1 prompt(s) unqueued" in caplog.text
+        assert "Last" not in caplog.text
 
 
 @pytest.mark.asyncio

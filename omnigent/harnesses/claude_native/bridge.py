@@ -4669,7 +4669,8 @@ def edit_queued_user_message(
     :param deadline: ``time.monotonic()`` value by which the caller needs the
         outcome, e.g. the runner's control deadline; ``None`` for no limit.
     :raises ClaudeInjectionCancelled: If less than
-        :data:`_QUEUED_EDIT_MIN_BUDGET_S` was left before Up; nothing was typed.
+        :data:`_QUEUED_EDIT_MIN_BUDGET_S` was left before Up; the queue is
+        untouched, but a terminal draft may already have been cleared.
     :raises ClaudeQueuedMessageMissing: If no queued prompt matches
         ``original``; any prompts Up popped were submitted again unchanged.
     :raises ClaudeQueuedMessageAmbiguous: If several queued prompts match
@@ -4705,6 +4706,7 @@ def edit_queued_user_message(
     _wait_for_claude_prompt_ready(
         socket_path, tmux_target, timeout_s=_TMUX_READY_TIMEOUT_S, bridge_dir=bridge_dir
     )
+    _check_queued_edit_budget(deadline)
     # Up pops the queue only from an empty composer. Claude may drop its "Press up to
     # edit queued messages" placeholder once cleared, so only the popAll records tell.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
@@ -4712,10 +4714,7 @@ def edit_queued_user_message(
         offset = transcript.stat().st_size
     except OSError as exc:
         raise ClaudeQueuedMessageMissing("Claude Code's transcript is unreadable.") from exc
-    if deadline is not None and deadline - time.monotonic() < _QUEUED_EDIT_MIN_BUDGET_S:
-        raise ClaudeInjectionCancelled(
-            "Claude Code took too long to get ready, so the message was not edited."
-        )
+    _check_queued_edit_budget(deadline)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Up")
     cancel_token = _INJECTION_CANCEL_EVENT.set(None)
     try:
@@ -4760,6 +4759,21 @@ def edit_queued_user_message(
     if len(matches) > 1:
         raise ClaudeQueuedMessageAmbiguous(
             "Claude Code has several queued messages with this text."
+        )
+
+
+def _check_queued_edit_budget(deadline: float | None) -> None:
+    """
+    Refuse an edit that would leave too little time to queue popped prompts again.
+
+    :param deadline: ``time.monotonic()`` value by which the caller needs the
+        outcome; ``None`` for no limit.
+    :raises ClaudeInjectionCancelled: If less than
+        :data:`_QUEUED_EDIT_MIN_BUDGET_S` is left.
+    """
+    if deadline is not None and deadline - time.monotonic() < _QUEUED_EDIT_MIN_BUDGET_S:
+        raise ClaudeInjectionCancelled(
+            "Claude Code took too long to get ready, so the message was not edited."
         )
 
 
@@ -4841,10 +4855,10 @@ def _popped_queue_prompts(transcript: Path, byte_offset: int) -> list[str]:
             )
             if operation is not None and operation.operation in {"popAll", "popOne"}:
                 operations.append(operation)
-        if operations:
-            # Claude stamps each pop record as it writes it, so one press can span timestamps.
+        if len(operations) > len(popped):
+            # Claude writes one pop record per prompt, so wait for a quiet window after the last.
             popped = [operation.content for operation in operations]
-            settle_until = settle_until or time.monotonic() + _QUEUE_POP_SETTLE_S
+            settle_until = time.monotonic() + _QUEUE_POP_SETTLE_S
         now = time.monotonic()
         if (settle_until is not None and now >= settle_until) or (
             settle_until is None and now >= deadline

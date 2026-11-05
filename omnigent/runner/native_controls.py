@@ -1264,7 +1264,11 @@ def build_native_controls(
         except ClaudeQueuedMessageAmbiguous:
             return JSONResponse(status_code=409, content={"error": "queued_message_ambiguous"})
         except ClaudeQueuedEditIncomplete as exc:
-            _logger.warning("claude-native queued message edit left prompts unqueued: %s", exc)
+            _logger.warning(
+                "claude-native queued message edit left %d prompt(s) unqueued for session=%s",
+                len(exc.unsent),
+                conv_id,
+            )
             return JSONResponse(
                 status_code=503,
                 content={
