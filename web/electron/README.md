@@ -508,9 +508,12 @@ request. Both an updated desktop and web bundle are required; older web bundles
 remain public-only without destroying existing public views.
 
 Eligibility is granted at navigation and re-checked at every navigation and agent
-read/action. A failed check revokes access before clearing the previous document;
-access stays revoked if clearing fails. Request and redirect checks use the
-in-memory grant and window trust gates, keeping disk reads off the request path.
+read/action. Local identity/enrollment results are cached per host/server pair for
+at most one second measured with a monotonic clock, so these checks can use
+enrollment information up to one second old. A failed check revokes access before
+clearing the previous document; access stays revoked if clearing fails. Request
+and redirect checks use the in-memory grant and window trust gates, keeping disk
+reads off the request path.
 
 Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.
@@ -876,6 +879,20 @@ server (see below), Connect, and you're in.
 > Note: this loads the UI from whatever server URL you give it — it does
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
+
+### Close Tab shortcut
+
+Cmd/Ctrl+W closes the selected visible workspace tab in an ordinary conversation.
+File tabs confirm unsaved edits before closing; terminal and side-chat tabs use
+their existing close behavior. With no closable visible tab, it returns to the
+new-session page. Outside a conversation, including grid workspaces, it closes
+the window. Grid panels do not participate in this shortcut yet.
+Cmd/Ctrl+Shift+W always requests window closure.
+
+The web app and shell must both support the Close Tab bridge; older combinations
+keep the window-close behavior. Verify on each supported desktop OS with focus
+inside an embedded browser: Cmd/Ctrl+W must close only its tab, and
+Cmd/Ctrl+Shift+W must close the window.
 
 ### Test desktop updates
 

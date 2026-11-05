@@ -53,6 +53,8 @@ _NAV_MSG = "sentinel-nav-7f3a remember this exact phrase"
 _PROMOTE_MSG = "sentinel-promote-91b2 keep this bubble"
 _QUEUE_MSG_A = "sentinel-queue-a-4d1e first of two"
 _QUEUE_MSG_B = "sentinel-queue-b-8c6f second of two"
+_RELOAD_MSG_A = "sentinel-reload-a-2b7c hold this turn open"
+_RELOAD_MSG_B = "sentinel-reload-b-6e0d queued behind it"
 
 # Equal-length tokens: the mock routes a request to the rightmost match, so B's
 # turn (whose history also carries A) gets B's queue.
@@ -262,3 +264,37 @@ def test_reply_actions_stay_hidden_while_a_queued_follow_up_sends(
     opacities = page.evaluate("() => window.__replyActionOpacity")
     assert opacities, "the reply to the first message never rendered"
     assert max(opacities) < 0.5, f"the reply's action row showed: {opacities}"
+
+
+def test_queued_message_returns_to_the_composer_after_a_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """A message queued behind a running turn is back in the composer after a reload."""
+    base_url, session_id = seeded_session
+    # Title generation sends the same text and can take a gate of its own.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "done", "block": True}] * 4,
+        key="queued-reload",
+        match=_RELOAD_MSG_A,
+    )
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
+    page.goto(f"{base_url}/c/{session_id}")
+    try:
+        _send(page, _RELOAD_MSG_A)
+        poll_until(
+            lambda: httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=5.0).json()["pending"]
+        )
+        _send(page, _RELOAD_MSG_B)
+        expect(page.get_by_test_id("composer-queued-strip")).to_contain_text(_RELOAD_MSG_B)
+
+        page.reload()
+
+        composer = page.get_by_label("Message the agent")
+        expect(composer).to_have_value(_RELOAD_MSG_B, timeout=30_000)
+    finally:
+        for _ in range(4):
+            httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)

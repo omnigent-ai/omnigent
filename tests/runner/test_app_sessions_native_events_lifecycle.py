@@ -8,11 +8,12 @@ import logging
 import os
 import sys
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
@@ -1183,7 +1184,7 @@ async def test_cursor_native_model_options_failure_is_retryable(
 
 
 @pytest.mark.asyncio
-async def test_opencode_native_model_options_uses_cli_catalog(
+async def test_opencode_native_model_options_reads_server_catalog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1200,19 +1201,36 @@ async def test_opencode_native_model_options_uses_cli_catalog(
             session_id=conv_id,
             server_base_url="http://127.0.0.1:49231",
             opencode_session_id="ses_1",
+            auth_secret="pw",
+            workspace="/repo",
         ),
     )
-    captured_envs: list[Mapping[str, str] | None] = []
 
-    def _fake_list_options(*, env: Mapping[str, str] | None = None) -> list[dict[str, object]]:
-        captured_envs.append(env)
-        return [{"id": "opencode-go/glm-5.2", "displayName": "opencode-go/glm-5.2"}]
+    class _Client:
+        closed = False
 
-    monkeypatch.setattr(
-        opencode_native_app_server,
-        "list_opencode_cli_model_options",
-        _fake_list_options,
-    )
+        async def list_models(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "id": "glm-5.2",
+                    "modelID": "glm-5.2",
+                    "providerID": "opencode-go",
+                    "name": "GLM 5.2",
+                    "status": "active",
+                    "enabled": True,
+                }
+            ]
+
+        async def aclose(self) -> None:
+            _Client.closed = True
+
+    built: list[dict[str, object]] = []
+
+    def _fake_client_for_state(**kwargs: object) -> _Client:
+        built.append(kwargs)
+        return _Client()
+
+    monkeypatch.setattr(opencode_native_app_server, "client_for_state", _fake_client_for_state)
     spec = _harness_spec("opencode-native")
 
     app, _ = await _build_app_for_spec(spec)
@@ -1226,14 +1244,21 @@ async def test_opencode_native_model_options_uses_cli_catalog(
 
     assert response.status_code == 200
     assert response.json() == {
-        "models": [{"id": "opencode-go/glm-5.2", "displayName": "opencode-go/glm-5.2"}]
+        "models": [
+            {
+                "id": "opencode-go/glm-5.2",
+                "model": "glm-5.2",
+                "providerID": "opencode-go",
+                "displayName": "opencode-go/glm-5.2",
+                "name": "GLM 5.2",
+                "isDefault": False,
+            }
+        ]
     }
-    assert len(captured_envs) == 1
-    cli_env = captured_envs[0]
-    assert cli_env is not None
-    bridge_dir = opencode_native_bridge.bridge_dir_for_bridge_id(conv_id)
-    assert cli_env["XDG_DATA_HOME"] == str(bridge_dir / "xdg-data")
-    assert cli_env["XDG_CONFIG_HOME"] == str(bridge_dir / "xdg-config")
+    assert built == [
+        {"base_url": "http://127.0.0.1:49231", "auth_secret": "pw", "directory": "/repo"}
+    ]
+    assert _Client.closed
 
 
 @pytest.mark.asyncio
@@ -1285,6 +1310,179 @@ async def test_bound_opencode_switch_qualifies_the_literal_gateway_id(
             )
     assert response.status_code == 200, response.text
     assert update.call_args.args[1] == "omnigent/omnigent/literal"
+
+
+@pytest.mark.asyncio
+async def test_opencode_model_switch_sets_model_on_live_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
+    from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
+    from omnigent.runner.app import _AUTO_OPENCODE_SERVERS
+
+    conv_id = "c6d1e2f3a4b54c6d8e9f0a1b2c3d4e5f"
+    monkeypatch.setattr(opencode_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    update = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge.update_model_override", update)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.bridge.read_bridge_state",
+        lambda _dir: OpenCodeNativeBridgeState(
+            session_id=conv_id,
+            server_base_url="http://127.0.0.1:1",
+            opencode_session_id="ses_live",
+        ),
+    )
+
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str, str | None]] = []
+            self.closed = False
+
+        async def set_model(
+            self, session_id: str, *, provider_id: str, model_id: str, variant: str | None = None
+        ) -> None:
+            self.calls.append((session_id, provider_id, model_id, variant))
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    fake_client = _Client()
+
+    class _Server:
+        def client(self, *, directory: str | None = None) -> _Client:
+            return fake_client
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        async with _runner_client(app) as client:
+            response = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag_1"}
+            )
+            assert response.status_code == 201, response.text
+            _AUTO_OPENCODE_SERVERS[conv_id] = _Server()  # type: ignore[assignment]
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "openai/gpt-5#high"},
+            )
+    finally:
+        _AUTO_OPENCODE_SERVERS.pop(conv_id, None)
+
+    assert response.status_code == 200, response.text
+    assert update.call_args.args[1] == "openai/gpt-5#high"
+    assert fake_client.calls == [("ses_live", "openai", "gpt-5", "high")]
+    assert fake_client.closed
+
+
+@pytest.mark.asyncio
+async def test_opencode_model_switch_records_last_applied_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
+    from omnigent.runner.app import _AUTO_OPENCODE_SERVERS
+
+    conv_id = "d7e2f3a4b5c64d7e8f9a0b1c2d3e4f5a"
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.bridge.update_model_override",
+        Mock(return_value=True),
+    )
+    record = Mock(return_value=True)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.bridge.update_last_applied_model", record
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.bridge.read_bridge_state",
+        lambda _dir: OpenCodeNativeBridgeState(
+            session_id=conv_id,
+            server_base_url="http://127.0.0.1:1",
+            opencode_session_id="ses_live",
+        ),
+    )
+
+    class _OkClient:
+        closed = False
+
+        async def set_model(
+            self, session_id: str, *, provider_id: str, model_id: str, variant: str | None = None
+        ) -> None:
+            del session_id, provider_id, model_id, variant
+
+        async def aclose(self) -> None:
+            _OkClient.closed = True
+
+    class _FailingClient:
+        closed = False
+
+        async def set_model(
+            self, session_id: str, *, provider_id: str, model_id: str, variant: str | None = None
+        ) -> None:
+            del session_id, provider_id, model_id, variant
+            raise httpx.HTTPError("boom")
+
+        async def aclose(self) -> None:
+            _FailingClient.closed = True
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        async with _runner_client(app) as client:
+            response = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag_1"}
+            )
+            assert response.status_code == 201, response.text
+
+            class _OkServer:
+                def client(self, *, directory: str | None = None) -> _OkClient:
+                    return _OkClient()
+
+            _AUTO_OPENCODE_SERVERS[conv_id] = _OkServer()  # type: ignore[assignment]
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "openai/gpt-5#high"},
+            )
+            assert response.status_code == 200, response.text
+            assert record.call_args.args[1] == "openai/gpt-5#high"
+
+            record.reset_mock()
+
+            class _FailingServer:
+                def client(self, *, directory: str | None = None) -> _FailingClient:
+                    return _FailingClient()
+
+            _AUTO_OPENCODE_SERVERS[conv_id] = _FailingServer()  # type: ignore[assignment]
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "openai/gpt-5-mini"},
+            )
+            assert response.status_code == 200, response.text
+            record.assert_not_called()
+    finally:
+        _AUTO_OPENCODE_SERVERS.pop(conv_id, None)
 
 
 @pytest.mark.asyncio
@@ -1590,7 +1788,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
 
     launch_resolver = Mock(side_effect=resolve_launch)
     monkeypatch.setattr(codex, "resolve_native_codex_launch", launch_resolver)
-    credentials = Mock(side_effect=AssertionError("cache reuse must not acquire credentials"))
+    credentials = Mock(side_effect=AssertionError("write-back must not acquire credentials"))
     monkeypatch.setattr(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
     )
@@ -1687,16 +1885,6 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
                 "codex-native", fingerprints[profile]
             ).parent
             assert len(list(catalog_dir.glob("*.json"))) == 2
-            for provider, host in (
-                ("default", "https://a.example"),
-                ("other", "https://b.example"),
-            ):
-                assert (
-                    codex._resolve_databricks_codex_model(
-                        host, provider, "shared-picker", codex_path=sys.executable
-                    )
-                    == f"{provider}.schema.model"
-                )
             credentials.assert_not_called()
     if case == "missing-spec":
         launch_resolver.assert_not_called()
@@ -2325,9 +2513,11 @@ async def test_events_codex_native_plan_mode_requires_loaded_bridge(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stalled_close", [False, True])
 async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    stalled_close: bool,
 ) -> None:
     """
     POST ``/events`` interrupt on a codex-native session calls
@@ -2367,6 +2557,19 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         transport="ws://127.0.0.1:43210",
         client_name="omnigent-codex-native-runner",
     )
+    close_cancelled: list[bool] = []
+    if stalled_close:
+        from omnigent.runner.native import interrupt as native_interrupt
+
+        monkeypatch.setattr(native_interrupt, "_CODEX_INTERRUPT_CLOSE_TIMEOUT_S", 0.02)
+
+        async def stall_close() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                close_cancelled.append(True)
+
+        monkeypatch.setattr(fake_client, "close", stall_close)
 
     def _fake_client_for_transport(
         transport: str,
@@ -2415,10 +2618,11 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         )
         assert create_resp.status_code == 201, create_resp.text
 
-        int_resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json={"type": "interrupt"},
-        )
+        async with asyncio.timeout(budget(5)):
+            int_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "interrupt"},
+            )
 
         captured_history = list(_session_histories_ref.get(conv_id, []))
         flagged = conv_id in app.state.interrupted_sessions
@@ -2430,7 +2634,8 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
     # 1) The runner reached Codex app-server's structured interrupt path. If
     # this is empty, the handler regressed to a terminal-only or no-op cancel.
     assert fake_client.connected
-    assert fake_client.closed
+    assert fake_client.closed is not stalled_close
+    assert close_cancelled == ([True] if stalled_close else [])
     assert fake_client.requests == [
         (
             "turn/interrupt",
@@ -3251,11 +3456,15 @@ async def test_events_codex_native_stop_after_completed_turn_is_noop_not_503(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["response_error", "connect", "request", "close"])
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
 async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    failure_stage: str,
+    event_type: str,
 ) -> None:
-    """A genuine Codex interrupt failure still surfaces as a 503.
+    """Failed and unanswered Codex controls return 503 without clearing the turn.
 
     The reconcile is narrow: only Codex's recognized stale-turn rejection is
     swallowed. Any other error (e.g. ``-32603`` thread-store) means the stop did
@@ -3263,6 +3472,10 @@ async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
     intact instead of falsely reporting idle.
     """
     from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.runner.native import interrupt as native_interrupt
+
+    monkeypatch.setattr(native_interrupt, "_CODEX_INTERRUPT_TIMEOUT_S", 0.1, raising=False)
+    monkeypatch.setattr(native_interrupt, "_CODEX_INTERRUPT_CLOSE_TIMEOUT_S", 0.02, raising=False)
 
     conv_id = "c0dec0dec0dec0dec0dec0dec0de9411"
     fake_client = _StaleTurnCodexAppServerClient(
@@ -3272,6 +3485,16 @@ async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
             {"code": -32603, "message": "thread-store internal error"}
         ),
     )
+    cancelled: list[str] = []
+
+    async def stall(*_args: object, **_kwargs: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(failure_stage)
+
+    if failure_stage != "response_error":
+        monkeypatch.setattr(fake_client, failure_stage, stall)
     app, _server_client, bridge_dir = _build_codex_native_runner_for_stale_turn(
         monkeypatch,
         tmp_path,
@@ -3289,16 +3512,19 @@ async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
         )
         assert create_resp.status_code == 201, create_resp.text
 
-        stop_resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json={"type": "interrupt"},
-        )
+        async with asyncio.timeout(budget(5)):
+            stop_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": event_type},
+            )
 
     assert stop_resp.status_code == 503, (
         f"a genuine interrupt failure must stay a 503; "
         f"got {stop_resp.status_code}: {stop_resp.text}"
     )
     assert stop_resp.json().get("error") == "codex_native_interrupt_failed"
+    assert cancelled == ([] if failure_stage == "response_error" else [failure_stage])
+    assert fake_client.closed is (failure_stage != "close")
     # The turn is still recorded: a genuine failure must not drop it.
     state = codex_native_bridge.read_bridge_state(bridge_dir)
     assert state is not None and state.active_turn_id == "turn_codex_live", (

@@ -16,13 +16,28 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
-@custom-variant mobile-app (&:where([data-mobile-app="true"], [data-mobile-app="true"] *));
+/* Native shells and browsers whose primary input is touch share this layout. */
+@custom-variant mobile-app {
+  &:where([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    @slot;
+  }
+  @media (pointer: coarse) and (hover: none) {
+    @slot;
+  }
+}
 
-/* CSS-pixel floor, independent of viewport width and pointer capability. */
+/* CSS-pixel floor for native shells and touch browsers, independent of width. */
 @utility mobile-touch-target {
   &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
     min-width: 44px;
     min-height: 44px;
+  }
+  /* Match the native branch's specificity so row resets like min-h-0 can't win. */
+  @media (pointer: coarse) and (hover: none) {
+    &:is(:root, :root *) {
+      min-width: 44px;
+      min-height: 44px;
+    }
   }
 }
 
@@ -128,18 +143,20 @@
   --shadow-dialog: 0 16px 48px rgb(var(--ui-shadow-neutral-rgb) / 0.2);
 }
 
-/* The two body text steps. Keep these non-inline: `@theme inline` bakes the
- * literal value into each utility, which would make the runtime typography
- * mapping below a no-op. Line heights are unitless so both tiers keep their
- * 1.6 rhythm at every size the Appearance setting allows. */
+/* Keep these non-inline: `@theme inline` bakes values into utilities and
+ * bypasses the runtime typography mapping. Unitless line heights scale with
+ * font size: 1.8 for body text and 1.4 for captions. */
 @theme {
   /* App-default interface/body text — every control, label, and menu item. */
+  --font-weight-normal: 450;
   --text-ui: 1rem;
-  --text-ui--line-height: 1.6;
-  /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
-   * body step, mapped below so it tracks the Appearance setting. */
-  --text-sm: 0.9rem;
-  --text-sm--line-height: 1.6;
+  --text-ui--line-height: 1.8;
+  --text-message: var(--text-ui);
+  --text-message--line-height: 1.8;
+  /* Captions, descriptions, and sub/group titles stay 1px below body text
+   * as the Appearance font size changes. */
+  --text-sm: calc(var(--text-ui) - 1px);
+  --text-sm--line-height: 1.4;
   /* `text-xs` is retired in favour of `text-sm`. Aliased rather than left on
    * Tailwind's 0.75rem, which against the fixed 16px root is a hard 12px that
    * ignores the Appearance setting — the same trap the ramp test guards. Keeps
@@ -486,6 +503,11 @@
   min-height: 28px;
 }
 
+/* Density rules above are unlayered, so opted-in app targets need the same cascade priority. */
+:is(.composer-add-menu, .composer-host-menu, .composer-agent-menu) .mobile-touch-target {
+  @apply mobile-touch-target;
+}
+
 .composer-agent-menu [role="menuitem"] > svg:last-child {
   margin-left: 0;
 }
@@ -508,7 +530,7 @@
   width: calc(100% - 24px);
   margin-inline: 12px;
   margin-bottom: -0.5px;
-  padding: 6px 8px;
+  padding: var(--composer-context-padding-block, 6px) 8px;
   background-color: var(--composer-header-bg);
   border: 0.5px solid color-mix(in srgb, var(--foreground) 2%, transparent);
   border-bottom: none;
@@ -1058,9 +1080,10 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* Native shells render beneath the status bar at every width. Keep floating
- * chat controls and the pinned Plan tracker below its safe area. */
+ * chat controls and the pinned Plan tracker below its safe area. Wide headers
+ * have too little space around 44px controls to overlap the status-bar inset. */
 :is([data-ios-native], [data-android-native]) .chat-header {
-  top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  top: max(0px, calc(var(--omnigent-safe-top) - var(--omnigent-header-top-overlap, 0px)));
 }
 :is([data-ios-native], [data-android-native]) .chat-plan-accordion {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
@@ -1103,6 +1126,10 @@ html[data-electron-mac] .breadcrumb-folder {
 
 /* Remaining native-shell adjustments are specific to the mobile layout. */
 @media (width < 48rem) {
+  :is([data-ios-native], [data-android-native]) .chat-header {
+    --omnigent-header-top-overlap: 0.5rem;
+  }
+
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
      panel: the edge-swipe drag settles via an inline `transform`, while the
      button toggle (and the drag's resting open/closed state) is driven by
@@ -1313,6 +1340,9 @@ html[data-electron-mac] .breadcrumb-folder {
      * documentElement by the Appearance setting / lib/uiFontPreferences.ts)
      * with the system stack as the fallback when it's unset. */
     font-family: var(--ui-font-family, var(--font-sans));
+    font-weight: var(--font-weight-normal);
+    letter-spacing: 0em;
+    -webkit-font-smoothing: antialiased;
     /* Keep the desktop rem grid fixed so font preferences cannot resize icons,
      * controls, spacing, or radii. Typography is mapped separately below. */
     font-size: 16px;
@@ -1342,11 +1372,9 @@ html[data-electron-mac] .breadcrumb-folder {
      * they need the preference on that scale. Multiplying the raw 13px shrinks
      * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
     --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
-    /* Body and caption tiers come off the raw preference, not the anchor: the
-     * anchor is the 16px-equivalent grid the title ratios need, and running the
-     * caption factor through it put text-sm at 14.4px against a 13px body —
-     * a caption step larger than the text it captions. */
-    --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
+    /* Body and caption sizes use the raw preference; the anchor is only
+     * for title ratios. Captions stay 1px below body text. */
+    --text-sm: calc(var(--desktop-ui-font-size) - 1px);
     --text-ui: var(--desktop-ui-font-size);
     --text-base: var(--desktop-ui-font-size);
     /* Title steps keep the anchor so each stays on its Tailwind ratio. */
@@ -1363,13 +1391,13 @@ html[data-electron-mac] .breadcrumb-folder {
 /* Mobile typography and sidebar geometry. The root remains at the global 16px
  * so rem-based controls and spacing keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile defaults to 14px when no preference is saved. An inline value from
+  /* Mobile defaults to 15px when no preference is saved. An inline value from
    * the Appearance setting overrides this directly, without rescaling. */
   :root {
-    --desktop-ui-font-size: 14px;
+    --desktop-ui-font-size: 15px;
     --mobile-ui-font-size: var(--desktop-ui-font-size);
     --ui-ramp-anchor: var(--mobile-ui-font-size);
-    --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
+    --text-sm: calc(var(--mobile-ui-font-size) - 1px);
     --text-ui: var(--mobile-ui-font-size);
     --text-base: var(--mobile-ui-font-size);
     --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
@@ -1392,6 +1420,17 @@ html[data-electron-mac] .breadcrumb-folder {
     width: var(--sidebar-icon-size-mobile);
     height: var(--sidebar-icon-size-mobile);
     padding: 0;
+  }
+}
+
+.plain-text-fallback.text-message {
+  font-size: var(--text-sm);
+}
+
+/* Plain-text message fallbacks use the body tier on touch and narrow screens. */
+@media (width < 48rem), (pointer: coarse) {
+  .plain-text-fallback.text-message {
+    font-size: var(--text-message);
   }
 }
 
@@ -1477,6 +1516,10 @@ html[data-electron-mac] .breadcrumb-folder {
 [data-streamdown="table-cell"],
 [data-streamdown="table-header-cell"],
 [data-streamdown="heading-6"] {
+  font-size: 1em;
+}
+
+.text-message [data-streamdown="heading-5"] {
   font-size: 1em;
 }
 
@@ -1567,6 +1610,12 @@ html[data-electron-mac] .breadcrumb-folder {
 [data-streamdown="table-cell"],
 [data-streamdown="table-header-cell"] {
   overflow-wrap: break-word;
+}
+
+/* Mermaid sizes each label box before the diagram joins the chat prose; an
+ * inherited `wrap-anywhere` re-wraps long words inside it and clips the extra lines. */
+[data-streamdown="mermaid-block"] svg {
+  overflow-wrap: normal;
 }
 
 /* KaTeX lays out radicals/fractions with positioned spans. Wide display math
