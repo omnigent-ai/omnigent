@@ -1561,8 +1561,17 @@ describe("fetchRewindPrompts", () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         object: "list",
-        data: [message("msg_q1", "user", "Write the parser")],
-        last_id: "msg_q1",
+        data: [
+          message("msg_q1", "user", "Write the parser"),
+          // Attachment-only: still a prompt to rewind to, with no text.
+          {
+            id: "msg_file",
+            type: "message",
+            role: "user",
+            content: [{ type: "input_file", file_id: "file_notes", filename: "notes.txt" }],
+          },
+        ],
+        last_id: "msg_file",
         has_more: false,
       }),
     );
@@ -1572,6 +1581,7 @@ describe("fetchRewindPrompts", () => {
     expect(prompts.map((prompt) => [prompt.itemId, prompt.text])).toEqual([
       ["msg_q2", "Add parser tests"],
       ["msg_q1", "Write the parser"],
+      ["msg_file", ""],
     ]);
     expect(olderCursor).toBeNull();
     expect(fetchMock.mock.calls[0]![0]).toBe(
