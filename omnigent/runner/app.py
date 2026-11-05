@@ -5260,6 +5260,18 @@ def create_runner_app(
                 content = result.get("content")
                 return content if not result.get("error") and isinstance(content, str) else None
 
+            async def _read_edited_text(path: str) -> str | None:
+                try:
+                    return await _read_text(path)
+                except Exception:
+                    _logger.debug(
+                        "could not read %r after a native edit",
+                        path,
+                        exc_info=True,
+                        extra={"session_id": _captured_session_id},
+                    )
+                    return None
+
             try:
                 changes = native_file_changes(payload)
                 if not changes:
@@ -5291,24 +5303,11 @@ def create_runner_app(
                                 exc_info=True,
                                 extra={"session_id": _captured_session_id},
                             )
-                        current_text = None
-                        if change.operation != "deleted" and registry.can_detect_revert(
-                            change.path, session_id=_captured_session_id
-                        ):
-                            try:
-                                current_text = await _read_text(change.path)
-                            except Exception:
-                                _logger.debug(
-                                    "could not read %r after a native edit",
-                                    change.path,
-                                    exc_info=True,
-                                    extra={"session_id": _captured_session_id},
-                                )
-                        registry.record_change(
+                        await registry.record_tracked_change(
                             change.path,
                             change.operation,
                             _captured_session_id,
-                            current_text=current_text,
+                            functools.partial(_read_edited_text, change.path),
                         )
                 _maybe_signal_changed_files(
                     _captured_session_id,

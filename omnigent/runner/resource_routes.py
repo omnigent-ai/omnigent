@@ -1773,14 +1773,16 @@ def register_resource_routes(
         return existing.data.decode("utf-8")
 
     async def _seed_editor_original(
-        fs: CallerProcessFilesystem, relative_path: str, session_id: str
+        fs: CallerProcessFilesystem, relative_path: str, session_id: str, environment_id: str
     ) -> None:
         """Seed the original an editor save replaces, when it is complete text."""
         if filesystem_registry is None:
             return
+        if environment_id != DEFAULT_ENVIRONMENT_ID:
+            # Another environment may hold a different file at this relative path.
+            filesystem_registry.forget_original(relative_path, session_id=session_id)
         original = await _read_editor_text(fs, relative_path)
-        if original is not None:
-            filesystem_registry.seed_snapshot(relative_path, original, session_id=session_id)
+        filesystem_registry.seed_snapshot(relative_path, original, session_id=session_id)
 
     async def _record_editor_change(
         fs: CallerProcessFilesystem, relative_path: str, operation: str, session_id: str
@@ -1788,13 +1790,8 @@ def register_resource_routes(
         """Record an editor save, passing its text when it may restore the original."""
         if filesystem_registry is None:
             return
-        current_text = (
-            await _read_editor_text(fs, relative_path)
-            if filesystem_registry.can_detect_revert(relative_path, session_id=session_id)
-            else None
-        )
-        filesystem_registry.record_change(
-            relative_path, operation, session_id, current_text=current_text
+        await filesystem_registry.record_tracked_change(
+            relative_path, operation, session_id, lambda: _read_editor_text(fs, relative_path)
         )
 
     @app.put(
@@ -1821,7 +1818,7 @@ def register_resource_routes(
         encoding = body.get("encoding", "utf-8")
         create_parents = body.get("create_parents", True)
         content_bytes = content_str.encode(encoding)
-        await _seed_editor_original(fs, relative_path, session_id)
+        await _seed_editor_original(fs, relative_path, session_id, environment_id)
         result = await fs.write(
             relative_path,
             content_bytes,
@@ -1860,7 +1857,7 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
-        await _seed_editor_original(fs, relative_path, session_id)
+        await _seed_editor_original(fs, relative_path, session_id, environment_id)
         body = await request.json()
         edit_req = TextEditRequest(
             old_text=body.get("old_text"),

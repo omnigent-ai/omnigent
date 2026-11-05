@@ -501,6 +501,64 @@ async def test_editor_save_of_a_truncated_original_stays_in_changes(
     assert (await client.get(f"{base}/diff/hello.txt")).json()["before"] is None
 
 
+@pytest.mark.parametrize(
+    "other_content,saves",
+    [
+        pytest.param(
+            "hello world",
+            [(DEFAULT_ENVIRONMENT_ID, "changed"), ("terminal", "hello world")],
+            id="other-restores-the-same-text",
+        ),
+        pytest.param(
+            "elsewhere",
+            [("terminal", "changed"), (DEFAULT_ENVIRONMENT_ID, "elsewhere")],
+            id="other-saves-first",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_editor_save_in_another_environment_keeps_the_change(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    other_content: str,
+    saves: list[tuple[str, str]],
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    (other_root / "hello.txt").write_text(other_content)
+    other_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process", cwd=str(other_root), sandbox=OSEnvSandboxSpec(type="none")
+        )
+    )
+    assert other_env is not None
+    request.addfinalizer(other_env.close)
+    resolve = registry.resolve_environment
+    monkeypatch.setattr(
+        registry,
+        "resolve_environment",
+        lambda session_id, environment_id, agent_spec=None: (
+            other_env
+            if environment_id == "terminal"
+            else resolve(session_id, environment_id, agent_spec)
+        ),
+    )
+
+    base = "/v1/sessions/conv_test/resources/environments"
+    for environment_id, content in saves:
+        response = await client.put(
+            f"{base}/{environment_id}/filesystem/hello.txt", json={"content": content}
+        )
+        assert response.status_code == 200, response.text
+
+    changes = (await client.get(f"{base}/{DEFAULT_ENVIRONMENT_ID}/changes")).json()["data"]
+    assert [(entry["path"], entry["status"]) for entry in changes] == [("hello.txt", "modified")]
+
+
 @pytest.mark.asyncio
 async def test_delete_file(
     client: httpx.AsyncClient,

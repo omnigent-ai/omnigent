@@ -18,6 +18,7 @@ import threading
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -352,8 +353,10 @@ def test_first_observation_preserves_known_or_unknown_original(
     assert registry.needs_snapshot("file.txt")
     registry.record_change("file.txt", operation, "session")
     registry.seed_snapshot("file.txt", "intermediate", session_id="session")
-    assert not registry.can_detect_revert("file.txt", session_id="session")
-    registry.record_change("file.txt", "modified", "session", current_text="intermediate")
+    assert registry.revert_generation("file.txt", session_id="session") is None
+    registry.record_change(
+        "file.txt", "modified", "session", current_text="intermediate", revert_generation=1
+    )
     assert not registry.needs_snapshot("file.txt")
     assert registry.get_baseline("file.txt") == original
     assert [entry["status"] for entry in registry.list_changed_files("session", limit=10)] == [
@@ -392,37 +395,87 @@ def test_first_observation_preserves_known_or_unknown_original(
         ),
     ],
 )
-def test_tracked_change_restoring_the_session_original_leaves_changes(
+@pytest.mark.asyncio
+async def test_tracked_change_restoring_the_session_original_leaves_changes(
     tmp_path: Path,
     original: str | None,
     changes: list[tuple[str, str | None]],
     statuses: list[str],
 ) -> None:
     registry = AgentEditFilesystemRegistry(tmp_path)
-    if original is not None:
-        registry.seed_snapshot("file.txt", original, session_id="session")
+    registry.seed_snapshot("file.txt", original, session_id="session")
     for operation, current_text in changes:
-        registry.record_change("file.txt", operation, "session", current_text=current_text)
+        await registry.record_tracked_change(
+            "file.txt", operation, "session", AsyncMock(return_value=current_text)
+        )
     listed = registry.list_changed_files("session", limit=10)
     assert [entry["status"] for entry in listed] == statuses
 
 
-def test_each_session_reverts_to_the_original_it_saw(tmp_path: Path) -> None:
+@pytest.mark.parametrize("newer_operation", ["modified", "deleted"])
+@pytest.mark.asyncio
+async def test_revert_read_overtaken_by_a_newer_change_keeps_the_path(
+    tmp_path: Path, newer_operation: str
+) -> None:
     registry = AgentEditFilesystemRegistry(tmp_path)
+    registry.seed_snapshot("file.txt", "a\n", session_id="session")
+    await registry.record_tracked_change(
+        "file.txt", "modified", "session", AsyncMock(return_value="b\n")
+    )
+
+    async def read_then_let_another_writer_record() -> str:
+        registry.record_change("file.txt", newer_operation, "session")
+        return "a\n"
+
+    await registry.record_tracked_change(
+        "file.txt", "modified", "session", read_then_let_another_writer_record
+    )
+    listed = registry.list_changed_files("session", limit=10)
+    assert [entry["status"] for entry in listed] == ["modified"]
+
+    await registry.record_tracked_change(
+        "file.txt", "modified", "session", AsyncMock(return_value="a\n")
+    )
+    assert registry.list_changed_files("session", limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_unreadable_original_stays_unknown_after_a_concurrent_seed(tmp_path: Path) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+    registry.seed_snapshot("file.txt", None, session_id="session")
+    # A second writer reads the first writer's result before it is recorded.
+    registry.seed_snapshot("file.txt", "m\n", session_id="session")
+    read = AsyncMock(return_value="m\n")
+    for _ in range(2):
+        await registry.record_tracked_change("file.txt", "modified", "session", read)
+    read.assert_not_awaited()
+    listed = registry.list_changed_files("session", limit=10)
+    assert [entry["status"] for entry in listed] == ["modified"]
+
+
+@pytest.mark.asyncio
+async def test_each_session_reverts_to_the_original_it_saw(tmp_path: Path) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+
+    async def record(session_id: str, current_text: str) -> None:
+        await registry.record_tracked_change(
+            "file.txt", "modified", session_id, AsyncMock(return_value=current_text)
+        )
+
     registry.seed_snapshot("file.txt", "a\n", session_id="first")
-    registry.record_change("file.txt", "modified", "first", current_text="b\n")
+    await record("first", "b\n")
     registry.seed_snapshot("file.txt", "b\n", session_id="second")
-    registry.record_change("file.txt", "modified", "second", current_text="a\n")
+    await record("second", "a\n")
 
     assert len(registry.list_changed_files("second", limit=10)) == 1
-    registry.record_change("file.txt", "modified", "second", current_text="b\n")
+    await record("second", "b\n")
     assert registry.list_changed_files("second", limit=10) == []
     assert len(registry.list_changed_files("first", limit=10)) == 1
     assert registry.get_baseline("file.txt") == "a\n"
 
     registry.unregister_conversation("first")
-    assert not registry.can_detect_revert("file.txt", session_id="first")
-    assert registry.can_detect_revert("file.txt", session_id="second")
+    assert registry.revert_generation("file.txt", session_id="first") is None
+    assert registry.revert_generation("file.txt", session_id="second") is not None
 
 
 def test_get_baseline_returns_snapshot_for_non_git_workspace(tmp_path: Path) -> None:
@@ -1587,12 +1640,12 @@ def test_multi_repo_parent_preserves_head_changes_and_recovers_without_hooks(
     # Existing fallback events must neither override Git nor omit loose-file edits.
     registry.seed_snapshot("alpha/same.txt", "wrong original", session_id="session")
     # Git owns the listing for repository paths, so writers skip the revert read there.
-    assert not registry.can_detect_revert("alpha/same.txt", session_id="session")
+    assert registry.revert_generation("alpha/same.txt", session_id="session") is None
     registry.record_change("alpha/same.txt", "created", "session")
     registry.record_change("alpha/phantom.txt", "modified", "session")
     (tmp_path / "notes.txt").write_text("after")
     registry.seed_snapshot("notes.txt", "before", session_id="session")
-    assert registry.can_detect_revert("notes.txt", session_id="session")
+    assert registry.revert_generation("notes.txt", session_id="session") is not None
     registry.record_change("notes.txt", "modified", "session")
     assert {r["path"]: r["status"] for r in reader.list_changed_files("session", limit=100)} == {
         **expected,

@@ -7559,8 +7559,9 @@ async def _seed_os_env_snapshot(
     Reads the file via *os_env* and passes the content to
     :meth:`~omnigent.runtime.filesystem_registry.FilesystemRegistry.seed_snapshot`
     so the before/after diff endpoint can show the original content.
-    Skips files without complete text (see :func:`_read_os_env_text`), since
-    a partial or binary original cannot tell when a write restores it.
+    A file without complete text (see :func:`_read_os_env_text`) seeds no
+    snapshot and an unknown original, since a partial or binary original
+    cannot tell when a write restores it.
 
     :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
         the current tool dispatch — reused to avoid opening a second connection.
@@ -7569,31 +7570,7 @@ async def _seed_os_env_snapshot(
     :param conversation_id: Session scope for the snapshot, e.g. ``"conv_abc123"``.
     """
     original = await _read_os_env_text(os_env, path)
-    if original is not None:
-        filesystem_registry.seed_snapshot(path, original, session_id=conversation_id)
-
-
-async def _record_os_env_change(
-    os_env: OSEnvironment,
-    path: str,
-    operation: str,
-    filesystem_registry: FilesystemRegistry,
-    conversation_id: str,
-) -> None:
-    """Record a write or edit of *path*, passing its new text when it may restore the original.
-
-    :param os_env: The environment that made the change.
-    :param path: Path argument forwarded from the tool call, e.g. ``"src/foo.py"``.
-    :param operation: ``"created"`` or ``"modified"``.
-    :param filesystem_registry: Registry that stores the change.
-    :param conversation_id: Session that made the change, e.g. ``"conv_abc123"``.
-    """
-    current_text = (
-        await _read_os_env_text(os_env, path)
-        if filesystem_registry.can_detect_revert(path, session_id=conversation_id)
-        else None
-    )
-    filesystem_registry.record_change(path, operation, conversation_id, current_text=current_text)
+    filesystem_registry.seed_snapshot(path, original, session_id=conversation_id)
 
 
 async def _execute_os_env_tool(
@@ -7684,8 +7661,8 @@ async def _execute_os_env_tool(
                 # previously exist, {"created": False} for an overwrite.
                 was_created = isinstance(result, dict) and result.get("created") is True
                 status = "created" if was_created else "modified"
-                await _record_os_env_change(
-                    os_env, _path, status, filesystem_registry, conversation_id
+                await filesystem_registry.record_tracked_change(
+                    _path, status, conversation_id, lambda: _read_os_env_text(os_env, _path)
                 )
         elif tool_name == SysOsEditTool.name():
             _path = cast("str", args.get("path", ""))
@@ -7698,8 +7675,8 @@ async def _execute_os_env_tool(
                 edits=cast("list[dict[str, str]] | None", args.get("edits")),
             )
             if filesystem_registry is not None and conversation_id is not None:
-                await _record_os_env_change(
-                    os_env, _path, "modified", filesystem_registry, conversation_id
+                await filesystem_registry.record_tracked_change(
+                    _path, "modified", conversation_id, lambda: _read_os_env_text(os_env, _path)
                 )
         elif tool_name == SysOsShellTool.name():
             result = await os_env.shell(

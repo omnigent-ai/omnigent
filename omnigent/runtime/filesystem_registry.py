@@ -33,7 +33,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Awaitable, Callable, Collection, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -569,6 +569,7 @@ class FilesystemRegistry(ABC):
         session_id: str,
         *,
         current_text: str | None = None,
+        revert_generation: int | None = None,
     ) -> None:
         """Record a file change made by the agent via a tool call.
 
@@ -584,20 +585,58 @@ class FilesystemRegistry(ABC):
             e.g. ``"conv_abc123"``.
         :param current_text: The file's complete text after the change, read
             through the environment that made it, or ``None`` when not read.
-            See :meth:`can_detect_revert`.
+        :param revert_generation: What :meth:`revert_generation` returned
+            before *current_text* was read. A change of *path* recorded since
+            then makes *current_text* stale.
         """
         return
 
-    def can_detect_revert(self, path: str, *, session_id: str) -> bool:
-        """Whether a change of *path* that restores *session_id*'s original leaves Changes.
+    def revert_generation(self, path: str, *, session_id: str) -> int | None:
+        """Return *path*'s change count for a revert check, or ``None`` without one.
 
-        Callers read the file's text after a tracked write only when this is
-        ``True`` and pass it to :meth:`record_change` as *current_text*.
+        ``None`` means a change that restores *session_id*'s original would
+        still leave *path* in Changes, so callers need not read its text.
 
         :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
         :param session_id: The session making the change, e.g. ``"conv_abc123"``.
         """
-        return False
+        return None
+
+    async def record_tracked_change(
+        self,
+        path: str,
+        operation: str,
+        session_id: str,
+        read_text: Callable[[], Awaitable[str | None]],
+    ) -> None:
+        """Record a tracked write, dropping *path* when it restores the session's original.
+
+        :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param operation: One of ``"created"``, ``"modified"``, or ``"deleted"``.
+        :param session_id: The session that made the change, e.g. ``"conv_abc123"``.
+        :param read_text: Returns the file's complete text through the
+            environment that made the change, or ``None``. Called only when
+            :meth:`revert_generation` allows a revert check.
+        """
+        generation = (
+            None if operation == "deleted" else self.revert_generation(path, session_id=session_id)
+        )
+        current_text = None if generation is None else await read_text()
+        self.record_change(
+            path,
+            operation,
+            session_id,
+            current_text=current_text,
+            revert_generation=generation,
+        )
+
+    def forget_original(self, path: str, *, session_id: str) -> None:
+        """Make *session_id*'s original for *path* unknown, so no write drops *path*.
+
+        :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param session_id: The session whose original is dropped, e.g. ``"conv_abc123"``.
+        """
+        return
 
     # ── Concrete: snapshot (no-op default) ────────────────────────
 
@@ -605,7 +644,9 @@ class FilesystemRegistry(ABC):
         """Whether an observed edit still needs an original outside Git."""
         return False
 
-    def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
+    def seed_snapshot(
+        self, path: str, content: str | None, *, session_id: str | None = None
+    ) -> None:
         """Seed a pre-write snapshot for *path*.
 
         Part of the base interface so callers can call it unconditionally on any
@@ -615,7 +656,8 @@ class FilesystemRegistry(ABC):
         in memory for use by the diff endpoint.
 
         :param path: Path relative to the workspace root.
-        :param content: File content before the write/edit.
+        :param content: File content before the write/edit, or ``None`` when
+            the writer could not read its complete text.
         :param session_id: Optional session scope for the snapshot.
         """
         return
@@ -739,6 +781,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # Per-session originals: session_id → {normalized path → complete text
         # before the session's first change there, or ``None`` when unknown}.
         self._session_originals: dict[str, dict[str, str | None]] = {}
+        # Per-session change counts: session_id → {normalized path → changes
+        # recorded there}, which tells a revert check that its read is stale.
+        self._change_generations: dict[str, dict[str, int]] = {}
 
     def record_change(
         self,
@@ -747,13 +792,15 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         session_id: str,
         *,
         current_text: str | None = None,
+        revert_generation: int | None = None,
     ) -> None:
         """Record a file change made by the agent via a tool call.
 
         Appends a :class:`_FileEvent` to the session's event list.  The file
         is stat-ed at record time to capture size and mtime; stat errors are
         silently suppressed (e.g. for deleted files).  When *current_text*
-        equals the session's original, the path's events are dropped instead.
+        equals the session's original and no change of the path was recorded
+        since *revert_generation*, the path's events are dropped instead.
 
         Ephemeral process artifacts (see :data:`_EPHEMERAL_PATTERNS`) are
         silently ignored.
@@ -766,6 +813,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             e.g. ``"conv_abc123"``.
         :param current_text: The file's complete text after the change, or
             ``None`` when not read.
+        :param revert_generation: What :meth:`revert_generation` returned
+            before *current_text* was read.
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -797,15 +846,32 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         )
         original = self._revertible_original(session_id, norm, operation)
         with self._lock:
+            generations = self._change_generations.setdefault(session_id, {})
+            generation = generations.get(norm, 0)
+            generations[norm] = generation + 1
             events = self._session_events.setdefault(session_id, [])
-            if original is not None and current_text == original:
+            if (
+                original is not None
+                and current_text == original
+                and revert_generation == generation
+            ):
                 events[:] = [event for event in events if event.path != norm]
                 return
             events.append(fe)
 
-    def can_detect_revert(self, path: str, *, session_id: str) -> bool:
+    def revert_generation(self, path: str, *, session_id: str) -> int | None:
         norm = _normalize_path(path, self._cwd)
-        return norm is not None and self._revertible_original(session_id, norm) is not None
+        if norm is None or self._revertible_original(session_id, norm) is None:
+            return None
+        with self._lock:
+            return self._change_generations.get(session_id, {}).get(norm, 0)
+
+    def forget_original(self, path: str, *, session_id: str) -> None:
+        norm = _normalize_path(path, self._cwd)
+        if norm is None:
+            return
+        with self._snapshots_lock:
+            self._session_originals.setdefault(session_id, {})[norm] = None
 
     def _revertible_original(
         self, session_id: str, norm: str, operation: str | None = None
@@ -834,6 +900,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         """
         with self._lock:
             self._session_events.pop(conversation_id, None)
+            self._change_generations.pop(conversation_id, None)
         with self._snapshots_lock:
             self._session_originals.pop(conversation_id, None)
             paths = self._snapshot_sessions.pop(conversation_id, set())
@@ -960,7 +1027,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._snapshots_lock:
             return norm not in self._snapshots
 
-    def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
+    def seed_snapshot(
+        self, path: str, content: str | None, *, session_id: str | None = None
+    ) -> None:
         """Seed a pre-write snapshot for *path* if one does not already exist.
 
         Must be called **before** writing new content to the file so the
@@ -969,7 +1038,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 
         :param path: Normalized path relative to the workspace root,
             e.g. ``"src/foo.py"``.
-        :param content: Current file content before the upcoming write.
+        :param content: Current file content before the upcoming write, or
+            ``None`` when it could not be read whole, which seeds no snapshot.
         :param session_id: Optional session identifier.  When provided,
             the path is registered under this session so that
             :meth:`unregister_conversation` can evict it later, and
@@ -979,7 +1049,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         if norm is None:
             return
         with self._snapshots_lock:
-            if norm not in self._snapshots:
+            if norm not in self._snapshots and content is not None:
                 self._snapshots[norm] = content
             if session_id:
                 self._snapshot_sessions.setdefault(session_id, set()).add(norm)
@@ -1538,8 +1608,10 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
     def needs_snapshot(self, path: str) -> bool:
         return self._owner(path) is None and super().needs_snapshot(path)
 
-    def can_detect_revert(self, path: str, *, session_id: str) -> bool:
-        return self._owner(path) is None and super().can_detect_revert(path, session_id=session_id)
+    def revert_generation(self, path: str, *, session_id: str) -> int | None:
+        if self._owner(path) is not None:
+            return None
+        return super().revert_generation(path, session_id=session_id)
 
     def with_git_runner(self, run_git: GitCommandRunner) -> MultiRepositoryFilesystemRegistry:
         """Bind one request's executor while sharing the existing fallback history."""
