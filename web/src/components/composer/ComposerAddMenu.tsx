@@ -142,7 +142,7 @@ export function ComposerAddMenu({
         sideOffset={geometry.sideOffset}
         collisionPadding={12}
         aria-label="Add"
-        className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px]"
+        className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px] max-md:p-1.5"
         style={{ width: geometry.width }}
         data-testid={`${testIdPrefix}-add-menu`}
       >

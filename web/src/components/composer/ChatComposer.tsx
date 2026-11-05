@@ -146,7 +146,12 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       {...props}
       onFocusCapture={(event) => {
         // Header controls bubble through React portals outside this card.
-        if (event.currentTarget.contains(event.target)) setFocusWithin(true);
+        if (
+          event.currentTarget.contains(event.target) &&
+          !event.target.closest('[data-composer-action="add"]')
+        ) {
+          setFocusWithin(true);
+        }
         onFocusCapture?.(event);
       }}
       onBlurCapture={(event) => {

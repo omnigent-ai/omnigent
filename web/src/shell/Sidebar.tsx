@@ -1057,7 +1057,7 @@ function SidebarImpl({
           tabIndex={effectiveOpen ? 0 : -1}
           aria-hidden={!effectiveOpen}
           className={cn(
-            "fixed inset-0 z-[45] bg-black/25 transition-[opacity,visibility] duration-200 ease-out md:hidden",
+            "fixed inset-0 z-[45] bg-transparent transition-[opacity,visibility] duration-200 ease-out md:hidden dark:bg-black/25",
             // invisible: the macOS shell makes any rendered button a no-drag title-bar region.
             effectiveOpen ? "opacity-100" : "pointer-events-none invisible opacity-0",
           )}
@@ -1150,7 +1150,11 @@ function SidebarImpl({
         data-floating={peek ? "true" : "false"}
       >
         {mobileLayout && effectiveOpen && (
-          <OmniGlassSurface variant="menu" borderRadius={0} className="-z-10" />
+          <OmniGlassSurface
+            variant="menu"
+            borderRadius={0}
+            className="sidebar-glass-surface -z-10"
+          />
         )}
         {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
@@ -1173,10 +1177,8 @@ function SidebarImpl({
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
           Inert in a browser and on other platforms, which keep the row below. */}
-            {/* h-14 below md matches the mobile chat header height so the
-            Search bubble shares a centerline with the overflow bubble in the
-            chat strip beside the open drawer. */}
-            <div className="sidebar-header-row flex h-14 shrink-0 items-center justify-between pr-3 pl-4 md:h-12">
+            {/* Mobile Search shares the floating chat controls' 16px edge inset. */}
+            <div className="sidebar-header-row flex shrink-0 items-center justify-between p-4 md:h-12 md:py-0 md:pr-3">
               {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -1441,7 +1443,7 @@ function SidebarImpl({
           drawer keeps once the collapse toggle is gone. */}
               <SidebarSettingsButton
                 testId="sidebar-settings-float"
-                className="absolute right-3 bottom-3 md:hidden"
+                className="absolute right-4 bottom-4 md:hidden"
               />
             </div>
 

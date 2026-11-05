@@ -508,6 +508,18 @@
   @apply mobile-touch-target;
 }
 
+@media (width < 48rem) {
+  .composer-add-menu [role="menuitem"].mobile-touch-target {
+    @apply h-7 rounded-md px-2 py-[3px] text-ui leading-4;
+    min-height: 28px;
+  }
+
+  .composer-add-menu [role="menuitem"] svg {
+    width: 16px;
+    height: 16px;
+  }
+}
+
 .composer-agent-menu [role="menuitem"] > svg:last-child {
   margin-left: 0;
 }
@@ -528,6 +540,17 @@
   [data-mobile-composer] {
     --composer-compact-start: 8px;
     --composer-compact-end: 8px;
+    --composer-morph-duration: 280ms;
+    --composer-morph-easing: cubic-bezier(0.22, 1, 0.36, 1);
+    transition:
+      border-radius var(--composer-morph-duration) var(--composer-morph-easing),
+      box-shadow 150ms ease;
+
+    > [aria-hidden="true"] > .glass-surface {
+      transition:
+        border-radius var(--composer-morph-duration) var(--composer-morph-easing),
+        opacity 260ms ease-out;
+    }
 
     > .px-3 {
       padding-inline: 8px;
@@ -563,10 +586,10 @@
     > [data-composer-input-area] {
       min-height: 0;
       padding: 16px 16px 8px;
+      margin-bottom: 0;
       transition:
-        margin-bottom 180ms ease,
-        padding 180ms ease,
-        min-height 180ms ease;
+        margin-bottom var(--composer-morph-duration) var(--composer-morph-easing),
+        padding var(--composer-morph-duration) var(--composer-morph-easing);
     }
 
     > [data-composer-input-area] > textarea {
@@ -583,6 +606,19 @@
     [data-composer-action-group="left"] {
       flex: 1 1 0;
       flex-wrap: wrap;
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      [data-composer-action-group="left"]
+        > :not([data-composer-action="add"], :has([data-composer-action="add"])),
+      [data-composer-action-group="right"]
+        > :not(
+          [data-composer-action="microphone"],
+          [data-composer-action="send"],
+          :has([data-composer-action="microphone"], [data-composer-action="send"])
+        ) {
+        animation: mobile-composer-controls-enter 220ms var(--composer-morph-easing) 60ms backwards;
+      }
     }
 
     [data-composer-action]:is(
@@ -612,22 +648,20 @@
       color: transparent;
     }
 
-    /* Keep menu anchors in place while their portaled menu owns focus. */
-    &[data-mobile-composer="collapsed"]:not(:has([data-state="open"])) {
-      border-radius: 9999px;
+    /* Add opens independently of the compact input layout. */
+    &[data-mobile-composer="collapsed"]:not(
+        :has([data-state="open"]:not([data-composer-action="add"]))
+      ) {
+      border-radius: 30px;
 
       > [aria-hidden="true"] > .glass-surface {
-        border-radius: 9999px !important;
+        border-radius: 30px !important;
       }
 
       > [data-composer-input-area] {
         z-index: 1;
-        display: flex;
-        min-height: 60px;
-        height: 60px;
         margin-bottom: -60px;
-        align-items: center;
-        padding-block: 0;
+        padding-block: calc((60px - 1lh) / 2);
         padding-inline: var(--composer-compact-start) var(--composer-compact-end);
         pointer-events: none;
       }
@@ -669,7 +703,21 @@
   }
 }
 
+@keyframes mobile-composer-controls-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
+  [data-mobile-composer],
+  [data-mobile-composer] > [aria-hidden="true"] > .glass-surface,
   [data-mobile-composer] > [data-composer-input-area] {
     transition: none;
   }
@@ -992,6 +1040,11 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 
 /* Mobile drawers use the shared glass layer behind their content. */
 @media (width < 48rem) {
+  :root:not(.dark) .sidebar-glass-surface {
+    --omni-glass-blur: 16px;
+    --omni-glass-brightness: 1;
+  }
+
   .conversations-sidebar {
     margin-top: -1px;
     margin-bottom: -1px;
@@ -1018,6 +1071,18 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 }
 
 @media (width < 48rem) {
+  .session-chat-transcript > [role="log"] {
+    --chat-edge-fade: linear-gradient(
+      to bottom,
+      transparent 0,
+      black max(64px, var(--omnigent-safe-top)),
+      black calc(100% - max(64px, var(--omnigent-safe-bottom))),
+      transparent 100%
+    );
+    -webkit-mask-image: var(--chat-edge-fade);
+    mask-image: var(--chat-edge-fade);
+  }
+
   [data-chat-surface] .session-chat-transcript {
     margin-bottom: calc(-1 * var(--session-composer-height, 0px));
   }

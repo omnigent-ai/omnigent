@@ -29,7 +29,7 @@ export function OmniGlassSurface({
   className,
 }: OmniGlassSurfaceProps) {
   const surface = GLASS_VARIANTS[variant];
-  const backdropFilter = `blur(${surface.blur}px) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(1.04)`;
+  const backdropFilter = `blur(var(--omni-glass-blur, ${surface.blur}px)) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(var(--omni-glass-brightness, 1.04))`;
   return (
     <span
       aria-hidden="true"
@@ -48,7 +48,7 @@ export function OmniGlassSurface({
         distortionScale={-270}
         refraction={false}
         opacity={0.45}
-        className="[&>.glass-surface\_\_sheen]:opacity-0 dark:[&>.glass-surface\_\_rim]:opacity-25 dark:[&>.glass-surface\_\_rim]:p-px!"
+        className="border border-black/[0.08] dark:border-0 [&>.glass-surface\_\_sheen]:opacity-0 dark:[&>.glass-surface\_\_rim]:opacity-25 dark:[&>.glass-surface\_\_rim]:p-px!"
         style={{
           background: surface.background,
           WebkitBackdropFilter: backdropFilter,

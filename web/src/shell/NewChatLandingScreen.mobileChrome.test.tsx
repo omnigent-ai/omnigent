@@ -185,6 +185,17 @@ describe("NewChatLandingScreen keyboard behaviour", () => {
     expect(header).not.toContainElement(workspace);
     expect(screen.getByTestId("new-chat-landing-composer-surface")).not.toContainElement(workspace);
 
+    const add = screen.getByRole("button", { name: "Add" });
+    fireEvent.focus(add);
+    expect(composer).toHaveAttribute("data-mobile-composer", "collapsed");
+    fireEvent.pointerDown(add, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    const addMenu = await screen.findByTestId("new-chat-landing-add-menu");
+    expect(addMenu).toBeVisible();
+    expect(composer).toHaveAttribute("data-mobile-composer", "collapsed");
+    fireEvent.keyDown(addMenu, { key: "Escape" });
+    await waitFor(() => expect(add).toHaveAttribute("aria-expanded", "false"));
+    expect(composer).toHaveAttribute("data-mobile-composer", "collapsed");
+
     const input = screen.getByTestId("new-chat-landing-input");
     fireEvent.focus(input);
     expect(composer).toHaveAttribute("data-mobile-composer", "expanded");
