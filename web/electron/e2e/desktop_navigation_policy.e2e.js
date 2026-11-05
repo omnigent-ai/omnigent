@@ -14,6 +14,7 @@ const {
   spawnServer,
 } = require("./desktopHarness");
 const { startDesignBackend, eventually } = require("./desktopDesignPromptHarness");
+const { escapeHtml } = require("../src/loopback-oauth");
 
 const deps = desktopDepsAvailable();
 
@@ -798,8 +799,8 @@ it(
       response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
       response.end(
         `<title>spog dev</title><body style="font:20px system-ui;padding:24px">` +
-          `<h1>spog dev server</h1><p>Host header: <b>${request.headers.host}</b></p>` +
-          `<p>Path: <b>${request.url}</b></p></body>`,
+          `<h1>spog dev server</h1><p>Host header: <b>${escapeHtml(request.headers.host)}</b></p>` +
+          `<p>Path: <b>${escapeHtml(request.url)}</b></p></body>`,
       );
     });
     await new Promise((resolve) => {
