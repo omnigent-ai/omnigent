@@ -6,6 +6,7 @@ import {
   layoutTasks,
   nextIdentifier,
   removeTask,
+  restoreDesign,
   starterWorkflow,
   TASK_WIDTH,
 } from "./workflowDesign";
@@ -107,4 +108,19 @@ it("preserves per-task agent placement in the API definition", () => {
 
 it("allocates stable identifiers without colliding with existing tasks", () => {
   expect(nextIdentifier("task", ["task_1", "task_3"])).toBe("task_2");
+});
+
+it("restores a saved DAG with independent task execution settings", () => {
+  const definition = executionDefinition(starterWorkflow());
+  definition.max_parallel_members = 8;
+  definition.member_timeout_seconds = 90;
+  definition.nodes[1].team = definition.nodes[0].team;
+  const restored = restoreDesign(definition);
+  expect(executionDefinition(restored).max_parallel_members).toBe(8);
+  expect(executionDefinition(restored).member_timeout_seconds).toBe(90);
+  expect(restored.nodes[1].depends_on).toEqual(["investigate"]);
+  restored.nodes[0].execution.members[0].placement.provider = "changed";
+  expect(restored.nodes[1].execution.members[0].placement.provider).not.toBe("changed");
+  expect(definition.teams[0].members[0].placement.provider).not.toBe("changed");
+  expect(() => restoreDesign({ ...definition, teams: [] })).toThrow(/Missing execution/);
 });

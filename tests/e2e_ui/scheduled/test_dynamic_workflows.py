@@ -241,6 +241,32 @@ def test_dynamic_workflow_review_and_repair(
     assert yaml.safe_load(path.read_text()) == definition
     dialog.get_by_role("button", name="Close", exact=True).click()
 
+    page.get_by_role("button", name="Save workflow", exact=True).click()
+    root_link = page.get_by_role("link", name="Open root session", exact=True)
+    expect(root_link).to_be_visible()
+    designer_url = page.url
+    root_path = root_link.get_attribute("href")
+    workflow_id = designer_url.split("workflow=")[1]
+    with httpx.Client(base_url=live_server, timeout=10) as client:
+        saved = client.get(f"/v1/workflows/designs/{workflow_id}").json()
+        root_id = saved["root_session_id"]
+        assert root_path == f"/c/{root_id}"
+        root = client.get(f"/v1/sessions/{root_id}").json()
+        assert root["runner_id"] is None and root["host_id"] is None
+        assert root["labels"]["omnigent.workflow.id"] == workflow_id
+        assert not any(
+            run.get("workflow_id") == workflow_id
+            for run in client.get("/v1/workflows").json()["data"]
+        )
+    page.reload()
+    expect(graph.get_by_role("button", name="Acceptance check", exact=True)).to_be_visible()
+    expect(root_link).to_have_attribute("href", root_path)
+    page.goto(live_server + root_path)
+    expect(page.get_by_role("link", name="Open workflow designer")).to_be_visible(timeout=15000)
+    page.screenshot(path=str(Path(output_path) / "root-session.png"), full_page=True)
+    page.get_by_role("link", name="Open workflow designer").click()
+    expect(graph.get_by_role("button", name="Acceptance check", exact=True)).to_be_visible()
+
     with page.expect_response(
         lambda response: (
             response.url.endswith("/v1/workflows") and response.request.method == "POST"
@@ -251,6 +277,8 @@ def test_dynamic_workflow_review_and_repair(
     assert Workflow.model_validate(created.value.json()["workflow"]) == Workflow.model_validate(
         definition
     )
+    assert created.value.json()["root_session_id"] == root_id
+    assert created.value.json()["workflow_id"] == workflow_id
     run_id = created.value.json()["run_id"]
     expect(page.get_by_role("heading", name="Test workflow")).to_be_visible()
     expect(graph.get_by_text("Select an arrow to remove it.", exact=True)).to_have_count(0)
@@ -279,6 +307,7 @@ def test_dynamic_workflow_review_and_repair(
             graph.get_by_role("button", name="summarize_check succeeded", exact=True)
         ).to_be_visible(timeout=15000)
         final = client.get(f"/v1/workflows/{run_id}").json()
+        assert final["root_session_id"] == root_id
         assert final["status"] == "succeeded"
         assert final["nodes"]["propose"]["members"]["owner"]["session_id"] == session
         assert final["nodes"]["propose"]["artifacts"][0]["revision"] == "sim-3"

@@ -49,6 +49,8 @@ class MemberRequest:
     turn_id: str
     round: int
     checkpoint: Callable[[], None]
+    workflow_id: str | None = None
+    root_session_id: str | None = None
 
 
 MemberExecutor = Callable[[MemberRequest], Awaitable[str]]
@@ -70,9 +72,13 @@ class WorkflowRunner:
         store: RunStore | None = None,
         validate: GateExecutor = execute_command_gate,
         binding: ExecutionBinding | None = None,
+        workflow_id: str | None = None,
+        root_session_id: str | None = None,
     ) -> None:
         self.workflow = Workflow.model_validate(workflow.model_dump())
         self.run_id = uuid4().hex
+        self.workflow_id = workflow_id
+        self.root_session_id = root_session_id
         self.status: Status = "pending"
         self.nodes = {node.id: NodeRun() for node in workflow.nodes}
         self.events: dict[str, EventRecord] = {}
@@ -95,7 +101,13 @@ class WorkflowRunner:
         if set(saved.nodes) != {node.id for node in saved.workflow.nodes}:
             raise ValueError("Checkpoint nodes do not match its workflow")
         runner = cls(
-            saved.workflow, execute, store=store, validate=validate, binding=saved.binding
+            saved.workflow,
+            execute,
+            store=store,
+            validate=validate,
+            binding=saved.binding,
+            workflow_id=saved.workflow_id,
+            root_session_id=saved.root_session_id,
         )
         runner.run_id, runner.nodes = saved.run_id, saved.nodes
         runner.events = {record.event.id: record for record in saved.events}
@@ -124,6 +136,8 @@ class WorkflowRunner:
     def snapshot(self) -> dict[str, Any]:
         return Checkpoint(
             run_id=self.run_id,
+            workflow_id=self.workflow_id,
+            root_session_id=self.root_session_id,
             status=self.status,
             workflow=self.workflow,
             nodes=self.nodes,
@@ -559,6 +573,8 @@ class WorkflowRunner:
                     output = await self._execute(
                         MemberRequest(
                             run_id=self.run_id,
+                            workflow_id=self.workflow_id,
+                            root_session_id=self.root_session_id,
                             node=node,
                             member=member,
                             phase=phase,

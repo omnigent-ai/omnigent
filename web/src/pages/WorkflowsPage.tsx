@@ -1,6 +1,14 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CopyIcon, DownloadIcon, FileCodeIcon, PlayIcon, WorkflowIcon } from "lucide-react";
+import {
+  CopyIcon,
+  DownloadIcon,
+  FileCodeIcon,
+  PlayIcon,
+  WorkflowIcon,
+  SaveIcon,
+} from "lucide-react";
+import { Link, useSearchParams } from "@/lib/routing";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,12 +27,14 @@ import {
   type WorkflowBackend,
   type WorkflowOptions,
   type WorkflowRun,
+  type SavedWorkflow,
 } from "@/lib/workflowsApi";
 import {
   canConnect,
   executionDefinition,
   removeTask,
   starterWorkflow,
+  restoreDesign,
   type WorkflowDesign,
 } from "./workflows/workflowDesign";
 import { WorkflowGraph } from "./workflows/WorkflowGraph";
@@ -35,7 +45,37 @@ import { WorkflowTest } from "./workflows/WorkflowTest";
 
 export function WorkflowsPage() {
   const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const designId = searchParams.get("workflow");
+  const [newId, setNewId] = useState(() => crypto.randomUUID().replaceAll("-", ""));
+  const loadedId = useRef<string | null>(null);
+  const savedDesign = useQuery({
+    queryKey: ["workflows", "design", designId],
+    queryFn: () => workflowRequest<SavedWorkflow>("/designs/" + designId),
+    enabled: designId !== null,
+  });
+  const [savedDraft, setSavedDraft] = useState<string | null>(null);
+  const [saved, setSaved] = useState<SavedWorkflow | null>(null);
   const [workflow, setWorkflow] = useState(starterWorkflow);
+  useEffect(() => {
+    if (savedDesign.data && loadedId.current !== designId) {
+      loadedId.current = designId;
+      const restored = restoreDesign(savedDesign.data.workflow);
+      setWorkflow(restored);
+      setSavedDraft(JSON.stringify(restored));
+      setSaved(savedDesign.data);
+      setRunId(null);
+      setTesting(false);
+    } else if (!designId && loadedId.current) {
+      loadedId.current = null;
+      setWorkflow(starterWorkflow());
+      setNewId(crypto.randomUUID().replaceAll("-", ""));
+      setSavedDraft(null);
+      setSaved(null);
+      setRunId(null);
+      setTesting(false);
+    }
+  }, [designId, savedDesign.data]);
   const [selectedId, setSelectedId] = useState<string | null>("investigate");
   const [testLive, setTestLive] = useState(false);
   const [runId, setRunId] = useState<string | null>(null);
@@ -62,7 +102,7 @@ export function WorkflowsPage() {
       design,
       testBackend,
     }: {
-      action: "export" | "test";
+      action: "export" | "test" | "save";
       design: WorkflowDesign;
       testBackend: WorkflowBackend;
     }) => {
@@ -70,8 +110,22 @@ export function WorkflowsPage() {
         workflow: executionDefinition(design),
       });
       if (action === "export") return { definition: result.definition };
+      const savedWorkflow = await workflowRequest<SavedWorkflow>(
+        "/designs/" + (designId ?? newId),
+        { workflow: executionDefinition(design) },
+      );
+      // Preserve the anchor even if launching the test subsequently fails.
+      loadedId.current = savedWorkflow.workflow_id;
+      setSaved(savedWorkflow);
+      setSavedDraft(JSON.stringify(design));
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      queryClient.setQueryData(["workflows", "design", savedWorkflow.workflow_id], savedWorkflow);
+      setSearchParams({ workflow: savedWorkflow.workflow_id }, { replace: true });
+      if (action === "save") return {};
+
       const run = await workflowRequest<WorkflowRun>("", {
         backend: testBackend,
+        workflow_id: savedWorkflow.workflow_id,
         definition: result.definition,
       });
       return { run };
@@ -81,13 +135,13 @@ export function WorkflowsPage() {
         queryClient.setQueryData(["workflows", "run", result.run.run_id], result.run);
         setRunId(result.run.run_id);
         setTesting(true);
-      } else {
+      } else if (result.definition) {
         setExported(result.definition ?? null);
         setCopyMessage(null);
       }
     },
   });
-  const submit = (action: "export" | "test") =>
+  const submit = (action: "export" | "test" | "save") =>
     compiling.mutate({ action, design: workflow, testBackend: backend });
   const connect = (source: string, target: string) => {
     if (!canConnect(workflow.nodes, source, target)) return;
@@ -98,6 +152,15 @@ export function WorkflowsPage() {
       ),
     });
   };
+  if (designId && loadedId.current !== designId) {
+    return (
+      <PageScroll>
+        <p role={savedDesign.error ? "alert" : "status"} className="p-6">
+          {savedDesign.error?.message ?? "Loading workflow…"}
+        </p>
+      </PageScroll>
+    );
+  }
   return (
     <PageScroll maxWidthClassName="max-w-[1440px]" extraTop="1rem">
       <div className="space-y-5 p-4 sm:p-6">
@@ -116,6 +179,13 @@ export function WorkflowsPage() {
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="outline"
+                  disabled={compiling.isPending}
+                  onClick={() => submit("save")}
+                >
+                  <SaveIcon className="size-4" /> Save workflow
+                </Button>
                 {runId && (
                   <Button variant="ghost" onClick={() => setTesting(true)}>
                     View test
@@ -148,6 +218,25 @@ export function WorkflowsPage() {
                 </Button>
               </div>
             </header>
+            <section aria-label="Workflow root session" className="rounded-lg border p-3 text-sm">
+              {saved ? (
+                <>
+                  <Link to={"/c/" + saved.root_session_id} target="_blank" className="underline">
+                    Open root session
+                  </Link>
+                  <span className="ml-2 text-muted-foreground">
+                    Shared across this workflow’s tests.
+                  </span>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {savedDraft === JSON.stringify(workflow)
+                      ? "Workflow saved. Reopen this URL to continue designing."
+                      : "Unsaved changes. Save workflow to update the design."}
+                  </p>
+                </>
+              ) : (
+                "Save or test this workflow to create its root session. No agent starts when you save."
+              )}
+            </section>
             <p className="text-xs text-muted-foreground">
               {testLive
                 ? "Tests use the runtime and agents configured in each task."
@@ -224,8 +313,8 @@ export function WorkflowsPage() {
                 />
                 <p className="text-xs text-muted-foreground">
                   Drag between connection points, or select a task and choose “Wait for”. To remove
-                  an arrow, click or tap it, then choose “Remove arrow”. Export YAML to save your
-                  design.
+                  an arrow, click or tap it, then choose “Remove arrow”. Save workflow to keep
+                  editing later, or export YAML for the CLI.
                 </p>
               </section>
               {selected && (

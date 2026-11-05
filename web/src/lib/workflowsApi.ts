@@ -26,6 +26,9 @@ export interface WorkflowTeam {
   members: WorkflowMember[];
 }
 export interface WorkflowDefinition {
+  max_nodes?: number;
+  max_parallel_members?: number;
+  member_timeout_seconds?: number;
   name: string;
   goal: string;
   teams: WorkflowTeam[];
@@ -48,7 +51,14 @@ interface Member {
   cleanup_error: string | null;
   turns: Record<string, { status: string; remote_id: string | null }>;
 }
+export interface SavedWorkflow {
+  workflow_id: string;
+  root_session_id: string;
+  workflow: WorkflowDefinition;
+}
 export interface WorkflowRun {
+  workflow_id?: string | null;
+  root_session_id?: string | null;
   run_id: string;
   status: string;
   active: boolean;

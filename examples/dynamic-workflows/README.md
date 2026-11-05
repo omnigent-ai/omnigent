@@ -75,9 +75,13 @@ constructed. Restart the server after changing the flag.
    agents contribute in parallel. Follow-ups start enabled with two retries.
 2. Read arrows from prerequisite to dependent task. Select an arrow and click
    **Remove arrow**, or uncheck its prerequisite under **Wait for**.
-3. Click **Export YAML** to save the design. The server validates the same model
-   consumed by the CLI and API; the designer does not persist unsaved drafts.
-4. Choose **Simulation** and **Test workflow**. The test view shows the DAG,
+3. Click **Save workflow** to persist the DAG and create its private **root session**.
+   Save the resulting `/workflows?workflow=...` URL or use **Open root session**;
+   that session has an **Open workflow designer** link back to the saved DAG.
+   Reload the designer to verify your tasks and execution settings were retained.
+   **Export YAML** produces a portable definition for the CLI and API.
+4. Choose **Simulation** and **Test workflow**. Testing saves the current design and
+   reuses its root session. The test view shows the DAG,
    outcomes, outputs and review gates. Fail a review to request repair, then pass
    the new candidate and watch downstream tasks become runnable.
 
@@ -93,6 +97,33 @@ The UI focuses on creating a workflow and testing its current definition. The
 API also exposes owner-scoped run inspection, event submission, stop and resume.
 Controllers are local to one server process; restarting it leaves checkpoints
 available for explicit resume.
+
+## Workflow root sessions
+
+A saved workflow has its own `workflow_id` and one `root_session_id`, distinct
+from any test's `run_id`. Saving creates an ordinary private Omnigent session
+bound to the built-in Codex agent, without allocating a host, starting a runner,
+or sending a prompt. It can be opened and connected through the normal session
+UI. Conversational DAG creation and editing are future work.
+
+All web/API runs of that saved workflow keep the same root ID in checkpoints,
+including after review, retry, stop and server restart. Live task sessions carry
+`omnigent.workflow.id` and `omnigent.workflow.root_session` labels. They retain
+independent execution settings: the root is an association, not a sandbox or
+runner parent. Execution can target a different Omnigent server.
+
+`POST /v1/workflows/designs/{workflow_id}` accepts `{"workflow": <definition>}`
+with a caller-generated 32-character lowercase hexadecimal ID. Repeated saves
+reuse the root. `GET` on the same path restores the definition and root ID.
+Pass `workflow_id` alongside `backend` and `definition` when starting a run with
+`POST /v1/workflows`. Omitting it creates a new saved workflow and root.
+Definitions and roots are private to their creator; deleting the root prevents
+further saves or runs for that workflow instead of silently replacing it.
+
+Unsaved edits remain in the page until **Save workflow** or **Test workflow**.
+Saved designs use the prototype's local server storage and last-save-wins updates.
+Keep that data directory across restarts. Exported YAML contains no session IDs;
+standalone CLI runs remain portable and do not create a server-side design/root.
 
 ## Real agent execution
 

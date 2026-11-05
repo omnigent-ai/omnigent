@@ -61,6 +61,8 @@ class WorkflowService:
             runs.append(
                 {
                     "run_id": saved["run_id"],
+                    "workflow_id": saved.get("workflow_id"),
+                    "root_session_id": saved.get("root_session_id"),
                     "name": saved["workflow"]["name"],
                     "status": saved["status"],
                     "backend": saved["binding"]["mode"],
@@ -69,11 +71,25 @@ class WorkflowService:
             )
         return runs
 
-    def create(self, owner: str, workflow: Workflow, binding: ExecutionBinding) -> RunStore:
+    def create(
+        self,
+        owner: str,
+        workflow: Workflow,
+        binding: ExecutionBinding,
+        *,
+        workflow_id: str | None = None,
+        root_session_id: str | None = None,
+    ) -> RunStore:
         async def unused(_request: Any) -> str:
             raise RuntimeError("Executor is selected when the controller starts")
 
-        runner = WorkflowRunner(workflow, unused, binding=binding)
+        runner = WorkflowRunner(
+            workflow,
+            unused,
+            binding=binding,
+            workflow_id=workflow_id,
+            root_session_id=root_session_id,
+        )
         store = RunStore(self.owner_directory(owner) / runner.run_id)
         store.save(runner.snapshot())
         self.start(store)

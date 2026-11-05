@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Literal
+from uuid import uuid4
 
 import yaml
 from fastapi import APIRouter, HTTPException, Request
@@ -12,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from omnigent.server.auth import AuthProvider, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.workflows.designs import SavedWorkflow, WorkflowDesigns
 from omnigent.workflows.execution import validate_connection_url
 from omnigent.workflows.models import CommandGate, Workflow
 from omnigent.workflows.service import WorkflowService
@@ -25,6 +27,7 @@ MAX_DEFINITION_LENGTH = 65536
 class StartWorkflow(BaseModel):
     model_config = ConfigDict(extra="forbid")
     backend: Backend
+    workflow_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     definition: str = Field(min_length=1, max_length=MAX_DEFINITION_LENGTH)
 
 
@@ -85,7 +88,7 @@ def example_definition() -> str:
 
 
 def create_workflows_router(
-    service: WorkflowService, auth_provider: AuthProvider | None
+    service: WorkflowService, auth_provider: AuthProvider | None, designs: WorkflowDesigns
 ) -> APIRouter:
     router = APIRouter()
 
@@ -137,6 +140,27 @@ def create_workflows_router(
     async def list_runs(request: Request) -> dict[str, Any]:
         return {"data": service.list_runs(owner(request))}
 
+    @router.get("/workflows/designs/{workflow_id}")
+    async def get_design(request: Request, workflow_id: str) -> SavedWorkflow:
+        try:
+            return designs.load(owner(request), workflow_id)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(404, "Workflow not found") from exc
+
+    @router.post("/workflows/designs/{workflow_id}")
+    async def save_design(
+        request: Request, workflow_id: str, body: CompileWorkflow
+    ) -> SavedWorkflow:
+        try:
+            validate_web_workflow(body.workflow)
+            if len(body.workflow.model_dump_json()) > MAX_DEFINITION_LENGTH:
+                raise ValueError("Workflow exceeds the API limit of 65,536 characters")
+            return await designs.save(owner(request), workflow_id, body.workflow)
+        except FileNotFoundError as exc:
+            raise HTTPException(409, "Workflow root session is unavailable") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @router.post("/workflows/definition")
     async def compile_definition(request: Request, body: CompileWorkflow) -> dict[str, str]:
         owner(request)
@@ -158,9 +182,25 @@ def create_workflows_router(
             binding = binding_for(user, body.backend)
             workflow = Workflow.model_validate(yaml.safe_load(body.definition))
             validate_web_workflow(workflow)
+            workflow_id = body.workflow_id or uuid4().hex
+            if body.workflow_id:
+                try:
+                    saved = designs.load(user, workflow_id)
+                except (ValueError, FileNotFoundError) as exc:
+                    raise HTTPException(404, "Workflow not found") from exc
+            else:
+                saved = await designs.save(user, workflow_id, workflow)
             if sum(not task.done() for task in service.tasks.values()) >= 8:
                 raise HTTPException(429, "The workflow controller is at capacity")
-            return service.inspect(service.create(user, workflow, binding))
+            return service.inspect(
+                service.create(
+                    user,
+                    workflow,
+                    binding,
+                    workflow_id=saved.workflow_id,
+                    root_session_id=saved.root_session_id,
+                )
+            )
         except (ValueError, yaml.YAMLError) as exc:
             raise HTTPException(400, str(exc)) from exc
 

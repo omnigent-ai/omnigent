@@ -15,6 +15,7 @@ to downstream tasks with checkpoints for restart and reconciliation.
 - `review`: accept exact candidate revisions, or send feedback for repair.
 - `outputs`: pass accepted JSON outputs and artifact references to dependants.
 - `recover`: reuse checkpoints and park uncertain remote actions for reconciliation.
+- `root-session`: persist a design with one private session across edits, tests and restarts.
 
 ## How to get to it (user POV)
 
@@ -22,8 +23,14 @@ to downstream tasks with checkpoints for restart and reconciliation.
 - Desktop: choose **Workflows** in the sidebar.
 - Browser/mobile: open `/workflows` directly; embedded apps prepend their configured basename.
 - Designer: add tasks, configure their agents, connect prerequisites, and export YAML.
+  **Save workflow** creates a private root session without launching agents. Reopen
+  `/workflows?workflow=<id>` to continue editing. **Open root session** opens the
+  anchor; **Open workflow designer** there returns to the saved DAG. Testing saves
+  the design and keeps the same root across runs.
 - Test view: choose Simulation or Task agents, then **Test workflow**.
 - API: `/v1/workflows` exposes options, definition compilation, create/inspect, events, stop and resume.
+  `POST`/`GET /v1/workflows/designs/<id>` save/reload a design and its root.
+  Pass its `workflow_id` when starting subsequent tests.
 - Validate: `python -m omnigent.workflows FILE --validate`.
 - Simulate: `python -m omnigent.workflows FILE --simulate --state DIRECTORY`.
 - Execute: `python -m omnigent.workflows FILE --server URL --state DIRECTORY`.
@@ -47,7 +54,8 @@ need no environment; the process scenario owns its isolated server and host. Rea
   This alias is component-tested; it has no separate live browser proof.
 - Form state and execution defaults: `web/src/pages/WorkflowsPage.test.tsx` and
   `web/src/pages/workflows/workflowDesign.test.ts`.
-- API validation, owner isolation and stop/resume: `tests/workflows/test_service.py`.
+- API validation, owner isolation and stop/resume: `tests/workflows/test_service.py` (including persisted roots, owner isolation,
+  retrying saves, two runs sharing a root, and missing-root rejection).
 - No service or API when disabled: `tests/server/integration/test_utility_endpoints.py`.
 - Graphs, scheduling and expansion: `tests/workflows/test_workflows.py`.
 - Candidate review, outputs, consultation and repair: `tests/workflows/test_ownership.py`.
@@ -65,11 +73,18 @@ need no environment; the process scenario owns its isolated server and host. Rea
   It verifies three distinct managed hosts, synthesis, output handoff and host removal.
   It does not independently inspect cloud resource termination.
 
+The existing browser journey also saves the DAG before running it, reloads its
+workflow URL, opens the real root session and follows its return link. REST checks
+that the root has no host or runner and that review/repair keeps the same root.
+`web/src/pages/workflows/WorkflowSessionLink.test.tsx` covers the opt-in gate and
+embedded basename on the return link; a real embedded deployment remains manual.
+
 ## Gotchas
 
 - All user-facing entry points are disabled by default, even for simulation.
   Python integration is explicit. Restart the server after changing flags.
-- Export YAML to save a design; unsaved drafts do not survive reload.
+- Save workflow before leaving or reloading; unsaved edits do not survive reload.
+  Export YAML when moving a definition to the CLI or another deployment.
 - Web live execution uses one configured operator connection and an explicit owner;
   other users can still simulate. Local single-user mode permits the local user.
 - Simulation does not allocate agents/compute or run local commands.
@@ -80,3 +95,9 @@ need no environment; the process scenario owns its isolated server and host. Rea
 - A controller crash or cancellation can leave remote work running. Inspect its sessions.
 - Credentials remain outside definitions; checkpoints still contain prompts and outputs.
 - This is a single-controller experiment. MAR and a distributed scheduler are deferred.
+
+- Saved designs and root sessions are private to their owner. Sessions on execution
+  servers reference the root through labels; they do not inherit its runner or
+  sandbox. The root currently uses the built-in Codex agent without auto-launch.
+  Chat-driven DAG editing is deferred. Standalone CLI definitions have no root ID;
+  roots are created when saving/testing through the web/API.

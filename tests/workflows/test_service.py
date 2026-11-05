@@ -10,16 +10,34 @@ import yaml
 from click.testing import CliRunner
 from fastapi import FastAPI
 
+from omnigent.db.utils import builtin_agent_id
+from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes.workflows import create_workflows_router, example_definition
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.workflows.__main__ import main
+from omnigent.workflows.designs import WorkflowDesigns
 from omnigent.workflows.models import Workflow
 from omnigent.workflows.service import WorkflowService
 from omnigent.workflows.state import ExecutionBinding
 
 
 @pytest.fixture
-async def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def designs(tmp_path: Path, db_uri):
+    agents = SqlAlchemyAgentStore(db_uri)
+    agents.create(builtin_agent_id(CODEX_NATIVE_AGENT_NAME), CODEX_NATIVE_AGENT_NAME, "unused")
+    return WorkflowDesigns(
+        tmp_path / "designs",
+        SqlAlchemyConversationStore(db_uri),
+        agents,
+        SqlAlchemyPermissionStore(db_uri),
+    )
+
+
+@pytest.fixture
+async def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, designs):
     for key in ("OWNER", "SERVER_URL"):
         monkeypatch.delenv(f"OMNIGENT_WORKFLOW_{key}", raising=False)
     service = WorkflowService(tmp_path)
@@ -30,6 +48,7 @@ async def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             UnifiedAuthProvider(
                 "header", local_single_user=False, header_name="X-Forwarded-Email"
             ),
+            designs,
         ),
         prefix="/v1",
     )
@@ -51,6 +70,10 @@ async def test_ui_run_repairs_after_failure_and_releases_dependants(api):
         json={"backend": "simulation", "definition": example_definition()},
     )
     assert response.status_code == 201, response.text
+    root_id = response.json()["root_session_id"]
+    workflow_id = response.json()["workflow_id"]
+    assert root_id
+    assert workflow_id
     run_id = response.json()["run_id"]
     path = f"/v1/workflows/{run_id}"
     await asyncio.gather(*service.tasks.values())
@@ -72,6 +95,8 @@ async def test_ui_run_repairs_after_failure_and_releases_dependants(api):
         await asyncio.gather(*service.tasks.values())
         current = (await client.get(path)).json()
         assert current["nodes"]["propose"]["members"]["owner"]["session_id"] == session
+    assert current["root_session_id"] == root_id
+    assert current["workflow_id"] == workflow_id
     assert current["status"] == "succeeded"
     assert current["nodes"]["summarize"]["status"] == "succeeded"
     assert len(current["nodes"]["propose"]["candidates"]) == 2
@@ -326,3 +351,99 @@ async def test_designer_refuses_invalid_exports(api, fault):
     if fault == "oversized":
         assert "65,536 characters" in response.json()["detail"]
     assert not service.tasks
+
+
+async def test_saved_design_has_one_private_root_across_saves_restarts_and_runs(api, designs):
+    client, service = api
+    workflow_id = "a" * 32
+    path = f"/v1/workflows/designs/{workflow_id}"
+    definition = yaml.safe_load(example_definition())
+    responses = await asyncio.gather(
+        *(client.post(path, json={"workflow": definition}) for _ in range(2))
+    )
+    assert all(response.status_code == 200 for response in responses)
+    saved = responses[0].json()
+    root_id = saved["root_session_id"]
+    assert responses[1].json()["root_session_id"] == root_id
+    root = designs.conversations.get_conversation(root_id)
+    assert root.agent_id == builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    assert root.parent_conversation_id is None
+    assert root.host_id is None and root.runner_id is None
+    assert root.labels["omnigent.workflow.id"] == workflow_id
+    assert designs.permissions.get("owner@example.test", root_id).level == 4
+    assert designs.permissions.get("__public__", root_id) is None
+    assert not service.tasks
+
+    definition["name"] = "Revised design"
+    updated = await client.post(path, json={"workflow": definition})
+    assert updated.json()["root_session_id"] == root_id
+    restarted = WorkflowDesigns(
+        designs.directory, designs.conversations, designs.agents, designs.permissions
+    )
+    assert restarted.load("owner@example.test", workflow_id).workflow.name == "Revised design"
+    assert (await client.get(path)).json()["workflow"]["name"] == "Revised design"
+    other = {"X-Forwarded-Email": "other@example.test"}
+    assert (await client.get(path, headers=other)).status_code == 404
+    denied = await client.post(
+        "/v1/workflows",
+        headers=other,
+        json={
+            "backend": "simulation",
+            "workflow_id": workflow_id,
+            "definition": yaml.safe_dump(definition),
+        },
+    )
+    assert denied.status_code == 404
+    for _ in range(2):
+        response = await client.post(
+            "/v1/workflows",
+            json={
+                "backend": "simulation",
+                "workflow_id": workflow_id,
+                "definition": yaml.safe_dump(definition),
+            },
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["root_session_id"] == root_id
+        await asyncio.gather(*service.tasks.values())
+        checkpoint = service.store("owner@example.test", response.json()["run_id"]).load()
+        assert checkpoint["root_session_id"] == root_id
+        assert checkpoint["workflow_id"] == workflow_id
+    other_design = await client.post(
+        "/v1/workflows/designs/" + "b" * 32, json={"workflow": definition}
+    )
+    assert other_design.json()["root_session_id"] != root_id
+    await designs.conversations.delete_conversation(root_id)
+    assert (await client.get(path)).status_code == 404
+    assert (await client.post(path, json={"workflow": definition})).status_code == 409
+
+
+async def test_failed_design_save_discards_its_root_and_can_be_retried(api, designs, monkeypatch):
+    client, _ = api
+    created = []
+    original = designs.conversations.create_conversation
+
+    def create(**kwargs):
+        root = original(**kwargs)
+        created.append(root.id)
+        return root
+
+    monkeypatch.setattr(designs.conversations, "create_conversation", create)
+    with monkeypatch.context() as patch:
+
+        def fail_save(*_args):
+            raise OSError("disk unavailable")
+
+        patch.setattr("omnigent.workflows.designs.atomic_write_json", fail_save)
+        with pytest.raises(OSError, match="disk unavailable"):
+            await client.post(
+                "/v1/workflows/designs/" + "a" * 32,
+                json={"workflow": yaml.safe_load(example_definition())},
+            )
+    assert designs.conversations.get_conversation(created[0]) is None
+    response = await client.post(
+        "/v1/workflows/designs/" + "a" * 32,
+        json={"workflow": yaml.safe_load(example_definition())},
+    )
+    assert response.status_code == 200
+    assert response.json()["root_session_id"] != created[0]

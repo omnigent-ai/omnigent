@@ -9,9 +9,7 @@ export const DEFAULT_TASK_OPTIONS = { allow_expansion: true, max_rounds: 3 } as 
 export const TASK_WIDTH = 224;
 const ROW_SPACING = 190;
 
-export interface WorkflowDesign {
-  name: string;
-  goal: string;
+export interface WorkflowDesign extends Omit<WorkflowDefinition, "teams" | "nodes"> {
   nodes: TaskDesign[];
 }
 
@@ -79,9 +77,9 @@ export function starterWorkflow(): WorkflowDesign {
 }
 
 export function executionDefinition(design: WorkflowDesign): WorkflowDefinition {
+  const { nodes: _nodes, ...settings } = design;
   return {
-    name: design.name,
-    goal: design.goal,
+    ...settings,
     teams: design.nodes.map((task) => ({ ...task.execution, id: task.id })),
     nodes: design.nodes.map(({ execution: _execution, ...task }) => ({
       ...task,
@@ -89,6 +87,19 @@ export function executionDefinition(design: WorkflowDesign): WorkflowDefinition 
       max_rounds: task.max_rounds ?? DEFAULT_TASK_OPTIONS.max_rounds,
       team: task.id,
     })),
+  };
+}
+
+export function restoreDesign(definition: WorkflowDefinition): WorkflowDesign {
+  const { nodes: _nodes, teams: _teams, ...settings } = definition;
+  return {
+    ...settings,
+    nodes: definition.nodes.map(({ team, ...task }) => {
+      const execution = definition.teams.find((item) => item.id === team);
+      if (!execution) throw new Error(`Missing execution settings for ${task.id}`);
+      const { id: _id, ...executionSettings } = execution;
+      return { ...task, execution: structuredClone(executionSettings) };
+    }),
   };
 }
 

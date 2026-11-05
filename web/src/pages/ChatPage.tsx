@@ -1,3 +1,4 @@
+import { WorkflowSessionLink } from "@/pages/workflows/WorkflowSessionLink";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
@@ -1279,6 +1280,7 @@ export function ChatPage() {
 
   return (
     <SessionSharedContext.Provider value={isSessionShared}>
+      <WorkflowSessionLink labels={activeSession?.labels ?? activeConv?.labels ?? {}} />
       <SessionLayout mainAgent={mainAgent} />
       <ReconnectSessionDialog
         open={dialogOpen}

@@ -46,6 +46,16 @@ class SessionExecutor:
                     "omnigent.workflow.node": request.node.id,
                     "omnigent.workflow.team": request.node.team,
                     "omnigent.workflow.member": request.member.id,
+                    **(
+                        {"omnigent.workflow.id": request.workflow_id}
+                        if request.workflow_id
+                        else {}
+                    ),
+                    **(
+                        {"omnigent.workflow.root_session": request.root_session_id}
+                        if request.root_session_id
+                        else {}
+                    ),
                 },
                 host_id=placement.host_id if isinstance(placement, ConnectedHost) else None,
                 workspace=placement.workspace,

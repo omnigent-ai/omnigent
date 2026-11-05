@@ -1,3 +1,4 @@
+import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -75,6 +76,12 @@ beforeEach(() => {
     if (init?.method === "POST") {
       const body = JSON.parse(init.body as string) as Record<string, unknown>;
       posts.push({ path, body });
+      if (path.includes("/designs/"))
+        return Response.json({
+          workflow_id: path.split("/").pop(),
+          root_session_id: "root-one",
+          workflow: body.workflow,
+        });
       if (path.endsWith("/definition"))
         return Response.json({ definition: "name: generated\nnodes: []\n" });
       return Response.json(run);
@@ -106,7 +113,9 @@ function renderPage() {
   });
   render(
     <QueryClientProvider client={client}>
-      <WorkflowsPage />
+      <MemoryRouter>
+        <WorkflowsPage />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }
@@ -366,7 +375,7 @@ it.each([false, true])(
     fireEvent.click(test);
     await screen.findByRole("heading", { name: "Test workflow" });
     expect(posts[0].body).not.toHaveProperty("backend");
-    expect(posts[1].body.backend).toBe("server");
+    expect(posts.find((post) => post.path === "/v1/workflows")?.body.backend).toBe("server");
   },
 );
 
@@ -375,16 +384,20 @@ it.each(["Pass review", "Fail review", "Send feedback"])(
   async (action) => {
     renderPage();
     await openTest();
-    expect(posts[1]).toEqual({
+    expect(posts[2]).toEqual({
       path: "/v1/workflows",
-      body: { backend: "simulation", definition: "name: generated\nnodes: []\n" },
+      body: {
+        backend: "simulation",
+        definition: "name: generated\nnodes: []\n",
+        workflow_id: expect.any(String),
+      },
     });
     fireEvent.change(screen.getByLabelText("Feedback or validation evidence"), {
       target: { value: "Reviewed revision one" },
     });
     fireEvent.click(screen.getByRole("button", { name: action }));
-    await waitFor(() => expect(posts).toHaveLength(4));
-    expect(posts[2].body).toMatchObject(
+    await waitFor(() => expect(posts).toHaveLength(5));
+    expect(posts[3].body).toMatchObject(
       action === "Send feedback"
         ? { kind: "feedback", node_id: "propose" }
         : {
@@ -439,4 +452,55 @@ it("shows field validation errors and preserves the design", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Export YAML" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("workflow → goal");
   expect(screen.getByLabelText("Workflow name")).toHaveValue("Keep this draft");
+});
+
+it("saves a design before execution and reuses its root for subsequent tests", async () => {
+  renderPage();
+  fireEvent.change(screen.getByLabelText("Workflow name"), { target: { value: "Rooted design" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+  expect(await screen.findByRole("link", { name: "Open root session" })).toHaveAttribute(
+    "href",
+    "/c/root-one",
+  );
+  expect(screen.getByText(/Workflow saved/)).toBeInTheDocument();
+  expect(posts.some((post) => post.path === "/v1/workflows")).toBe(false);
+  const firstSave = posts.find((post) => post.path.includes("/designs/"))!;
+  fireEvent.change(screen.getByLabelText("Workflow goal"), { target: { value: "New goal" } });
+  expect(screen.getByText(/Unsaved changes/)).toBeInTheDocument();
+  await openTest();
+  expect(posts.filter((post) => post.path.includes("/designs/"))).toHaveLength(2);
+  expect(posts.filter((post) => post.path.includes("/designs/"))[1].path).toBe(firstSave.path);
+  expect(posts.find((post) => post.path === "/v1/workflows")?.body.workflow_id).toBe(
+    firstSave.path.split("/").pop(),
+  );
+});
+
+it("restores the saved DAG through its workflow URL", async () => {
+  const workflowId = "a".repeat(32);
+  const definition = executionDefinition(starterWorkflow());
+  definition.name = "Saved DAG";
+  const fetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
+  vi.mocked(authenticatedFetch).mockImplementation(async (url, init) =>
+    String(url).endsWith("/designs/" + workflowId) && !init
+      ? Response.json({
+          workflow_id: workflowId,
+          root_session_id: "saved-root",
+          workflow: definition,
+        })
+      : fetch(url, init),
+  );
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={["/workflows?workflow=" + workflowId]}>
+        <WorkflowsPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByLabelText("Workflow name")).toHaveValue("Saved DAG");
+  expect(screen.getByRole("link", { name: "Open root session" })).toHaveAttribute(
+    "href",
+    "/c/saved-root",
+  );
+  expect(posts).toHaveLength(0);
 });

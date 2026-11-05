@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeftIcon, RotateCcwIcon, SquareIcon } from "lucide-react";
+import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { workflowRequest, type WorkflowRun } from "@/lib/workflowsApi";
@@ -40,7 +41,16 @@ export function WorkflowTest({ runId, onBack }: { runId: string; onBack: () => v
           </p>
         </div>
         {current && (
-          <div className="flex gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {current.root_session_id && (
+              <Link
+                to={"/c/" + current.root_session_id}
+                target="_blank"
+                className="text-sm underline"
+              >
+                Open root session
+              </Link>
+            )}
             <Button
               variant="outline"
               disabled={current.active || terminal.has(current.status) || control.isPending}

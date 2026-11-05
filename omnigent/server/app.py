@@ -3818,9 +3818,19 @@ def create_app(
     )
     if workflow_service is not None:
         from omnigent.server.routes.workflows import create_workflows_router
+        from omnigent.workflows.designs import WorkflowDesigns
 
         app.include_router(
-            create_workflows_router(workflow_service, auth_provider),
+            create_workflows_router(
+                workflow_service,
+                auth_provider,
+                WorkflowDesigns(
+                    workflow_service.directory / "designs",
+                    conversation_store,
+                    agent_store,
+                    permission_store,
+                ),
+            ),
             prefix="/v1",
             tags=["workflows"],
         )
