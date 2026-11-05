@@ -8,7 +8,6 @@ import sys
 import textwrap
 import threading
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +17,7 @@ import yaml
 
 from omnigent.claude_launcher import ClaudeLauncher
 from omnigent.harnesses.claude_native import plugin_discovery
+from omnigent.inner import _proc
 from omnigent.spec.skill_sources import (
     SkillSourceContext,
     _harness_family,
@@ -1542,23 +1542,15 @@ def test_claude_launch_probe_that_cannot_start_backs_off_and_keeps_installed_plu
     assert start_failures_logged() == 2
 
 
-def _process_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    # An unreaped zombie still accepts signal 0 but no longer runs.
-    with suppress(OSError):
-        return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] != "Z"
-    return True
-
-
 @pytest.mark.posix_only
-@pytest.mark.parametrize("hung", ["launcher-plugin", "launch"])
+@pytest.mark.parametrize("hung", ["launcher-plugin", "launcher-plugin-at-exit", "launch"])
 def test_exit_does_not_wait_on_a_hung_claude_launch_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hung: str
 ) -> None:
-    """A hung launcher plugin does not hold the process open, and exit kills a running launch."""
+    """A hung launcher plugin does not hold the process open, and exit kills a running launch.
+
+    A launcher plugin that returns once exit has begun does not start a launch.
+    """
     pid_file = tmp_path / "launch.pid"
     configure_claude_launch(
         isolate_provider_resolution(monkeypatch, tmp_path / "config"),
@@ -1566,22 +1558,36 @@ def test_exit_does_not_wait_on_a_hung_claude_launch_probe(
         f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n",
     )
     entered = tmp_path / "entered"
-    if hung == "launcher-plugin":
+    if hung != "launch":
         monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "hung")
     child = textwrap.dedent(
         f"""
-        import pathlib, threading, time
+        import atexit, pathlib, threading, time
+        release = threading.Event()
+
+        def release_launcher_after_exit_cleanup():
+            release.set()
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not pathlib.Path({str(pid_file)!r}).exists():
+                if plugin_discovery.launch_plugins_generation():
+                    break
+                time.sleep(0.05)
+
+        # Registered before omnigent is imported, so it runs after omnigent's exit hook.
+        if {hung == "launcher-plugin-at-exit"!r}:
+            atexit.register(release_launcher_after_exit_cleanup)
         import omnigent.claude_launcher as claude_launcher
         from omnigent.harnesses.claude_native import plugin_discovery
 
         class Hung(claude_launcher.ClaudeLauncher):
             def launch(self, command, args):
                 pathlib.Path({str(entered)!r}).touch()
-                threading.Event().wait()
+                release.wait()
+                return command, args
 
         claude_launcher._load_launcher = lambda _name: Hung()
         plugin_discovery.prewarm_claude_launch_plugins()
-        ready = pathlib.Path({str(entered if hung == "launcher-plugin" else pid_file)!r})
+        ready = pathlib.Path({str(pid_file if hung == "launch" else entered)!r})
         while not ready.exists():
             time.sleep(0.05)
         """
@@ -1597,7 +1603,9 @@ def test_exit_does_not_wait_on_a_hung_claude_launch_probe(
 
     if hung == "launch":
         pid = int(pid_file.read_text())
-        poll_until(lambda: not _process_running(pid), timeout_s=10, interval_s=0.05)
+        poll_until(lambda: not _proc.process_alive(pid), timeout_s=10, interval_s=0.05)
+    else:
+        assert not pid_file.exists()
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(

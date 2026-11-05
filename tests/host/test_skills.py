@@ -371,11 +371,11 @@ def test_incomplete_codex_catalog_reports_warnings_and_is_cached_only_briefly(
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize("blocked", ["launcher-plugin", "launch"])
-@pytest.mark.parametrize("shared_discovery", [True, False], ids=["shared", "separate"])
+@pytest.mark.parametrize("catalogs", ["shared", "separate", "session"])
 def test_slow_claude_launch_probe_does_not_delay_catalogs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    shared_discovery: bool,
+    catalogs: str,
     blocked: str,
     _no_configured_claude_launch: Callable[[], bool],
 ) -> None:
@@ -418,10 +418,16 @@ def test_slow_claude_launch_probe_does_not_delay_catalogs(
         launches,
         f"while not os.path.exists({str(release)!r}):\n    time.sleep(0.05)\nprint({init!r})\n",
     )
-    shared = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
+    session_bundle = _bundle({}, executor={"config": {"harness": "claude-native"}})
+
+    def fetch_bundle(_frame: HostSkillsFrame) -> httpx.Response:
+        if catalogs != "session":
+            pytest.fail("No bundle expected")
+        return _response(session_bundle)
+
+    shared = HostSkillDiscovery(fetch_bundle)
     discoveries = [
-        shared if shared_discovery else HostSkillDiscovery(lambda _: pytest.fail("No bundle"))
-        for _ in range(2)
+        HostSkillDiscovery(fetch_bundle) if catalogs == "separate" else shared for _ in range(2)
     ]
     workspaces = [tmp_path / "first", tmp_path / "second"]
     for workspace in workspaces:
@@ -429,7 +435,10 @@ def test_slow_claude_launch_probe_does_not_delay_catalogs(
 
     def catalog(discovery: HostSkillDiscovery, workspace: Path) -> tuple[list[str], list[str]]:
         warnings: list[str] = []
-        frame = HostSkillsFrame("request", "claude-native", str(workspace))
+        if catalogs == "session":
+            frame = HostSkillsFrame("request", "session", str(workspace), "session", "agent", "1")
+        else:
+            frame = HostSkillsFrame("request", "claude-native", str(workspace))
         skills = discovery.discover(frame, workspace, warnings=warnings)
         return [skill["name"] for skill in skills], warnings
 
@@ -461,6 +470,7 @@ def test_skill_reads_wait_for_a_claude_launch_until_its_deadline(
     """Session skills and skill content wait for a launch's plugins, but not past its deadline.
 
     A launcher plugin that hangs is then reported as failed rather than loading forever.
+    A skill that is already listed is read without waiting.
     """
     for name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
         monkeypatch.delenv(name, raising=False)
@@ -482,7 +492,8 @@ def test_skill_reads_wait_for_a_claude_launch_until_its_deadline(
     monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "gated")
     monkeypatch.setattr("omnigent.claude_launcher._load_launcher", lambda _name: GatedLauncher())
     home = tmp_path / "home"
-    home.mkdir()
+    (home / ".claude" / "skills" / "local").mkdir(parents=True)
+    (home / ".claude" / "skills" / "local" / "SKILL.md").write_text(_skill("local"))
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     plugin = tmp_path / "launch" / "dev"
     (plugin / "skills" / "review").mkdir(parents=True)
@@ -516,10 +527,13 @@ def test_skill_reads_wait_for_a_claude_launch_until_its_deadline(
         try:
             poll_until(lambda: entered or None, timeout_s=10, interval_s=0.05)
             done, _ = futures_wait(waiting, timeout=0.5)
+            local = read_skill_content("claude-native", "local")
+            assert resolved == []
         finally:
             resolve.set()
         assert not done
-        assert waiting[0].result(timeout=20) == (["dev:review"], [])
+        assert local["name"] == "local"
+        assert waiting[0].result(timeout=20) == (["local", "dev:review"], [])
         assert "Private instructions" in waiting[1].result(timeout=20)["content"]
 
     # A new launch identity starts a probe whose launcher plugin hangs past its deadline.
@@ -528,16 +542,16 @@ def test_skill_reads_wait_for_a_claude_launch_until_its_deadline(
     try:
         with pytest.raises(plugin_discovery.LaunchPluginsPending):
             plugin_discovery.claude_launch_plugin_dirs(wait=False)
-        now[0] += plugin_discovery.LAUNCH_PLUGINS_TIMEOUT_S + 5
+        now[0] += plugin_discovery.LAUNCH_PLUGINS_DEADLINE_S
         stalled = (
             "Claude plugins added by the configured launch are missing: the launch "
-            "did not answer within 15s; see the host log for details."
+            "did not answer within 12s; see the host log for details."
         )
-        assert session_skills() == ([], [stalled])
+        assert session_skills() == (["local"], [stalled])
         with pytest.raises(LookupError):
             read_skill_content("claude-native", "dev:review")
         assert entered == ["gated", "hung"]
-        assert caplog.text.count("did not answer within 15s") == 1
+        assert caplog.text.count("did not answer within 12s") == 1
         generation = plugin_discovery.launch_plugins_generation()
     finally:
         resolve.set()
@@ -546,6 +560,6 @@ def test_skill_reads_wait_for_a_claude_launch_until_its_deadline(
         timeout_s=10,
         interval_s=0.05,
     )
-    assert session_skills() == (["dev:review"], [])
+    assert session_skills() == (["local", "dev:review"], [])
     assert resolved == [True, True]
     assert len(launches.read_text().splitlines()) == 2

@@ -20,6 +20,8 @@ from omnigent.inner import _proc
 _log = logging.getLogger(__name__)
 
 LAUNCH_PLUGINS_TIMEOUT_S = 10.0
+# Readers stop waiting here, inside the server's 15s limit on a skill-content request.
+LAUNCH_PLUGINS_DEADLINE_S = LAUNCH_PLUGINS_TIMEOUT_S + 2
 # The launch identity keys each answer, so this only bounds how long a missed change lasts.
 LAUNCH_PLUGINS_TTL_S = 3600.0
 # Each consecutive failure of one launch doubles the wait before it is spawned again.
@@ -69,12 +71,16 @@ class _LaunchProbe:
 _probes_lock = threading.Lock()
 _probes: dict[tuple[object, ...], _LaunchProbe] = {}
 _generation = 0
+_launches_lock = threading.Lock()
 _running_launches: set[subprocess.Popen[str]] = set()
+_exiting = False
 
 
 def _kill_running_launches() -> None:
+    global _exiting
     # Probe threads are daemons, so exit kills the launches they still wait on.
-    with _probes_lock:
+    with _launches_lock:
+        _exiting = True
         launches = list(_running_launches)
     for process in launches:
         _proc.kill_tree(process)
@@ -170,7 +176,6 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
     command, args = _configured_command()
     launcher = os.environ.get(CLAUDE_LAUNCHER_ENV_VAR, "").strip()
     key = (launcher, command, *args, binary_identity(command))
-    budget_s = LAUNCH_PLUGINS_TIMEOUT_S + 5
     with _probes_lock:
         probe = _probes.get(key)
         executable = probe.executable if probe is not None else None
@@ -188,7 +193,7 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
             probe = _probes[key] = _LaunchProbe()
         if probe.running is None and probe.refresh_at <= time.monotonic():
             probe.running = threading.Event()
-            probe.deadline = time.monotonic() + budget_s
+            probe.deadline = time.monotonic() + LAUNCH_PLUGINS_DEADLINE_S
             try:
                 # A daemon, so a hung launcher plugin cannot keep the process from exiting.
                 threading.Thread(
@@ -207,7 +212,7 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
         if probe.running is not None:
             if time.monotonic() < probe.deadline:
                 raise LaunchPluginsPending
-            stalled = f"did not answer within {budget_s:g}s"
+            stalled = f"did not answer within {LAUNCH_PLUGINS_DEADLINE_S:g}s"
             if probe.failure != stalled:
                 probe.failure = stalled
                 _log.warning("The configured Claude launch %s", stalled)
@@ -264,20 +269,23 @@ def _record_failure(probe: _LaunchProbe, failure: str) -> None:
 def _probe_plugin_dirs(
     command: str, launch_args: list[str], env: dict[str, str]
 ) -> dict[str, Path]:
-    process = subprocess.Popen(
-        _proc.pipe_supervised_command(command, *launch_args),
-        cwd=Path.home(),
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        # Stderr can echo the launch's arguments, so only the exit status is reported.
-        stderr=subprocess.DEVNULL,
-        text=True,
-        errors="replace",
-        **_proc.spawn_kwargs(),
-    )
-    _proc.remember_process_group(process)
-    with _probes_lock:
+    # Spawning under the lock means exit either kills this launch or stops it from starting.
+    with _launches_lock:
+        if _exiting:
+            raise LaunchPluginsFailed("was not started because the host is exiting")
+        process = subprocess.Popen(
+            _proc.pipe_supervised_command(command, *launch_args),
+            cwd=Path.home(),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            # Stderr can echo the launch's arguments, so only the exit status is reported.
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+            **_proc.spawn_kwargs(),
+        )
+        _proc.remember_process_group(process)
         _running_launches.add(process)
     try:
         stdout, _ = process.communicate(timeout=LAUNCH_PLUGINS_TIMEOUT_S)
@@ -287,7 +295,7 @@ def _probe_plugin_dirs(
             process.communicate(timeout=1)
         raise
     finally:
-        with _probes_lock:
+        with _launches_lock:
             _running_launches.discard(process)
     for line in stdout.splitlines():
         try:

@@ -18,7 +18,10 @@ def read_skill_content(
 ) -> dict[str, str | bool]:
     ctx = skill_source_context_from_env(roots=(Path.home(),), harness=harness)
     if source_id is None:
-        skills = resolve_harness_skills(ctx, harness)
+        # Only a skill not listed yet waits for a configured Claude launch to report.
+        skills = resolve_harness_skills(replace(ctx, wait_for_launch_plugins=False), harness)
+        if harness == "claude-native" and all(skill.name != name for skill in skills):
+            skills = resolve_harness_skills(ctx, harness)
     else:
         if harness != "claude-native":
             raise LookupError("plugin skill unavailable")
