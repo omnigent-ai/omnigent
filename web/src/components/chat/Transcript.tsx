@@ -53,16 +53,15 @@ import {
   ScrollToBottomOnSend,
   WorkingIndicator,
   bubbleKey,
-  buildPendingBubbles,
   collectPendingElicitations,
   computeIsWorking,
   extractUserText,
   isSystemBubble,
-  mergePendingBubbles,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
+  withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
@@ -129,6 +128,7 @@ function TranscriptImpl({
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
+  const failedInputs = useChatStore((s) => s.failedInputs);
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
@@ -142,6 +142,8 @@ function TranscriptImpl({
   // cache so a streaming append rebuilds only the active bubble, reusing the
   // finalized prefix by reference. Pending user messages (POSTed but not yet
   // acked) render as trailing user bubbles so the input is visible immediately.
+  // Undelivered startup messages replace their pending bubbles, above the
+  // failure notice that explains them.
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
     const committed = stripGatedSubagentRoutingChips(
@@ -156,16 +158,18 @@ function TranscriptImpl({
       ),
       subagentRoutingOverride,
     );
-    if (pendingUserMessages.length === 0) return committed;
-    return mergePendingBubbles(
+    return withUncommittedUserBubbles(
       committed,
-      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
+      pendingUserMessages,
+      failedInputs,
+      getCurrentAuthorId(),
     );
   }, [
     blocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedInputs,
     subagentRoutingOverride,
     sessionStatus,
   ]);

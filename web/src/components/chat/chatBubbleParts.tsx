@@ -55,6 +55,7 @@ import {
 } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
+import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
@@ -70,7 +71,7 @@ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
-import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
@@ -84,13 +85,14 @@ import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
-import type { SessionStatus } from "@/lib/types";
+import type { PendingInput, SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
   type TranscriptScrollbarDragDetail,
@@ -234,6 +236,72 @@ export function buildPendingBubbles(
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
     };
   });
+}
+
+/**
+ * Build "Not delivered" user bubbles from a session's undelivered startup inputs.
+ *
+ * @param failedInputs - The snapshot's `failedInputs`, in submission order.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function buildUndeliveredBubbles(
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  return failedInputs.map((input) => {
+    const author = input.createdBy ?? selfAuthor;
+    return {
+      kind: "user",
+      itemId: input.pendingId,
+      // No transcript item exists, so there is nothing to link to.
+      pending: true,
+      undelivered: true,
+      content: input.content,
+      ...(author !== null ? { createdBy: author } : {}),
+    };
+  });
+}
+
+function isStartupFailureBubble(bubble: Bubble): boolean {
+  return (
+    bubble.kind === "assistant" &&
+    bubble.items.some((item) => item.kind === "error" && item.code === "startup_input_failed")
+  );
+}
+
+/**
+ * Place undelivered messages above the startup failure notice that explains
+ * them, or at the end of the transcript when that notice isn't loaded.
+ */
+export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble[]): Bubble[] {
+  if (undelivered.length === 0) return committed;
+  const notice = committed.findIndex(isStartupFailureBubble);
+  if (notice === -1) return [...committed, ...undelivered];
+  return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
+}
+
+/**
+ * Add a conversation's uncommitted user messages to its committed bubbles: the
+ * undelivered startup messages, and the optimistic sends they don't replace.
+ *
+ * @param committed - Bubbles built from the transcript.
+ * @param pendingUserMessages - The conversation's optimistic sends.
+ * @param failedInputs - The snapshot's undelivered startup messages.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function withUncommittedUserBubbles(
+  committed: Bubble[],
+  pendingUserMessages: PendingUserMessage[],
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  const withUndelivered = placeUndeliveredBubbles(
+    committed,
+    buildUndeliveredBubbles(failedInputs, selfAuthor),
+  );
+  const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
+  if (pending.length === 0) return withUndelivered;
+  return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, selfAuthor));
 }
 
 // A committed bubble that exists ONLY to render one or more
@@ -472,10 +540,29 @@ export function WorkingIndicator() {
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
   const tick = useWorkingLabelTick();
-  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
-  // the state and the shimmer stays off (it would misread as the agent still
-  // thinking). While the turn is active the shimmer shows, with the pill beside it.
-  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
+  // Background shells outliving a finished turn keep the session in progress,
+  // but the agent isn't thinking: show a plain spinner instead of the shimmer.
+  // The main composer's pill announces the count; side chats have no pill.
+  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
+    const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
+    return (
+      <>
+        {scopedConversationId && (
+          <span role="status" aria-live="polite" className="sr-only">
+            {label}
+          </span>
+        )}
+        <Message from="assistant" data-testid="background-tasks-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
+              <RunningDot className="size-3.5" />
+              <span className="text-sm font-mono">{label}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
+    );
+  }
   const label = workingIndicatorLabel(tick, blockedOn, {
     answerableInChat: hasOwnPendingElicitation,
     // The toggle switches to the root session's terminal, not a side chat's.
@@ -960,6 +1047,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </div>
         </div>
+        {bubble.undelivered && (
+          <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
+        )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. A text-less
             steering message has no enabled footer control to focus (Copy is
             absent and Copy link is disabled while pending), so keep its

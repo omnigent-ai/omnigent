@@ -1537,7 +1537,7 @@ def create_runner_app(
     # subprocess. The release closes the httpx client an in-flight
     # ``proxy_stream`` is reading, which surfaces there as a transport error;
     # the stream's failure handler consumes the record to report the exit.
-    _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
+    _required_terminal_exit_errors: dict[str, dict[str, Any]] = {}
     app.state.required_terminal_exit_errors = _required_terminal_exit_errors
     _clean_terminal_exit_responses: dict[str, str | None] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
@@ -1937,13 +1937,14 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
-    def _build_delivery_timeout_error(event: TerminalExitEvent) -> dict[str, str]:
+    def _build_delivery_timeout_error(event: TerminalExitEvent) -> dict[str, Any]:
         """Build the failure for a pane the delivery timeout closed.
 
         Stands in for the turn's own readiness error when releasing the harness
         severs its stream first. The executor reports that error as a
-        ``RuntimeError``; the same code keeps both readings of one failure
-        together.
+        ``RuntimeError`` with ``undelivered`` set, since nothing reached the
+        pane; the same shape keeps both readings of one failure together and
+        lets the server keep the queued message.
 
         :param event: The exit of the pane Omnigent closed.
         """
@@ -1955,11 +1956,11 @@ def create_runner_app(
         )
         if event.last_output:
             message = f"{message}\n\nLast captured terminal output:\n{event.last_output}"
-        return {"code": "RuntimeError", "message": message}
+        return {"code": "RuntimeError", "message": message, "undelivered": True}
 
     def _build_required_terminal_error(
         event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Build the structured ``session.status`` error for a required-terminal exit.
 
         Always carries ``code`` + a fully-composed ``message`` (back-compat: the
@@ -1971,7 +1972,7 @@ def create_runner_app(
         :param diagnosis: The exit's :func:`classify_terminal_failure` result.
         """
         message = _format_required_terminal_exit_output(event, diagnosis)
-        error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
+        error: dict[str, Any] = {"code": "required_terminal_exited", "message": message}
         if diagnosis is not None:
             error["title"] = diagnosis.title
             error["cause"] = diagnosis.cause
@@ -3658,7 +3659,12 @@ def create_runner_app(
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _turn_pending_ids.pop(session_id, None)
-        _ingest_cond.pop(session_id, None)
+        ingest_cond = _ingest_cond.pop(session_id, None)
+        if ingest_cond is not None:
+            # Wake waiters on the dropped gate, so a cancelled ticket's
+            # retirement sees it gone and ends instead of waiting forever.
+            async with ingest_cond:
+                ingest_cond.notify_all()
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -7775,6 +7781,14 @@ def create_runner_app(
                 return await _handle_codex_native_clear(conversation_id)
             if _session_harness_name(conversation_id) == "opencode-native":
                 return await _handle_opencode_native_clear(conversation_id)
+            # Only a server that continues the work in a new session marks the
+            # request; an older server's plain clear keeps the unsupported 204.
+            if (
+                _session_harness_name(conversation_id) == "claude-sdk"
+                and isinstance(body, dict)
+                and body.get("continue_in_new_session") is True
+            ):
+                return await _handle_claude_sdk_clear(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":
@@ -8044,6 +8058,10 @@ def create_runner_app(
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id
 
+    async def _release_session_harness(session_id: str) -> None:
+        if process_manager is not None:
+            await process_manager.release(session_id)
+
     _native_controls = build_native_controls(
         _active_turns=_active_turns,
         _background_tasks=_background_tasks,
@@ -8067,6 +8085,7 @@ def create_runner_app(
         _opencode_terminal_ensure_locks=_opencode_terminal_ensure_locks,
         _publish_event=_publish_event,
         _publish_turn_status=_publish_turn_status,
+        _release_session_harness=_release_session_harness,
         _resolve_session_agent_spec=_resolve_session_agent_spec,
         _resolve_session_claude_launch_config=_resolve_session_claude_launch_config,
         _run_turn_bg=_run_turn_bg,
@@ -8090,6 +8109,7 @@ def create_runner_app(
     _handle_claude_native_permission_mode_change = (
         _native_controls.handle_claude_native_permission_mode_change
     )
+    _handle_claude_sdk_clear = _native_controls.handle_claude_sdk_clear
     _handle_claude_sdk_compact = _native_controls.handle_claude_sdk_compact
     _handle_codex_native_approval_mode_change = (
         _native_controls.handle_codex_native_approval_mode_change

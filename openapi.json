@@ -6118,6 +6118,12 @@
             "title": "Archive Worktree Cleanup",
             "type": "boolean"
           },
+          "automation_trigger_poll_minutes": {
+            "default": 10,
+            "format": "int64",
+            "title": "Automation Trigger Poll Minutes",
+            "type": "integer"
+          },
           "automations_enabled": {
             "default": false,
             "title": "Automations Enabled",
@@ -6284,6 +6290,11 @@
           "server_version": {
             "title": "Server Version",
             "type": "string"
+          },
+          "session_claude_sdk_clear": {
+            "default": false,
+            "title": "Session Claude Sdk Clear",
+            "type": "boolean"
           },
           "session_event_types": {
             "default": [],
@@ -8709,6 +8720,15 @@
             ],
             "description": "Runtime-native session id this conversation wraps, e.g. a Claude Code session uuid for `omnigent claude` sessions. `None` for regular AP-only conversations. Populated by the wrapper bridge.",
             "title": "External Session Id"
+          },
+          "failed_inputs": {
+            "description": "Durable managed-startup inputs that were never delivered, e.g. because the sandbox host did not come online. Same shape as `pending_inputs`, in submission order; their file blocks keep ids that still resolve under this session. Empty when nothing failed.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Failed Inputs",
+            "type": "array"
           },
           "git_branch": {
             "anyOf": [
