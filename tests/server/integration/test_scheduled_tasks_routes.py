@@ -872,6 +872,28 @@ async def test_mcp_services_use_the_deployment_selection(
     assert checked == [(("system.ai.github",), "alice@example.com")]
 
 
+async def test_mcp_services_that_do_not_fit_the_column_are_rejected(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient
+) -> None:
+    class _AcceptAll:
+        def validate(self, request, services, *, spec, user_id):
+            return tuple(services)
+
+        def session_labels(self, services):
+            return {}
+
+        def selected_services(self, labels):
+            return ()
+
+    auth_app.state.session_mcp_selection = _AcceptAll()
+    long_names = [f"system.ai.{'x' * 100}{i:02d}" for i in range(40)]
+    rejected = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(mcp_services=long_names), headers=_headers()
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "Too many MCP services" in rejected.text
+
+
 @pytest.mark.parametrize("operation", ["create", "update"])
 async def test_permission_save_requires_resolved_harness(
     auth_client: httpx.AsyncClient,

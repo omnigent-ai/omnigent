@@ -1545,7 +1545,7 @@ class SqlScheduledTask(OmnigentBase):
     # ``--permission-mode`` launch arg. NULL = use the agent default.
     permission_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # JSON list of MCP service names every fired session starts with. NULL = none.
-    mcp_services: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    mcp_services: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     # Per-firing cost budget in USD. When set, the fire path attaches a
     # cost_budget policy to each spawned session. NULL = no per-firing cap.
     max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)

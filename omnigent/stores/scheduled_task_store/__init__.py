@@ -21,7 +21,7 @@ _UNSET: Any = object()
 
 
 # Width of the ``scheduled_tasks.mcp_services`` column.
-MCP_SERVICES_MAX_STORED_CHARS = 2048
+MCP_SERVICES_MAX_STORED_CHARS = 4096
 
 
 def encode_mcp_services(services: tuple[str, ...]) -> str | None:
