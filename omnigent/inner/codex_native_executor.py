@@ -1539,6 +1539,9 @@ def _content_to_input_items(
         items = []
     else:
         items = [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+    # Side commands keep their full question for the forwarder's child route.
+    if side_chat.side_chat_question(items) is not None:
+        return items
     return _spill_oversized_text(
         items,
         bridge_dir,
