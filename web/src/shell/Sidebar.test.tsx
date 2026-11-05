@@ -255,7 +255,7 @@ function renderSidebar(
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
-  return render(
+  const tree = () => (
     <QueryClientProvider client={qc}>
       <CapabilitiesProvider info={info ?? "loading"}>
         <SidebarDataProvider config={config}>
@@ -266,8 +266,11 @@ function renderSidebar(
           </ExtensionCatalogProvider>
         </SidebarDataProvider>
       </CapabilitiesProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const result = render(tree());
+  // Re-render the same tree so hook mocks swapped mid-test reach the rows.
+  return { ...result, refresh: () => result.rerender(tree()) };
 }
 
 // Session scope lives in the Sessions heading's filter menu; pick an option to
@@ -484,23 +487,11 @@ describe("Sidebar session list", () => {
       const row = (shared: boolean) =>
         conv("owned", "Claude Code", { owner: "viewer@example.com", shared_with_others: shared });
       mockConversations([row(false)]);
-      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-      const tree = () => (
-        <QueryClientProvider client={qc}>
-          <SidebarDataProvider>
-            <TooltipProvider>
-              <MemoryRouter initialEntries={["/"]}>
-                <Sidebar open onClose={vi.fn()} />
-              </MemoryRouter>
-            </TooltipProvider>
-          </SidebarDataProvider>
-        </QueryClientProvider>
-      );
-      const { rerender } = render(tree());
+      const { refresh } = renderSidebar();
       expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
 
       mockConversations([row(true)]);
-      rerender(tree());
+      refresh();
       expect(screen.getByRole("img", { name: "Shared session" })).toBeInTheDocument();
     } finally {
       viewer.mockRestore();
