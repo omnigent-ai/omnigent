@@ -21,6 +21,7 @@ const {
   Notification,
   clipboard,
   dialog,
+  globalShortcut,
   ipcMain,
   nativeImage,
   nativeTheme,
@@ -122,6 +123,7 @@ const {
   macApplicationMenu,
   settingsMenuItem,
 } = require("./settingsNavigation");
+const { acceleratorLabel, createGlobalShowShortcut } = require("./globalShowShortcut");
 const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
@@ -1674,6 +1676,56 @@ const updater = createDesktopUpdater({
   // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
   updatesEnabled: !app.isPackaged || !isDevBuild,
+});
+
+/**
+ * Native consent before a system-wide shortcut registers. The IPC gate only proves the
+ * request came from the pinned server's page, not that the user asked for it.
+ */
+async function confirmGlobalShortcut(win, accelerator) {
+  const origin = win ? pinnedOrigin(win) : null;
+  if (!origin) return false;
+  let host = origin;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    // Keep the full origin string if it doesn't parse.
+  }
+  const label = acceleratorLabel(accelerator, process.platform === "darwin");
+  const icon = nativeImage.createFromPath(ICON_PNG);
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    icon: icon.isEmpty() ? undefined : icon,
+    title: "Omnigent",
+    message: `Use ${label} to show Omnigent from any app?`,
+    detail:
+      `${host} wants to set a system-wide shortcut. While Omnigent is running, pressing ` +
+      `${label} in any app brings Omnigent to the front.\n\nOnly allow servers you trust.`,
+    buttons: ["Don't Allow", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  return response === 1;
+}
+
+// "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
+// come forward from another app.
+const globalShowShortcut = createGlobalShowShortcut({
+  globalShortcut,
+  loadSettings,
+  saveSettings,
+  isMac: process.platform === "darwin",
+  show: () => {
+    const win = activeWindow();
+    if (!win) {
+      createWindow();
+      return;
+    }
+    if (win.isMinimized()) win.restore();
+    win.focus();
+    if (process.platform === "darwin") app.focus({ steal: true });
+  },
 });
 
 // Shell-owned About window: available from the native application menu even
@@ -4811,6 +4863,35 @@ function registerIpc() {
     return true;
   });
 
+  // Settings → "Show Omnigent from anywhere" (opt-in, system-wide shortcut).
+  ipcMain.handle("omnigent:get-global-shortcut", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("get-global-shortcut is only available to a connected server page");
+    }
+    return globalShowShortcut.current();
+  });
+  ipcMain.handle("omnigent:set-global-shortcut", (event, setting) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("set-global-shortcut is only available to a connected server page");
+    }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return globalShowShortcut.set(setting, (accelerator) =>
+      confirmGlobalShortcut(win, accelerator),
+    );
+  });
+  // The Settings recorder takes the next chord here, ahead of the page's shortcuts and the menu.
+  ipcMain.handle("omnigent:record-global-shortcut", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("record-global-shortcut is only available to a connected server page");
+    }
+    return globalShowShortcut.record(event.sender);
+  });
+  ipcMain.handle("omnigent:cancel-global-shortcut-recording", (event) => {
+    if (!isPinnedOriginSender(event)) return false;
+    globalShowShortcut.cancelRecording();
+    return true;
+  });
+
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the
   // app-wide badge shown is the sum across windows (see updateBadge), so two
   // windows on different servers don't clobber each other's counts.
@@ -5966,6 +6047,7 @@ if (!gotLock) {
     registerSessionExpiryAccess();
     registerIpc();
     buildMenu();
+    globalShowShortcut.apply();
     // Patch PATH for GUI-launched Electron on macOS/Linux:
     // A desktop launcher inherits a minimal system PATH that omits directories like
     // /opt/homebrew/bin and ~/.nvm/... where CLI tools (claude, codex, tmux) live.
@@ -6011,6 +6093,7 @@ if (!gotLock) {
     });
   });
 
+  app.on("will-quit", () => globalShortcut.unregisterAll());
   app.on("window-all-closed", () => {
     // macOS apps typically stay alive until Cmd-Q.
     if (process.platform !== "darwin") app.quit();
