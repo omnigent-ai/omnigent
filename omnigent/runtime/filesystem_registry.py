@@ -621,14 +621,19 @@ class FilesystemRegistry(ABC):
         generation = (
             None if operation == "deleted" else self.revert_generation(path, session_id=session_id)
         )
-        current_text = None if generation is None else await read_text()
-        self.record_change(
-            path,
-            operation,
-            session_id,
-            current_text=current_text,
-            revert_generation=generation,
-        )
+        current_text = None
+        try:
+            if generation is not None:
+                current_text = await read_text()
+        finally:
+            # The write already happened, so record it even if the read is cancelled.
+            self.record_change(
+                path,
+                operation,
+                session_id,
+                current_text=current_text,
+                revert_generation=generation,
+            )
 
     def forget_original(self, path: str, *, session_id: str) -> None:
         """Make *session_id*'s original for *path* unknown, so no write drops *path*.

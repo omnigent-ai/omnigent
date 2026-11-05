@@ -11,6 +11,7 @@ Events are injected via :func:`_inject`, which calls :meth:`record_change` on
 the registry so tests exercise the same code path as real tool calls.
 """
 
+import asyncio
 import logging
 import os
 import subprocess
@@ -449,6 +450,28 @@ async def test_unreadable_original_stays_unknown_after_a_concurrent_seed(tmp_pat
     for _ in range(2):
         await registry.record_tracked_change("file.txt", "modified", "session", read)
     read.assert_not_awaited()
+    listed = registry.list_changed_files("session", limit=10)
+    assert [entry["status"] for entry in listed] == ["modified"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_revert_read_still_records_the_change(tmp_path: Path) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+    registry.seed_snapshot("file.txt", "a\n", session_id="session")
+    read_started = asyncio.Event()
+
+    async def read_until_cancelled() -> str | None:
+        read_started.set()
+        await asyncio.Event().wait()
+        return "a\n"
+
+    record = asyncio.create_task(
+        registry.record_tracked_change("file.txt", "modified", "session", read_until_cancelled)
+    )
+    await read_started.wait()
+    record.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await record
     listed = registry.list_changed_files("session", limit=10)
     assert [entry["status"] for entry in listed] == ["modified"]
 
