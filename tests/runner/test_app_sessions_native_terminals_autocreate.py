@@ -2549,6 +2549,55 @@ async def test_auto_create_claude_terminal_subscription_ignores_inherited_api_cr
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under ``managed-mcp.json`` the relay entry reads the session's bridge from the env."""
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    (config_home / "config.yaml").write_text(
+        "providers:\n  claude:\n    kind: subscription\n    cli: claude\n    default: true\n"
+    )
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridge")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
+    )
+    managed_dir = tmp_path / "etc-claude-code"
+    managed_dir.mkdir()
+    relay_entry = claude_native_bridge.managed_mcp_relay_entry()
+    (managed_dir / "managed-mcp.json").write_text(
+        json.dumps({"mcpServers": {"omnigent": relay_entry}})
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed_dir / "managed-settings.json",),
+    )
+    captured: dict[str, Any] = {}
+
+    await _auto_create_claude_terminal(
+        "conv_managed_relay",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),
+        agent_spec=AgentSpec(
+            spec_version=1,
+            name="claude",
+            executor=ExecutorSpec(config={"harness": "claude-native"}),
+        ),
+        auth_token_factory=lambda: None,
+    )
+
+    spec = captured["spec"]
+    assert "--mcp-config" not in spec.args
+    bridge_dir = Path(spec.env[claude_native_bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV])
+    assert (bridge_dir / "bridge.json").is_file()
+    assert spec.env[claude_native_bridge.MANAGED_MCP_RELAY_TMPDIR_ENV] == str(tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

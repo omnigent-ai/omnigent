@@ -9159,6 +9159,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
+        claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
@@ -9894,10 +9895,13 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(
-            claude_config,
-            client_surface=resource_registry.client_surface(session_id),
-        ),
+        env={
+            **build_native_claude_terminal_env(
+                claude_config,
+                client_surface=resource_registry.client_surface(session_id),
+            ),
+            **claude_terminal_relay_env(bridge_dir),
+        },
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning

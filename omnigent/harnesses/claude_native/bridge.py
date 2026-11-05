@@ -268,6 +268,15 @@ _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
+# Read by the static relay entry in an enterprise managed-mcp.json; see
+# docs/CLAUDE_MANAGED_MCP.md.
+MANAGED_MCP_RELAY_PYTHON_ENV = "OMNIGENT_MCP_RELAY_PYTHON"
+MANAGED_MCP_RELAY_BRIDGE_DIR_ENV = "OMNIGENT_MCP_RELAY_BRIDGE_DIR"
+MANAGED_MCP_RELAY_TMPDIR_ENV = "OMNIGENT_MCP_RELAY_TMPDIR"
+MANAGED_MCP_RELAY_MISSING_WARNING = (
+    "Claude Code has an enterprise managed-mcp.json without Omnigent's relay entry; "
+    "starting without Omnigent's MCP tools (see docs/CLAUDE_MANAGED_MCP.md)."
+)
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 # Tools-changed: harness POSTs to the bridge MCP server's localhost
 # control endpoint, which emits ``notifications/tools/list_changed``
@@ -1607,7 +1616,7 @@ def acp_mcp_bridge_root() -> Path:
 
 
 def prepare_acp_mcp_bridge_dir() -> Path:
-    """Create a fresh, secure per-relay bridge dir for an ACP harness.
+    """Create a fresh, secure per-relay bridge dir for an ACP harness or claude-sdk.
 
     Returns a unique owner-only directory under :func:`acp_mcp_bridge_root` with
     a minimal token-only ``bridge.json`` — so the shared ``serve-mcp`` serves
@@ -2384,29 +2393,93 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
         :data:`sys.executable`.
     :returns: JSON-serializable Claude MCP config.
     """
-    python = python_executable or sys.executable
     return {
         "mcpServers": {
-            _MCP_SERVER_NAME: {
-                "command": python,
-                "args": [
-                    "-I",
-                    "-m",
-                    "omnigent.harnesses.claude_native.bridge",
-                    "serve-mcp",
-                    "--bridge-dir",
-                    str(bridge_dir),
-                ],
-                "env": {
-                    "PYTHONUNBUFFERED": "1",
-                    # The bridge root is derived from tempfile at import time.
-                    # Keep it aligned with the runner when Claude inherits a
-                    # different TMPDIR from the user's shell.
-                    "TMPDIR": str(_TRUSTED_PARENT),
-                },
-            }
+            _MCP_SERVER_NAME: _serve_mcp_entry(
+                python_executable or sys.executable, str(bridge_dir), str(_TRUSTED_PARENT)
+            )
         }
     }
+
+
+def _serve_mcp_entry(python: str, bridge_dir: str, tmpdir: str) -> _JsonObject:
+    """One Claude Code MCP server entry that runs ``serve-mcp`` for a bridge directory."""
+    return {
+        "command": python,
+        "args": [
+            "-I",
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            bridge_dir,
+        ],
+        "env": {
+            "PYTHONUNBUFFERED": "1",
+            # The bridge root is derived from tempfile at import time. Keep it
+            # aligned with the runner when Claude inherits a different TMPDIR.
+            "TMPDIR": tmpdir,
+        },
+    }
+
+
+def managed_mcp_relay_entry() -> _JsonObject:
+    """The static ``omnigent`` entry an operator adds to Claude Code's ``managed-mcp.json``.
+
+    Claude Code refuses ``--mcp-config`` while that file exists, so this entry stands in
+    for :func:`build_mcp_config`; Claude Code expands each session's values from the
+    environment :func:`managed_mcp_relay_env` sets.
+    """
+    return _serve_mcp_entry(
+        f"${{{MANAGED_MCP_RELAY_PYTHON_ENV}}}",
+        f"${{{MANAGED_MCP_RELAY_BRIDGE_DIR_ENV}}}",
+        f"${{{MANAGED_MCP_RELAY_TMPDIR_ENV}}}",
+    )
+
+
+def managed_mcp_relay_env(
+    bridge_dir: Path, *, python_executable: str | None = None
+) -> dict[str, str]:
+    """Environment that points :func:`managed_mcp_relay_entry` at one session's bridge.
+
+    :param bridge_dir: Bridge directory ``serve-mcp`` serves.
+    :param python_executable: Python with Omnigent installed; ``None`` uses this one.
+    :returns: Claude Code environment, e.g. ``{"OMNIGENT_MCP_RELAY_BRIDGE_DIR": "/tmp/x", ...}``.
+    """
+    return {
+        MANAGED_MCP_RELAY_PYTHON_ENV: python_executable or sys.executable,
+        MANAGED_MCP_RELAY_BRIDGE_DIR_ENV: str(bridge_dir),
+        MANAGED_MCP_RELAY_TMPDIR_ENV: str(_TRUSTED_PARENT),
+    }
+
+
+def claude_terminal_relay_env(
+    bridge_dir: Path, *, python_executable: str | None = None
+) -> dict[str, str]:
+    """Relay environment for a Claude Code terminal, needed only under ``managed-mcp.json``.
+
+    Without that file :func:`augment_claude_args` passes the relay as ``--mcp-config``.
+    """
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
+
+    if not claude_code_managed_mcp_present():
+        return {}
+    return managed_mcp_relay_env(bridge_dir, python_executable=python_executable)
+
+
+def managed_mcp_relay_configured() -> bool:
+    """Whether the ``managed-mcp.json`` Claude Code applies has the relay entry.
+
+    Only an ``omnigent`` entry that reads the bridge directory from the environment
+    can reach a session's relay.
+    """
+    from omnigent.host.mcp_inventory import managed_claude_mcp_config
+
+    _present, servers = managed_claude_mcp_config()
+    entry = servers.get(_MCP_SERVER_NAME)
+    return isinstance(entry, Mapping) and (
+        f"${{{MANAGED_MCP_RELAY_BRIDGE_DIR_ENV}" in json.dumps(entry)
+    )
 
 
 def _pin_runner_tmpdir(command: str) -> str:
@@ -3007,11 +3080,10 @@ def augment_claude_args(
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     if claude_code_managed_mcp_present():
-        # Claude Code exits at startup on --mcp-config while an enterprise MCP config exists.
-        _logger.warning(
-            "Claude Code has an enterprise managed-mcp.json; launching without "
-            "Omnigent's MCP tools."
-        )
+        # Claude Code exits at startup on --mcp-config while an enterprise MCP config
+        # exists; its relay entry reads the bridge from claude_terminal_relay_env.
+        if not managed_mcp_relay_configured():
+            _logger.warning(MANAGED_MCP_RELAY_MISSING_WARNING)
     else:
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])

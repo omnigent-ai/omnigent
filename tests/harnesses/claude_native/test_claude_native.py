@@ -208,6 +208,20 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
     # The runner recovers the bridge from the settings path, and hooks still load.
     assert Path(args[args.index("--settings") + 1]).parent == bridge_dir
     assert "SessionStart" in _load_invocation_settings(args)["hooks"]
+    # A static relay entry in the managed file reaches this bridge through the env.
+    relay_env = body["spec"]["env"]
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV] == str(bridge_dir)
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_PYTHON_ENV] == sys.executable
+
+    managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
+    managed_file.write_text(
+        json.dumps({"mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}}),
+        encoding="utf-8",
+    )
+    captured_warnings.clear()
+    body = claude_native._claude_terminal_request((), command="claude", bridge_dir=bridge_dir)
+    assert "--mcp-config" not in body["spec"]["args"]
+    assert captured_warnings == []
 
 
 def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:
