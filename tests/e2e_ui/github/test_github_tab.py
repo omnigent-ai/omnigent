@@ -28,7 +28,7 @@ import re
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e_ui.conftest import (
     fetch_with_retry,
@@ -446,27 +446,43 @@ def test_composer_pr_link_opens_github_tab(
         expect(panel).to_have_attribute("data-state", "closed")
         expect(pr_link).to_be_in_viewport()
 
-    expected_font_size = font_size * 0.9
+    expected_font_size = font_size - 1
     for test_id, actual_font_size in font_sizes.items():
         assert actual_font_size == pytest.approx(expected_font_size, abs=0.01), (
             f"{test_id} should use the caption size at {font_size}px preference: {font_sizes}"
         )
     reference_center = centers["composer-workspace-dir.icon"]
-    expected_bar_height = 28 if is_mobile else 37
-    expected_center_offset = 14 if is_mobile else 19
-    assert bar_bounds["height"] == pytest.approx(expected_bar_height, abs=0.1)
-    assert reference_center == pytest.approx(bar_bounds["y"] + expected_center_offset, abs=0.5)
+    pr_center = centers["composer-pr-link.icon"]
+    if not is_mobile:
+        assert bar_bounds["height"] == pytest.approx(37, abs=0.1)
+        assert reference_center == pytest.approx(bar_bounds["y"] + 19, abs=0.5)
+        assert pr_center == pytest.approx(reference_center, abs=0.5)
     for name, center in centers.items():
-        assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
+        row_center = (
+            pr_center
+            if name.startswith(("composer-pr-link.", "composer-context-ring."))
+            else reference_center
+        )
+        assert center == pytest.approx(row_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
         assert pair_gap == pytest.approx(4, abs=0.1), (name, pair_gaps)
     directory_bounds = page.get_by_test_id("composer-workspace-dir").bounding_box()
     branch_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
     assert directory_bounds is not None and branch_bounds is not None
-    selector_gaps = (
+    selector_gaps = [
         branch_bounds["x"] - directory_bounds["x"] - directory_bounds["width"],
-        pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"],
-    )
+    ]
+    if abs(pr_center - reference_center) <= 0.5:
+        selector_gaps.append(pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"])
+    else:
+        assert is_mobile
+        assert pr_bounds["y"] >= branch_bounds["y"] + branch_bounds["height"]
+        assert pr_bounds["x"] == pytest.approx(directory_bounds["x"], abs=0.5)
+    for rect in (directory_bounds, branch_bounds, pr_bounds, context_bounds):
+        assert rect["x"] >= bar_bounds["x"]
+        assert rect["x"] + rect["width"] <= bar_bounds["x"] + bar_bounds["width"]
+        assert rect["y"] >= bar_bounds["y"]
+        assert rect["y"] + rect["height"] <= bar_bounds["y"] + bar_bounds["height"]
     expected_selector_gap = 2 if is_mobile else 8
     for gap in selector_gaps:
         assert gap == pytest.approx(expected_selector_gap, abs=0.1), selector_gaps
@@ -546,11 +562,11 @@ def test_no_pr_keeps_linking_when_another_provider_discovery_fails(
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_be_visible()
 
 
-@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile", "canvas"])
 def test_post_top_level_pr_comment(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
 ) -> None:
-    """The same composer posts and retains drafts through every PR-panel entry point."""
+    """Comments and push history share a feed through every PR-panel entry point."""
     base_url, session_id = seeded_session
     _stub_github(page, pr_count=2)
     pr_url = _INFO["pr"]["url"]
@@ -559,6 +575,7 @@ def test_post_top_level_pr_comment(
             **_INFO["pr"]["comments"][0],
             "body": f"Earlier comment {index + 1}",
             "url": f"{pr_url}#comment-{index}",
+            "created_at": "2026-10-25T06:00:00Z" if index == 29 else "2026-09-05T07:32:02Z",
         }
         for index in range(30)
     ]
@@ -568,7 +585,30 @@ def test_post_top_level_pr_comment(
         "selected_pr_url": pr_url,
         "capabilities": {"comment_posting": True},
         "selected_account": "octocat",
-        "pr": {**_INFO["pr"], "comments": comments},
+        "pr": {
+            **_INFO["pr"],
+            "comments": comments,
+            "timeline_events": [
+                {
+                    "id": "commit-1",
+                    "kind": "commit",
+                    "author": "octocat",
+                    "created_at": "2026-10-24T12:00:00Z",
+                    "url": "https://example.com/acme/app/commit/" + "a" * 40,
+                    "sha": "a" * 40,
+                    "message": "Address review feedback",
+                },
+                {
+                    "id": "force-push-1",
+                    "kind": "force_push",
+                    "author": "octocat",
+                    "created_at": "2026-10-25T12:00:00Z",
+                    "url": "https://example.com/acme/app/commit/" + "b" * 40,
+                    "sha": "b" * 40,
+                    "previous_sha": "a" * 40,
+                },
+            ],
+        },
     }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
     posts = []
@@ -587,7 +627,11 @@ def test_post_top_level_pr_comment(
     page.route(re.compile(r"/resources/github/comments$"), post_comment)
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
-    page.goto(f"{base_url}/c/{session_id}")
+    if entry == "canvas":
+        from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
+
+        _stub_server_info(page, canvas=True, session_pull_requests=True)
+    page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
     panel = (
         page.get_by_test_id("github-panel-drawer")
         if mobile
@@ -612,6 +656,20 @@ def test_post_top_level_pr_comment(
     composer_top = textbox.evaluate("el => el.getBoundingClientRect().top")
     feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     expect(panel.get_by_text("Earlier comment 30", exact=True)).to_be_in_viewport()
+    rows = feed.get_by_role("listitem")
+    expect(rows).to_have_count(32)
+    expect(rows.nth(29)).to_contain_text("committed")
+    expect(rows.nth(29)).to_contain_text("Address review feedback")
+    expect(
+        rows.nth(29).get_by_role("link", name="Open commit aaaaaaa on GitHub", exact=True)
+    ).to_have_attribute("href", "https://example.com/acme/app/commit/" + "a" * 40)
+    expect(rows.nth(30)).to_contain_text("Earlier comment 30")
+    expect(rows.nth(31)).to_contain_text("force-pushed")
+    expect(rows.nth(31)).to_contain_text("bbbbbbb")
+    expect(
+        rows.nth(31).get_by_role("link", name="Open commit bbbbbbb on GitHub", exact=True)
+    ).to_have_attribute("href", "https://example.com/acme/app/commit/" + "b" * 40)
+    page.screenshot(path=str(tmp_path / f"push-history-{entry}.png"))
     assert textbox.evaluate("el => el.getBoundingClientRect().top") == pytest.approx(
         composer_top, abs=1
     )
@@ -642,6 +700,9 @@ def test_post_top_level_pr_comment(
     expect(textbox).to_have_value("")
     panel.get_by_role("button", name="Refresh", exact=True).click()
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    expect(rows).to_have_count(33)
+    expect(rows.nth(31)).to_contain_text("force-pushed")
+    expect(rows.nth(32)).to_contain_text("Thanks for reviewing!")
     feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_in_viewport()
     expect(post_button).to_be_in_viewport()
@@ -1089,3 +1150,329 @@ def test_reply_to_inline_review_conversation(
     ]
     ranged.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-range-posted.png"))
+
+
+# Two additions match "added": the first on line 2, the second on line 4.
+_FIND_PATCH = (
+    "diff --git a/src/app/main.py b/src/app/main.py\n"
+    "index e69de29..4b825dc 100644\n"
+    "--- a/src/app/main.py\n"
+    "+++ b/src/app/main.py\n"
+    "@@ -1,2 +1,4 @@\n"
+    " line1\n"
+    "+added line\n"
+    " line2\n"
+    "+added again\n"
+)
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
+def test_changes_find_reveals_collapsed_and_filtered(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """Find reveals a collapsed file's match, highlights it, and steps through matches.
+
+    Exercises find reveal, navigation, and highlighting through both panel entry points.
+    Filter-dependent hints are covered by component tests.
+    """
+    base_url, session_id = seeded_session
+    mobile = entry == "composer-mobile"
+    page.emulate_media(color_scheme="dark" if mobile else "light")
+    _stub_github(page, pr_count=2)
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda route: route.fulfill(json={**_PR_DIFF, "patch": _FIND_PATCH}),
+    )
+    page.set_viewport_size({"width": 390 if mobile else 1440, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    if mobile:
+        page.get_by_test_id("composer-pr-link").click()
+    else:
+        open_right_rail(page)
+        panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role(
+        "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
+    ).click()
+    tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+
+    file = panel.locator('[data-github-file="src/app/main.py"]')
+    file.get_by_role("button", name=re.compile(r"main\.py"), expanded=True).click()
+    expect(file.locator("diffs-container")).to_have_count(0)
+
+    panel.get_by_role("button", name="Find in changes", exact=True).click()
+    find = panel.get_by_role("textbox", name="Find in changes", exact=True)
+    expect(find).to_be_focused()
+    find.fill("added")
+    expect(panel.get_by_text("1 of 2", exact=True)).to_be_visible()
+    expect(file.locator("diffs-container")).to_have_count(1)
+
+    def wait_for_highlight(line: str) -> None:
+        # Painting runs in an effect after the counter updates, so poll for the new range.
+        page.wait_for_function(
+            """([line]) => [...(CSS.highlights.get("pr-find-active") ?? [])].some((range) =>
+                range.startContainer.isConnected && range.toString() === "added"
+                && range.startContainer.parentElement.closest("[data-line]")
+                    ?.getAttribute("data-line") === line)""",
+            arg=[line],
+        )
+
+    def highlighted() -> list[dict[str, str | None]]:
+        return page.evaluate(
+            """() => [...(CSS.highlights.get("pr-find-active") ?? [])].map((range) => ({
+                text: range.toString(),
+                line: range.startContainer.parentElement.closest("[data-line]")
+                    ?.getAttribute("data-line") ?? null,
+            }))"""
+        )
+
+    first = file.locator('[data-line="2"][data-line-type="change-addition"]')
+    expect(first).to_be_in_viewport()
+    wait_for_highlight("2")
+    assert highlighted() == [{"text": "added", "line": "2"}]
+    page.screenshot(path=str(tmp_path / f"find-{entry}-first-match.png"))
+
+    find.press("Enter")
+    expect(panel.get_by_text("2 of 2", exact=True)).to_be_visible()
+    wait_for_highlight("4")
+    assert highlighted() == [{"text": "added", "line": "4"}]
+    expect(file.locator('[data-line="4"][data-line-type="change-addition"]')).to_be_in_viewport()
+
+    if not mobile:
+        # The highlight survives a diff re-render in the other layout.
+        panel.get_by_role("button", name="Switch to split view", exact=True).click()
+        wait_for_highlight("4")
+        assert highlighted() == [{"text": "added", "line": "4"}]
+        panel.get_by_role("button", name="Switch to unified view", exact=True).click()
+
+    find.press("Escape")
+    expect(find).to_have_count(0)
+    page.wait_for_function("() => !CSS.highlights.has('pr-find-active')")
+    assert highlighted() == []
+
+    # Ctrl/Cmd+F reopens the bar from inside the Changes tab.
+    file.get_by_role("button", name=re.compile(r"main\.py"), expanded=True).focus()
+    page.keyboard.press("ControlOrMeta+f")
+    expect(panel.get_by_role("textbox", name="Find in changes", exact=True)).to_be_focused()
+    page.screenshot(path=str(tmp_path / f"find-{entry}-reopened.png"))
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
+def test_changes_viewed_progress_persists_and_resets(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """Viewed marks collapse files, survive a reload, and reset when the PR gets a new head."""
+    base_url, session_id = seeded_session
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
+    _stub_github(page)
+    pr_url = _INFO["pr"]["url"]
+    # The PR's head moves mid-test, so every resource answers for the current head.
+    head = {"sha": "head1"}
+
+    def info_at_head(route: Route) -> None:
+        route.fulfill(
+            json={
+                **_INFO,
+                "tracking_available": True,
+                "selected_pr_url": pr_url,
+                "prs": [
+                    {
+                        "url": pr_url,
+                        "host": "example.com",
+                        "repository": "acme/app",
+                        "number": _PR_NUMBER,
+                        "relationship": "created",
+                    }
+                ],
+                "pr": {**_INFO["pr"], "head_sha": head["sha"], "base_sha": "base"},
+            }
+        )
+
+    page.route(re.compile(r"/resources/github(?:\?|$)"), info_at_head)
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda r: r.fulfill(json={**_CHANGES, "head_sha": head["sha"], "base_sha": "base"}),
+    )
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda r: r.fulfill(json={**_PR_DIFF, "head_sha": head["sha"], "base_sha": "base"}),
+    )
+
+    def open_changes() -> Locator:
+        if mobile:
+            page.get_by_test_id("composer-pr-link").click()
+            panel = page.get_by_test_id("github-panel-drawer")
+        else:
+            open_right_rail(page)
+            panel = page.get_by_role("complementary", name="Workspace")
+            panel.get_by_role("tab", name="Pull Requests").click()
+        panel.get_by_role("tablist", name="Pull request", exact=True).get_by_role(
+            "tab", name="Changes", exact=True
+        ).click()
+        return panel
+
+    page.goto(f"{base_url}/c/{session_id}")
+    panel = open_changes()
+    expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
+    panel.get_by_role("checkbox", name="Viewed README.md").click()
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
+    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    if not mobile:  # Mobile shows the count without the bar.
+        expect(panel.get_by_role("progressbar", name="Files viewed")).to_have_attribute(
+            "aria-valuenow", "50"
+        )
+    # Marking collapses the file's diff.
+    expect(
+        panel.get_by_role("button", name=re.compile(r"^README\.md"), expanded=False)
+    ).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"viewed-{entry}-marked.png"), animations="disabled")
+
+    # Marks are browser-local, so they survive a reload on the same head.
+    page.reload()
+    panel = open_changes()
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked(timeout=30_000)
+    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+
+    # A new head starts with no marks and says so until the notice is dismissed.
+    head["sha"] = "head2"
+    page.reload()
+    panel = open_changes()
+    expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).not_to_be_checked()
+    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"viewed-{entry}-reset.png"), animations="disabled")
+    panel.get_by_role("button", name="Dismiss", exact=True).click()
+    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_have_count(0)
+
+    # Hiding viewed files, once every file is viewed, shows the all-viewed state.
+    panel.get_by_role("checkbox", name="Viewed README.md").click()
+    panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
+    panel.get_by_role("checkbox", name="Hide viewed").click()
+    expect(panel.get_by_text("All 2 files viewed", exact=True)).to_be_visible()
+    if not mobile:
+        expect(panel.get_by_role("progressbar", name="Files viewed")).to_have_attribute(
+            "aria-valuenow", "100"
+        )
+    page.screenshot(path=str(tmp_path / f"viewed-{entry}-all-viewed.png"), animations="disabled")
+    panel.get_by_role("button", name="Show viewed", exact=True).click()
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).not_to_be_checked()
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
+def test_changes_filter_copy_open(page: Page, seeded_session: tuple[str, str], entry: str) -> None:
+    """Filter changed files, copy a path, and open a file at the pinned head revision.
+
+    The rail covers the desktop sidebar and icon copy. The mobile composer covers the
+    collapsed sidebar's inline filter and every file action in the overflow menu.
+    """
+    base_url, session_id = seeded_session
+    is_mobile = entry == "composer-mobile"
+    pr_url = _INFO["pr"]["url"]
+    _stub_github(page)
+    # The list reports the revisions it was fetched for, which Open links use.
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda route: route.fulfill(json={**_CHANGES, "head_sha": "head", "base_sha": "base"}),
+    )
+    # Supply fork metadata and revisions for the Open-link assertion.
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_INFO,
+                "tracking_available": True,
+                "selected_pr_url": pr_url,
+                "prs": [
+                    {
+                        "url": pr_url,
+                        "host": "example.com",
+                        "repository": "acme/app",
+                        "number": _PR_NUMBER,
+                        "relationship": "created",
+                    }
+                ],
+                "pr": {
+                    **_INFO["pr"],
+                    "head_sha": "head",
+                    "base_sha": "base",
+                    "head_repository_url": "https://example.com/fork/app",
+                },
+            }
+        ),
+    )
+    if is_mobile:
+        workspace = "/workspace/demo-app"
+
+        def session_details(route: Route) -> None:
+            response = fetch_with_retry(route)
+            snapshot = response.json()
+            snapshot.update(
+                workspace=workspace, git_branch="feature/github-tab", host_id="composer-pr-host"
+            )
+            route.fulfill(response=response, json=snapshot)
+
+        page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
+        page.route(
+            "**/v1/hosts/composer-pr-host/worktrees?*",
+            lambda route: route.fulfill(
+                json={
+                    "data": [
+                        {
+                            "path": workspace,
+                            "branch": "feature/github-tab",
+                            "is_main": False,
+                            "detached": False,
+                        }
+                    ]
+                }
+            ),
+        )
+        page.set_viewport_size({"width": 390, "height": 844})
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
+    page.goto(f"{base_url}/c/{session_id}")
+    if is_mobile:
+        page.get_by_test_id("composer-pr-link").click()
+        panel = page.get_by_test_id("github-panel-drawer")
+        expect(panel).to_have_attribute("data-state", "open")
+    else:
+        open_right_rail(page)
+        panel = page.get_by_role("complementary", name="Workspace")
+        panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+
+    files = panel.locator("[data-github-file]")
+    expect(files).to_have_count(2, timeout=30_000)
+    if is_mobile:
+        # The sidebar starts collapsed on mobile, so the filter opens above the list.
+        panel.get_by_role("button", name="Show file filter").click()
+    filter_box = panel.get_by_role("searchbox", name="Filter changed files")
+    filter_box.fill("readme")
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    filter_box.fill("no-such-file")
+    expect(panel.get_by_text('No changed files match "no-such-file"')).to_be_visible()
+    panel.get_by_role("button", name="Clear filter").click()
+    expect(files).to_have_count(2)
+    filter_box.fill("readme")
+    filter_box.press("Escape")
+    expect(filter_box).to_have_value("")
+    expect(files).to_have_count(2)
+
+    if is_mobile:
+        panel.get_by_role("button", name="More actions for src/app/main.py").click()
+        page.get_by_role("menuitem", name="Copy path", exact=True).click()
+    else:
+        panel.get_by_role("button", name="Copy path src/app/main.py").click()
+    expect(page.get_by_text("Copied path", exact=True)).to_be_visible()
+    assert page.evaluate("navigator.clipboard.readText()") == "src/app/main.py"
+
+    panel.get_by_role("button", name="More actions for README.md").click()
+    expect(page.get_by_role("menuitem", name="Open in GitHub")).to_have_attribute(
+        "href", "https://example.com/fork/app/blob/head/README.md"
+    )

@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import shutil
 import subprocess
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -46,9 +48,11 @@ from omnigent.runner import create_runner_app, native_file_observer
 from omnigent.runner.native import ResolvedSpec
 from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig, ToolsConfig
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
 from omnigent.terminals.pane_reaper import PaneRef
+from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -93,6 +97,18 @@ class _StubResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
+    def set_session_background_publisher(
+        self,
+        publisher: Callable[[str, bool], None],
+    ) -> None:
+        """
+        Accept the background-shell publisher installed by the runner app.
+
+        The stub never launches a real terminal, so the callback stays unused.
+        :returns: None.
+        """
+        del publisher
+
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],
@@ -107,6 +123,9 @@ class _StubResourceRegistry:
         :returns: None.
         """
         self._session_status_publisher = publisher
+
+    def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
+        self._session_failure_publisher = publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -363,11 +382,50 @@ async def _launch_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scheduled", [False, True])
 async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     relay_env: _RelayEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    scheduled: bool,
 ) -> None:
-    """A bridge_inject_dir launch writes tool_relay.json with the relay tools."""
-    resp = await _launch_terminal(relay_env.client, relay_env.session_id, bridge_inject_dir=True)
+    """The session relay and its notifier must not retain the launching occurrence."""
+    started = bridge.start_tool_relay
+    notified = threading.Event()
+
+    def start(**kwargs):
+        logging.getLogger("omnigent.runner.test").info("session relay started")
+        return started(**kwargs)
+
+    def notify(*args, **kwargs):
+        logging.getLogger("omnigent.runner.test").info("session relay notified")
+        notified.set()
+
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
+    monkeypatch.setattr(bridge, "post_tools_changed", notify)
+    if scheduled:
+        relay_env.client.headers[SCHEDULED_RUN_HEADER] = json.dumps(
+            {
+                "task_id": "task",
+                "run_id": "run",
+                "task_workspace_id": 7,
+                "scheduled_at": 1000,
+                "target": "connected_host",
+                "session_mode": "continue",
+            }
+        )
+    with capture_debug_rows("runner") as rows:
+        resp = await _launch_terminal(
+            relay_env.client, relay_env.session_id, bridge_inject_dir=True
+        )
+        assert await asyncio.to_thread(notified.wait, 5)
+    relay_env.client.headers.pop(SCHEDULED_RUN_HEADER, None)
+    probes = [
+        row
+        for row in rows
+        if row["message"] in {"session relay started", "session relay notified"}
+    ]
+    assert len(probes) == 2
+    assert all("run_id" not in row["attributes"] for row in probes)
     assert resp.status_code == 200, f"terminal launch failed: {resp.text}"
 
     relay_file = relay_env.bridge_dir / _TOOL_RELAY_FILE
@@ -1071,6 +1129,19 @@ async def test_relay_policy_evaluate_truncates_long_upstream_error(
             raise httpx.RequestError("x" * 5000)
 
     loop = asyncio.get_running_loop()
+    logging_started = asyncio.Event()
+    release_logging = threading.Event()
+    logging_finished = threading.Event()
+
+    def blocked_warning(*args: object, **kwargs: object) -> None:
+        loop.call_soon_threadsafe(logging_started.set)
+        try:
+            assert release_logging.wait(15), "error response waited for diagnostic logging"
+        finally:
+            logging_finished.set()
+
+    warning = Mock(side_effect=blocked_warning)
+    monkeypatch.setattr(bridge._logger, "warning", warning)
     relay = start_tool_relay(
         bridge_dir=bridge_dir,
         tools=[],
@@ -1092,6 +1163,8 @@ async def test_relay_policy_evaluate_truncates_long_upstream_error(
                 timeout=5.0,
             )
 
+        await asyncio.wait_for(logging_started.wait(), timeout=5)
+        assert not logging_finished.is_set(), "response must arrive before logging finishes"
         assert resp.status_code == 502
         body = resp.text
         # The actionable prefix + leading cause survive; the tail is elided.
@@ -1101,7 +1174,11 @@ async def test_relay_policy_evaluate_truncates_long_upstream_error(
         assert body.endswith("...")
         # Bounded well under the raw 5000-char reason.
         assert len(body) < 500
+        warning.assert_called_once()
+        assert isinstance(warning.call_args.kwargs["exc_info"], httpx.RequestError)
+        assert str(warning.call_args.kwargs["exc_info"]) == "x" * 5000
     finally:
+        release_logging.set()
         relay.close()
 
 

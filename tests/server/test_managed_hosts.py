@@ -2490,9 +2490,12 @@ async def test_launch_success_registers_host_and_returns_workspace(
     online poll observes a genuine hosts-table transition.
     """
     host_store = HostStore(db_uri)
+    state = ManagedLaunch(settled=asyncio.Event())
 
     def _register(invocation: HostStartInvocation) -> None:
         """Simulate the sandbox host connecting over the tunnel."""
+        assert state.host_online_failure_hint is not None
+        assert state.host_online_failure_hint() is None
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
@@ -2506,8 +2509,10 @@ async def test_launch_success_registers_host_and_returns_workspace(
         owner=_OWNER,
         host_store=host_store,
         host_id=requested_host_id,
+        launch_state=state,
     )
 
+    assert state.host_online_failure_hint is None
     assert fake.prepared is True
     # Only a requested id needs the host to key off its default here.
     config_writes = [cmd for cmd in fake.commands if cmd.startswith("python3 -c")]
@@ -2876,14 +2881,73 @@ async def test_launch_host_start_failure_terminates_and_deletes_host(db_uri: str
     """
     fake = FakeSandboxLauncher(fail_on_host_start=True)
     host_store = HostStore(db_uri)
+    state = ManagedLaunch(settled=asyncio.Event())
 
     with pytest.raises(HTTPException) as exc:
         await launch_managed_host(
-            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store, launch_state=state
         )
+    assert state.host_online_failure_hint is None
     assert exc.value.status_code == 502
     assert "simulated in-sandbox host start failure" in exc.value.detail
     assert fake.terminated == ["sb-fake-1"]
+    assert host_store.list_hosts(_OWNER) == []
+
+
+@pytest.mark.parametrize("relaunch", [False, True])
+async def test_cancelled_launch_releases_provider_recovery_hint(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, relaunch: bool
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _provision_managed_sandbox
+
+    tracker = ManagedLaunchTracker()
+    tracker.begin("conv-hint")
+    state = tracker.get("conv-hint")
+    assert state is not None
+    host_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    fake = FakeSandboxLauncher(
+        on_host_start=lambda _invocation: loop.call_soon_threadsafe(host_started.set)
+    )
+    monkeypatch.setattr(
+        fake, "host_online_failure_hint", lambda sandbox_id: f"Inspect logs for {sandbox_id}"
+    )
+    host_store = HostStore(db_uri)
+    existing = None
+    if relaunch:
+        existing = host_store.register_managed_host(
+            host_id=uuid.uuid4().hex,
+            name="durable-host",
+            user_id=_OWNER,
+            token="old-token",
+            token_expires_at=now_epoch() + 3600,
+            provider=fake.provider,
+            sandbox_id="old-sandbox",
+        )
+    launch = asyncio.create_task(
+        _provision_managed_sandbox(
+            session_id="conv-hint",
+            owner=_OWNER,
+            sandbox_config=_injected_config(fake),
+            repos=(),
+            tracker=tracker,
+            host_store=host_store,
+            relaunch_host=existing,
+        )
+    )
+    try:
+        await asyncio.wait_for(host_started.wait(), 5)
+        assert state.host_online_failure_hint is not None
+        assert state.host_online_failure_hint() == "Inspect logs for sb-fake-1"
+    finally:
+        launch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+    assert state.host_online_failure_hint is None
+    # Cancellation leaves the sandbox for its caller's cleanup.
+    [host] = host_store.list_hosts(_OWNER)
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+    assert fake.terminated == (["old-sandbox"] if relaunch else []) + ["sb-fake-1"]
     assert host_store.list_hosts(_OWNER) == []
 
 
