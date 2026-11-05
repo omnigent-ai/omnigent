@@ -158,18 +158,22 @@ the header menu), and each place is a separate entry point.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
-  (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
+  (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
   (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
   clears the cached rows and shows loading while session timestamps refresh,
   including project folders, pins, and Archived. With the flag off,
-  sessions always use Updated regardless of the saved preference. Shared sessions
-  get their own section above Sessions. Status groups are Needs attention, Unread,
+  sessions always use Updated regardless of the saved preference. Sessions shared
+  with the viewer get their own "Shared with me" section above Sessions, without a
+  per-row people icon. Status groups are Needs attention, Unread,
   Working, Draft, and Done. Working stays visible with muted “No sessions” text
   when empty. Starting or running sessions enter Working immediately; idle must
   last 10 seconds before they leave it. Errors and approvals bypass that delay.
+  Background work of a native Claude or Codex session keeps it in Working, and
+  a prompt its turn waits on in the terminal puts it in Needs attention; see the
+  `working-status` rules in [Native harnesses](./native-harnesses.md).
   This only affects grouping, and existing hover/rename holds still apply.
   Harness groups sessions under alphabetically ordered harness names (such as
   Claude Code, Codex, and Pi), including custom agents using the same harness.
@@ -200,7 +204,9 @@ menu → **Open in grid** and choose the pane and direction. Each pane has its o
 transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
-screen; drafts and terminal connections survive view changes.
+screen; drafts and terminal connections survive view changes. A managed session
+whose sandbox never started shows its saved first message as **Not delivered**
+in its cell too, with **Copy message to new session**.
 Render failures in one chat or terminal show **Try again** in that view while
 cell controls, the other view and neighboring sessions stay usable. Clear the
 fault and retry to recover.
@@ -321,7 +327,9 @@ Projects header holds Grouping, Display, Ordering and Show. In
 Status, Harness, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
 project, Shared and Sessions rows together; the Sessions header keeps only New
-session. Hovering a row opens
+session. On Display → Shared with me, Projects is hidden (folders hold only the
+viewer's own sessions) and the Shared with me header carries the funnel, New
+session and Select sessions. Hovering a row opens
 its tooltip; the repo and PR rows load from the session's GitHub info only once
 the tooltip opens, and fall back to the PR the server stored for the session
 when the live lookup has none, with its age once that state is over five
@@ -777,11 +785,12 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
   seeds an error item directly into the spawned server's database.
 - **`reconnect`, offline-host cause (own environment):**
-  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_preserves_failed_turn_and_retry`
+  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_refuses_input_and_keeps_reconnect_action`
   creates Claude/Codex native-wrapper sessions on a real disposable host, stops
-  the host and its runners, and checks the API failure and browser details.
-  It covers missing and stale runner bindings, reload persistence, and retry
-  without duplicate transcript input. Repeat with `--device='iPhone 13'` for
+  the host and its runners, and checks that both client retry contracts refuse
+  without transcript input, failed status, or pending work. It covers missing
+  and stale runner bindings, reload, the host menu's Reconnect action, and a
+  refused retry with no extra items. Repeat with `--device='iPhone 13'` for
   the mobile entry point; keep browser evidence outside the checkout.
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`

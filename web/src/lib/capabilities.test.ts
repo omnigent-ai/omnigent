@@ -271,6 +271,22 @@ describe.each([
   });
 });
 
+it.each([
+  [undefined, 10],
+  [10, 10],
+  [30, 30],
+  [240, 240],
+  [9, 10],
+  [241, 10],
+  [10.5, 10],
+  ["30", 10],
+  [true, 10],
+])("parses trigger polling minutes %j as %j", async (advertised, expected) => {
+  expect(
+    (await probe({ automation_trigger_poll_minutes: advertised })).automation_trigger_poll_minutes,
+  ).toBe(expected);
+});
+
 describe("resolveServerInfo scheduled_task_session_modes", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ scheduled_task_session_modes: true })).scheduled_task_session_modes).toBe(
