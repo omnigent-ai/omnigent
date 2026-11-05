@@ -132,7 +132,7 @@ export function HeaderConversationMenu({
   const isArchived = conversation.archived === true;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
-  const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
+  const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
   // Share and Agent info reach this menu on mobile from the header's legacy
   // Share · Agent info menu, which reported them under these ids. Keep
   // emitting the same ones so the metric series stays continuous, and only on
@@ -401,7 +401,7 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
+            className="mobile-touch-target shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
           >
             <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
           </Button>
@@ -465,11 +465,20 @@ export function HeaderConversationMenu({
               }}
               className="mt-4 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
             />
-            <DialogFooter className="mt-4 border-t-0 bg-transparent">
-              <Button type="button" variant="ghost" onClick={() => setRenameOpen(false)}>
+            <DialogFooter className="mt-4 border-t-0 bg-transparent mobile-app:flex-col-reverse mobile-app:gap-1">
+              <Button
+                type="button"
+                variant="ghost"
+                className="mobile-touch-target mobile-app:w-full"
+                onClick={() => setRenameOpen(false)}
+              >
                 Cancel
               </Button>
-              <Button type="submit" disabled={!renameTitle.trim() || rename.isPending}>
+              <Button
+                type="submit"
+                className="mobile-touch-target mobile-app:w-full"
+                disabled={!renameTitle.trim() || rename.isPending}
+              >
                 Rename
               </Button>
             </DialogFooter>
