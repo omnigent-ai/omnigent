@@ -9340,7 +9340,7 @@ def test_list_conversations_sort_by_id_pages_a_spawn_tree_in_id_order(
 def test_spawn_tree_read_examines_rows_through_the_root_index(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """The descendants read (no kind or archived filter, ``sort_by="id"``)
+    """``list_spawn_tree`` (no kind or archived filter, ``sort_by="id"``)
     is served in index order with no sort step, so ``limit`` bounds the rows
     examined even when the tree holds many archived sub-agents."""
     from sqlalchemy import event
@@ -9363,22 +9363,19 @@ def test_spawn_tree_read_examines_rows_through_the_root_index(
 
     event.listen(engine, "before_cursor_execute", capture)
     try:
-        page = conversation_store.list_conversations(
-            limit=5,
-            kind=None,
-            include_archived=True,
-            root_conversation_id=root.id,
-            order="asc",
-            sort_by="id",
-        )
+        page = conversation_store.list_spawn_tree(root.id, limit=5)
     finally:
         event.remove(engine, "before_cursor_execute", capture)
 
     assert len(page.data) == 5 and page.has_more
-    statement, params = statements[-1]
+    # Every read the tree load issues (rows, then SQLite insertion-order
+    # tiebreakers) walks the root index with no sort step.
+    assert len(statements) == 2
     with engine.connect() as conn:
-        plan = " ".join(
-            str(row[-1]) for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, params)
-        )
-    assert "ix_conversations_root_conversation_id" in plan
-    assert "TEMP B-TREE" not in plan
+        for statement, params in statements:
+            plan = " ".join(
+                str(row[-1])
+                for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, params)
+            )
+            assert "ix_conversations_root_conversation_id" in plan, plan
+            assert "TEMP B-TREE" not in plan, plan

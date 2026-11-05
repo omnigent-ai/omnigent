@@ -241,9 +241,9 @@ def register_items_routes(
         """Return a page of *parent*'s sub-agent subtree, breadth-first.
 
         Every sub-agent records the root of its spawn tree, so one bounded
-        read in index order returns the whole tree and the subtree is cut out
-        in memory. READ on *parent* covers its descendants: a sub-agent's
-        access is its parent chain's.
+        read (:meth:`ConversationStore.list_spawn_tree`) returns the whole
+        tree and the subtree is cut out in memory. READ on *parent* covers
+        its descendants: a sub-agent's access is its parent chain's.
 
         :param parent: The session the caller was authorized on.
         :param limit: Maximum rows in the page.
@@ -256,19 +256,10 @@ def register_items_routes(
             the tree outgrew one read since the page it came from.
         """
         page = await asyncio.to_thread(
-            conversation_store.list_conversations,
+            conversation_store.list_spawn_tree,
+            parent.root_conversation_id or parent.id,
             # The tree's root row plus up to the cap of sub-agents.
             limit=_SPAWN_TREE_READ_CAP + 1,
-            # No kind or archived filter: neither is in the
-            # (workspace_id, root_conversation_id, id) index, so filtering in
-            # SQL would examine rows past the limit. Both are applied below.
-            kind=None,
-            include_archived=True,
-            root_conversation_id=parent.root_conversation_id or parent.id,
-            order="asc",
-            # Index order, so the read examines at most the limit; siblings
-            # are ordered newest-first below.
-            sort_by="id",
         )
         if page.has_more:
             if after is not None:
@@ -276,13 +267,13 @@ def register_items_routes(
                 # cannot continue, so the client restarts.
                 raise StaleCursorError(after)
             return None
+        # Rows come in the store's one-level listing order, so grouping keeps
+        # each parent's children in the order a per-level walk reads them.
         children_of: dict[str, list[Conversation]] = {}
         for row in page.data:
             # An archived sub-agent hides its subtree, as in a per-level walk.
             if row.parent_conversation_id and not row.archived:
                 children_of.setdefault(row.parent_conversation_id, []).append(row)
-        for siblings in children_of.values():
-            siblings.sort(key=lambda c: (c.created_at, c.id), reverse=True)
         ordered: list[Conversation] = []
         depths: dict[str, int] = {}
         parent_ids: dict[str, str] = {}

@@ -3514,6 +3514,44 @@ class SqlAlchemyConversationStore(ConversationStore):
         if granted is None:
             raise StaleCursorError(cursor_id)
 
+    def list_spawn_tree(self, root_conversation_id: str, *, limit: int) -> PagedList[Conversation]:
+        """Read one spawn tree, breaking timestamp ties by this store's tiebreaker.
+
+        The one-level listing orders siblings by ``(created_at,
+        _tiebreaker_col)`` (insertion order on SQLite, id elsewhere), so the
+        tree is ordered the same way. Both reads walk the
+        ``(workspace_id, root_conversation_id, id)`` index in id order, so
+        *limit* bounds the rows each examines.
+
+        :param root_conversation_id: Root of the spawn tree.
+        :param limit: Maximum conversations to return.
+        :returns: The tree's conversations in listing order.
+        """
+        page = super().list_spawn_tree(root_conversation_id, limit=limit)
+        if self._conv_engine.dialect.name != "sqlite":
+            return page
+        with self._conv_session("list_spawn_tree") as session:
+            tiebreakers = dict(
+                session.execute(
+                    select(SqlConversation.id, self._tiebreaker_col)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.root_conversation_id == root_conversation_id,
+                    )
+                    .order_by(SqlConversation.id)
+                    .limit(limit)
+                ).all()
+            )
+        rows = sorted(
+            page.data, key=lambda c: (c.created_at, tiebreakers.get(c.id, 0)), reverse=True
+        )
+        return PagedList(
+            data=rows,
+            first_id=rows[0].id if rows else None,
+            last_id=rows[-1].id if rows else None,
+            has_more=page.has_more,
+        )
+
     @staticmethod
     def _resolve_sort_column(sort_by: str) -> QueryableAttribute[Any]:
         """

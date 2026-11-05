@@ -1894,6 +1894,40 @@ class ConversationStore(ABC):
         """Restore a failed profile rotation unless its binding changed or is authoritative."""
         raise NotImplementedError
 
+    def list_spawn_tree(self, root_conversation_id: str, *, limit: int) -> PagedList[Conversation]:
+        """Read one spawn tree in a single bounded read, to rebuild its hierarchy.
+
+        Returns up to *limit* conversations of the tree rooted at
+        *root_conversation_id*: the root and sub-agents at every depth,
+        archived included. They are ordered newest first, with timestamp ties
+        broken the way :meth:`list_conversations` breaks them, so each
+        parent's children appear in the order a one-level listing returns
+        them. ``has_more`` means the tree holds more than *limit* rows.
+
+        The default reads in id order (``sort_by="id"``, the root index's
+        order in SQL stores, so *limit* bounds the rows examined) and breaks
+        ties by id.
+
+        :param root_conversation_id: Root of the spawn tree.
+        :param limit: Maximum conversations to return.
+        :returns: The tree's conversations in listing order.
+        """
+        page = self.list_conversations(
+            limit=limit,
+            kind=None,
+            include_archived=True,
+            root_conversation_id=root_conversation_id,
+            order="asc",
+            sort_by="id",
+        )
+        rows = sorted(page.data, key=lambda c: (c.created_at, c.id), reverse=True)
+        return PagedList(
+            data=rows,
+            first_id=rows[0].id if rows else None,
+            last_id=rows[-1].id if rows else None,
+            has_more=page.has_more,
+        )
+
     @abstractmethod
     def list_conversations_by_runner_id(
         self,

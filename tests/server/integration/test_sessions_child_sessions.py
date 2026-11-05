@@ -2673,13 +2673,14 @@ def _seed_tree(conv_store: SqlAlchemyConversationStore, root_id: str) -> dict[st
 
 
 async def _walk_levels(
-    client: httpx.AsyncClient, session_id: str, max_depth: int
+    client: httpx.AsyncClient, session_id: str, max_depth: int, limit: int = 20
 ) -> list[tuple[str, str]]:
     """Walk the tree one ``child_sessions`` call per node, like older clients.
 
     :param client: The test HTTP client.
     :param session_id: Session to walk below.
     :param max_depth: Levels to walk.
+    :param limit: Children read per node, as the per-level page size.
     :returns: ``(id, parent_session_id)`` in breadth-first order.
     """
     rows: list[tuple[str, str]] = []
@@ -2687,7 +2688,7 @@ async def _walk_levels(
     for _ in range(max_depth):
         next_frontier: list[str] = []
         for node in frontier:
-            resp = await client.get(f"/v1/sessions/{node}/child_sessions")
+            resp = await client.get(f"/v1/sessions/{node}/child_sessions", params={"limit": limit})
             assert resp.status_code == 200
             for row in resp.json()["data"]:
                 rows.append((row["id"], row["parent_session_id"]))
@@ -2715,12 +2716,7 @@ async def test_child_sessions_descendants_returns_the_subtree_in_walk_order(
     body = resp.json()
 
     rows = [(row["id"], row["parent_session_id"]) for row in body["data"]]
-    assert sorted(rows) == sorted(await _walk_levels(client, session["id"], 3))
-    # Breadth-first, and each parent's children newest first, as a walk reads them.
-    assert [row["depth"] for row in body["data"]] == sorted(row["depth"] for row in body["data"])
-    for parent_id in {row["parent_session_id"] for row in body["data"]}:
-        created = [r["created_at"] for r in body["data"] if r["parent_session_id"] == parent_id]
-        assert created == sorted(created, reverse=True)
+    assert rows == await _walk_levels(client, session["id"], 3)
     depths = {row["id"]: row["depth"] for row in body["data"]}
     # a3 is four levels down, past the default depth of 3.
     assert depths == {ids["a"]: 1, ids["b"]: 1, ids["a1"]: 2, ids["a2"]: 3}
@@ -2889,49 +2885,47 @@ async def test_child_sessions_descendants_cursor_fails_once_the_tree_outgrows_on
     assert resp.json()["error"]["code"] == "stale_cursor"
 
 
-async def test_child_sessions_descendants_exact_breadth_first_order(
+async def test_child_sessions_descendants_breaks_timestamp_ties_like_a_walk(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """The exact sequence: level by level, each level grouped by its parents'
-    order, each parent's children newest first with ties broken by id
-    (descending), as the MySQL, PostgreSQL and managed stores order a level."""
+    """Siblings created in the same second come back in the order the store's
+    one-level listing returns them (insertion order on SQLite, id elsewhere),
+    so a per-parent limit keeps the same child and branch as the walk.
+
+    Failure means the SDK's ``child_sessions_tree(limit=...)`` selects a
+    different sub-agent once it switches to ``descendants=true``.
+    """
+    from omnigent_client._sessions import _limit_children_per_parent
     from sqlalchemy import update
 
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlConversation
 
     session = await _create_parent_session(client)
     conv_store = SqlAlchemyConversationStore(db_uri)
-    ids: dict[str, str] = {"root": session["id"]}
-    created = {"a": 100, "b": 100, "a1": 200, "a2": 200, "b1": 150, "b2": 300}
-    for name, parent in [
-        ("a", "root"),
-        ("b", "root"),
-        ("a1", "a"),
-        ("a2", "a"),
-        ("b1", "b"),
-        ("b2", "b"),
-    ]:
-        ids[name] = _seed_child(
-            conv_store=conv_store, parent_id=ids[parent], title=f"worker:{name}"
-        ).id
+
+    def seed(parent_id: str, name: str) -> str:
+        return _seed_child(conv_store=conv_store, parent_id=parent_id, title=f"worker:{name}").id
+
+    siblings = [seed(session["id"], f"s{i}") for i in range(6)]
+    # Keep adding until id order and insertion order disagree, so the test
+    # cannot pass by an id tie-break that happens to match insertion order.
+    while sorted(siblings) == siblings or sorted(siblings, reverse=True) == siblings:
+        siblings.append(seed(session["id"], f"s{len(siblings)}"))
+    for sibling in siblings:
+        seed(sibling, f"{sibling[:6]}-child")
     with conv_store._conv_engine.begin() as conn:
-        for name, ts in created.items():
-            conn.execute(
-                update(SqlConversation)
-                .where(SqlConversation.id == ids[name])
-                .values(created_at=ts)
-            )
+        conn.execute(
+            update(SqlConversation)
+            .where(SqlConversation.id.in_(siblings))
+            .values(created_at=1_700_000_000)
+        )
+    url = f"/v1/sessions/{session['id']}/child_sessions"
 
-    def newest_first(*names: str) -> list[str]:
-        return sorted(names, key=lambda n: (created[n], ids[n]), reverse=True)
+    body = (await client.get(url, params={"descendants": "true"})).json()
+    rows = [(row["id"], row["parent_session_id"]) for row in body["data"]]
+    assert rows == await _walk_levels(client, session["id"], 3)
 
-    level1 = newest_first("a", "b")
-    children = {"a": newest_first("a1", "a2"), "b": newest_first("b1", "b2")}
-    expected = [ids[n] for n in level1] + [ids[c] for p in level1 for c in children[p]]
-
-    resp = await client.get(
-        f"/v1/sessions/{session['id']}/child_sessions", params={"descendants": "true"}
-    )
-
-    assert [row["id"] for row in resp.json()["data"]] == expected
+    kept = _limit_children_per_parent(body["data"], session["id"], 1)
+    walked = await _walk_levels(client, session["id"], 3, limit=1)
+    assert [(row["id"], row["parent_id"]) for row in kept] == walked
