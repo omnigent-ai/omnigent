@@ -20,6 +20,7 @@ import { subagentTabId } from "@/lib/subagentTabs";
 import type { Session } from "@/lib/types";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
+import { TerminalFirstContextProvider, type TerminalFirstView } from "./TerminalFirstContext";
 import {
   type DefaultWorkspaceTab,
   writeDefaultWorkspaceTab,
@@ -200,6 +201,8 @@ function renderWorkspace(
     initialPath?: string;
     closeSelectedTabRef?: { current: (() => boolean) | null };
     permissionLevel?: number | null;
+    /** The main session's Chat/Terminal choice; omitted means not terminal-first. */
+    mainView?: TerminalFirstView;
   } = {},
 ) {
   let overrides = initialOverrides;
@@ -216,59 +219,73 @@ function renderWorkspace(
     initialOverrides.queryClient ??
     new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const tree = () => (
-    <TooltipProvider delayDuration={0}>
-      <WorkspacePanel
-        conversationId={overrides.conversationId ?? "conv_ws"}
-        contained={overrides.contained}
-        width={overrides.width ?? 360}
-        open={overrides.open}
-        animateVisibility={overrides.animateVisibility}
-        resizing={overrides.resizing}
-        inert={overrides.inert}
-        handleProps={{
-          tabIndex: 0,
-          role: "separator",
-          "aria-label": "Resize panel",
-          onMouseDown: vi.fn(),
-          onKeyDown: vi.fn(),
-        }}
-        rightRailTab={overrides.rightRailTab === undefined ? "files" : overrides.rightRailTab}
-        onRightRailTabChange={onRightRailTabChange}
-        openPanels={overrides.openPanels ?? []}
-        onClosePanel={onClosePanel}
-        closeSelectedTabRef={overrides.closeSelectedTabRef}
-        showFilesPanel={overrides.showFilesPanel ?? true}
-        showContentSearch={overrides.showContentSearch}
-        showGithubTab={overrides.showGithubTab ?? false}
-        showBrowserTab={overrides.showBrowserTab ?? false}
-        onReveal={onReveal}
-        changedCount={overrides.changedCount ?? 0}
-        subagentsWorking={0}
-        agentCount={1}
-        rootSessionId={null}
-        selectedFilePath={overrides.selectedFilePath ?? null}
-        openFiles={overrides.openFiles ?? []}
-        openFileViewer={openFileViewer}
-        onCloseFile={onCloseFile}
-        onShowScopeView={vi.fn()}
-        onCommentsOpenChange={vi.fn()}
-        openTerminalTab={openTerminalTab}
-        openTerminals={overrides.openTerminals ?? []}
-        selectedTerminalKey={overrides.selectedTerminalKey ?? null}
-        onCloseTerminal={onCloseTerminal}
-        maximized={overrides.maximized ?? false}
-        onToggleMaximized={onToggleMaximized}
-        permissionLevel={overrides.permissionLevel ?? null}
-        filesPanelSort={"recent" as ChangedSort}
-        onSortChange={vi.fn()}
-        filesPanelShowHidden={false}
-        onShowHiddenChange={vi.fn()}
-        liveness={overrides.liveness}
-        pending={overrides.pending}
-        mobileSideChatsOpen={overrides.mobileSideChatsOpen}
-        onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
-      />
-    </TooltipProvider>
+    <TerminalFirstContextProvider
+      value={{
+        isClaudeNative: false,
+        isNativeWrapper: overrides.mainView !== undefined,
+        isTerminalFirst: overrides.mainView !== undefined,
+        isShellView: false,
+        view: overrides.mainView ?? "chat",
+        terminalViewKey: null,
+        setView: vi.fn(),
+        terminalsAvailable: overrides.mainView !== undefined,
+        terminalStartingUp: false,
+      }}
+    >
+      <TooltipProvider delayDuration={0}>
+        <WorkspacePanel
+          conversationId={overrides.conversationId ?? "conv_ws"}
+          contained={overrides.contained}
+          width={overrides.width ?? 360}
+          open={overrides.open}
+          animateVisibility={overrides.animateVisibility}
+          resizing={overrides.resizing}
+          inert={overrides.inert}
+          handleProps={{
+            tabIndex: 0,
+            role: "separator",
+            "aria-label": "Resize panel",
+            onMouseDown: vi.fn(),
+            onKeyDown: vi.fn(),
+          }}
+          rightRailTab={overrides.rightRailTab === undefined ? "files" : overrides.rightRailTab}
+          onRightRailTabChange={onRightRailTabChange}
+          openPanels={overrides.openPanels ?? []}
+          onClosePanel={onClosePanel}
+          closeSelectedTabRef={overrides.closeSelectedTabRef}
+          showFilesPanel={overrides.showFilesPanel ?? true}
+          showContentSearch={overrides.showContentSearch}
+          showGithubTab={overrides.showGithubTab ?? false}
+          showBrowserTab={overrides.showBrowserTab ?? false}
+          onReveal={onReveal}
+          changedCount={overrides.changedCount ?? 0}
+          subagentsWorking={0}
+          agentCount={1}
+          rootSessionId={null}
+          selectedFilePath={overrides.selectedFilePath ?? null}
+          openFiles={overrides.openFiles ?? []}
+          openFileViewer={openFileViewer}
+          onCloseFile={onCloseFile}
+          onShowScopeView={vi.fn()}
+          onCommentsOpenChange={vi.fn()}
+          openTerminalTab={openTerminalTab}
+          openTerminals={overrides.openTerminals ?? []}
+          selectedTerminalKey={overrides.selectedTerminalKey ?? null}
+          onCloseTerminal={onCloseTerminal}
+          maximized={overrides.maximized ?? false}
+          onToggleMaximized={onToggleMaximized}
+          permissionLevel={overrides.permissionLevel ?? null}
+          filesPanelSort={"recent" as ChangedSort}
+          onSortChange={vi.fn()}
+          filesPanelShowHidden={false}
+          onShowHiddenChange={vi.fn()}
+          liveness={overrides.liveness}
+          pending={overrides.pending}
+          mobileSideChatsOpen={overrides.mobileSideChatsOpen}
+          onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
+        />
+      </TooltipProvider>
+    </TerminalFirstContextProvider>
   );
   // The panel reads session snapshots and renders router links.
   const Providers = ({ children }: { children: ReactNode }) => (
@@ -1588,6 +1605,58 @@ describe("WorkspacePanel mobile side chats", () => {
 
     expect(screen.queryByTestId("side-chats-panel-drawer")).toBeNull();
     expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+});
+
+describe("WorkspacePanel side chat view mode", () => {
+  const agentTerminal = {
+    id: "terminal_claude_main",
+    name: "main",
+    session: "claude",
+    running: true,
+  };
+  beforeEach(() => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side"],
+      selectedSideChatId: "conv_side",
+    });
+    useTerminalsMock.mockImplementation((sessionId) => ({
+      terminals: sessionId === "conv_side" ? [agentTerminal] : [],
+      isLoading: false,
+      error: null,
+    }));
+  });
+
+  it("shows the side chat's own terminal while the main session is in Terminal view", async () => {
+    const { rerender } = renderWorkspace({ rightRailTab: "sidechat", mainView: "terminal" });
+
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent(
+      "terminal_claude_main",
+    );
+    // The chat stays mounted behind the terminal so its drafts and queue survive.
+    const chat = screen.getByTestId("side-chat-pane-stub").parentElement!;
+    expect(chat).toHaveClass("hidden");
+    expect(chat).toHaveAttribute("inert");
+
+    rerender({ mainView: "chat" });
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+    expect(screen.getByTestId("side-chat-pane-stub").parentElement).not.toHaveClass("hidden");
+    expect(screen.getByTestId("side-chat-pane-stub").parentElement).not.toHaveAttribute("inert");
+  });
+
+  it.each([
+    ["the main session is not terminal-first", undefined, "conv_side"],
+    ["the side chat has no agent terminal", "terminal" as const, "conv_other_side"],
+  ])("keeps the chat when %s", (_case, mainView, childId) => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: [childId],
+      selectedSideChatId: childId,
+    });
+    renderWorkspace({ rightRailTab: "sidechat", mainView });
+
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent(childId);
+    expect(screen.getByTestId("side-chat-pane-stub").parentElement).not.toHaveClass("hidden");
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
   });
 });
 
