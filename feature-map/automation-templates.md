@@ -104,8 +104,9 @@ to customize.
   keep one session, and editing keeps only the reset to a new session.
 - `responsive`: gallery items have icons, descriptions, access requirements,
   pointer cursors, and keyboard focus indicators. Continued trigger cadence is
-  fixed; other tasks expose schedule controls. The modal opens with Instructions
-  focused and Name visible above it. Run on and session mode precede Repeat and
+  fixed; other tasks expose schedule controls. Name comes first, followed by
+  Trigger type during creation. The modal opens with Instructions focused.
+  Run on and session mode precede Repeat and
   Time because both determine the minimum interval. Time and timezone are separate
   controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
   opens its searchable dropdown. Custom schedules use the same typed time input.

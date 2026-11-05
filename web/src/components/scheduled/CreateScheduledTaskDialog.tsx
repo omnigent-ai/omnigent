@@ -890,6 +890,17 @@ export function CreateScheduledTaskDialog({
           className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 py-5"
           data-testid="scheduled-task-dialog-body"
         >
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="task-name">Name</Label>
+            <Input
+              id="task-name"
+              value={name}
+              placeholder="Name this automation"
+              data-testid="task-name-input"
+              className="text-ui focus-visible:ring-0"
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
           {!isEdit && (
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="task-trigger-type">Trigger type</Label>
@@ -942,18 +953,6 @@ export function CreateScheduledTaskDialog({
           >
             {({ recurrenceFields, endingFields }) => (
               <>
-                <div className="flex flex-col gap-1.5">
-                  <Label htmlFor="task-name">Name</Label>
-                  <Input
-                    id="task-name"
-                    value={name}
-                    placeholder="Name this automation"
-                    data-testid="task-name-input"
-                    className="text-ui focus-visible:ring-0"
-                    onChange={(e) => setName(e.target.value)}
-                  />
-                </div>
-
                 {trigger !== null ? (
                   <TriggerTemplateFields
                     source={trigger}
