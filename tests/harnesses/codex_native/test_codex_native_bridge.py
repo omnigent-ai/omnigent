@@ -44,6 +44,7 @@ from omnigent.harnesses.codex_native.bridge import (
     record_child_usage_baseline,
     record_codex_automatic_input_receipt,
     record_codex_interrupt,
+    settle_codex_automatic_input,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -367,6 +368,157 @@ def test_delayed_same_owner_publication_cannot_erase_a_newer_receipt(tmp_path: P
     write_bridge_state(tmp_path, claimed)
 
     assert read_bridge_state(tmp_path) == received
+
+
+def test_delayed_claim_cannot_resurrect_after_owner_matched_settlement(tmp_path: Path) -> None:
+    """A durable settlement tombstone wins over a delayed pre-settlement writer."""
+    _seed_active_turn(tmp_path, "turn_source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claimed = claim_codex_automatic_input(
+        tmp_path, source, client_message_id="automatic-client-id"
+    )
+    assert claimed is not None
+    received = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=source.session_id,
+        thread_id=source.thread_id,
+        turn_id="turn_automatic",
+        client_message_id="automatic-client-id",
+    )
+    assert received is not None
+    settled = settle_codex_automatic_input(tmp_path, expected=received, outcome="completed")
+    assert settled is not None
+
+    write_bridge_state(tmp_path, claimed)
+
+    assert read_bridge_state(tmp_path) == settled
+
+
+@pytest.mark.parametrize("deadline", [0, -1, True, float("inf"), float("nan")])
+def test_automatic_claim_rejects_invalid_deadline(tmp_path: Path, deadline: float) -> None:
+    _seed_active_turn(tmp_path, "source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    assert (
+        claim_codex_automatic_input(
+            tmp_path,
+            source,
+            client_message_id="exact",
+            deadline=deadline,
+        )
+        is None
+    )
+    assert read_bridge_state(tmp_path) == source
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "session_id",
+        "thread_id",
+        "socket_path",
+        "codex_home",
+        "automatic_input_client_message_id",
+        "automatic_input_source_turn_id",
+    ],
+)
+def test_automatic_settlement_requires_original_owner_and_claim(
+    tmp_path: Path, change: str
+) -> None:
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claim = claim_codex_automatic_input(tmp_path, source, client_message_id="exact")
+    assert claim is not None
+    mismatched = replace(claim, **{change: "foreign"})
+    assert settle_codex_automatic_input(tmp_path, expected=mismatched, outcome="uncertain") is None
+    assert read_bridge_state(tmp_path) == claim
+
+
+@pytest.mark.parametrize("newer_turn", [False, True])
+def test_automatic_receipt_cannot_adopt_after_newer_turn_ran_to_idle(
+    tmp_path: Path,
+    newer_turn: bool,
+) -> None:
+    _seed_active_turn(tmp_path, "source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claim = claim_codex_automatic_input(tmp_path, source, client_message_id="exact")
+    assert claim is not None
+    if newer_turn:
+        update_active_turn_id(tmp_path, "manual")
+        update_active_turn_id(tmp_path, None)
+    proof = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=source.session_id,
+        thread_id=source.thread_id,
+        turn_id="automatic",
+        client_message_id="exact",
+    )
+    assert proof is not None
+    accepted = settle_codex_automatic_input(tmp_path, expected=claim, outcome="accepted")
+    assert (accepted is None) is newer_turn
+
+
+def test_automatic_settlement_cannot_regress_or_rearm_automatic_turn(tmp_path: Path) -> None:
+    _seed_active_turn(tmp_path, "source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claim = claim_codex_automatic_input(tmp_path, source, client_message_id="exact")
+    assert claim is not None
+    proof = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=source.session_id,
+        thread_id=source.thread_id,
+        turn_id="automatic",
+        client_message_id="exact",
+    )
+    assert proof is not None
+    accepted = settle_codex_automatic_input(tmp_path, expected=claim, outcome="accepted")
+    assert accepted is not None
+    assert settle_codex_automatic_input(tmp_path, expected=accepted, outcome="uncertain") is None
+    completed = settle_codex_automatic_input(tmp_path, expected=accepted, outcome="completed")
+    assert completed is not None
+    assert clear_active_turn_id_if_matches(tmp_path, "automatic", expected_owner=completed)
+    settled = read_bridge_state(tmp_path)
+    write_bridge_state(tmp_path, accepted)
+    assert read_bridge_state(tmp_path) == settled
+    assert settle_codex_automatic_input(tmp_path, expected=claim, outcome="uncertain") is None
+    assert claim_codex_automatic_input(tmp_path, completed, client_message_id="repeat") is None
+    update_active_turn_id(tmp_path, "manual")
+    manual = read_bridge_state(tmp_path)
+    assert manual is not None
+    assert claim_codex_automatic_input(tmp_path, manual, client_message_id="fresh") is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("automatic_input_outcome", "unknown"),
+        ("automatic_input_deadline", True),
+        ("automatic_input_deadline", -1),
+        ("automatic_input_deadline", "never"),
+        ("automatic_input_deadline", float("inf")),
+        ("turn_generation", -1),
+        ("turn_generation", True),
+        ("automatic_input_turn_generation", -1),
+        ("automatic_input_turn_generation", True),
+    ],
+)
+def test_invalid_automatic_lifecycle_metadata_fails_closed(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    _seed_active_turn(tmp_path, "source")
+    path = tmp_path / "state.json"
+    payload = json.loads(path.read_text())
+    payload[field] = value
+    path.write_text(json.dumps(payload))
+    assert read_bridge_state(tmp_path) is None
 
 
 @pytest.mark.parametrize("conflict", ["claim", "receipt"])

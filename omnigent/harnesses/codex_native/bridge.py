@@ -200,6 +200,10 @@ class CodexNativeBridgeState:
     :param automatic_input_client_message_id: Native delivery id allocated before submission.
     :param automatic_input_turn_id: Native turn proven by the matching delivery receipt.
     :param automatic_input_owner_scope: Session, thread, transport, and credential owner.
+    :param automatic_input_outcome: Durable recovery or cancellation settlement.
+    :param automatic_input_deadline: Fixed UTC epoch deadline shared across reconnects.
+    :param turn_generation: Monotonic activity revision within the current native owner.
+    :param automatic_input_turn_generation: Activity revision that authorized the claim.
     """
 
     session_id: str
@@ -217,6 +221,10 @@ class CodexNativeBridgeState:
     automatic_input_client_message_id: str | None = None
     automatic_input_turn_id: str | None = None
     automatic_input_owner_scope: tuple[str, ...] = ()
+    automatic_input_outcome: str | None = None
+    automatic_input_deadline: float | None = None
+    turn_generation: int = 0
+    automatic_input_turn_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -1091,6 +1099,10 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "automatic_input_client_message_id": state.automatic_input_client_message_id,
                     "automatic_input_turn_id": state.automatic_input_turn_id,
                     "automatic_input_owner_scope": state.automatic_input_owner_scope,
+                    "automatic_input_outcome": state.automatic_input_outcome,
+                    "automatic_input_deadline": state.automatic_input_deadline,
+                    "turn_generation": state.turn_generation,
+                    "automatic_input_turn_generation": state.automatic_input_turn_generation,
                 },
                 handle,
                 sort_keys=True,
@@ -1115,8 +1127,20 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
         if _bridge_owner_matches(current, state) and current is not None:
             current_interrupt_wins = current.interrupt_generation >= state.interrupt_generation
             automatic_input = _merge_automatic_input_fields(current, state)
+            published_turn_id = state.active_turn_id
+            if (
+                current.automatic_input_outcome in {"completed", "cancel_completed"}
+                and published_turn_id is not None
+                and published_turn_id
+                in {
+                    current.automatic_input_source_turn_id,
+                    current.automatic_input_turn_id,
+                }
+            ):
+                published_turn_id = current.active_turn_id
             state = replace(
                 state,
+                active_turn_id=published_turn_id,
                 interrupt_generation=max(state.interrupt_generation, current.interrupt_generation),
                 interrupted_turn_id=(
                     current.interrupted_turn_id
@@ -1127,6 +1151,17 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                 automatic_input_client_message_id=automatic_input[1],
                 automatic_input_turn_id=automatic_input[2],
                 automatic_input_owner_scope=automatic_input[3],
+                automatic_input_outcome=automatic_input[4],
+                automatic_input_deadline=automatic_input[5],
+                automatic_input_turn_generation=current.automatic_input_turn_generation,
+                turn_generation=max(
+                    current.turn_generation
+                    + int(
+                        published_turn_id is not None
+                        and published_turn_id != current.active_turn_id
+                    ),
+                    state.turn_generation,
+                ),
             )
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
@@ -1661,6 +1696,19 @@ def _optional_string_is_valid(value: object) -> bool:
     return value is None or (isinstance(value, str) and bool(value))
 
 
+_AUTOMATIC_INPUT_OUTCOMES = frozenset(
+    {
+        "accepted",
+        "completed",
+        "uncertain",
+        "cancel_requested",
+        "cancel_acknowledged",
+        "cancel_unconfirmed",
+        "cancel_completed",
+    }
+)
+
+
 def _bridge_owner_scope(state: CodexNativeBridgeState) -> tuple[str, str, str, str]:
     """Return the native session, thread, transport, and credential owner."""
     return state.session_id, state.thread_id, state.socket_path, state.codex_home
@@ -1675,20 +1723,22 @@ def _bridge_owner_matches(
 
 def _automatic_input_fields(
     state: CodexNativeBridgeState,
-) -> tuple[str | None, str | None, str | None, tuple[str, ...]]:
+) -> tuple[str | None, str | None, str | None, tuple[str, ...], str | None, float | None]:
     """Return one automatic input's durable claim and receipt as an atomic group."""
     return (
         state.automatic_input_source_turn_id,
         state.automatic_input_client_message_id,
         state.automatic_input_turn_id,
         state.automatic_input_owner_scope,
+        state.automatic_input_outcome,
+        state.automatic_input_deadline,
     )
 
 
 def _merge_automatic_input_fields(
     current: CodexNativeBridgeState,
     incoming: CodexNativeBridgeState,
-) -> tuple[str | None, str | None, str | None, tuple[str, ...]]:
+) -> tuple[str | None, str | None, str | None, tuple[str, ...], str | None, float | None]:
     """Merge same-owner control state monotonically; persisted claims win conflicts."""
     current_fields = _automatic_input_fields(current)
     incoming_fields = _automatic_input_fields(incoming)
@@ -1710,11 +1760,18 @@ def _merge_automatic_input_fields(
     ):
         _logger.warning("Ignored conflicting same-claim Codex automatic-input receipt")
         return current_fields
+    current_outcome = current_fields[4]
+    incoming_outcome = incoming_fields[4]
+    if current_outcome is not None and incoming_outcome not in {None, current_outcome}:
+        _logger.warning("Ignored conflicting same-claim Codex automatic-input settlement")
+        incoming_outcome = current_outcome
     return (
         current_fields[0],
         current_fields[1],
         current_receipt or incoming_receipt,
         current_fields[3],
+        current_outcome or incoming_outcome,
+        current_fields[5],
     )
 
 
@@ -1761,19 +1818,39 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     automatic_client_id = _optional_nonempty_string(raw.get("automatic_input_client_message_id"))
     automatic_turn_id = _optional_nonempty_string(raw.get("automatic_input_turn_id"))
     automatic_owner = raw.get("automatic_input_owner_scope", [])
+    automatic_outcome = _optional_nonempty_string(raw.get("automatic_input_outcome"))
+    automatic_deadline = raw.get("automatic_input_deadline")
+    turn_generation = raw.get("turn_generation", 0)
+    automatic_generation = raw.get("automatic_input_turn_generation", 0)
     if (
         type(interrupt_generation) is not int
         or interrupt_generation < 0
+        or type(turn_generation) is not int
+        or turn_generation < 0
+        or type(automatic_generation) is not int
+        or automatic_generation < 0
         or not _optional_string_is_valid(raw.get("interrupted_turn_id"))
         or (interrupted_turn_id is not None and interrupt_generation == 0)
         or not _optional_string_is_valid(raw.get("automatic_input_source_turn_id"))
         or not _optional_string_is_valid(raw.get("automatic_input_client_message_id"))
         or not _optional_string_is_valid(raw.get("automatic_input_turn_id"))
+        or automatic_outcome not in _AUTOMATIC_INPUT_OUTCOMES | {None}
+        or (
+            automatic_deadline is not None
+            and (
+                type(automatic_deadline) not in {int, float}
+                or automatic_deadline <= 0
+                or not math.isfinite(automatic_deadline)
+            )
+        )
         or not isinstance(automatic_owner, list)
         or len(automatic_owner) not in {0, 4}
         or any(not isinstance(value, str) or not value for value in automatic_owner)
         or ((automatic_source is None) != (automatic_client_id is None))
-        or (automatic_source is None and (automatic_turn_id is not None or automatic_owner))
+        or (
+            automatic_source is None
+            and (automatic_turn_id is not None or automatic_owner or automatic_outcome is not None)
+        )
         or (automatic_source is not None and len(automatic_owner) != 4)
         or (automatic_source is not None and automatic_source == automatic_turn_id)
     ):
@@ -1803,6 +1880,10 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             automatic_input_client_message_id=automatic_client_id,
             automatic_input_turn_id=automatic_turn_id,
             automatic_input_owner_scope=tuple(automatic_owner),
+            automatic_input_outcome=automatic_outcome,
+            automatic_input_deadline=automatic_deadline,
+            turn_generation=turn_generation,
+            automatic_input_turn_generation=automatic_generation,
         ),
         "ready",
     )
@@ -1850,6 +1931,8 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
             replace(
                 state,
                 active_turn_id=active_turn_id,
+                turn_generation=state.turn_generation
+                + int(active_turn_id is not None and state.active_turn_id != active_turn_id),
                 active_shell_turn_id=(
                     active_turn_id if state.active_shell_turn_id == active_turn_id else None
                 ),
@@ -1878,12 +1961,21 @@ def record_codex_interrupt(
             current.automatic_input_source_turn_id == expected.active_turn_id
             and current.automatic_input_owner_scope == _bridge_owner_scope(current)
             and current.active_turn_id in {None, current.automatic_input_turn_id}
+            and current.automatic_input_outcome not in {"completed", "cancel_completed"}
         )
         if current.active_turn_id != expected.active_turn_id and not owns_automatic_input:
             return None
-        target_turn_id = current.active_turn_id or current.automatic_input_turn_id
+        automatic_pending = (
+            current.automatic_input_source_turn_id is not None
+            and current.automatic_input_outcome not in {"completed", "cancel_completed"}
+        )
+        target_turn_id = current.active_turn_id or (
+            current.automatic_input_turn_id if automatic_pending else None
+        )
         interrupted_turn_id = (
-            target_turn_id or current.automatic_input_source_turn_id or expected.active_turn_id
+            target_turn_id
+            or (current.automatic_input_source_turn_id if automatic_pending else None)
+            or expected.active_turn_id
         )
         updated = replace(
             current,
@@ -1901,6 +1993,7 @@ def claim_codex_automatic_input(
     completed: CodexNativeBridgeState,
     *,
     client_message_id: str,
+    deadline: float | None = None,
 ) -> CodexNativeBridgeState | None:
     """Persist one automatic request before submission, or fail closed.
 
@@ -1911,7 +2004,18 @@ def claim_codex_automatic_input(
     to completion under the same owner.
     """
     source_turn_id = completed.active_turn_id
-    if source_turn_id is None or not client_message_id:
+    if (
+        source_turn_id is None
+        or not client_message_id
+        or (
+            deadline is not None
+            and (
+                type(deadline) not in {int, float}
+                or not math.isfinite(deadline)
+                or deadline <= time.time()
+            )
+        )
+    ):
         return None
     with _bridge_state_lock(bridge_dir):
         current = read_bridge_state(bridge_dir)
@@ -1923,7 +2027,14 @@ def claim_codex_automatic_input(
             or current.pending_shell_command_id is not None
             or current.active_shell_turn_id is not None
             or current.interrupted_turn_id == source_turn_id
-            or current.automatic_input_source_turn_id is not None
+            or (
+                current.automatic_input_source_turn_id is not None
+                and (
+                    current.automatic_input_outcome not in {"completed", "cancel_completed"}
+                    or source_turn_id
+                    in {current.automatic_input_source_turn_id, current.automatic_input_turn_id}
+                )
+            )
         ):
             return None
         updated = replace(
@@ -1932,6 +2043,10 @@ def claim_codex_automatic_input(
             automatic_input_source_turn_id=source_turn_id,
             automatic_input_client_message_id=client_message_id,
             automatic_input_owner_scope=_bridge_owner_scope(current),
+            automatic_input_turn_id=None,
+            automatic_input_outcome=None,
+            automatic_input_deadline=deadline,
+            automatic_input_turn_generation=current.turn_generation,
         )
         _write_bridge_state_unlocked(bridge_dir, updated)
         return updated
@@ -1964,6 +2079,106 @@ def record_codex_automatic_input_receipt(
         if state.automatic_input_turn_id == turn_id:
             return state
         updated = replace(state, automatic_input_turn_id=turn_id)
+        _write_bridge_state_unlocked(bridge_dir, updated)
+        return updated
+
+
+def settle_codex_automatic_input(
+    bridge_dir: Path,
+    *,
+    expected: CodexNativeBridgeState,
+    outcome: str,
+) -> CodexNativeBridgeState | None:
+    """Settle only the exact persisted claim and retain a tombstone for stale writers."""
+    if outcome not in _AUTOMATIC_INPUT_OUTCOMES:
+        raise ValueError(f"invalid automatic input outcome: {outcome}")
+    with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if (
+            not _bridge_owner_matches(current, expected)
+            or current is None
+            or current.automatic_input_source_turn_id != expected.automatic_input_source_turn_id
+            or current.automatic_input_client_message_id
+            != expected.automatic_input_client_message_id
+            or current.automatic_input_owner_scope != expected.automatic_input_owner_scope
+            or (
+                expected.automatic_input_turn_id is not None
+                and current.automatic_input_turn_id != expected.automatic_input_turn_id
+            )
+            or current.automatic_input_source_turn_id is None
+        ):
+            return None
+        if (
+            outcome
+            in {
+                "accepted",
+                "completed",
+                "cancel_requested",
+                "cancel_acknowledged",
+                "cancel_unconfirmed",
+                "cancel_completed",
+            }
+            and current.automatic_input_turn_id is None
+        ):
+            return None
+        prior = current.automatic_input_outcome
+        if prior == "accepted" and outcome not in {"accepted", "completed", "cancel_requested"}:
+            return None
+        if prior == "uncertain" and outcome not in {
+            "uncertain",
+            "completed",
+            "cancel_requested",
+            "cancel_completed",
+        }:
+            return None
+        if outcome in {"cancel_acknowledged", "cancel_unconfirmed"} and prior not in {
+            "cancel_requested",
+            outcome,
+        }:
+            return None
+        if prior in {"completed", "cancel_completed"}:
+            return current if prior == outcome else None
+        if outcome == "accepted" and (
+            current.interrupt_generation != expected.interrupt_generation
+            or codex_automatic_input_was_interrupted(current)
+            or current.active_turn_id not in {None, current.automatic_input_turn_id}
+            or current.pending_shell_command_id is not None
+            or current.active_shell_turn_id is not None
+            or prior is not None
+            or not (
+                current.turn_generation == current.automatic_input_turn_generation
+                or (
+                    current.active_turn_id == current.automatic_input_turn_id
+                    and current.turn_generation == current.automatic_input_turn_generation + 1
+                )
+            )
+        ):
+            return None
+        if prior in {"cancel_acknowledged", "cancel_unconfirmed"} and outcome not in {
+            prior,
+            "cancel_completed",
+        }:
+            return None
+        if prior == "cancel_requested" and outcome not in {
+            "cancel_requested",
+            "cancel_acknowledged",
+            "cancel_unconfirmed",
+            "cancel_completed",
+        }:
+            return None
+        updated = replace(
+            current,
+            automatic_input_outcome=outcome,
+            active_turn_id=(
+                current.automatic_input_turn_id
+                if outcome == "accepted"
+                else current.active_turn_id
+            ),
+            turn_generation=current.turn_generation
+            + int(
+                outcome == "accepted" and current.active_turn_id != current.automatic_input_turn_id
+            ),
+        )
         _write_bridge_state_unlocked(bridge_dir, updated)
         return updated
 
@@ -2115,6 +2330,7 @@ def clear_active_turn_id_if_matches(
         ``"turn_abc123"``. ``None`` means Codex did not include an id;
         if a turn is live it is left intact (returns ``False``), and if
         no turn is live the call is a no-op (returns ``True``).
+    :param expected_owner: Optional session/thread/transport owner checked under the lock.
     :param on_cleared: Optional callback invoked while the state lock is
         still held, only when the turn is cleared (or no state exists).
         Running it under the lock serializes a dependent side effect (such
