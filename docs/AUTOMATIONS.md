@@ -202,3 +202,5 @@ All scheduler backends must support `scheduled_task_harness_settings` before usi
 
 - [Agent YAML spec](AGENT_YAML_SPEC.md) -- defining the agent an automation binds to.
 - [Policies](POLICIES.md) -- gates and spend caps that apply to sessions an automation creates.
+
+When editing an automation that reuses a session, model, effort, and permission controls belong to that existing session. Change them in the session itself. Trigger templates also create separate workers: **Edit worker instructions** opens the system prompt, where the worker creation call specifies the harness and optional model. This leaves the polling session and its deduplication history intact.

@@ -811,7 +811,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
       }
       expect(screen.queryByTestId("task-workspace-browse")).not.toBeInTheDocument();
       expect(screen.getByLabelText("Repository")).toHaveTextContent(label);
-      const sessionLock = /To change model, effort, or permission mode/;
+      const sessionLock = /This automation continues in an existing session/;
       if (editing) {
         expect(screen.getByText(sessionLock)).toBeInTheDocument();
         expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
@@ -1619,7 +1619,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
       }
       expect(screen.getByTestId("task-session-settings-note")).toHaveTextContent(
-        "To change model, effort, or permission mode, edit the existing session directly.",
+        "This automation continues in an existing session, so its model, effort, and permission mode are controlled by that session.",
       );
       fireEvent.change(screen.getByTestId("task-prompt-input"), {
         target: { value: "Updated prompt" },
