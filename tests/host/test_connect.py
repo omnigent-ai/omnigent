@@ -3634,7 +3634,7 @@ async def test_run_prewarms_zygote_during_capability_discovery(
 async def test_run_keeps_one_model_catalog_prewarm_across_reconnects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Catalog prewarm belongs to the host lifetime, not a tunnel generation."""
+    """Catalog prewarms belong to the host lifetime, not a tunnel generation."""
     host = _make_host_process()
     host._zygote_disabled = True
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
@@ -3645,6 +3645,16 @@ async def test_run_keeps_one_model_catalog_prewarm_across_reconnects(
     prewarm_calls = 0
     connect_calls = 0
     prewarm_cancelled_while_connecting = False
+    plugin_prewarm_calls = 0
+    plugin_prewarm_released = threading.Event()
+    plugin_prewarm_returned = threading.Event()
+    connected_after_plugin_prewarm = False
+
+    def _prewarm_launch_plugins() -> None:
+        nonlocal plugin_prewarm_calls
+        plugin_prewarm_calls += 1
+        plugin_prewarm_released.wait(10)
+        plugin_prewarm_returned.set()
 
     async def _prewarm() -> None:
         nonlocal prewarm_calls
@@ -3656,24 +3666,36 @@ async def test_run_keeps_one_model_catalog_prewarm_across_reconnects(
             prewarm_cancelled.set()
 
     async def _connect_and_serve() -> None:
-        nonlocal connect_calls, prewarm_cancelled_while_connecting
+        nonlocal connect_calls, prewarm_cancelled_while_connecting, connected_after_plugin_prewarm
         connect_calls += 1
         await asyncio.wait_for(prewarm_started.wait(), timeout=1.0)
         prewarm_cancelled_while_connecting |= prewarm_cancelled.is_set()
+        connected_after_plugin_prewarm |= plugin_prewarm_returned.is_set()
         if connect_calls < 3:
             raise ConnectionError("test disconnect")
         raise KeyboardInterrupt
 
     monkeypatch.setattr(host, "_prewarm_model_options", _prewarm)
     monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.plugin_discovery.prewarm_claude_launch_plugins",
+        _prewarm_launch_plugins,
+    )
 
-    await host.run()
+    try:
+        await host.run()
+    finally:
+        plugin_prewarm_released.set()
 
     assert connect_calls == 3
     assert prewarm_calls == 1
     assert not prewarm_cancelled_while_connecting
     assert prewarm_cancelled.is_set()
     assert host._model_options_prewarm_task is None
+    # A launch plugin prewarm still running does not hold up connecting.
+    assert not connected_after_plugin_prewarm
+    assert plugin_prewarm_returned.wait(5)
+    assert plugin_prewarm_calls == 1
 
 
 async def test_run_does_not_retry_failed_model_catalog_prewarm_while_offline(

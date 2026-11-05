@@ -1166,7 +1166,7 @@ def test_claude_launch_customization_triggers(
             "exited 3 without an init event",
             "exited 3 without an init event",
         ),
-        ("time.sleep(30)\n", 0.5, "timed out after 0.5s", "timed out after 0.5s"),
+        ("time.sleep(30)\n", 1.0, "timed out after 1s", "timed out after 1s"),
     ],
     ids=["no-init", "timeout"],
 )
@@ -1182,9 +1182,10 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
     home = _claude_home_with_plugin(
         tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
     )
+    launches = tmp_path / "launches.jsonl"
     configure_claude_launch(
         isolate_provider_resolution(monkeypatch, tmp_path / "config"),
-        tmp_path / "launches.jsonl",
+        launches,
         script,
         args=("--token", "synthetic-launch-secret"),
     )
@@ -1205,6 +1206,9 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
     ]
     assert logged in caplog.text
     assert "synthetic-launch-secret" not in caplog.text
+    # Neither failure leaves the launch running; a timed-out launch is killed.
+    [launch] = [json.loads(line) for line in launches.read_text().splitlines()]
+    poll_until(lambda: not _proc.process_alive(launch["pid"]), timeout_s=10, interval_s=0.05)
 
 
 _CONFIG_UNREADABLE = (

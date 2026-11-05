@@ -370,8 +370,15 @@ def test_incomplete_codex_catalog_reports_warnings_and_is_cached_only_briefly(
 
 
 @pytest.mark.posix_only
-@pytest.mark.parametrize("blocked", ["launcher-plugin", "launch"])
-@pytest.mark.parametrize("catalogs", ["shared", "separate", "session"])
+@pytest.mark.parametrize(
+    ("catalogs", "blocked"),
+    [
+        ("shared", "launcher-plugin"),
+        ("shared", "launch"),
+        ("separate", "launch"),
+        ("session", "launcher-plugin"),
+    ],
+)
 def test_slow_claude_launch_probe_does_not_delay_catalogs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -10,7 +10,7 @@ from pathlib import Path
 
 def write_launch_recorder(launcher: Path, launches: Path, script: str) -> None:
     """
-    Write an executable that appends its argv and cwd to *launches*, then runs *script*.
+    Write an executable that appends its argv, cwd and pid to *launches*, then runs *script*.
 
     :param launcher: Executable path to create, e.g. ``tmp_path / "bin" / "claude"``.
     :param launches: JSON-lines file each launch appends to.
@@ -20,7 +20,8 @@ def write_launch_recorder(launcher: Path, launches: Path, script: str) -> None:
     launcher.write_text(
         f"#!{sys.executable}\nimport json, os, sys, time\n"
         f"with open({str(launches)!r}, 'a') as out:\n"
-        "    out.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}) + '\\n')\n" + script
+        "    record = {'argv': sys.argv[1:], 'cwd': os.getcwd(), 'pid': os.getpid()}\n"
+        "    out.write(json.dumps(record) + '\\n')\n" + script
     )
     launcher.chmod(0o755)
 
