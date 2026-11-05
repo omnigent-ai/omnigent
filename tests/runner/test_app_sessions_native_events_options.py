@@ -4083,6 +4083,17 @@ async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
 
 
 @pytest.mark.asyncio
+async def test_deleting_a_session_the_runner_never_set_up_is_harmless() -> None:
+    """The server's rollback of an unconfirmed continuation can repeat its delete."""
+    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    async with _runner_client(app) as client:
+        responses = [
+            await client.delete("/v1/sessions/a6b5cbd7e8f49a0b1c2d3e4f56473829") for _ in range(2)
+        ]
+    assert [response.status_code for response in responses] == [200, 200]
+
+
+@pytest.mark.asyncio
 async def test_events_legacy_clear_on_claude_sdk_stays_unsupported() -> None:
     """
     An unmarked ``clear`` (an older server's) keeps claude-sdk's unsupported 204.
