@@ -1477,6 +1477,54 @@ describe("side-chat scroll position", () => {
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
   });
 
+  it("follows the list's size while the reader is at the end", () => {
+    // A reply's last markdown update can land after the render that changed the turn.
+    const observers: { callback: () => void; targets: Element[]; disconnect: () => void }[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        callback: () => void;
+        targets: Element[] = [];
+        disconnect = vi.fn();
+        constructor(callback: () => void) {
+          this.callback = callback;
+          observers.push(this);
+        }
+        observe(target: Element) {
+          this.targets.push(target);
+        }
+        unobserve() {}
+      },
+    );
+    try {
+      const conversation = conversationRegistry.acquire(childId);
+      conversation.setState({ sessionStatus: "idle" });
+      const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+      const { unmount } = renderPane(<SideChatPane childId={childId} />);
+      // An empty side chat has no list; the observer attaches when the first reply mounts it.
+      expect(
+        screen.getByText("Ask a question here without affecting the main conversation."),
+      ).toBeInTheDocument();
+      act(() => conversation.setState({ blocks: earlierAnswer }));
+      const answer = screen.getByText("Earlier side-chat answer");
+      const list = observers.find((observer) => observer.targets.some((t) => t.contains(answer)))!;
+
+      scrollIntoView.mockClear();
+      act(() => list.callback());
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+
+      scrollReaderUp();
+      scrollIntoView.mockClear();
+      act(() => list.callback());
+      expect(scrollIntoView).not.toHaveBeenCalled();
+
+      unmount();
+      expect(list.disconnect).toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it.each([
     {
       action: "queues a follow-up",

@@ -308,6 +308,7 @@ export function SideChatPane({
   // follows the tail again. A side chat is short and non-virtualized, so a
   // bottom sentinel scrolled on each change is enough.
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const followTail = useRef(true);
   useEffect(() => {
@@ -325,6 +326,19 @@ export function SideChatPane({
     !loadFailed &&
     !showsWorking &&
     !showsBackgroundTasks;
+  const showsList =
+    !loadFailed && !(fullSession && loadingConversation && bubbles.length === 0) && !isEmpty;
+  // A reply's markdown can grow after the render that changed it (streaming
+  // updates commit in a transition), so follow the list's size too.
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
+    });
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, [showsList]);
 
   const startSideChat = async (text: string) => {
     if (!onStart) return;
@@ -404,7 +418,7 @@ export function SideChatPane({
               )}
             </div>
           ) : (
-            <div className="flex flex-col gap-4">
+            <div ref={listRef} className="flex flex-col gap-4">
               {bubbles.map((bubble, index) => (
                 <BubbleView
                   key={bubbleKey(bubble)}
