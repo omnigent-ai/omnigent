@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -144,11 +145,14 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
 
 
 def test_oversized_input_survives_real_codex_transport(codex_effort_rig: _Rig) -> None:
-    """A real Codex thread receives a file reference while history keeps the full paste."""
+    """Real Codex either echoes a spill receipt or refuses before creating a native turn."""
     rig = codex_effort_rig
+    supports_spill_receipts = rig.codex_version >= (0, 154, 0)
     with _session(rig, _STANDARD_MODEL, "medium") as session:
         end_marker = f"END_OF_LARGE_INPUT_{uuid.uuid4().hex}"
         text = "synthetic input line\n" * 55_000 + end_marker
+        stable_id = uuid.uuid4().hex
+        original_content = [{"type": "input_text", "text": text}]
         _json(rig.model.post("/mock/reset"))
 
         response = rig.api.post(
@@ -157,8 +161,8 @@ def test_oversized_input_survives_real_codex_transport(codex_effort_rig: _Rig) -
                 "type": "message",
                 "data": {
                     "role": "user",
-                    "stable_id": uuid.uuid4().hex,
-                    "content": [{"type": "input_text", "text": text}],
+                    "stable_id": stable_id,
+                    "content": original_content,
                 },
             },
             timeout=30,
@@ -167,17 +171,27 @@ def test_oversized_input_survives_real_codex_transport(codex_effort_rig: _Rig) -
 
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
             items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
                 "data"
             ]
             user_matches = [
                 item
                 for item in items
-                if item.get("role") == "user"
-                and item.get("content") == [{"type": "input_text", "text": text}]
+                if item.get("role") == "user" and item.get("content") == original_content
+            ]
+            refusals = [
+                item
+                for item in items
+                if item.get("type") == "error" and item.get("code") == "input_too_large"
             ]
             state = read_bridge_state(session.bridge)
-            if user_matches and state is not None:
+            if (
+                user_matches
+                and state is not None
+                and not snapshot.get("pending_inputs")
+                and (supports_spill_receipts or refusals)
+            ):
                 break
             time.sleep(0.2)
         else:
@@ -187,16 +201,41 @@ def test_oversized_input_survives_real_codex_transport(codex_effort_rig: _Rig) -
             )
 
         async def read_thread() -> dict[str, Any]:
+            assert state is not None
             client = client_for_transport(state.socket_path, client_name="spill-e2e-observer")
             await client.connect()
             try:
+                assert client.supports_user_message_ids is supports_spill_receipts
                 result = await client.request(
                     "thread/read", {"threadId": state.thread_id, "includeTurns": True}
                 )
-                return result["result"]["thread"]
+                payload = result.get("result")
+                assert isinstance(payload, dict)
+                thread = payload.get("thread")
+                assert isinstance(thread, dict)
+                return thread
             finally:
                 await client.close()
 
+        assert len(user_matches) == 1
+        assert len([item for item in items if item.get("role") == "user"]) == 1
+        assert snapshot["pending_inputs"] == []
+        if not supports_spill_receipts:
+            assert len(refusals) == 1
+            assert user_matches[0]["id"] == stable_id
+            assert refusals[0]["message"] == (
+                "This Codex version cannot safely receive the large input, so it was not sent."
+            )
+            assert refusals[0]["remediation"] == "Upgrade Codex to 0.154.0 or later, then retry."
+            assert state.active_turn_id is None
+            with pytest.raises(
+                CodexAppServerResponseError, match="is not materialized yet"
+            ) as unmaterialized:
+                asyncio.run(read_thread())
+            assert unmaterialized.value.code == -32600
+            return
+
+        assert refusals == []
         deadline = time.monotonic() + 30
         last_read_error: CodexAppServerResponseError | None = None
         while time.monotonic() < deadline:
@@ -221,10 +260,16 @@ def test_oversized_input_survives_real_codex_transport(codex_effort_rig: _Rig) -
             and str(item.get("clientId", "")).startswith("omnigent-spill:")
         ]
         wire = json.dumps(native_user_items)
-        assert len(user_matches) == 1
         assert len(native_user_items) == 1
         assert "omnigent_paste_" in wire
         assert end_marker not in wire
+        [reference] = [
+            block["text"]
+            for block in native_user_items[0]["content"]
+            if block.get("type") == "text" and block.get("text", "").startswith("[Attached file: ")
+        ]
+        cached_text = Path(reference.removeprefix("[Attached file: ").removesuffix("]"))
+        assert cached_text.read_text(encoding="utf-8") == text
 
 
 pytestmark = [
@@ -250,6 +295,7 @@ class _Rig:
     source_home: Path
     catalog: dict[str, Any]
     runner_env: dict[str, str]
+    codex_version: tuple[int, int, int]
 
     def capabilities(self, model: str) -> set[str]:
         row = next((row for row in self.catalog["models"] if row["slug"] == model), None)
@@ -322,6 +368,13 @@ def codex_effort_rig(
     )
     (root / "bundled-catalog.json").write_text(json.dumps(catalog, indent=2))
     version = subprocess.check_output(["codex", "--version"], text=True).strip()
+    version_match = re.search(r"\b(\d+)\.(\d+)\.(\d+)", version)
+    assert version_match is not None, f"Codex reported an unrecognized version: {version}"
+    codex_version = (
+        int(version_match.group(1)),
+        int(version_match.group(2)),
+        int(version_match.group(3)),
+    )
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT, text=True)
     print(f"Real harness: {version}; checkout: {revision.strip()}; evidence: {root}", flush=True)
     with (
@@ -330,7 +383,7 @@ def codex_effort_rig(
         httpx.Client(base_url=mock_llm_server_url, timeout=10, trust_env=False) as model,
     ):
         stack.start_runner(cwd=_REPO_ROOT, env=env)
-        yield _Rig(stack, api, model, source, catalog, env)
+        yield _Rig(stack, api, model, source, catalog, env, codex_version)
 
 
 @dataclass
