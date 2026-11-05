@@ -556,10 +556,17 @@ def register_core_routes(
         for user_id, level in wanted.items():
             await asyncio.to_thread(permission_store.grant, user_id, target_id, level)
 
-    async def _release_unreturned_runner_session(session_id: str) -> None:
-        """Best-effort: drop a deleted fork's session from the runner it was set up on."""
+    async def _release_unreturned_runner_session(session_id: str, routing: Conversation) -> None:
+        """Best-effort: drop a deleted fork's session from the runner it was sent to.
+
+        *routing* names that runner, since the fork's own binding may already
+        be rolled back. The runner's delete is idempotent and also stops an
+        initialization still in flight there.
+        """
         try:
-            runner_client = await _get_runner_client(session_id, runner_router)
+            runner_client = await _get_runner_client(
+                session_id, runner_router, conversation=routing
+            )
             if runner_client is not None:
                 await runner_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
         except Exception:
@@ -4777,6 +4784,9 @@ def register_core_routes(
                 fork_id = generate_conversation_id()
                 runner_bound = runner_online
                 runner_initialized = False
+                # Set once the fork is sent to the runner, which may set it up
+                # (or still be doing so) even when the bind then fails.
+                runner_dispatched = False
                 try:
                     fork = await _fork_session(
                         request,
@@ -4811,6 +4821,7 @@ def register_core_routes(
                             )
                     if runner_online:
                         assert source.runner_id is not None and runner_router is not None
+                        runner_dispatched = True
                         try:
                             await _update_session(
                                 request,
@@ -4859,8 +4870,10 @@ def register_core_routes(
                                 raise
                 except Exception:
                     # Leave no fork for a retry to duplicate, nor its runner session.
-                    if runner_initialized:
-                        await _release_unreturned_runner_session(fork_id)
+                    if runner_dispatched:
+                        await _release_unreturned_runner_session(
+                            fork_id, dataclasses.replace(source, id=fork_id)
+                        )
                     await _delete_unreturned_session(fork_id)
                     await _release_unreturned_fork_host(
                         request, source.host_id if host_bound else None

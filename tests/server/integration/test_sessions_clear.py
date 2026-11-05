@@ -1037,8 +1037,9 @@ async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize
     The source's saved inference configuration must be accepted, so an
     unconfirmed initialization fails the clear; so does a later step, such as
     detaching the source, after the runner set the new session up. The new
-    session is deleted (and dropped from the runner it was set up on), was
-    never listed in the owner's tabs, and the source gets no notice or redirect.
+    session is deleted and dropped from the runner it was sent to (which may
+    have set it up without confirming), was never listed in the owner's tabs,
+    and the source gets no notice or redirect.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
@@ -1075,8 +1076,8 @@ async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize
     ]
     [new_id] = [session_id for session_id in initialized if session_id != source.id]
     assert store.get_conversation(new_id) is None
-    released = (f"/v1/sessions/{new_id}", {})
-    assert (released in live_runner.posts) == (failure == "after_initialization")
+    # Dropped from the runner even when the runner never confirmed it.
+    assert (f"/v1/sessions/{new_id}", {}) in live_runner.posts
     assert new_id not in live_runner.announced
     assert len((await client.get("/v1/sessions")).json()["data"]) == before
     assert message_texts(store, source.id) == []
