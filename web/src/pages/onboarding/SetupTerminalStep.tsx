@@ -8,12 +8,24 @@
 // No stream available (older shell / browser preview) → a single phase line.
 
 import { useEffect, useRef, useState } from "react";
-import { RotateCw } from "lucide-react";
+import { Copy, RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { ConnectProgress, SetupResult } from "@/pages/onboarding/ServerSelectorV2";
 import { ConnectStatus } from "@/pages/onboarding/primitives";
+import { buildFailureDiagnostics } from "@/pages/onboarding/failureDiagnostics";
 
 type Phase = "installing" | "running" | "ready" | "failed";
+type CopyState = "idle" | "copied" | "failed";
+
+/** What a failure copy may say about where it happened. Never raw output. */
+export interface DiagnosticsContext {
+  /** Which runner the run action connects ("laptop", "arca", or a local start). */
+  runner?: string;
+  /** The server being connected, reduced to its origin before it is copied. */
+  serverUrl?: string;
+  /** Developer fixtures set this so a copy is labeled as simulated. */
+  simulated?: boolean;
+}
 
 // Empty-terminal beat before the first install commands stream in, so the
 // install step doesn't flash straight from empty into output.
@@ -30,6 +42,8 @@ export function SetupTerminalStep({
   runningHint = "Starting the local server…",
   connection = null,
   onCancelConnect,
+  onCopyDiagnostics,
+  diagnosticsContext,
 }: {
   /** Install the CLI first (when missing). Absent → skip straight to onRun. */
   onInstallCli?: () => Promise<SetupResult>;
@@ -49,10 +63,18 @@ export function SetupTerminalStep({
   /** Progress of the run phase's server connect (null when not connecting). */
   connection?: ConnectProgress | null;
   onCancelConnect?: () => void;
+  /** Copy text to the clipboard; a rejection or `false` shows "Couldn't copy". Absent → no button. */
+  onCopyDiagnostics?: (text: string) => void | boolean | Promise<unknown>;
+  diagnosticsContext?: DiagnosticsContext;
 }) {
   const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
   const [errorAction, setErrorAction] = useState<string | undefined>();
+  const [errorKind, setErrorKind] = useState<string | undefined>();
+  // Set only when the shell sent a curated message; a legacy `error` is display-only.
+  const [structuredMessage, setStructuredMessage] = useState<string | undefined>();
+  const [failedStage, setFailedStage] = useState<"install" | "connect">("connect");
+  const [copyState, setCopyState] = useState<CopyState>("idle");
   const [lines, setLines] = useState<string[]>([]);
   // Bump to re-run the sequence on retry.
   const [attempt, setAttempt] = useState(0);
@@ -100,6 +122,9 @@ export function SetupTerminalStep({
     let canceled = false;
     setError(undefined);
     setErrorAction(undefined);
+    setErrorKind(undefined);
+    setStructuredMessage(undefined);
+    setCopyState("idle");
     setLines([]);
     (async () => {
       const install = onInstallCliRef.current;
@@ -119,6 +144,9 @@ export function SetupTerminalStep({
           setPhase("failed");
           setError(res.errorMessage ?? res.error ?? "Couldn't install the Omnigent CLI.");
           setErrorAction(res.errorAction);
+          setErrorKind(res.errorKind);
+          setStructuredMessage(res.errorMessage);
+          setFailedStage("install");
           return;
         }
         setLines([]);
@@ -131,6 +159,9 @@ export function SetupTerminalStep({
         setPhase("failed");
         setError(result.errorMessage ?? result.error);
         setErrorAction(result.errorAction);
+        setErrorKind(result.errorKind);
+        setStructuredMessage(result.errorMessage);
+        setFailedStage("connect");
       }
     })();
     return () => {
@@ -148,6 +179,28 @@ export function SetupTerminalStep({
     const timer = setInterval(() => setDots((n) => (n % 3) + 1), 400);
     return () => clearInterval(timer);
   }, [inProgress]);
+
+  const copyDiagnostics = async () => {
+    if (!onCopyDiagnostics) return;
+    // Only structured, curated fields are used; the legacy combined `error` is
+    // the display fallback and stays out of the copy.
+    const text = buildFailureDiagnostics({
+      surface: "Setup terminal",
+      stage: failedStage,
+      runner: diagnosticsContext?.runner,
+      serverUrl: diagnosticsContext?.serverUrl,
+      simulated: diagnosticsContext?.simulated,
+      errorKind,
+      errorMessage: structuredMessage,
+      errorAction,
+    });
+    try {
+      const result = await onCopyDiagnostics(text);
+      if (alive.current) setCopyState(result === false ? "failed" : "copied");
+    } catch {
+      if (alive.current) setCopyState("failed");
+    }
+  };
 
   const streamed = lines.length > 0;
   const baseLabel =
@@ -207,22 +260,36 @@ export function SetupTerminalStep({
           </div>
         )}
         {phase === "failed" && (
-          <div role="alert" className="space-y-1">
-            <div className="text-destructive">
-              <span className="select-none" aria-hidden="true">
-                ✕
-              </span>{" "}
-              {error ?? "Could not set up Omnigent."}
-            </div>
-            {errorAction && (
-              <div className="text-cyan-700 dark:text-cyan-300">
+          <>
+            <div role="alert" className="space-y-1">
+              <div className="text-destructive">
                 <span className="select-none" aria-hidden="true">
-                  →
+                  ✕
                 </span>{" "}
-                {errorAction}
+                {error ?? "Could not set up Omnigent."}
+              </div>
+              {errorAction && (
+                <div className="text-foreground/80">
+                  <span className="select-none" aria-hidden="true">
+                    →
+                  </span>{" "}
+                  {errorAction}
+                </div>
+              )}
+            </div>
+            {onCopyDiagnostics && (
+              <div className="flex items-center gap-2 pt-2 font-sans">
+                <Button variant="outline" size="sm" onClick={copyDiagnostics}>
+                  <Copy className="size-3.5" aria-hidden />
+                  Copy diagnostics
+                </Button>
+                <span role="status" aria-live="polite" className="text-xs text-muted-foreground">
+                  {copyState === "copied" && "Copied"}
+                  {copyState === "failed" && "Couldn't copy. Try again."}
+                </span>
               </div>
             )}
-          </div>
+          </>
         )}
       </div>
 

@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SetupTerminalStep, WARMUP_MS } from "./SetupTerminalStep";
 
@@ -43,7 +43,9 @@ describe("SetupTerminalStep", () => {
     expect(screen.getByText(errorMessage)).toHaveClass("text-destructive");
     expect(screen.queryByText(`${errorMessage} ${errorAction}`)).toBeNull();
     const actionLine = screen.getByText(errorAction);
-    expect(actionLine).toHaveClass("text-cyan-700");
+    // The next step is guidance, so it must not inherit the failure's red.
+    expect(actionLine).not.toHaveClass("text-destructive");
+    expect(actionLine.className).not.toMatch(/cyan|red/);
     expect(actionLine.querySelector("span")).toHaveAttribute("aria-hidden", "true");
   });
 
@@ -213,5 +215,125 @@ describe("SetupTerminalStep", () => {
     render(<SetupTerminalStep onRun={vi.fn().mockResolvedValue({ ok: false })} onBack={onBack} />);
     fireEvent.click(await screen.findByRole("button", { name: "Back" }));
     expect(onBack).toHaveBeenCalledOnce();
+  });
+
+  describe("copy diagnostics", () => {
+    const failure = {
+      ok: false,
+      error:
+        "Sign-in to https://srv.example.com/ didn't complete. Finish signing in and try again.",
+      errorMessage: "Sign-in to https://srv.example.com/ didn't complete.",
+      errorAction: "Finish signing in and try again.",
+      errorKind: "laptop-sign-in",
+    };
+
+    it("copies only curated fields and reports Copied after the write resolves", async () => {
+      const onCopyDiagnostics = vi.fn().mockResolvedValue(undefined);
+      render(
+        <SetupTerminalStep
+          onRun={vi.fn().mockResolvedValue(failure)}
+          onBack={vi.fn()}
+          onCopyDiagnostics={onCopyDiagnostics}
+          diagnosticsContext={{ runner: "laptop", serverUrl: "https://srv.example.com/a?ticket=T" }}
+        />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /Copy diagnostics/ }));
+      expect(await screen.findByText("Copied")).toBeInTheDocument();
+      const text = onCopyDiagnostics.mock.calls[0][0] as string;
+      expect(text).toContain("Failure kind: laptop-sign-in");
+      expect(text).toContain("Runner: laptop");
+      expect(text).toContain("Stage: connect");
+      expect(text).toContain("Server: https://srv.example.com\n");
+      expect(text).toContain("Next step: Finish signing in and try again.");
+      expect(text).not.toContain("ticket");
+    });
+
+    it("shows a failure, not Copied, when the clipboard write rejects or returns false", async () => {
+      const onCopyDiagnostics = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("denied"))
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(undefined);
+      render(
+        <SetupTerminalStep
+          onRun={vi.fn().mockResolvedValue(failure)}
+          onBack={vi.fn()}
+          onCopyDiagnostics={onCopyDiagnostics}
+        />,
+      );
+      const button = await screen.findByRole("button", { name: /Copy diagnostics/ });
+      fireEvent.click(button);
+      expect(await screen.findByText(/Couldn't copy/)).toBeInTheDocument();
+      expect(screen.queryByText("Copied")).toBeNull();
+      fireEvent.click(button);
+      await waitFor(() => expect(onCopyDiagnostics).toHaveBeenCalledTimes(2));
+      expect(await screen.findByText(/Couldn't copy/)).toBeInTheDocument();
+      fireEvent.click(button);
+      expect(await screen.findByText("Copied")).toBeInTheDocument();
+    });
+
+    it("withholds legacy combined error text and labels simulated runs", async () => {
+      const onCopyDiagnostics = vi.fn().mockResolvedValue(undefined);
+      render(
+        <SetupTerminalStep
+          onRun={vi.fn().mockResolvedValue({
+            ok: false,
+            error: "Failed: /home/alice/.ssh/id_rsa permission denied",
+          })}
+          onBack={vi.fn()}
+          onCopyDiagnostics={onCopyDiagnostics}
+          diagnosticsContext={{ simulated: true }}
+        />,
+      );
+      // The legacy line is still shown to the user as before.
+      expect(await screen.findByText(/permission denied/)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /Copy diagnostics/ }));
+      await screen.findByText("Copied");
+      const text = onCopyDiagnostics.mock.calls[0][0] as string;
+      expect(text).toContain("Failure: details withheld");
+      expect(text).toContain("Simulated: yes");
+      expect(text).not.toContain("alice");
+    });
+
+    it("clears the copy status when Retry starts a new run, and hides the button when unsupported", async () => {
+      const onRun = vi.fn().mockResolvedValueOnce(failure).mockResolvedValueOnce(failure);
+      const { unmount } = render(
+        <SetupTerminalStep
+          onRun={onRun}
+          onBack={vi.fn()}
+          onCopyDiagnostics={vi.fn().mockResolvedValue(undefined)}
+        />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /Copy diagnostics/ }));
+      await screen.findByText("Copied");
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await waitFor(() => expect(onRun).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.queryByText("Copied")).toBeNull());
+      unmount();
+      render(<SetupTerminalStep onRun={vi.fn().mockResolvedValue(failure)} onBack={vi.fn()} />);
+      await screen.findByRole("alert");
+      expect(screen.queryByRole("button", { name: /Copy diagnostics/ })).toBeNull();
+    });
+
+    it("labels an install failure with the install stage", async () => {
+      const onCopyDiagnostics = vi.fn().mockResolvedValue(undefined);
+      render(
+        <SetupTerminalStep
+          onInstallCli={vi.fn().mockResolvedValue({
+            ok: false,
+            errorMessage: "The installer exited.",
+            errorAction: "Try again.",
+          })}
+          onRun={vi.fn()}
+          onBack={vi.fn()}
+          onCopyDiagnostics={onCopyDiagnostics}
+        />,
+      );
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Copy diagnostics/ }, { timeout: 3000 }),
+      );
+      await screen.findByText("Copied");
+      expect(onCopyDiagnostics.mock.calls[0][0]).toContain("Stage: install");
+    });
   });
 });

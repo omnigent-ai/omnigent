@@ -30,6 +30,8 @@ const OUTPUT_TAIL_CHARS = 8000;
  *   identity?: { serverUrl: string, hostId: string },
  *   errorKind?: import("./arca").ArcaErrorKind,
  *   error?: string,
+ *   errorMessage?: string,
+ *   errorAction?: string,
  *   startedAt?: number,
  *   finishedAt?: number,
  *   output?: string,
@@ -130,6 +132,8 @@ function createArcaAutoConnect({
             state: "failed",
             errorKind: result.errorKind ?? "unknown",
             error: result.error ?? "Connecting to Arca failed.",
+            ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+            ...(result.errorAction ? { errorAction: result.errorAction } : {}),
             finishedAt,
             output,
           };

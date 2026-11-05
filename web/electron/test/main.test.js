@@ -5008,6 +5008,31 @@ describe("onboarding runner IPC", () => {
     assert.equal(result.error, `${result.errorMessage} ${result.errorAction}`);
   });
 
+  it("passes the structured Arca failure to the setup page instead of the combined text only", async (t) => {
+    const managedServer = "https://workspace.cloud.databricks.com/omnigent";
+    const h = harness(t, {
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaResult: {
+        ok: false,
+        errorKind: "omni-auth",
+        authError: true,
+        error: "The Arca instance isn't signed in to this server. Run `arca ssh` first.",
+        errorMessage: "The Arca instance isn't signed in to this server.",
+        errorAction: "Run `arca ssh` first.",
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+
+    const result = await h.ipc.get("omnigent:connect-runner")(event, managedServer, "remote");
+
+    assert.equal(result.ok, false);
+    assert.equal(result.errorKind, "omni-auth");
+    assert.equal(result.errorMessage, "The Arca instance isn't signed in to this server.");
+    assert.equal(result.errorAction, "Run `arca ssh` first.");
+    assert.equal(result.output, undefined);
+  });
+
   it("passes separate authentication message and action fields to the setup page", async (t) => {
     const errorMessage = "Sign-in to https://host.example/ml/omnigents didn't complete.";
     const errorAction = "Finish signing in and try again.";
@@ -5020,7 +5045,33 @@ describe("onboarding runner IPC", () => {
 
     const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
 
-    assert.deepEqual(plain(result), { ok: false, error: legacyError, errorMessage, errorAction });
+    assert.deepEqual(plain(result), {
+      ok: false,
+      error: legacyError,
+      errorMessage,
+      errorAction,
+      errorKind: "laptop-sign-in",
+    });
+  });
+
+  it("labels a laptop sign-in failure with its process-level kind for diagnostics", async (t) => {
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      serverAuthResult: {
+        ok: false,
+        error: "Sign-in timed out. Try again.",
+        errorMessage: "Sign-in timed out.",
+        errorAction: "Try again.",
+        failure: { kind: "timed-out" },
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.equal(result.errorKind, "laptop-sign-in-timed-out");
+    // The raw process failure object stays in the shell.
+    assert.equal(result.failure, undefined);
   });
 
   // Remote runs on a managed server behind the internal flag; local uses a laptop CLI.

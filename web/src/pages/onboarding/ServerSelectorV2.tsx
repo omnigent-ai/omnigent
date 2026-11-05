@@ -29,6 +29,7 @@ import {
 } from "@/pages/onboarding/ServerSelectStep";
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 import { CliInstallStep } from "@/pages/onboarding/CliInstallStep";
+import { SIMULATED_BANNER } from "@/pages/onboarding/authFailureFixture";
 
 /**
  * Outcome of a connect attempt. `error` → the connect was rejected and the
@@ -48,6 +49,8 @@ export interface SetupResult {
   error?: string;
   errorMessage?: string;
   errorAction?: string;
+  /** Short machine-readable failure class, used only to label copied diagnostics. */
+  errorKind?: string;
 }
 
 /** What an in-flight connect is waiting on: browser sign-in, or the server page. */
@@ -124,14 +127,20 @@ export interface ServerSelectorV2Setup {
   onRunnerLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
   onRemoveServer?: (url: string) => void;
-  /** Copy text to the clipboard via the shell's native bridge. */
-  onCopy: (text: string) => void;
+  /** Copy text to the clipboard via the shell's native bridge. A returned
+   *  promise lets callers report whether the copy actually succeeded. */
+  onCopy: (text: string) => void | Promise<unknown>;
   /** Advisory reachability probe for a just-added server URL. */
   onCheckServer: (url: string) => Promise<ServerCheckResult>;
   /** Open the Cloud deploy docs in the user's browser. */
   onCloudSetup: () => void;
   /** Revert to the classic (legacy) setup page. */
   onSwitchToLegacy: () => void;
+  /** Developer fixtures only: open straight on the terminal step connecting
+   *  `url` through `runner`, skipping the install. Never set by the real shell. */
+  initialTerminal?: { url: string; runner: Runner };
+  /** Developer fixtures only: copied diagnostics are labeled as simulated. */
+  simulatedFailures?: boolean;
   /** Disable "Switch to legacy" — the env var pins the selector on, so it can't
    *  take effect. */
   switchToLegacyDisabled?: boolean;
@@ -172,7 +181,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const returning = setup.connectedBefore === true || setup.recentServers.length > 0;
   const hasServers = setup.recentServers.length > 0 || mdm;
   const [step, setStep] = useState<Step>(
-    !mdm && (failedOrForced || (returning && hasServers)) ? "server" : "landing",
+    setup.initialTerminal
+      ? "terminal"
+      : !mdm && (failedOrForced || (returning && hasServers))
+        ? "server"
+        : "landing",
   );
   const [landingError, setLandingError] = useState(setup.error);
   // Wizard color scheme radio. Seeded from the shell's current source (which
@@ -209,7 +222,17 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const [terminalTarget, setTerminalTarget] = useState<
     | { kind: "local"; back: Step; url?: string }
     | { kind: "connect"; back: Step; url: string; runner?: Runner; skipInstall?: boolean }
-  >({ kind: "local", back: "local" });
+  >(
+    setup.initialTerminal
+      ? {
+          kind: "connect",
+          back: "landing",
+          url: setup.initialTerminal.url,
+          runner: setup.initialTerminal.runner,
+          skipInstall: true,
+        }
+      : { kind: "local", back: "local" },
+  );
   const [remoteRunnerFailed, setRemoteRunnerFailed] = useState(false);
   // Install runs in the terminal step only when the CLI is missing AND in-app
   // install is actually offered (macOS — onInstallCli is present). An installed
@@ -348,6 +371,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     terminalTarget.kind,
     setup.localServerRunning === true,
   );
+  // Server-URL copies have no failure UI, so a rejected write must not go unhandled.
+  const copyQuietly = (text: string) => {
+    void Promise.resolve(setup.onCopy(text)).catch(() => {});
+  };
   // Whether the server step is showing its URL-input ("add") view vs the list —
   // reported up so the band can show the hero icons only in the add view.
   const [serverAddMode, setServerAddMode] = useState(false);
@@ -376,6 +403,14 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
       className="grid min-h-screen place-items-center overflow-auto p-6 pb-20"
       style={{ background: "var(--onboarding-wizard-background)" }}
     >
+      {setup.simulatedFailures && (
+        <div
+          role="note"
+          className="fixed left-3 top-2 z-10 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-foreground"
+        >
+          {SIMULATED_BANNER}
+        </div>
+      )}
       {/* Top-right cog: settings for this setup surface. no-drag so it's
           clickable over the window's drag strip. */}
       <div
@@ -502,6 +537,17 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
               runningHint={terminalCopy.hint}
               connection={connection}
               onCancelConnect={cancelConnect}
+              onCopyDiagnostics={setup.onCopy}
+              diagnosticsContext={{
+                runner:
+                  terminalRunner === "remote"
+                    ? "arca"
+                    : terminalRunner === "local"
+                      ? "laptop"
+                      : undefined,
+                serverUrl: terminalUrl,
+                simulated: setup.simulatedFailures === true,
+              }}
             />
           ))}
         {step === "server" && (
@@ -518,7 +564,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             connection={connection}
             onCancelConnect={cancelConnect}
             onRemove={setup.onRemoveServer}
-            onCopy={setup.onCopy}
+            onCopy={copyQuietly}
             onCheckServer={setup.onCheckServer}
             onAddModeChange={setServerAddMode}
           />

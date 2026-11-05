@@ -21,11 +21,13 @@
 const CONFIRM_CHANNEL = "arca-connect:confirm";
 const CANCEL_CHANNEL = "arca-connect:cancel";
 const RESIZE_CHANNEL = "arca-connect:resize";
+const COPY_DIAGNOSTICS_CHANNEL = "arca-connect:copy-diagnostics";
 const CONTENT_WIDTH = 720;
 const MIN_CONTENT_HEIGHT = 300;
 const RUNNING_CONTENT_HEIGHT = 500;
 const MAX_CONTENT_HEIGHT = 640;
 const { arcaTarget } = require("./arcaIdentity");
+const { buildFailureDiagnostics } = require("./failure_diagnostics");
 
 /**
  * @param {{
@@ -39,6 +41,7 @@ const { arcaTarget } = require("./arcaIdentity");
  *   startLogin: (serverUrl: string) => ReturnType<typeof import("./arca").startArcaLogin>,
  *   loginCommandLine: (serverUrl: string) => string,
  *   log?: (message: string) => void,
+ *   clipboard?: { writeText: (text: string) => unknown },
  * }} deps
  * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect", signInFirst?: boolean }) => Promise<object> }}
  */
@@ -52,6 +55,7 @@ function createArcaConnectFlow({
   startLogin,
   loginCommandLine,
   log = () => {},
+  clipboard,
 }) {
   /**
    * Button routing, keyed by the console window's webContents id and kept
@@ -59,7 +63,7 @@ function createArcaConnectFlow({
    * must still route after the result promise settled. Only messages from a
    * registered console's own webContents are honored — a server page
    * (different webContents) can't spoof consent.
-   * @type {Map<number, { win: Electron.BrowserWindow, phase: () => string, onConfirm: () => void, onCancel: () => void }>}
+   * @type {Map<number, { win: Electron.BrowserWindow, phase: () => string, onConfirm: () => void, onCancel: () => void, diagnostics: () => string | null }>}
    */
   const consoles = new Map();
   /**
@@ -75,6 +79,18 @@ function createArcaConnectFlow({
   });
   ipcMain.on(CANCEL_CHANNEL, (event) => {
     consoles.get(event.sender.id)?.onCancel();
+  });
+  // The text is built here from the last failure, never taken from the page, so
+  // this channel cannot be used to write arbitrary text to the clipboard.
+  ipcMain.handle(COPY_DIAGNOSTICS_CHANNEL, async (event) => {
+    const text = consoles.get(event.sender.id)?.diagnostics();
+    if (!text || !clipboard) return { ok: false };
+    try {
+      await clipboard.writeText(text);
+      return { ok: true };
+    } catch {
+      return { ok: false };
+    }
   });
   ipcMain.on(RESIZE_CHANNEL, (event, payload) => {
     const consoleState = consoles.get(event.sender.id);
@@ -159,6 +175,7 @@ function createArcaConnectFlow({
       let loginAttempted = signInFirst;
       let connect = null;
       let settled = false;
+      let diagnosticsText = null;
       const sendInit = (reason) => {
         try {
           if (win.isDestroyed()) return;
@@ -211,9 +228,25 @@ function createArcaConnectFlow({
             return;
           }
           phase = "done";
+          const ok = result.ok === true;
+          diagnosticsText = ok
+            ? null
+            : buildFailureDiagnostics({
+                surface: "Arca connect console",
+                stage: login ? "sign-in" : "connect",
+                runner: "arca",
+                errorKind: result.errorKind,
+                errorMessage: result.errorMessage,
+                errorAction: result.errorAction,
+                serverUrl,
+              });
           send("arca-connect:done", {
-            ok: result.ok === true,
-            error: result.ok === true ? null : (result.error ?? "Connecting to Arca failed."),
+            ok,
+            error: ok ? null : (result.error ?? "Connecting to Arca failed."),
+            // Structured copy lets the page show the failure and the next step on separate lines.
+            ...(!ok && result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+            ...(!ok && result.errorAction ? { errorAction: result.errorAction } : {}),
+            ...(ok ? {} : { canCopyDiagnostics: clipboard !== undefined }),
           });
           settle({ ...result, shownInConsole: true });
         });
@@ -222,6 +255,7 @@ function createArcaConnectFlow({
       consoles.set(consoleId, {
         win,
         phase: () => phase,
+        diagnostics: () => diagnosticsText,
         onConfirm: () => {
           if (phase !== "asking") return;
           log(`arca connect: user confirmed; running against ${serverUrl}`);
@@ -285,6 +319,7 @@ module.exports = {
   CANCEL_CHANNEL,
   CONFIRM_CHANNEL,
   RESIZE_CHANNEL,
+  COPY_DIAGNOSTICS_CHANNEL,
   CONTENT_WIDTH,
   MIN_CONTENT_HEIGHT,
   RUNNING_CONTENT_HEIGHT,

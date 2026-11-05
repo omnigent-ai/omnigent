@@ -736,6 +736,8 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
               errorKind: "timeout",
               error:
                 "Arca sign-in timed out. Check Arca Companion, finish browser sign-in, and try again.",
+              errorMessage: "Arca sign-in timed out.",
+              errorAction: "Check Arca Companion, finish browser sign-in, and try again.",
             }
           : describeConnectFailure({ code: null, stdout, stderr, timedOut: true }),
       );

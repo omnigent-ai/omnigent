@@ -359,6 +359,7 @@ const arcaConnectFlow = createArcaConnectFlow({
   ipcMain,
   pagePath: path.join(__dirname, "..", "arca-connect", "index.html"),
   preloadPath: path.join(__dirname, "arca_connect_preload.js"),
+  clipboard,
   startConnect: (serverUrl, onOutput) => startArcaHostConnect(serverUrl, { onOutput }),
   startLogin: (serverUrl) => arca.startArcaLogin(serverUrl),
   loginCommandLine: (serverUrl) => {
@@ -577,6 +578,9 @@ async function connectOnboardingArca(serverUrl, log, sender) {
                   status.state === "unavailable"
                     ? "The arca CLI was not found on this machine."
                     : (status.error ?? "Couldn't connect Arca."),
+                ...(status.errorKind ? { errorKind: status.errorKind } : {}),
+                ...(status.errorMessage ? { errorMessage: status.errorMessage } : {}),
+                ...(status.errorAction ? { errorAction: status.errorAction } : {}),
               };
       }
     }
@@ -4499,6 +4503,7 @@ function registerIpc() {
         error: auth.error,
         ...(auth.errorMessage ? { errorMessage: auth.errorMessage } : {}),
         ...(auth.errorAction ? { errorAction: auth.errorAction } : {}),
+        errorKind: auth.failure ? `laptop-sign-in-${auth.failure.kind}` : "laptop-sign-in",
       };
     }
     // Close out the sign-in lines so the log never ends on a stale prompt.

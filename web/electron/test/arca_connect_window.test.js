@@ -14,6 +14,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { JSDOM } = require("jsdom");
 
+const flushPromises = () =>
+  new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+
 /** Load the console page with a fake bridge; jsdom has no layout, so scrollHeight is stubbed. */
 function renderConsole(t, { scrollHeight }) {
   const dom = new JSDOM(
@@ -103,11 +108,73 @@ for (const copy of [
   });
 }
 
+describe("arca connect console failure display", () => {
+  const failed = {
+    ok: false,
+    error: "Arca sign-in timed out. Check Arca Companion, finish browser sign-in, and try again.",
+    errorMessage: "Arca sign-in timed out.",
+    errorAction: "Check Arca Companion, finish browser sign-in, and try again.",
+    canCopyDiagnostics: true,
+  };
+
+  it("shows the failure and the next step on separate lines with distinct styling hooks", (t) => {
+    const page = renderConsole(t, { scrollHeight: 400 });
+    page.events.Done(failed);
+    const status = page.document.getElementById("status");
+    assert.equal(status.dataset.kind, "error");
+    assert.equal(page.document.getElementById("status-message").textContent, failed.errorMessage);
+    assert.equal(page.document.getElementById("status-action").textContent, failed.errorAction);
+    assert.equal(page.document.getElementById("diagnostics").hidden, false);
+    const css = fs.readFileSync(path.join(__dirname, "../arca-connect/index.html"), "utf8");
+    // Only the failure line is red; the action inherits the neutral foreground.
+    assert.match(css, /#status\[data-kind="error"\] #status-message\s*\{\s*color: var\(--danger\)/);
+    assert.match(css, /#status-action\s*\{\s*color: var\(--fg\)/);
+  });
+
+  it("keeps a legacy combined error on the failure line and hides empty action", (t) => {
+    const page = renderConsole(t, { scrollHeight: 400 });
+    page.events.Done({ ok: false, error: "Connecting to Arca failed (exit code 1)." });
+    assert.equal(
+      page.document.getElementById("status-message").textContent,
+      "Connecting to Arca failed (exit code 1).",
+    );
+    assert.equal(page.document.getElementById("status-action").textContent, "");
+    assert.equal(page.document.getElementById("diagnostics").hidden, true);
+  });
+
+  it("reports Copied only when the shell confirms the clipboard write", async (t) => {
+    const page = renderConsole(t, { scrollHeight: 400 });
+    const results = [{ ok: false }, { ok: true }];
+    page.document.defaultView.arcaConnect.copyDiagnostics = async () => results.shift();
+    page.events.Done(failed);
+    const button = page.document.getElementById("copy-diagnostics");
+    const state = page.document.getElementById("copy-state");
+    button.click();
+    await flushPromises();
+    assert.match(state.textContent, /Couldn't copy/);
+    button.click();
+    await flushPromises();
+    assert.equal(state.textContent, "Copied");
+  });
+
+  it("reports a failed copy when the bridge call rejects", async (t) => {
+    const page = renderConsole(t, { scrollHeight: 400 });
+    page.document.defaultView.arcaConnect.copyDiagnostics = async () => {
+      throw new Error("ipc gone");
+    };
+    page.events.Done(failed);
+    page.document.getElementById("copy-diagnostics").click();
+    await flushPromises();
+    assert.match(page.document.getElementById("copy-state").textContent, /Couldn't copy/);
+  });
+});
+
 /** A fake Electron world: BrowserWindow + ipcMain + a controllable connect. */
-function flowHarness() {
+function flowHarness({ clipboard } = {}) {
   const world = {
     windows: [],
     ipc: new EventEmitter(),
+    handlers: {},
     connects: [],
     logins: [],
   };
@@ -157,7 +224,11 @@ function flowHarness() {
     BrowserWindow: FakeWindow,
     ipcMain: {
       on: (channel, fn) => world.ipc.on(channel, fn),
+      handle: (channel, fn) => {
+        world.handlers[channel] = fn;
+      },
     },
+    clipboard,
     pagePath: "/bundle/arca-connect/index.html",
     preloadPath: "/bundle/src/arca_connect_preload.js",
     commandLine: (url) => `arca ssh isaac omni host --server ${url} …`,
@@ -196,6 +267,9 @@ function flowHarness() {
   /** Emit a preload→main message as if it came from `win`'s webContents. */
   world.sendFrom = (win, channel, payload) =>
     world.ipc.emit(channel, { sender: { id: win.webContents.id } }, payload);
+  /** Invoke an ipcMain.handle channel as if from `win`'s webContents. */
+  world.invokeFrom = (win, channel, payload) =>
+    world.handlers[channel]({ sender: { id: win.webContents.id } }, payload);
   return { world, flow };
 }
 
@@ -259,7 +333,11 @@ describe("arca connect console flow", () => {
     assert.equal((await result).error, "sign-in timed out");
     assert.equal(world.connects.length, 1);
     const done = win.webContents.sent.filter(([channel]) => channel === "arca-connect:done");
-    assert.deepEqual(done.at(-1)[1], { ok: false, error: "sign-in timed out" });
+    assert.deepEqual(done.at(-1)[1], {
+      ok: false,
+      error: "sign-in timed out",
+      canCopyDiagnostics: false,
+    });
   });
 
   it("signs in before connecting when a connect already failed for sign-in", async () => {
@@ -429,5 +507,87 @@ describe("arca connect console flow", () => {
     // After settling, a new run opens a fresh console.
     void flow.run(null, "https://srv.example.com");
     assert.equal(world.windows.length, 2);
+  });
+
+  it("copies shell-built diagnostics without raw output, tickets or the OAuth URL", async () => {
+    const written = [];
+    const { world, flow } = flowHarness({ clipboard: { writeText: (text) => written.push(text) } });
+    const url = "https://account.databricks.com/omnigent?o=123&ticket=SECRET-TICKET";
+    const result = flow.run(null, url);
+    const win = world.windows[0];
+    world.sendFrom(win, "arca-connect:confirm");
+    world.connects[0].onOutput("https://idp.example.com/auth?token=RAWTOKEN /home/alice/.ssh");
+    world.connects[0].finish({
+      ok: false,
+      errorKind: "timeout",
+      error:
+        "Connecting to Arca timed out. The instance may still be starting. Check `arca status`.",
+      errorMessage: "Connecting to Arca timed out. The instance may still be starting.",
+      errorAction: "Check `arca status` and try again.",
+      stdout: "https://idp.example.com/auth?token=RAWTOKEN",
+      stderr: "/home/alice/.ssh/id_rsa",
+    });
+    await result;
+    const done = win.webContents.sent.filter(([channel]) => channel === "arca-connect:done");
+    assert.equal(
+      done.at(-1)[1].errorMessage,
+      "Connecting to Arca timed out. The instance may still be starting.",
+    );
+    assert.equal(done.at(-1)[1].errorAction, "Check `arca status` and try again.");
+    assert.equal(done.at(-1)[1].canCopyDiagnostics, true);
+    assert.deepEqual(await world.invokeFrom(win, "arca-connect:copy-diagnostics"), { ok: true });
+    assert.equal(written.length, 1);
+    const text = written[0];
+    assert.match(text, /Failure kind: timeout/);
+    assert.match(text, /Failure: Connecting to Arca timed out\./);
+    assert.match(text, /Next step: Check `arca status` and try again\./);
+    assert.match(text, /Stage: connect/);
+    assert.match(text, /Server: https:\/\/account\.databricks\.com\n/);
+    for (const secret of ["SECRET-TICKET", "RAWTOKEN", "/home/alice", "idp.example.com", "o=123"]) {
+      assert.ok(!text.includes(secret), `diagnostics leaked ${secret}`);
+    }
+  });
+
+  it("reports a failed copy and refuses foreign senders or a clean run", async () => {
+    const failing = flowHarness({
+      clipboard: {
+        writeText: () => {
+          throw new Error("denied");
+        },
+      },
+    });
+    const result = failing.flow.run(null, "https://srv.example.com");
+    const win = failing.world.windows[0];
+    // Nothing to copy until a failure exists.
+    assert.deepEqual(await failing.world.invokeFrom(win, "arca-connect:copy-diagnostics"), {
+      ok: false,
+    });
+    failing.world.sendFrom(win, "arca-connect:confirm");
+    failing.world.connects[0].finish({ ok: false, error: "legacy failure" });
+    await result;
+    assert.deepEqual(await failing.world.invokeFrom(win, "arca-connect:copy-diagnostics"), {
+      ok: false,
+    });
+    assert.deepEqual(
+      await failing.world.handlers["arca-connect:copy-diagnostics"]({ sender: { id: 9999 } }),
+      { ok: false },
+    );
+  });
+
+  it("withholds legacy error text from diagnostics", async () => {
+    const written = [];
+    const { world, flow } = flowHarness({ clipboard: { writeText: (text) => written.push(text) } });
+    const result = flow.run(null, "https://srv.example.com");
+    const win = world.windows[0];
+    world.sendFrom(win, "arca-connect:confirm");
+    world.connects[0].finish({
+      ok: false,
+      error: "Connecting to Arca failed: Permission denied (publickey) for /home/alice",
+    });
+    await result;
+    await world.invokeFrom(win, "arca-connect:copy-diagnostics");
+    assert.match(written[0], /Failure kind: unknown/);
+    assert.match(written[0], /Failure: details withheld/);
+    assert.ok(!written[0].includes("alice"));
   });
 });

@@ -130,11 +130,30 @@
         overflow: auto;
         font-weight: 500;
       }
-      #status[data-kind="error"] {
+      #status[data-kind="error"] #status-message {
         color: var(--danger);
       }
-      #status[data-kind="ok"] {
+      #status[data-kind="ok"] #status-message {
         color: var(--accent);
+      }
+      /* The supported next step is guidance, not part of the failure: neutral color. */
+      #status-action {
+        color: var(--fg);
+        font-weight: 400;
+      }
+      #status-action:empty {
+        display: none;
+      }
+      #diagnostics {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #diagnostics[hidden] {
+        display: none;
+      }
+      #copy-state {
+        color: var(--muted);
       }
       footer {
         display: flex;
@@ -197,7 +216,14 @@
       <div id="command">…</div>
       <div id="terminal"></div>
     </div>
-    <div id="status"></div>
+    <div id="status">
+      <div id="status-message"></div>
+      <div id="status-action"></div>
+    </div>
+    <div id="diagnostics" hidden>
+      <button id="copy-diagnostics" type="button">Copy diagnostics</button>
+      <span id="copy-state" role="status" aria-live="polite"></span>
+    </div>
     <footer>
       <button id="cancel" type="button">Cancel</button>
       <button id="confirm" type="button" class="primary">Connect</button>

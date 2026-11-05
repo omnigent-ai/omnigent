@@ -17,6 +17,8 @@
 //   remote=1                      offer the remote environment on the runner step
 //   step=server                   open straight on the server list
 //   error=<msg>                   show a connect-error banner
+//   authFailure=<scenario>        dev builds only: open on a scripted sign-in failure
+//                                 (see authFailureFixture.ts); clipboard=deny fails the copy
 //
 // Examples (all against the vite dev server):
 //   new + no MDM ............ ?mock=1
@@ -24,6 +26,11 @@
 //   new + MDM ............... ?mock=1&managed=https://field-eng.example.com,https://corp.example.com
 //   returning + MDM ......... ?mock=1&installed=1&returning=1&managed=https://field-eng.example.com
 
+import {
+  authFailureFixture,
+  copyToBrowserClipboard,
+  parseAuthFailureScenario,
+} from "./authFailureFixture";
 import { isLocalInstall } from "./ServerSelectStep";
 import type { ServerSelectorV2Setup } from "./ServerSelectorV2";
 
@@ -69,6 +76,12 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
   // when the stream finishes.
   let installLog: ((line: string) => void) | null = null;
   let runnerLog: ((line: string) => void) | null = null;
+
+  const scenario = parseAuthFailureScenario(params);
+  const fixture = scenario
+    ? authFailureFixture(scenario, managedServers[0] ?? recentServers[0])
+    : undefined;
+  const clipboardDenied = params.get("clipboard") === "deny";
 
   return {
     initialUrl: recentServers[0] ?? managedServers[0] ?? "http://localhost:6767",
@@ -151,7 +164,11 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
       };
     },
     onRemoveServer: (url) => log("onRemoveServer", url),
-    onCopy: (text) => log("onCopy", text),
+    // The browser preview writes to the real clipboard so Copy is verifiable.
+    onCopy: (text) => {
+      log("onCopy", text);
+      return copyToBrowserClipboard(text, clipboardDenied);
+    },
     onCheckServer: async (url) => {
       log("onCheckServer", url);
       // The local install is down unless localRunning=1; everything else is up.
@@ -168,5 +185,7 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
       else if (scheme === "light") root.classList.remove("dark");
       else root.classList.toggle("dark", window.matchMedia("(prefers-color-scheme: dark)").matches);
     },
+    // Last, so the fixture's scripted runner replaces the mock runner.
+    ...fixture,
   };
 }

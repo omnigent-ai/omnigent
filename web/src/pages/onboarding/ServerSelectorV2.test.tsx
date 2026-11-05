@@ -496,7 +496,7 @@ describe("ServerSelectorV2", () => {
       getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
     });
     expect(await screen.findByText(errorMessage)).toBeInTheDocument();
-    expect(screen.getByText(errorAction)).toHaveClass("text-cyan-700");
+    expect(screen.getByText(errorAction)).toHaveClass("text-foreground/80");
     expect(onConnect).not.toHaveBeenCalled();
     const skip = screen.getByRole("button", { name: "Continue anyway" });
     expect(skip.nextElementSibling).toBe(screen.getByRole("button", { name: "Retry" }));
