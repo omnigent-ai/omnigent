@@ -10,6 +10,10 @@ import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePrefer
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
 import {
+  SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
+  notifyShowProjectHeaderActionsOnTouchChanged,
+} from "./projectHeaderActionPreferences";
+import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   notifyHiddenPickerAgentsChanged,
 } from "./pickerEntryVisibility";
@@ -44,6 +48,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:always-use-worktree",
   DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
+  SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
   "web-theme",
 ] as const;
 
@@ -163,6 +168,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   // Same-tab writes fire no storage event, so the subscribable preferences
   // have to be told; otherwise an open picker keeps the pre-import set.
   notifyHiddenPickerAgentsChanged();
+  notifyShowProjectHeaderActionsOnTouchChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

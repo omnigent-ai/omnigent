@@ -389,7 +389,7 @@ function ChangesSidebar({
       <div
         {...handleProps}
         aria-label="Resize file list"
-        className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
+        className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50"
       />
       {filter}
       {children}
