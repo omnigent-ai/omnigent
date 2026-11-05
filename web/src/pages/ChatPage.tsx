@@ -70,7 +70,7 @@ import {
   useBrainHarnessLabels,
   useHarnessEffortFamilies,
 } from "@/lib/agentLabels";
-import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
+import { useCanStartSideChat, usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
@@ -158,7 +158,7 @@ export {
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
-  KeepBottomOnViewportResize,
+  KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
   SessionSharedContext,
@@ -206,7 +206,12 @@ import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
-import { isBrandHarness, useHostMcpServers, type HostMcpServer } from "@/hooks/useHarnessInventory";
+import {
+  INVENTORY_HARNESS_IDS,
+  isBrandHarness,
+  useHostMcpServers,
+  type HostMcpServer,
+} from "@/hooks/useHarnessInventory";
 import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import {
   getSessionHost,
@@ -1627,6 +1632,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // Cold selector (harness rarely changes) — gates the selection popup's "Ask
   // in side chat" action to harnesses that support side chat.
   const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
+  const canStartSideChat = useCanStartSideChat(conversationId, permissionLevel);
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1869,7 +1875,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
               containerRef={conversationRef}
               onReply={(text) => composerRef.current?.appendReplyQuote(text)}
               onAskInSideChat={
-                supportsSideChat(selectionSessionHarness)
+                supportsSideChat(selectionSessionHarness, canStartSideChat)
                   ? (text) => composerRef.current?.startSideChat(text)
                   : undefined
               }
@@ -2158,6 +2164,21 @@ export function buildSlashCommandMap(
     m[`${skillPrefix}${skill.name}`] = skillMenuDescription(skill);
   }
   return m;
+}
+
+/**
+ * Whether the composer offers ``/clear`` for a session on *harness*.
+ *
+ * SDK clear requires its capability flag; native clear uses
+ * ``session_event_types``. Elsewhere a typed /clear stays plaintext.
+ */
+export function composerOffersClear(harness: string | null, info: ServerInfo | "loading"): boolean {
+  if (info === "loading") return false;
+  if (harness === "claude-sdk") return info.session_claude_sdk_clear === true;
+  return (
+    (harness === "claude-native" || harness === "codex-native") &&
+    !!info.session_event_types?.includes("clear")
+  );
 }
 
 /**
@@ -2559,14 +2580,35 @@ function ComposerImpl(
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
   const mcpPanelRequested = composerSessionId !== null && value.trim() === "/mcp";
-  const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
-  const hostMcpHarness =
-    nativeMcpHarness !== undefined && isBrandHarness(nativeMcpHarness) ? nativeMcpHarness : null;
   const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
     composerSessionId === null ? null : getSessionHost(composerSessionId),
   );
   const hostMcpRoutingId =
     sessionRoutingHostId(composerSession?.hostId, composerSession?.labels) ?? inheritedHostId;
+  const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
+  // claude-sdk runs the Claude Code CLI, so on a host its /mcp lists the host's Claude servers.
+  const sdkHostMcpKey = hostMcpRoutingId !== null ? "claude" : undefined;
+  const hostMcpKey = sessionHarness === "claude-sdk" ? sdkHostMcpKey : nativeMcpHarness;
+  const hostMcpHarness = hostMcpKey !== undefined && isBrandHarness(hostMcpKey) ? hostMcpKey : null;
+  const { data: sessionAgent, isError: sessionAgentFailed } = useSessionAgent(composerSessionId);
+  // A claude-sdk session run without setting sources (`skills: none`) loads only managed
+  // servers; until the session's agent arrives, or if its request fails, list only those.
+  const hostUserServersLoaded =
+    sessionHarness !== "claude-sdk" ||
+    (!sessionAgentFailed &&
+      sessionAgent !== undefined &&
+      sessionAgent.loads_user_settings !== false);
+  let sdkAgentStatus: string | undefined;
+  if (sessionHarness === "claude-sdk" && sessionAgentFailed) {
+    sdkAgentStatus = "Couldn’t load this session’s agent, so only managed MCP servers are shown.";
+  } else if (sessionHarness === "claude-sdk" && sessionAgent === undefined) {
+    sdkAgentStatus = "Loading this session’s agent; only managed MCP servers are shown so far.";
+  }
+  const isSessionHostServer = useCallback(
+    (server: HostMcpServer) =>
+      server.harness === hostMcpHarness && (server.managed === true || hostUserServersLoaded),
+    [hostMcpHarness, hostUserServersLoaded],
+  );
   // Poll while a host server awaits sign-in: the user completes it elsewhere.
   const hostMcpQuery = useHostMcpServers(
     hostMcpRoutingId,
@@ -2574,12 +2616,11 @@ function ComposerImpl(
     useCallback(
       (servers: HostMcpServer[] | undefined) =>
         servers?.some(
-          (server) =>
-            server.harness === hostMcpHarness && server.auth_status === "sign_in_required",
+          (server) => isSessionHostServer(server) && server.auth_status === "sign_in_required",
         )
           ? HOST_MCP_SIGN_IN_POLL_MS
           : false,
-      [hostMcpHarness],
+      [isSessionHostServer],
     ),
   );
   const hostMcpStatus =
@@ -2591,9 +2632,12 @@ function ComposerImpl(
           ? "Loading MCP servers…"
           : hostMcpQuery.isError
             ? "Couldn’t load MCP servers from this session’s host."
-            : undefined;
+            : sdkAgentStatus;
+  const mcpSettingsHarness = nativeMcpHarness
+    ? sessionHarness
+    : hostMcpHarness && INVENTORY_HARNESS_IDS[hostMcpHarness];
   const mcpSettingsHref =
-    `/settings/harnesses${nativeMcpHarness ? `/${sessionHarness}` : ""}` +
+    `/settings/harnesses${mcpSettingsHarness ? `/${mcpSettingsHarness}` : ""}` +
     (hostMcpRoutingId ? `?host=${encodeURIComponent(hostMcpRoutingId)}` : "");
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
@@ -2896,13 +2940,7 @@ function ComposerImpl(
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
   const composerServerInfo = useServerInfo();
-  // /clear runs the harness's own /clear in the session terminal, which moves
-  // the terminal onto a fresh session the view then follows. Older servers
-  // reject the clear control, so a typed /clear stays plaintext there.
-  const showClear =
-    (sessionHarness === "claude-native" || sessionHarness === "codex-native") &&
-    composerServerInfo !== "loading" &&
-    !!composerServerInfo.session_event_types?.includes("clear");
+  const showClear = composerOffersClear(sessionHarness, composerServerInfo);
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -2911,7 +2949,8 @@ function ComposerImpl(
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
-  const showSide = supportsSideChat(sessionHarness);
+  const canStartSideChat = useCanStartSideChat(composerSessionId, permissionLevel);
+  const showSide = supportsSideChat(sessionHarness, canStartSideChat);
   const slashCommands = useMemo(
     () =>
       buildSlashCommandMap(
@@ -3423,30 +3462,28 @@ function ComposerImpl(
       .join(" ") || undefined;
   const mcpServers = useMemo(() => {
     const byName = new Map<string, McpServerRow>(
-      (hostMcpQuery.data ?? [])
-        .filter((server) => server.harness === hostMcpHarness)
-        .map((server) => [
-          server.name,
-          {
-            name: server.name,
-            description:
-              [server.plugin && `${server.plugin} plugin`, server.url_host]
-                .filter(Boolean)
-                .join(" · ") || undefined,
-            connection:
-              server.auth_status === "connected"
-                ? "connected"
-                : server.auth_status === "sign_in_required"
-                  ? "sign-in-required"
-                  : undefined,
-            // No URL means the state is still worth showing, with nothing to click.
-            // The scheme is enforced host-side and again at the frame decoder; this
-            // is the last gate before it becomes an href.
-            signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
-              ? { kind: "url", url: server.sign_in_url! }
-              : undefined,
-          },
-        ]),
+      (hostMcpQuery.data ?? []).filter(isSessionHostServer).map((server) => [
+        server.name,
+        {
+          name: server.name,
+          description:
+            [server.plugin && `${server.plugin} plugin`, server.url_host]
+              .filter(Boolean)
+              .join(" · ") || undefined,
+          connection:
+            server.auth_status === "connected"
+              ? "connected"
+              : server.auth_status === "sign_in_required"
+                ? "sign-in-required"
+                : undefined,
+          // No URL means the state is still worth showing, with nothing to click.
+          // The scheme is enforced host-side and again at the frame decoder; this
+          // is the last gate before it becomes an href.
+          signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
+            ? { kind: "url", url: server.sign_in_url! }
+            : undefined,
+        },
+      ]),
     );
     const catalogLoaded = !registryCatalog.loading && !registryCatalog.error;
     for (const server of selectedAgent?.mcp_servers ?? []) {
@@ -3478,7 +3515,7 @@ function ComposerImpl(
     return [...byName.values()];
   }, [
     hasRegistryServers,
-    hostMcpHarness,
+    isSessionHostServer,
     hostMcpQuery.data,
     registryCatalog.error,
     registryCatalog.loading,
@@ -4250,7 +4287,9 @@ function ComposerImpl(
                 planActive={codexPlanMode}
                 planLabel={codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
                 onSideChat={
-                  composerSessionId && !isReadOnly && supportsSideChat(sessionHarness)
+                  composerSessionId &&
+                  !isReadOnly &&
+                  supportsSideChat(sessionHarness, canStartSideChat)
                     ? () => {
                         if (usesNativeSideChatFork(sessionHarness)) {
                           // Codex forks in-process from a typed /side; prefill so
@@ -4263,10 +4302,12 @@ function ComposerImpl(
                         const sourceId = useChatStore.getState().conversationId;
                         if (sourceId === null) return;
                         createSideChat(sourceId).then(
-                          ({ childSessionId }) =>
+                          ({ childSessionId }) => {
+                            useChatStore.getState().requestSideChatFocus(childSessionId);
                             useChatStore.setState({
                               sideChatToOpen: { childId: childSessionId, parentId: sourceId },
-                            }),
+                            });
+                          },
                           () => toast.error("Couldn't start a side chat for this session."),
                         );
                       }

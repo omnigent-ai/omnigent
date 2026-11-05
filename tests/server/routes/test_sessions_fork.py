@@ -7,6 +7,8 @@ shape using minimal real-type stubs — no MagicMock.
 
 from __future__ import annotations
 
+import json
+import uuid
 from typing import Any
 
 import httpx
@@ -25,7 +27,15 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
-from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_PUBLIC,
+    AuthProvider,
+    UnifiedAuthProvider,
+)
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
     REQUESTED_HOST_ID_LABEL_KEY,
@@ -42,6 +52,8 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.server.helpers import create_test_agent
 
 # ── Minimal store stubs ──────────────────────────────────────────
@@ -193,9 +205,14 @@ class _ConversationStore:
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
+        copy_items: bool = True,
+        continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: dict[str, str] | None = None,
         created_by: str | None = None,
+        conversation_id: str | None = None,
+        side_chat_parent_id: str | None = None,
     ) -> Conversation:
         """
         Record the fork call and return a fixed new conversation.
@@ -227,6 +244,13 @@ class _ConversationStore:
         :param up_to_response_id: Truncation point, e.g. ``"resp_a"``.
             Mirrors the real store: ``None`` copies everything; a value
             matching no item's ``response_id`` raises ValueError.
+        :param before_item_id: Continuation cutoff; recorded only (the
+            fork route never sets it).
+        :param copy_items: ``False`` for a continuation that keeps no
+            history; recorded only.
+        :param continue_source: Whether the fork continues its source on the
+            same placement; recorded only.
+        :param conversation_id: Id chosen by the caller; recorded only.
         :param project_id: First-class project the fork is filed into
             (route passes the source's project only when the forker
             owns it), or ``None`` for unfiled.
@@ -259,9 +283,14 @@ class _ConversationStore:
                 "resume_source_native_session": resume_source_native_session,
                 "presentation_labels": presentation_labels,
                 "up_to_response_id": up_to_response_id,
+                "before_item_id": before_item_id,
+                "copy_items": copy_items,
+                "continue_source": continue_source,
+                "conversation_id": conversation_id,
                 "project_id": project_id,
                 "file_id_map": file_id_map,
                 "created_by": created_by,
+                "side_chat_parent_id": side_chat_parent_id,
             }
         )
         src = self._convs.get(source_conversation_id)
@@ -312,6 +341,7 @@ class _ConversationStore:
             title=title or f"Fork of {src.title}",
             agent_id=effective_agent_id,
             labels=fork_labels,
+            side_chat_parent_id=side_chat_parent_id,
         )
         self._convs[fork_id] = fork
         return fork
@@ -630,6 +660,7 @@ def test_side_chat_records_its_source_without_a_persisted_workspace(
     labels = response.json()["labels"]
     assert labels[SIDE_CHAT_LABEL_KEY] == "1"
     assert labels[SIDE_CHAT_SOURCE_LABEL_KEY] == source.id
+    assert response.json()["side_chat_parent_id"] == source.id
     assert FORK_SOURCE_LABEL_KEY not in labels
     assert response.json()["kind"] == "default"
     assert response.json()["host_id"] is None
@@ -647,6 +678,298 @@ def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
 
     assert response.status_code == 201, response.text
     assert SIDE_CHAT_SOURCE_LABEL_KEY not in response.json()["labels"]
+    assert store.fork_calls[-1]["side_chat_parent_id"] is None
+    assert response.json()["side_chat_parent_id"] is None
+
+
+async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: Any) -> set[str]:
+    """Every side chat listed for *parent_id*, one per page."""
+    listed: set[str] = set()
+    after = None
+    while True:
+        params = {"limit": 1, **({"after": after} if after else {})}
+        response = await client.get(
+            f"/v1/sessions/{parent_id}/side_chats", params=params, **kwargs
+        )
+        assert response.status_code == 200, response.text
+        page = response.json()
+        # Pagination only ever names the side chats this page returned.
+        assert {page["first_id"], page["last_id"]} <= {row["id"] for row in page["data"]} | {None}
+        listed.update(row["id"] for row in page["data"])
+        if not page["has_more"]:
+            return listed
+        after = page["last_id"]
+
+
+@pytest.mark.asyncio
+async def test_side_chats_are_listed_for_their_parent_on_every_device(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A parent's side chats, generic and Codex, are listed page by page."""
+    agent = await create_test_agent(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(agent_id=agent["id"])
+    other_parent = store.create_conversation(agent_id=agent["id"])
+
+    async def fork(source_id: str, body: dict[str, Any]) -> dict:
+        response = await client.post(f"/v1/sessions/{source_id}/fork", json=body)
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    async def codex_child(data: dict[str, str]) -> str:
+        response = await client.post(
+            f"/v1/sessions/{parent.id}/events",
+            json={"type": "external_codex_subagent_start", "data": data},
+        )
+        assert response.status_code == 202, response.text
+        return response.json()["child_session_id"]
+
+    # Created through a dashed spelling of the parent's id; listed through either.
+    dashed_parent = str(uuid.UUID(hex=parent.id))
+    side_chat = await fork(dashed_parent, {"side_chat": True})
+    another_side_chat = await fork(parent.id, {"side_chat": True})
+    other_side_chat = await fork(other_parent.id, {"side_chat": True})
+    plain_fork = await fork(parent.id, {})
+    codex_side_chat = await codex_child(
+        {"thread_id": "thread_side", "agent_nickname": "Side chat"}
+    )
+    await codex_child({"thread_id": "thread_worker", "agent_nickname": "Worker"})
+    # A Codex side chat that ended stays listed, so its transcript stays readable.
+    store.set_labels(codex_side_chat, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+
+    expected = {side_chat["id"], another_side_chat["id"], codex_side_chat}
+    assert await _side_chat_ids(client, parent.id) == expected
+    snapshot = await client.get(f"/v1/sessions/{side_chat['id']}")
+    assert snapshot.json()["side_chat_parent_id"] == parent.id
+    assert await _side_chat_ids(client, dashed_parent) == expected
+    sidebar = await client.get("/v1/sessions")
+    assert sidebar.status_code == 200, sidebar.text
+    sidebar_ids = {row["id"] for row in sidebar.json()["data"]}
+    assert plain_fork["id"] in sidebar_ids
+    assert not sidebar_ids & {side_chat["id"], another_side_chat["id"], other_side_chat["id"]}
+
+
+@pytest.mark.asyncio
+async def test_only_the_owner_starts_and_lists_side_chats(
+    auth_client: httpx.AsyncClient, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Editors, readers and admins of a shared parent can't start side chats or see the owner's."""
+    owner, editor, reader = "owner@example.com", "editor@example.com", "reader@example.com"
+    admin = "admin@example.com"
+    headers = {user: {"X-Forwarded-Email": user} for user in (owner, editor, reader, admin)}
+    store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    agent = await create_test_agent(client, name="side-chat-privacy")
+    parent = store.create_conversation(agent_id=agent["id"], harness_override="codex-native")
+    for user in (owner, editor, reader, RESERVED_USER_PUBLIC):
+        permissions.ensure_user(user)
+    permissions.ensure_user(admin, is_admin=True)
+    permissions.grant(owner, parent.id, LEVEL_OWNER)
+    permissions.grant(editor, parent.id, LEVEL_EDIT)
+    permissions.grant(reader, parent.id, LEVEL_READ)
+    permissions.grant(RESERVED_USER_PUBLIC, parent.id, LEVEL_READ)
+
+    async def fork(user: str, body: dict[str, Any]) -> httpx.Response:
+        return await auth_client.post(
+            f"/v1/sessions/{parent.id}/fork", json=body, headers=headers[user]
+        )
+
+    for user in (editor, reader, admin):
+        refused = await fork(user, {"side_chat": True})
+        assert refused.status_code == 403, refused.text
+    # A Codex /side typed in the web composer starts a side chat too.
+    side_command = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "/side why?"}]},
+        },
+        headers=headers[editor],
+    )
+    assert side_command.status_code == 403, side_command.text
+    # A plain text block counts as /side too.
+    smuggled = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "text", "text": "/side why?"}]},
+        },
+        headers=headers[editor],
+    )
+    assert smuggled.status_code == 403, smuggled.text
+    # Older executors interpret a lone text attachment as /side too.
+    attached = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "filename": "note.txt",
+                        "file_data": "data:text/plain;base64,L3NpZGUgd2h5Pw==",
+                    }
+                ],
+            },
+        },
+        headers=headers[editor],
+    )
+    assert attached.status_code == 403, attached.text
+    malformed = json.loads(attached.request.content)
+    malformed["data"]["content"].insert(0, {"type": "input_text", "text": True})
+    refused = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events", json=malformed, headers=headers[editor]
+    )
+    assert refused.status_code == 403, refused.text
+    assert await _side_chat_ids(auth_client, parent.id, headers=headers[owner]) == set()
+
+    # Reject before forwarding, including when the owner's runner is older.
+    for attachment in (
+        {"type": "input_file", "file_id": "unresolved-file"},
+        {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+    ):
+        refused = await auth_client.post(
+            f"/v1/sessions/{parent.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "/side explain this"}, attachment],
+                },
+            },
+            headers=headers[owner],
+        )
+        assert refused.status_code == 400, refused.text
+        assert "attachments" in refused.json()["error"]["message"]
+    uploaded = await auth_client.post(
+        f"/v1/sessions/{parent.id}/resources/files",
+        files={"file": ("note.txt", b"/side why?", "text/plain")},
+        headers=headers[editor],
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    for block_type in ("input_file", "input_image"):
+        referenced = await auth_client.post(
+            f"/v1/sessions/{parent.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": block_type, "file_id": uploaded.json()["id"]}],
+                },
+            },
+            headers=headers[editor],
+        )
+        assert referenced.status_code == (403 if block_type == "input_file" else 202), (
+            referenced.text
+        )
+    # Ordinary text attachments remain messages for collaborators.
+    ordinary = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "filename": "note.txt",
+                        "file_data": "data:text/plain;base64,aGVsbG8=",
+                    }
+                ],
+            },
+        },
+        headers=headers[editor],
+    )
+    assert ordinary.status_code == 202, ordinary.text
+    # Ordinary forks still need only read access.
+    assert (await fork(reader, {})).status_code == 201
+    started = await fork(owner, {"side_chat": True})
+    assert started.status_code == 201, started.text
+    registered = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
+        },
+        headers=headers[owner],
+    )
+    assert registered.status_code == 202, registered.text
+    # An editor cannot register a side chat directly either.
+    forged = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_forged", "agent_nickname": "Side chat"},
+        },
+        headers=headers[editor],
+    )
+    assert forged.status_code == 403, forged.text
+
+    async def snapshot(user: str) -> dict[str, Any]:
+        response = await auth_client.get(f"/v1/sessions/{parent.id}", headers=headers[user])
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    assert (await snapshot(owner))["side_chat_allowed"] is True
+    # An admin sees owner level but, without the owner grant, no side chats.
+    assert (await snapshot(admin))["permission_level"] == LEVEL_OWNER
+    for user in (editor, reader, admin):
+        assert (await snapshot(user))["side_chat_allowed"] is False
+
+    assert await _side_chat_ids(auth_client, parent.id, headers=headers[owner]) == {
+        started.json()["id"],
+        registered.json()["child_session_id"],
+    }
+    for user in (editor, reader, admin):
+        assert await _side_chat_ids(auth_client, parent.id, headers=headers[user]) == set()
+    # A signed-out viewer of the public parent gets none either.
+    assert await _side_chat_ids(auth_client, parent.id) == set()
+
+    # A Codex sub-agent the editor started, with its own owner grant, still
+    # belongs to the parent's owner, and so does a side chat opened from it.
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        agent_id=agent["id"],
+        harness_override="codex-native",
+    )
+    permissions.grant(editor, child.id, LEVEL_OWNER)
+    nested = await auth_client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_nested", "agent_nickname": "Side chat"},
+        },
+        headers=headers[owner],
+    )
+    assert nested.status_code == 202, nested.text
+    assert await _side_chat_ids(auth_client, child.id, headers=headers[owner]) == {
+        nested.json()["child_session_id"]
+    }
+    assert await _side_chat_ids(auth_client, child.id, headers=headers[editor]) == set()
+
+    # The session's own runner registers its side chats, whoever it signs in as.
+    token = "side-chat-runner-token"
+    bound = store.create_conversation(
+        agent_id=agent["id"],
+        harness_override="codex-native",
+        runner_id=token_bound_runner_id(token),
+    )
+    permissions.grant(owner, bound.id, LEVEL_OWNER)
+    permissions.grant(editor, bound.id, LEVEL_EDIT)
+    from_runner = await auth_client.post(
+        f"/v1/sessions/{bound.id}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_runner", "agent_nickname": "Side chat"},
+        },
+        headers={**headers[editor], RUNNER_TUNNEL_TOKEN_HEADER: token},
+    )
+    assert from_runner.status_code == 202, from_runner.text
+    assert await _side_chat_ids(auth_client, bound.id, headers=headers[owner]) == {
+        from_runner.json()["child_session_id"]
+    }
 
 
 @pytest.mark.asyncio
@@ -1017,6 +1340,16 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     # The route forwarded the truncation point to the store — None here
     # means the request field was dropped and the fork copied everything.
     assert conv_store.fork_calls[0]["up_to_response_id"] == "resp_001"
+    # An ordinary fork is no continuation: it keeps history and picks no id.
+    assert {
+        key: conv_store.fork_calls[0][key]
+        for key in ("before_item_id", "copy_items", "continue_source", "conversation_id")
+    } == {
+        "before_item_id": None,
+        "copy_items": True,
+        "continue_source": False,
+        "conversation_id": None,
+    }
     body = resp.json()
     # Only resp_001's two items survive the truncation; msg_3 (resp_002)
     # appearing means the store ignored the cutoff.

@@ -167,7 +167,16 @@ def log_task_created(
     template = (
         template
         if template
-        in {"custom", "jira", "slack", "github", "follow-up-monitor", "pr-sweep", "news-digest"}
+        in {
+            "custom",
+            "jira",
+            "slack",
+            "github",
+            "linear",
+            "follow-up-monitor",
+            "pr-sweep",
+            "news-digest",
+        }
         else "unknown"
     )
     with contextlib.suppress(Exception):

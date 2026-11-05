@@ -333,6 +333,118 @@ def test_resolve_pr_via_commit_rejects_closed_only(
     assert github_resource._resolve_pr_via_commit(str(repo)) is None
 
 
+def test_resolve_pr_via_commit_skips_checkout_on_up_to_date_base(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fork whose default branch lags lists others' open PRs for the base tip.
+
+    Only a branch with commits beyond the base branch has a PR of its own.
+    """
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    _run(["git", "update-ref", "refs/remotes/upstream/main", "main"], repo)
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if argv[0] == "api" and argv[1].startswith("repos/acme-dev/repo/commits/"):
+            row = {
+                "number": 270,
+                "state": "open",
+                "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+            }
+            return (0, json.dumps([row]), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+    _run(["git", "checkout", "-q", "main"], repo)
+    assert github_resource._resolve_pr_via_commit(str(repo)) is None
+
+
+@pytest.mark.parametrize(
+    ("lookup_remote", "mirror"),
+    [
+        pytest.param("origin", "mirror", id="origin-lookup"),
+        pytest.param("fork", "origin", id="tracking-remote-lookup"),
+    ],
+)
+def test_resolve_pr_via_commit_ignores_same_named_repo_on_another_host(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, lookup_remote: str, mirror: str
+) -> None:
+    """A same-named repo on another host is not the PR's base, so it can't hide the PR."""
+    _run(["git", "remote", "add", lookup_remote, "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    _run(["git", "remote", "add", mirror, "git@gitlab.com:acme/repo.git"], repo)
+    _run(["git", "remote", "add", "mirror-fork", "git@gitlab.com:acme-dev/repo.git"], repo)
+    for branch in ("feature", "main"):
+        _run(["git", "config", f"branch.{branch}.remote", lookup_remote], repo)
+    _run(["git", "update-ref", "refs/remotes/upstream/main", "main"], repo)
+    _run(["git", "update-ref", f"refs/remotes/{mirror}/main", "feature"], repo)
+    row = {
+        "number": 270,
+        "state": "open",
+        "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+    }
+    _stub_gh(monkeypatch, {("api",): (0, json.dumps([row]), "")})
+
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+    _run(["git", "checkout", "-q", "main"], repo)
+    assert github_resource._resolve_pr_via_commit(str(repo)) is None
+
+
+@pytest.mark.parametrize(
+    ("base_remote", "lookalike_ref"),
+    [
+        pytest.param(None, None, id="no-base-remote"),
+        pytest.param("upstream", None, id="no-tracking-ref"),
+        pytest.param("upstream", "refs/heads/refs/remotes/upstream/main", id="lookalike-branch"),
+    ],
+)
+def test_resolve_pr_via_commit_keeps_open_pr_without_base_tracking_ref(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, base_remote: str | None, lookalike_ref: str | None
+) -> None:
+    """Without a local tracking ref of the PR's base branch, an open row is still accepted."""
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    if base_remote:
+        _run(["git", "remote", "add", base_remote, "git@github.com:acme/repo.git"], repo)
+    if lookalike_ref:
+        _run(["git", "update-ref", lookalike_ref, "main"], repo)
+    _run(["git", "checkout", "-q", "main"], repo)
+    row = {
+        "number": 270,
+        "state": "open",
+        "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+    }
+    _stub_gh(monkeypatch, {("api",): (0, json.dumps([row]), "")})
+
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+
+
+def test_resolve_pr_via_commit_picks_later_open_pr_after_skipping_one(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row skipped because its base branch has the commit doesn't stop a later row matching."""
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    _run(["git", "update-ref", "refs/remotes/upstream/main", "feature"], repo)
+    rows = [
+        {
+            "number": 270,
+            "state": "open",
+            "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+        },
+        {
+            "number": 271,
+            "state": "open",
+            "base": {"ref": "release", "repo": {"full_name": "acme/repo"}},
+        },
+    ]
+    _stub_gh(monkeypatch, {("api",): (0, json.dumps(rows), "")})
+
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (271, "acme/repo")
+
+
 def test_resolve_pr_via_commit_none_without_repo(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -17,6 +17,7 @@ from typing import Literal, cast
 from websockets.exceptions import WebSocketException
 
 from omnigent.debug_logging import debug_event
+from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
@@ -698,7 +699,8 @@ async def _wait_for_shell_completion(
                     message="Codex native session changed while waiting for the shell command; "
                     "this message was not delivered.",
                     remediation="Send the message again in the current session.",
-                )
+                ),
+                preserve_session=True,
             )
         if current.pending_shell_command_id is None and current.active_shell_turn_id is None:
             return current
@@ -1064,6 +1066,13 @@ class CodexNativeExecutor(Executor):
         del tools, system_prompt
         settings_overrides = _model_effort_overrides(config)
         latest_user_content = _latest_user_content(messages)
+        try:
+            side_question = side_chat.side_chat_question_from_content(latest_user_content)
+        except OmnigentError as exc:
+            yield ExecutorError(
+                message=exc.message, code=exc.code, undelivered=True, preserve_session=True
+            )
+            return
         shell_command = _shell_command_from_content(latest_user_content)
         if shell_command is not None and not native_shell_command_is_authorized(shell_command):
             failure = _CODEX_SHELL_AUTHORIZATION_REQUIRED
@@ -1208,7 +1217,6 @@ class CodexNativeExecutor(Executor):
                 else:
                     try:
                         _require_codex_binding(self._bridge_dir, state)
-                        side_question = side_chat.side_chat_question(input_items)
                         if shell_command is not None:
                             await _run_codex_shell_command(
                                 client,

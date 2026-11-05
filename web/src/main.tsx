@@ -1,6 +1,7 @@
 import { appConfig } from "./appConfig";
 import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
@@ -49,7 +50,7 @@ initBrowserTelemetry();
 // `refetchOnWindowFocus: true` on that specific `useQuery`.
 const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { staleTime: 30_000, refetchOnWindowFocus: false },
+    queries: APP_QUERY_DEFAULTS,
   },
 });
 

@@ -4,7 +4,12 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
 import { useChatStore } from "@/store/chatStore";
-import { isNativeFindShortcut, type TranscriptGeometry, VirtualBubbleList } from "./Transcript";
+import {
+  isNativeFindShortcut,
+  type TranscriptGeometry,
+  VirtualBubbleList,
+  visibleTranscriptBubbles,
+} from "./Transcript";
 
 afterEach(cleanup);
 
@@ -22,6 +27,43 @@ const assistantBubble: Extract<Bubble, { kind: "assistant" }> = {
   error: null,
   items: [{ kind: "text", itemId: "assistant-1", text: "hello back", final: true }],
 };
+
+it("omits hidden sub-agent wakes from visible row geometry", () => {
+  const wake: Bubble = {
+    kind: "user",
+    itemId: "wake",
+    content: [
+      {
+        type: "input_text",
+        text: "[System: sub-agent Dewey finished (completed) \u2014 1 result waiting in inbox. Call sys_read_inbox to collect.]",
+      },
+    ],
+  };
+  const timer: Bubble = {
+    kind: "user",
+    itemId: "timer",
+    content: [{ type: "input_text", text: "[System: timer reminder fired]" }],
+  };
+  const bubbles = [assistantBubble, wake, timer, bubble];
+  const visible = visibleTranscriptBubbles(bubbles);
+
+  expect(visible).toEqual([assistantBubble, timer, bubble]);
+  const malformed: Bubble = {
+    kind: "user",
+    itemId: "malformed",
+    content: [{ type: "input_text", text: null as unknown as string }],
+  };
+  expect(visibleTranscriptBubbles([malformed, wake])).toEqual([malformed]);
+  const wakeWithBody: Bubble = {
+    ...wake,
+    itemId: "wake-with-body",
+    content: [...wake.content, { type: "input_text", text: "\nOther context" }],
+  };
+  expect(visibleTranscriptBubbles([wakeWithBody])).toEqual([wakeWithBody]);
+  expect(visibleTranscriptBubbles(visible)).toBe(visible);
+  render(list(false, document.createElement("div"), vi.fn(), false, visible));
+  expect(vi.mocked(useVirtualizer).mock.lastCall?.[0].count).toBe(3);
+});
 
 function list(
   hasTasks: boolean,

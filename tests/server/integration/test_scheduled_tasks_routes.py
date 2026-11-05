@@ -7,6 +7,7 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -20,6 +21,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.automations_availability import AUTOMATIONS_HEADER
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from omnigent.runner.identity import (
@@ -383,11 +385,20 @@ async def test_automations_gate_is_checked_per_request(
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
 
+    session_id = _owned_session(db_uri)
+
     async with _serve(app, mock_llm, tmp_path) as client:
 
         async def enabled_in_info() -> bool:
             info = (await client.get("/v1/info", headers=_headers())).json()
             assert info["scheduled_task_inbox"] == info["automations_enabled"]
+            # The runner reads the same gate off its bundle download to hide the tools.
+            bundle = await client.get(
+                f"/v1/sessions/{session_id}/agent/contents", headers=_headers()
+            )
+            assert bundle.status_code == 200, bundle.text
+            expected = "1" if info["automations_enabled"] else "0"
+            assert bundle.headers[AUTOMATIONS_HEADER] == expected
             return info["automations_enabled"]
 
         created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
@@ -1795,8 +1806,11 @@ async def test_list_runs_includes_conversation_read_state_fields(
     so the frontend can compute the unread dot without per-row session GETs.
     Runs with no conversation (skipped/failed host-less) get null for all three.
     """
+    import time
     import uuid
 
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     _make_user(db_uri)
@@ -1816,7 +1830,27 @@ async def test_list_runs_includes_conversation_read_state_fields(
     # A known session the viewer saw but never flagged, waiting on its harness.
     waiting = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
     conv_store.set_session_live_status(waiting.id, "waiting")
+    conv_store.set_pending_elicitation_count(waiting.id, 2)
+    runner_id = f"runner_{uuid.uuid4().hex}"
+    conv_store.set_runner_id(waiting.id, runner_id)
+    conv_store.touch_runner_liveness([runner_id], now=int(time.time()))
     _set_read_state("alice@example.com", waiting.id, 1_700_000_100, False)
+
+    in_process = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
+    elicitation_id = uuid.uuid4().hex
+    pending_elicitations.record_publish(
+        in_process.id,
+        {"type": "response.elicitation_request", "elicitation_id": elicitation_id},
+    )
+    in_process_run_id = uuid.uuid4().hex
+    _seed_run(
+        db_uri,
+        task_id,
+        in_process_run_id,
+        scheduled_at=1600,
+        status="running",
+        conversation_id=in_process.id,
+    )
 
     succeeded_id = uuid.uuid4().hex
     running_id = uuid.uuid4().hex
@@ -1858,6 +1892,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert succ["viewer_last_seen"] == conv.updated_at - 1
     assert succ["viewer_unread"] is True
     assert succ["session_cost_usd"] == 1.234
+    assert succ["conversation_pending_approvals"] == 0
 
     # Status reads as the sessions list reports it ("waiting" is "running"), and
     # an unflagged session is explicitly not unread rather than unknown.
@@ -1866,6 +1901,9 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert running["viewer_last_seen"] == 1_700_000_100
     assert running["viewer_unread"] is False
     assert running["session_cost_usd"] is None
+    assert running["conversation_pending_approvals"] == 2
+    assert runs[in_process_run_id]["conversation_pending_approvals"] == 1
+    pending_elicitations.resolve(in_process.id, elicitation_id)
 
     # The skipped run (no conversation_id) gets null for all three fields.
     skip = runs[skipped_id]
@@ -1874,6 +1912,36 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert skip["viewer_last_seen"] is None
     assert skip["viewer_unread"] is None
     assert skip["session_cost_usd"] is None
+    assert skip["conversation_pending_approvals"] == 0
+
+    # Another replica's fresh runner remains actionable; stale/disconnected runners do not.
+    now = int(time.time())
+    for last_seen, pending in (
+        (now - 5, 2),
+        (now - RUNNER_LIVENESS_TTL_S - 5, 0),
+        (None, 0),
+        (now, 2),
+    ):
+        if last_seen is None:
+            conv_store.clear_runner_liveness(runner_id)
+        else:
+            conv_store.touch_runner_liveness([runner_id], now=last_seen)
+        resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+        assert resp.status_code == 200
+        waiting_run = next(row for row in resp.json()["runs"] if row["id"] == running_id)
+        assert waiting_run["conversation_pending_approvals"] == pending
+        assert (
+            conv_store.get_session_activity([waiting.id])[waiting.id].pending_elicitation_count
+            == 2
+        )
+
+    conv_store.clear_runner_id(waiting.id)
+    assert pending_elicitations.count_for(waiting.id) == 0
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200
+    waiting_run = next(row for row in resp.json()["runs"] if row["id"] == running_id)
+    assert waiting_run["conversation_pending_approvals"] == 0
+    assert conv_store.get_session_activity([waiting.id])[waiting.id].pending_elicitation_count == 2
 
     # Continuing the same session reports its current total on every run.
     _seed_run(
@@ -2548,6 +2616,23 @@ async def test_run_now_triggers_and_records_a_run(
     assert row["last_run_status"] == "running"
 
 
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_database_scheduler_run_now_returns_recorded_run_id(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    task_id = created.json()["id"]
+    response = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert response.status_code == 202, response.text
+    runs = (
+        await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    ).json()["runs"]
+    assert len(runs) == 1
+    assert response.json() == {"triggered": True, "id": task_id, "run_id": runs[0]["id"]}
+
+
 async def test_run_now_allows_paused_task(
     auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
 ) -> None:
@@ -3131,3 +3216,129 @@ async def test_random_worktree_requires_pinned_repository(
     )
     assert response.status_code == 422, response.text
     assert "random worktree requires" in response.text
+
+
+@pytest.mark.parametrize(
+    "execution_target,session_mode,minutes,status",
+    [
+        ("connected_host", "new", 10, 200),
+        ("connected_host", "continue", 10, 200),
+        ("managed_sandbox", "continue", 10, 200),
+        ("managed_sandbox", "new", 10, 400),
+        ("managed_sandbox", "new", 60, 200),
+    ],
+)
+async def test_create_interval_policy(
+    auth_client, auth_app, execution_target, session_mode, minutes, status
+):
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            session_mode=session_mode,
+            execution_target=execution_target,
+            host_id=None,
+            workspace=None,
+            rrule=f"FREQ=MINUTELY;INTERVAL={minutes}",
+        ),
+        headers=_headers(),
+    )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json()["session_mode"] == session_mode
+        assert response.json()["execution_target"] == execution_target
+        assert response.json()["session_id"] is None
+
+
+async def test_update_validates_effective_schedule_and_session_mode(auth_client, auth_app):
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(execution_target="managed_sandbox", host_id=None, workspace=None),
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    url = f"/v1/scheduled-tasks/{response.json()['id']}"
+    for patch, expected in [
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10"}, 400),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10", "session_mode": "continue"}, 200),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=15"}, 200),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=9"}, 400),
+        ({"session_mode": "new"}, 400),
+        ({"name": "Renamed"}, 200),
+        ({"execution_target": "connected_host", "session_mode": "new"}, 200),
+        ({"execution_target": "managed_sandbox"}, 400),
+        ({"execution_target": "managed_sandbox", "session_mode": "continue"}, 200),
+    ]:
+        response = await auth_client.patch(url, json=patch, headers=_headers())
+        assert response.status_code == expected, response.text
+    saved = (await auth_client.get(url, headers=_headers())).json()
+    assert (saved["session_mode"], saved["rrule"]) == ("continue", "FREQ=MINUTELY;INTERVAL=15")
+    response = await auth_client.patch(
+        url, json={"session_mode": "new", "rrule": "FREQ=HOURLY"}, headers=_headers()
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["session_mode"] == "new"
+
+
+@pytest.mark.parametrize("policy_field", ["session_mode", "execution_target"])
+@pytest.mark.parametrize("recurrence_first", [False, True])
+async def test_concurrent_schedule_edits_reject_stale_validation(
+    auth_client, auth_app, monkeypatch, policy_field, recurrence_first
+):
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    initial = _create_body(
+        execution_target="managed_sandbox" if policy_field == "session_mode" else "connected_host",
+        session_mode="continue" if policy_field == "session_mode" else "new",
+        host_id=None,
+        workspace=None,
+    )
+    response = await auth_client.post("/v1/scheduled-tasks", json=initial, headers=_headers())
+    assert response.status_code == 200, response.text
+    url = f"/v1/scheduled-tasks/{response.json()['id']}"
+    recurrence_patch = {"rrule": "FREQ=MINUTELY;INTERVAL=10"}
+    policy_patch = {policy_field: "new" if policy_field == "session_mode" else "managed_sandbox"}
+    validate = scheduled_tasks_routes._validate_rrule_or_400
+    validated = asyncio.Barrier(2)
+    first_saved = asyncio.Event()
+
+    async def validate_together(rrule, session_mode, execution_target):
+        await validate(rrule, session_mode, execution_target)
+        await validated.wait()
+        if (rrule == recurrence_patch["rrule"]) != recurrence_first:
+            await first_saved.wait()
+
+    async def patch(fields, first):
+        try:
+            return await auth_client.patch(url, json=fields, headers=_headers())
+        finally:
+            if first:
+                first_saved.set()
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(scheduled_tasks_routes, "_validate_rrule_or_400", validate_together)
+        async with asyncio.timeout(10):
+            recurrence_response, policy_response = await asyncio.gather(
+                patch(recurrence_patch, recurrence_first),
+                patch(policy_patch, not recurrence_first),
+            )
+    winner, loser = (
+        (recurrence_response, policy_response)
+        if recurrence_first
+        else (policy_response, recurrence_response)
+    )
+    assert winner.status_code == 200, winner.text
+    assert loser.status_code == 409, loser.text
+    assert "Reload and try again" in loser.text
+    saved = (await auth_client.get(url, headers=_headers())).json()
+    assert (saved["rrule"], saved["session_mode"], saved["execution_target"]) == (
+        winner.json()["rrule"],
+        winner.json()["session_mode"],
+        winner.json()["execution_target"],
+    )
+    assert saved["state"] == "active"
+    retry = await auth_client.patch(
+        url, json=policy_patch if recurrence_first else recurrence_patch, headers=_headers()
+    )
+    assert retry.status_code == 400, retry.text
+    assert "Minimum interval is 60 minutes" in retry.text

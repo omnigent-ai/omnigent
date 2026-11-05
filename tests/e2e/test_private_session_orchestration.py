@@ -278,6 +278,12 @@ def test_private_manager_launch_send_read_and_sharing(
                 )
 
                 agent = client.get(f"/v1/sessions/{worker}").json()["agent_id"]
+                # A session the manager starts is filed beside it, in its project.
+                project = client.post("/v1/projects", json={"name": "Orchestration"})
+                assert project.status_code == 200, project.text
+                project_id = project.json()["id"]
+                filed = client.patch(f"/v1/sessions/{manager}", json={"project_id": project_id})
+                assert filed.status_code == 200, filed.text
                 configure("NEW_WORKER_TASK", [{"text": "NEW_WORKER_RESULT"}])
                 configure(
                     "MANAGER_SEND_READ_CREATE",
@@ -306,6 +312,7 @@ def test_private_manager_launch_send_read_and_sharing(
                 created = client.get(f"/v1/sessions/{created['id']}").json()
                 assert created["parent_session_id"] is None
                 assert created["labels"]["omnigent.created_by_session_id"] == manager
+                assert created["project_id"] == project_id
                 assert created["host_id"] == host_id
                 wait_text(created["id"], "NEW_WORKER_RESULT")
                 grants = client.get(f"/v1/sessions/{created['id']}/permissions").json()[

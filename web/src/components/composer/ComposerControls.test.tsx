@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ComposerHostTrigger,
@@ -18,8 +19,8 @@ describe("shared composer controls", () => {
     render(
       <>
         <ComposerWorkspaceBar data-testid="workspace-bar">
-          <ComposerWorkspaceTrigger kind="directory" label="repo" />
-          <ComposerWorkspaceTrigger kind="worktree" label="main" />
+          <ComposerWorkspaceTrigger kind="directory" label="repo" tooltip="repo" menuOpen={false} />
+          <ComposerWorkspaceTrigger kind="worktree" label="main" tooltip="main" menuOpen={false} />
         </ComposerWorkspaceBar>
         <ComposerHostTrigger label="This machine" status="online" />
       </>,
@@ -60,19 +61,60 @@ describe("shared composer controls", () => {
   it("lets workspace labels use half the bar instead of a fixed pixel cap", () => {
     render(
       <ComposerWorkspaceBar>
-        <ComposerWorkspaceTrigger kind="directory" label="new-composer-width" />
-        <ComposerWorkspaceTrigger kind="worktree" label="feature/new-composer-width" />
+        <ComposerWorkspaceTrigger
+          kind="directory"
+          label="new-composer-width"
+          tooltip="new-composer-width"
+          menuOpen={false}
+        />
+        <ComposerWorkspaceTrigger
+          kind="worktree"
+          label="feature/new-composer-width"
+          tooltip="feature/new-composer-width"
+          menuOpen={false}
+        />
       </ComposerWorkspaceBar>,
     );
 
     for (const trigger of screen.getAllByRole("button")) {
-      expect(trigger).toHaveClass("min-w-10", "md:min-w-11", "px-1", "max-w-[calc(50%-0.25rem)]");
+      expect(trigger).toHaveClass("min-w-10", "md:min-w-11", "px-1", "max-w-full");
+      // The tooltip wrapper is the bar's flex item, so it carries the cap.
+      expect(trigger.parentElement).toHaveClass("max-w-[calc(50%-0.25rem)]");
       expect(trigger).not.toHaveClass("max-w-[180px]");
       expect(trigger.querySelector("span")).toHaveClass("min-w-0", "truncate");
       for (const icon of trigger.querySelectorAll("svg")) {
         expect(icon).toHaveClass("shrink-0");
       }
     }
+  });
+
+  it("shows workspace details in a tooltip that stays hidden while the menu is open", async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <ComposerWorkspaceTrigger
+        kind="directory"
+        label="repo"
+        tooltip="Working directory: /home/alice/repo"
+        menuOpen={false}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "repo" });
+    expect(trigger).not.toHaveAttribute("title");
+    // Screen readers get the details without hovering.
+    expect(trigger).toHaveAccessibleDescription("Working directory: /home/alice/repo");
+    await user.hover(trigger);
+    expect(await screen.findByRole("tooltip", {}, { timeout: 3000 })).toHaveTextContent(
+      "Working directory: /home/alice/repo",
+    );
+    rerender(
+      <ComposerWorkspaceTrigger
+        kind="directory"
+        label="repo"
+        tooltip="Working directory: /home/alice/repo"
+        menuOpen
+      />,
+    );
+    expect(screen.queryByRole("tooltip")).toBeNull();
   });
 
   it("renders a product-icon model trigger instead of a separate settings gear", () => {
@@ -86,7 +128,7 @@ describe("shared composer controls", () => {
     );
     const trigger = screen.getByRole("button", { name: "Codex configuration" });
     expect(trigger).toHaveTextContent("GPT-5.6-Sol");
-    expect(trigger).toHaveClass("w-auto");
+    expect(trigger).toHaveClass("w-auto", "shrink");
     expect(trigger).toHaveClass("px-2", "py-0", "border-0", "leading-5", "md:min-h-7");
     expect(trigger).not.toHaveClass("pr-0");
     expect(trigger).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
@@ -358,8 +400,14 @@ describe("workspace bar label collapse", () => {
   it("marks each chip label to collapse to its icon and keeps the label as the name", () => {
     render(
       <ComposerWorkspaceBar>
-        <ComposerWorkspaceTrigger kind="directory" label="repo" />
-        <ComposerWorkspaceTrigger kind="worktree" label="main" aria-label="Branch: main" />
+        <ComposerWorkspaceTrigger kind="directory" label="repo" tooltip="repo" menuOpen={false} />
+        <ComposerWorkspaceTrigger
+          kind="worktree"
+          label="main"
+          tooltip="main"
+          menuOpen={false}
+          aria-label="Branch: main"
+        />
       </ComposerWorkspaceBar>,
     );
     const label = screen.getByText("repo");
@@ -374,7 +422,12 @@ describe("workspace bar label collapse", () => {
     vi.stubGlobal("ResizeObserver", StubResizeObserver);
     render(
       <ComposerWorkspaceBar data-testid="bar">
-        <ComposerWorkspaceTrigger kind="worktree" label="feature/really-long-branch-name" />
+        <ComposerWorkspaceTrigger
+          kind="worktree"
+          label="feature/really-long-branch-name"
+          tooltip="feature/really-long-branch-name"
+          menuOpen={false}
+        />
       </ComposerWorkspaceBar>,
     );
     const bar = screen.getByTestId("bar");
@@ -394,7 +447,7 @@ describe("workspace bar label collapse", () => {
     vi.stubGlobal("ResizeObserver", StubResizeObserver);
     render(
       <ComposerWorkspaceBar data-testid="bar">
-        <ComposerWorkspaceTrigger kind="directory" label="repo" />
+        <ComposerWorkspaceTrigger kind="directory" label="repo" tooltip="repo" menuOpen={false} />
       </ComposerWorkspaceBar>,
     );
     const bar = screen.getByTestId("bar");

@@ -69,11 +69,13 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { SideChatPicker } from "./SideChatPicker";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
+import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
 import { createSideChat, stopSession } from "@/lib/sessionsApi";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
@@ -122,13 +124,6 @@ function WorkspaceMenuShortcut({
 }) {
   return <CompactShortcutKeys keys={keys} className={className} />;
 }
-
-// Side-chat child ids opened in THIS app session. Module scope, so it resets on
-// reload/restart. A Codex side chat is an ephemeral thread-fork of the parent's
-// runner: one restored from localStorage after a restart points at a dead
-// process, so it must be read-only. This set distinguishes a live, this-session
-// child from a restored (dead) one.
-const sideChatsStartedThisSession = new Set<string>();
 
 function WorkspaceTabTooltip({
   label,
@@ -802,8 +797,8 @@ interface WorkspacePanelProps {
   mobileSideChatsOpen?: boolean;
   /** Open or close the mobile side-chats drawer. */
   onMobileSideChatsOpenChange?: (open: boolean) => void;
-  /** Reports whether a sub-agent tab is open, so a phone can reach the drawer. */
-  onHasSubagentTabsChange?: (hasSubagentTabs: boolean) => void;
+  /** Reports whether a side-chat or sub-agent tab is open, so a phone can reach the drawer. */
+  onHasSideChatTabsChange?: (hasSideChatTabs: boolean) => void;
   /** Opens a sub-agent from the Agents tab as a rail tab; absent where unsupported (Grid panes). */
   subagentPanelOpener?: SubagentPanelOpener;
 }
@@ -877,7 +872,7 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
-  onHasSubagentTabsChange,
+  onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
   const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
@@ -906,11 +901,12 @@ function WorkspacePanelImpl({
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
-  const hasSubagentTabs = sideChats.tabs.some((id) => subagentSessionIdFromTab(id) !== null);
+  // Open tabs stay reachable even where this viewer can't start a side chat.
+  const hasSideChatTabs = sideChats.tabs.length > 0;
   useEffect(() => {
-    onHasSubagentTabsChange?.(hasSubagentTabs);
-    return () => onHasSubagentTabsChange?.(false);
-  }, [hasSubagentTabs, onHasSubagentTabsChange]);
+    onHasSideChatTabsChange?.(hasSideChatTabs);
+    return () => onHasSideChatTabsChange?.(false);
+  }, [hasSideChatTabs, onHasSideChatTabsChange]);
   const activeHarness = useChatStore((s) => s.sessionHarness);
   const sideChatHarness = sessionHarness === undefined ? activeHarness : sessionHarness;
   const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
@@ -945,8 +941,6 @@ function WorkspacePanelImpl({
       // existing session) must not take a slot in the Codex awaiting queue.
       sideChats.open(childId);
     } else {
-      // Started this session → live (not a dead restored Codex fork).
-      sideChatsStartedThisSession.add(childId);
       const awaiting = awaitingPendingIdsRef.current.shift();
       if (awaiting !== undefined) {
         sideChats.rekey(awaiting, childId);
@@ -969,9 +963,10 @@ function WorkspacePanelImpl({
   // that supports side chat.
   const activeAgentId = useChatStore((s) => s.boundAgentId);
   const parentAgentId = agentId === undefined ? activeAgentId : agentId;
-  const onNewSideChat = supportsSideChat(sideChatHarness)
+  const canStartSideChat = useCanStartSideChat(conversationId, permissionLevel);
+  const onNewSideChat = supportsSideChat(sideChatHarness, canStartSideChat)
     ? () => {
-        sideChats.openPending();
+        useChatStore.getState().requestSideChatFocus(sideChats.openPending());
         onRightRailTabChange("sidechat");
       }
     : undefined;
@@ -1120,14 +1115,6 @@ function WorkspacePanelImpl({
           (isMobile ? mobileSideChatsOpen : open && sideChatSelected) ? conversationId : undefined
         }
         onStart={(text) => startPendingSideChat(selectedSideChat, text)}
-        // A Codex side chat restored after a restart is a dead ephemeral
-        // fork: show it read-only rather than let the user
-        // send into a thread that no longer exists.
-        readOnly={
-          usesNativeSideChatFork(sideChatHarness) &&
-          !selectedSideChat.startsWith("pending:") &&
-          !sideChatsStartedThisSession.has(selectedSideChat)
-        }
       />
     );
   };
@@ -1241,6 +1228,17 @@ function WorkspacePanelImpl({
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
+  const sideChatPicker = supportsSideChat(sideChatHarness, canStartSideChat) && !pending && (
+    <SideChatPicker
+      key={conversationId}
+      conversationId={conversationId}
+      onOpen={(childId) => {
+        sideChats.open(childId);
+        onRightRailTabChange("sidechat");
+        onReveal?.();
+      }}
+    />
+  );
   const newTabMenu = (menuAlign: "start" | "end") => (
     <NewTabMenu
       conversationId={conversationId}
@@ -1744,6 +1742,7 @@ function WorkspacePanelImpl({
             pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
             {showOpenTabs && newTabMenu("end")}
+            {sideChatPicker}
             {panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {
@@ -1821,7 +1820,8 @@ function WorkspacePanelImpl({
           data-workspace-panel-content
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
         >
-          {showContentSearch && showFilesPanel && !pending && (
+          {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
+          {showContentSearch && showFilesPanel && !pending && !isMobile && (
             <div
               className={cn(
                 "min-h-0 flex-1 flex-col",
@@ -1982,6 +1982,7 @@ function WorkspacePanelImpl({
                 </div>
               );
             })}
+            {sideChatPicker}
             {onNewSideChat && (
               <Button
                 type="button"

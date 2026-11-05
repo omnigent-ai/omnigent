@@ -1,6 +1,7 @@
 import {
   forwardRef,
   useEffect,
+  useId,
   useRef,
   useState,
   type ComponentPropsWithoutRef,
@@ -67,6 +68,25 @@ export function ComposerWorkspaceBar({
   );
 }
 
+/**
+ * Tooltip text only reaches assistive tech while the tooltip is open, so text
+ * that adds to the accessible name also gets a persistent hidden description.
+ */
+export function useTooltipDescription(name: string | undefined, details: ReactNode) {
+  const id = useId();
+  if (typeof details !== "string" || details === name) {
+    return { describedBy: undefined, description: null };
+  }
+  return {
+    describedBy: id,
+    description: (
+      <span id={id} className="sr-only">
+        {details}
+      </span>
+    ),
+  };
+}
+
 export const ComposerWorkspaceTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
@@ -75,35 +95,49 @@ export const ComposerWorkspaceTrigger = forwardRef<
     icon?: ReactNode;
     /** Hide the visible label; it stays the accessible name. */
     iconOnly?: boolean;
+    /** Hover details, e.g. the full path; hidden while its menu is open. */
+    tooltip: ReactNode;
+    menuOpen: boolean;
   }
 >(function ComposerWorkspaceTrigger(
-  { kind, label, icon, iconOnly = false, className, ...props },
+  { kind, label, icon, iconOnly = false, tooltip, menuOpen, className, ...props },
   ref,
 ) {
   const Icon = kind === "directory" ? FolderIcon : GitForkIcon;
+  const { describedBy, description } = useTooltipDescription(props["aria-label"] ?? label, tooltip);
   return (
-    <button
-      ref={ref}
-      type="button"
-      // Icon-only while the bar is collapsed, so the label is the name.
-      aria-label={label}
-      className={cn(
-        "relative inline-flex h-6 min-w-10 mobile-touch-target mobile-app:h-auto max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
-        className,
-      )}
-      {...props}
+    <ComposerMenuTooltip
+      menuOpen={menuOpen}
+      content={tooltip}
+      // The wrapper is the bar's flex item, so it carries the width cap.
+      className="max-w-[calc(50%-0.25rem)]"
+      contentClassName="max-w-[min(36rem,calc(100vw-2rem))] break-all"
     >
-      {icon ?? <Icon className="size-3.5 shrink-0" />}
-      {!iconOnly && (
-        <span
-          data-workspace-collapse-label=""
-          className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
-        >
-          {label}
-        </span>
-      )}
-      <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
-    </button>
+      <button
+        ref={ref}
+        type="button"
+        // Icon-only while the bar is collapsed, so the label is the name.
+        aria-label={label}
+        aria-describedby={describedBy}
+        className={cn(
+          "relative inline-flex h-6 min-w-10 mobile-touch-target mobile-app:h-auto max-w-full cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
+          className,
+        )}
+        {...props}
+      >
+        {icon ?? <Icon className="size-3.5 shrink-0" />}
+        {!iconOnly && (
+          <span
+            data-workspace-collapse-label=""
+            className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+          >
+            {label}
+          </span>
+        )}
+        <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
+      </button>
+      {description}
+    </ComposerMenuTooltip>
   );
 });
 
@@ -379,7 +413,7 @@ export const ComposerHarnessTrigger = forwardRef<
       aria-label={label}
       aria-busy={loading || undefined}
       className={cn(
-        "h-auto min-h-8 mobile-touch-target min-w-0 w-auto max-w-full gap-1 rounded-lg border-0 px-2 py-0 text-[13px] leading-5 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
+        "h-auto min-h-8 mobile-touch-target min-w-0 w-auto max-w-full shrink gap-1 rounded-lg border-0 px-2 py-0 text-ui leading-5 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
         className,
       )}
       {...props}
@@ -412,7 +446,7 @@ export const ComposerHarnessTrigger = forwardRef<
       >
         {model && (
           <span
-            className="min-w-0 truncate text-left text-[13px] leading-5 font-medium text-foreground"
+            className="min-w-0 truncate text-left text-ui leading-5 font-medium text-foreground"
             title={model}
             data-testid={`${testIdPrefix}-agent-model-value`}
           >
@@ -421,7 +455,7 @@ export const ComposerHarnessTrigger = forwardRef<
         )}
         {effort && (
           <span
-            className="shrink-0 text-[13px] leading-5 font-normal text-muted-foreground"
+            className="shrink-0 text-ui leading-5 font-normal text-muted-foreground"
             data-testid={`${testIdPrefix}-agent-effort-value`}
           >
             {effort}

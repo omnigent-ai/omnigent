@@ -8,7 +8,7 @@ import dataclasses
 import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -30,7 +30,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.db.utils import generate_agent_id, generate_file_id
+from omnigent.db.utils import generate_agent_id, generate_conversation_id, generate_file_id
 from omnigent.debug_logging import (
     add_audit_attrs,
     debug_event,
@@ -51,6 +51,7 @@ from omnigent.harnesses.codex_native.timeouts import (
     SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
 )
 from omnigent.models.model_override import validate_model_override
+from omnigent.native._native_supersession import supersession_notice_text
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -94,6 +95,9 @@ from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -124,6 +128,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
+    _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _logger,
     get_server_runner_router,
     set_server_runner_router,
@@ -161,6 +166,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_collaboration_mode,
     _publish_permission_mode,
     _publish_sandbox_status,
+    _publish_session_superseded,
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
@@ -173,6 +179,7 @@ from omnigent.server.routes._sessions.helpers import (
     _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
+    _session_status_from_cache,
     _set_read_state,
     _start_managed_launch_task,
     _surface_model_change_forward_failure,
@@ -195,9 +202,13 @@ from omnigent.server.routes._sessions.orchestration import (
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
+    _mark_session_moving,
+    _persist_external_conversation_item,
     _persist_model_change_note,
     _publish_runner_recovered_status,
     _run_managed_launch,
+    _session_is_moving,
+    _session_is_starting,
     _spawn_archive_stop,
     _validate_session_model_selection,
     ensure_runner_connected,
@@ -221,6 +232,7 @@ from omnigent.server.schemas import (
     SessionProjectSummary,
     SessionPullRequestSummary,
     SessionResponse,
+    SupersessionReason,
     UpdateSessionRequest,
 )
 from omnigent.server.session_orchestration import require_orchestration_source
@@ -256,6 +268,12 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+# Continues a claude-sdk session in a fresh session on ``/clear`` once the
+# release callback has freed its client; returns the new session's id.
+ClearSessionIntoFreshSession = Callable[
+    [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
+]
 
 
 def _require_attachment_compatible_history(
@@ -432,8 +450,11 @@ def register_core_routes(
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
-) -> None:
-    """Register the core session routes on router."""
+) -> ClearSessionIntoFreshSession:
+    """Register the core session routes on router.
+
+    :returns: The claude-sdk ``/clear`` rotation the events route calls.
+    """
 
     async def _check_initial_input(request: Request, event: SessionEventInput | None) -> None:
         """Refuse a malformed first input before the session exists."""
@@ -505,14 +526,113 @@ def register_core_routes(
         except Exception:
             # The create fails, so leave no session (or uploaded file) for a retry
             # to duplicate.
-            if file_store is not None:
-                blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
-                if artifact_store is not None:
-                    for blob_key in blob_keys:
-                        with contextlib.suppress(Exception):
-                            await asyncio.to_thread(artifact_store.delete, blob_key)
-            await conversation_store.delete_conversation(session_id)
+            await _delete_unreturned_session(session_id)
             raise
+
+    async def _list_session_grants(session_id: str) -> dict[str, int]:
+        """Every grant on *session_id*, as grantee to level."""
+        assert permission_store is not None
+        levels: dict[str, int] = {}
+        after: str | None = None
+        while True:
+            grants, after = await asyncio.to_thread(
+                permission_store.list_for_session, session_id, limit=500, after_user_id=after
+            )
+            levels.update((grant.user_id, grant.level) for grant in grants)
+            if after is None:
+                return levels
+
+    async def _copy_session_grants(source_id: str, target_id: str) -> None:
+        """Give *target_id*, a session created with no grants, exactly *source_id*'s."""
+        if permission_store is None:
+            return
+        for user_id, level in (await _list_session_grants(source_id)).items():
+            await asyncio.to_thread(permission_store.grant, user_id, target_id, level)
+
+    async def _release_unreturned_runner_session(session_id: str, routing: Conversation) -> None:
+        """Best-effort: drop a deleted fork's session from the runner it was sent to.
+
+        *routing* names that runner, since the fork's own binding may already
+        be rolled back. The runner's delete is idempotent and also stops an
+        initialization still in flight there.
+        """
+        try:
+            runner_client = await _get_runner_client(
+                session_id, runner_router, conversation=routing
+            )
+            if runner_client is not None:
+                await runner_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
+        except Exception:
+            _logger.warning(
+                "Failed to release the runner session of unreturned fork %s",
+                session_id,
+                exc_info=True,
+            )
+
+    async def _release_unreturned_fork_host(request: Request, host_id: str | None) -> None:
+        """Tear down a deleted fork's managed sandbox if nothing else uses it.
+
+        A fork may have been the sandbox's last reference (its source deleted
+        meanwhile), so its removal ends the sandbox like a session delete.
+        Best-effort: the original error is what the caller reports.
+        """
+        host_store = getattr(request.app.state, "host_store", None)
+        if host_id is None or host_store is None:
+            return
+        from omnigent.server.managed_hosts import release_session_managed_host
+
+        try:
+            await release_session_managed_host(
+                host_id, host_store, getattr(request.app.state, "sandbox_config", None)
+            )
+        except Exception:
+            _logger.warning(
+                "Failed to release the managed host %s of an unreturned fork",
+                host_id,
+                exc_info=True,
+            )
+
+    async def _delete_unreturned_session(session_id: str) -> None:
+        """Delete a session whose creating request failed, with its unshared files."""
+        if file_store is not None:
+            blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
+            if artifact_store is not None:
+                for blob_key in blob_keys:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(artifact_store.delete, blob_key)
+        await conversation_store.delete_conversation(session_id)
+
+    async def _unreturned_fork_agent_copy(
+        fork_id: str, source_agent_id: str | None
+    ) -> Agent | None:
+        """The agent copy a failed fork was given in place of its source's agent."""
+        try:
+            fork = await asyncio.to_thread(conversation_store.get_conversation, fork_id)
+            if fork is None or fork.agent_id is None or fork.agent_id == source_agent_id:
+                return None
+            return await asyncio.to_thread(agent_store.get, fork.agent_id)
+        except Exception:
+            _logger.exception("Failed to look up rejected fork's agent copy")
+            return None
+
+    async def _delete_unreturned_agent_copy(
+        session_id: str, agent_id: str, bundle_location: str | None
+    ) -> None:
+        """Remove the agent copy a failed fork made, once its session is gone."""
+        try:
+            # Keep the copy if session rollback failed and still references it.
+            if (
+                await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                is not None
+            ):
+                return
+            await asyncio.to_thread(agent_store.delete, agent_id)
+            if bundle_location is not None and artifact_store is not None:
+                await asyncio.to_thread(
+                    _delete_stored_session_bundle_after_failure, artifact_store, bundle_location
+                )
+        except Exception:
+            _logger.exception("Failed to remove rejected fork's agent copy")
 
     async def _schedule_managed_launch(
         request: Request,
@@ -890,6 +1010,23 @@ def register_core_routes(
             )
         return runner_id, launch_failed
 
+    async def side_chat_allowed(
+        user_id: str | None, session_id: str, conversation: Conversation | None = None
+    ) -> bool:
+        """Whether *user_id* may start side chats in a session: its root's owner only."""
+        if auth_provider is None or permission_store is None:
+            return True
+        conv = conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        return conv is not None and await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            conv,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        )
+
     @router.post(
         "/sessions/orchestrated",
         status_code=201,
@@ -1095,6 +1232,7 @@ def register_core_routes(
             background_title_coordinator=background_title_coordinator,
             project_store=project_store,
             created_by_session_id=source.id if source is not None else None,
+            created_by_project_id=source.project_id if source is not None else None,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -1700,7 +1838,7 @@ def register_core_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             access.level,
@@ -1718,6 +1856,10 @@ def register_core_routes(
             viewer_id=user_id,
             request=request,
         )
+        snapshot.side_chat_allowed = await side_chat_allowed(
+            user_id, session_id, access.conversation
+        )
+        return snapshot
 
     @router.get(
         "/sessions/{session_id}/labels",
@@ -2302,7 +2444,10 @@ def register_core_routes(
           per ``watch`` (full state for the new set), then
           ``{"type": "changed", "items": [...]}`` /
           ``{"type": "removed", "ids": [...]}`` deltas as watched
-          sessions change, and ``{"type": "heartbeat"}`` when idle.
+          sessions change, ``{"type": "access_changed", "ids": [...]}``
+          when a watched session is newly shared with the user (its row
+          may be unchanged, so list membership must be re-read), and
+          ``{"type": "heartbeat"}`` when idle.
 
         Watched-row freshness is pull-based — each interval the server
         re-reads the watched ids (the same read ``GET /v1/sessions`` does)
@@ -2506,12 +2651,16 @@ def register_core_routes(
                     if not isinstance(sid, str):
                         continue
                     async with emit_lock:
-                        # Already watched ⇒ the normal diff already covers it.
-                        if sid in watched:
-                            continue
                         try:
                             items = await _fetch_watched_items([sid], user_id)
-                            if items:
+                            if items and sid in watched:
+                                # The interval diff covers the row, but a grant
+                                # that leaves the row unchanged (e.g. a direct
+                                # read share of a session already readable by
+                                # link) emits no delta. Tell the client its access
+                                # changed so it re-reads list membership.
+                                await _send({"type": "access_changed", "ids": [sid]})
+                            elif items:
                                 await _send({"type": "changed", "items": items})
                         except WebSocketDisconnect:
                             # Client gone mid-send — propagate to tear the stream down.
@@ -3790,7 +3939,7 @@ def register_core_routes(
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the
         # items read — it dominated this response's size and build time.
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             level,
@@ -3803,6 +3952,8 @@ def register_core_routes(
             viewer_id=user_id,
             request=request,
         )
+        snapshot.side_chat_allowed = await side_chat_allowed(user_id, session_id)
+        return snapshot
 
     # ── POST /sessions/{source_id}/fork ─────────────────────────
 
@@ -3876,13 +4027,48 @@ def register_core_routes(
         :raises OmnigentError: 404 if *source_id* does not exist or
             ``body.agent_id`` names no agent; 403/404 if the caller
             lacks read access on the source, or on the session that
-            owns a session-scoped ``body.agent_id``; 400 if the source
+            owns a session-scoped ``body.agent_id``; 403 for a side chat
+            unless the caller owns the source's root session; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
             for a sandbox this server has not configured; 409 if
             ``body.host_id`` is already in use; 410 if the
             source's agent was removed or a required bundle copy finds
             its source missing.
+        """
+        fork = await _fork_session(request, source_id, body)
+        assert fork is not None
+        return fork
+
+    async def _fork_session(
+        request: Request,
+        source_id: str,
+        body: SessionForkRequest,
+        *,
+        before_item_id: str | None = None,
+        keep_sandbox_labels: bool = False,
+        copy_history: bool = True,
+        continue_source: bool = False,
+        fork_id: str | None = None,
+        validate_only: bool = False,
+    ) -> SessionResponse | None:
+        """Fork *source_id* as :func:`fork_session` documents.
+
+        :param before_item_id: Internal cutoff for rewind and clear: copy only
+            the items before this one, e.g. ``"msg_abc123"``.
+        :param keep_sandbox_labels: Copy the source's managed-sandbox labels,
+            for a fork that stays in the source's sandbox.
+        :param copy_history: ``False`` copies none of the source's items or
+            files, whatever it holds when the fork commits.
+        :param continue_source: Create the fork on the source's host and
+            workspace, with its routing switches, as a same-owner continuation;
+            it gets no creation-default sharing nor owner grant (the caller sets
+            its grants), is not announced here, and the response carries no
+            items or permission.
+        :param fork_id: Id to create the fork under, e.g. so a caller can
+            remove it by id even if this call fails part-way.
+        :param validate_only: Run every check that could refuse the fork, then
+            return ``None`` without creating anything.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -3896,6 +4082,16 @@ def register_core_routes(
                     f"Session not found: {source_id!r}",
                     code=ErrorCode.NOT_FOUND,
                 )
+        if body.side_chat and not await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            source,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ):
+            raise OmnigentError(
+                "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
+            )
         if source.agent_id is None:
             raise OmnigentError(
                 "Source session has no agent binding — cannot fork.",
@@ -4142,6 +4338,16 @@ def register_core_routes(
             from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 
             extra_labels[REQUESTED_HOST_ID_LABEL_KEY] = body.host_id
+        # A fork staying in the source's sandbox keeps what its relaunch
+        # re-clones (repositories) and how its host routes.
+        if keep_sandbox_labels:
+            from omnigent.server.managed_hosts import MANAGED_SANDBOX_LABEL_NAMESPACE
+
+            extra_labels.update(
+                (key, value)
+                for key, value in source.labels.items()
+                if key.startswith(MANAGED_SANDBOX_LABEL_NAMESPACE)
+            )
 
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
@@ -4255,7 +4461,7 @@ def register_core_routes(
         # degrades — so a probe would only trade latency for the same outcome.
         fork_file_id_map: dict[str, str] = {}
         fork_source_files: list[StoredFile] = []
-        if file_store is not None and artifact_store is not None:
+        if copy_history and file_store is not None and artifact_store is not None:
             files_after: str | None = None
             while True:
                 files_page = await asyncio.to_thread(
@@ -4291,6 +4497,8 @@ def register_core_routes(
         if body.host_id is not None:
             await _check_requested_host_id(request, body.host_id, user_id)
 
+        if validate_only:
+            return None
         # Copied last, after every validation above; the copy row itself is
         # inserted inside fork_conversation's transaction.
         fork_agent_id = base_agent.id
@@ -4341,9 +4549,14 @@ def register_core_routes(
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
+                before_item_id=before_item_id,
+                copy_items=copy_history,
+                continue_source=continue_source,
+                conversation_id=fork_id,
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
+                side_chat_parent_id=source.id if body.side_chat else None,
             )
         except LookupError as exc:
             await drop_unused_copy()
@@ -4366,17 +4579,8 @@ def register_core_routes(
         try:
             await record_profile(request, new_conv.id, sandbox_profile, conversation_store)
         except Exception:
-            if clone_location is not None and agent_store is not None:
-                try:
-                    # Keep the copy if session rollback failed and still references it.
-                    if (
-                        await asyncio.to_thread(conversation_store.get_conversation, new_conv.id)
-                        is None
-                    ):
-                        await asyncio.to_thread(agent_store.delete, fork_agent_id)
-                        await drop_unused_copy()
-                except Exception:
-                    _logger.exception("Failed to remove rejected fork's agent copy")
+            if clone_location is not None:
+                await _delete_unreturned_agent_copy(new_conv.id, fork_agent_id, clone_location)
             raise
 
         # Create the fork-owned rows the rewritten items now reference —
@@ -4427,7 +4631,7 @@ def register_core_routes(
         # both create paths: a managed-guard failure (misconfigured server,
         # unconfigured provider) must not leave the just-forked session
         # unowned and thus invisible to the caller.
-        if permission_store is not None and user_id is not None:
+        if permission_store is not None and user_id is not None and not continue_source:
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
@@ -4457,12 +4661,13 @@ def register_core_routes(
             # row, so announcing it would leak it into every open sidebar (the
             # real-time path bypasses the list-endpoint's side-chat filter).
             # Pushed once its managed labels are written, as on a create.
-            if not body.side_chat:
+            # A continuation is announced once placed, with the source's sharing.
+            if not body.side_chat and not continue_source:
                 _announce_session_added(user_id, new_conv.id)
         # Default-public grant only after the managed launch was accepted (see
         # the create paths). A side chat is a private scratch fork of the
-        # caller's own view.
-        if user_id is not None and not body.side_chat:
+        # caller's own view; a continuation takes its source's sharing instead.
+        if user_id is not None and not body.side_chat and not continue_source:
             await _grant_default_public(
                 request.app.state,
                 permission_store,
@@ -4477,6 +4682,9 @@ def register_core_routes(
         # transcript via the paged items endpoint, so returning the whole
         # copied history only made the user-blocked response scale with
         # source size.
+        if continue_source:
+            # The continuation reads only the new session's metadata.
+            return _build_session_response(new_conv, [], "idle", agent_name=base_agent.name)
         fork_items = await asyncio.to_thread(
             conversation_store.list_items,
             new_conv.id,
@@ -4484,7 +4692,7 @@ def register_core_routes(
             order="desc",
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
-        return _build_session_response(
+        response = _build_session_response(
             new_conv,
             list(reversed(fork_items.data)),
             "idle",
@@ -4492,6 +4700,8 @@ def register_core_routes(
             last_task_error=None,
             agent_name=base_agent.name,
         )
+        response.side_chat_allowed = await side_chat_allowed(user_id, new_conv.id, new_conv)
+        return response
 
     # ── POST /sessions/{session_id}/switch-agent (reserved) ──────
     # Placeholder: in-place agent switching was retired and will return with a
@@ -4507,3 +4717,343 @@ def register_core_routes(
                 "Fork the session into another agent instead."
             ),
         )
+
+    # ── Continuing a session's work in another session ──────────
+
+    # Moves into a continuation still running after their request was cancelled.
+    _continuation_tasks: set[asyncio.Task[str]] = set()
+
+    def _forget_continuation(done: asyncio.Task[str]) -> None:
+        """Drop a finished move; its failure was reported to a waiting request."""
+        _continuation_tasks.discard(done)
+        if not done.cancelled():
+            done.exception()  # Retrieved, so an abandoned request's failure is not re-logged.
+
+    async def _continue_session_in_fork(
+        request: Request,
+        source: Conversation,
+        *,
+        before_item_id: str | None,
+        command: str,
+        title: str,
+        notice: Callable[[str], str],
+        reason: SupersessionReason,
+        prepare: Callable[[], Awaitable[None]] | None = None,
+        copy_history: bool = True,
+    ) -> str:
+        """
+        Continue *source* in a fork on the same placement, superseding it.
+
+        The fork keeps the source's agent, labels (managed-sandbox ones
+        included) and run settings and only the history before
+        *before_item_id*. It is bound to the source's host and workspace and
+        to its live runner, and the source gets a notice linking to it plus a
+        ``session.superseded`` redirect for live viewers. A fork that cannot
+        be placed is deleted again. Messages to *source* are refused until
+        the redirect is published.
+
+        :param request: The incoming request, whose caller must own *source*.
+        :param source: Session to supersede.
+        :param before_item_id: First item the fork drops, e.g. ``"msg_abc"``;
+            ``None`` keeps the whole history.
+        :param command: The slash command being run, e.g. ``"/clear"``, for errors.
+        :param title: The fork's title; ``""`` lets its first message name it.
+        :param notice: Builds the source's notice from the fork's id.
+        :param reason: ``session.superseded`` reason, e.g. ``"clear"``.
+        :param prepare: Runs once the request is known to be allowed, before
+            the fork exists, e.g. to free the source's live client.
+        :param copy_history: ``False`` starts the fork empty, with none of the
+            source's items or files; *before_item_id* must then be ``None``.
+        :returns: The fork's session id.
+        :raises OmnigentError: When the caller does not own *source*, it is a
+            sub-agent, a side chat or running a turn, or no runner or host can take the fork;
+            ``WRONG_REPLICA`` when its runner is live on another replica.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, source.id, LEVEL_OWNER, permission_store, conversation_store
+        )
+        if source.kind == "sub_agent":
+            raise OmnigentError(
+                f"{command} is only available in a top-level session.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # A side chat rides its source's runner with no host of its own, so a
+        # fork (which drops the side-chat labels) would have no placement.
+        if source.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+            raise OmnigentError(
+                f"{command} isn't available in a side chat.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if _session_is_moving(source.id):
+            raise OmnigentError(
+                f"This chat is already moving to a new session; wait before running {command}.",
+                code=ErrorCode.CONFLICT,
+            )
+        # An input still reaching its runner counts as a running turn, whatever
+        # status the session shows (a failed one can be recovering).
+        status = _session_status_from_cache(source.id, source.live_status)
+        if status == "running" or _session_is_starting(source.id):
+            raise OmnigentError(
+                f"Stop the current turn before running {command}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # Held, with no await since the checks above, until viewers are
+        # redirected: messages arriving meanwhile are refused, not run here.
+        moving = contextlib.ExitStack()
+        moving.enter_context(_mark_session_moving(source.id))
+
+        async def move() -> str:
+            with moving:
+                from omnigent.server.routes.sessions.routes_events import (
+                    _raise_if_runner_on_another_replica,
+                )
+
+                # A saved startup input still to be delivered is a turn waiting to
+                # start. Checked once moving, so no new one can be saved meanwhile.
+                startup = getattr(request.app.state, "startup_inputs", None)
+                if startup is not None and await startup.has_undelivered(source.id):
+                    raise OmnigentError(
+                        f"Wait for this session's first message to start before running {command}.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                runner_online = (
+                    source.runner_id is not None
+                    and runner_router is not None
+                    and runner_router.runner_is_online(source.runner_id)
+                )
+                if not runner_online and source.runner_id is not None:
+                    # A runner live on another replica is not offline: re-address there
+                    # rather than continue without it.
+                    await _raise_if_runner_on_another_replica(
+                        source, request.app.state, conversation_store
+                    )
+                host_bound = source.host_id is not None and source.workspace is not None
+                runner_offline = OmnigentError(
+                    f"Can't run {command} while this session's runner is offline. "
+                    "Reconnect the session (send a message to wake it), then try again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+                if not runner_online and not host_bound:
+                    raise runner_offline
+                fork_request = SessionForkRequest(title=title)
+                fork_options: dict[str, Any] = {
+                    "before_item_id": before_item_id,
+                    "keep_sandbox_labels": True,
+                    "copy_history": copy_history,
+                    "continue_source": True,
+                }
+                if prepare is not None:
+                    # Refuse before the source's live client is freed, so a clear
+                    # that can't continue leaves it untouched.
+                    await _fork_session(
+                        request, source.id, fork_request, validate_only=True, **fork_options
+                    )
+                profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+                if host_bound and profile_catalog is not None:
+                    await asyncio.to_thread(
+                        profile_catalog.require_session_host,
+                        source.id,
+                        source.host_id,
+                        bind=False,
+                    )
+                if prepare is not None:
+                    await prepare()
+
+                # Chosen up front so a failure anywhere after the fork is
+                # written, inside the fork call included, can remove it by id.
+                fork_id = generate_conversation_id()
+                runner_bound = runner_online
+                runner_initialized = False
+                # Set once the fork is sent to the runner, which may set it up
+                # (or still be doing so) even when the bind then fails.
+                runner_dispatched = False
+                try:
+                    fork = await _fork_session(
+                        request, source.id, fork_request, fork_id=fork_id, **fork_options
+                    )
+                    assert fork is not None
+                    # The same conversation continues there, and every live viewer
+                    # of the source is redirected to it, so it shares exactly as
+                    # the source does (no creation default was applied).
+                    await _copy_session_grants(source.id, fork.id)
+                    # Created with no grants of its own, the fork is the caller's
+                    # only through the copy: a source deleted meanwhile had none.
+                    try:
+                        await _require_access_and_level(
+                            user_id, fork.id, LEVEL_OWNER, permission_store, conversation_store
+                        )
+                    except OmnigentError as exc:
+                        raise OmnigentError(
+                            f"This session was deleted or changed hands during {command}.",
+                            code=ErrorCode.CONFLICT,
+                        ) from exc
+                    if host_bound:
+                        assert source.host_id is not None
+                        # The fork was born on the host under its row lock, so a
+                        # delete of the source from here on keeps it; a host torn
+                        # down first was not copied and leaves the fork unplaced.
+                        if fork.host_id != source.host_id:
+                            raise OmnigentError(
+                                f"This session's host went away during {command}; try again.",
+                                code=ErrorCode.CONFLICT,
+                            )
+                        if profile_catalog is not None:
+                            # Adopt and reauthorize the sandbox's accepted profile
+                            # now, so the fork can wake it even with no runner.
+                            await asyncio.to_thread(
+                                profile_catalog.require_session_host, fork.id, source.host_id
+                            )
+                    if runner_online:
+                        assert source.runner_id is not None and runner_router is not None
+                        runner_dispatched = True
+                        try:
+                            await _update_session(
+                                request,
+                                fork.id,
+                                UpdateSessionRequest(runner_id=source.runner_id),
+                                include_usage=False,
+                            )
+                        except Exception:
+                            if runner_router.runner_is_online(source.runner_id):
+                                raise
+                            runner_bound = False
+                        else:
+                            runner_initialized = True
+                            # The bind tolerates a runner gone before its client
+                            # lookup, so confirm the placement it reports.
+                            runner_bound = runner_router.runner_is_online(source.runner_id)
+                        if not runner_bound:
+                            # The runner left after the check. One now on another
+                            # replica is re-addressed; a host-bound fork otherwise
+                            # relaunches on its host, as with an offline runner.
+                            await _raise_if_runner_on_another_replica(
+                                source, request.app.state, conversation_store
+                            )
+                            if not host_bound:
+                                raise runner_offline
+                            if runner_initialized:
+                                # Drop the binding to the vanished runner, so the
+                                # fork relaunches on its host like an offline one.
+                                await asyncio.to_thread(
+                                    conversation_store.clear_runner_id, fork.id
+                                )
+                    if runner_bound and host_bound:
+                        # As native /clear does: the fork now holds the runner, so
+                        # stopping or archiving the source must not stop it. The
+                        # source keeps its host and resumes on a relaunched runner.
+                        try:
+                            await _update_session(
+                                request,
+                                source.id,
+                                UpdateSessionRequest(runner_id=""),
+                                include_usage=False,
+                            )
+                        except OmnigentError as exc:
+                            # A source deleted meanwhile has nothing left to detach.
+                            if exc.code != ErrorCode.NOT_FOUND:
+                                raise
+                except Exception:
+                    # Leave no fork for a retry to duplicate, nor its runner session.
+                    if runner_dispatched:
+                        await _release_unreturned_runner_session(
+                            fork_id, dataclasses.replace(source, id=fork_id)
+                        )
+                    agent_copy = await _unreturned_fork_agent_copy(fork_id, source.agent_id)
+                    await _delete_unreturned_session(fork_id)
+                    if agent_copy is not None:
+                        await _delete_unreturned_agent_copy(
+                            fork_id, agent_copy.id, agent_copy.bundle_location
+                        )
+                    await _release_unreturned_fork_host(
+                        request, source.host_id if host_bound else None
+                    )
+                    raise
+                # Placed and shared as the source is: now the owner's tabs list it.
+                _announce_session_added(user_id, fork.id)
+
+                # Best-effort, as for native supersession: the fork already holds the
+                # work, so a lost notice must not strand it unreturned.
+                try:
+                    await _persist_external_conversation_item(
+                        source.id,
+                        source,
+                        SessionEventInput(
+                            type=_EXTERNAL_CONVERSATION_ITEM_TYPE,
+                            data={
+                                "item_type": "message",
+                                "item_data": {
+                                    "role": "assistant",
+                                    "agent": fork.agent_name or "assistant",
+                                    "content": [{"type": "output_text", "text": notice(fork.id)}],
+                                },
+                            },
+                        ),
+                        conversation_store,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "Failed to persist the %s supersession notice; old_session=%s new_session=%s",
+                        command,
+                        source.id,
+                        fork.id,
+                        exc_info=True,
+                        extra={"session_id": source.id},
+                    )
+                _publish_session_superseded(source.id, fork.id, reason=reason)
+                _logger.info(
+                    "Session superseded by %s",
+                    command,
+                    extra=debug_event(
+                        "session_superseded",
+                        session_id=source.id,
+                        target_session_id=fork.id,
+                        command=command,
+                        runner_bound=runner_bound,
+                    ),
+                )
+                return fork.id
+
+        # Shielded: once allowed, the move runs to its end (placed, or rolled
+        # back) even if the request is cancelled, e.g. by a client disconnect,
+        # so a cancellation never strands a half-made successor; meanwhile the
+        # move guard refuses a retry.
+        task = asyncio.create_task(move(), name=f"continue-{source.id}")
+        _continuation_tasks.add(task)
+        task.add_done_callback(_forget_continuation)
+        return await asyncio.shield(task)
+
+    async def clear_session_into_fresh_session(
+        request: Request,
+        source: Conversation,
+        release_source: Callable[[], Awaitable[None]],
+    ) -> str:
+        """
+        Continue *source* in a fresh session on the same placement.
+
+        Used for claude-sdk ``/clear``: the SDK replays the Omnigent
+        transcript whenever its client restarts, so clearing in place would
+        bring the old context back.
+
+        :param request: The incoming request, whose caller must own *source*.
+        :param source: Session being cleared.
+        :param release_source: Frees the source's live client; runs only once
+            the clear is allowed.
+        :returns: The new session's id.
+        """
+        return await _continue_session_in_fork(
+            request,
+            source,
+            before_item_id=None,
+            command="/clear",
+            # Untitled, so the first message names it like any new chat.
+            title="",
+            notice=supersession_notice_text,
+            reason="clear",
+            prepare=release_source,
+            # Decided as the fork commits, so items a concurrent write adds
+            # meanwhile stay behind too.
+            copy_history=False,
+        )
+
+    return clear_session_into_fresh_session
