@@ -16033,7 +16033,13 @@ def test_btw_overlay_parses_completed_single_turn(footer: str) -> None:
     assert overlay.truncated is False
 
 
-def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
+_BTW_HISTORY_HINTS = pytest.mark.parametrize(
+    "history_hint", ["←/→ to switch", "⇧←/→ to browse"], ids=["switch", "shift-browse"]
+)
+
+
+@_BTW_HISTORY_HINTS
+def test_btw_overlay_takes_current_turn_and_flags_truncation(history_hint: str) -> None:
     """
     With stacked side turns, only the LAST question is taken, and a tall
     overflowing overlay is flagged truncated.
@@ -16045,7 +16051,7 @@ def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
         "",
         *answer_lines,
         "",
-        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+        f"    {history_hint} · c to copy · f to fork · x to clear history · Esc to close",
     )
     overlay = claude_native_bridge._btw_overlay_from_pane(pane)
     assert overlay is not None
@@ -16094,8 +16100,11 @@ def test_btw_overlay_preserves_relative_indentation() -> None:
     assert overlay.answer == "- top\n  - nested"
 
 
+@_BTW_HISTORY_HINTS
 @pytest.mark.parametrize("close_hint", ["Esc to close", "Esc to\n    close"])
-def test_btw_overlay_present_matches_settled_multiturn_and_generating(close_hint: str) -> None:
+def test_btw_overlay_present_matches_settled_multiturn_and_generating(
+    close_hint: str, history_hint: str
+) -> None:
     """The dismiss guard matches every /btw overlay state, settled or not."""
     settled = _btw_pane(
         "    /btw q",
@@ -16109,7 +16118,7 @@ def test_btw_overlay_present_matches_settled_multiturn_and_generating(close_hint
         "    /btw q2",
         "",
         "      A",
-        f"    ←/→ to switch · c to copy · f to fork · x to clear history · {close_hint}",
+        f"    {history_hint} · c to copy · f to fork · x to clear history · {close_hint}",
     )
     generating = _btw_pane(
         "    /btw q",

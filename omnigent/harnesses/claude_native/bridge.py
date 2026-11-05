@@ -5345,6 +5345,10 @@ def _permission_mode_from_pane(pane: str) -> str | None:
 _BTW_OVERLAY_BORDER_GLYPH = "▔"
 # Whitespace is removed from footer hints because terminal wraps can split words.
 _BTW_FOOTER_CLOSE_HINT = "Esctoclose"
+# The footer opens with a scroll hint for one turn, or a history hint once side
+# turns stack: "←/→ to switch" in older Claude Code, "⇧←/→ to browse" in 2.1.283.
+_BTW_FOOTER_SHIFT_GLYPH = "⇧"
+_BTW_FOOTER_HISTORY_HINTS = ("←/→toswitch", "←/→tobrowse")
 # A settled overlay's footer offers copy + fork; while the answer is
 # still generating the footer carries neither and a ``✻ Answering…`` line
 # shows in the region. Both conditions gate "the exchange is complete".
@@ -5404,14 +5408,14 @@ def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
         (
             index
             for index in range(len(lines) - 1, -1, -1)
-            if lines[index].lstrip().startswith(("↑/↓", "←/→"))
+            if lines[index].lstrip().lstrip(_BTW_FOOTER_SHIFT_GLYPH).startswith(("↑/↓", "←/→"))
         ),
         None,
     )
     if footer_idx is None:
         return None
-    footer = "".join("".join(lines[footer_idx:]).split())
-    if not footer.startswith(("↑/↓toscroll", "←/→toswitch")) or not footer.endswith(
+    footer = "".join("".join(lines[footer_idx:]).split()).lstrip(_BTW_FOOTER_SHIFT_GLYPH)
+    if not footer.startswith(("↑/↓toscroll", *_BTW_FOOTER_HISTORY_HINTS)) or not footer.endswith(
         _BTW_FOOTER_CLOSE_HINT
     ):
         return None
@@ -5490,13 +5494,13 @@ def _btw_overlay_present(pane: str) -> bool:
     if parts is None:
         return False
     region, footer = parts
-    # The /btw footer offers copy+fork (single, settled), switch (multi-turn),
+    # The /btw footer offers copy+fork (single, settled), history (multi-turn),
     # or the region shows the answering spinner (still generating). Requiring
     # one of these keeps a model picker / confirm dialog (other "Esc to close"
     # surfaces) from matching.
     if all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
         return True
-    if "toswitch" in footer:
+    if any(hint in footer for hint in _BTW_FOOTER_HISTORY_HINTS):
         return True
     return any(_BTW_ANSWERING_HINT in line for line in region)
 
