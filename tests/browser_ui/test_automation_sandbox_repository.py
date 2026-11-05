@@ -147,3 +147,82 @@ def test_automation_sandbox_repository(
         page.get_by_role("button", name="Actions for Repository maintenance").click()
         page.get_by_role("menuitem", name="Edit", exact=True).click()
         expect(repository).to_have_text("Provider default")
+
+
+@pytest.mark.parametrize("prompt_kind", ["scheduled", "trigger", "custom-trigger"])
+def test_reused_automation_explains_locked_settings(
+    page: Page, browser_contract: BrowserContract, prompt_kind: str
+) -> None:
+    trigger = prompt_kind != "scheduled"
+    with contextmanager(chat_session_handle)(page, browser_contract) as chat:
+        contract = browser_contract
+        chat.harness = "claude-native"
+        contract.json(
+            "/v1/info",
+            {
+                "single_user": True,
+                "automations_enabled": True,
+                "scheduled_task_session_modes": True,
+                "features": {"automations_v2": True},
+            },
+        )
+        prompt = (
+            "This automation watches Jira and starts one Omnigent session "
+            "for each new ticket.\n\n"
+            "Instructions for each session:\nTriage the ticket.\n\n"
+            "Posting instructions for each session:\nSign the reply."
+            if trigger
+            else "Summarize changes."
+        )
+        if prompt_kind == "custom-trigger":
+            prompt += "\n\nInstructions for each session:\nExtra heading."
+        task = {
+            "id": "settings-automation",
+            "name": "Repository maintenance",
+            "owner_user_id": "local",
+            "created_at": 1,
+            "updated_at": 1,
+            "agent_id": chat.agent_id,
+            "prompt": prompt,
+            "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+            "timezone": "UTC",
+            "model_override": None,
+            "reasoning_effort": None,
+            "permission_mode": None,
+            "session_mode": "continue",
+            "session_id": chat.session_id,
+            "host_id": None,
+            "project_id": None,
+            "execution_target": "connected_host",
+            "workspace": None,
+            "state": "active",
+            "last_run_at": None,
+            "last_run_status": None,
+            "last_run_conversation_id": None,
+            "next_run_at": None,
+        }
+        contract.json("/v1/scheduled-tasks", {"scheduled_tasks": [task]})
+        page.goto(f"{contract.base_url}/tasks")
+        page.get_by_role("button", name="Maybe later", exact=True).click()
+        page.get_by_role("button", name="Actions for Repository maintenance").click()
+        page.get_by_role("menuitem", name="Edit", exact=True).click()
+        note = page.get_by_test_id("task-session-settings-note")
+        note.scroll_into_view_if_needed()
+        expect(note).to_contain_text("This automation continues in an existing session")
+        expect(page.get_by_test_id("task-model-trigger")).to_be_disabled()
+        if trigger:
+            expect(note).to_contain_text("each match starts a new worker")
+            page.get_by_role("button", name="Edit worker instructions", exact=True).click()
+            editor = page.get_by_role(
+                "textbox",
+                name="Prompt" if prompt_kind == "custom-trigger" else "System prompt",
+                exact=True,
+            )
+            expect(editor).to_be_focused()
+            page.get_by_test_id("task-name-input").click()
+            page.get_by_role("button", name="Edit worker instructions", exact=True).click()
+            expect(editor).to_be_focused()
+        else:
+            expect(
+                page.get_by_role("button", name="Edit worker instructions", exact=True)
+            ).to_have_count(0)

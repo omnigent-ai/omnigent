@@ -147,6 +147,7 @@ export function CreateScheduledTaskDialog({
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
   const [systemPromptOpen, setSystemPromptOpen] = useState(false);
   const [editingSystemPrompt, setEditingSystemPrompt] = useState(false);
+  const promptFieldsRef = useRef<HTMLDivElement>(null);
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
 
@@ -799,7 +800,7 @@ export function CreateScheduledTaskDialog({
               }}
             />
           ) : (
-            <div className="flex flex-col gap-1.5">
+            <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
               <Label htmlFor="task-prompt">
                 {systemPrompt === null ? "Prompt" : "Your prompt"}
               </Label>
@@ -844,6 +845,7 @@ export function CreateScheduledTaskDialog({
                     {editingSystemPrompt ? (
                       <Textarea
                         aria-label="System prompt"
+                        autoFocus
                         value={systemPrompt}
                         rows={8}
                         className="max-h-80 resize-y text-ui"
@@ -1182,8 +1184,37 @@ export function CreateScheduledTaskDialog({
                   >
                     <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
                     <p>
-                      To change model, effort, or permission mode, edit the existing session
-                      directly.
+                      This automation continues in an existing session, so its model, effort, and
+                      permission mode are controlled by that session. Edit the session directly to
+                      change them.
+                      {editingTemplateTrigger && (
+                        <>
+                          {" "}
+                          Trigger automations reuse a polling session even though each match starts
+                          a new worker. To change the model or harness for future workers, edit the
+                          worker creation instructions in the{" "}
+                          {systemPrompt === null ? "prompt" : "system prompt"}.{" "}
+                          <button
+                            type="button"
+                            className="underline underline-offset-2"
+                            onClick={() => {
+                              if (systemPrompt !== null) {
+                                setSystemPromptOpen(true);
+                                setEditingSystemPrompt(true);
+                              }
+                              promptFieldsRef.current
+                                ?.querySelector<HTMLTextAreaElement>(
+                                  systemPrompt === null
+                                    ? "#task-prompt"
+                                    : 'textarea[aria-label="System prompt"]',
+                                )
+                                ?.focus();
+                            }}
+                          >
+                            Edit worker instructions
+                          </button>
+                        </>
+                      )}
                     </p>
                   </div>
                 ) : (
