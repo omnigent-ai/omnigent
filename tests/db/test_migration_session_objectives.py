@@ -77,7 +77,14 @@ def _indexes(engine: Engine) -> dict[str, list[str]]:
 
 
 def _row(object_id: bytes, **values: object) -> dict[str, object]:
-    return {"conversation_id": _SESSION, "id": object_id, "created_at": 1, **values}
+    # The table has no database defaults, so every insert names the workspace.
+    return {
+        "workspace_id": 0,
+        "conversation_id": _SESSION,
+        "id": object_id,
+        "created_at": 1,
+        **values,
+    }
 
 
 # MySQL reports a CHECK violation as OperationalError 3819 rather than IntegrityError.
@@ -126,12 +133,16 @@ def test_table_shape(db_engine: Engine) -> None:
         "created_at",
         "id",
     ]
+    # Both ordered indexes carry the whole primary key, so each entry is unique.
     assert indexes["ix_session_objectives_run_created"] == [
         "workspace_id",
         "scheduled_task_run_id",
         "created_at",
         "id",
+        "conversation_id",
     ]
+    # A new table declares no database defaults.
+    assert {name: column["default"] for name, column in columns.items()} == dict.fromkeys(columns)
 
 
 @pytest.mark.parametrize("column", ["objective_payload", "outcome_payload"])
@@ -166,19 +177,29 @@ def test_payload_size_checks(db_engine: Engine, column: str) -> None:
         )
 
 
-@pytest.mark.parametrize("missing", ["outcome_success", "outcome_payload", "outcome_recorded_at"])
+@pytest.mark.parametrize(
+    "missing",
+    [
+        ("outcome_success",),
+        ("outcome_payload",),
+        ("outcome_recorded_at",),
+        ("outcome_payload", "outcome_recorded_at"),
+        ("outcome_success", "outcome_recorded_at"),
+        ("outcome_success", "outcome_payload"),
+    ],
+)
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
-def test_an_outcome_is_stored_whole(db_engine: Engine, missing: str) -> None:
-    """An outcome needs its success, words and time together; none of them is stored alone."""
+def test_an_outcome_is_stored_whole(db_engine: Engine, missing: tuple[str, ...]) -> None:
+    """An outcome needs its success, words and time together; no part of it is stored alone."""
     table = sa.Table(_TABLE, sa.MetaData(), autoload_with=db_engine)
     with db_engine.begin() as conn:
         conn.execute(table.insert().values(**_row(b"1" * 16)))
         conn.execute(table.insert().values(**_row(b"2" * 16, **_OUTCOME)))
-    partial = {name: value for name, value in _OUTCOME.items() if name != missing}
+    partial = {name: value for name, value in _OUTCOME.items() if name not in missing}
     with _rejected_by_check(), db_engine.begin() as conn:
         conn.execute(table.insert().values(**_row(b"3" * 16, **partial)))
     with _rejected_by_check(), db_engine.begin() as conn:
-        conn.execute(table.update().where(table.c.id == b"2" * 16).values({missing: None}))
+        conn.execute(table.update().where(table.c.id == b"2" * 16).values(dict.fromkeys(missing)))
 
 
 def test_migration_round_trips(tmp_path: Path) -> None:

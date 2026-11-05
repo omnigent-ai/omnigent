@@ -6,7 +6,7 @@ Revises: e5b2c8d4f1a7
 A session's status says whether its turns finished, not whether the agent did
 what it set out to do. The new ``session_objectives`` table holds what an
 agent records about that: one row per objective, in order, with the outcome
-the agent later records for it. Nothing reads or writes it yet.
+the agent later records for it.
 
 The primary key leads with the session, so a session's objectives stay
 together. The objective and outcome words can repeat task content, so they go
@@ -20,7 +20,9 @@ column so objectives can later be counted by it.
 ``ix_session_objectives_conversation_created`` orders a session's objectives
 by ``created_at`` (then ``id``) for paged listing and, read backward, for its
 latest objective. ``ix_session_objectives_run_created`` does the same for the
-objectives recorded during one automation run, which its run history shows.
+objectives recorded during one automation run, which its run history shows; it
+ends with ``conversation_id`` so it holds the whole primary key. The table has
+no database defaults: writes name the workspace.
 
 Deployment: apply this migration before a server that uses the table. Servers
 that migrate at startup do so on their own. Processes already running an older
@@ -54,7 +56,7 @@ def upgrade() -> None:
     """Create ``session_objectives`` with its checks and ordering indexes."""
     op.create_table(
         "session_objectives",
-        sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
+        sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         sa.Column("conversation_id", Uuid16(), nullable=False),
         sa.Column("id", Uuid16(), nullable=False),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
@@ -87,7 +89,7 @@ def upgrade() -> None:
     op.create_index(
         "ix_session_objectives_run_created",
         "session_objectives",
-        ["workspace_id", "scheduled_task_run_id", "created_at", "id"],
+        ["workspace_id", "scheduled_task_run_id", "created_at", "id", "conversation_id"],
     )
 
 
