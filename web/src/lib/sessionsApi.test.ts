@@ -1539,6 +1539,7 @@ describe("listFailedInputs", () => {
             {
               pending_id: "pending_3",
               content: [{ type: "input_text", text: "first" }],
+              item_id: "c3",
               position: 3,
             },
           ],
@@ -1559,8 +1560,8 @@ describe("listFailedInputs", () => {
       controller.signal,
       controller.signal,
     ]);
-    expect(inputs).toEqual([
-      { pendingId: "pending_3", content: [{ type: "input_text", text: "first" }] },
+    expect(inputs).toStrictEqual([
+      { pendingId: "pending_3", content: [{ type: "input_text", text: "first" }], itemId: "c3" },
       {
         pendingId: "pending_1",
         content: [{ type: "input_text", text: "second" }],
@@ -1594,6 +1595,7 @@ describe("listFailedInputs", () => {
             {
               pending_id: "pending_1",
               content: [{ type: "input_text", text: "first" }],
+              item_id: "a1",
               position: 1,
             },
           ],
