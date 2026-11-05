@@ -43,7 +43,9 @@ def test_partial_settings_keep_defaults_and_are_immutable():
         "lease_seconds": 120,
         "batch_size": 100,
         "max_startups": 100,
+        "max_startups_per_workspace": 25,
         "recovery_seconds": 30,
+        "run_now_cooldown_seconds": 60,
     }
     with pytest.raises(ValidationError, match="frozen"):
         config.lease_seconds = 10

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 
@@ -12,6 +12,14 @@ DispatchCursor = tuple[int, int, str]
 TaskCursor = tuple[int, str]
 # Resume both the task scan and an unfinished page scan within that task.
 DeletedTaskCursor = tuple[int, str, tuple[int, str] | None]
+
+
+class ManualRunRejectedError(Exception):
+    """A Run now request conflicts with the task's unstarted runs or its cooldown."""
+
+    def __init__(self, reason: Literal["already_pending", "cooldown"], message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @runtime_checkable
@@ -75,10 +83,19 @@ class ScheduledTaskDispatchStore(Protocol):
         ...
 
     def request_manual_run(
-        self, task: ScheduledTask, *, now: int, trigger_key: str, host_id: str | None
+        self,
+        task: ScheduledTask,
+        *,
+        now: int,
+        trigger_key: str,
+        host_id: str | None,
+        cooldown_seconds: int = 0,
     ) -> ScheduledTaskRun | None:
         """Record a Run now request as a pending ``scheduled`` run, for any undeleted task.
 
+        Rejects the request with :class:`ManualRunRejectedError` while an earlier
+        request is still waiting to be claimed, or within ``cooldown_seconds`` of the
+        task's last Run now.
         Returns None if the task no longer exists or was deleted.
         """
         ...

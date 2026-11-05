@@ -39,6 +39,14 @@ Every `poll_seconds`, each server does the following:
    owns, and claims the owned tasks while it has startup capacity.
 4. Reads one page of pending Run now requests and claims the ones it owns.
 
+Startup capacity is counted per replica. `max_startups` caps all startups on
+the replica, and `max_startups_per_workspace` caps one workspace's share, so a
+backlog in one workspace cannot take every slot. A slot is reserved before the
+claim awaits the store, so concurrent claims cannot exceed either limit. A task
+or request skipped for its workspace's share stays due or pending for a later
+poll. Limits apply per replica, so a cluster can run up to `replicas *
+max_startups` startups.
+
 The claim creates a `starting` run with a lease and, for a scheduled occurrence,
 moves the task's `next_run_at` forward, in one transaction. If another replica already claimed the
 occurrence, or the task was edited, paused or deleted after it was listed, the

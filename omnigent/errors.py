@@ -168,6 +168,10 @@ class ErrorCode:
     :cvar INVALID_INPUT: Request validation failed (HTTP 400).
     :cvar ALREADY_EXISTS: Duplicate resource (HTTP 409).
     :cvar CONFLICT: Operation conflicts with current state (HTTP 409).
+    :cvar QUOTA_EXCEEDED: The caller already holds the maximum number of an
+        limited resource, such as active scheduled tasks (HTTP 429).
+    :cvar RATE_LIMITED: The request repeats an action faster than its
+        cooldown allows (HTTP 429).
     :cvar INTERNAL_ERROR: Unexpected server error (HTTP 500).
     :cvar HARNESS_PROTOCOL_VIOLATION: A harness emitted an SSE
         sequence that violates the Omnigent↔harness contract — e.g.
@@ -244,6 +248,8 @@ class ErrorCode:
     INVALID_INPUT = "invalid_input"
     ALREADY_EXISTS = "already_exists"
     CONFLICT = "conflict"
+    QUOTA_EXCEEDED = "quota_exceeded"
+    RATE_LIMITED = "rate_limited"
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
@@ -282,6 +288,8 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.INVALID_INPUT: 400,
     ErrorCode.ALREADY_EXISTS: 409,
     ErrorCode.CONFLICT: 409,
+    ErrorCode.QUOTA_EXCEEDED: 429,
+    ErrorCode.RATE_LIMITED: 429,
     ErrorCode.INTERNAL_ERROR: 500,
     # Harness protocol violations are server-side bugs in the
     # harness implementation — surface as 500 (no client action
@@ -336,6 +344,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.INVALID_INPUT: ErrorCategory.USER,
     ErrorCode.ALREADY_EXISTS: ErrorCategory.USER,
     ErrorCode.CONFLICT: ErrorCategory.USER,
+    ErrorCode.QUOTA_EXCEEDED: ErrorCategory.USER,
+    ErrorCode.RATE_LIMITED: ErrorCategory.USER,
     # Our fault, raised where the site knows it is ours.
     ErrorCode.INTERNAL_ERROR: ErrorCategory.SERVER,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorCategory.SERVER,
@@ -407,6 +417,8 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.INVALID_INPUT: ErrorImpact.BENIGN,
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
+    ErrorCode.QUOTA_EXCEEDED: ErrorImpact.BENIGN,
+    ErrorCode.RATE_LIMITED: ErrorImpact.BENIGN,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.LOGIN_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
@@ -436,6 +448,8 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.INVALID_INPUT: ErrorPhase.REQUEST,
     ErrorCode.ALREADY_EXISTS: ErrorPhase.REQUEST,
     ErrorCode.CONFLICT: ErrorPhase.REQUEST,
+    ErrorCode.QUOTA_EXCEEDED: ErrorPhase.REQUEST,
+    ErrorCode.RATE_LIMITED: ErrorPhase.REQUEST,
     ErrorCode.WRONG_REPLICA: ErrorPhase.ROUTING,
     ErrorCode.RUNNER_UNAVAILABLE: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HOST_OFFLINE: ErrorPhase.RUNNER_LAUNCH,

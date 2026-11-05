@@ -2126,6 +2126,8 @@ def create_app(
                     lease_seconds=dispatch_config.lease_seconds,
                     batch_size=dispatch_config.batch_size,
                     max_startups=dispatch_config.max_startups,
+                    max_startups_per_workspace=dispatch_config.max_startups_per_workspace,
+                    run_now_cooldown_seconds=dispatch_config.run_now_cooldown_seconds,
                     recovery_seconds=dispatch_config.recovery_seconds,
                 )
             app_inst.state.scheduled_task_scheduler = None

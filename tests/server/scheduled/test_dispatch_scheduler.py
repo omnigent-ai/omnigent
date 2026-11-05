@@ -6,6 +6,7 @@ import asyncio
 import logging
 import threading
 import uuid
+from collections import Counter
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -2109,9 +2110,11 @@ async def test_pending_runs_cost_each_poll_one_page_and_still_make_progress(stor
     clock = FakeClock(task.created_at + 60)
 
     def request(key):
-        host_id = occurrence_host_id(task, key)
+        # The store keeps one waiting Run now request per task, so each one gets its own task.
+        requested_task = _task(store, seed=key, execution_target="managed_sandbox")
+        host_id = occurrence_host_id(requested_task, key)
         return store.request_manual_run(
-            task, now=task.created_at, trigger_key=key, host_id=host_id
+            requested_task, now=task.created_at, trigger_key=key, host_id=host_id
         )
 
     unowned = [request(f"manual:{i}") for i in range(5)]
@@ -2481,3 +2484,74 @@ async def test_ten_minute_persisted_schedule_by_execution(store, session_mode, e
         executor.assert_not_awaited()
         assert saved.state == "paused"
         assert saved.next_run_at is None
+
+
+async def test_concurrent_claims_never_exceed_the_replica_startup_limit(store) -> None:
+    # Each claim awaits the store, so the limit must be reserved before that await.
+    tasks = [_task(store, seed=f"race-{i}", execution_target="managed_sandbox") for i in range(5)]
+    clock = FakeClock(tasks[0].created_at + 60)
+    pending = []
+    for task in tasks:
+        key = f"manual:race-{task.id}"
+        with workspace_scope(task.workspace_id):
+            pending.append(
+                store.request_manual_run(
+                    task,
+                    now=task.created_at,
+                    trigger_key=key,
+                    host_id=occurrence_host_id(task, key),
+                )
+            )
+    release = asyncio.Event()
+
+    async def fire(task, lease):
+        await release.wait()
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now, max_startups=2)
+    await asyncio.gather(*(scheduler._start_pending(run) for run in pending))
+    assert len(scheduler._startups) == 2
+    assert len(store.list_pending_runs()) == 3
+    release.set()
+    await _drain(scheduler)
+    assert scheduler._startup_slots.total() == 0
+
+
+async def test_one_workspace_cannot_take_every_startup_slot(store) -> None:
+    # Workspace 1 has more waiting requests than its share; workspace 2 must still start.
+    anchors = []
+    for workspace_id, count in ((1, 3), (2, 2)):
+        with workspace_scope(workspace_id):
+            for i in range(count):
+                task = _task(
+                    store, seed=f"fair-{workspace_id}-{i}", execution_target="managed_sandbox"
+                )
+                anchors.append(task.created_at)
+                key = f"manual:fair-{workspace_id}-{i}"
+                store.request_manual_run(
+                    task,
+                    now=task.created_at,
+                    trigger_key=key,
+                    host_id=occurrence_host_id(task, key),
+                )
+    release = asyncio.Event()
+
+    async def fire(task, lease):
+        await release.wait()
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        AsyncMock(),
+        now=FakeClock(min(anchors) + 60).now,
+        max_startups=4,
+        max_startups_per_workspace=2,
+    )
+    await scheduler.poll_once()
+    started = Counter(workspace_id for workspace_id, _ in scheduler._startups)
+    assert started == {1: 2, 2: 2}
+    # The workspace-1 request over its share stays waiting for a later poll.
+    assert [run.workspace_id for run in store.list_pending_runs()] == [1]
+    release.set()
+    await _drain(scheduler)

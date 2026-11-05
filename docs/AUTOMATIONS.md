@@ -167,6 +167,8 @@ Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversat
 | `failed` | The firing or the turn failed; see `error_code`. |
 | `skipped` | The firing was deliberately not attempted -- for example an unsupported `execution_target`. |
 
+Limits: an authenticated owner may have 20 active automations (`max_active_tasks_per_owner`). Creating a task, or resuming a paused one, beyond that returns `429` with `quota_exceeded`; pausing or deleting one frees a slot. Run now returns `409` while an earlier Run now request is still waiting to be claimed, and `429` with `rate_limited` within 60 seconds (`run_now_cooldown_seconds`) of the last request for the same task. Local single-user mode has no owner cap.
+
 `ScheduledTaskRun` also declares `scheduled` and `starting` statuses. The default scheduler creates runs at dispatch with status `running`. With `automations_v2` enabled, Run now records `scheduled` until a server claims the request. The persistent scheduler then records `starting` while it prepares a run, and `running` once the prompt is sent, or saved with its sandbox's host bound. A continued session's run goes straight to `succeeded` once its prompt is delivered.
 
 Run history shows **Session needs approval · Open to review** when the linked session has a pending permission request or question and its runner is reachable. Stale counts from disconnected runners are hidden using the same liveness rules as the session sidebar. Sessions without a bound runner use their live approval requests rather than a persisted count. Open the run to review it. This is current session state, including when several runs reuse that session; it is not a historical per-run outcome. Permission enforcement and approval timeouts are unchanged.

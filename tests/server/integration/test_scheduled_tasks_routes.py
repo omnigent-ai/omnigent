@@ -34,6 +34,7 @@ from omnigent.server.app import create_app
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
+from omnigent.server.scheduled.config import DEFAULT_SCHEDULED_TASK_LIMITS
 from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
     ScheduledTaskDispatchHooks,
@@ -44,6 +45,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.scheduled_task_store.dispatch import ManualRunRejectedError
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
@@ -3342,3 +3344,74 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     )
     assert retry.status_code == 400, retry.text
     assert "Minimum interval is 60 minutes" in retry.text
+
+
+async def test_active_task_cap_applies_on_create_and_resume(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The owner's active-task cap blocks a new task, and resuming one, past the limit."""
+    _make_user(db_uri)
+    limit = DEFAULT_SCHEDULED_TASK_LIMITS.max_active_tasks_per_owner
+    created = []
+    for index in range(limit):
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(name=f"task {index}"), headers=_headers()
+        )
+        assert resp.status_code == 200, resp.text
+        created.append(resp.json()["id"])
+
+    over = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(name="one too many"), headers=_headers()
+    )
+    assert over.status_code == 429, over.text
+    assert "quota_exceeded" in over.text
+
+    paused = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created[0]}", json={"state": "paused"}, headers=_headers()
+    )
+    assert paused.status_code == 200, paused.text
+    replacement = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(name="replacement"), headers=_headers()
+    )
+    assert replacement.status_code == 200, replacement.text
+
+    resumed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created[0]}", json={"state": "active"}, headers=_headers()
+    )
+    assert resumed.status_code == 429, resumed.text
+    assert "quota_exceeded" in resumed.text
+
+
+class _RejectingScheduler:
+    """Stands in for the database scheduler to raise a fixed Run now rejection."""
+
+    def __init__(self, error: ManualRunRejectedError) -> None:
+        self._error = error
+
+    async def run_now(self, task: object) -> None:
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    ("reason", "status_code", "error_code"),
+    [("already_pending", 409, "conflict"), ("cooldown", 429, "rate_limited")],
+)
+async def test_run_now_rejections_map_to_client_errors(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    reason: str,
+    status_code: int,
+    error_code: str,
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    auth_app.state.scheduled_task_dispatch_enabled = True
+    auth_app.state.scheduled_task_scheduler = _RejectingScheduler(
+        ManualRunRejectedError(reason, "rejected for the test")
+    )
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
+    assert resp.status_code == status_code, resp.text
+    assert error_code in resp.text

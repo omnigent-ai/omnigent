@@ -16,7 +16,12 @@ class ScheduledTaskSchedulerConfig(BaseModel):
     lease_seconds: int = Field(default=120, gt=0)
     batch_size: int = Field(default=100, gt=0)
     max_startups: int = Field(default=100, gt=0)
+    # Each workspace may hold at most this many of the replica's startup slots,
+    # so one tenant's backlog cannot starve the others. Clamped to max_startups.
+    max_startups_per_workspace: int = Field(default=25, gt=0)
     recovery_seconds: float = Field(default=30, gt=0)
+    # Minimum gap between Run now requests for one task.
+    run_now_cooldown_seconds: int = Field(default=60, gt=0)
 
     @model_validator(mode="after")
     def check_renewal_interval(self) -> Self:
@@ -29,4 +34,14 @@ class ScheduledTaskSchedulerConfig(BaseModel):
         return self
 
 
+class ScheduledTaskLimits(BaseModel):
+    """Per-owner product limits; managed deployments may override them per workspace."""
+
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    # Counts only active tasks: paused and completed tasks do not hold a slot.
+    max_active_tasks_per_owner: int = Field(default=20, gt=0)
+
+
 DEFAULT_SCHEDULER_CONFIG = ScheduledTaskSchedulerConfig()
+DEFAULT_SCHEDULED_TASK_LIMITS = ScheduledTaskLimits()

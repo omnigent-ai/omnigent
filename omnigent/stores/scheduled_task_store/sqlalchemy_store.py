@@ -59,6 +59,7 @@ from omnigent.stores.scheduled_task_store import (
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
     DispatchCursor,
+    ManualRunRejectedError,
     TaskCursor,
 )
 
@@ -1298,9 +1299,19 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         return run_write_transaction(self._session_immediate, "claim_occurrence", write)
 
     def request_manual_run(
-        self, task: ScheduledTask, *, now: int, trigger_key: str, host_id: str | None
+        self,
+        task: ScheduledTask,
+        *,
+        now: int,
+        trigger_key: str,
+        host_id: str | None,
+        cooldown_seconds: int = 0,
     ) -> ScheduledTaskRun | None:
-        """Insert under the task lock, so a concurrent delete either wins or purges the run."""
+        """Insert under the task lock, so a concurrent delete either wins or purges the run.
+
+        The same lock serializes concurrent requests for one task, so the pending
+        and cooldown checks cannot both pass.
+        """
         if task.workspace_id != current_workspace_id():
             return None
         run_id = uuid.uuid4().hex
@@ -1309,6 +1320,37 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row = session.get(SqlScheduledTask, (task.workspace_id, task.id), with_for_update=True)
             if row is None or row.state == encode_scheduled_task_state("deleted"):
                 return None
+            task_runs = (
+                SqlScheduledTaskRun.workspace_id == task.workspace_id,
+                SqlScheduledTaskRun.scheduled_task_id == task.id,
+            )
+            # Only unclaimed requests: a continue-mode task may overlap a starting run.
+            waiting = session.scalar(
+                select(SqlScheduledTaskRun.id)
+                .where(
+                    *task_runs,
+                    SqlScheduledTaskRun.status == encode_scheduled_task_run_status("scheduled"),
+                )
+                .limit(1)
+            )
+            if waiting is not None:
+                raise ManualRunRejectedError(
+                    "already_pending",
+                    "A Run now request for this automation is already waiting to start.",
+                )
+            if cooldown_seconds > 0:
+                last_requested_at = session.scalar(
+                    select(func.max(SqlScheduledTaskRun.scheduled_at)).where(
+                        *task_runs,
+                        SqlScheduledTaskRun.trigger_key.like("manual:%"),
+                    )
+                )
+                if last_requested_at is not None and now - last_requested_at < cooldown_seconds:
+                    raise ManualRunRejectedError(
+                        "cooldown",
+                        f"Run now was already requested for this automation within the last "
+                        f"{cooldown_seconds} seconds. Try again shortly.",
+                    )
             run = SqlScheduledTaskRun(
                 workspace_id=task.workspace_id,
                 id=run_id,

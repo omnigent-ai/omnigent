@@ -7,6 +7,7 @@ import contextlib
 import logging
 import math
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Collection, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -425,6 +426,8 @@ class PersistentTaskScheduler:
         lease_seconds: int = DEFAULT_SCHEDULER_CONFIG.lease_seconds,
         batch_size: int = DEFAULT_SCHEDULER_CONFIG.batch_size,
         max_startups: int = DEFAULT_SCHEDULER_CONFIG.max_startups,
+        max_startups_per_workspace: int = DEFAULT_SCHEDULER_CONFIG.max_startups_per_workspace,
+        run_now_cooldown_seconds: int = DEFAULT_SCHEDULER_CONFIG.run_now_cooldown_seconds,
         recovery_seconds: float = DEFAULT_SCHEDULER_CONFIG.recovery_seconds,
     ) -> None:
         config = ScheduledTaskSchedulerConfig(
@@ -433,6 +436,8 @@ class PersistentTaskScheduler:
             lease_seconds=lease_seconds,
             batch_size=batch_size,
             max_startups=max_startups,
+            max_startups_per_workspace=max_startups_per_workspace,
+            run_now_cooldown_seconds=run_now_cooldown_seconds,
             recovery_seconds=recovery_seconds,
         )
         store.check_dispatch_support()
@@ -449,10 +454,16 @@ class PersistentTaskScheduler:
         self._lease_seconds = config.lease_seconds
         self._batch_size = config.batch_size
         self._max_startups = config.max_startups
+        self._max_startups_per_workspace = config.max_startups_per_workspace
+        self._run_now_cooldown_seconds = config.run_now_cooldown_seconds
         self._recovery_seconds = config.recovery_seconds
         self._loop: asyncio.Task[None] | None = None
         self._recovery: asyncio.Task[None] | None = None
         self._startups: dict[tuple[int, str], asyncio.Task[None]] = {}
+        # Slots held by a running startup or one still being claimed, per workspace.
+        # Reserved synchronously, before any await, so concurrent callers cannot
+        # both pass the limit check.
+        self._startup_slots: Counter[int] = Counter()
         self._last_observed_due: LRUCache[tuple[int, str], int] = LRUCache(maxsize=4096)
         self._poll_lock = asyncio.Lock()
         self._stopped = False
@@ -556,7 +567,9 @@ class PersistentTaskScheduler:
 
         Starting it inside the request would tie the startup to the request's
         context, which request cancellation tears down when the response ends.
-        Returns the recorded run, or None if the task was deleted.
+        Returns the recorded run, or None if the task was deleted. Raises
+        ManualRunRejectedError while the task has an unstarted request or is
+        within its Run now cooldown.
         """
         trigger_key = manual_trigger_key()
         host_id = occurrence_host_id(task, trigger_key)
@@ -567,6 +580,7 @@ class PersistentTaskScheduler:
                 now=int(self._now()),
                 trigger_key=trigger_key,
                 host_id=host_id,
+                cooldown_seconds=self._run_now_cooldown_seconds,
             )
 
     async def _claim_pending(self) -> None:
@@ -575,7 +589,7 @@ class PersistentTaskScheduler:
         The cursor persists across polls and wraps at the end, so requests owned
         by other replicas cost each poll at most one page.
         """
-        if self._stopped or len(self._startups) >= self._max_startups:
+        if self._stopped or self._startups_full():
             return
         runs = await asyncio.to_thread(
             self._store.list_pending_runs, after=self._pending_cursor, limit=self._batch_size
@@ -585,7 +599,7 @@ class PersistentTaskScheduler:
             operation="claim",
         )
         for run in runs:
-            if self._stopped or len(self._startups) >= self._max_startups:
+            if self._stopped or self._startups_full():
                 # Resume here next poll, so no request is skipped.
                 return
             self._pending_cursor = (run.workspace_id, run.id)
@@ -602,15 +616,23 @@ class PersistentTaskScheduler:
             self._pending_cursor = None
 
     async def _start_pending(self, run: ScheduledTaskRun) -> None:
-        now = int(self._now())
-        with workspace_scope(run.workspace_id):
-            claimed = await asyncio.to_thread(
-                self._store.claim_pending_run, run, now=now, lease_seconds=self._lease_seconds
-            )
-        if claimed is None:
+        """Claim and start one Run now request, unless its workspace is at its share."""
+        if not self._reserve_startup(run.workspace_id):
             return
-        task, run = claimed
-        self._start(task, run)
+        slot_taken = False
+        try:
+            now = int(self._now())
+            with workspace_scope(run.workspace_id):
+                claimed = await asyncio.to_thread(
+                    self._store.claim_pending_run, run, now=now, lease_seconds=self._lease_seconds
+                )
+            if claimed is None:
+                return
+            task, run = claimed
+            slot_taken = self._start(task, run)
+        finally:
+            if not slot_taken:
+                self._release_startup(run.workspace_id)
         _log_event(
             _logger.info,
             "Claimed requested run %s for task %s",
@@ -799,7 +821,7 @@ class PersistentTaskScheduler:
     async def _claim_due(self) -> None:
         cutoff = int(self._now())
         cursor: DispatchCursor | None = None
-        while not self._stopped and len(self._startups) < self._max_startups:
+        while not self._stopped and not self._startups_full():
             tasks = await asyncio.to_thread(
                 self._store.list_due_tasks, cutoff, after=cursor, limit=self._batch_size
             )
@@ -846,11 +868,16 @@ class PersistentTaskScheduler:
                 operation="claim",
             )
             for task, host_id in candidates:
-                if self._stopped or len(self._startups) >= self._max_startups:
+                if self._stopped or self._startups_full():
                     return
                 if host_ownership_key(task.workspace_id, host_id) not in owned:
                     continue
+                # Skipped rather than stopping the poll, so other workspaces still start.
+                # The task stays due: nothing is claimed, so its occurrence is not lost.
+                if not self._reserve_startup(task.workspace_id):
+                    continue
                 assert task.next_run_at is not None
+                slot_taken = False
                 try:
                     now = int(self._now())
                     _log_event(
@@ -896,7 +923,7 @@ class PersistentTaskScheduler:
                             ),
                         )
                     else:
-                        self._start(task, run)
+                        slot_taken = self._start(task, run)
                         _log_event(
                             _logger.info,
                             "Claimed scheduled run %s for task %s",
@@ -908,18 +935,53 @@ class PersistentTaskScheduler:
                     _logger.exception(
                         _CLAIM_FAILURE_MESSAGE, task.id, extra=_claim_failure_event(task)
                     )
+                finally:
+                    if not slot_taken:
+                        self._release_startup(task.workspace_id)
 
-    def _start(self, task: ScheduledTask, run: ScheduledTaskRun) -> None:
-        """Start a claimed run; once stopping, leave it for recovery.
+    def _startups_full(self) -> bool:
+        return self._startup_slots.total() >= self._max_startups
 
+    def _reserve_startup(self, workspace_id: int) -> bool:
+        """Take one startup slot if the replica and this workspace have room.
+
+        Synchronous, so the check and the reservation cannot interleave with another caller.
+        """
+        if self._stopped or self._startups_full():
+            return False
+        workspace_limit = min(self._max_startups_per_workspace, self._max_startups)
+        if self._startup_slots[workspace_id] >= workspace_limit:
+            return False
+        self._startup_slots[workspace_id] += 1
+        return True
+
+    def _release_startup(self, workspace_id: int) -> None:
+        self._startup_slots[workspace_id] -= 1
+        if self._startup_slots[workspace_id] <= 0:
+            del self._startup_slots[workspace_id]
+
+    def _finish_startup(self, key: tuple[int, str], workspace_id: int) -> None:
+        self._startups.pop(key, None)
+        self._release_startup(workspace_id)
+
+    def _start(self, task: ScheduledTask, run: ScheduledTaskRun) -> bool:
+        """Start a claimed run in a slot the caller reserved; returns False once stopping.
+
+        A False return leaves the run for recovery and the caller releases the slot.
         Callers log the claim afterwards, so a failing log cannot keep the run
         from starting.
         """
-        if not self._stopped:
-            key = (run.workspace_id, run.id)
-            startup = asyncio.create_task(self._execute(task, run))
-            self._startups[key] = startup
-            startup.add_done_callback(lambda _, key=key: self._startups.pop(key, None))
+        if self._stopped:
+            return False
+        key = (run.workspace_id, run.id)
+        startup = asyncio.create_task(self._execute(task, run))
+        self._startups[key] = startup
+        startup.add_done_callback(
+            lambda _, key=key, workspace_id=run.workspace_id: self._finish_startup(
+                key, workspace_id
+            )
+        )
+        return True
 
     async def _owned_host_keys(
         self, keys: list[str], *, operation: str, timeout: float | None = None
