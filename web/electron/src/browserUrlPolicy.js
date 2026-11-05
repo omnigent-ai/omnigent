@@ -10,7 +10,8 @@ const dns = require("node:dns");
 // javascript:, ...) is a privileged surface or code channel and is rejected.
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 
-// The exact loopback hosts an eligible session context may open. Other
+// The exact loopback hosts an eligible session context may open. Eligible
+// contexts may also open `*.localhost` subdomains (see isLoopbackName); other
 // loopback spellings and DNS names that resolve to loopback stay blocked.
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -166,6 +167,24 @@ function isBlockedHostname(hostname) {
   return isIpLiteral(host) && isInternalAddress(host);
 }
 
+/** True for an RFC 6761 `*.localhost` subdomain without empty labels or a trailing dot. */
+function isLocalhostSubdomain(hostname) {
+  if (!hostname.endsWith(".localhost")) return false;
+  const labels = hostname.slice(0, -".localhost".length).split(".");
+  return labels.every((label) => label !== "");
+}
+
+/** True for a host an eligible context may open as a loopback preview. */
+function isLoopbackName(hostname) {
+  return LOOPBACK_HOSTS.has(hostname) || isLocalhostSubdomain(hostname);
+}
+
+/** True if an IP address is in 127.0.0.0/8 or is ::1 (including IPv4-mapped forms). */
+function isLoopbackAddress(address) {
+  const canonical = canonicalAddress(address);
+  return canonical === "0:0:0:0:0:0:0:1" || (canonical?.startsWith("127.") ?? false);
+}
+
 /**
  * Decide whether a renderer-issued navigation to `url` is allowed: `{ ok: true }`
  * for an http(s) URL to a non-internal host (or eligible loopback), else
@@ -192,7 +211,7 @@ function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
     };
   }
   const hostname = parsed.hostname;
-  if (allowLocalhost && LOOPBACK_HOSTS.has(hostname)) {
+  if (allowLocalhost && isLoopbackName(hostname)) {
     return { ok: true };
   }
   if (isBlockedHostname(hostname)) {
@@ -231,7 +250,7 @@ async function checkAgentNavigation(
   const verdict = isAgentNavigationAllowed(url, { allowLocalhost });
   if (!verdict.ok) return verdict;
   const { hostname } = new URL(url);
-  if ((allowLocalhost && LOOPBACK_HOSTS.has(hostname)) || isIpLiteral(hostname)) {
+  if ((allowLocalhost && isLoopbackName(hostname)) || isIpLiteral(hostname)) {
     return verdict;
   }
   let addresses = [];
@@ -269,6 +288,15 @@ function isAgentConnectionAllowed(url, ip, { allowLocalhost = false } = {}) {
     // Judge the address alone.
   }
   if (allowLocalhost && LOOPBACK_HOSTS.has(hostname)) return { ok: true };
+  if (allowLocalhost && isLocalhostSubdomain(hostname)) {
+    // Chromium connects these names to loopback itself; anything else means a
+    // resolver or proxy sent the request elsewhere.
+    if (ip && isLoopbackAddress(ip)) return { ok: true };
+    return {
+      ok: false,
+      error: `navigation blocked: host "${hostname}" did not connect to a loopback address`,
+    };
+  }
   if (!ip) {
     return {
       ok: false,
@@ -341,5 +369,8 @@ module.exports = {
   isBlockedIpv6,
   isInternalAddress,
   isBlockedHostname,
+  isLocalhostSubdomain,
+  isLoopbackName,
+  isLoopbackAddress,
   ALLOWED_SCHEMES,
 };

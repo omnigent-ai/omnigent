@@ -18,8 +18,15 @@ const {
 } = require("../src/browserUrlPolicy");
 
 describe("browserUrlPolicy — agent navigation allowlist", () => {
-  it("allows only canonical loopback destinations with Arca eligibility", () => {
-    for (const host of ["localhost", "127.0.0.1", "[::1]"]) {
+  it("allows only canonical loopback destinations with loopback eligibility", () => {
+    for (const host of [
+      "localhost",
+      "127.0.0.1",
+      "[::1]",
+      "app.localhost",
+      "spog.dev.localhost",
+      "xn--bcher-kva.localhost",
+    ]) {
       assert.equal(
         isAgentNavigationAllowed(`http://${host}:5173/`, { allowLocalhost: true }).ok,
         true,
@@ -27,8 +34,18 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
       assert.equal(isAgentNavigationAllowed(`https://${host}/`, { allowLocalhost: true }).ok, true);
       assert.equal(isAgentNavigationAllowed(`http://${host}/`).ok, false);
     }
+    assert.equal(
+      isAgentNavigationAllowed("https://SPOG.dev.localhost:23090/one?view=1", {
+        allowLocalhost: true,
+      }).ok,
+      true,
+    );
     for (const url of [
-      "http://app.localhost",
+      "http://.localhost/",
+      "http://a..localhost/",
+      "http://%2e.localhost/",
+      "http://localhost./",
+      "http://app.localhost./",
       "http://[::ffff:127.0.0.1]:5173/",
       "http://[::127.0.0.1]/",
       "http://127.2.3.4",
@@ -275,7 +292,17 @@ describe("browserUrlPolicy — DNS-aware agent navigation", () => {
     assert.equal((await checkAgentNavigation("http://[fd12::1]/", { resolveHost })).ok, false);
     const arca = { resolveHost, allowLocalhost: true };
     assert.equal((await checkAgentNavigation("http://localhost:5173/", arca)).ok, true);
+    // Chromium resolves *.localhost to loopback itself; the connected-address
+    // check verifies where the request actually went.
+    assert.equal((await checkAgentNavigation("http://spog.dev.localhost:5173/", arca)).ok, true);
     assert.deepEqual(lookups, []);
+    assert.equal(
+      (await checkAgentNavigation("http://spog.dev.localhost:5173/", { resolveHost })).ok,
+      false,
+    );
+    // Only the final label decides; a public domain containing "localhost" still resolves.
+    assert.equal((await checkAgentNavigation("http://localhost.lvh.me/", arca)).ok, false);
+    assert.deepEqual(lookups, ["localhost.lvh.me"]);
     // A DNS alias for loopback is not part of the Arca exception.
     assert.equal((await checkAgentNavigation("http://lvh.me:5173/", arca)).ok, false);
   });
@@ -320,6 +347,20 @@ describe("browserUrlPolicy — connected address check", () => {
     assert.equal(isAgentConnectionAllowed("http://[::1]:5173/", "::1", eligible).ok, true);
     assert.equal(isAgentConnectionAllowed("http://localhost:5173/", "127.0.0.1").ok, false);
     assert.equal(isAgentConnectionAllowed("http://lvh.me:5173/", "127.0.0.1", eligible).ok, false);
+  });
+
+  it("allows *.localhost only when an eligible view connected to loopback", () => {
+    const eligible = { allowLocalhost: true };
+    const url = "https://spog.dev.localhost:23090/one";
+    for (const ip of ["127.0.0.1", "127.0.1.1", "::1", "::ffff:7f00:1"]) {
+      assert.equal(isAgentConnectionAllowed(url, ip, eligible).ok, true, ip);
+      assert.equal(isAgentConnectionAllowed(url, ip).ok, false, ip);
+    }
+    for (const ip of [undefined, "", "10.0.0.5", "192.168.1.10", "93.184.215.14", "fd00::1"]) {
+      const verdict = isAgentConnectionAllowed(url, ip, eligible);
+      assert.equal(verdict.ok, false, String(ip));
+      assert.match(verdict.error, /did not connect to a loopback address/);
+    }
   });
 });
 

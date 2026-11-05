@@ -21,6 +21,7 @@ const {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isAgentNavigationAllowed,
+  isLocalhostSubdomain,
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
@@ -453,7 +454,7 @@ function createBrowserViewRegistry({
   }
 
   // Resolve named hosts in the owning partition before any request is sent.
-  // IP literals and eligible exact-loopback hosts need only the URL check.
+  // IP literals and eligible loopback names need only the URL check.
   async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
@@ -507,9 +508,11 @@ function createBrowserViewRegistry({
         : isAgentConnectionAllowed(policyUrl, ip, policy);
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
-    // (same-IP limit documented on isProxyAddress).
+    // (same-IP limit documented on isProxyAddress). A proxy would resolve
+    // `*.localhost` on its own network, so those must connect to loopback.
     const proxied =
       !!ip &&
+      !(URL.canParse(policyUrl) && isLocalhostSubdomain(new URL(policyUrl).hostname)) &&
       (await isProxyAddress(ip, await resolveProxy(policyUrl, policy.partition), (hostname) =>
         resolveHost(hostname, policy.partition),
       ));

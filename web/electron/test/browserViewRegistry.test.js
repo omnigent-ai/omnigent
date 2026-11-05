@@ -1104,6 +1104,27 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
   });
 
+  it("never exempts a *.localhost response through the proxy", async () => {
+    const proxyLookups = [];
+    const context = { hostIsThisMachine: true };
+    const { registry, idOf } = makeNetworkGuardRegistry({
+      allowsLocalhost: (ctx) => ctx === context,
+      resolveProxy: async (url) => {
+        proxyLookups.push(url);
+        return "PROXY proxy.corp:3128; DIRECT";
+      },
+    });
+    const url = "http://spog.dev.localhost:5173/";
+    registry.openOrNavigate("conv_1", url, undefined, { agent: true, agentContext: context });
+    const response = (ip) =>
+      registry.shouldCancelAgentResponse({ webContentsId: idOf("conv_1"), url, ip });
+    assert.deepEqual(
+      await Promise.all(["127.0.0.1", "::1", "10.0.0.2", "93.184.215.14"].map(response)),
+      [false, false, true, true],
+    );
+    assert.deepEqual(proxyLookups, []);
+  });
+
   it("forces policy-enforced network requests past the HTTP cache", () => {
     const { registry, idOf } = makeNetworkGuardRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });

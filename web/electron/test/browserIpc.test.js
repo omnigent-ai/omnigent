@@ -1684,7 +1684,12 @@ describe("browser IPC sessions on this machine", () => {
     assert.equal(registry.get("conv").agentContext, null);
   });
 
-  for (const url of ["http://localhost:5173", "http://127.0.0.1:5173", "http://[::1]:5173"]) {
+  for (const url of [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://[::1]:5173",
+    "https://spog.dev.localhost:23090/one",
+  ]) {
     it(`allows an enrolled local session to open ${url}`, async () => {
       const { navigate } = localNavigation();
       const result = await navigate(url);
@@ -1695,7 +1700,7 @@ describe("browser IPC sessions on this machine", () => {
   for (const url of [
     "http://192.168.1.1",
     "http://169.254.169.254",
-    "http://app.localhost",
+    "http://app.localhost.",
     "http://alias.example",
     "http://0.0.0.0",
   ]) {
@@ -1715,6 +1720,7 @@ describe("browser IPC sessions on this machine", () => {
       assert.equal((await navigate("https://example.com")).ok, true);
       const entry = registry.get("conv");
       assert.equal((await navigate("http://localhost:5173")).ok, false);
+      assert.equal((await navigate("http://spog.dev.localhost:5173")).ok, false);
       assert.equal(registry.get("conv"), entry);
       assert.equal(
         (await ipcMain.invoke("omnigent:browser-screenshot", {}, { conversationId: "conv" })).ok,
