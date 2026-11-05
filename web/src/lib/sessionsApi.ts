@@ -997,8 +997,8 @@ export async function createSideChat(
 }
 
 /**
- * Bind an existing (unbound) session to a host + working directory and
- * launch its runner: ``POST /v1/hosts/{hostId}/runners``.
+ * Bind an existing session to a host + working directory and launch its
+ * runner: ``POST /v1/hosts/{hostId}/runners``.
  *
  * This is the fork-resume path — the clone already exists; this picks
  * its host/directory at resume time. When ``git`` is set the server
@@ -1006,11 +1006,15 @@ export async function createSideChat(
  * runner to it; otherwise it binds ``workspace`` directly.
  *
  * @param hostId - Host the caller owns to launch on, e.g. ``"host_abc"``.
- * @param sessionId - The (unbound) session to bind, e.g. ``"conv_abc"``.
+ * @param sessionId - The session to bind, e.g. ``"conv_abc"``; unbound
+ *   unless ``replaceRunner`` is set.
  * @param workspace - Absolute directory on the host. With ``git`` set,
  *   this is the source repository the worktree branches from.
  * @param git - Optional worktree options. ``baseBranch`` omitted → the
  *   host branches from the repo's current HEAD.
+ * @param options - ``replaceRunner`` moves a bound session off its runner
+ *   (Switch host): the server releases that binding and stops the runner.
+ *   Only servers advertising ``host_launch_replace_runner`` accept it.
  * @returns The bound runner id.
  * @throws Error carrying the server's failure detail (e.g. a duplicate
  *   branch or an offline host) so the picker can surface it inline.
@@ -1025,6 +1029,7 @@ export async function launchRunner(
     existingWorktree?: boolean;
     existingBranch?: boolean;
   },
+  options?: { replaceRunner?: boolean },
 ): Promise<{ runnerId: string }> {
   const body: {
     session_id: string;
@@ -1035,7 +1040,9 @@ export async function launchRunner(
       existing_worktree?: boolean;
       existing_branch?: boolean;
     };
+    replace_runner?: boolean;
   } = { session_id: sessionId, workspace };
+  if (options?.replaceRunner) body.replace_runner = true;
   if (git !== undefined) {
     // `existing_worktree` binds a pre-existing worktree (no worktree is
     // created; the branch is recorded for the sidebar + delete flow) and

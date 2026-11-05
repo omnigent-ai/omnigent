@@ -252,6 +252,12 @@ export interface ServerInfo {
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
   session_fork_workspaces?: boolean;
   /**
+   * True when a runner launch accepts ``replace_runner``, so Switch host moves a
+   * session in one call and the server stops the runner it leaves. Older
+   * servers need the runner released first.
+   */
+  host_launch_replace_runner?: boolean;
+  /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
    * and the Import bundle button. Absent on older servers (off).
@@ -419,6 +425,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
+  host_launch_replace_runner: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -580,6 +587,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
+          host_launch_replace_runner: data.host_launch_replace_runner === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,

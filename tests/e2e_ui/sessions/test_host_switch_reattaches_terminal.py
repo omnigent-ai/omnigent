@@ -29,6 +29,7 @@ import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
+from tests.e2e_ui.sessions.test_host_badge import _advertise_one_call_host_switch
 
 _FAKE_HOST_ID = "host_switch_origin"
 _TARGET_HOST_ID = "host_switch_target"
@@ -200,6 +201,7 @@ def test_switching_host_reattaches_the_web_terminal(
     )
     page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_session)
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+    _advertise_one_call_host_switch(page)
 
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -233,8 +235,10 @@ def test_switching_host_reattaches_the_web_terminal(
     switch.click()
 
     expect(dialog).to_have_count(0, timeout=15_000)
-    assert [c.get("runner_id") for c in release_calls] == [""], release_calls
-    assert [c.get("session_id") for c in launch_calls] == [session_id], launch_calls
+    assert ["runner_id" in c for c in release_calls] == [False], release_calls
+    assert [(c.get("session_id"), c.get("replace_runner")) for c in launch_calls] == [
+        (session_id, True)
+    ], launch_calls
 
     # The switch is done: the terminal strip must show host B's shell and drop
     # host A's. On the buggy build it stays on host A -> tab_b never appears.

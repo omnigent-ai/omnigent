@@ -114,6 +114,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_worktrees"] is True
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
+    # Gates Switch host's single-call move; older servers omit it.
+    assert data["host_launch_replace_runner"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True

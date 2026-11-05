@@ -59,6 +59,7 @@ from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.scheduled_context import scheduled_run_scope
 from omnigent.server.app import create_app
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
@@ -79,6 +80,7 @@ from tests.server.helpers import websocket_scope as _websocket_scope
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "c2d81b1a6812ae1cf32221c5a2a70ba0"
+_OTHER_HOST_ID = "5f0e9d8c7b6a49382716f5e4d3c2b1a0"
 _WORKSPACE = "/work/repo"
 _RUNNER_NOT_AVAILABLE = (
     "The runner for this session is not available — it may have failed to start. "
@@ -130,7 +132,7 @@ def _runner_hello() -> HelloFrame:
 
 
 @pytest.fixture()
-def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
+def app(runtime_init: None, db_uri: str, tmp_path, request: pytest.FixtureRequest) -> FastAPI:
     """FastAPI app wired WITH ``host_store`` so the inline host-launch
     branch of ``POST /v1/sessions`` is active.
 
@@ -142,6 +144,8 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     :param runtime_init: Initializes the runtime + mock LLM.
     :param db_uri: SQLite database URI.
     :param tmp_path: Pytest temp dir for artifacts and cache.
+    :param request: Indirect parametrization may pass :class:`FeatureFlags`;
+        otherwise the feature defaults apply.
     :returns: A configured FastAPI app with host routes mounted.
     """
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -156,29 +160,36 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        feature_flags=getattr(request, "param", None),
     )
 
 
-async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+async def _connect_host(
+    app: FastAPI, *, host_id: str = _HOST_ID, name: str = "laptop"
+) -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
 
     :param app: The FastAPI app under test (its ``state.host_registry``
         is the same instance the session-create launch path reads).
+    :param host_id: Host to connect, e.g. ``_HOST_ID``.
+    :param name: Host name for the hello frame. A second host needs its own
+        name: the server treats a reused name as the same machine with a new
+        identity and moves its sessions over.
     :returns: The connected ASGI communicator, ready to exchange frames.
     """
-    path = f"/v1/hosts/{_HOST_ID}/tunnel"
+    path = f"/v1/hosts/{host_id}/tunnel"
     comm = ApplicationCommunicator(app, _websocket_scope(path))
     await comm.send_input({"type": "websocket.connect"})
     accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     hello = encode_host_frame(
-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name=name)
     )
     await comm.send_input({"type": "websocket.receive", "text": hello})
     registry = app.state.host_registry
-    while registry.get(_HOST_ID) is None:
+    while registry.get(host_id) is None:
         await asyncio.sleep(0.01)
     return comm
 
@@ -4568,8 +4579,9 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
 class _HostFrameResponder:
     """Answer host round-trips in the background and record every stop request."""
 
-    def __init__(self, comm: ApplicationCommunicator) -> None:
+    def __init__(self, comm: ApplicationCommunicator, *, launch_status: str = "launched") -> None:
         self._comm = comm
+        self._launch_status = launch_status
         self.stopped_runner_ids: list[str] = []
         self.launch_frames: list[HostLaunchRunnerFrame] = []
         self._task: asyncio.Task[None] | None = None
@@ -4607,8 +4619,12 @@ class _HostFrameResponder:
                 reply = HostStopRunnerResultFrame(request_id=frame.request_id, status="stopped")
             elif isinstance(frame, HostLaunchRunnerFrame):
                 self.launch_frames.append(frame)
+                launched = self._launch_status == "launched"
                 reply = HostLaunchRunnerResultFrame(
-                    request_id=frame.request_id, status="launched", runner_id="runner_from_host"
+                    request_id=frame.request_id,
+                    status=self._launch_status,
+                    runner_id="runner_from_host" if launched else None,
+                    error=None if launched else "host refused the launch",
                 )
             else:
                 continue
@@ -4641,6 +4657,12 @@ async def _drain_detached_stops() -> None:
     from omnigent.server.routes._sessions import orchestration
 
     await asyncio.gather(*list(orchestration._detached_stop_tasks), return_exceptions=True)
+
+
+async def _drain_superseded_runner_stops() -> None:
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+
+    await asyncio.gather(*list(sessions_helpers._detached_supersede_stops), return_exceptions=True)
 
 
 @pytest.fixture
@@ -4866,6 +4888,194 @@ async def test_archiving_grandchild_on_roots_shared_runner_does_not_stop_it(
         f"archiving grandchild {grandchild['id']} asked the host to stop "
         f"{host.stopped_runner_ids}; it still rides the root's runner {parent['runner_id']}"
     )
+
+
+@pytest.mark.parametrize(
+    "app",
+    [None, FeatureFlags(enabled_features=frozenset({Feature.SANDBOX_PROFILES}))],
+    ids=["profiles-off", "profiles-on"],
+    indirect=True,
+)
+@pytest.mark.parametrize("launch_status", ["launched", "failed"])
+async def test_switching_host_stops_the_runner_on_the_host_it_left(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    launch_status: str,
+) -> None:
+    """A launch that moves a session to another host stops its runner on the old one.
+
+    The launch releases the session's binding itself (``replace_runner``), so
+    the server still knows which runner the session leaves. Released, that
+    runner serves nothing, so it is stopped whether or not the new host then
+    starts one. With sandbox profiles on, the profile catalog does the release.
+    """
+    origin = await _connect_host(app)
+    session = await _inline_launch_session(client, origin)
+    target = await _connect_host(app, host_id=_OTHER_HOST_ID, name="desktop")
+    async with (
+        _HostFrameResponder(origin) as origin_host,
+        _HostFrameResponder(target, launch_status=launch_status) as target_host,
+    ):
+        response = await client.post(
+            f"/v1/hosts/{_OTHER_HOST_ID}/runners",
+            json={"session_id": session["id"], "workspace": "/work/other", "replace_runner": True},
+        )
+        await _drain_superseded_runner_stops()
+
+    assert [frame.session_id for frame in target_host.launch_frames] == [session["id"]]
+    assert origin_host.stopped_runner_ids == [session["runner_id"]], (
+        f"moving session {session['id']} must stop its runner on the host it left "
+        f"(stops: {origin_host.stopped_runner_ids})"
+    )
+    assert target_host.stopped_runner_ids == []
+    row = SqlAlchemyConversationStore(db_uri).get_conversation(session["id"])
+    assert row is not None
+    if launch_status == "launched":
+        assert response.status_code == 200, response.text
+        assert (row.host_id, row.runner_id) == (_OTHER_HOST_ID, response.json()["runner_id"])
+    else:
+        assert response.status_code == 502, response.text
+        assert (row.host_id, row.runner_id) == (None, None)
+
+
+@pytest.mark.parametrize("moved", ["child", "parent"])
+async def test_switching_host_stops_a_shared_runner_only_for_its_owner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    _shared_runner_family: dict[str, str],
+    moved: str,
+) -> None:
+    """A runner a parent shares with its sub-agent is the parent's to stop.
+
+    Moving the child leaves the runner up for the parent. Moving the parent
+    stops it, as a relaunch does; the child's next turn rebinds it to the
+    parent's new runner.
+    """
+    origin = await _connect_host(app)
+    parent = await _inline_launch_session(client, origin)
+    target = await _connect_host(app, host_id=_OTHER_HOST_ID, name="desktop")
+    async with (
+        _HostFrameResponder(origin) as origin_host,
+        _HostFrameResponder(target) as target_host,
+    ):
+        child = await _inline_child_session(client, parent["id"])
+        _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        moved_id = child["id"] if moved == "child" else parent["id"]
+        response = await client.post(
+            f"/v1/hosts/{_OTHER_HOST_ID}/runners",
+            json={"session_id": moved_id, "workspace": "/work/other", "replace_runner": True},
+        )
+        await _drain_superseded_runner_stops()
+
+    assert response.status_code == 200, response.text
+    assert [frame.session_id for frame in target_host.launch_frames] == [moved_id]
+    expected_stops = [parent["runner_id"]] if moved == "parent" else []
+    assert origin_host.stopped_runner_ids == expected_stops, (
+        f"moving the {moved} {moved_id} stopped {origin_host.stopped_runner_ids}; "
+        f"expected {expected_stops}"
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.get_conversation(moved_id).runner_id == response.json()["runner_id"]
+    if moved == "child":
+        assert store.get_conversation(parent["id"]).runner_id == parent["runner_id"]
+
+
+async def test_switching_host_refuses_a_binding_that_changed_mid_request(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A move releases only the binding it read, never a runner bound since.
+
+    A relaunch can rebind the session between the launch's authorization read
+    and its release. The move is refused and the new runner keeps serving.
+    """
+    origin = await _connect_host(app)
+    session = await _inline_launch_session(client, origin)
+    target = await _connect_host(app, host_id=_OTHER_HOST_ID, name="desktop")
+    store = SqlAlchemyConversationStore(db_uri)
+    relaunched_runner_id = token_bound_runner_id("relaunch-binding-token")
+    registry = app.state.host_registry
+    admit_launch = registry.admit_launch
+
+    async def admit_after_relaunch(conn: HostConnection, session_id: str, **kwargs: Any) -> None:
+        await asyncio.to_thread(store.replace_runner_id, session_id, relaunched_runner_id)
+        await admit_launch(conn, session_id, **kwargs)
+
+    monkeypatch.setattr(registry, "admit_launch", admit_after_relaunch)
+    async with (
+        _HostFrameResponder(origin) as origin_host,
+        _HostFrameResponder(target) as target_host,
+    ):
+        response = await client.post(
+            f"/v1/hosts/{_OTHER_HOST_ID}/runners",
+            json={"session_id": session["id"], "workspace": "/work/other", "replace_runner": True},
+        )
+        await _drain_superseded_runner_stops()
+
+    assert response.status_code == 409, response.text
+    assert target_host.launch_frames == []
+    assert origin_host.stopped_runner_ids == []
+    row = store.get_conversation(session["id"])
+    assert row is not None
+    assert (row.host_id, row.runner_id) == (_HOST_ID, relaunched_runner_id)
+
+
+async def test_cancelled_switch_still_stops_the_runner_it_released(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch cancelled while it releases the binding still stops the old runner.
+
+    The release commits on a worker thread, so a cancellation then cannot undo
+    it. Without the stop the runner would be left serving nothing.
+    """
+    origin = await _connect_host(app)
+    session = await _inline_launch_session(client, origin)
+    target = await _connect_host(app, host_id=_OTHER_HOST_ID, name="desktop")
+    releasing, release = threading.Event(), threading.Event()
+    clear_runner_id = SqlAlchemyConversationStore.clear_runner_id
+
+    def clear_after_cancel(
+        store: SqlAlchemyConversationStore, conversation_id: str, **kwargs: Any
+    ) -> Conversation:
+        releasing.set()
+        assert release.wait(budget(10.0))
+        return clear_runner_id(store, conversation_id, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "clear_runner_id", clear_after_cancel)
+    async with (
+        _HostFrameResponder(origin) as origin_host,
+        _HostFrameResponder(target) as target_host,
+    ):
+        switch = asyncio.create_task(
+            client.post(
+                f"/v1/hosts/{_OTHER_HOST_ID}/runners",
+                json={
+                    "session_id": session["id"],
+                    "workspace": "/work/other",
+                    "replace_runner": True,
+                },
+            )
+        )
+        assert await asyncio.to_thread(releasing.wait, budget(10.0))
+        switch.cancel()
+        release.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await switch
+        deadline = time.monotonic() + budget(10.0)
+        while not origin_host.stopped_runner_ids and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+    assert origin_host.stopped_runner_ids == [session["runner_id"]], (
+        f"the cancelled switch released session {session['id']} but never stopped "
+        f"its runner (stops: {origin_host.stopped_runner_ids})"
+    )
+    assert target_host.launch_frames == []
 
 
 class _StagedRunners:

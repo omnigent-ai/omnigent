@@ -3627,6 +3627,12 @@
             ],
             "description": "Optional git worktree options. In create mode the server creates a worktree for a new branch off `workspace` on the host and binds the runner to it (the fork-resume path; mirrors `POST /v1/sessions`). In bind mode (`existing_worktree=True`) `workspace` already IS a worktree \u2014 no worktree is created; `branch_name` is recorded as the session's `git_branch` for display and opt-in cleanup. `None` binds `workspace` directly. `host_id` is always present (it is in the path), so no host check is needed here."
           },
+          "replace_runner": {
+            "default": false,
+            "description": "Move a bound session off its current runner (\"Switch host\") instead of refusing it. The launch releases that binding and stops the runner the session leaves.",
+            "title": "Replace Runner",
+            "type": "boolean"
+          },
           "session_id": {
             "description": "Session to bind the new runner to, e.g. `\"conv_abc123\"`.",
             "title": "Session Id",
@@ -6165,6 +6171,11 @@
           },
           "harness_install_enabled": {
             "title": "Harness Install Enabled",
+            "type": "boolean"
+          },
+          "host_launch_replace_runner": {
+            "default": true,
+            "title": "Host Launch Replace Runner",
             "type": "boolean"
           },
           "installable_harnesses": {
@@ -13079,7 +13090,7 @@
     },
     "/v1/hosts/{host_id}/runners": {
       "post": {
-        "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
+        "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline or a binding to replace changed, 403 if caller doesn't own the host, 400 if session already has a runner and `replace_runner` is unset.",
         "operationId": "launch_runner_v1_hosts__host_id__runners_post",
         "parameters": [
           {

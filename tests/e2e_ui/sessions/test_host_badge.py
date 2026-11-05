@@ -402,15 +402,32 @@ def test_host_badge_labels_sandbox_session_by_provider(
     expect(badge).not_to_have_attribute("aria-label", re.compile(re.escape("managed-cd8f66d0")))
 
 
+def _advertise_one_call_host_switch(page: Page) -> None:
+    """Advertise ``host_launch_replace_runner`` whatever the server under test reports.
+
+    The compatibility lane runs this suite against older servers; pinning the
+    capability keeps the asserted switch calls the same in every lane.
+
+    :param page: Playwright page before navigation.
+    """
+
+    def _serve_info(route: Route) -> None:
+        response = fetch_with_retry(route)
+        info = response.json()
+        info["host_launch_replace_runner"] = True
+        route.fulfill(response=response, json=info)
+
+    page.route("**/v1/info", _serve_info)
+
+
 def _patch_switch_targets(page: Page, session_id: str, *, target_host_id: str) -> list[dict]:
     """Offer a second online host and capture the two calls a switch makes.
 
-    The move has no dedicated endpoint — it is a ``PATCH /v1/sessions/{id}``
-    that releases the runner binding followed by a
-    ``POST /v1/hosts/{target}/runners`` that binds a new one. Both are
-    intercepted and answered here so the test never needs a second real host;
-    what it asserts is that the UI issues them, in that order, with the right
-    payloads.
+    A switch is a ``PATCH /v1/sessions/{id}`` that clears the model override
+    followed by a ``POST /v1/hosts/{target}/runners`` that replaces the
+    session's runner. Both are intercepted and answered here so the test never
+    needs a second real host; what it asserts is that the UI issues them, in
+    that order, with the right payloads.
 
     :param page: Playwright page before navigation.
     :param target_host_id: Host id the dialog should offer as a move target.
@@ -452,6 +469,7 @@ def _patch_switch_targets(page: Page, session_id: str, *, target_host_id: str) -
             ),
         )
 
+    _advertise_one_call_host_switch(page)
     page.route(re.compile(r"/v1/hosts/[^/]+/filesystem"), _patch_filesystem)
     page.route(re.compile(rf"/v1/hosts/{re.escape(target_host_id)}/runners(\?|$)"), _patch_launch)
     page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_release)
@@ -465,7 +483,7 @@ def test_host_badge_switches_the_session_to_another_host(
     """Clicking an online host badge moves the session to another machine.
 
     The whole point of the flow: pick a host, pick a directory, and the session
-    is released from the old runner and relaunched on the new host. The origin
+    is moved off the old runner onto one launched on the new host. The origin
     host is excluded from the picker (moving to where it already is is a no-op).
 
     :param page: Playwright page fixture.
@@ -555,10 +573,12 @@ def test_host_badge_switches_the_session_to_another_host(
     kinds = [c["kind"] for c in calls]
     assert kinds == ["release", "launch"], f"expected release then launch, got {kinds}"
     release_body = calls[0]["body"] or {}
-    # The runner binding is released, and the model override goes with it: a
-    # model id is resolved against the OLD host's catalog.
-    assert release_body.get("runner_id") == "", release_body
+    # The model override is cleared, since a model id is resolved against the
+    # OLD host's catalog. The binding stays for the launch to replace, so the
+    # server can stop the runner the session leaves.
     assert release_body.get("model_override") == "default", release_body
+    assert "runner_id" not in release_body, release_body
     launch_body = calls[1]["body"] or {}
     assert launch_body.get("session_id") == session_id, launch_body
     assert launch_body.get("workspace") == "/home/e2e/repo", launch_body
+    assert launch_body.get("replace_runner") is True, launch_body

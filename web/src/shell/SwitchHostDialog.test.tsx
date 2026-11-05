@@ -9,11 +9,13 @@ import { SwitchHostDialog } from "./SwitchHostDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
-import { launchRunner, updateSession } from "@/lib/sessionsApi";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { getSession, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 
 // Heavy children have their own suites; stub them so this one stays on the
-// dialog's two-call move and its recovery from a half-finished switch.
+// dialog's move calls and its recovery from a half-finished switch.
 vi.mock("./WorkspacePathField", () => ({
   WorkspacePathField: ({
     value,
@@ -63,7 +65,11 @@ vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: ["/Users/alice/repo"], addRecent: vi.fn() }),
 }));
-vi.mock("@/lib/sessionsApi", () => ({ launchRunner: vi.fn(), updateSession: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({
+  getSession: vi.fn(),
+  launchRunner: vi.fn(),
+  updateSession: vi.fn(),
+}));
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
 // <select> keeps the option list assertable.
 vi.mock("@/components/ui/select", () => ({
@@ -104,23 +110,40 @@ vi.mock("@/components/ui/select", () => ({
 
 const useHostsMock = vi.mocked(useHosts);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
+const getSessionMock = vi.mocked(getSession);
 const launchRunnerMock = vi.mocked(launchRunner);
 const updateSessionMock = vi.mocked(updateSession);
 
-function renderDialog() {
+const REPLACING_SERVER: ServerInfo = { ...FALLBACK_SERVER_INFO, host_launch_replace_runner: true };
+
+/** Render the dialog; ``serverInfo`` defaults to a server without the one-call move. */
+function renderDialog(serverInfo: ServerInfo | "loading" = "loading") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <QueryClientProvider client={client}>
-      <SwitchHostDialog open onOpenChange={() => {}} sessionId="conv_1" currentHostId="host_old" />
-    </QueryClientProvider>,
+    <CapabilitiesProvider info={serverInfo}>
+      <QueryClientProvider client={client}>
+        <SwitchHostDialog
+          open
+          onOpenChange={() => {}}
+          sessionId="conv_1"
+          currentHostId="host_old"
+        />
+      </QueryClientProvider>
+    </CapabilitiesProvider>,
   );
   return client;
+}
+
+/** The session snapshot the dialog reads back after a failed one-call move. */
+function sessionBoundTo(runnerId: string | null): Awaited<ReturnType<typeof getSession>> {
+  return { id: "conv_1", runnerId } as Awaited<ReturnType<typeof getSession>>;
 }
 
 beforeEach(() => {
   vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
   useHostsMock.mockReset();
   useHostFilesystemMock.mockReset();
+  getSessionMock.mockReset();
   launchRunnerMock.mockReset();
   updateSessionMock.mockReset();
   useHostsMock.mockReturnValue({
@@ -238,7 +261,36 @@ describe("SwitchHostDialog", () => {
     expect(launchRunnerMock).not.toHaveBeenCalled();
   });
 
-  it("releases the runner and the model override before launching on the new host", async () => {
+  it("moves the session in one launch when the server releases the runner itself", async () => {
+    const client = renderDialog(REPLACING_SERVER);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+
+    const button = await screen.findByTestId("switch-host-button");
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+
+    // The binding stays until the launch replaces it, so the server still
+    // knows which runner to stop. The model id is resolved against the old
+    // host's catalog, so it is cleared before the new runner reads it.
+    await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+    expect(updateSessionMock).toHaveBeenCalledWith("conv_1", {
+      modelOverride: null,
+      silent: true,
+    });
+    expect(launchRunnerMock).toHaveBeenCalledWith(
+      "host_new",
+      "conv_1",
+      "/Users/alice/repo",
+      undefined,
+      { replaceRunner: true },
+    );
+    expect(updateSessionMock.mock.invocationCallOrder[0]).toBeLessThan(
+      launchRunnerMock.mock.invocationCallOrder[0],
+    );
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-agent", "conv_1"] });
+  });
+
+  it("releases the runner and the model override first on an older server", async () => {
     const client = renderDialog();
     const invalidate = vi.spyOn(client, "invalidateQueries");
 
@@ -288,7 +340,42 @@ describe("SwitchHostDialog", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_1") });
   });
 
-  it("offers the origin host again when the launch fails after the release", async () => {
+  it("offers the origin host again when a failed move left the session unbound", async () => {
+    launchRunnerMock.mockRejectedValue(new Error("host failed to launch runner"));
+    getSessionMock.mockResolvedValue(sessionBoundTo(null));
+    renderDialog(REPLACING_SERVER);
+    expect(screen.queryByTestId("switch-host-option-host_old")).toBeNull();
+
+    const button = await screen.findByTestId("switch-host-button");
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+
+    const error = await screen.findByTestId("switch-host-error");
+    await waitFor(() => expect(error.textContent).toContain("isn't running anywhere"));
+    expect(error.textContent).toContain("host failed to launch runner");
+    expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
+  });
+
+  it("keeps the session's host when the server refused the move", async () => {
+    // A refusal before the release (a bad directory, say) leaves the session
+    // on its old runner, so the copy must not claim it stopped anywhere.
+    launchRunnerMock.mockRejectedValue(new Error("workspace path does not exist"));
+    getSessionMock.mockResolvedValue(sessionBoundTo("runner_old"));
+    renderDialog(REPLACING_SERVER);
+
+    const button = await screen.findByTestId("switch-host-button");
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+
+    const error = await screen.findByTestId("switch-host-error");
+    expect(error.textContent).toContain("workspace path does not exist");
+    await waitFor(() => expect(getSessionMock).toHaveBeenCalledWith("conv_1"));
+    await waitFor(() => expect(button).not.toHaveAttribute("aria-busy", "true"));
+    expect(error.textContent).not.toContain("isn't running anywhere");
+    expect(screen.queryByTestId("switch-host-option-host_old")).toBeNull();
+  });
+
+  it("offers the origin host again when the launch fails after an older server's release", async () => {
     launchRunnerMock.mockRejectedValue(new Error("host is offline"));
     renderDialog();
 

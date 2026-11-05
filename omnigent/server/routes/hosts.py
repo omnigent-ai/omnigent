@@ -21,7 +21,7 @@ import contextlib
 import logging
 import secrets
 import weakref
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -98,6 +98,9 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
+if TYPE_CHECKING:
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
 _logger = logging.getLogger(__name__)
 
 _HARNESS_LOGIN_TERMINAL_GRACE_S = 5 * 60
@@ -125,6 +128,66 @@ def _track_runner_launch_cleanup(task: asyncio.Task[None]) -> None:
             )
 
     task.add_done_callback(_done)
+
+
+async def _release_runner_for_move(
+    conv: Conversation,
+    *,
+    conversation_store: ConversationStore,
+    host_store: HostStore,
+    host_registry: HostRegistry,
+    profile_catalog: SandboxProfileCatalog | None,
+    user_id: str | None,
+) -> None:
+    """
+    Release a moving session's runner binding, then stop that runner.
+
+    The release happens inside the launch because only this request still
+    knows which runner the session is leaving. It clears exactly the binding
+    *conv* holds, so a runner bound since (a relaunch) is refused, not
+    stopped. A sub-agent's inherited runner stays up for its ancestor.
+
+    :param conv: Session row read when the launch was authorized.
+    :param conversation_store: Store holding the binding.
+    :param host_store: Host records, for the sandbox profile check.
+    :param host_registry: Live host tunnels, for the stop.
+    :param profile_catalog: Sandbox profile catalog, when enabled.
+    :param user_id: Caller, e.g. ``"alice@example.com"``.
+    :raises HTTPException: 409 if the binding changed after *conv* was read.
+    """
+    from omnigent.server.routes._sessions.helpers import (
+        _owns_host_runner,
+        _spawn_superseded_runner_stop,
+    )
+
+    owns_runner = await _owns_host_runner(conv, conversation_store)
+    try:
+        if profile_catalog is not None:
+            await asyncio.to_thread(
+                profile_catalog.reassign_runner,
+                conv,
+                None,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                user_id=user_id,
+            )
+        else:
+            await asyncio.to_thread(
+                conversation_store.clear_runner_id, conv.id, expected_binding=conv
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _logger.info(
+        "Session unbound from runner",
+        extra=debug_event(
+            "session_runner_unbound",
+            session_id=conv.id,
+            previous_runner_id=conv.runner_id,
+            previous_host_id=conv.host_id,
+        ),
+    )
+    if owns_runner and conv.host_id is not None and conv.runner_id is not None:
+        _spawn_superseded_runner_stop(conv.id, conv.host_id, conv.runner_id, host_registry)
 
 
 # Per-call timeout for host.list_dir round-trips. Listing is a single
@@ -737,11 +800,15 @@ class LaunchRunnerRequest(BaseModel):
         as the session's ``git_branch`` for display and opt-in cleanup.
         ``None`` binds ``workspace`` directly. ``host_id`` is always
         present (it is in the path), so no host check is needed here.
+    :param replace_runner: Move a bound session off its current runner
+        ("Switch host") instead of refusing it. The launch releases that
+        binding and stops the runner the session leaves.
     """
 
     session_id: str
     workspace: str
     git: SessionGitOptions | None = None
+    replace_runner: bool = False
 
 
 async def _resolve_agent_spec_cwd(
@@ -1092,8 +1159,9 @@ def create_hosts_router(
             ``workspace``.
         :returns: ``{"runner_id": ..., "status": "launching"}``.
         :raises HTTPException: 404 if host not found, 409 if host
-            offline, 403 if caller doesn't own the host, 400 if
-            session already has a runner.
+            offline or a binding to replace changed, 403 if caller
+            doesn't own the host, 400 if session already has a runner
+            and ``replace_runner`` is unset.
         """
         # require_user: resolve_host_launch skips its ownership checks
         # for user_id=None (the auth-disabled single-user case), so an
@@ -1270,7 +1338,7 @@ def create_hosts_router(
                 )
                 if current is None:
                     raise HTTPException(status_code=404, detail="session not found")
-                if current.runner_id is not None:
+                if current.runner_id is not None and not body.replace_runner:
                     raise HTTPException(
                         status_code=400,
                         detail="session already has a runner bound",
@@ -1309,6 +1377,18 @@ def create_hosts_router(
                     allow_unbound=True,
                     transfer_from_host_id=target.conv.host_id,
                 )
+                if body.replace_runner and target.conv.runner_id is not None:
+                    # Shielded so a cancelled request still stops a runner it released.
+                    await asyncio.shield(
+                        _release_runner_for_move(
+                            target.conv,
+                            conversation_store=conversation_store,
+                            host_store=host_store,
+                            host_registry=host_registry,
+                            profile_catalog=profile_catalog,
+                            user_id=user_id,
+                        )
+                    )
             except BaseException:
                 await _rollback_worktree()
                 raise
