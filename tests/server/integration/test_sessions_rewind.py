@@ -420,6 +420,8 @@ async def test_rewind_still_returns_the_new_session_when_its_attachments_fail(
         # Well-formed ids: another session's prompt, and one no item has.
         ("claude-sdk", 2, "foreign_prompt", 400, "needs one of this session's prompts"),
         ("claude-sdk", 2, "unknown_item", 400, "needs one of this session's prompts"),
+        # Hidden context, e.g. a loaded skill's body, is not a prompt the user wrote.
+        ("claude-sdk", 2, "meta_message", 400, "needs one of this session's prompts"),
         ("claude-sdk", 2, "editor", 403, ""),
     ],
 )
@@ -457,6 +459,22 @@ async def test_rewind_refusals_create_no_session(
         item_id = item_ids(store, other_id)[2]
     elif placement == "unknown_item":
         item_id = uuid.uuid4().hex
+    elif placement == "meta_message":
+        [meta] = store.append(
+            source_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_meta",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "skill body"}],
+                        is_meta=True,
+                    ),
+                )
+            ],
+        )
+        item_id = meta.id
     headers = {"X-Forwarded-Email": caller}
     before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
 

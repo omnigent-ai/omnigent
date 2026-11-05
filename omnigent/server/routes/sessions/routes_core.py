@@ -5220,7 +5220,14 @@ def register_core_routes(
         except ValueError as exc:
             raise not_a_prompt from exc
         item = conversation_store.get_item(session_id, item_id)
-        if item is None or not isinstance(item.data, MessageData) or item.data.role != "user":
+        # Hidden context (``is_meta``), e.g. a loaded skill's body, isn't a
+        # prompt the user wrote, so the picker doesn't list it either.
+        if (
+            item is None
+            or not isinstance(item.data, MessageData)
+            or item.data.role != "user"
+            or item.data.is_meta
+        ):
             raise not_a_prompt
         return item.data
 
