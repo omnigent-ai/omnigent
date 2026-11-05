@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 from filelock import FileLock
 
-from omnigent.runner.pr_observer import extract_prs, observe_hook
+from omnigent.runner import pr_observer
+from omnigent.runner.pr_observer import _shell_segments, extract_prs, observe_hook
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from tests.budgets import budget
 
@@ -819,21 +820,29 @@ _CREATED_A = {"stdout": A, "gitOperation": {"pr": {"url": A, "action": "created"
             id="quoted-heredoc-keeps-continued-line",
         ),
         pytest.param(
-            "(( count = 8 << 1 ))\ngh pr create --title t",
+            # Read as a heredoc, ``shift`` would close a body holding the create.
+            "(( count = 8 << shift ))\ngh pr create --title t\nshift",
             {"stdout": A},
             [A],
             True,
             id="arithmetic-shift",
         ),
         pytest.param(
-            "cat <<\\\nEOF\nbody\nEOF\ngh pr create --title t",
+            ": ${BODY:-<<EOF }\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="heredoc-text-in-parameter-expansion",
+        ),
+        pytest.param(
+            "cat <<\\\nEOF\ngh pr view 7\nEOF\ngh pr create --title t",
             {"stdout": A},
             [A],
             True,
             id="continued-heredoc-delimiter",
         ),
         pytest.param(
-            "cat <<\\\n-EOF\nbody\nEOF\ngh pr create --title t",
+            "cat <<\\\n-EOF\n\tgh pr view 7\n\tEOF\ngh pr create --title t",
             {"stdout": A},
             [A],
             True,
@@ -869,6 +878,32 @@ def test_create_beside_substitution_and_heredoc(
     refs, was_created = extract_prs("Bash", {"command": command}, result)
     assert [ref.url for ref in refs] == urls
     assert was_created is created
+
+
+def test_unquoted_substitution_stays_one_exact_token() -> None:
+    segments = _shell_segments("GH_TOKEN=$(gh auth token --user me) gh pr create")
+    assert [segment.raw_tokens for segment in segments] == [
+        ("GH_TOKEN=$(gh auth token --user me)", "gh", "pr", "create")
+    ]
+
+
+def test_heredoc_operators_on_one_continued_line_read_bounded_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read: list[int] = []
+    original = pr_observer._heredoc_operator_text
+
+    def counting(command: str, start: int) -> tuple[str, bool]:
+        text, truncated = original(command, start)
+        read.append(len(text))
+        return text, truncated
+
+    monkeypatch.setattr(pr_observer, "_heredoc_operator_text", counting)
+    operators = 2000
+    _shell_segments("cat " + "<<A \\\n" * operators + "\n")
+    # Rescanning the rest of the line for each operator would read ~operators**2 characters.
+    assert sum(read) <= pr_observer._HEREDOC_OPERATOR_LIMIT * len(read)
+    assert len(read) <= operators
 
 
 @pytest.mark.parametrize("tool_name", ["Bash", "exec_command"])

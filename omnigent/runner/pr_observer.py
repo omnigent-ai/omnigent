@@ -75,6 +75,53 @@ def _arithmetic_end(command: str, start: int) -> int | None:
     return None
 
 
+def _parameter_expansion_end(command: str, start: int) -> int | None:
+    """Return the index just past the ``}`` closing the ``${`` at *start*, or ``None``."""
+    depth = 0
+    quote: str | None = None
+    index = start
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "\\":
+            index += 1
+        elif quote == '"':
+            if char == '"':
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif command.startswith("${", index):
+            depth += 1
+            index += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return None
+
+
+# Longest ``<<`` operator text, delimiter included, read before giving up on it.
+_HEREDOC_OPERATOR_LIMIT = 256
+
+
+def _heredoc_operator_text(command: str, start: int) -> tuple[str, bool]:
+    """Return the operator text at *start* without continuations, and whether it was cut short."""
+    text: list[str] = []
+    index = start
+    while index < len(command) and len(text) < _HEREDOC_OPERATOR_LIMIT:
+        if command.startswith("\\\n", index):
+            index += 2
+        elif command[index] == "\n":
+            return "".join(text), False
+        else:
+            text.append(command[index])
+            index += 1
+    return "".join(text), index < len(command)
+
+
 def _logical_line(command: str, start: int, *, join: bool = True) -> tuple[str, int]:
     """Return the line at *start* and the index after it, joining backslash-newlines if *join*."""
     parts: list[str] = []
@@ -100,9 +147,9 @@ class _Heredoc:
 
 def _heredoc_operator(command: str, start: int) -> _Heredoc | None:
     """Read the ``<<`` at *start* when its delimiter is a plain or simply quoted word."""
-    line, _ = _logical_line(command, start)
+    line, truncated = _heredoc_operator_text(command, start)
     match = HEREDOC_DELIMITER.match(line)
-    if match is None:
+    if match is None or (truncated and match.end() == len(line)):
         return None
     delimiter = match.group("delimiter")
     quoted = delimiter[0] in "'\""
@@ -114,14 +161,17 @@ def _heredoc_operator(command: str, start: int) -> _Heredoc | None:
     return _Heredoc(delimiter, bool(match.group("tabs")), quoted)
 
 
-def _heredoc_body_end(command: str, start: int, heredoc: _Heredoc) -> int:
-    """Return the index just past the delimiter line closing a body that starts at *start*."""
+def _heredoc_body_end(command: str, start: int, heredoc: _Heredoc) -> int | None:
+    """Return the index just past the delimiter line closing a body that starts at *start*.
+
+    ``None`` means no delimiter line follows, which suggests the ``<<`` was misread.
+    """
     index = start
     while index < len(command):
         line, index = _logical_line(command, index, join=not heredoc.quoted)
         if (line.lstrip("\t") if heredoc.strip_tabs else line) == heredoc.delimiter:
             return index
-    return len(command)
+    return None
 
 
 def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str, bool]:
@@ -164,6 +214,14 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
             result.extend(c if c.isalnum() else "\\" + c for c in command[index:end])
             index = end
             continue
+        if model_syntax and quote is None and command.startswith("${", index):
+            # A ``<<`` inside an expansion's word is text, not a redirection.
+            end = _parameter_expansion_end(command, index)
+            if end is None:
+                return _prepare_shell_text(command, model_syntax=False)
+            result.append(command[index:end])
+            index = end
+            continue
         if (
             model_syntax
             and quote is None
@@ -195,7 +253,10 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
             result.append(char)
             index += 1
             for heredoc in heredocs:
-                index = _heredoc_body_end(command, index, heredoc)
+                end = _heredoc_body_end(command, index, heredoc)
+                if end is None:
+                    return _prepare_shell_text(command, model_syntax=False)
+                index = end
             heredocs.clear()
             continue
         if quote is None and char in "<>":
