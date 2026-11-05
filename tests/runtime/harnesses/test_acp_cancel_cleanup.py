@@ -61,7 +61,7 @@ async def test_cancel_keeps_prompt_reader_alive_until_response_or_deadline(
         if method == "initialize":
             respond(message["id"], {"protocolVersion": 1, "agentCapabilities": {}})
         elif method == "session/new":
-            respond(message["id"], {"sessionId": "phone"})
+            respond(message["id"], {"sessionId": "stub"})
         elif method == "session/prompt":
             prompt_id = message["id"]
             prompt_ready.set()
@@ -103,9 +103,9 @@ async def test_cancel_keeps_prompt_reader_alive_until_response_or_deadline(
     monkeypatch.setattr(acp._proc, "terminate_tree", terminate)
     monkeypatch.setattr(acp._proc, "kill_tree", kill)
     executor = acp.AcpExecutor(
-        acp.AcpAgentConfig(command="phone-helper", name="phone", omnigent_mcp=False)
+        acp.AcpAgentConfig(command="stub-agent", name="stub", omnigent_mcp=False)
     )
-    adapter = ExecutorAdapter(lambda: executor, session_key="phone")
+    adapter = ExecutorAdapter(lambda: executor, session_key="stub")
     ctx = TurnContext(response_id="reply", event_queue=asyncio.Queue(), cancelled=asyncio.Event())
     adapter._in_flight[ctx.response_id] = ctx
     task = asyncio.create_task(
@@ -157,7 +157,7 @@ def test_reap_budget_is_acp_specific() -> None:
     from omnigent.inner.executor import MockExecutor
     from omnigent.runtime.harnesses._executor_adapter import INTERRUPT_TIMEOUT_S
 
-    executor = acp.AcpExecutor(acp.AcpAgentConfig(command="phone-helper"))
+    executor = acp.AcpExecutor(acp.AcpAgentConfig(command="stub-agent"))
     assert _executor_reap_timeout(executor) > (
         acp.ACP_CANCEL_GRACE_SECONDS + acp._ACP_TERMINATION_TIMEOUT_SECONDS
     )
