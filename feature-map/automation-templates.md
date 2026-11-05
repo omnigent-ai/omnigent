@@ -15,6 +15,8 @@ to customize.
   filter with no search; searches and Active/Paused filters hide the preview.
 - `create`: a gallery item or suggested automation opens integration setup;
   New automation opens a blank form.
+- `scope`: the fixed **in** operator matches one or more projects, channels,
+  repositories, or teams. Separate multiple values with commas.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, or Linear. Sessions start whether it is checked or not.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
@@ -99,6 +101,8 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`
   covers the preview and Templates tab with reload. It creates
   a Jira automation and cross-checks the hourly schedule and prompt through REST.
+  The mobile preview uses one project; the desktop Templates path uses two
+  comma-separated projects and verifies that both appear in the saved query.
   It edits the user prompt through the row menu and the system prompt through
   the detail page, checks persistence through REST, and reopens the editor. The
   preview entry runs at mobile width; the Templates entry runs at desktop width.

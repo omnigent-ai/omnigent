@@ -121,11 +121,17 @@ export function TriggerTemplateFields({
                 {template.events[0].label}
               </span>
             )}
+            <span
+              className={cn(CHIP, "flex items-center")}
+              data-testid="task-trigger-scope-operator"
+            >
+              in
+            </span>{" "}
             <span className="text-muted-foreground">{template.scopeLabel}</span>
             <Input
               value={fields.scope}
               placeholder={template.scopePlaceholder}
-              aria-label={template.scopeLabel}
+              aria-label={`in ${template.scopeLabel}`}
               data-testid="task-trigger-scope"
               className={cn(CHIP, "min-w-28 flex-1 placeholder:text-primary/50")}
               onChange={(e) => onChange({ ...fields, scope: e.target.value })}

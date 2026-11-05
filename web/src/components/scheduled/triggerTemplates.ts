@@ -96,7 +96,7 @@ export interface TriggerTemplate {
    * names who can write what the event watches, e.g. "create a ticket in this project".
    */
   events: { id: string; label: string; authorAction: string }[];
-  /** Words between the event and the scope, e.g. "in project". */
+  /** Scope kind after the "in" operator, e.g. "projects". */
   scopeLabel: string;
   scopePlaceholder: string;
   fields: TriggerConditionField[];
@@ -121,8 +121,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     events: [
       { id: "created", label: "Ticket created", authorAction: "create a ticket in this project" },
     ],
-    scopeLabel: "in project",
-    scopePlaceholder: "ES",
+    scopeLabel: "projects",
+    scopePlaceholder: "ES, OPS",
     fields: [
       { id: "label", label: "Label", operators: ["is", "is_not"], placeholder: "omnigent" },
       { id: "issuetype", label: "Issue type", operators: ["is", "is_not"], placeholder: "Bug" },
@@ -156,8 +156,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
       "Watch channels for matching messages and start a session to respond or investigate.",
     name: "Slack messages",
     events: [{ id: "posted", label: "Message posted", authorAction: "post in this channel" }],
-    scopeLabel: "in channel",
-    scopePlaceholder: "#eng-support",
+    scopeLabel: "channels",
+    scopePlaceholder: "#eng-support, #bugs",
     fields: [
       { id: "text", label: "Text", operators: ["contains", "not_contains"], placeholder: "error" },
       {
@@ -194,8 +194,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         authorAction: "open an issue or pull request in this repository",
       },
     ],
-    scopeLabel: "in repo",
-    scopePlaceholder: "owner/repo",
+    scopeLabel: "repos",
+    scopePlaceholder: "owner/repo, owner/other",
     fields: [
       { id: "label", label: "Label", operators: ["is", "is_not"], placeholder: "bug" },
       { id: "author", label: "Author", operators: ["is", "is_not"], placeholder: "octocat" },
@@ -229,8 +229,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     events: [
       { id: "created", label: "Issue created", authorAction: "create an issue in this team" },
     ],
-    scopeLabel: "in team",
-    scopePlaceholder: "ENG",
+    scopeLabel: "teams",
+    scopePlaceholder: "ENG, OPS",
     fields: [
       { id: "label", label: "Label", operators: ["is", "is_not"], placeholder: "Bug" },
       { id: "status", label: "Status", operators: ["is", "is_not"], placeholder: "Triage" },
