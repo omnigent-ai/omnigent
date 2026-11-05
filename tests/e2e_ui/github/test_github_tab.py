@@ -868,7 +868,9 @@ def test_reply_to_inline_review_conversation(
     if entry == "canvas":
         from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
 
-        _stub_server_info(page, canvas=True, session_pull_requests=True)
+        _stub_server_info(
+            page, canvas=True, session_pull_requests=True, comment_anchor_metadata=True
+        )
     page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
     main_composer = page.get_by_label("Message the agent", exact=True)
     main_composer.fill("Please keep the public API stable.")

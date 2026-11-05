@@ -24,6 +24,7 @@ import { TabsContent } from "@/components/ui/tabs";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useComments } from "@/hooks/useComments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import type { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
@@ -449,6 +450,7 @@ export function PullRequestChangesTab({
   const headSha = pr.head_sha;
   const baseSha = pr.base_sha;
   const mobile = useIsMobileViewport();
+  const serverInfo = useServerInfo();
   const sessionComments = useComments(selected ? conversationId : undefined);
   const selectedPrUrl = data.selected_pr_url ?? pr.url;
   const localComments = useMemo(
@@ -1305,7 +1307,11 @@ export function PullRequestChangesTab({
                 threadContext={threadContext}
                 matchingRevision={matchingRevision}
                 localComments={localComments.filter((comment) => comment.path === file.path)}
-                canCommentLocally={!!(canEdit && prDiff.data?.head_sha && prDiff.data?.base_sha)}
+                canCommentLocally={
+                  serverInfo !== "loading" &&
+                  serverInfo.comment_anchor_metadata === true &&
+                  !!(canEdit && prDiff.data?.head_sha && prDiff.data?.base_sha)
+                }
               />
             ))
           )}

@@ -6184,6 +6184,11 @@
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
+          "comment_anchor_metadata": {
+            "default": true,
+            "title": "Comment Anchor Metadata",
+            "type": "boolean"
+          },
           "databricks_features": {
             "title": "Databricks Features",
             "type": "boolean"

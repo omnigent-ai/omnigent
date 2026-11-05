@@ -478,30 +478,42 @@ export function PullRequestFileSection({
             role="group"
             aria-label="Comment destination"
           >
-            <button
-              type="button"
-              className={cn(
-                "h-[calc(100%-1px)] rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
-                local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
-              )}
-              aria-pressed={local}
-              disabled={!canCommentLocally || composer.draft.pending}
-              onClick={() => composer.setDestination("local")}
-            >
-              Agent
-            </button>
-            <button
-              type="button"
-              className={cn(
-                "h-[calc(100%-1px)] rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
-                !local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
-              )}
-              aria-pressed={!local}
-              disabled={!threadContext.canCreate || composer.draft.pending}
-              onClick={() => composer.setDestination("github")}
-            >
-              GitHub
-            </button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    "inline-flex h-[calc(100%-1px)] cursor-pointer items-center justify-center rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
+                    local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
+                  )}
+                  aria-pressed={local}
+                  disabled={!canCommentLocally || composer.draft.pending}
+                  onClick={() => composer.setDestination("local")}
+                >
+                  Agent
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>
+                Save in this session and attach to your next message to the agent.
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    "inline-flex h-[calc(100%-1px)] cursor-pointer items-center justify-center rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
+                    !local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
+                  )}
+                  aria-pressed={!local}
+                  disabled={!threadContext.canCreate || composer.draft.pending}
+                  onClick={() => composer.setDestination("github")}
+                >
+                  GitHub
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>Post a review comment on the GitHub pull request.</TooltipContent>
+            </Tooltip>
           </div>
         }
       />

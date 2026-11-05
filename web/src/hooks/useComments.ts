@@ -1,4 +1,4 @@
-import type { LocalReviewAnchor } from "@/lib/localReviewComments";
+import { isLocalReviewComment, type LocalReviewAnchor } from "@/lib/localReviewComments";
 import { removeLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -94,7 +94,36 @@ export async function createComment(
     },
   );
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  return response.json();
+  const comment: Comment = await response.json();
+  if (
+    payload.anchor_metadata &&
+    (!isLocalReviewComment(comment) ||
+      comment.conversation_id !== sessionId ||
+      comment.path !== payload.path ||
+      !Object.entries(payload.anchor_metadata).every(
+        ([key, value]) =>
+          (comment.anchor_metadata?.[key as keyof LocalReviewAnchor] ?? null) === (value ?? null),
+      ))
+  ) {
+    const message = "This server did not preserve the review location. Your draft is saved.";
+    // A mixed-version deployment may accept the request as an ordinary Files comment.
+    try {
+      if (!comment?.id) throw new Error("Missing comment ID");
+      await deleteComment(sessionId, comment.id);
+    } catch {
+      throw new Error(`${message} A comment may remain in Files; remove it before retrying.`);
+    }
+    throw new Error(`${message} Update the server before retrying.`);
+  }
+  return comment;
+}
+
+async function deleteComment(sessionId: string, commentId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 }
 
 /** POST /v1/sessions/{id}/comments */
@@ -119,13 +148,7 @@ export function useAddComment(sessionId: string) {
 export function useDeleteComment(sessionId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (commentId: string) => {
-      const res = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
-        { method: "DELETE" },
-      );
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    },
+    mutationFn: (commentId: string) => deleteComment(sessionId, commentId),
     onSuccess: (_, commentId) => {
       removeLocalReviewContext(sessionId, commentId);
       void queryClient.invalidateQueries({

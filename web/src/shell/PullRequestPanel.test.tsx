@@ -1,6 +1,8 @@
 import type { FileDiff } from "@pierre/diffs/react";
 import type { Comment } from "@/hooks/useComments";
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 // Tests for PullRequestPanel — the stacked "Files changed" view. The GitHub data
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
@@ -273,15 +275,17 @@ function renderPanel(mobile = false, active?: boolean) {
     client,
     ...render(<PullRequestPanel conversationId="conv_1" active={active} />, {
       wrapper: ({ children }) => (
-        <QueryClientProvider client={client}>
-          {mobile ? (
-            <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
-              {children}
-            </MobilePanelDrawer>
-          ) : (
-            children
-          )}
-        </QueryClientProvider>
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: true }}>
+          <QueryClientProvider client={client}>
+            {mobile ? (
+              <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
+                {children}
+              </MobilePanelDrawer>
+            ) : (
+              children
+            )}
+          </QueryClientProvider>
+        </CapabilitiesProvider>
       ),
     }),
   };
@@ -3484,9 +3488,12 @@ it("saves a local comment as agent context and retains earlier revisions", async
   };
   const comments: Comment[] = [];
   const requests: string[] = [];
+  let failMutation = false;
   const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = String(input);
     requests.push(`${init?.method ?? "GET"} ${url}`);
+    if (failMutation && (init?.method === "PATCH" || init?.method === "DELETE"))
+      return new Response(null, { status: 500, statusText: "Try again" });
     if (url.endsWith("/comments") && init?.method === "POST") {
       const comment = {
         ...JSON.parse(String(init.body)),
@@ -3560,9 +3567,30 @@ it("saves a local comment as agent context and retains earlier revisions", async
     card.getByRole("textbox", { name: "Edit local comment" }),
     "Validate empty input",
   );
+  const originalAnchor = { ...comments[0]!.anchor_metadata! };
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(card.getByRole("textbox", { name: "Edit local comment" })).toHaveValue(
+    "Validate empty input",
+  );
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Handle empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
   await userEvent.click(card.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(comments[0]?.body).toBe("Validate empty input"));
   expect(contexts.result.current[0]?.body).toBe("Validate empty input");
+  expect(contexts.result.current[0]?.anchor_metadata).toEqual(originalAnchor);
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Validate empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
   await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
   await waitFor(() =>
     expect(screen.queryByRole("region", { name: "Local review comment" })).not.toBeInTheDocument(),

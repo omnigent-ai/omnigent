@@ -295,6 +295,8 @@ class ServerInfoResponse(BaseModel):
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
+    # Session comments accept and preserve immutable PR coordinates.
+    comment_anchor_metadata: bool = True
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.

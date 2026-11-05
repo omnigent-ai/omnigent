@@ -99,6 +99,7 @@ async def test_well_known_manifest_shape(client: httpx.AsyncClient) -> None:
     # Same source of truth as /api/version and /v1/info.server_version, so a
     # client never sees three different answers for one server.
     assert body["server_version"] == VERSION
+    assert body["comment_anchor_metadata"] is True
     # Present-but-null: clients rely on the key existing, and null is the
     # "no floor" path every shipped shell must accept.
     assert "min_desktop_version" in body

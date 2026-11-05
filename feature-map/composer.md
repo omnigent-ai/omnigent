@@ -165,6 +165,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
+- `review-context`: submitting an Agent comment in PR Changes attaches a chip
+  to the session composer. Hover previews the comment, click reveals it in
+  Changes, and X deletes the saved comment. Failed deletion retains the chip.
+  See [local review](pull-request-conversations.md) for all four entry points.
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
   terminal or code editor. While listening, Enter keeps the dictated text and
