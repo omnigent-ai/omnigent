@@ -48,7 +48,11 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
-import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import {
+  isSystemUserContent,
+  parseSystemMessage,
+  stripAutomationContext,
+} from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
@@ -109,10 +113,12 @@ function sliceByCodePoint(str: string, limit: number): string {
 export const SessionSharedContext = createContext(false);
 
 export function extractUserText(content: MessageContentBlock[]): string {
-  return content
-    .filter(isTextBlock)
-    .map((c) => c.text)
-    .join("")
+  return stripAutomationContext(
+    content
+      .filter(isTextBlock)
+      .map((c) => c.text)
+      .join(""),
+  )
     .replace(ATTACHED_RE, "")
     .trimEnd();
 }

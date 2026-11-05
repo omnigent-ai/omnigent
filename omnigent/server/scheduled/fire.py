@@ -359,6 +359,7 @@ class _NewRunRecorder:
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
 # automation pages never show it.
 UNATTENDED_RUN_NOTE = (
+    "<omnigent-automation-context>\n"
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
     "No one can answer questions, approve requests or give input, so work toward the "
     "goal above on your own. Don't ask questions, wait for confirmation or stop to "
@@ -372,7 +373,8 @@ UNATTENDED_RUN_NOTE = (
     "independent work and permitted alternatives. Do not change permission settings to "
     "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
     "prioritizing those the user is most likely to want to change, then summarize what "
-    "you did and anything you couldn't do."
+    "you did and anything you couldn't do.\n"
+    "</omnigent-automation-context>"
 )
 
 

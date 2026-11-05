@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
+import { AUTOMATION_CONTEXT_NOTE } from "@/lib/systemMessage";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { BubbleView, buildPendingBubbles } from "./ChatPage";
 
@@ -53,6 +54,33 @@ function renderBubble(bubble: Bubble) {
 }
 
 describe("UserBubble markdown rendering", () => {
+  it.each([false, true])(
+    "preserves visible and copied text for modified note=%s",
+    async (modified) => {
+      const note = modified
+        ? AUTOMATION_CONTEXT_NOTE.replace("no one is watching this run.", "include a table.")
+        : AUTOMATION_CONTEXT_NOTE;
+      const text = `Summarize **today**.\n\n${note}`;
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      try {
+        renderBubble(userBubble(text));
+        expect(screen.getByText("today")).toBeInTheDocument();
+        if (modified) {
+          expect(screen.getByText(/include a table/)).toBeInTheDocument();
+        } else {
+          expect(screen.queryByText(/no one is watching/)).not.toBeInTheDocument();
+        }
+        fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+        await waitFor(() =>
+          expect(writeText).toHaveBeenCalledWith(modified ? text : "Summarize **today**."),
+        );
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
   it("renders **bold** markdown as a strong node, not literal asterisks", () => {
     renderBubble(userBubble("hello **world**"));
     // Streamdown emits bold as an element tagged data-streamdown="strong"
