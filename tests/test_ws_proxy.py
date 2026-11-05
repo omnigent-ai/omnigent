@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import datetime
 import logging
 import socket
 import ssl
@@ -13,16 +12,13 @@ import threading
 import time
 import types
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
+from omnigent.inner.egress.ca import ensure_ca
+from omnigent.inner.egress.certs import HostCertCache
 from omnigent.util.ws_proxy import (
     open_proxy_connect_socket,
     redact_proxy_url,
@@ -423,35 +419,6 @@ async def test_connect_timeout_bounds_the_whole_handshake():
         await asyncio.wait_for(drip_ended.wait(), 1.5)
 
 
-def _self_signed_cert(directory: Path, hostname: str) -> Path:
-    """Write a self-signed certificate and key for *hostname*; return the cert path."""
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
-    now = datetime.datetime.now(datetime.UTC)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=5))
-        .not_valid_after(now + datetime.timedelta(days=1))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(key, hashes.SHA256())
-    )
-    (directory / "key.pem").write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    )
-    cert_path = directory / "cert.pem"
-    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    return cert_path
-
-
 @asynccontextmanager
 async def _forwarding_proxy(upstream_port):
     """CONNECT proxy that resolves the tunnel host itself and relays raw bytes."""
@@ -484,9 +451,8 @@ async def _forwarding_proxy(upstream_port):
 @pytest.mark.parametrize("certified_host", [_TLS_HOST, "other.sandbox.test"])
 async def test_connect_tunnel_wss(tmp_path, certified_host):
     """TLS rides the CONNECT tunnel and is verified against the tunnel URL's host."""
-    cert = _self_signed_cert(tmp_path, certified_host)
-    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    server_ctx.load_cert_chain(cert, tmp_path / "key.pem")
+    ca, ca_key = ensure_ca(cache_dir=tmp_path)
+    server_ctx = HostCertCache(ca, ca_key).get_ssl_context(certified_host)
     seen_sni = []
     server_ctx.sni_callback = lambda _sock, name, _ctx: seen_sni.append(name)
 
@@ -501,7 +467,7 @@ async def test_connect_tunnel_wss(tmp_path, certified_host):
             sock = await open_proxy_connect_socket(
                 f"http://127.0.0.1:{proxy_port}", url, timeout=5
             )
-            client_ctx = ssl.create_default_context(cafile=str(cert))
+            client_ctx = ssl.create_default_context(cafile=str(ca))
             if certified_host == _TLS_HOST:
                 async with connect(url, sock=sock, ssl=client_ctx, open_timeout=5) as ws:
                     await ws.send("ping")
