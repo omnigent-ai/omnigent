@@ -15,8 +15,8 @@ the header menu), and each place is a separate entry point.
   indentation level with curved connectors and are absent from the Agents panel.
   Archive/delete promotes the oldest active member; compute survives while any
   session remains bound. The representative pins/moves the family; individual
-  pins are shortcuts. Existing sessions cannot join a family; ordinary forks
-  remain standalone and may reuse the source host.
+  pins appear only in Pinned and return to their nest when unpinned. Existing
+  sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
 
 - `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
@@ -498,7 +498,8 @@ it keeps the working directory and creates a standalone fork with copied history
 Other sessions' ephemeral sandboxes are omitted, and an offline source cannot
 be selected. Older servers keep the fresh-sandbox choices. A fork
 of any sandbox session defaults to a fresh sandbox from the source's provider
-when the server offers it, and otherwise to a connected host.
+when the server offers it, otherwise to its reusable online sandbox, then to a
+connected host.
 **Continue in another directory…** on these sessions continues on a connected
 host; like any recovery, it never offers a new sandbox. The composer's host
 menu shows a disabled **Switch host…** item when you have write access.
@@ -1181,7 +1182,9 @@ Own-environment sibling CUJs: `uv run --no-sync pytest
 This uses real replicas/hosts/runners with local sandbox allocation and a scripted
 model. It covers desktop kebab/right-click/header and mobile long-press/header
 composer navigation, shared/fresh compute, pin/project/fork actions, archive/undo,
-and survivor messaging after representative deletion. Set `OMNIGENT_DEMO_DIR`
+and survivor messaging after representative deletion. It also checks that expanded
+family rows hide actions when not hovered, deletion keeps peers nested before the
+server responds, and personal pins appear only once. Set `OMNIGENT_DEMO_DIR`
 outside the checkout to retain recordings.
 The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
 `web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and

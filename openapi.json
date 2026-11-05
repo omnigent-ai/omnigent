@@ -7520,6 +7520,16 @@
             "default": "list",
             "title": "Object",
             "type": "string"
+          },
+          "page_boundary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionPageBoundary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "title": "SessionList",
@@ -8004,6 +8014,32 @@
           "conversation_id"
         ],
         "title": "SessionModelOptionsEvent",
+        "type": "object"
+      },
+      "SessionPageBoundary": {
+        "description": "Last visible primary-page row, before family context is appended.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "SessionPageBoundary",
         "type": "object"
       },
       "SessionPermissionModeEvent": {

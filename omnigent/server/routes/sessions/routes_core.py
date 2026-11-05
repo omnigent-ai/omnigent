@@ -2035,7 +2035,7 @@ def register_core_routes(
         pinned: bool = Query(default=False),
         expand_families: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
-    ) -> PaginatedList:
+    ) -> dict[str, Any]:
         """
         List sessions with cursor-based pagination.
 
@@ -2194,6 +2194,16 @@ def register_core_routes(
         # side-chat-labeled fork from the sidebar list (it is still a normal
         # session, just not listed as a top-level one here).
         page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
+        boundary_row = page.data[-1] if page.data else None
+        page_boundary = (
+            {
+                "id": boundary_row.id,
+                "created_at": boundary_row.created_at,
+                "updated_at": boundary_row.updated_at,
+            }
+            if boundary_row
+            else None
+        )
         from omnigent.server.session_families import project_families
 
         page.data, family_info = await asyncio.to_thread(
@@ -2317,12 +2327,14 @@ def register_core_routes(
         # single-session snapshot, the WS stream, and the /health poll, not
         # from list rows. Skipping it here removes the session-connectivity
         # and hosts-table queries from every GET /v1/sessions.
-        return PaginatedList(
+        result = PaginatedList(
             data=[item.model_dump(exclude_none=True) for item in items],
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
-        )
+        ).model_dump()
+        result["page_boundary"] = page_boundary
+        return result
 
     async def _comments_fingerprints_for(
         conv_ids: list[str],

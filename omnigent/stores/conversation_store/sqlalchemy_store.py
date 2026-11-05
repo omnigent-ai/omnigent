@@ -1886,7 +1886,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             promote_pin: bool,
             project_id: str | None,
         ) -> None:
-            source_labels = _fetch_labels(labels_session, label_source_id)
+            source_labels = _fetch_labels(
+                labels_session, label_source_id, keys=(PROJECT_LABEL_KEY, pin_key, family_pin_key)
+            )
             updates: dict[str, str] = {}
             if project_id is None and PROJECT_LABEL_KEY in source_labels:
                 updates[PROJECT_LABEL_KEY] = source_labels[PROJECT_LABEL_KEY]

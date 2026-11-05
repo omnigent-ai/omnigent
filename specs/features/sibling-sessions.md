@@ -29,8 +29,8 @@ The first seven items transcribe the whiteboard with the subsequent clarificatio
    followed by session ID for deterministic ordering.
    When every member is archived, the oldest retained member represents the family.
 3. Pinning the representative pins the family. Pinning another member creates
-   an individual shortcut. Family pins survive promotion and include future
-   members; unpinning the family preserves individual pins.
+   an individual shortcut, temporarily removing it from the nest until unpinned.
+   Family pins survive promotion and include future members; unpinning the family preserves individual pins.
 4. An indented member cannot move independently or detach from its family.
    Custom ordering moves the whole family and preserves its position when the
    representative changes. Status grouping uses the highest-priority member status.
@@ -52,7 +52,9 @@ Additional requirements:
   users who want copied history use ordinary Fork.
 - Siblings have a curved decorative elbow beside their indentation. They never
   appear in the right Agents panel. Expand/collapse has a separate accessible
-  button; individual pinned shortcuts can appear flat outside their family.
+  button; individual pinned shortcuts appear once, flat in Pinned, even when the
+  family is also pinned. During deletion, remaining peers stay grouped while
+  representative metadata refreshes.
 - Every sibling starts private, including when the source has readers or the
   deployment defaults to public sharing. Family membership grants no access.
 - Owner orchestration allows private and effectively read-only shared sources.

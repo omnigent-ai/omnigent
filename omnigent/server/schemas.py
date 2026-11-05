@@ -3260,6 +3260,14 @@ class SessionListItem(BaseModel):
     pull_requests_synced: bool | None = None
 
 
+class SessionPageBoundary(BaseModel):
+    """Last visible primary-page row, before family context is appended."""
+
+    id: str
+    created_at: int
+    updated_at: int
+
+
 class SessionList(BaseModel):
     """Paginated list of sessions; ``data`` is a page of ``SessionListItem``."""
 
@@ -3268,6 +3276,7 @@ class SessionList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+    page_boundary: SessionPageBoundary | None = None
 
 
 class ChildSessionList(BaseModel):

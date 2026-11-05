@@ -25,6 +25,7 @@ export function scopeBoundaryRow<T extends ScopeBoundary>(
 }
 
 function boundaryOf(page: ConversationsPage): ScopeBoundary | undefined {
+  if (page.page_boundary !== undefined) return page.page_boundary ?? undefined;
   const row = scopeBoundaryRow(page.data, page.last_id);
   return row && { id: row.id, updated_at: row.updated_at, created_at: row.created_at };
 }
@@ -36,7 +37,7 @@ export function refreshScopeWindow(
   limit: number,
   sortBy: SessionSortBy = "updated_at",
 ): ScopeCacheData {
-  const compare = (a: Conversation, b: Conversation) => compareSessionRows(a, b, sortBy);
+  const compare = (a: ScopeBoundary, b: ScopeBoundary) => compareSessionRows(a, b, sortBy);
   const windowSize =
     current?.windowSize ?? Math.max(limit, current?.pages.flatMap((page) => page.data).length ?? 0);
   if (windowSize <= limit || !incoming.has_more) {
@@ -51,7 +52,7 @@ export function refreshScopeWindow(
     };
   }
   const previous = current?.pages.flatMap((page) => page.data) ?? [];
-  const incomingTail = scopeBoundaryRow(incoming.data, incoming.last_id);
+  const incomingTail = boundaryOf(incoming);
   const older = incomingTail ? previous.filter((row) => compare(row, incomingTail) > 0) : previous;
   const rows = dedupeSessionRows([...older, ...incoming.data]).sort(compare);
   const overlaps = incomingTail && previous.some((row) => row.id === incomingTail.id);

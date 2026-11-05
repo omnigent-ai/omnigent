@@ -1329,6 +1329,35 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
         params={"limit": 1, "agent_id": sibling.agent_id, "expand_families": True},
     )
     assert {row["id"] for row in expanded.json()["data"]} == {source["id"], sibling_id}
+    assert expanded.json()["page_boundary"]["id"] == sibling_id
+    # Filtering a cursor side chat must not move the boundary into appended family context.
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
+
+    with monkeypatch.context() as clock:
+        clock.setattr(
+            "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+            lambda: sibling.created_at - 1,
+        )
+        hidden = store.create_conversation(
+            conversation_id="f" * 32,
+            agent_id=sibling.agent_id,
+            labels={SIDE_CHAT_LABEL_KEY: "true"},
+        )
+    permissions.grant("alice", hidden.id, LEVEL_OWNER)
+    filtered = (
+        await auth_client.get(
+            "/v1/sessions",
+            params={"limit": 2, "agent_id": sibling.agent_id, "expand_families": True},
+        )
+    ).json()
+    assert filtered["last_id"] == hidden.id
+    assert filtered["page_boundary"] == {
+        "id": sibling_id,
+        "created_at": sibling.created_at,
+        "updated_at": sibling.updated_at,
+    }
+    assert {row["id"] for row in filtered["data"]} == {source["id"], sibling_id}
     pinned = await auth_client.patch(
         f"/v1/sessions/{sibling_id}", json={"labels": {"omnigent.pinned": "1"}}
     )

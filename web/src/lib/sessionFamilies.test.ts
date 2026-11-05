@@ -20,5 +20,8 @@ describe("session families", () => {
     expect(orderSessionFamilies(promoted).map((row) => row.id)).toEqual(["b", "c"]);
     expect(isIndentedSibling(promoted[1])).toBe(false);
     expect(orderSessionFamilies([b])).toEqual([b]);
+    // Removal reaches the list before the server's replacement metadata.
+    expect(orderSessionFamilies([c, standalone, b]).map((row) => row.id)).toEqual(["b", "c", "x"]);
+    expect(b.family?.representative_id).toBe("a");
   });
 });

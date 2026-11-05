@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -157,6 +158,21 @@ async def _drive(rig: ManagedReplicas) -> None:
                     assert representative_label and sibling_label
                     assert sibling_label["x"] >= representative_label["x"] + 16
                     await page.screenshot(path=str(evidence / "siblings-two-sandboxes.png"))
+                    representative = page.locator(f'li[data-sidebar-session-id="{source_id}"]')
+                    await page.mouse.move(1200, 900)
+                    for action in ("quick-pin-conversation", "quick-archive-conversation"):
+                        await expect(representative.get_by_test_id(action)).to_have_css(
+                            "opacity", "0"
+                        )
+                    await representative.hover()
+                    await expect(
+                        representative.get_by_test_id("quick-pin-conversation")
+                    ).to_have_css("opacity", "1")
+                    await page.mouse.move(1200, 900)
+                    await expect(
+                        representative.get_by_test_id("quick-pin-conversation")
+                    ).to_have_css("opacity", "0")
+                    await page.screenshot(path=str(evidence / "family-actions-at-rest.png"))
                     # The clicked member's sandbox is the only ephemeral host in its picker.
                     row = page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
                     await row.hover()
@@ -207,6 +223,15 @@ async def _drive(rig: ManagedReplicas) -> None:
                     await row.hover()
                     await row.get_by_test_id("conversation-actions").click()
                     await page.get_by_test_id("delete-conversation").click()
+                    release_delete = asyncio.Event()
+
+                    async def delay_delete(route):
+                        if route.request.method == "DELETE":
+                            await release_delete.wait()
+                        await route.continue_()
+
+                    delete_url = f"**/v1/sessions/{source_id}*"
+                    await page.route(delete_url, delay_delete)
                     await (
                         page.get_by_role("dialog")
                         .get_by_role("button", name="Delete", exact=True)
@@ -215,6 +240,19 @@ async def _drive(rig: ManagedReplicas) -> None:
                     await expect(
                         page.locator(f'li[data-sidebar-session-id="{source_id}"]')
                     ).to_have_count(0)
+                    try:
+                        await expect(
+                            page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
+                        ).to_have_attribute("data-sibling-session", "true")
+                        await expect(
+                            page.locator(
+                                f'li[data-sidebar-session-id="{sibling_id}"]'
+                            ).get_by_role("button", name="Collapse session family")
+                        ).to_be_visible()
+                        await page.screenshot(path=str(evidence / "family-delete-pending.png"))
+                    finally:
+                        release_delete.set()
+                        await page.unroute(delete_url, delay_delete)
                     promoted = await _poll(
                         client,
                         f"{rig.a}/v1/sessions/{sibling_id}",
@@ -323,12 +361,15 @@ async def _drive(rig: ManagedReplicas) -> None:
                     member_row = project_section.locator(member_selector)
                     await member_row.hover()
                     await member_row.get_by_role("button", name="Pin conversation").click()
-                    await expect(page.locator(member_selector)).to_have_count(2)
-                    await expect(member_row).to_have_attribute("data-sibling-session", "true")
-                    await page.screenshot(path=str(evidence / "project-personal-pin.png"))
-                    await member_row.hover()
-                    await member_row.get_by_role("button", name="Unpin conversation").click()
                     await expect(page.locator(member_selector)).to_have_count(1)
+                    await expect(member_row).to_have_count(0)
+                    pinned_row = page.locator(member_selector)
+                    await expect(pinned_row).not_to_have_attribute("data-sibling-session", "true")
+                    await page.screenshot(path=str(evidence / "project-personal-pin.png"))
+                    await pinned_row.hover()
+                    await pinned_row.get_by_role("button", name="Unpin conversation").click()
+                    await expect(page.locator(member_selector)).to_have_count(1)
+                    await expect(member_row).to_have_attribute("data-sibling-session", "true")
                     for pinned in (True, False):
                         representative = page.locator(
                             f'li[data-sidebar-session-id="{sibling_id}"]'

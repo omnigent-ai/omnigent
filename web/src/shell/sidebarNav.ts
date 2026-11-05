@@ -4,7 +4,7 @@ import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
-import { orderSessionFamilies } from "@/lib/sessionFamilies";
+import { orderSessionFamilies, isIndividuallyPinnedSibling } from "@/lib/sessionFamilies";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -465,7 +465,9 @@ export function dedupeConversationsById(conversations: readonly Conversation[]):
 // bottom. A missing/unparseable value sinks to the bottom, stably.
 export function orderByPinnedTimestamp(conversations: readonly Conversation[]): Conversation[] {
   const pinnedAt = (c: Conversation): number => {
-    const raw = c.family?.pinned_at ?? c.labels?.[PINNED_LABEL_KEY];
+    const raw = isIndividuallyPinnedSibling(c)
+      ? c.labels[PINNED_LABEL_KEY]
+      : (c.family?.pinned_at ?? c.labels?.[PINNED_LABEL_KEY]);
     const ms = raw ? Number(raw) : NaN;
     return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
   };
@@ -480,7 +482,11 @@ export interface PinOrderWrite {
 
 /** A pinned family moves as one unit; nested rows only provide context. */
 export function isPinOrderUnit(conversation: Conversation): boolean {
-  return !conversation.family?.pinned || conversation.family.representative_id === conversation.id;
+  return (
+    isIndividuallyPinnedSibling(conversation) ||
+    !conversation.family?.pinned ||
+    conversation.family.representative_id === conversation.id
+  );
 }
 
 /**
@@ -505,7 +511,11 @@ export function pinOrderWrites(
   const [row] = from < 0 ? [{ id: fromId } as Conversation] : moved.splice(from, 1);
   moved.splice(to, 0, row);
   const value = (c: Conversation | undefined): number =>
-    Number(c?.family?.pinned_at ?? c?.labels?.[PINNED_LABEL_KEY]);
+    Number(
+      c && isIndividuallyPinnedSibling(c)
+        ? c.labels[PINNED_LABEL_KEY]
+        : (c?.family?.pinned_at ?? c?.labels?.[PINNED_LABEL_KEY]),
+    );
   const prev = value(moved[to - 1]);
   const next = value(moved[to + 1]);
   let pinnedAt = prev + (next - prev) / 2;

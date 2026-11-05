@@ -129,15 +129,23 @@ describe("dropping an unpinned session onto a pinned row", () => {
     expect(mocks.reorderPins).toHaveBeenCalledOnce();
   });
 
-  it("reorders an individually pinned sibling rendered without its family", async () => {
-    mocks.pinned[0].family = { id: "family", representative_id: "parent", pinned: false };
-    renderSidebar();
+  it.each([false, true])(
+    "reorders an individually pinned sibling (family pinned: %s)",
+    async (pinned) => {
+      mocks.pinned[0].family = {
+        id: "family",
+        representative_id: "parent",
+        pinned,
+        pinned_at: pinned ? "500" : null,
+      };
+      renderSidebar();
 
-    await dropOnto("conv_a", "conv_b");
+      await dropOnto("conv_a", "conv_b");
 
-    expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_a", pinnedAt: 1001 }]);
-    expect(mocks.pinFn).not.toHaveBeenCalled();
-  });
+      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_a", pinnedAt: 1001 }]);
+      expect(mocks.pinFn).not.toHaveBeenCalled();
+    },
+  );
 
   it("leaves the existing pins alone when the new pin is rejected (e.g. at the pin cap)", async () => {
     mocks.pinFn.mockRejectedValue(new Error("You can pin up to 30 sessions."));

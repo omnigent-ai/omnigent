@@ -132,6 +132,46 @@ describe("scope merge", () => {
 });
 
 describe("scope refresh", () => {
+  it("retains history when a filtered cursor precedes appended family context", () => {
+    const family = { id: "family", representative_id: "representative", pinned: false };
+    const current = {
+      pages: [
+        {
+          ...sessionRowsPage(
+            [row("recent", 100), row("history", 70), row("older", 40), row("representative", 10)],
+            true,
+          ),
+          last_id: "older",
+        },
+      ],
+      pageParams: [undefined],
+      windowSize: 240,
+    };
+    const incoming = {
+      ...sessionRowsPage(
+        [
+          { ...row("recent", 100), family },
+          { ...row("representative", 10), family },
+        ],
+        true,
+      ),
+      last_id: "side_chat",
+      page_boundary: { id: "recent", created_at: 0, updated_at: 100 },
+    };
+    const refreshed = refreshScopeWindow(current, incoming, 100);
+    expect(refreshed.pages[0].data.map((item) => item.id)).toEqual([
+      "recent",
+      "history",
+      "older",
+      "representative",
+    ]);
+    expect(refreshed.pages[0].last_id).toBe("older");
+    expect(
+      appendScopePage(refreshed, sessionRowsPage([row("next", 30)]), 30).pages[0].data.map(
+        (item) => item.id,
+      ),
+    ).toEqual(["recent", "history", "older", "next", "representative"]);
+  });
   it("retains loaded history beyond the raw cursor when expansion appends older context", () => {
     const family = { id: "family", representative_id: "old", pinned: false };
     const current = {

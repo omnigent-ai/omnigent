@@ -324,6 +324,8 @@ export interface ConversationsPage {
   first_id: string | null;
   last_id: string | null;
   has_more: boolean;
+  /** Primary page boundary, before family expansion; absent on older servers. */
+  page_boundary?: Pick<Conversation, "id" | "created_at" | "updated_at"> | null;
 }
 
 // ── Deleting-session tombstones ───────────────────────────────────────

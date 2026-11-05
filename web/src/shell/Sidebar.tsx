@@ -1,4 +1,9 @@
-import { orderSessionFamilies, isIndentedSibling } from "@/lib/sessionFamilies";
+import {
+  orderSessionFamilies,
+  isIndentedSibling,
+  isIndividuallyPinnedSibling,
+  sessionFamilyGroups,
+} from "@/lib/sessionFamilies";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { useGridSessions } from "@/grid/GridSessionsContext";
 import { GridSidebar } from "@/grid/GridWorkspace";
@@ -339,7 +344,7 @@ import {
 // + kebab take its place; on mobile those controls are gone, so the badge holds
 // that edge. A held pinned-row shortcut hint fades it the same way.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -1642,7 +1647,7 @@ function ProjectFolder({
           (c) =>
             (c.archived === true) === archived &&
             sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
-            (archived || (!c.family?.pinned && (c.family != null || !pinnedSet.has(c.id)))),
+            (archived || (!c.family?.pinned && !pinnedSet.has(c.id))),
         ),
         activeOverride,
         frozenSortKeys,
@@ -2250,9 +2255,7 @@ function ConversationList({
     const pinned = orderSessionFamilies(
       orderByPinnedTimestamp(notArchived.filter((c) => c.family?.pinned || pinnedSet.has(c.id))),
     );
-    const pinnedIdSet = new Set(
-      pinned.filter((c) => c.family?.pinned || !c.family).map((c) => c.id),
-    );
+    const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
     // Folders use live members on All / My and archives on Archived. Filing is
     // owner-only, so Shared and grouped views omit folders; pins precede them.
@@ -2341,11 +2344,10 @@ function ConversationList({
       ]),
     );
     const familyGroups = new Map<string, string>();
+    const familyRows = sessionFamilyGroups(ordered);
     for (const row of ordered) {
       if (!row.family) continue;
-      const representative = ordered.find(
-        (candidate) => candidate.id === row.family!.representative_id,
-      );
+      const representative = familyRows.get(row.family.id)?.[0];
       const group = groupTitles.get(
         (view.grouping === "created" || view.grouping === "harness") && representative
           ? representative.id
@@ -4166,11 +4168,13 @@ function ConversationSection({
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
   const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
-  const familyRepresentatives = new Set(
-    conversations.filter((row) => row.family?.representative_id === row.id).map((row) => row.id),
-  );
-  const isNestedFamilyRow = (row: Conversation) =>
-    isIndentedSibling(row) && familyRepresentatives.has(row.family!.representative_id!);
+  const families = sessionFamilyGroups(conversations);
+  const familyRepresentative = (row: Conversation) =>
+    row.family && !isIndividuallyPinnedSibling(row) ? families.get(row.family.id)?.[0] : undefined;
+  const isNestedFamilyRow = (row: Conversation) => {
+    const representative = familyRepresentative(row);
+    return representative !== undefined && representative.id !== row.id;
+  };
   const visibleFamilyRows = conversations.filter(
     (row) => !isNestedFamilyRow(row) || !collapsedFamilies.has(row.family!.id),
   );
@@ -4293,10 +4297,9 @@ function ConversationSection({
                   conversation={conv}
                   familyIndented={isNestedFamilyRow(conv)}
                   familyExpanded={
-                    conv.family?.representative_id === conv.id &&
-                    conversations.some(
-                      (row) => row.id !== conv.id && row.family?.id === conv.family?.id,
-                    )
+                    conv.family &&
+                    familyRepresentative(conv)?.id === conv.id &&
+                    families.get(conv.family.id)!.length > 1
                       ? !collapsedFamilies.has(conv.family.id)
                       : undefined
                   }
@@ -6083,7 +6086,7 @@ function ConversationRowImpl({
                         "text-muted-foreground transition-opacity",
                         "hidden md:inline-flex",
                         "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
                       )}
                       onClick={(e) => {
                         // Keep the toggle click off the surrounding Link (no navigation).
@@ -6125,7 +6128,7 @@ function ConversationRowImpl({
                         "text-muted-foreground transition-opacity",
                         "hidden md:inline-flex",
                         "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
                       )}
                       onClick={(e) => {
                         // Keep the toggle click off the surrounding Link (no navigation).

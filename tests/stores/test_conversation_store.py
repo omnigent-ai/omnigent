@@ -9813,17 +9813,47 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
     source = store.create_conversation(conversation_id="1" * 32, title="Coordinator")
     first = store.create_conversation(conversation_id="2" * 32, title="Research")
     second = store.create_conversation(conversation_id="3" * 32, title="Implementation")
-    store.set_labels(source.id, {pinned_label_key(user_id): "123"})
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [
-            executor.submit(store.add_new_sibling, source.id, member.id, user_id=user_id)
-            for member in (first, second)
-        ]
-        for future in futures:
-            future.result()
+    store.set_labels(
+        source.id,
+        {
+            pinned_label_key(user_id): "123",
+            "omni_project": "Family project",
+            "unrelated": "keep private",
+        },
+    )
+    label_copy_queries = []
+
+    def capture_label_copy(_conn, _cursor, statement, parameters, context, _many):
+        columns = getattr(context.compiled.statement, "selected_columns", None)
+        if columns is not None and list(columns.keys()) == ["key", "value"]:
+            label_copy_queries.append((statement, parameters))
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture_label_copy)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(store.add_new_sibling, source.id, member.id, user_id=user_id)
+                for member in (first, second)
+            ]
+            for future in futures:
+                future.result()
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture_label_copy)
+    assert label_copy_queries
+    assert (
+        sum(
+            ".key IN (" in statement.replace('"', "")
+            and set(parameters[-3:])
+            == {"omni_project", pinned_label_key(user_id), family_pinned_label_key(user_id)}
+            for statement, parameters in label_copy_queries
+        )
+        >= 2
+    )
     family = store.get_session_family(first.id)
     assert [member.id for member in family] == [source.id, first.id, second.id]
     assert all(member.family_id == source.id for member in family)
+    assert all(member.labels.get("omni_project") == "Family project" for member in family)
+    assert all("unrelated" not in member.labels for member in family[1:])
     assert {
         row.id for row in store.list_conversations(pinned=True, pinned_owner=user_id).data
     } == {
