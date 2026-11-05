@@ -76,8 +76,8 @@ class ScheduledTask:
         existing session.
     :param workspace: Connected-host directory or managed-sandbox repository URL.
         ``None`` uses the execution target's default workspace.
-    :param base_branch: Reserved legacy column; scheduled tasks currently do
-        not create git worktrees at fire time.
+    :param base_branch: Create a random worktree from this ref for each new
+        session. ``None`` runs in the selected workspace; ``"HEAD"`` opts in.
     :param execution_target: ``"connected_host"`` for a pinned host, or
         ``"managed_sandbox"`` for a fresh sandbox per occurrence.
     :param host_id: Specific connected host to run on. ``None`` only for legacy

@@ -54,7 +54,9 @@ describe("mobile sidebar drawer", () => {
     renderSidebar({ open: false });
 
     const scrim = screen.getByTestId("sidebar-scrim");
-    expect(scrim).toHaveClass("pointer-events-none", "opacity-0");
+    // Invisible too: on the macOS desktop shell even a transparent scrim is a
+    // no-drag region that keeps the title bar from dragging the window.
+    expect(scrim).toHaveClass("pointer-events-none", "invisible", "opacity-0");
     // Untappable is not enough for a focusable control: parked, it must also
     // leave the tab order and the a11y tree. (Not `inert` — React 18 drops the
     // boolean form, so this would silently stay reachable.)
@@ -111,7 +113,7 @@ describe("mobile sidebar drawer", () => {
 
     const float = screen.getByTestId("sidebar-settings-float");
     expect(float).toHaveAttribute("href", "/settings");
-    expect(float.closest("a, button")).toHaveClass("absolute", "bottom-3", "md:hidden");
+    expect(float.closest("a, button")).toHaveClass("absolute", "bottom-4", "right-4", "md:hidden");
 
     // The header-row Settings copy and the collapse toggle are desktop-only.
     expect(screen.getByTestId("settings-button")).toHaveClass("max-md:hidden");
@@ -128,7 +130,8 @@ describe("mobile sidebar drawer", () => {
 
     for (const button of [search, settings]) {
       expect(button).toHaveClass("max-md:size-11", "max-md:text-foreground");
-      expect(button).not.toHaveClass("sidebar-glass-chip", "max-md:rounded-full");
+      expect(button.className).toMatch(/(?:^| )(?:max-md:)?rounded-full(?: |$)/);
+      expect(button).not.toHaveClass("sidebar-glass-chip");
     }
   });
 
