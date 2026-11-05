@@ -23,8 +23,9 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings > Appearance apply to the curated list too. A remembered pick the curation drops falls back to the
   configured default carrying that agent's own brain harness, never the
   rejected agent's, and a project's configured agent outside the curation is
-  reported unavailable until the user picks an offered one. Display only,
-  and New Chat only: the scheduled-task and project-settings pickers are untouched.
+  reported unavailable until the user picks an offered one. Display only;
+  [automations](automation-templates.md) share this curation while preserving
+  saved selections on edit. Project-settings pickers are unchanged.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
@@ -97,7 +98,29 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings terminal theme.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
-  turn and reconnect must not leave a stale idle or working state.
+  turn and reconnect must not leave a stale idle or working state. The sidebar
+  status follows these rules:
+  - Claude: the status Claude Code reports for itself (OSC 7501) decides
+    working, idle and waiting for input, with three exceptions. A background
+    shell still running after its turn keeps the session working until it
+    exits. A prompt that a turn waits on in Claude's terminal, with no card in
+    Chat, shows "Needs response" and its tooltip names the prompt. A sign-in block
+    after a failed turn shows the turn as failed, not working.
+  - Codex: an active goal keeps the session working between turns, and a
+    background terminal keeps it working after its turn until it exits. A goal
+    stopped by its usage or budget limit fails the session, and so does a
+    system error that Codex reports outside a turn; during a turn, the turn's
+    own outcome decides.
+  - Background work shows the working spinner with the tooltip "Working in the
+    background". The composer lists running Claude background shells and Codex
+    background terminals as "1 background task" with each one's command. Claude's
+    list changes when a turn ends; Codex's changes within a few seconds of a
+    terminal starting or stopping.
+  - Answering a prompt in Chat or the Inbox clears "Needs response" from the
+    row, its status group, the dock badge and the Inbox count at once. If the
+    answer fails to send, the prompt shows again. A session the sidebar had not
+    loaded yet, such as one in a collapsed project folder, updates with the
+    next session-list refresh instead.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
   leaves the parent usable.
@@ -167,6 +190,20 @@ Switch Terminal → Chat, close/reopen the viewer, and reload during quiet work.
 Repeat the Chat and header-menu Terminal paths at phone width. A locally
 launched `omnigent claude` session is a separate launch path; inspect its linked
 Chat session as well as the local terminal.
+
+**Sidebar status rules:** keep the sidebar in view. In a Claude session, ask
+for `sleep 60` in a background shell and let the turn end: the row keeps its
+spinner until the sleep exits. In a Codex session, set a goal with several
+steps, then have Codex start `python3 -m http.server 8765` in the background:
+the row stays working between turns and while the server runs, and goes idle
+once both end. While the server runs, the composer shows "1 background task"
+with its command, the same list Codex shows for `/ps` in its terminal.
+Answer an approval in Chat and another from the Inbox: "Needs response" clears
+at once. Block the answer request in the browser's developer tools and answer
+again: the prompt comes back. A prompt shown only in Claude's terminal has no
+reliable manual trigger: Claude's own prompts also get a Chat card within about
+a second, and a dialog the user opens, such as `/model`, leaves Claude
+reporting working during a turn and done after it, so the row does not change.
 
 **Pi Smart Routing:** enable Smart Routing for the session, then send a task
 from Chat or type it into the native Pi terminal. Follow a completed tool call
@@ -241,6 +278,17 @@ only when the server enables the `import_review` release feature.
 **Harness credential repair:** Settings → Harnesses → a needs-auth harness →
 Settings. Activate either the credential card or its Reconfigure affordance;
 both open the same repair flow.
+
+**Native tmux repair:** use a host whose tmux is missing, older than 3.3, or
+prints no readable version. Ready native harnesses then show **needs tmux** in
+the New Chat picker and Settings → Harnesses (CLI install, update and sign-in
+problems still show first). Open **Set up tmux** in Settings, or the picker's
+setup action, to reach the tmux step: copy `brew install tmux` (on Linux, use
+the package manager), then press **Check again**. Without Check again, the host
+picks tmux up on its next periodic readiness refresh, about a minute later.
+The desktop app keeps the PATH it started with, so if tmux went into a new PATH
+directory, quit and reopen the app. Signing in or saving a credential on a host
+without tmux continues to the same tmux step.
 
 **Harness account sign-in and switching:** Settings → Harnesses → Codex or
 Claude. Use **Sign in again** on an expired Codex card, or open the configured
@@ -426,6 +474,32 @@ Cross-harness journeys:
   Machine-managed Claude provider settings can prevent the scripted endpoint
   from being used: report that blocker or use an isolated test container.
   Do not change machine policy to obtain a passing run.
+- **`working-status`, sidebar status rules (component and server checks):**
+  each rule above has regression tests. They use scripted Claude status files
+  and a scripted Codex app-server, not the real CLIs.
+  - Claude background shell:
+    `tests/harnesses/claude_native/test_claude_native_status_file.py::test_background_signal_follows_shell_and_idle_only`,
+    `tests/runner/test_session_resources.py::test_background_shell_reports_reach_the_server_as_session_events`
+    and
+    `tests/server/integration/test_sessions_endpoints.py::test_external_background_work_sets_sidebar_flag_without_status_edge`.
+  - Claude terminal-only prompt:
+    `tests/server/test_session_live_state.py::test_status_edges_set_and_clear_the_parked_reason`.
+  - Claude sign-in block:
+    `tests/harnesses/claude_native/test_claude_native_program_status.py::test_auth_block_is_a_failed_turn_while_a_prompt_block_is_work`.
+  - Codex goal and its limits:
+    `tests/harnesses/codex_native/forwarder/test_background_work.py::test_active_goal_keeps_the_session_working_until_it_ends`
+    and
+    `tests/harnesses/codex_native/forwarder/test_background_work.py::test_goal_stopped_by_a_limit_fails_the_session_once`.
+  - Codex background terminal, in the sidebar and the composer:
+    `tests/harnesses/codex_native/forwarder/test_background_work.py::test_running_background_terminal_keeps_the_session_working_after_its_turn`
+    and
+    `tests/server/integration/test_sessions_endpoints.py::test_external_background_work_lists_tasks_for_the_composer`.
+  - Codex system error:
+    `tests/harnesses/codex_native/forwarder/test_turn_errors.py::test_system_error_fails_a_thread_no_turn_is_running`
+    and
+    `tests/harnesses/codex_native/forwarder/test_turn_errors.py::test_system_error_during_a_turn_waits_for_the_turn_outcome`.
+  - How each state shows in the sidebar, and answering a prompt: from `web`,
+    `pnpm exec vitest run src/hooks/useSessionState.test.ts src/shell/sidebarNav.test.ts src/hooks/useSidebarWorkingIds.test.ts src/components/SessionStateBadge.test.tsx src/lib/localElicitationResolutions.test.ts src/hooks/useSidebarData.test.tsx src/pages/InboxPage.test.tsx`.
 - **`working-status`, browser presentation only:** the existing
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
   injects a status event through the real server to check the blocked hint.

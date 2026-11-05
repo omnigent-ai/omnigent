@@ -37,7 +37,7 @@ import {
 } from "./routingDecision";
 import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
-import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
+import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -153,6 +153,7 @@ export type RenderItem =
       } | null;
       askUserQuestion?: Record<string, unknown> | null;
       exitPlanMode?: Record<string, unknown> | null;
+      fileEdit?: FileEditRequest | null;
       codexCommand?: {
         command: string;
         cwd: string | null;
@@ -1771,6 +1772,7 @@ function buildAssistantItems(
         response: b.response,
         askUserQuestion: b.askUserQuestion,
         exitPlanMode: b.exitPlanMode,
+        fileEdit: b.fileEdit,
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
         allowAutoMode: b.allowAutoMode,
