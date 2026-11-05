@@ -4103,6 +4103,69 @@ async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
 
 
 @pytest.mark.asyncio
+async def test_queued_claude_sdk_clear_ends_when_its_session_is_deleted_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear whose turn comes just as its session is deleted does not strand.
+
+    Ordering: the input ahead finishes and passes the gate to the clear, then
+    the session is deleted (dropping its gate) before the clear resumes. The
+    clear must notice its gate is gone, answer, and not recreate the gate.
+    """
+    from omnigent.runner import app as runner_app
+
+    gate: dict[str, Any] = {}
+    build = runner_app.build_native_controls
+
+    def keep_gate(**kwargs: Any) -> Any:
+        gate.update(
+            cond=kwargs["_ingest_cond"],
+            next_seq=kwargs["_ingest_next_seq"],
+            now_serving=kwargs["_ingest_now_serving"],
+        )
+        return build(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", keep_gate)
+    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    sid = "b7c6dce8f9a05b1c2d3e4f5a67584930"
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        # An input ahead holds ticket 0.
+        gate["next_seq"][sid] = 1
+        cond = gate["cond"].setdefault(sid, asyncio.Condition())
+        clear = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "clear", "continue_in_new_session": True},
+            )
+        )
+        for _ in range(20):  # Let the clear take ticket 1 and wait.
+            await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- queue it
+        assert gate["next_seq"][sid] == 2 and not clear.done()
+
+        # The input ahead finishes and passes the gate to the clear ...
+        async with cond:
+            gate["now_serving"][sid] = 1
+            cond.notify_all()
+        # ... and, before the clear resumes, deletion drops the session's gate.
+        gate["now_serving"].pop(sid, None)
+        gate["next_seq"].pop(sid, None)
+        gate["cond"].pop(sid, None)
+        async with cond:
+            cond.notify_all()
+
+        answered = await asyncio.wait_for(clear, timeout=5)
+
+    assert answered.status_code == 410, answered.text
+    assert sid not in gate["now_serving"] and sid not in gate["next_seq"]
+    assert sid not in gate["cond"]
+
+
+@pytest.mark.asyncio
 async def test_deleting_a_session_the_runner_never_set_up_is_harmless() -> None:
     """The server's rollback of an unconfirmed continuation can repeat its delete."""
     app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk"))

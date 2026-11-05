@@ -2439,6 +2439,16 @@ def build_native_controls(
         try:
             async with _cond:
                 while _ingest_now_serving.get(conv_id, 0) != _seq:
+                    if _ingest_cond.get(conv_id) is not _cond:
+                        # The session was deleted while this waited: its gate
+                        # is gone, so answer without recreating it.
+                        return JSONResponse(
+                            status_code=410,
+                            content={
+                                "error": "claude_sdk_clear_session_gone",
+                                "detail": "The session was deleted.",
+                            },
+                        )
                     await _cond.wait()
         except asyncio.CancelledError:
             # Give up the place in line without jumping the input ahead of it,
