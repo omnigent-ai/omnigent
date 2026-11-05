@@ -694,13 +694,27 @@ async def test_saved_input_waits_while_clear_moves_the_session(
     def turns() -> list[dict[str, Any]]:
         return [event for event in forwarded if event.get("type") == "message"]
 
+    refused, passes = [0], [0]
+    waits_out_move, recover = startup._waits_out_session_move, startup._recover_session
+
+    async def count_refusals(*args: Any) -> bool:
+        waited = await waits_out_move(*args)
+        refused[0] += waited
+        return waited
+
+    async def count_passes(*args: Any) -> bool:
+        passes[0] += 1
+        return await recover(*args)
+
+    monkeypatch.setattr(startup, "_waits_out_session_move", count_refusals)
+    monkeypatch.setattr(startup, "_recover_session", count_passes)
     moving = orchestration._mark_session_moving(session_id)
     moving.__enter__()
     startup.host_changed(env.app, host_id)
     [(_, worker, _)] = startup._workers.values()
     try:
-        # The worker retries a busy session every 0.25s; give it several passes.
-        await asyncio.sleep(1.0)  # custom-lint: disable=sleep-then-assert -- non-event
+        # The worker keeps retrying while the move holds the session.
+        await poll_until_async(lambda: refused[0] >= 3, timeout_s=10)
         [pending] = env.conv_store.list_pending_inputs(session_id)
         assert (pending.id, pending.status) == (saved.id, "in_progress")
         assert env.conv_store.list_items(session_id).data == []
@@ -708,10 +722,15 @@ async def test_saved_input_waits_while_clear_moves_the_session(
 
         moving.__exit__(None, None, None)
         wake_startup_worker(host_id)
-        await poll_until_async(lambda: len(turns()) == 1, timeout_s=10)
-        await asyncio.sleep(1.0)  # custom-lint: disable=sleep-then-assert -- no repeat
+        await poll_until_async(
+            lambda: len(turns()) == 1 and not env.conv_store.list_pending_inputs(session_id),
+            timeout_s=10,
+        )
+        # A full pass after the delivery finished does not deliver it again.
+        delivered_at = passes[0]
+        wake_startup_worker(host_id)
+        await poll_until_async(lambda: passes[0] > delivered_at, timeout_s=10)
         assert len(turns()) == 1
-        assert env.conv_store.list_pending_inputs(session_id) == []
     finally:
         if orchestration._session_is_moving(session_id):
             moving.__exit__(None, None, None)
