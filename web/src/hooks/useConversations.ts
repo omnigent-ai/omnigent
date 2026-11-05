@@ -40,6 +40,7 @@ import {
   overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
   PIN_WRITE_MUTATION_KEY,
+  PINNED_CONVERSATIONS_KEY,
   PINNED_LABEL_KEY,
   filtersFromProjectQueryKey,
   parseProjectSessionsQueryKey,
@@ -1697,13 +1698,9 @@ export function useBulkMoveToProject() {
 export { PINNED_LABEL_KEY };
 
 // TanStack Query key for the server-authoritative pinned-session list.
-// Deliberately NOT under the ["conversations"] prefix: the list mutations do
-// prefix-matched `getQueriesData(["conversations"])` sweeps (and
-// `filtersFromConversationQueryKey`, which throws on a non-list key) plus
-// `invalidateQueries(["conversations"])`. A pinned key nested under that prefix
-// would be swept into those loops — the throw aborted the toggle's cache patch,
-// so a pinned row didn't move until a refetch. A sibling key keeps it isolated.
-export const PINNED_CONVERSATIONS_KEY = ["pinned-conversations"] as const;
+// Defined in the leaf cache module (see sessionListCache) so its overlays can
+// patch the pinned set without a value import cycle; re-exported here.
+export { PINNED_CONVERSATIONS_KEY };
 
 /**
  * Result of the pinned-session query. `conversations` is the viewer's pinned

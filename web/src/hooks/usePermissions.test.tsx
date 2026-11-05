@@ -16,10 +16,11 @@ vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTest
 // up a QueryClient or re-testing the resolution order.
 
 import { act, renderHook } from "@testing-library/react";
-import type { Conversation } from "./useConversations";
+import type { Conversation, PinnedConversationsResult } from "./useConversations";
 import type { Session } from "@/lib/types";
 import type * as PermissionsApi from "@/lib/permissionsApi";
 import { PUBLIC_USER_ID } from "@/lib/permissionsApi";
+import { PINNED_CONVERSATIONS_KEY } from "@/lib/sessionListCache";
 
 vi.mock("./useConversations", () => ({ useConversations: vi.fn() }));
 vi.mock("./useSession", () => ({ useSession: vi.fn() }));
@@ -147,76 +148,134 @@ describe("share mutations — sidebar shared flag", () => {
   const listKey = ["conversations", "", false];
   const grantsKey = ["permissions", "conv_1"];
   const grant = (user_id: string, level = 1) => ({ user_id, conversation_id: "conv_1", level });
-  const listData = (row: Partial<Conversation> = {}) => ({
-    pages: [{ data: [{ ...makeConv(4), owner: "owner@example.com", ...row }] }],
-    pageParams: [null],
+  const sessionRow = (row: Partial<Conversation> = {}): Conversation => ({
+    ...makeConv(4),
+    owner: "owner@example.com",
+    ...row,
   });
+  // The list and pinned caches hold the row in different shapes.
+  const listCache = {
+    key: listKey,
+    data: (row: Partial<Conversation> = {}) => ({
+      pages: [{ data: [sessionRow(row)] }],
+      pageParams: [null],
+    }),
+    flag: (qc: QueryClient) =>
+      qc.getQueryData<{ pages: { data: Conversation[] }[] }>(listKey)?.pages[0].data[0]
+        .shared_with_others,
+  };
+  const pinnedCache = {
+    key: [...PINNED_CONVERSATIONS_KEY],
+    data: (row: Partial<Conversation> = {}) => ({
+      conversations: [sessionRow({ labels: { "omnigent.pinned": "123" }, ...row })],
+      filterHonored: true,
+    }),
+    flag: (qc: QueryClient) =>
+      qc.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)?.conversations[0]
+        .shared_with_others,
+  };
 
   function setup(grantees?: string[]) {
     const qc = new QueryClient();
-    qc.setQueryData(listKey, listData());
-    if (grantees)
+    if (grantees) {
       qc.setQueryData(grantsKey, [
         grant("owner@example.com", 4),
         ...grantees.map((id) => grant(id)),
       ]);
+    }
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={qc}>{children}</QueryClientProvider>
     );
-    const sharedFlag = () =>
-      qc.getQueryData<{ pages: { data: Conversation[] }[] }>(listKey)!.pages[0].data[0]
-        .shared_with_others;
     const hooks = renderHook(
       () => ({ grant: useGrantPermission("conv_1"), revoke: useRevokePermission("conv_1") }),
       { wrapper },
     ).result;
-    return { qc, sharedFlag, hooks };
+    return { qc, hooks };
+  }
+
+  /** Start a fetch for `key` whose first response stays pending until released. */
+  function deferFirstFetch<T>(qc: QueryClient, key: unknown[], fresh: T) {
+    let release!: (data: T) => void;
+    let calls = 0;
+    const done = qc
+      .fetchQuery({
+        queryKey: key,
+        queryFn: () => {
+          calls += 1;
+          if (calls > 1) return Promise.resolve(fresh);
+          return new Promise<T>((resolve) => {
+            release = resolve;
+          });
+        },
+      })
+      .catch(() => undefined);
+    return { release: (data: T) => release(data), done };
   }
 
   it.each([
     ["a user", "friend@example.com", true],
     ["the public link", PUBLIC_USER_ID, undefined],
   ])("sets the flag after granting %s", async (_label, userId, expected) => {
-    const { sharedFlag, hooks } = setup();
+    const { qc, hooks } = setup();
+    qc.setQueryData(listKey, listCache.data());
     await act(() => hooks.current.grant.mutateAsync({ userId, level: 1 }));
-    expect(sharedFlag()).toBe(expected);
+    expect(listCache.flag(qc)).toBe(expected);
   });
 
   it.each([
     ["the last user grantee", ["friend@example.com", PUBLIC_USER_ID], false],
     ["one of two user grantees", ["friend@example.com", "other@example.com"], true],
   ])("recomputes the flag after revoking %s", async (_label, grantees, expected) => {
-    const { sharedFlag, hooks } = setup(grantees);
+    const { qc, hooks } = setup(grantees);
+    qc.setQueryData(listKey, listCache.data());
     await act(() => hooks.current.revoke.mutateAsync("friend@example.com"));
-    expect(sharedFlag()).toBe(expected);
+    expect(listCache.flag(qc)).toBe(expected);
   });
 
   it("tracks back-to-back changes before the grant list refetches", async () => {
-    const { sharedFlag, hooks } = setup(["a@example.com", "b@example.com"]);
+    const { qc, hooks } = setup(["a@example.com", "b@example.com"]);
+    qc.setQueryData(listKey, listCache.data());
     await act(() => hooks.current.revoke.mutateAsync("a@example.com"));
     await act(() => hooks.current.revoke.mutateAsync("b@example.com"));
-    expect(sharedFlag()).toBe(false);
+    expect(listCache.flag(qc)).toBe(false);
 
     await act(() => hooks.current.grant.mutateAsync({ userId: "c@example.com", level: 1 }));
     await act(() => hooks.current.revoke.mutateAsync(PUBLIC_USER_ID));
-    expect(sharedFlag()).toBe(true);
+    expect(listCache.flag(qc)).toBe(true);
   });
 
-  it("drops a list response fetched before the change", async () => {
-    const { qc, sharedFlag, hooks } = setup();
-    let resolveStale!: (data: ReturnType<typeof listData>) => void;
-    const staleFetch = qc
-      .fetchQuery({
-        queryKey: listKey,
-        queryFn: () =>
-          new Promise<ReturnType<typeof listData>>((resolve) => {
-            resolveStale = resolve;
-          }),
-      })
-      .catch(() => undefined);
+  it("updates a pinned session outside the loaded list pages", async () => {
+    const { qc, hooks } = setup([PUBLIC_USER_ID]);
+    qc.setQueryData(PINNED_CONVERSATIONS_KEY, pinnedCache.data());
     await act(() => hooks.current.grant.mutateAsync({ userId: "friend@example.com", level: 1 }));
-    resolveStale(listData({ shared_with_others: false }));
-    await staleFetch;
-    expect(sharedFlag()).toBe(true);
+    expect(pinnedCache.flag(qc)).toBe(true);
+    const pinned = qc.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)!;
+    expect(pinned.conversations[0].labels["omnigent.pinned"]).toBe("123");
+
+    await act(() => hooks.current.revoke.mutateAsync("friend@example.com"));
+    expect(pinnedCache.flag(qc)).toBe(false);
+  });
+
+  it.each([
+    ["session list", listCache],
+    ["pinned set", pinnedCache],
+  ])("replaces a %s read that predates the change", async (_label, cache) => {
+    const { qc, hooks } = setup();
+    qc.setQueryData(cache.key, cache.data());
+    const read = deferFirstFetch(qc, cache.key, cache.data({ shared_with_others: true }));
+    await act(() => hooks.current.grant.mutateAsync({ userId: "friend@example.com", level: 1 }));
+    read.release(cache.data({ shared_with_others: false }));
+    await act(() => read.done);
+    expect(cache.flag(qc)).toBe(true);
+  });
+
+  it("lets a first list load finish when sharing mid-load", async () => {
+    const { qc, hooks } = setup();
+    const read = deferFirstFetch(qc, listKey, listCache.data());
+    await act(() => hooks.current.grant.mutateAsync({ userId: "friend@example.com", level: 1 }));
+    read.release(listCache.data({ shared_with_others: true }));
+    await act(() => read.done);
+    expect(qc.getQueryState(listKey)).toMatchObject({ status: "success", fetchStatus: "idle" });
+    expect(listCache.flag(qc)).toBe(true);
   });
 });

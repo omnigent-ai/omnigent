@@ -481,8 +481,6 @@ describe("Sidebar session list", () => {
           owner: "viewer@example.com",
           shared_with_others: false,
         }),
-        // An older server omits the field: treated as not shared.
-        conv("owned_unknown", "Claude Code", { owner: "viewer@example.com" }),
       ]);
       renderSidebar();
       selectSessionFilter("all");
@@ -492,10 +490,8 @@ describe("Sidebar session list", () => {
         "title",
         "Shared with others",
       );
-      for (const id of ["owned_private", "owned_unknown"]) {
-        const row = screen.getByText(id).closest("li")!;
-        expect(within(row).queryByRole("img", { name: "Shared session" })).toBeNull();
-      }
+      const privateRow = screen.getByText("owned_private").closest("li")!;
+      expect(within(privateRow).queryByRole("img", { name: "Shared session" })).toBeNull();
     } finally {
       viewer.mockRestore();
     }

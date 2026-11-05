@@ -34,6 +34,7 @@ import {
   filtersFromConversationQueryKey,
   filtersFromProjectQueryKey,
   insertNewRowsIntoPages,
+  mergeIntoPinnedRow,
   mergeItemsIntoPages,
   nullsToUndefined,
   PROJECT_LABEL_KEY,
@@ -156,15 +157,7 @@ function applyItemsToCache(
         if (!item) return row;
         foundAnywhere.add(row.id);
         changed = true;
-        // Pin membership and pin timestamps reconcile through the pinned query.
-        return {
-          ...row,
-          ...item,
-          labels: {
-            ...(item.labels ?? row.labels),
-            ["omnigent.pinned"]: row.labels["omnigent.pinned"],
-          },
-        };
+        return mergeIntoPinnedRow(row, item);
       })
       .filter((row) => !row.archived);
     return changed ? { ...previous, conversations } : previous;

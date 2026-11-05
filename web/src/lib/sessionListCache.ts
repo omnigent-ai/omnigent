@@ -11,7 +11,12 @@
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import { scopeBoundaryRow } from "@/lib/sidebarData";
-import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
+import type {
+  Conversation,
+  ConversationsPage,
+  PinnedConversationsResult,
+  SessionSortBy,
+} from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 
 /** Cache value shape for a `useConversations` infinite query. */
@@ -38,6 +43,27 @@ export const PROJECT_LABEL_KEY = "omni_project";
  * without a hooks-layer import cycle.
  */
 export const PINNED_LABEL_KEY = "omnigent.pinned";
+
+// Deliberately NOT under the ["conversations"] prefix: the list mutations do
+// prefix-matched `getQueriesData(["conversations"])` sweeps (and
+// `filtersFromConversationQueryKey`, which throws on a non-list key) plus
+// `invalidateQueries(["conversations"])`. A pinned key nested under that prefix
+// would be swept into those loops — the throw aborted the toggle's cache patch,
+// so a pinned row didn't move until a refetch. A sibling key keeps it isolated.
+export const PINNED_CONVERSATIONS_KEY = ["pinned-conversations"] as const;
+
+/**
+ * Overlay a wire item onto a pinned-cache row. Pin membership and the pin
+ * timestamp reconcile through the pinned query, so the row keeps its own
+ * `omnigent.pinned` label whatever labels the item carries.
+ */
+export function mergeIntoPinnedRow(row: Conversation, item: SessionListWireItem): Conversation {
+  return {
+    ...row,
+    ...item,
+    labels: { ...(item.labels ?? row.labels), [PINNED_LABEL_KEY]: row.labels[PINNED_LABEL_KEY] },
+  };
+}
 
 /** Mutation key shared by every pin, unpin, and pinned-reorder write. */
 export const PIN_WRITE_MUTATION_KEY = ["pin-write"] as const;
@@ -551,8 +577,9 @@ export function overlayArchivedIntoCaches(
 }
 
 /**
- * Overlay a partial row onto every cached session list (and the backfill row)
- * that holds it, so a local mutation repaints the sidebar without a refetch.
+ * Overlay a partial row onto every cached session list (the pinned set and the
+ * backfill row included) that holds it, so a local mutation repaints the
+ * sidebar without a refetch.
  *
  * @param queryClient - The app QueryClient.
  * @param wire - The changed fields, keyed by session `id`.
@@ -578,6 +605,16 @@ export function overlayListItemIntoCaches(
     const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     if (next !== data) queryClient.setQueryData(key, next);
   }
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old?.conversations.some((row) => row.id === wire.id)
+      ? {
+          ...old,
+          conversations: old.conversations.map((row) =>
+            row.id === wire.id ? mergeIntoPinnedRow(row, wire) : row,
+          ),
+        }
+      : old,
+  );
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", wire.id], (old) =>
     old ? { ...old, ...wire } : old,
   );

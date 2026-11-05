@@ -16,7 +16,7 @@ import {
   listPermissions,
   revokePermission,
 } from "@/lib/permissionsApi";
-import { overlayListItemIntoCaches } from "@/lib/sessionListCache";
+import { overlayListItemIntoCaches, PINNED_CONVERSATIONS_KEY } from "@/lib/sessionListCache";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useSession } from "./useSession";
 
@@ -56,10 +56,18 @@ export function useSessionOwner(sessionId: string | null) {
   });
 }
 
+// Session-list caches a share change patches (see overlayListItemIntoCaches).
+const SESSION_LIST_ROOTS = new Set<unknown>([
+  "conversations",
+  "project-sessions",
+  PINNED_CONVERSATIONS_KEY[0],
+]);
+
 /**
  * Apply a successful share change to the cached grant list, then derive the
- * sidebar row's shared flag from it. In-flight reads are cancelled first so a
- * response fetched before the change can't overwrite either cache.
+ * sidebar row's shared flag from it and overlay it onto every cached list.
+ * List reads already in flight predate the change, so they're restarted (not
+ * cancelled) to keep a stale response from landing and to never strand a load.
  *
  * @param qc - The app QueryClient.
  * @param sessionId - Session whose grants changed.
@@ -67,17 +75,12 @@ export function useSessionOwner(sessionId: string | null) {
  * @param sharedWithoutGrants - Flag to apply when no grant list is cached, or
  *   `undefined` to leave the row for the updates stream to correct.
  */
-async function applyShareChange(
+function applyShareChange(
   qc: QueryClient,
   sessionId: string,
   update: (grants: Permission[]) => Permission[],
   sharedWithoutGrants: boolean | undefined,
-): Promise<void> {
-  await Promise.all([
-    qc.cancelQueries({ queryKey: permissionsKey(sessionId) }),
-    qc.cancelQueries({ queryKey: ["conversations"] }),
-    qc.cancelQueries({ queryKey: ["project-sessions"] }),
-  ]);
+): void {
   const grants = qc.getQueryData<Permission[]>(permissionsKey(sessionId));
   const next = grants && update(grants);
   if (next) qc.setQueryData(permissionsKey(sessionId), next);
@@ -87,7 +90,13 @@ async function applyShareChange(
   if (shared !== undefined) {
     overlayListItemIntoCaches(qc, { id: sessionId, shared_with_others: shared });
   }
+  // Invalidation refetches with cancelRefetch, replacing any in-flight read.
   void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
+  void qc.invalidateQueries({
+    predicate: (query) =>
+      SESSION_LIST_ROOTS.has(query.queryKey[0]) && query.state.fetchStatus === "fetching",
+    refetchType: "all",
+  });
 }
 
 /** Grant or update a permission, keeping the grant list and sidebar flag current. */
