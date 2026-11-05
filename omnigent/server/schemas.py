@@ -3263,13 +3263,13 @@ class SideChatSummary(BaseModel):
     :param id: Side-chat session id, e.g. ``"conv_side123"``.
     :param object: Fixed resource type, always ``"side_chat"``.
     :param created_at: Unix epoch seconds when the side chat was created.
-    :param closed: Whether the side chat was closed, so its tab should close.
+    :param title: The side chat's title, when available.
     """
 
     id: str
     object: Literal["side_chat"] = "side_chat"
     created_at: int
-    closed: bool = False
+    title: str | None = None
 
 
 class SideChatList(BaseModel):

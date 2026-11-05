@@ -69,6 +69,7 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { SideChatPicker } from "./SideChatPicker";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
@@ -1128,7 +1129,7 @@ function WorkspacePanelImpl({
     const queued = useChatStore.getState().clearQueuedMessages(childId);
     if (!childId.startsWith("pending:")) {
       try {
-        await stopSession(childId, { closeTab: true });
+        await stopSession(childId);
       } catch {
         useChatStore.getState().restoreQueuedMessages(queued);
         toast.error("Couldn't close side chat. Try again.");
@@ -1227,6 +1228,17 @@ function WorkspacePanelImpl({
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
+  const sideChatPicker = canStartSideChat && !pending && (
+    <SideChatPicker
+      key={conversationId}
+      conversationId={conversationId}
+      onOpen={(childId) => {
+        sideChats.open(childId);
+        onRightRailTabChange("sidechat");
+        onReveal?.();
+      }}
+    />
+  );
   const newTabMenu = (menuAlign: "start" | "end") => (
     <NewTabMenu
       conversationId={conversationId}
@@ -1730,6 +1742,7 @@ function WorkspacePanelImpl({
             pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
             {showOpenTabs && newTabMenu("end")}
+            {sideChatPicker}
             {panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {
@@ -1969,6 +1982,7 @@ function WorkspacePanelImpl({
                 </div>
               );
             })}
+            {sideChatPicker}
             {onNewSideChat && (
               <Button
                 type="button"

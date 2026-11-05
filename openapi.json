@@ -9980,12 +9980,6 @@
       "SideChatSummary": {
         "description": "A side chat listed in its parent session's Workspace rail.",
         "properties": {
-          "closed": {
-            "default": false,
-            "description": "Whether the side chat was closed, so its tab should close.",
-            "title": "Closed",
-            "type": "boolean"
-          },
           "created_at": {
             "description": "Unix epoch seconds when the side chat was created.",
             "format": "int64",
@@ -10003,6 +9997,18 @@
             "description": "Fixed resource type, always `\"side_chat\"`.",
             "title": "Object",
             "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The side chat's title, when available.",
+            "title": "Title"
           }
         },
         "required": [
@@ -19555,7 +19561,7 @@
     },
     "/v1/sessions/{session_id}/side_chats": {
       "get": {
-        "description": "List the side chats shown as tabs in a session's Workspace rail.\n\nOnly the owner of the session's root starts side chats there, so only\nthat owner gets any, in id order; anyone else, admins included, gets an\nempty page. Closed side chats are included, so other devices can close\ntheir tabs.\n\n**Returns:** A `PaginatedList` of `SideChatSummary`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
+        "description": "List the side chats available in a session's Workspace rail.\n\nOnly the owner of the session's root starts side chats there, so only\nthat owner gets any, in id order; anyone else, admins included, gets an\nempty page. Opening and closing tabs is local to each device.\n\n**Returns:** A `PaginatedList` of `SideChatSummary`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
         "operationId": "list_side_chats_v1_sessions__session_id__side_chats_get",
         "parameters": [
           {
@@ -19569,13 +19575,13 @@
             }
           },
           {
-            "description": "Maximum side chats to return (1-1000, default 100).",
+            "description": "Maximum side chats to return (1-20, default 20).",
             "in": "query",
             "name": "limit",
             "required": false,
             "schema": {
-              "default": 100,
-              "maximum": 1000,
+              "default": 20,
+              "maximum": 20,
               "minimum": 1,
               "title": "Limit",
               "type": "integer"

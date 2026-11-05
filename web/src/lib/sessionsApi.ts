@@ -1577,14 +1577,10 @@ export function interrupt(sessionId: string, responseId?: string): Promise<PostE
  * transcript stays viewable; only the running process is stopped.
  * Owner-only server-side. For claude-native sessions the bound runner
  * hard-kills the tmux pane the `claude` binary runs in — the analog
- * of exiting from inside tmux, but driven from the web UI. `closeTab`
- * also closes a side chat's tab on the user's other devices.
+ * of exiting from inside tmux, but driven from the web UI.
  */
-export function stopSession(
-  sessionId: string,
-  { closeTab = false }: { closeTab?: boolean } = {},
-): Promise<PostEventResponse> {
-  return postEvent(sessionId, { type: "stop_session", data: closeTab ? { close_tab: true } : {} });
+export function stopSession(sessionId: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, { type: "stop_session", data: {} });
 }
 
 /** Reconnect or relaunch the existing runner without replaying user input. */

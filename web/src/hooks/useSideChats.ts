@@ -1,17 +1,7 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { authenticatedFetch } from "@/lib/identity";
-import { setSessionParent } from "@/lib/sessionHost";
-import {
-  MAX_OPEN_FILES,
-  readSessionWorkspaceState,
-  saveSessionWorkspaceState,
-} from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, saveSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { newPendingSideChatId } from "@/lib/sideChat";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
-import { isTempConvId } from "@/lib/tempConversationId";
-import { useChatStore } from "@/store/chatStore";
-import { conversationRegistry } from "@/store/conversationRegistry";
 
 interface SideChatTabsState {
   /** Open side-chat child conversation ids, in open order. */
@@ -40,54 +30,12 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
   };
 }
 
-interface SideChatRow {
-  id: string;
-  created_at: number;
-  closed?: boolean;
-}
-
-function sideChatsQueryKey(conversationId: string): readonly unknown[] {
-  return ["conversation", conversationId, "side_chats"];
-}
-
-/** The parent's side chats on the server, oldest first, split by whether they were closed. */
-async function fetchSideChats(parentId: string): Promise<{ open: string[]; closed: string[] }> {
-  const rows: SideChatRow[] = [];
-  let after: string | null = null;
-  // Sequential by design: each page's cursor comes from the previous page.
-  /* oxlint-disable no-await-in-loop */
-  do {
-    const query = new URLSearchParams({ limit: "100", ...(after ? { after } : {}) });
-    const res = await authenticatedFetch(
-      `/v1/sessions/${encodeURIComponent(parentId)}/side_chats?${query.toString()}`,
-    );
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    const page = (await res.json()) as {
-      data: SideChatRow[];
-      has_more?: boolean;
-      last_id?: string | null;
-    };
-    rows.push(...page.data);
-    // A cursor that doesn't advance would page forever.
-    after = page.has_more && page.last_id && page.last_id !== after ? page.last_id : null;
-  } while (after !== null);
-  /* oxlint-enable no-await-in-loop */
-  // Pages come in id order; tabs open in creation order.
-  rows.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
-  const open: string[] = [];
-  const closed: string[] = [];
-  for (const row of rows) {
-    // Side chats run on the parent's runner, so route them by its host.
-    setSessionParent(row.id, parentId);
-    (row.closed ? closed : open).push(row.id);
-  }
-  return { open, closed };
-}
-
 /**
- * Per-session side-chat tabs for the Workspace rail, mirroring
- * {@link useBrowserTabs}: locally ordered tabs (`sessionWorkspaceState`) merged
- * with the server's side-chat lifecycle on load and focus.
+ * Per-session side-chat tabs for the Workspace rail — a browser-local list of
+ * child conversation ids, mirroring {@link useBrowserTabs}. The references live
+ * in `sessionWorkspaceState` (localStorage), never on the server, so they are
+ * per-device and per-browser: they persist across app restarts and reloads but
+ * do not follow the user to another device.
  *
  * Opening (`open`) just records an already-created child id as a tab — the
  * child itself is created by the server (Codex's native ephemeral fork, or the
@@ -115,13 +63,10 @@ export function useSideChats(conversationId: string) {
       const pending =
         unsaved.current?.conversationId === conversationId ? unsaved.current.changes : [];
       const changes = [...pending, mutate];
-      const stored = readSideChatTabsState(conversationId);
-      const next = changes.reduce((current, change) => change(current), stored);
-      if (pending.length === 0 && next === stored) {
-        // Nothing to save; still show what other windows saved.
-        setState(stored);
-        return;
-      }
+      const next = changes.reduce(
+        (current, change) => change(current),
+        readSideChatTabsState(conversationId),
+      );
       const saved = saveSessionWorkspaceState(conversationId, {
         openSideChats: next.tabs,
         // Omitted when empty, so a session without sub-agent tabs is stored as before.
@@ -135,48 +80,6 @@ export function useSideChats(conversationId: string) {
     },
     [conversationId],
   );
-
-  const queryClient = useQueryClient();
-  const { data: serverSideChats, dataUpdatedAt } = useQuery({
-    queryKey: sideChatsQueryKey(conversationId),
-    queryFn: () => fetchSideChats(conversationId),
-    enabled: !isTempConvId(conversationId),
-    staleTime: 0,
-    refetchOnWindowFocus: true,
-    retry: false,
-  });
-  useEffect(() => {
-    if (!serverSideChats) return;
-    const { open } = serverSideChats;
-    // A remote close must leave this device's queued or sending work reachable.
-    const queued = useChatStore.getState().queuedMessages;
-    const closed = serverSideChats.closed.filter((id) => {
-      const live = conversationRegistry.peek(id)?.getState();
-      return (
-        !queued.some((message) => message.conversationId === id) &&
-        live?.status !== "streaming" &&
-        live?.sessionStatus !== "running"
-      );
-    });
-    const syncedTabs = (tabs: string[]): string[] => {
-      // A tab the list doesn't name (pending, just created, or an older side chat) stays.
-      const kept = tabs.filter((id) => !closed.includes(id));
-      // Storage holds at most MAX_OPEN_FILES tabs, so only the newest listed ones
-      // fill the free slots and a kept tab is never pushed out.
-      const room = MAX_OPEN_FILES - kept.length;
-      const missing = open.filter((id) => !kept.includes(id));
-      return room > 0 ? [...kept, ...missing.slice(-room)] : kept;
-    };
-    // Through update, so tabs a failed storage write is still holding are synced too.
-    update((latest) => {
-      const tabs = syncedTabs(latest.tabs);
-      const selected =
-        latest.selected !== null && closed.includes(latest.selected) ? null : latest.selected;
-      const same =
-        tabs.length === latest.tabs.length && tabs.every((id, index) => id === latest.tabs[index]);
-      return same && selected === latest.selected ? latest : { ...latest, tabs, selected };
-    });
-  }, [serverSideChats, dataUpdatedAt, conversationId, update]);
 
   /** Select a side-chat tab, or clear the selection (null). */
   const select = useCallback(
@@ -231,10 +134,11 @@ export function useSideChats(conversationId: string) {
     [update],
   );
 
-  /** Close a tab, after the server has closed a real side chat. A closed
-   *  selected tab hands the selection to its left neighbour in the strip. */
+  /** Close a tab. Drops only the client-side reference — an ephemeral Codex
+   *  fork dies with its process, and a generic child stays hidden server-side.
+   *  A closed selected tab hands the selection to its left neighbour in the strip. */
   const close = useCallback(
-    (childId: string) => {
+    (childId: string) =>
       update((current) => {
         const strip = [...current.tabs, ...current.subagentTabs];
         const index = strip.indexOf(childId);
@@ -249,23 +153,8 @@ export function useSideChats(conversationId: string) {
           subagentTabs: current.subagentTabs.filter((id) => id !== childId),
           selected,
         };
-      });
-      // The cached list must not reopen the tab, even if the refetch below fails.
-      const key = sideChatsQueryKey(conversationId);
-      queryClient.setQueryData<{ open: string[]; closed: string[] }>(key, (listed) =>
-        listed && listed.open.includes(childId)
-          ? {
-              open: listed.open.filter((id) => id !== childId),
-              closed: [...listed.closed, childId],
-            }
-          : listed,
-      );
-      // A list already in flight was read before this close; drop it, don't join it.
-      void queryClient
-        .cancelQueries({ queryKey: key })
-        .then(() => queryClient.invalidateQueries({ queryKey: key }));
-    },
-    [update, queryClient, conversationId],
+      }),
+    [update],
   );
 
   // Side chats, then sub-agent tabs: the order the strip shows them in.

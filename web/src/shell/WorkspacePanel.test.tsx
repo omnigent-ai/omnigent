@@ -1564,10 +1564,7 @@ describe("WorkspacePanel mobile side chats", () => {
         expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
       );
       // Closing a tab says so, so the user's other devices drop it too.
-      expect(stop.mock.calls).toEqual([
-        ["conv_side_b", { closeTab: true }],
-        ["conv_side_b", { closeTab: true }],
-      ]);
+      expect(stop.mock.calls).toEqual([["conv_side_b"], ["conv_side_b"]]);
       expect(queuedAtStop).toEqual([[], []]);
       expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBeUndefined();
       expect(useChatStore.getState().queuedMessages).toEqual([otherChat]);

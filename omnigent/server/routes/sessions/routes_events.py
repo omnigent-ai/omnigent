@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import itertools
 import secrets
@@ -55,6 +57,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
@@ -80,6 +83,7 @@ from omnigent.runtime import (
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.content_resolver import _resolve_message_content
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import presence
 from omnigent.server import session_pull_requests as server_prs
@@ -317,7 +321,6 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     RUNNER_LIVENESS_TTL_S,
-    SIDE_CHAT_CLOSED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     runner_seen_is_fresh,
 )
@@ -887,6 +890,56 @@ _TURN_STARTING_EVENT_TYPES = frozenset({"message", "session_message", _SLASH_COM
 _IN_FLIGHT_EVENT_TYPES = _TURN_STARTING_EVENT_TYPES | {_COMPACT_TYPE}
 
 
+def _legacy_side_chat_attachment(
+    content: object,
+    session_id: str,
+    file_store: FileStore | None,
+    artifact_store: ArtifactStore | None,
+) -> bool:
+    """Old Codex executors interpret a lone text attachment as a slash command."""
+    from omnigent.harnesses.codex_native.side_chat import side_chat_question_from_text
+
+    if not isinstance(content, list):
+        return False
+    blocks = [block for block in content if isinstance(block, dict)]
+    if file_store is not None and artifact_store is not None:
+        try:
+            blocks = _resolve_message_content(
+                blocks,
+                file_store,
+                artifact_store,
+                session_id=session_id,
+                defer_filesystem_files=True,
+            )
+        except (ValueError, KeyError) as exc:
+            raise OmnigentError(
+                "Could not read the attachment", code=ErrorCode.INVALID_INPUT
+            ) from exc
+    if any(
+        block.get("type") == "input_image"
+        or (block.get("type") in {"text", "input_text"} and block.get("text"))
+        for block in blocks
+    ):
+        return False
+    texts = []
+    for block in blocks:
+        if block.get("type") != "input_file":
+            continue
+        data = block.get("file_data")
+        if not isinstance(data, str):
+            return False
+        try:
+            parsed = parse_data_uri(data)
+            if not parsed.mime_type.startswith("text/"):
+                return False
+            text = base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
+        except (ValueError, binascii.Error):
+            return False
+        if text:
+            texts.append(text)
+    return len(texts) == 1 and side_chat_question_from_text(texts[0]) is not None
+
+
 def register_events_routes(
     router: APIRouter,
     *,
@@ -1047,7 +1100,6 @@ def register_events_routes(
                                     else None,
                                 )
                             )
-                            await reopen_side_chat_tab(request, session_id)
                         continue
                     await _authorized_conversation(request, session_id, external_transcript=True)
                     add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
@@ -1056,25 +1108,11 @@ def register_events_routes(
                     )
                     acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
                 return acks
-            ack = await _post_event_impl(
+            return await _post_event_impl(
                 request,
                 session_id,
                 body,
                 in_flight=in_flight if body.type in _IN_FLIGHT_EVENT_TYPES else None,
-            )
-            await reopen_side_chat_tab(request, session_id)
-            return ack
-
-    async def reopen_side_chat_tab(request: Request, session_id: str) -> None:
-        """Bring back a closed side-chat tab on every device once a message to it is accepted.
-
-        So a follow-up queued on another device never runs out of sight, while a
-        rejected one (a sealed Codex side chat answers 409) leaves the tab closed.
-        """
-        if getattr(request.state, "reopens_side_chat_tab", False):
-            request.state.reopens_side_chat_tab = False
-            await asyncio.to_thread(
-                conversation_store.delete_label, session_id, SIDE_CHAT_CLOSED_LABEL_KEY
             )
 
     router.include_router(event_router)
@@ -1241,9 +1279,7 @@ def register_events_routes(
           kills its tmux pane) and 204s otherwise. Stop is non-sticky:
           it writes no persistent marker, so the next message
           auto-relaunches the session on its (still-online) host via
-          the normal message-dispatch relaunch path. With
-          ``data.close_tab``, stopping a side chat also records that its tab
-          was closed, so the user's other devices drop it.
+          the normal message-dispatch relaunch path.
         - ``"retry_session"`` reconnects or relaunches the existing runner
           and retries a failed saved startup input, if one is present.
         - ``"message"`` on an ``omnigent claude`` terminal session
@@ -1285,20 +1321,23 @@ def register_events_routes(
         if (
             body.type == "message"
             and isinstance(request, Request)
-            and SIDE_CHAT_CLOSED_LABEL_KEY in (conv.labels or {})
-        ):
-            # Reopened by post_event only once the message is accepted.
-            request.state.reopens_side_chat_tab = True
-        if (
-            body.type == "message"
-            and isinstance(request, Request)
-            and _opens_codex_side_chat(conv, body)
+            and _native_pane_harness(conv) == "codex-native"
             and not await asyncio.to_thread(
                 _is_session_owner,
                 user_id,
                 conv,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
+            )
+            and (
+                _opens_codex_side_chat(conv, body)
+                or await asyncio.to_thread(
+                    _legacy_side_chat_attachment,
+                    body.data.get("content"),
+                    conv.id,
+                    file_store,
+                    artifact_store,
+                )
             )
         ):
             raise OmnigentError(
@@ -1930,16 +1969,7 @@ def register_events_routes(
             and _is_codex_native_subagent(conv)
             and is_side_chat_child(conv.labels)
         )
-        # Closing a side chat's tab, rather than any other stop, drops it on the
-        # user's other devices too.
-        tab_closed = (
-            {SIDE_CHAT_CLOSED_LABEL_KEY: "1"}
-            if body.type == _STOP_SESSION_TYPE and body.data.get("close_tab") is True
-            else {}
-        )
         if stop_codex_side_chat and is_session_closed(conv.labels, conv.title):
-            if tab_closed:
-                await asyncio.to_thread(conversation_store.set_labels, session_id, tab_closed)
             return {"queued": False}
         if body.type == _INTERRUPT_TYPE or stop_codex_side_chat:
             target_session_id = session_id
@@ -1966,7 +1996,7 @@ def register_events_routes(
                         await asyncio.to_thread(
                             conversation_store.set_labels,
                             session_id,
-                            {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE, **tab_closed},
+                            {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
                         )
                     return {"queued": False}
                 if (
@@ -2026,24 +2056,10 @@ def register_events_routes(
                 await asyncio.to_thread(
                     conversation_store.set_labels,
                     session_id,
-                    {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE, **tab_closed},
+                    {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
                 )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
-            # Mark the tab closed before the stop settles the side chat, so no
-            # other device drains queued work into it on the stop's idle edge.
-            # The side chat stays writable; a later message reopens the tab.
-            closing_tab = bool(tab_closed) and bool((conv.labels or {}).get(SIDE_CHAT_LABEL_KEY))
-            if closing_tab:
-                await asyncio.to_thread(conversation_store.set_labels, session_id, tab_closed)
-
-            async def keep_tab_open() -> None:
-                """A stop that fails leaves the tab open everywhere."""
-                if closing_tab:
-                    await asyncio.to_thread(
-                        conversation_store.delete_label, session_id, SIDE_CHAT_CLOSED_LABEL_KEY
-                    )
-
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -2060,7 +2076,6 @@ def register_events_routes(
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
-                await keep_tab_open()
                 raise
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
@@ -2081,7 +2096,6 @@ def register_events_routes(
                     )
                     cleanup_resp.raise_for_status()
                 except (httpx.HTTPError, ConnectionError) as exc:
-                    await keep_tab_open()
                     raise OmnigentError(
                         "Couldn't release the side chat's resources. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -2117,7 +2131,6 @@ def register_events_routes(
                         else None
                     )
                     if runner_status not in {"dead", "unknown"}:
-                        await keep_tab_open()
                         raise OmnigentError(
                             "Couldn't confirm the session's runner stopped. Please try again.",
                             code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -2163,7 +2176,7 @@ def register_events_routes(
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
-            # The stop itself is non-sticky: nothing seals the session. The
+            # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
             # its (still-online) host via the normal message-dispatch
@@ -3003,7 +3016,6 @@ def register_events_routes(
                 conv,
                 body,
                 conversation_store,
-                # Only the session's runner or its owner may add to the owner's side chats.
                 lists_side_chat=_has_bound_runner_authority(request, conv)
                 or await asyncio.to_thread(
                     _is_session_owner,

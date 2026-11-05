@@ -47,7 +47,6 @@ from omnigent.server.routes.sessions import create_sessions_router, routes_core
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     FORK_SOURCE_LABEL_KEY,
-    SIDE_CHAT_CLOSED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
@@ -682,9 +681,9 @@ def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
     assert response.json()["side_chat_parent_id"] is None
 
 
-async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: Any) -> dict:
-    """Every side chat listed for *parent_id*, one per page, mapped to its closed flag."""
-    listed: dict[str, bool] = {}
+async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: Any) -> set[str]:
+    """Every side chat listed for *parent_id*, one per page."""
+    listed: set[str] = set()
     after = None
     while True:
         params = {"limit": 1, **({"after": after} if after else {})}
@@ -695,7 +694,7 @@ async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: An
         page = response.json()
         # Pagination only ever names the side chats this page returned.
         assert {page["first_id"], page["last_id"]} <= {row["id"] for row in page["data"]} | {None}
-        listed.update({row["id"]: row["closed"] for row in page["data"]})
+        listed.update(row["id"] for row in page["data"])
         if not page["has_more"]:
             return listed
         after = page["last_id"]
@@ -727,18 +726,17 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
     # Created through a dashed spelling of the parent's id; listed through either.
     dashed_parent = str(uuid.UUID(hex=parent.id))
     side_chat = await fork(dashed_parent, {"side_chat": True})
-    closed_side_chat = await fork(parent.id, {"side_chat": True})
+    another_side_chat = await fork(parent.id, {"side_chat": True})
     other_side_chat = await fork(other_parent.id, {"side_chat": True})
     plain_fork = await fork(parent.id, {})
     codex_side_chat = await codex_child(
         {"thread_id": "thread_side", "agent_nickname": "Side chat"}
     )
     await codex_child({"thread_id": "thread_worker", "agent_nickname": "Worker"})
-    store.set_labels(closed_side_chat["id"], {SIDE_CHAT_CLOSED_LABEL_KEY: "1"})
     # A Codex side chat that ended stays listed, so its transcript stays readable.
     store.set_labels(codex_side_chat, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
 
-    expected = {side_chat["id"]: False, closed_side_chat["id"]: True, codex_side_chat: False}
+    expected = {side_chat["id"], another_side_chat["id"], codex_side_chat}
     assert await _side_chat_ids(client, parent.id) == expected
     snapshot = await client.get(f"/v1/sessions/{side_chat['id']}")
     assert snapshot.json()["side_chat_parent_id"] == parent.id
@@ -747,7 +745,7 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
     assert sidebar.status_code == 200, sidebar.text
     sidebar_ids = {row["id"] for row in sidebar.json()["data"]}
     assert plain_fork["id"] in sidebar_ids
-    assert not sidebar_ids & {side_chat["id"], closed_side_chat["id"], other_side_chat["id"]}
+    assert not sidebar_ids & {side_chat["id"], another_side_chat["id"], other_side_chat["id"]}
 
 
 @pytest.mark.asyncio
@@ -788,15 +786,17 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         headers=headers[editor],
     )
     assert side_command.status_code == 403, side_command.text
-    # The check reads /side the way the runner does, in any text block and at any length.
-    for content in ([{"type": "text", "text": "/side why?"}],):
-        smuggled = await auth_client.post(
-            f"/v1/sessions/{parent.id}/events",
-            json={"type": "message", "data": {"role": "user", "content": content}},
-            headers=headers[editor],
-        )
-        assert smuggled.status_code == 403, smuggled.text
-    # A text attachment is an ordinary message: its contents never act as /side.
+    # A plain text block counts as /side too.
+    smuggled = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "text", "text": "/side why?"}]},
+        },
+        headers=headers[editor],
+    )
+    assert smuggled.status_code == 403, smuggled.text
+    # Older executors interpret a lone text attachment as /side too.
     attached = await auth_client.post(
         f"/v1/sessions/{parent.id}/events",
         json={
@@ -814,7 +814,47 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         },
         headers=headers[editor],
     )
-    assert attached.status_code == 202, attached.text
+    assert attached.status_code == 403, attached.text
+    uploaded = await auth_client.post(
+        f"/v1/sessions/{parent.id}/resources/files",
+        files={"file": ("note.txt", b"/side why?", "text/plain")},
+        headers=headers[editor],
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    for block_type in ("input_file", "input_image"):
+        referenced = await auth_client.post(
+            f"/v1/sessions/{parent.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": block_type, "file_id": uploaded.json()["id"]}],
+                },
+            },
+            headers=headers[editor],
+        )
+        assert referenced.status_code == (403 if block_type == "input_file" else 202), (
+            referenced.text
+        )
+    # Ordinary text attachments remain messages for collaborators.
+    ordinary = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "filename": "note.txt",
+                        "file_data": "data:text/plain;base64,aGVsbG8=",
+                    }
+                ],
+            },
+        },
+        headers=headers[editor],
+    )
+    assert ordinary.status_code == 202, ordinary.text
     # Ordinary forks still need only read access.
     assert (await fork(reader, {})).status_code == 201
     started = await fork(owner, {"side_chat": True})
@@ -828,7 +868,7 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         headers=headers[owner],
     )
     assert registered.status_code == 202, registered.text
-    # An editor may still register a Codex child, but not into the owner's side chats.
+    # An editor cannot register a side chat directly either.
     forged = await auth_client.post(
         f"/v1/sessions/{parent.id}/events",
         json={
@@ -837,7 +877,7 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         },
         headers=headers[editor],
     )
-    assert forged.status_code == 202, forged.text
+    assert forged.status_code == 403, forged.text
 
     async def snapshot(user: str) -> dict[str, Any]:
         response = await auth_client.get(f"/v1/sessions/{parent.id}", headers=headers[user])
@@ -851,13 +891,13 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         assert (await snapshot(user))["side_chat_allowed"] is False
 
     assert await _side_chat_ids(auth_client, parent.id, headers=headers[owner]) == {
-        started.json()["id"]: False,
-        registered.json()["child_session_id"]: False,
+        started.json()["id"],
+        registered.json()["child_session_id"],
     }
     for user in (editor, reader, admin):
-        assert await _side_chat_ids(auth_client, parent.id, headers=headers[user]) == {}
+        assert await _side_chat_ids(auth_client, parent.id, headers=headers[user]) == set()
     # A signed-out viewer of the public parent gets none either.
-    assert await _side_chat_ids(auth_client, parent.id) == {}
+    assert await _side_chat_ids(auth_client, parent.id) == set()
 
     # A Codex sub-agent the editor started, with its own owner grant, still
     # belongs to the parent's owner, and so does a side chat opened from it.
@@ -878,9 +918,9 @@ async def test_only_the_owner_starts_and_lists_side_chats(
     )
     assert nested.status_code == 202, nested.text
     assert await _side_chat_ids(auth_client, child.id, headers=headers[owner]) == {
-        nested.json()["child_session_id"]: False
+        nested.json()["child_session_id"]
     }
-    assert await _side_chat_ids(auth_client, child.id, headers=headers[editor]) == {}
+    assert await _side_chat_ids(auth_client, child.id, headers=headers[editor]) == set()
 
     # The session's own runner registers its side chats, whoever it signs in as.
     token = "side-chat-runner-token"
@@ -901,7 +941,7 @@ async def test_only_the_owner_starts_and_lists_side_chats(
     )
     assert from_runner.status_code == 202, from_runner.text
     assert await _side_chat_ids(auth_client, bound.id, headers=headers[owner]) == {
-        from_runner.json()["child_session_id"]: False
+        from_runner.json()["child_session_id"]
     }
 
 

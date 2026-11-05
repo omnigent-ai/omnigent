@@ -135,10 +135,6 @@ SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 # Server-owned routing ancestry; it does not require a workspace or own a runner.
 SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
-# Set when a side chat's tab is closed, so the user's other devices drop it too.
-# Unlike ``omnigent.closed`` it leaves the side chat writable.
-SIDE_CHAT_CLOSED_LABEL_KEY = "omnigent.side_chat.closed"
-
 # Items a generic side chat copies from its parent get ids starting with the side
 # chat's own first 12 id characters, so any device can hide exactly that history.
 # A side chat's own items get random ids, which match by chance once in 16**12.
@@ -250,7 +246,6 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
-    SIDE_CHAT_CLOSED_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
 }
@@ -810,22 +805,6 @@ class ConversationStore(ABC):
         :param after: Cursor: the previous page's last id.
         :param limit: Maximum ids to return.
         :returns: Side-chat ids, e.g. ``["conv_side1"]``.
-        """
-        ...
-
-    @abstractmethod
-    def get_created_at_and_labels(
-        self, conversation_ids: list[str], keys: tuple[str, ...]
-    ) -> dict[str, tuple[int, dict[str, str]]]:
-        """Return each existing conversation's creation time and its labels among *keys*.
-
-        Reads one conversation row and at most ``len(keys)`` label rows per id,
-        never the conversation's other labels.
-
-        :param conversation_ids: Conversations to read, e.g. ``["conv_abc123"]``.
-        :param keys: The labels to read, e.g. ``("omnigent.closed",)``.
-        :returns: ``{id: (created_at, {key: value})}`` with only the labels that
-            are set; missing ids are omitted.
         """
         ...
 

@@ -52,7 +52,6 @@ from omnigent.server.schemas import (
     SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.conversation_store import SIDE_CHAT_CLOSED_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
 
 # ``?descendants=true`` depth: the default matches the CLI tree and the web
@@ -327,20 +326,19 @@ def register_items_routes(
     async def list_side_chats(
         request: Request,
         session_id: str,
-        limit: int = Query(default=100, ge=1, le=1000),
+        limit: int = Query(default=20, ge=1, le=20),
         after: str | None = Query(default=None),
     ) -> PaginatedList:
         """
-        List the side chats shown as tabs in a session's Workspace rail.
+        List the side chats available in a session's Workspace rail.
 
         Only the owner of the session's root starts side chats there, so only
         that owner gets any, in id order; anyone else, admins included, gets an
-        empty page. Closed side chats are included, so other devices can close
-        their tabs.
+        empty page. Opening and closing tabs is local to each device.
 
         :param request: Inbound HTTP request; carries the caller identity.
         :param session_id: Parent session id, e.g. ``"conv_abc123"``.
-        :param limit: Maximum side chats to return (1-1000, default 100).
+        :param limit: Maximum side chats to return (1-20, default 20).
         :param after: Cursor: the previous page's ``last_id``.
         :returns: A :class:`PaginatedList` of :class:`SideChatSummary`.
         :raises OmnigentError: 403 if the caller lacks READ on
@@ -369,16 +367,13 @@ def register_items_routes(
         )
         has_more = len(ids) > limit
         ids = ids[:limit]
-        rows = await asyncio.to_thread(
-            conversation_store.get_created_at_and_labels, ids, (SIDE_CHAT_CLOSED_LABEL_KEY,)
-        )
+        rows = await asyncio.to_thread(conversation_store.get_conversations, ids)
         return PaginatedList(
             data=[
                 SideChatSummary(
                     id=side_id,
-                    created_at=rows[side_id][0],
-                    # Only a closed tab; an ended Codex side chat stays readable.
-                    closed=SIDE_CHAT_CLOSED_LABEL_KEY in rows[side_id][1],
+                    created_at=rows[side_id].created_at,
+                    title=rows[side_id].title,
                 )
                 for side_id in ids
                 if side_id in rows

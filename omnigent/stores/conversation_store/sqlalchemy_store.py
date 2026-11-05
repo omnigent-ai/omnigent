@@ -1622,39 +1622,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session("list_side_chat_ids") as session:
             return list(session.scalars(stmt.order_by(meta.id).limit(limit)))
 
-    def get_created_at_and_labels(
-        self, conversation_ids: list[str], keys: tuple[str, ...]
-    ) -> dict[str, tuple[int, dict[str, str]]]:
-        if not conversation_ids:
-            return {}
-        stmt = (
-            select(
-                SqlConversation.id,
-                SqlConversation.created_at,
-                SqlConversationLabel.key,
-                SqlConversationLabel.value,
-            )
-            .outerjoin(
-                SqlConversationLabel,
-                and_(
-                    SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
-                    SqlConversationLabel.conversation_id == SqlConversation.id,
-                    SqlConversationLabel.key.in_(keys),
-                ),
-            )
-            .where(
-                SqlConversation.workspace_id == current_workspace_id(),
-                SqlConversation.id.in_(conversation_ids),
-            )
-        )
-        found: dict[str, tuple[int, dict[str, str]]] = {}
-        with self._conv_session("get_created_at_and_labels") as ap_sess:
-            for conv_id, created_at, key, value in ap_sess.execute(stmt).all():
-                _, labels = found.setdefault(conv_id, (created_at, {}))
-                if key is not None:
-                    labels[key] = value
-        return found
-
     def set_labels(
         self,
         conversation_id: str,
