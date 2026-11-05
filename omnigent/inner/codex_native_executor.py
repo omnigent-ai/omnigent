@@ -9,6 +9,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -1009,7 +1010,7 @@ class CodexNativeExecutor(Executor):
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # noqa: BLE001 - the local cancel above already took effect.
+                except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
