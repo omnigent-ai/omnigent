@@ -1134,9 +1134,9 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.deepEqual(proxyLookups, ["http://spog.dev.localhost:5173/hmr"]);
   });
 
-  it("accepts an IP-less *.localhost upgrade only on a direct route for an eligible view", async () => {
+  it("sends *.localhost requests and IP-less upgrades only on a direct route for an eligible view", async () => {
     const context = { hostIsThisMachine: true };
-    const upgradeCancelled = async (resolveProxy, viewId = "local") => {
+    const verdictsOn = async (resolveProxy, viewId = "local") => {
       const { registry, idOf, lookups } = makeNetworkGuardRegistry({
         allowsLocalhost: (ctx) => ctx === context,
         resolveProxy,
@@ -1146,24 +1146,51 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
         agentContext: context,
       });
       registry.openOrNavigate("remote", "https://example.com/", undefined, { agent: true });
-      const cancel = await registry.shouldCancelAgentResponse({
-        webContentsId: idOf(viewId),
-        url: "ws://spog.dev.localhost:5173/hmr",
-        resourceType: "webSocket",
-        statusCode: 101,
-      });
+      const webContentsId = idOf(viewId);
+      const page = { webContentsId, url: "http://spog.dev.localhost:5173/", resourceType: "xhr" };
+      const socket = { webContentsId, url: "ws://spog.dev.localhost:5173/hmr" };
+      const worker = { ...page, webContentsId: undefined };
+      const verdicts = {
+        request: await registry.shouldCancelAgentRequest(page),
+        workerRequest: await registry.shouldCancelAgentRequest(
+          worker,
+          agentPartition("w-test", viewId),
+        ),
+        socketRequest: await registry.shouldCancelAgentRequest(socket),
+        upgrade: await registry.shouldCancelAgentResponse({
+          ...socket,
+          resourceType: "webSocket",
+          statusCode: 101,
+        }),
+        exactLocalhost: await registry.shouldCancelAgentRequest({
+          ...page,
+          url: "http://localhost:5173/",
+        }),
+      };
       assert.deepEqual(lookups, [], "no DNS lookup for *.localhost");
-      return cancel;
+      return verdicts;
     };
     const direct = async () => "DIRECT";
-    assert.equal(
-      await upgradeCancelled(direct),
-      false,
+    assert.deepEqual(
+      await verdictsOn(direct),
+      {
+        request: false,
+        workerRequest: false,
+        socketRequest: false,
+        upgrade: false,
+        exactLocalhost: false,
+      },
       "Chromium connects a direct *.localhost to loopback",
     );
-    assert.equal(
-      await upgradeCancelled(direct, "remote"),
-      true,
+    assert.deepEqual(
+      await verdictsOn(direct, "remote"),
+      {
+        request: true,
+        workerRequest: true,
+        socketRequest: true,
+        upgrade: true,
+        exactLocalhost: true,
+      },
       "an ineligible view never opens *.localhost",
     );
     const unsafeRoutes = {
@@ -1175,14 +1202,19 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
       },
     };
     const verdicts = await Promise.all(
-      Object.entries(unsafeRoutes).map(async ([label, route]) => [
-        label,
-        await upgradeCancelled(route),
-      ]),
+      Object.entries(unsafeRoutes).map(async ([label, route]) => [label, await verdictsOn(route)]),
     );
+    // Exact localhost keeps its existing request-stage behaviour.
+    const refused = {
+      request: true,
+      workerRequest: true,
+      socketRequest: true,
+      upgrade: true,
+      exactLocalhost: false,
+    };
     assert.deepEqual(
       verdicts,
-      Object.keys(unsafeRoutes).map((label) => [label, true]),
+      Object.keys(unsafeRoutes).map((label) => [label, refused]),
     );
   });
 

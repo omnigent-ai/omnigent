@@ -820,6 +820,16 @@ it(
     await new Promise((resolve) => {
       fixture.listen(0, "127.0.0.1", resolve);
     });
+    // An HTTP proxy that answers every request it receives.
+    const proxyRequests = [];
+    const proxyFixture = http.createServer((request, response) => {
+      proxyRequests.push(request.url);
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      response.end("served by the proxy");
+    });
+    await new Promise((resolve) => {
+      proxyFixture.listen(0, "127.0.0.1", resolve);
+    });
     const devHost = `spog.dev.localhost:${fixture.address().port}`;
     const devUrl = (view) => `http://${devHost}/one?view=${view}`;
     const marks = [];
@@ -965,6 +975,39 @@ it(
         "the dev server sees its *.localhost Host header",
       );
 
+      mark("proxy routes");
+      // Chromium sends *.localhost around an ordinary proxy; only an explicit
+      // `<-loopback>` rule routes it through one, and the guard refuses that.
+      const agentView = await viewAt(devUrl("agent"));
+      const setViewProxy = (config) =>
+        electronApp.evaluate(
+          (_electron, { id, proxyConfig }) =>
+            global.omnigentTestBrowserRegistries[0]
+              .get(id)
+              .view.webContents.session.setProxy(proxyConfig),
+          { id: agentView.id, proxyConfig: config },
+        );
+      const proxyRules = `http://127.0.0.1:${proxyFixture.address().port}`;
+      await setViewProxy({ proxyRules });
+      const bypassed = await requestAgentNavigation(
+        backend.serverUrl,
+        backend.sessionId,
+        devUrl("system-proxy"),
+      );
+      assert.equal(bypassed.ok, true, JSON.stringify(bypassed));
+      await expectDevPage(devUrl("system-proxy"), "*.localhost beside a system proxy");
+      await setViewProxy({ proxyRules, proxyBypassRules: "<-loopback>" });
+      const forced = await requestAgentNavigation(
+        backend.serverUrl,
+        backend.sessionId,
+        devUrl("forced-proxy"),
+      );
+      assert.equal(forced.ok, true, "the IPC hop accepts the URL; the network guard cancels it");
+      assert.equal(await pageText(agentView.id), "", "the proxied *.localhost page stays blank");
+      await setViewProxy({ mode: "direct" });
+      assert.equal(devRequests.length, 4, "the forced-proxy request never reaches the dev server");
+      assert.deepEqual(proxyRequests, [], "no *.localhost request is sent through the proxy");
+
       mark("CUJ-4 remote session refused");
       await window.goto(`${backend.serverUrl}/c/${backend.otherSessionId}`);
       await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
@@ -986,7 +1029,7 @@ it(
       await remoteBar.press("Enter");
       const refusal = window.getByRole("alert").filter({ hasText: "is a loopback/internal host" });
       await refusal.waitFor();
-      assert.equal(devRequests.length, 3, "a remote session sends no *.localhost request");
+      assert.equal(devRequests.length, 4, "a remote session sends no *.localhost request");
       await wait(recording ? 4000 : 1000);
       assert.equal(await refusal.isVisible(), true, "the refusal stays on screen");
       mark("end");
@@ -995,7 +1038,7 @@ it(
       fs.mkdirSync(recordDir, { recursive: true });
       fs.writeFileSync(
         path.join(recordDir, "localhost-subdomain-evidence.json"),
-        JSON.stringify({ marks, devRequests }, null, 2),
+        JSON.stringify({ marks, devRequests, proxyRequests }, null, 2),
       );
       if (desktop) {
         await desktop.window.unrouteAll({ behavior: "wait" });
@@ -1008,6 +1051,10 @@ it(
       fixture.closeAllConnections();
       await new Promise((resolve) => {
         fixture.close(resolve);
+      });
+      proxyFixture.closeAllConnections();
+      await new Promise((resolve) => {
+        proxyFixture.close(resolve);
       });
       fs.rmSync(scratch, { recursive: true, force: true });
     }

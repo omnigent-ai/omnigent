@@ -521,8 +521,10 @@ Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.
 
 Eligibility is per view: a public page in an eligible view can frame loopback
-documents too. A `*.localhost` request must connect to a loopback address;
-one a resolver or proxy sends elsewhere is cancelled. Private networks,
+documents too. A `*.localhost` request is sent only on a direct route and must
+connect to a loopback address. Chromium already sends these names around
+ordinary system and PAC proxies; a proxy rule that removes that bypass
+(`<-loopback>`) leaves the page blank. Private networks,
 link-local/metadata addresses, `0.0.0.0`, trailing-dot or empty-label forms
 such as `app.localhost.`, and DNS aliases resolving to loopback remain blocked.
 Normal TLS, CORS, authentication, and local-network permission rules still
@@ -649,8 +651,10 @@ including the address bar, chat links, and agent actions, enforces this policy.
   through its partition before sending, including GET/HEAD subresources and
   WebSockets. IP literals use the URL check without DNS. Loopback names
   (`localhost`, `127.0.0.1`, `[::1]`, and `*.localhost`) remain available to
-  eligible Arca and this-machine sessions without DNS; a `*.localhost` response
-  must come from a loopback address. Enforcement cancels requests and
+  eligible Arca and this-machine sessions without DNS. A `*.localhost` request
+  is cancelled before sending unless the partition's proxy lookup returns
+  `DIRECT` alone, and its response must come from a loopback address.
+  Enforcement cancels requests and
   keeps the view open.
   Guarded HTTP requests skip cache reads to obtain connected-address metadata;
   a response whose address is missing
@@ -659,10 +663,9 @@ including the address bar, chat links, and agent actions, enforces this policy.
   network round trips and may increase latency and bandwidth. WebSocket upgrades
   can omit the connected IP; those repeat the partition DNS check at the 101
   response. This is not connected-IP verification and cannot rule out a DNS
-  change between check and connection. An IP-less `*.localhost` upgrade is
-  accepted only when the partition's proxy lookup returns `DIRECT` alone,
-  because Chromium pins those names to loopback but a proxy could route them
-  elsewhere. Limits: a DNS
+  change between check and connection. An IP-less `*.localhost` upgrade
+  repeats the direct-route check instead, because Chromium pins those names to
+  loopback and only a proxy could route them elsewhere. Limits: a DNS
   change between preflight and connection can still send a request to a private
   address; the HTTP response check prevents the page from reading its response.
   Pages restored from the back-forward cache and navigations answered by a service worker make no
