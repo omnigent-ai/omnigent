@@ -1448,6 +1448,27 @@ describe("history a side chat copied from its parent", () => {
     expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
   });
 
+  it("leaves a listed Codex side chat's own transcript alone", () => {
+    listSideChat();
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "codex-native", loadingConversation: true });
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([
+          // A native fork copies nothing, so even a prefix-looking id is its own turn.
+          userItem(`${childId.slice(0, 12)}own`, "resp_own", "Asked in the Codex side chat"),
+          userItem("item_next", "resp_next", "Followed up"),
+        ]),
+      }),
+    );
+
+    expect(screen.getByText("Asked in the Codex side chat")).toBeInTheDocument();
+    expect(screen.getByText("Followed up")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
+
   it("hides nothing when the fork copied nothing", () => {
     listSideChat();
     const entry = conversationRegistry.acquire(childId);

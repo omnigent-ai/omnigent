@@ -248,7 +248,10 @@ export function useSideChats(conversationId: string) {
             }
           : listed,
       );
-      void queryClient.invalidateQueries({ queryKey: key });
+      // A list already in flight was read before this close; drop it, don't join it.
+      void queryClient
+        .cancelQueries({ queryKey: key })
+        .then(() => queryClient.invalidateQueries({ queryKey: key }));
     },
     [update, queryClient, conversationId],
   );

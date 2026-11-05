@@ -116,6 +116,9 @@ from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -1266,10 +1269,16 @@ def register_events_routes(
             body.type == "message"
             and isinstance(request, Request)
             and _opens_codex_side_chat(conv, body)
+            and not await asyncio.to_thread(
+                _is_session_owner,
+                user_id,
+                conv,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            )
         ):
-            # Only a session's owner can start its side chats.
-            await _require_access_and_level(
-                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            raise OmnigentError(
+                "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
             )
         start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"

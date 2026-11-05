@@ -750,15 +750,17 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
 async def test_only_the_owner_starts_and_lists_side_chats(
     auth_client: httpx.AsyncClient, client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """Editors and readers of a shared parent can't start side chats or see the owner's."""
+    """Editors, readers and admins of a shared parent can't start side chats or see the owner's."""
     owner, editor, reader = "owner@example.com", "editor@example.com", "reader@example.com"
-    headers = {user: {"X-Forwarded-Email": user} for user in (owner, editor, reader)}
+    admin = "admin@example.com"
+    headers = {user: {"X-Forwarded-Email": user} for user in (owner, editor, reader, admin)}
     store = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
     agent = await create_test_agent(client, name="side-chat-privacy")
     parent = store.create_conversation(agent_id=agent["id"], harness_override="codex-native")
     for user in (owner, editor, reader, RESERVED_USER_PUBLIC):
         permissions.ensure_user(user)
+    permissions.ensure_user(admin, is_admin=True)
     permissions.grant(owner, parent.id, LEVEL_OWNER)
     permissions.grant(editor, parent.id, LEVEL_EDIT)
     permissions.grant(reader, parent.id, LEVEL_READ)
@@ -769,7 +771,7 @@ async def test_only_the_owner_starts_and_lists_side_chats(
             f"/v1/sessions/{parent.id}/fork", json=body, headers=headers[user]
         )
 
-    for user in (editor, reader):
+    for user in (editor, reader, admin):
         refused = await fork(user, {"side_chat": True})
         assert refused.status_code == 403, refused.text
     # A Codex /side typed in the web composer starts a side chat too.
@@ -800,10 +802,33 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         started.json()["id"]: False,
         registered.json()["child_session_id"]: False,
     }
-    for user in (editor, reader):
+    for user in (editor, reader, admin):
         assert await _side_chat_ids(auth_client, parent.id, headers=headers[user]) == {}
     # A signed-out viewer of the public parent gets none either.
     assert await _side_chat_ids(auth_client, parent.id) == {}
+
+    # A Codex sub-agent the editor started, with its own owner grant, still
+    # belongs to the parent's owner, and so does a side chat opened from it.
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        agent_id=agent["id"],
+        harness_override="codex-native",
+    )
+    permissions.grant(editor, child.id, LEVEL_OWNER)
+    nested = await auth_client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_nested", "agent_nickname": "Side chat"},
+        },
+        headers=headers[owner],
+    )
+    assert nested.status_code == 202, nested.text
+    assert await _side_chat_ids(auth_client, child.id, headers=headers[owner]) == {
+        nested.json()["child_session_id"]: False
+    }
+    assert await _side_chat_ids(auth_client, child.id, headers=headers[editor]) == {}
 
 
 @pytest.mark.asyncio

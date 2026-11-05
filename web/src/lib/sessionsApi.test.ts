@@ -1168,6 +1168,19 @@ describe("getSession", () => {
     expect((await getSession("side")).sideChatSettingsSupported).toBe(supported === true);
   });
 
+  it("reads the parent that lists a side chat", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "side",
+        agent_id: "agent",
+        status: "idle",
+        created_at: 0,
+        side_chat_parent_id: "conv_parent",
+      }),
+    );
+    expect((await getSession("side")).sideChatParentId).toBe("conv_parent");
+  });
+
   it("GETs the sessions endpoint and parses the response", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

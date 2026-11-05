@@ -412,9 +412,9 @@ pickers, seeded from the source session when its harness family is kept.
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
 
-**Side chat** (from an existing session): choose **+ → Start a new side chat**
-in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on selected
-text. For native Codex, send the first message before using its model/effort
+**Side chat** (from an existing session you own): choose **+ → Start a new side
+chat** in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on
+selected text. Editors and viewers of a shared session don't get these. For native Codex, send the first message before using its model/effort
 pill; later selections apply on the next turn. For other supported harnesses,
 open the side-chat model pill to choose model/effort before or after its
 first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)

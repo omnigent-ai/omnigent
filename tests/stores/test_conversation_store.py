@@ -31,7 +31,7 @@ from omnigent.entities import (
     ResourceEventData,
 )
 from omnigent.errors import StaleCursorError
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -174,44 +174,29 @@ def test_fork_drops_per_user_pin_labels(
     assert pinned_label_key("bob") not in fork.labels
 
 
-def test_side_chats_are_listed_for_their_owner_one_page_at_a_time(tmp_path: Path) -> None:
-    """A parent's side chats page in id order for whoever owns them, and no one else."""
-    from omnigent.stores.permission_store.sqlalchemy_store import (
-        SqlAlchemyPermissionStore,
-    )
-
+def test_side_chats_page_by_parent_in_id_order(tmp_path: Path) -> None:
+    """A parent's side chats, generic and Codex, page in id order and nothing else is listed."""
     # Split databases: the listing must read only the Omnigent side.
-    omnigent_uri = f"sqlite:///{tmp_path}/omnigent.db"
-    store = SqlAlchemyConversationStore(omnigent_uri, f"sqlite:///{tmp_path}/conversations.db")
-    perms = SqlAlchemyPermissionStore(omnigent_uri)
-    for user in ("alice", "bob"):
-        perms.ensure_user(user)
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path}/omnigent.db", f"sqlite:///{tmp_path}/conversations.db"
+    )
     parent = store.create_conversation()
-    perms.grant("alice", parent.id, LEVEL_OWNER)
-    alices = [store.create_conversation(side_chat_parent_id=parent.id) for _ in range(2)]
-    for side_chat in alices:
-        perms.grant("alice", side_chat.id, LEVEL_OWNER)
-    bobs = store.create_conversation(side_chat_parent_id=parent.id)
-    perms.grant("bob", bobs.id, LEVEL_OWNER)
-    # A Codex /side fork is a sub-agent, owned through its parent.
+    generic = [store.create_conversation(side_chat_parent_id=parent.id) for _ in range(2)]
     codex = store.create_conversation(
         kind="sub_agent", parent_conversation_id=parent.id, side_chat_parent_id=parent.id
     )
-    elsewhere = store.create_conversation(side_chat_parent_id=store.create_conversation().id)
-    perms.grant("alice", elsewhere.id, LEVEL_OWNER)
-    perms.grant("alice", store.create_conversation().id, LEVEL_OWNER)
-    store.set_labels(alices[0].id, {"omnigent.closed": "true", "unrelated": "x"})
+    store.create_conversation(side_chat_parent_id=store.create_conversation().id)
+    store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    store.set_labels(generic[0].id, {"omnigent.closed": "true", "unrelated": "x"})
 
-    first = store.list_side_chat_ids(parent.id, owned_by="alice", limit=2)
-    rest = store.list_side_chat_ids(parent.id, owned_by="alice", after=first[-1], limit=2)
+    first = store.list_side_chat_ids(parent.id, limit=2)
+    rest = store.list_side_chat_ids(parent.id, after=first[-1], limit=2)
 
-    mine = sorted([*(side_chat.id for side_chat in alices), codex.id])
-    assert first + rest == mine
-    assert store.list_side_chat_ids(parent.id, owned_by="bob") == [bobs.id]
-    assert store.list_side_chat_ids(parent.id, owned_by=None) == sorted([*mine, bobs.id])
-    assert store.get_created_at_and_label(mine, "omnigent.closed") == {
-        side_chat.id: (side_chat.created_at, "true" if side_chat is alices[0] else None)
-        for side_chat in [*alices, codex]
+    side_chats = [*generic, codex]
+    assert first + rest == sorted(side_chat.id for side_chat in side_chats)
+    assert store.get_created_at_and_label(first + rest, "omnigent.closed") == {
+        side_chat.id: (side_chat.created_at, "true" if side_chat is generic[0] else None)
+        for side_chat in side_chats
     }
 
 

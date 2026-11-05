@@ -792,18 +792,16 @@ class ConversationStore(ABC):
         self,
         parent_id: str,
         *,
-        owned_by: str | None,
         after: str | None = None,
         limit: int = 100,
     ) -> list[str]:
-        """Return the ids of *parent_id*'s side chats that *owned_by* owns, in id order.
+        """Return the ids of *parent_id*'s side chats in id order.
 
-        Ownership is an owner grant on the side chat or, for a sub-agent side
-        chat (a Codex ``/side`` fork), on the parent it delegates access to.
+        Reads at most *limit* index entries. There is no per-row access check:
+        only the owner of the parent's root can start side chats there, and
+        the routes list them to that owner alone.
 
         :param parent_id: Session whose rail lists the side chats, e.g. ``"conv_abc123"``.
-        :param owned_by: The caller, e.g. ``"alice@example.com"``; ``None``
-            (auth disabled) lists every side chat of the parent.
         :param after: Cursor: the previous page's last id.
         :param limit: Maximum ids to return.
         :returns: Side-chat ids, e.g. ``["conv_side1"]``.

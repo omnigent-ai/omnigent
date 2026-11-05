@@ -22,12 +22,14 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
-    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
+)
+from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
@@ -331,9 +333,10 @@ def register_items_routes(
         """
         List the side chats shown as tabs in a session's Workspace rail.
 
-        Only the session's owner starts side chats, so only the owner gets any,
-        in id order; a reader of a shared session gets an empty page. Closed
-        side chats are included, so other devices can close their tabs.
+        Only the owner of the session's root starts side chats there, so only
+        that owner gets any, in id order; anyone else, admins included, gets an
+        empty page. Closed side chats are included, so other devices can close
+        their tabs.
 
         :param request: Inbound HTTP request; carries the caller identity.
         :param session_id: Parent session id, e.g. ``"conv_abc123"``.
@@ -347,21 +350,22 @@ def register_items_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        if access.conversation is None and (
-            await asyncio.to_thread(conversation_store.get_conversation, session_id) is None
-        ):
+        parent = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if parent is None:
             raise _session_not_found()
-        # Only a session's owner starts its side chats, so no one else has any here.
-        if (auth_provider is not None and user_id is None) or (
-            access.level is not None and access.level < LEVEL_OWNER
+        # Only the owner of the parent's root starts its side chats, so they are all theirs.
+        if not await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            parent,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
         ):
             return PaginatedList(data=[], has_more=False)
         ids = await asyncio.to_thread(
-            conversation_store.list_side_chat_ids,
-            session_id,
-            owned_by=user_id,
-            after=after,
-            limit=limit + 1,
+            conversation_store.list_side_chat_ids, parent.id, after=after, limit=limit + 1
         )
         has_more = len(ids) > limit
         ids = ids[:limit]

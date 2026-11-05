@@ -11,7 +11,6 @@ from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
-    Exists,
     LargeBinary,
     Select,
     and_,
@@ -1608,12 +1607,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         parent_id: str,
         *,
-        owned_by: str | None,
         after: str | None = None,
         limit: int = 100,
     ) -> list[str]:
-        from omnigent.server.auth import LEVEL_OWNER
-
         if limit <= 0:
             raise ValueError("limit must be positive")
         meta = SqlConversationMetadata
@@ -1623,28 +1619,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if after is not None:
             stmt = stmt.where(meta.id > after)
-        if owned_by is not None:
-
-            def owns(conversation_id: QueryableAttribute[str] | str) -> Exists:
-                return (
-                    select(SqlSessionPermission.conversation_id)
-                    .where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == owned_by,
-                        SqlSessionPermission.conversation_id == conversation_id,
-                        SqlSessionPermission.level >= LEVEL_OWNER,
-                    )
-                    .exists()
-                )
-
-            # Only the parent's owner starts its side chats (the routes check), so
-            # for that owner every row this reads is returned.
-            stmt = stmt.where(
-                or_(
-                    owns(meta.id),
-                    and_(meta.kind == encode_conversation_kind("sub_agent"), owns(parent_id)),
-                )
-            )
         with self._session("list_side_chat_ids") as session:
             return list(session.scalars(stmt.order_by(meta.id).limit(limit)))
 

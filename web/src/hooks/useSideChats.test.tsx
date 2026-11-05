@@ -438,6 +438,34 @@ describe("side chats opened on another device", () => {
     expect(readSessionWorkspaceState("session-a").openSideChats).toEqual([]);
   });
 
+  it("stay closed when closed before the first list arrives", async () => {
+    writeSessionWorkspaceState("session-a", { openSideChats: ["conv_side"] });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The first list, read before the close, still names the side chat open.
+    vi.mocked(authenticatedFetch).mockImplementationOnce(async () => {
+      await held;
+      return new Response(
+        JSON.stringify({ data: [{ id: "conv_side", created_at: 1 }], last_id: "conv_side" }),
+      );
+    });
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
+    expect(result.current.tabs).toEqual(["conv_side"]);
+
+    serverSideChats([{ id: "conv_side", created_at: 1, closed: true }]);
+    act(() => result.current.close("conv_side"));
+    release();
+    await waitFor(() => expect(vi.mocked(authenticatedFetch)).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(queryClient.getQueryCache().getAll()[0]?.state.fetchStatus).toBe("idle"),
+    );
+
+    expect(result.current.tabs).toEqual([]);
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual([]);
+  });
+
   it("leave local tabs alone when the server can't list them", async () => {
     writeSessionWorkspaceState("session-a", { openSideChats: ["conv_local"] });
     serverSideChats(null);
