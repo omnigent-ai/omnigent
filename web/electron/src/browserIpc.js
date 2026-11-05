@@ -11,7 +11,7 @@ const crypto = require("node:crypto");
 const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
-const { isGoogleAccessBlockedUrl, systemBrowserUrl } = require("./browserSystemHandoff");
+const { isGoogleAccessBlockedUrl, systemBrowserCandidates } = require("./browserSystemHandoff");
 const { buildDesignModeScript } = require("./designModeScript");
 
 const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
@@ -667,23 +667,33 @@ function registerBrowserIpc({
   });
 
   // ── Toolbar: open in the system browser ──────────────────────────────────
-  // Main picks the URL from the view itself (see systemBrowserUrl), so the
-  // renderer can only ask to hand off the page this tab is showing.
+  // Main picks the URL from the view itself, and only one the view's own
+  // navigation policy allows, so the renderer can't choose the destination.
   ipcMain.handle("omnigent:browser-open-in-system-browser", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    let url;
+    let candidates;
     try {
-      url = systemBrowserUrl({
+      candidates = systemBrowserCandidates({
         currentUrl: entry.view.webContents.getURL(),
         navigationTrail: entry.navigationTrail,
       });
     } catch {
       return { ok: false, error: "browser closed" };
     }
-    if (!url) return { ok: false, error: "This tab has no web page to open." };
+    if (candidates.length === 0) {
+      return { ok: false, error: "This tab has no web page to open." };
+    }
+    const verdicts = await Promise.all(
+      candidates.map((candidate) =>
+        g.registry.checkSystemBrowserUrl(args.conversationId, candidate),
+      ),
+    );
+    const allowed = verdicts.findIndex((verdict) => verdict.ok);
+    if (allowed === -1) return { ok: false, error: verdicts.at(-1).error };
+    const url = candidates[allowed];
     try {
       await openExternal(url);
       return { ok: true, url };

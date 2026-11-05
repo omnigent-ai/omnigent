@@ -12,7 +12,7 @@ const GOOGLE_ACCESS_BLOCKED_HOST = "access.workspace.google.com";
 // another browser restarts the sign-in instead of reaching the user's page.
 const GOOGLE_SIGN_IN_HOSTS = new Set(["accounts.google.com", GOOGLE_ACCESS_BLOCKED_HOST]);
 
-// Main-frame URLs remembered per view since its last explicit navigation.
+// Most navigation-trail entries kept per view.
 const NAVIGATION_TRAIL_LIMIT = 30;
 
 /**
@@ -71,26 +71,24 @@ function recordNavigation(trail, url) {
 }
 
 /**
- * The URL to open in the system browser for a view. Normally the current
- * page; on Google's access block page, the newest sign-in `continue` target
- * on an origin the view loaded, else the newest non-sign-in page it loaded.
- * A page can set `continue` freely, so unvisited origins are never opened.
+ * URLs to open in the system browser for a view, best first. Normally just the
+ * current page; on Google's access block page, sign-in `continue` targets on
+ * origins the view loaded (newest first), then the pages it loaded (newest
+ * first), then the block page. Callers still apply the view's navigation policy.
  *
  * @param {{ currentUrl: string, navigationTrail?: string[] }} view
- * @returns {string | null} Null when the view shows no http(s) page.
+ * @returns {string[]} Empty when the view shows no http(s) page.
  */
-function systemBrowserUrl({ currentUrl, navigationTrail = [] }) {
+function systemBrowserCandidates({ currentUrl, navigationTrail = [] }) {
   const current = parseWebUrl(currentUrl);
-  if (!current) return null;
-  if (!isGoogleAccessBlockedUrl(current.href)) return current.href;
+  if (!current) return [];
+  if (!isGoogleAccessBlockedUrl(current.href)) return [current.href];
   const visitedPages = navigationTrail.filter((url) => parseWebUrl(url) && !isGoogleSignInUrl(url));
   const visitedOrigins = new Set(visitedPages.map((url) => new URL(url).origin));
-  const newestFirst = [current.href, ...[...navigationTrail].reverse()];
-  for (const url of newestFirst) {
-    const target = signInContinueUrl(url);
-    if (target && visitedOrigins.has(new URL(target).origin)) return target;
-  }
-  return visitedPages.at(-1) ?? current.href;
+  const continueTargets = [current.href, ...[...navigationTrail].reverse()]
+    .map(signInContinueUrl)
+    .filter((target) => target && visitedOrigins.has(new URL(target).origin));
+  return [...new Set([...continueTargets, ...[...visitedPages].reverse(), current.href])];
 }
 
 module.exports = {
@@ -99,5 +97,5 @@ module.exports = {
   isGoogleAccessBlockedUrl,
   recordNavigation,
   signInContinueUrl,
-  systemBrowserUrl,
+  systemBrowserCandidates,
 };

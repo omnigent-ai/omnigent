@@ -8,12 +8,13 @@ const {
   isGoogleAccessBlockedUrl,
   recordNavigation,
   signInContinueUrl,
-  systemBrowserUrl,
+  systemBrowserCandidates,
 } = require("../src/browserSystemHandoff");
 
 const BLOCKED = "https://access.workspace.google.com/remediate?flow=x";
 const DOC = "https://docs.google.com/document/d/1";
 const SIGN_IN = `https://accounts.google.com/ServiceLogin?continue=${encodeURIComponent(DOC)}`;
+const systemBrowserUrl = (view) => systemBrowserCandidates(view)[0] ?? null;
 
 describe("browserSystemHandoff — detection", () => {
   it("flags only the Google Workspace access-blocked host", () => {
@@ -61,7 +62,19 @@ describe("browserSystemHandoff — navigation trail", () => {
   });
 });
 
-describe("browserSystemHandoff — systemBrowserUrl", () => {
+describe("browserSystemHandoff — systemBrowserCandidates", () => {
+  it("lists continue targets, then loaded pages, then the block page", () => {
+    const LANDING = "https://docs.google.com/";
+    assert.deepEqual(
+      systemBrowserCandidates({
+        currentUrl: BLOCKED,
+        navigationTrail: [LANDING, DOC, SIGN_IN, BLOCKED],
+      }),
+      [DOC, LANDING, BLOCKED],
+    );
+    assert.deepEqual(systemBrowserCandidates({ currentUrl: "about:blank" }), []);
+  });
+
   it("opens an ordinary page as is and refuses non-web pages", () => {
     assert.equal(
       systemBrowserUrl({ currentUrl: "https://example.com/a?b=1" }),

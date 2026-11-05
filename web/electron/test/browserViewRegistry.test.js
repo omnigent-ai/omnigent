@@ -1221,10 +1221,46 @@ describe("browserViewRegistry — navigation trail", () => {
     registry.openOrNavigate("conv_1", "https://example.com/");
     emit("did-start-navigation", {}, "https://example.com/next", false, true);
     emit("did-start-navigation", {}, "https://example.com/frame", false, false);
+    emit("did-start-navigation", {}, "https://example.com/next#hash", true, true);
     assert.deepEqual(registry.get("conv_1").navigationTrail, [
       "https://example.com/",
       "https://example.com/next",
     ]);
+  });
+});
+
+describe("browserViewRegistry — system-browser handoff policy", () => {
+  it("applies the view's own navigation policy only when it is enforced", async () => {
+    const { registry } = makeNetworkGuardRegistry({
+      allowsLocalhost: (context) => context?.hostIsThisMachine === true,
+    });
+    registry.openOrNavigate("agent", "https://example.com/", undefined, { agent: true });
+    registry.openOrNavigate("local", "https://example.com/", undefined, {
+      agent: true,
+      agentContext: { hostIsThisMachine: true },
+    });
+    registry.openOrNavigate("user", "https://example.com/");
+
+    assert.deepEqual(await registry.checkSystemBrowserUrl("agent", "https://example.com/doc"), {
+      ok: true,
+    });
+    const refused = ["http://192.168.1.1/", "http://lvh.me:5173/", "https://unresolved.test/"];
+    const verdicts = await Promise.all(
+      refused.map((url) => registry.checkSystemBrowserUrl("agent", url)),
+    );
+    assert.deepEqual(
+      verdicts.map((verdict) => verdict.ok),
+      [false, false, false],
+    );
+    assert.equal(
+      (await registry.checkSystemBrowserUrl("local", "http://127.0.0.1:5173/")).ok,
+      true,
+    );
+    assert.equal((await registry.checkSystemBrowserUrl("user", "http://192.168.1.1/")).ok, true);
+    assert.deepEqual(await registry.checkSystemBrowserUrl("missing", "https://example.com/"), {
+      ok: false,
+      error: "No browser view",
+    });
   });
 });
 

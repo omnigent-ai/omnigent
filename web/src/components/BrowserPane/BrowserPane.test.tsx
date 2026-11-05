@@ -671,6 +671,9 @@ describe("BrowserPane system-browser handoff", () => {
     );
     expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled();
     expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+      "https://example.com/",
+    );
   });
 
   it("keeps the old pane on a shell that can't hand off", async () => {

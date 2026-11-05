@@ -160,7 +160,7 @@ async function openBrowserPane({ scratch, recordDir }) {
 /** Run a journey in a fresh shell; the clip is saved as `clip`, or `failed-<clip>`. */
 async function withBrowserPane({ name, clip }, journey) {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), `omni-${name}-`));
-  const recordDir = recordDirFor(name);
+  const recordDir = recordDirFor(name, scratch);
   try {
     const { backend, desktop } = await openBrowserPane({ scratch, recordDir });
     let passed = false;
@@ -212,11 +212,10 @@ async function closeDesktop(desktop, recordDir, name) {
   fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
 }
 
-function recordDirFor(name) {
+// Without OMNIGENT_DESKTOP_RECORD_DIR, clips go to scratch and are removed with it.
+function recordDirFor(name, scratch) {
   const root = process.env.OMNIGENT_DESKTOP_RECORD_DIR;
-  return root
-    ? path.join(root, name)
-    : fs.mkdtempSync(path.join(os.tmpdir(), `omni-${name}-recordings-`));
+  return root ? path.join(root, name) : path.join(scratch, "recordings");
 }
 
 it(

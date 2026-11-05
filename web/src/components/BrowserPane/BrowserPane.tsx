@@ -242,8 +242,10 @@ export function BrowserPane({
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && !viewChanged && r?.exists) {
         setHasView(true);
-        if (!urlEventSeenRef.current) setGoogleAccessBlocked(r.googleAccessBlocked === true);
-        if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
+        if (!urlEventSeenRef.current) {
+          setGoogleAccessBlocked(r.googleAccessBlocked === true);
+          if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
+        }
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
       }

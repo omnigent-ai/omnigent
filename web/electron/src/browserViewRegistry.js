@@ -233,17 +233,12 @@ function createBrowserViewRegistry({
   function attachNavigationTrail(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
-    const record = (details, url, isMainFrame) => {
-      const mainFrame = details?.isMainFrame ?? isMainFrame;
-      if (!mainFrame || details?.isSameDocument) return;
+    const record = (details, url, isInPlace, isMainFrame) => {
+      if (!(details?.isMainFrame ?? isMainFrame) || (details?.isSameDocument ?? isInPlace)) return;
       recordNavigation(entry.navigationTrail, details?.url ?? url);
     };
-    wc.on("did-start-navigation", (details, url, _isInPlace, isMainFrame) =>
-      record(details, url, isMainFrame),
-    );
-    wc.on("did-redirect-navigation", (details, url, _isInPlace, isMainFrame) =>
-      record(details, url, isMainFrame),
-    );
+    wc.on("did-start-navigation", record);
+    wc.on("did-redirect-navigation", record);
   }
 
   // Popups stay in this view: an agent-visited page opening the user's system
@@ -435,6 +430,15 @@ function createBrowserViewRegistry({
       allowLocalhost: allowsLocalhost(agentContext),
       partition: agentPartition(partitionScope, conversationId),
     });
+  }
+
+  // Trail URLs are page-controlled, and the trail can hold hops the guard
+  // cancelled, so a policy-enforced view hands off only URLs it could load.
+  async function checkSystemBrowserUrl(conversationId, url) {
+    const entry = get(conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    if (!entry.navigationPolicyEnforced) return { ok: true };
+    return checkAgentNavigationFor(conversationId, url, entry.agentContext);
   }
 
   function entryForWebContents(webContentsId) {
@@ -733,6 +737,7 @@ function createBrowserViewRegistry({
     needsAgentViewRevocation,
     revokeAgentView,
     checkAgentNavigation: checkAgentNavigationFor,
+    checkSystemBrowserUrl,
     shouldCancelAgentRequest,
     agentRequestHeaders,
     shouldCancelAgentResponse,

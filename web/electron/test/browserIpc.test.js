@@ -473,6 +473,7 @@ function makeRegistry(conversationId, webContents) {
     has: (id) => entries.has(id),
     beginAgentNavigation: () => () => true,
     checkAgentNavigation: allowAgentNavigation,
+    checkSystemBrowserUrl: allowAgentNavigation,
     openOrNavigate: (id) => {
       const wc = makeWebContents();
       const entry = { view: { webContents: wc } };
@@ -1145,6 +1146,23 @@ describe("browserIpc — open in system browser", () => {
     const result = await invoke();
     assert.equal(result.ok, true);
     assert.deepEqual(opened, ["https://docs.google.com/document/d/1"]);
+  });
+
+  it("skips candidates the view's policy refuses and reports the refusal", async () => {
+    const DOC = "https://docs.google.com/document/d/1";
+    const INTERNAL = "https://wiki.corp.internal/";
+    const ctx = setupHandoff({ url: BLOCKED, navigationTrail: [DOC, INTERNAL, BLOCKED] });
+    const checked = [];
+    ctx.registry.checkSystemBrowserUrl = async (_conversationId, candidate) => {
+      checked.push(candidate);
+      return candidate === INTERNAL ? { ok: false, error: "navigation blocked" } : { ok: true };
+    };
+    assert.deepEqual(await ctx.invoke(), { ok: true, url: DOC });
+    assert.deepEqual(checked, [INTERNAL, DOC, BLOCKED]);
+
+    ctx.registry.checkSystemBrowserUrl = async () => ({ ok: false, error: "navigation blocked" });
+    assert.deepEqual(await ctx.invoke(), { ok: false, error: "navigation blocked" });
+    assert.deepEqual(ctx.opened, [DOC]);
   });
 
   it("refuses a missing view or a tab with no web page", async () => {
