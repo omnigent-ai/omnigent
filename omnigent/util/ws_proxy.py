@@ -472,7 +472,12 @@ def _dial_proxy(host: str, port: int, remaining_budget: Callable[[], float]) -> 
     for family, sock_type, proto, _canonical_name, address in socket.getaddrinfo(
         host, port, type=socket.SOCK_STREAM
     ):
-        sock = socket.socket(family, sock_type, proto)
+        try:
+            sock = socket.socket(family, sock_type, proto)
+        except OSError as exc:
+            # A family this host cannot open, such as IPv6 when it is disabled.
+            first_error = first_error or exc
+            continue
         try:
             sock.settimeout(remaining_budget())
             sock.connect(address)

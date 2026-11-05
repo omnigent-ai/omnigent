@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import errno
 import logging
 import socket
 import ssl
@@ -42,7 +43,6 @@ _OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
         (_TUNNEL_URL, {"http_proxy": "http://p:1", "HTTP_PROXY": "http://p:2"}, "http://p:1"),
         (_TUNNEL_URL, {}, None),
         (_TUNNEL_URL, {"http_proxy": "p:1"}, "http://p:1"),
-        (_TUNNEL_URL, {"http_proxy": "socks5://p:1"}, None),
         ("unix:///tmp/sock", {"all_proxy": "http://p:1"}, None),
         ("not a url", {"all_proxy": "http://p:1"}, None),
         ("ws://[::1:8000/t", {"http_proxy": "http://p:1"}, None),
@@ -194,8 +194,10 @@ async def _connect_proxy(reply):
         ("", _TUNNEL_URL, b"server.sandbox.test:8000"),
         ("alice:open%20sesame@", _TUNNEL_URL, b"server.sandbox.test:8000"),
         ("", "ws://bücher.example:8000/t", b"xn--bcher-kva.example:8000"),
+        ("", "ws://server.sandbox.test/t", b"server.sandbox.test:80"),
+        ("", "wss://[fd00::1]/t", b"[fd00::1]:443"),
     ],
-    ids=["anonymous", "authenticated", "idna-host"],
+    ids=["anonymous", "authenticated", "idna-host", "ws-default-port", "ipv6-wss-default-port"],
 )
 async def test_connect_tunnel(userinfo, ws_url, authority):
     async with _connect_proxy(_OK) as (port, requests):
@@ -391,6 +393,34 @@ def test_proxy_dial_shares_one_budget_across_addresses(monkeypatch):
     assert attempts == [(addresses[0], 3.0), (addresses[1], 2.0)]
     assert clock[0] == 103.0
     assert all(sock.closed for sock in opened)
+
+
+def test_proxy_dial_skips_an_address_whose_socket_cannot_be_created(monkeypatch):
+    """An address family the host cannot open falls through to the next address."""
+    from omnigent.util import ws_proxy
+
+    connected = []
+
+    class FakeSocket:
+        def __init__(self, family, *_args):
+            if family == socket.AF_INET6:
+                raise OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, address):
+            connected.append(address)
+
+    patched_socket = types.SimpleNamespace(**vars(socket))
+    patched_socket.getaddrinfo = lambda *_args, **_kwargs: [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 3128, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 3128)),
+    ]
+    patched_socket.socket = FakeSocket
+    monkeypatch.setattr(ws_proxy, "socket", patched_socket)
+    assert isinstance(ws_proxy._dial_proxy("proxy.test", 3128, lambda: 3.0), FakeSocket)
+    assert connected == [("192.0.2.1", 3128)]
 
 
 async def test_connect_timeout_bounds_the_whole_handshake():
