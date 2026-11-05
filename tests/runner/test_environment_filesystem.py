@@ -514,6 +514,15 @@ async def test_editor_save_of_a_truncated_original_stays_in_changes(
             [("terminal", "changed"), (DEFAULT_ENVIRONMENT_ID, "elsewhere")],
             id="other-saves-first",
         ),
+        pytest.param(
+            "hello world",
+            [
+                (DEFAULT_ENVIRONMENT_ID, "changed"),
+                ("terminal", None),
+                (DEFAULT_ENVIRONMENT_ID, "hello world"),
+            ],
+            id="other-deletes",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -524,7 +533,7 @@ async def test_editor_save_in_another_environment_keeps_the_change(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
     other_content: str,
-    saves: list[tuple[str, str]],
+    saves: list[tuple[str, str | None]],
 ) -> None:
     request.addfinalizer(registry._primary_envs["conv_test"].close)
     other_root = tmp_path / "other"
@@ -550,9 +559,11 @@ async def test_editor_save_in_another_environment_keeps_the_change(
 
     base = "/v1/sessions/conv_test/resources/environments"
     for environment_id, content in saves:
-        response = await client.put(
-            f"{base}/{environment_id}/filesystem/hello.txt", json={"content": content}
-        )
+        url = f"{base}/{environment_id}/filesystem/hello.txt"
+        if content is None:
+            response = await client.delete(url)
+        else:
+            response = await client.put(url, json={"content": content})
         assert response.status_code == 200, response.text
 
     changes = (await client.get(f"{base}/{DEFAULT_ENVIRONMENT_ID}/changes")).json()["data"]

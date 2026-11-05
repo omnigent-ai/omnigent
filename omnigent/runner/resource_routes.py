@@ -1772,15 +1772,21 @@ def register_resource_routes(
             return None
         return existing.data.decode("utf-8")
 
+    def _forget_other_environment_original(
+        relative_path: str, session_id: str, environment_id: str
+    ) -> None:
+        """Make the original unknown before a non-default environment changes the path."""
+        if filesystem_registry is not None and environment_id != DEFAULT_ENVIRONMENT_ID:
+            # Another environment may hold a different file at this relative path.
+            filesystem_registry.forget_original(relative_path, session_id=session_id)
+
     async def _seed_editor_original(
         fs: CallerProcessFilesystem, relative_path: str, session_id: str, environment_id: str
     ) -> None:
         """Seed the original an editor save replaces, when it is complete text."""
         if filesystem_registry is None:
             return
-        if environment_id != DEFAULT_ENVIRONMENT_ID:
-            # Another environment may hold a different file at this relative path.
-            filesystem_registry.forget_original(relative_path, session_id=session_id)
+        _forget_other_environment_original(relative_path, session_id, environment_id)
         original = await _read_editor_text(fs, relative_path)
         filesystem_registry.seed_snapshot(relative_path, original, session_id=session_id)
 
@@ -1898,6 +1904,7 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
+        _forget_other_environment_original(relative_path, session_id, environment_id)
         result = await fs.delete(relative_path, recursive=recursive)
         if filesystem_registry is not None and result.type in ("file", "symlink"):
             filesystem_registry.record_change(relative_path, "deleted", session_id)
