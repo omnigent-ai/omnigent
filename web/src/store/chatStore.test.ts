@@ -16126,60 +16126,77 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(state.pendingRetryStableId).toBeNull();
   });
 
-  it("offers a startup input for resending when its managed launch failed during the reconnect gap", async () => {
-    seedSession("conv_launch_gap", []);
-    sessionLabels.set("conv_launch_gap", { "omnigent.startup": "pending" });
-    const sinks = routeStreamOpens();
-    const controller = new AbortController();
-    useChatStore.setState({
-      conversationId: "conv_launch_gap",
-      abortController: controller,
-      startupPending: true,
-      pendingUserMessages: [
-        {
-          tempId: "tmp_first",
-          content: [{ type: "input_text", text: "saved on server" }],
-          posted: true,
-        },
-      ],
-    });
+  it.each([
+    { returns: "its first input for resending", firstInput: "saved on server" },
+    { returns: "nothing", firstInput: null },
+  ] as const)(
+    "ends managed startup when its launch failed during the reconnect gap, returning $returns",
+    async ({ firstInput }) => {
+      seedSession("conv_launch_gap", []);
+      sessionLabels.set("conv_launch_gap", { "omnigent.startup": "pending" });
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_launch_gap",
+        abortController: controller,
+        startupPending: true,
+        pendingUserMessages:
+          firstInput === null
+            ? []
+            : [
+                {
+                  tempId: "tmp_first",
+                  content: [{ type: "input_text", text: firstInput }],
+                  posted: true,
+                },
+              ],
+      });
 
-    const loop = startStreamPump("conv_launch_gap", controller, setState, getState);
-    await drainAsync();
-    failManagedLaunch("conv_launch_gap", "saved on server");
-    sinks[0]!.error();
-    await drainAsync();
-    expect(sinks).toHaveLength(2);
+      const loop = startStreamPump("conv_launch_gap", controller, setState, getState);
+      await drainAsync();
+      if (firstInput === null) {
+        sessionLabels.set("conv_launch_gap", { "omnigent.startup": "failed" });
+      } else {
+        failManagedLaunch("conv_launch_gap", firstInput);
+      }
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
 
-    const state = useChatStore.getState();
-    expect(state.failedSendDraft).toEqual({
-      conversationId: "conv_launch_gap",
-      text: "saved on server",
-      files: [],
-      startupInputIds: ["pending_first"],
-      recovered: true,
-    });
-    expect(state.pendingUserMessages).toEqual([]);
-    expect(state.startupPending).toBe(false);
+      const state = useChatStore.getState();
+      expect(state.failedSendDraft).toEqual(
+        firstInput === null
+          ? null
+          : {
+              conversationId: "conv_launch_gap",
+              text: firstInput,
+              files: [],
+              startupInputIds: ["pending_first"],
+              recovered: true,
+            },
+      );
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.startupPending).toBe(false);
 
-    // The user resends the restored text; a later reconnect must not take it for the failed input.
-    const resend: PendingUserMessage = {
-      tempId: "tmp_resend",
-      content: [{ type: "input_text", text: "saved on server" }],
-    };
-    useChatStore.setState({ failedSendDraft: null, pendingUserMessages: [resend] });
-    sinks[1]!.error();
-    await drainAsync();
-    expect(sinks).toHaveLength(3);
-    expect(useChatStore.getState().pendingUserMessages).toEqual([resend]);
-    expect(useChatStore.getState().failedSendDraft).toBeNull();
+      // A later reconnect must not take a same-text send for the failed input.
+      const resend: PendingUserMessage = {
+        tempId: "tmp_resend",
+        content: [{ type: "input_text", text: "saved on server" }],
+      };
+      useChatStore.setState({ failedSendDraft: null, pendingUserMessages: [resend] });
+      sinks[1]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(3);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([resend]);
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
 
-    const last = sinks[2]!;
-    last.push("data: [DONE]\n\n");
-    last.close();
-    await drainAsync(2);
-    await loop;
-  });
+      const last = sinks[2]!;
+      last.push("data: [DONE]\n\n");
+      last.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
 
   it("offers a startup input on reconnect when the live failure could not read it back", async () => {
     seedSession("conv_launch_gap", []);
@@ -16241,34 +16258,6 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     });
     expect(useChatStore.getState().startupPending).toBe(false);
     expect(lookupNotices()).toEqual([]);
-
-    const last = sinks[1]!;
-    last.push("data: [DONE]\n\n");
-    last.close();
-    await drainAsync(2);
-    await loop;
-  });
-
-  it("ends managed startup when its launch failed during the reconnect gap with nothing to return", async () => {
-    seedSession("conv_launch_gap", []);
-    sessionLabels.set("conv_launch_gap", { "omnigent.startup": "pending" });
-    const sinks = routeStreamOpens();
-    const controller = new AbortController();
-    useChatStore.setState({
-      conversationId: "conv_launch_gap",
-      abortController: controller,
-      startupPending: true,
-    });
-
-    const loop = startStreamPump("conv_launch_gap", controller, setState, getState);
-    await drainAsync();
-    sessionLabels.set("conv_launch_gap", { "omnigent.startup": "failed" });
-    sinks[0]!.error();
-    await drainAsync();
-    expect(sinks).toHaveLength(2);
-
-    expect(useChatStore.getState().startupPending).toBe(false);
-    expect(useChatStore.getState().failedSendDraft).toBeNull();
 
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
