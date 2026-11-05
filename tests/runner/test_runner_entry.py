@@ -3093,6 +3093,7 @@ async def test_runner_shutdown_closes_terminal_registry(
         isolate_provider_resolution(monkeypatch, tmp_path / "config"),
         tmp_path / "launches.jsonl",
         f"open({str(launch_pid)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n",
+        interpreted=True,
     )
 
     app = entry_mod.create_app()

@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -16,6 +17,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
 from omnigent.spec.types import SkillSpec
 from tests._helpers.claude_launch import configure_claude_launch
+from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 
 
@@ -666,12 +668,17 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
     monkeypatch: pytest.MonkeyPatch,
     _no_configured_claude_launch: Callable[[], bool],
 ) -> None:
-    """A listed skill resolves while the configured launch is pending; its plugin skill waits."""
+    """A listed skill resolves while the configured launch is pending; its plugin skill waits.
+
+    A catalog missing a stalled or failed launch's plugins is rebuilt once the launch answers.
+    """
     for env_name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH", "OMNIGENT_CLAUDE_LAUNCHER"):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(
         plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
     )
+    now = [0.0]
+    monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
     home = tmp_path / "home"
     plugin = tmp_path / "launch" / "dev"
     for root, name in ((home / ".claude", "local"), (plugin, "review")):
@@ -680,35 +687,76 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
         skill.write_text(_skill_md(name, f"Use {name}."))
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     release = tmp_path / "release"
+    fail = tmp_path / "fail"
     plugins = [{"name": "dev", "path": str(plugin), "source": "dev@inline"}]
     init = {"type": "system", "subtype": "init", "plugins": plugins}
-    configure_claude_launch(
-        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
-        tmp_path / "launches.jsonl",
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    launches = tmp_path / "launches.jsonl"
+    script = (
         f"while not os.path.exists({str(release)!r}):\n    time.sleep(0.05)\n"
-        f"print({json.dumps(init)!r})\n",
+        f"if os.path.exists({str(fail)!r}):\n    sys.exit(3)\n"
+        f"print({json.dumps(init)!r})\n"
     )
+    configure_claude_launch(config_home, launches, script)
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     app = _make_app(bundle, [], "all", workspace=workspace, harness="claude-native")
     url = "/v1/sessions/conv_launch/skills/resolve"
+    late_url = "/v1/sessions/conv_late/skills/resolve"
+    failed_url = "/v1/sessions/conv_failed/skills/resolve"
+    review = {"name": "dev:review"}
 
     async for c in _client(app):
         try:
             listed = await asyncio.wait_for(c.post(url, json={"name": "local"}), 5)
-            pending = asyncio.ensure_future(c.post(url, json={"name": "dev:review"}))
+            pending = asyncio.ensure_future(c.post(url, json=review))
             await asyncio.sleep(0.5)
             waited = not pending.done()
         finally:
             release.touch()
         launched = await asyncio.wait_for(pending, 15)
 
+        # A new launch identity answers only after its probe's deadline has passed.
+        release.unlink()
+        configure_claude_launch(config_home, launches, script, args=("--", "late"))
+        try:
+            with pytest.raises(plugin_discovery.LaunchPluginsPending):
+                plugin_discovery.claude_launch_plugin_dirs(wait=False)
+            await poll_until_async(lambda: len(launches.read_text().splitlines()) == 2)
+            now[0] += plugin_discovery.LAUNCH_PLUGINS_DEADLINE_S
+            stalled = await c.post(late_url, json=review)
+            stalled_generation = plugin_discovery.launch_plugins_generation()
+        finally:
+            release.touch()
+        await poll_until_async(
+            lambda before=stalled_generation: plugin_discovery.launch_plugins_generation() > before
+        )
+        late = await c.post(late_url, json=review)
+
+        # A failed launch is asked again once its backoff ends.
+        monkeypatch.setattr(
+            "omnigent.runner.app._INCOMPLETE_SESSION_SKILLS_CACHE_TTL_SECONDS", 0.0
+        )
+        fail.touch()
+        configure_claude_launch(config_home, launches, script, args=("--", "failing"))
+        failed = await c.post(failed_url, json=review)
+        backing_off = await c.post(failed_url, json=review)
+        fail.unlink()
+        now[0] += plugin_discovery.FAILED_LAUNCH_BACKOFF_S
+        retried = await c.post(failed_url, json=review)
+
     assert listed.status_code == 200, listed.text
     assert waited
     assert launched.status_code == 200, launched.text
     assert "body for review" in launched.json()["meta_text"]
+    assert stalled.status_code == 404, stalled.text
+    assert late.status_code == 200, late.text
+    assert failed.status_code == 404, failed.text
+    assert backing_off.status_code == 404, backing_off.text
+    assert retried.status_code == 200, retried.text
+    assert len(launches.read_text().splitlines()) == 4
 
 
 @pytest.mark.asyncio
