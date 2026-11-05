@@ -3921,7 +3921,7 @@ def create_runner_app(
         """Recognize an unloaded bridge without a recorded startup failure."""
         from omnigent.harnesses.codex_native.bridge import (
             read_bridge_startup_error,
-            read_bridge_state,
+            read_bridge_state_result,
         )
 
         def has_live_owner() -> bool:
@@ -3934,9 +3934,9 @@ def create_runner_app(
 
         if has_live_owner():
             return False
-        current_state = read_bridge_state(bridge_dir)
+        current_state = read_bridge_state_result(bridge_dir)
         return (
-            current_state is None if state is None else current_state == state
+            current_state.status == "missing" if state is None else current_state.state == state
         ) and read_bridge_startup_error(bridge_dir) is None
 
     codex_goal_runner = CodexGoalRunner(

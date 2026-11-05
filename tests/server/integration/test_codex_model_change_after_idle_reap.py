@@ -499,6 +499,11 @@ async def test_goal_read_forwards_to_a_live_codex_backend(
         "startup-failure",
         "missing-state-startup-failure",
         "changed-bridge",
+        "invalid-json",
+        "invalid-encoding",
+        "invalid-state",
+        "non-file-state",
+        "unreadable-state",
     ],
 )
 async def test_goal_read_preserves_failure_for_a_loaded_or_failed_bridge(
@@ -520,6 +525,23 @@ async def test_goal_read_preserves_failure_for_a_loaded_or_failed_bridge(
         )
     elif guard.endswith("startup-failure"):
         bridge.record_app_server_stopped(session.codex.bridge_dir)
+    elif guard in {"invalid-json", "invalid-encoding", "invalid-state"}:
+        contents = {"invalid-json": b"{", "invalid-encoding": b"\xff", "invalid-state": b"{}"}
+        (session.codex.bridge_dir / "state.json").write_bytes(contents[guard])
+    elif guard == "non-file-state":
+        state_path = session.codex.bridge_dir / "state.json"
+        state_path.unlink()
+        state_path.mkdir()
+    elif guard == "unreadable-state":
+        state_path = session.codex.bridge_dir / "state.json"
+        read_text = Path.read_text
+
+        def refuse_state_read(path: Path, *args: Any, **kwargs: Any) -> str:
+            if path == state_path:
+                raise PermissionError("Synthetic state read denied")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", refuse_state_read)
     else:
         state = bridge.read_bridge_state(session.codex.bridge_dir)
         assert state is not None
@@ -534,7 +556,11 @@ async def test_goal_read_preserves_failure_for_a_loaded_or_failed_bridge(
 
     response = await client.get(f"/v1/sessions/{session.session_id}/codex_goal")
 
-    expected_status = 502 if guard.startswith("missing-state-") else 503
+    unavailable_state = guard.startswith(("missing-state-", "invalid-")) or guard in {
+        "non-file-state",
+        "unreadable-state",
+    }
+    expected_status = 502 if unavailable_state else 503
     assert response.status_code == expected_status, response.text
     assert response.json()["error"] == "codex_native_goal_failed"
     assert session.codex.launches == 1
