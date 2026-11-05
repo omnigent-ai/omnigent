@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from sqlalchemy import Engine, or_, select, tuple_, update
+from sqlalchemy import Engine, case, or_, select, tuple_, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -677,7 +677,13 @@ class HostStore:
 
         run_write_transaction(self._session_immediate, "update_harness_readiness", write)
 
-    def heartbeat(self, host_id: str) -> None:
+    def heartbeat(
+        self,
+        host_id: str,
+        *,
+        managed_token: str | None = None,
+        token_ttl_s: int | None = None,
+    ) -> None:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
 
@@ -687,18 +693,23 @@ class HostStore:
         ``PING_INTERVAL_S``. Does not change ``status`` — a host whose
         ping loop is running is, by construction, still ``"online"``.
 
-        No-op if the host does not exist.
+        A managed tunnel also renews its current launch token. Only an already
+        authenticated connection may request renewal, including after expiry;
+        new connections must still pass :meth:`resolve_launch_token`.
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param managed_token: Credential accepted when this tunnel connected.
+            Guards against renewing a revoked or replaced sandbox generation.
+        :param token_ttl_s: Provider's reconnect window in seconds. ``None``
+            keeps the existing expiry, e.g. when its provider was removed.
         """
-        # Single UPDATE rather than SELECT-then-mutate: this runs every
-        # ping interval for every connected host, so the extra read is
-        # pure overhead. A missing host simply matches no rows (a no-op).
-        updated_at = now_epoch()
+        if token_ttl_s is not None and (managed_token is None or token_ttl_s <= 0):
+            raise ValueError("token renewal requires a managed token and a positive TTL")
 
         def write(session: Session) -> None:
-            session.execute(
+            updated_at = now_epoch()
+            statement = (
                 update(SqlHost)
                 .where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -707,6 +718,31 @@ class HostStore:
                 )
                 .values(updated_at=updated_at)
             )
+            if managed_token is not None:
+                row = session.get(SqlHost, (current_workspace_id(), host_id))
+                if row is None:
+                    return
+                require_active_account(session, row.user_id, generation=row.account_generation)
+                statement = statement.where(
+                    SqlHost.token_hash == hash_host_launch_token(managed_token),
+                    SqlHost.token_expires_at.is_not(None),
+                    SqlHost.status == encode_host_status("online"),
+                    SqlHost.sandbox_provider.is_not(None),
+                    SqlHost.sandbox_id.is_not(None),
+                    or_(
+                        SqlHost.terminating_sandbox_id.is_(None),
+                        SqlHost.terminating_sandbox_id != SqlHost.sandbox_id,
+                    ),
+                )
+                if token_ttl_s is not None:
+                    expires_at = updated_at + token_ttl_s
+                    statement = statement.values(
+                        token_expires_at=case(
+                            (SqlHost.token_expires_at < expires_at, expires_at),
+                            else_=SqlHost.token_expires_at,
+                        )
+                    )
+            session.execute(statement)
 
         run_write_transaction(self._session_immediate, "update_host_heartbeat", write)
 

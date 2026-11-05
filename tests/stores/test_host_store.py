@@ -571,6 +571,144 @@ def test_heartbeat_noop_for_unknown_host(host_store: HostStore) -> None:
     host_store.heartbeat("aababcc3941edb738172734a9ab7bb8c")
 
 
+@pytest.mark.parametrize(("expires_in", "token_ttl_s"), [(30, 60), (3600, 60), (30, None)])
+def test_managed_heartbeat_renews_connected_host_token(
+    host_store: HostStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    expires_in: int,
+    token_ttl_s: int | None,
+) -> None:
+    """An authenticated connection renews without shortening or rotating its token."""
+    host_id = uuid.uuid4().hex
+    started_at = now_epoch()
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="connected-sandbox",
+        user_id="alice@example.com",
+        token="launch-token",
+        provider="kubernetes",
+        sandbox_id="sandbox",
+        token_expires_at=started_at + expires_in,
+    )
+    host_store.upsert_on_connect(
+        host_id, "connected-sandbox", "alice@example.com", managed_token="launch-token"
+    )
+    heartbeat_at = started_at + 40
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: heartbeat_at)
+    if expires_in < 40:
+        assert host_store.resolve_launch_token(host_id, "launch-token") is None
+
+    host_store.heartbeat(host_id, managed_token="launch-token", token_ttl_s=token_ttl_s)
+
+    expected_expiry = started_at + expires_in
+    if token_ttl_s is not None:
+        expected_expiry = max(expected_expiry, heartbeat_at + token_ttl_s)
+    with Session(get_or_create_engine(db_uri)) as session:
+        row = session.get(SqlHost, (current_workspace_id(), host_id))
+        assert row is not None
+        assert row.token_expires_at == expected_expiry
+        assert row.updated_at == heartbeat_at
+    assert (host_store.resolve_launch_token(host_id, "launch-token") is not None) == (
+        expected_expiry >= heartbeat_at
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["replace", "revoke", "detach", "delete", "offline", "workspace", "delete-owner", "new-owner"],
+)
+def test_managed_heartbeat_cannot_restore_stale_authority(
+    host_store: HostStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    host_id = uuid.uuid4().hex
+    workspace_id = current_workspace_id()
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(SqlUser).values(
+                workspace_id=workspace_id,
+                id="alice@example.com",
+                account_generation="original-owner",
+            )
+        )
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="stale-sandbox",
+        user_id="alice@example.com",
+        token="old-token",
+        provider="kubernetes",
+        sandbox_id="old-sandbox",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host = host_store.upsert_on_connect(
+        host_id, "stale-sandbox", "alice@example.com", managed_token="old-token"
+    )
+    if change == "replace":
+        host_store.replace_managed_host_sandbox(
+            host_id=host_id,
+            user_id=host.user_id,
+            token="new-token",
+            provider="kubernetes",
+            sandbox_id="new-sandbox",
+            token_expires_at=now_epoch() + 3600,
+        )
+        host_store.upsert_on_connect(host_id, host.name, host.user_id, managed_token="new-token")
+    elif change == "revoke":
+        host_store.revoke_launch_token(host_id)
+    elif change == "detach":
+        assert host_store.detach_stale_managed_sandbox(
+            host_id, sandbox_id="old-sandbox", expected_updated_at=host.updated_at
+        )
+    elif change == "delete":
+        host_store.delete_host(host_id)
+    elif change == "offline":
+        host_store.set_offline(host_id)
+    elif change in {"delete-owner", "new-owner"}:
+        with engine.begin() as connection:
+            connection.execute(
+                update(SqlUser)
+                .where(SqlUser.workspace_id == workspace_id, SqlUser.id == host.user_id)
+                .values(
+                    {"deleted_at": now_epoch()}
+                    if change == "delete-owner"
+                    else {"account_generation": "replacement-owner"}
+                )
+            )
+    with Session(engine) as session:
+        row = session.get(SqlHost, (workspace_id, host_id))
+        assert row is not None
+        before = (row.token_hash, row.token_expires_at, row.updated_at)
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: before[2] + 40)
+
+    if change in {"delete-owner", "new-owner"}:
+        with pytest.raises(OmnigentError, match="authority has been revoked"):
+            host_store.heartbeat(host_id, managed_token="old-token", token_ttl_s=7200)
+    else:
+        with workspace_scope(workspace_id + 1 if change == "workspace" else workspace_id):
+            host_store.heartbeat(host_id, managed_token="old-token", token_ttl_s=7200)
+
+    with Session(engine) as session:
+        row = session.get(SqlHost, (workspace_id, host_id))
+        assert row is not None
+        assert (row.token_hash, row.token_expires_at, row.updated_at) == before
+
+
+@pytest.mark.parametrize(
+    ("managed_token", "token_ttl_s"), [(None, 60), ("token", 0), ("token", -1)]
+)
+def test_managed_heartbeat_rejects_invalid_renewal(
+    host_store: HostStore, managed_token: str | None, token_ttl_s: int
+) -> None:
+    with pytest.raises(ValueError):
+        host_store.heartbeat(
+            uuid.uuid4().hex, managed_token=managed_token, token_ttl_s=token_ttl_s
+        )
+
+
 def test_is_online_true_for_fresh_online_host(host_store: HostStore) -> None:
     """
     Verify is_online is True for an online host seen just now.

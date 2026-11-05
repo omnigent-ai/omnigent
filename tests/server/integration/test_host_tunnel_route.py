@@ -13,7 +13,7 @@ import anyio
 import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
@@ -50,11 +50,13 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.server import tunnel_handshake
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
 from omnigent.stores.host_store import HostStore
 from tests.budgets import budget
+from tests.server.helpers import FakeSandboxLauncher
 
 pytestmark = pytest.mark.asyncio
 
@@ -1651,6 +1653,84 @@ async def test_managed_token_authenticates_as_record_owner(
     assert host.status == "online"
     # The managed binding survives the connect upsert.
     assert host.sandbox_id == "sb-tunnel-1"
+
+
+@pytest.mark.parametrize("provider", [None, "modal", "daytona"])
+async def test_managed_heartbeat_renews_token_for_reconnect(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str | None,
+) -> None:
+    """An authenticated live tunnel keeps its token usable beyond launch expiry."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+    import omnigent.stores.host_store as store_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    token_ttl_s = 600
+    config = ManagedSandboxConfig(
+        server_url="https://managed-test.example.com",
+        launcher_factory=FakeSandboxLauncher,
+        token_ttl_s=token_ttl_s,
+        provider=provider,
+    )
+    deployment = ManagedSandboxDeployment.single(config)
+    if provider == "modal":
+        deployment = ManagedSandboxDeployment(
+            configs=(
+                ManagedSandboxConfig(
+                    server_url=config.server_url,
+                    launcher_factory=FakeSandboxLauncher,
+                    token_ttl_s=1200,
+                    provider="daytona",
+                ),
+                config,
+            )
+        )
+    registry, store = HostRegistry(), HostStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(registry, store, sandbox_config=deployment), prefix="/v1"
+    )
+    token = "long-lived-sandbox-token"
+    should_renew = provider != "daytona"
+    _register_managed(store, host_id=_HOST_ID, token=token)
+    communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+    await communicator.send_input({"type": "websocket.connect"})
+    assert (await communicator.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+    await _send_hello_and_wait(communicator, registry)
+    try:
+        # Advance past every expiry the initial connection could have issued.
+        renewed_at = now_epoch() + 7 * 24 * 3600
+        monkeypatch.setattr(store_mod, "now_epoch", lambda: renewed_at)
+        await _wait_updated_at_at_least(store, _HOST_ID, renewed_at)
+        assert (store.resolve_launch_token(_HOST_ID, token) is not None) == should_renew
+        with Session(get_or_create_engine(db_uri)) as session:
+            row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()
+            assert row.token_expires_at is not None
+            if should_renew:
+                assert row.token_expires_at == renewed_at + token_ttl_s
+            else:
+                assert row.token_expires_at < renewed_at
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+
+    reconnected = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+    await reconnected.send_input({"type": "websocket.connect"})
+    response = await reconnected.receive_output(timeout=budget(1.0))
+    if not should_renew:
+        assert response["type"] == "websocket.close"
+        assert response["code"] == 4004
+        await reconnected.wait(timeout=budget(2.0))
+        return
+    assert response["type"] == "websocket.accept"
+    try:
+        await _send_hello_and_wait(reconnected, registry)
+        assert store.is_online(_HOST_ID)
+    finally:
+        await reconnected.send_input({"type": "websocket.disconnect", "code": 1000})
+        await reconnected.wait(timeout=budget(2.0))
 
 
 async def test_managed_token_is_revalidated_after_websocket_accept(
