@@ -359,6 +359,7 @@ class _NewRunRecorder:
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
 # automation pages never show it.
 UNATTENDED_RUN_NOTE = (
+    "<omnigent-automation-context>\n"
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
     "No one can answer questions, approve requests or give input, so work toward the "
     "goal above on your own. Don't ask questions, wait for confirmation or stop to "
@@ -372,7 +373,8 @@ UNATTENDED_RUN_NOTE = (
     "independent work and permitted alternatives. Do not change permission settings to "
     "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
     "prioritizing those the user is most likely to want to change, then summarize what "
-    "you did and anything you couldn't do."
+    "you did and anything you couldn't do.\n"
+    "</omnigent-automation-context>"
 )
 
 
@@ -701,12 +703,13 @@ async def _run_fire_for_task(
         await _keep_first_session(
             deps, stored, conv.id, host_id=None if managed else effective.host_id
         )
-    except _SessionTaken:
+    except _SessionTaken as exc:
         await _discard_session(deps, conv)
-        await recorder.finish(
-            "skipped",
-            error="another run already started the session this automation continues",
-            error_code="continued_session_busy",
+        await _continue_session(
+            deps,
+            replace(stored, session_id=exc.session_id),
+            fire_dispatch.reuse or _make_reuse_dispatch(deps),
+            recorder,
         )
         return
     except _SessionNotRecorded as exc:
@@ -976,6 +979,10 @@ class _SessionNotRecorded(Exception):
 class _SessionTaken(Exception):
     """Another run already recorded the session a continue task's first firing created."""
 
+    def __init__(self, session_id: str) -> None:
+        super().__init__()
+        self.session_id = session_id
+
 
 async def _keep_first_session(
     deps: FireDeps, task: ScheduledTask, session_id: str, *, host_id: str | None
@@ -1016,7 +1023,15 @@ async def _keep_first_session(
             return True
         raise _SessionNotRecorded(certain=True) from None
     if outcome == "taken":
-        raise _SessionTaken
+        try:
+            stored = await asyncio.to_thread(deps.scheduled_task_store.get, task.id)
+        except Exception:
+            _logger.exception("scheduled fire: could not re-read task %s", task.id)
+            raise _SessionNotRecorded(certain=True) from None
+        if stored is None or stored.state == "deleted" or not stored.continues_session:
+            raise _SessionNotRecorded(certain=True)
+        assert stored.session_id is not None
+        raise _SessionTaken(stored.session_id)
     if outcome == "stale":
         _logger.info(
             "scheduled fire: task %s changed during its first run; not keeping its session",

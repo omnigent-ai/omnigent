@@ -7,6 +7,7 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -2548,6 +2549,23 @@ async def test_run_now_triggers_and_records_a_run(
     assert row["last_run_status"] == "running"
 
 
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_database_scheduler_run_now_returns_recorded_run_id(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    task_id = created.json()["id"]
+    response = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert response.status_code == 202, response.text
+    runs = (
+        await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    ).json()["runs"]
+    assert len(runs) == 1
+    assert response.json() == {"triggered": True, "id": task_id, "run_id": runs[0]["id"]}
+
+
 async def test_run_now_allows_paused_task(
     auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
 ) -> None:
@@ -3131,3 +3149,129 @@ async def test_random_worktree_requires_pinned_repository(
     )
     assert response.status_code == 422, response.text
     assert "random worktree requires" in response.text
+
+
+@pytest.mark.parametrize(
+    "execution_target,session_mode,minutes,status",
+    [
+        ("connected_host", "new", 10, 200),
+        ("connected_host", "continue", 10, 200),
+        ("managed_sandbox", "continue", 10, 200),
+        ("managed_sandbox", "new", 10, 400),
+        ("managed_sandbox", "new", 60, 200),
+    ],
+)
+async def test_create_interval_policy(
+    auth_client, auth_app, execution_target, session_mode, minutes, status
+):
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            session_mode=session_mode,
+            execution_target=execution_target,
+            host_id=None,
+            workspace=None,
+            rrule=f"FREQ=MINUTELY;INTERVAL={minutes}",
+        ),
+        headers=_headers(),
+    )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json()["session_mode"] == session_mode
+        assert response.json()["execution_target"] == execution_target
+        assert response.json()["session_id"] is None
+
+
+async def test_update_validates_effective_schedule_and_session_mode(auth_client, auth_app):
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(execution_target="managed_sandbox", host_id=None, workspace=None),
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    url = f"/v1/scheduled-tasks/{response.json()['id']}"
+    for patch, expected in [
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10"}, 400),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10", "session_mode": "continue"}, 200),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=15"}, 200),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=9"}, 400),
+        ({"session_mode": "new"}, 400),
+        ({"name": "Renamed"}, 200),
+        ({"execution_target": "connected_host", "session_mode": "new"}, 200),
+        ({"execution_target": "managed_sandbox"}, 400),
+        ({"execution_target": "managed_sandbox", "session_mode": "continue"}, 200),
+    ]:
+        response = await auth_client.patch(url, json=patch, headers=_headers())
+        assert response.status_code == expected, response.text
+    saved = (await auth_client.get(url, headers=_headers())).json()
+    assert (saved["session_mode"], saved["rrule"]) == ("continue", "FREQ=MINUTELY;INTERVAL=15")
+    response = await auth_client.patch(
+        url, json={"session_mode": "new", "rrule": "FREQ=HOURLY"}, headers=_headers()
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["session_mode"] == "new"
+
+
+@pytest.mark.parametrize("policy_field", ["session_mode", "execution_target"])
+@pytest.mark.parametrize("recurrence_first", [False, True])
+async def test_concurrent_schedule_edits_reject_stale_validation(
+    auth_client, auth_app, monkeypatch, policy_field, recurrence_first
+):
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    initial = _create_body(
+        execution_target="managed_sandbox" if policy_field == "session_mode" else "connected_host",
+        session_mode="continue" if policy_field == "session_mode" else "new",
+        host_id=None,
+        workspace=None,
+    )
+    response = await auth_client.post("/v1/scheduled-tasks", json=initial, headers=_headers())
+    assert response.status_code == 200, response.text
+    url = f"/v1/scheduled-tasks/{response.json()['id']}"
+    recurrence_patch = {"rrule": "FREQ=MINUTELY;INTERVAL=10"}
+    policy_patch = {policy_field: "new" if policy_field == "session_mode" else "managed_sandbox"}
+    validate = scheduled_tasks_routes._validate_rrule_or_400
+    validated = asyncio.Barrier(2)
+    first_saved = asyncio.Event()
+
+    async def validate_together(rrule, session_mode, execution_target):
+        await validate(rrule, session_mode, execution_target)
+        await validated.wait()
+        if (rrule == recurrence_patch["rrule"]) != recurrence_first:
+            await first_saved.wait()
+
+    async def patch(fields, first):
+        try:
+            return await auth_client.patch(url, json=fields, headers=_headers())
+        finally:
+            if first:
+                first_saved.set()
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(scheduled_tasks_routes, "_validate_rrule_or_400", validate_together)
+        async with asyncio.timeout(10):
+            recurrence_response, policy_response = await asyncio.gather(
+                patch(recurrence_patch, recurrence_first),
+                patch(policy_patch, not recurrence_first),
+            )
+    winner, loser = (
+        (recurrence_response, policy_response)
+        if recurrence_first
+        else (policy_response, recurrence_response)
+    )
+    assert winner.status_code == 200, winner.text
+    assert loser.status_code == 409, loser.text
+    assert "Reload and try again" in loser.text
+    saved = (await auth_client.get(url, headers=_headers())).json()
+    assert (saved["rrule"], saved["session_mode"], saved["execution_target"]) == (
+        winner.json()["rrule"],
+        winner.json()["session_mode"],
+        winner.json()["execution_target"],
+    )
+    assert saved["state"] == "active"
+    retry = await auth_client.patch(
+        url, json=policy_patch if recurrence_first else recurrence_patch, headers=_headers()
+    )
+    assert retry.status_code == 400, retry.text
+    assert "Minimum interval is 60 minutes" in retry.text
