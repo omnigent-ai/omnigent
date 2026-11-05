@@ -3551,7 +3551,10 @@ it("saves a local comment as agent context and retains earlier revisions", async
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
   expect(screen.getAllByText(/Earlier revision/).length).toBeGreaterThan(0);
   const card = within(screen.getAllByRole("region", { name: "Local review comment" })[0]!);
-  await userEvent.click(card.getByRole("button", { name: "Edit" }));
+  expect(
+    card.queryByRole("button", { name: /Attach to agent|Mark addressed|Reopen/ }),
+  ).not.toBeInTheDocument();
+  await userEvent.click(card.getByRole("button", { name: "Edit local comment" }));
   await userEvent.clear(card.getByRole("textbox", { name: "Edit local comment" }));
   await userEvent.type(
     card.getByRole("textbox", { name: "Edit local comment" }),
@@ -3560,14 +3563,7 @@ it("saves a local comment as agent context and retains earlier revisions", async
   await userEvent.click(card.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(comments[0]?.body).toBe("Validate empty input"));
   expect(contexts.result.current[0]?.body).toBe("Validate empty input");
-  await userEvent.click(card.getByRole("button", { name: "Mark addressed" }));
-  await waitFor(() => expect(comments[0]?.status).toBe("addressed"));
-  expect(contexts.result.current).toHaveLength(0);
-  await userEvent.click(card.getByRole("button", { name: "Reopen" }));
-  await waitFor(() => expect(comments[0]?.status).toBe("draft"));
-  await userEvent.click(card.getByRole("button", { name: "Attach to agent" }));
-  expect(contexts.result.current).toHaveLength(1);
-  await userEvent.click(card.getByRole("button", { name: "Delete" }));
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
   await waitFor(() =>
     expect(screen.queryByRole("region", { name: "Local review comment" })).not.toBeInTheDocument(),
   );

@@ -18,6 +18,7 @@ import {
 import { FileDiff } from "@pierre/diffs/react";
 import type { DiffLineAnnotation, FileDiffMetadata, SelectedLineRange } from "@pierre/diffs";
 import { Button } from "@/components/ui/button";
+import { tabsListVariants } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Comment } from "@/hooks/useComments";
 import {
@@ -473,14 +474,14 @@ export function PullRequestFileSection({
         disabled={composer.stale || (local ? !canCommentLocally : !threadContext.canCreate)}
         destinationControl={
           <div
-            className="inline-flex shrink-0 rounded-md bg-muted p-0.5"
+            className={cn(tabsListVariants(), "h-8 shrink-0")}
             role="group"
             aria-label="Comment destination"
           >
             <button
               type="button"
               className={cn(
-                "rounded px-2.5 py-1 text-ui transition-colors",
+                "h-[calc(100%-1px)] rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
                 local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
               )}
               aria-pressed={local}
@@ -492,7 +493,7 @@ export function PullRequestFileSection({
             <button
               type="button"
               className={cn(
-                "rounded px-2.5 py-1 text-ui transition-colors",
+                "h-[calc(100%-1px)] rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
                 !local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
               )}
               aria-pressed={!local}

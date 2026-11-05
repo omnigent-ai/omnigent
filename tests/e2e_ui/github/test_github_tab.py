@@ -1164,6 +1164,11 @@ def test_reply_to_inline_review_conversation(
         plus.click()
         draft.get_by_role("button", name="Agent", exact=True).click()
         draft.get_by_role("textbox", name="New review comment").fill(body)
+        destination = draft.get_by_role("group", name="Comment destination").bounding_box()
+        write_preview = draft.get_by_role("tablist").bounding_box()
+        assert destination and write_preview
+        assert abs(destination["height"] - write_preview["height"]) <= 1
+        page.screenshot(path=str(tmp_path / f"inline-{entry}-{side}-composer.png"))
         tabs.get_by_role("tab", name="Summary", exact=True).click()
         tabs.get_by_role("tab", name="Changes", exact=False).click()
         expect(draft.get_by_role("button", name="Agent", exact=True)).to_have_attribute(
@@ -1198,6 +1203,34 @@ def test_reply_to_inline_review_conversation(
     target = panel.locator(f'[data-local-review-comment="{old_comment["id"]}"]')
     expect(target).to_be_focused()
     expect(target).to_be_in_viewport()
+    expect(target.get_by_role("button", name="Edit local comment", exact=True)).to_be_visible()
+    expect(target.get_by_role("button", name="Delete local comment", exact=True)).to_be_visible()
+    expect(
+        target.get_by_role("button", name=re.compile("Attach to agent|Mark addressed"))
+    ).to_have_count(0)
+    if mobile:
+        panel.get_by_role("button", name="Close", exact=True).click()
+    page.get_by_role(
+        "button", name="Delete local review comment src/app/main.py:2 (new)", exact=True
+    ).click()
+    expect(page.get_by_role("button", name=re.compile("Open local review comment"))).to_have_count(
+        1
+    )
+    response = page.request.get(f"{base_url}/v1/sessions/{session_id}/comments")
+    assert response.ok
+    assert [comment["id"] for comment in response.json()] == [old_comment["id"]]
+    chip.click()
+    expect(file.get_by_role("region", name="Local review comment")).to_have_count(1)
+    target.get_by_role("button", name="Delete local comment", exact=True).click()
+    expect(file.get_by_role("region", name="Local review comment")).to_have_count(0)
+    if mobile:
+        panel.get_by_role("button", name="Close", exact=True).click()
+    expect(page.get_by_role("button", name=re.compile("Open local review comment"))).to_have_count(
+        0
+    )
+    response = page.request.get(f"{base_url}/v1/sessions/{session_id}/comments")
+    assert response.ok
+    assert response.json() == []
 
 
 # Two additions match "added": the first on line 2, the second on line 4.

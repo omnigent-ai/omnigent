@@ -5807,10 +5807,15 @@ describe("Composer reply quotes", () => {
     },
   );
 
-  it("attaches local review context without sending, replacing a draft, or duplicating it", () => {
+  it("attaches local review context and deletes it only after a successful chip removal", async () => {
     const props = composerProps();
     const ref = createRef<ComponentRef<typeof Composer>>();
-    render(<Composer {...props} ref={ref} />);
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <Composer {...props} ref={ref} />
+      </QueryClientProvider>,
+    );
     act(() => ref.current?.appendReplyQuote("Existing quote"));
     fireEvent.change(textarea(), { target: { value: "My instructions" } });
     const comment = {
@@ -5854,12 +5859,35 @@ describe("Composer reply quotes", () => {
     expect(serializeReplyDraft(sentReply!)).toBe(sentText);
     expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
     act(() => requestLocalReviewContext(comment));
-    fireEvent.click(screen.getByLabelText("Remove local review comment src/example.ts:12 (new)"));
-    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
-    act(() => requestLocalReviewContext(comment));
+    const request = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockResolvedValueOnce(new Response(null, { status: 500, statusText: "Server error" }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const error = vi.spyOn(toast, "error");
+    fireEvent.click(screen.getByLabelText("Delete local review comment src/example.ts:12 (new)"));
+    await waitFor(() =>
+      expect(error).toHaveBeenCalledWith("Couldn't delete comment: 500 Server error"),
+    );
+    expect(
+      screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Delete local review comment src/example.ts:12 (new)"),
+      ).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByLabelText("Delete local review comment src/example.ts:12 (new)"));
+    await waitFor(() =>
+      expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument(),
+    );
+    expect(request).toHaveBeenLastCalledWith("/v1/sessions/conv_test/comments/123", {
+      method: "DELETE",
+    });
+    act(() => requestLocalReviewContext({ ...comment, id: "456" }));
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toContain("[Comment 123]");
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toContain("[Comment 456]");
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).not.toContain("[Comment 123]");
   });
 
   it("keeps mention markers in the structured payload used to restore a failed send", () => {

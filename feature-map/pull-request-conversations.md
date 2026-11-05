@@ -29,8 +29,8 @@ together in Comments.
   unresolved navigation and original context for unplaceable conversations.
   Conversations on files hidden by the path filter are hidden with their file.
   Navigating to one clears the filter and shows **Filter cleared to show <file>**.
-- `local-review`: Save session-only comments on either diff side, edit/delete or
-  mark them addressed. Submitting an **Agent** comment attaches a context chip
+- `local-review`: Save session-only comments on either diff side, with pencil and
+  trash actions in the comment header. Submitting an **Agent** comment attaches a context chip
   to the session composer while preserving existing text and attachments. Hover
   previews the comment; clicking reveals it in Changes. The full snapshots are
   sent only when the user submits their chat message.
@@ -150,7 +150,7 @@ outdated thread and confirm the suggestion uses its labeled original context.
   coordinates in `anchor_metadata` separate from Files character offsets. They
   persist across reloads and are never posted to GitHub. Only explicitly attached
   comments enter the chat message; Files comments are not included automatically.
-  Chips persist with the session draft; removing one does not delete the comment.
+  Chips persist with the session draft; removing one deletes the saved comment.
 - Older history refreshes on demand; a first-page poll does not refresh every page.
 - Hidden-context and outdated conversations use an explicit original snippet;
   they are never attached to an unrelated current line.
