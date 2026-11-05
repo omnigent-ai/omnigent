@@ -2672,7 +2672,8 @@ class BackgroundSessionTitleRequest(BaseModel):
     """Private runner request for isolated background title inference."""
 
     prompt: str = Field(min_length=1, max_length=20_000)
-    additional_instructions: str | None = Field(default=None, max_length=4_000)
+    # Fits the server's and the session owner's 4,000-character guidance plus framing.
+    additional_instructions: str | None = Field(default=None, max_length=10_000)
     agent_id: str | None = None
     model_override: str | None = None
     harness_override: str | None = None
@@ -5351,6 +5352,28 @@ HarnessStreamEvent = (
     | SubagentCompletedEvent
     | SubagentToolCallEvent
 )
+
+
+# ── User settings ─────────────────────────────────────────────────
+
+
+class SessionTitleInstructionsRequest(BaseModel):
+    """Replace the caller's title instructions; null or blank clears them.
+
+    The stripped value may hold at most 4,000 characters. The raw bound only
+    caps request size before stripping.
+    """
+
+    instructions: str | None = Field(..., max_length=16_000)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionTitleInstructionsResponse(BaseModel):
+    """The caller's saved title instructions and the limit the server enforces."""
+
+    instructions: str | None
+    max_chars: int
 
 
 # ── Projects ──────────────────────────────────────────────────────

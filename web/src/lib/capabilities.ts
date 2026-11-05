@@ -269,6 +269,11 @@ export interface ServerInfo {
    */
   session_pull_requests?: boolean;
   /**
+   * True when the server stores each user's session title instructions
+   * (``/v1/settings/session-title-instructions``); absent on older servers (off).
+   */
+  session_title_instructions?: boolean;
+  /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
    */
@@ -587,6 +592,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
           session_pull_requests: data.session_pull_requests === true,
+          session_title_instructions: data.session_title_instructions === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,

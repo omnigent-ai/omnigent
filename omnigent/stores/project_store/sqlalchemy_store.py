@@ -9,15 +9,12 @@ from typing import Any
 
 import zstandard
 from sqlalchemy import LargeBinary, asc, select, type_coerce, update
-from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
-from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode, encode
 from omnigent.db.db_models import SqlPreference, SqlProject, current_workspace_id
+from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -383,40 +380,12 @@ class SqlAlchemyProjectStore(ProjectStore):
                 "sort_mode": "manual",
                 "ordered_project_ids": ids,
             }
-            encoded = _encode_order(preference)
-            values = {
-                "workspace_id": workspace_id,
-                "user_id": preference_user_id,
-                "key": _PROJECT_ORDER_KEY,
-                "value": encoded,
-            }
-            dialect = self._engine.dialect.name
-            stmt: Insert
-            if dialect == "mysql":
-                stmt = (
-                    mysql_insert(SqlPreference)
-                    .values(**values)
-                    .on_duplicate_key_update(value=encoded)
-                )
-            elif dialect == "sqlite":
-                stmt = (
-                    sqlite_insert(SqlPreference)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "key"],
-                        set_={"value": encoded},
-                    )
-                )
-            else:
-                stmt = (
-                    pg_insert(SqlPreference)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "key"],
-                        set_={"value": encoded},
-                    )
-                )
-            session.execute(stmt)
+            upsert_preference_row(
+                session,
+                user_id=preference_user_id,
+                key=_PROJECT_ORDER_KEY,
+                value=_encode_order(preference),
+            )
             return preference
 
         return run_write_transaction(self._session_immediate, "save_project_order", write)

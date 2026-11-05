@@ -77,6 +77,7 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
@@ -1843,6 +1844,8 @@ function TerminalClipboardControl() {
 
 /** App-wide behavior settings. */
 function GeneralSection() {
+  const info = useServerInfo();
+  const titleInstructions = info !== "loading" && info.session_title_instructions === true;
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
       <div className="flex flex-col gap-6">
@@ -1854,6 +1857,11 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
+          {titleInstructions && (
+            <div className="mt-4 border-t border-border pt-4">
+              <SessionTitleInstructionsControl />
+            </div>
+          )}
           <div className="mt-4 border-t border-border pt-4">
             <OpenSubagentsInPanelControl />
           </div>

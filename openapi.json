@@ -6308,6 +6308,11 @@
             "title": "Session Search Scope",
             "type": "boolean"
           },
+          "session_title_instructions": {
+            "default": false,
+            "title": "Session Title Instructions",
+            "type": "boolean"
+          },
           "sharing_mode": {
             "enum": [
               "on",
@@ -9473,6 +9478,56 @@
           "title"
         ],
         "title": "SessionTitleEvent",
+        "type": "object"
+      },
+      "SessionTitleInstructionsRequest": {
+        "additionalProperties": false,
+        "description": "Replace the caller's title instructions; null or blank clears them.\n\nThe stripped value may hold at most 4,000 characters. The raw bound only\ncaps request size before stripping.",
+        "properties": {
+          "instructions": {
+            "anyOf": [
+              {
+                "maxLength": 16000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          }
+        },
+        "required": [
+          "instructions"
+        ],
+        "title": "SessionTitleInstructionsRequest",
+        "type": "object"
+      },
+      "SessionTitleInstructionsResponse": {
+        "description": "The caller's saved title instructions and the limit the server enforces.",
+        "properties": {
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "max_chars": {
+            "format": "int64",
+            "title": "Max Chars",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instructions",
+          "max_chars"
+        ],
+        "title": "SessionTitleInstructionsResponse",
         "type": "object"
       },
       "SessionTodosEvent": {
@@ -19561,6 +19616,68 @@
         "summary": "Fork Session",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/settings/session-title-instructions": {
+      "get": {
+        "description": "Read the caller's own title instructions.",
+        "operationId": "get_session_title_instructions_v1_settings_session_title_instructions_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTitleInstructionsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Session Title Instructions",
+        "tags": [
+          "settings"
+        ]
+      },
+      "put": {
+        "description": "Save or clear the caller's title instructions.",
+        "operationId": "save_session_title_instructions_v1_settings_session_title_instructions_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTitleInstructionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTitleInstructionsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Session Title Instructions",
+        "tags": [
+          "settings"
         ]
       }
     },

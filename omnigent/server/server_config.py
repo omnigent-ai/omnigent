@@ -112,37 +112,48 @@ def config_str_list(value: Any) -> list[str]:
     return [str(item).strip() for item in items if str(item).strip()]
 
 
-def session_title_instructions(config: Mapping[str, Any]) -> str | None:
-    """Return validated additional guidance for automatic session titles.
+def normalize_session_title_instructions(raw: object, *, source: str) -> str | None:
+    """Validate custom title guidance from the server config or a user setting.
 
-    The setting is server-owned metadata rather than part of an agent spec.
-    Invalid values fail open to the default title prompt so a config typo can
-    never prevent a user turn from starting.
+    Invalid values fail open to the default title prompt so a typo can never
+    prevent a user turn from starting.
 
-    :param config: Loaded server config containing the optional
-        ``session_title_instructions`` top-level key.
-    :returns: Stripped custom instructions, or ``None`` when unset or invalid.
+    :param raw: Candidate guidance, e.g. ``"Prefix titles with the date."``.
+    :param source: Where the value came from, used in warnings, e.g.
+        ``"server config session_title_instructions"``.
+    :returns: Stripped instructions, or ``None`` when unset or invalid.
     """
-    raw = config.get(SESSION_TITLE_INSTRUCTIONS_KEY)
     if raw is None:
         return None
     if not isinstance(raw, str):
-        logger.warning(
-            "server config %s must be a string — using default title instructions",
-            SESSION_TITLE_INSTRUCTIONS_KEY,
-        )
+        logger.warning("%s must be a string — using default title instructions", source)
         return None
     value = raw.strip()
     if not value:
         return None
     if len(value) > SESSION_TITLE_INSTRUCTIONS_MAX_CHARS:
         logger.warning(
-            "server config %s exceeds %d characters — using default title instructions",
-            SESSION_TITLE_INSTRUCTIONS_KEY,
+            "%s exceeds %d characters — using default title instructions",
+            source,
             SESSION_TITLE_INSTRUCTIONS_MAX_CHARS,
         )
         return None
     return value
+
+
+def session_title_instructions(config: Mapping[str, Any]) -> str | None:
+    """Return validated additional guidance for automatic session titles.
+
+    The setting is server-owned metadata rather than part of an agent spec.
+
+    :param config: Loaded server config containing the optional
+        ``session_title_instructions`` top-level key.
+    :returns: Stripped custom instructions, or ``None`` when unset or invalid.
+    """
+    return normalize_session_title_instructions(
+        config.get(SESSION_TITLE_INSTRUCTIONS_KEY),
+        source=f"server config {SESSION_TITLE_INSTRUCTIONS_KEY}",
+    )
 
 
 @dataclass(frozen=True)

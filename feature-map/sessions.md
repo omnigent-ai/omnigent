@@ -25,6 +25,11 @@ the header menu), and each place is a separate entry point.
   above them; a drop on another project's row still files the session there.
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
+- `title-instructions`: Settings → General → Sessions → **Title instructions**
+  saves personal guidance (up to 4,000 characters) for automatic titles of
+  sessions you own. The server adds it after any operator
+  `session_title_instructions`; Clear removes only the personal guidance, so
+  titles fall back to the operator setting or, without one, the default prompt.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
   Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
@@ -599,6 +604,13 @@ plain `uv run pytest`, which starts a private server for the test.
   test drives a touch drag: in a narrow window open the drawer, press and hold a
   row, drop it on another row of its list, and expect the new order without the
   session opening.
+- **`title-instructions`:**
+  `tests/e2e_ui/sessions/test_session_title_instructions_setting.py` saves and
+  clears the field in the browser, then checks the next Claude SDK session's
+  title request against a scripted mock model. The field appears only when
+  `/v1/info` reports `session_title_instructions`. Per-user isolation, limits
+  and invalid stored values are covered in `tests/stores/test_user_settings_store.py`
+  and `tests/server/routes/test_user_settings_routes.py`.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
