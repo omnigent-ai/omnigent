@@ -134,7 +134,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
   A Claude native launch customized by a configured command, arguments or
   launcher also lists the plugins that launch loads, such as `--plugin-dir`, in
-  both the in-session and new-session composers.
+  both the in-session and new-session composers. The host asks the launch from
+  the home directory, so plugins it adds relative to a workspace are not listed.
   States: loading, error/retry, unavailable while disconnected, and an
   incomplete catalog, including a launch that has not reported its plugins yet
   (the host asks it in the background) or cannot report them.
