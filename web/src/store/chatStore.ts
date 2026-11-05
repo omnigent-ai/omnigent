@@ -8139,7 +8139,13 @@ function returnFailedStartupInputs(
         }),
   };
   if (inputs.length === 0) return patch;
-  return { ...patch, failedSendDraft: failedStartupDraft(conversationId, waiting, inputs) };
+  // Inputs sent before the waiting draft's own saved send go ahead of it, in the order sent.
+  const firstHeld = unreturned.findIndex((input) => inWaitingDraft.includes(input.pendingId));
+  const sentBefore = inputs.filter((input) => unreturned.indexOf(input) < firstHeld);
+  const ahead = failedStartupDraft(conversationId, null, sentBefore);
+  const leading = ahead && waiting ? joinFailedSendDrafts(ahead, waiting) : (waiting ?? ahead);
+  const sentAfter = inputs.filter((input) => !sentBefore.includes(input));
+  return { ...patch, failedSendDraft: failedStartupDraft(conversationId, leading, sentAfter) };
 }
 
 /** Hand back a failed launch's inputs, then name any a composer took back in that composer's draft. */

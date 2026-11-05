@@ -23109,6 +23109,14 @@ describe("a send cut off by a reload", () => {
       draft: { text: "saved on server" },
     },
     {
+      // Both were saved, so they come back in the order they were sent.
+      unanswered: "the unanswered follow-up it saved after the first input",
+      send: { text: "rerun the failing test" },
+      savedAs: "item_first",
+      savedAfter: "pending_second",
+      draft: { text: "saved on server\n\nrerun the failing test" },
+    },
+    {
       unanswered: "a queued resend",
       send: { text: "saved on server, edited", startupInputIds: ["pending_first"] },
       savedAs: "item_first",
@@ -23124,12 +23132,19 @@ describe("a send cut off by a reload", () => {
     },
   ])(
     "hands back $unanswered on load with the failed launch's first input once",
-    async ({ send, savedAs, image, queued, followUp, draft }) => {
+    async ({ send, savedAs, savedAfter, image, queued, followUp, draft }) => {
       seedSession("conv_reload", []);
       failManagedLaunch("conv_reload", "saved on server");
       const [input] = sessionFailedInputs.get("conv_reload")!;
       input!.item_id = savedAs;
       if (image) input!.content.push(image);
+      if (savedAfter) {
+        sessionFailedInputs.get("conv_reload")!.push({
+          pending_id: savedAfter,
+          item_id: "stable_reload",
+          content: [{ type: "input_text", text: send.text }],
+        });
+      }
       const record = { stableId: "stable_reload", authorId: "user_a", ...send };
       if (queued) rememberQueuedSends("conv_reload", [record]);
       else rememberUnsentSend("conv_reload", record);
@@ -23142,14 +23157,15 @@ describe("a send cut off by a reload", () => {
       await tick();
 
       const state = useChatStore.getState();
+      const returned = ["pending_first", ...(savedAfter ? [savedAfter] : [])];
       expect(state.failedSendDraft).toEqual({
         conversationId: "conv_reload",
         files: [],
         ...draft,
-        startupInputIds: ["pending_first"],
+        startupInputIds: returned,
         recovered: true,
       });
-      expect(state.returnedStartupInputs).toEqual(["pending_first"]);
+      expect(state.returnedStartupInputs).toEqual(returned);
       const notices = state.blocks.filter(
         (block) => block.type === "error" && block.level === "info",
       );
