@@ -30,6 +30,7 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.databricks_ai_gateway import gateway_request_tag_headers
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.models import model_catalog
@@ -521,6 +522,7 @@ def _get_openai_async_client(
             gateway_auth = _ShellCommandBearerAuth(databricks_auth_command)
         return AsyncOpenAI(
             base_url=_gateway_base_url_for_model(base_url_override, model),
+            default_headers=gateway_request_tag_headers(base_url_override),
             api_key=_OPENAI_KEY_PLACEHOLDER,
             http_client=httpx.AsyncClient(auth=gateway_auth),
             **retry_kwargs,
@@ -547,6 +549,7 @@ def _get_openai_async_client(
         return AsyncOpenAI(
             api_key=api_key,
             base_url=_gateway_base_url_for_model(base_url, model) if base_url else None,
+            default_headers=gateway_request_tag_headers(base_url),
             **retry_kwargs,
         )
 
@@ -564,10 +567,10 @@ def _get_openai_async_client(
 
         try:
             auth, host = _resolve_databricks_auth(profile)
+            base_url = base_url_override or _databricks_openai_base_url(host)
             return AsyncOpenAI(
-                base_url=_gateway_base_url_for_model(
-                    base_url_override or _databricks_openai_base_url(host), model
-                ),
+                base_url=_gateway_base_url_for_model(base_url, model),
+                default_headers=gateway_request_tag_headers(base_url),
                 api_key=_OPENAI_KEY_PLACEHOLDER,
                 http_client=httpx.AsyncClient(auth=auth),
                 **retry_kwargs,
@@ -598,6 +601,7 @@ def _get_openai_async_client(
     if os.environ.get("OPENAI_BASE_URL"):
         return AsyncOpenAI(
             base_url=_gateway_base_url_for_model(os.environ["OPENAI_BASE_URL"], model),
+            default_headers=gateway_request_tag_headers(os.environ["OPENAI_BASE_URL"]),
             api_key=os.environ.get("OPENAI_API_KEY", _OPENAI_KEY_PLACEHOLDER),
             **retry_kwargs,
         )
@@ -630,10 +634,10 @@ def _get_openai_async_client(
             "the package (`pip install 'omnigent[databricks]'`) or set "
             "OPENAI_API_KEY/OPENAI_BASE_URL for non-Databricks OpenAI access."
         ) from exc
+    base_url = base_url_override or _databricks_openai_base_url(host)
     return AsyncOpenAI(
-        base_url=_gateway_base_url_for_model(
-            base_url_override or _databricks_openai_base_url(host), model
-        ),
+        base_url=_gateway_base_url_for_model(base_url, model),
+        default_headers=gateway_request_tag_headers(base_url),
         api_key=_OPENAI_KEY_PLACEHOLDER,
         http_client=httpx.AsyncClient(auth=auth),
         **retry_kwargs,

@@ -25,8 +25,9 @@
 
 import { escapeHtmlAttr } from "@/lib/html";
 import bridgeRuntime from "./htmlCommentBridgeRuntime.js?raw";
-import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
+import { prepareHtmlPreviewDoc, startTagEnd } from "./codeViewerHelpers";
 import { type HtmlPreviewZoomAction, isHtmlPreviewZoomAction } from "./htmlPreviewZoom";
+import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
 /** Protocol version — bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
@@ -52,6 +53,8 @@ export const BRIDGE_MSG = {
   selectionCleared: "omni:selectionCleared",
   /** iframe → parent: the user pressed a zoom shortcut inside the preview. */
   zoom: "omni:zoom",
+  /** iframe → parent: the document's vertical scroll offset after it scrolled. */
+  scroll: "omni:scroll",
 } as const;
 
 /** Rect of a selection in the iframe's own viewport coordinates. */
@@ -93,9 +96,20 @@ export interface BridgeZoom {
   action: HtmlPreviewZoomAction;
 }
 
+export interface BridgeScroll {
+  type: typeof BRIDGE_MSG.scroll;
+  /** The document's vertical scroll offset, in the frame's CSS pixels. */
+  top: number;
+}
+
 /** Any message the iframe can send to the parent (post-handshake). */
 export type InboundBridgeMessage =
-  BridgeReady | BridgeSelection | BridgeCommentClick | BridgeSelectionCleared | BridgeZoom;
+  | BridgeReady
+  | BridgeSelection
+  | BridgeCommentClick
+  | BridgeSelectionCleared
+  | BridgeZoom
+  | BridgeScroll;
 
 // ---------------------------------------------------------------------------
 // Inbound message validation
@@ -151,6 +165,10 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
       return { type: BRIDGE_MSG.selectionCleared };
     case BRIDGE_MSG.zoom:
       return isHtmlPreviewZoomAction(d.action) ? { type: BRIDGE_MSG.zoom, action: d.action } : null;
+    case BRIDGE_MSG.scroll:
+      return typeof d.top === "number" && Number.isFinite(d.top) && d.top >= 0
+        ? { type: BRIDGE_MSG.scroll, top: d.top }
+        : null;
     default:
       return null;
   }
@@ -295,6 +313,22 @@ const BRIDGE_HIGHLIGHT_STYLE =
   "</style>";
 
 /**
+ * Hides the page while a scroll restore is pending, so clamped offsets never paint and
+ * hidden controls take no clicks. The runtime removes it once the restore settles. If the
+ * runtime never runs, the animation still ends, but the rule keeps overriding the page's own
+ * <html> animation.
+ */
+function restoreHideStyle(nonce: string): string {
+  // The runtime's budget starts only when the bridge script at the end of the body runs.
+  const fallbackMs = 2 * SCROLL_RESTORE_BUDGET_MS;
+  return (
+    `<style data-omni-restore-hide="${escapeHtmlAttr(nonce)}">` +
+    `html{animation:omni-restore-hide ${fallbackMs}ms!important}` +
+    "@keyframes omni-restore-hide{from,to{opacity:0;pointer-events:none}}</style>"
+  );
+}
+
+/**
  * Prepare HTML artifact content for the comment-enabled preview iframe: first
  * run {@link prepareHtmlPreviewDoc} (so links still open in a new tab), then
  * append the highlight `<style>` and the bridge `<script>` so the script runs
@@ -307,15 +341,33 @@ const BRIDGE_HIGHLIGHT_STYLE =
  * @param html  Raw artifact HTML.
  * @param nonce Per-mount nonce shared with the parent for message validation.
  * @param runtimeUrl External runtime asset for embeds whose CSP blocks inline scripts.
+ * @param restoreScrollTop Saved vertical offset the runtime returns to as the document
+ *   lays out, so a remounted preview reopens where the reader was; 0 keeps the top. The
+ *   page stays hidden until it gets there, via a style placed first in the head.
  */
-export function injectCommentBridge(html: string, nonce: string, runtimeUrl?: string): string {
-  const prepared = prepareHtmlPreviewDoc(html);
+export function injectCommentBridge(
+  html: string,
+  nonce: string,
+  runtimeUrl?: string,
+  restoreScrollTop = 0,
+): string {
+  let prepared = prepareHtmlPreviewDoc(html);
+  const restoring = Number.isFinite(restoreScrollTop) && restoreScrollTop > 0;
+  if (restoring) {
+    const headStart = Math.max(startTagEnd(prepared, "head"), 0);
+    prepared = prepared.slice(0, headStart) + restoreHideStyle(nonce) + prepared.slice(headStart);
+  }
   const src = runtimeUrl ? ` src="${escapeHtmlAttr(runtimeUrl)}"` : "";
   const body = runtimeUrl ? "" : HTML_COMMENT_BRIDGE_RUNTIME;
   const protocol = escapeHtmlAttr(JSON.stringify({ source: BRIDGE_SOURCE, types: BRIDGE_MSG }));
+  const restore = restoring
+    ? ` data-omni-restore-scroll="${escapeHtmlAttr(
+        JSON.stringify({ top: restoreScrollTop, budgetMs: SCROLL_RESTORE_BUDGET_MS }),
+      )}"`
+    : "";
   const inject =
     BRIDGE_HIGHLIGHT_STYLE +
-    `<script${src} data-omni-nonce="${escapeHtmlAttr(nonce)}" data-omni-protocol="${protocol}">${body}</script>`;
+    `<script${src} data-omni-nonce="${escapeHtmlAttr(nonce)}" data-omni-protocol="${protocol}"${restore}>${body}</script>`;
 
   const bodyClose = prepared.search(/<\/body\s*>/i);
   if (bodyClose !== -1) {

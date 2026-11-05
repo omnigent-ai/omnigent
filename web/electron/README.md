@@ -508,9 +508,12 @@ request. Both an updated desktop and web bundle are required; older web bundles
 remain public-only without destroying existing public views.
 
 Eligibility is granted at navigation and re-checked at every navigation and agent
-read/action. A failed check revokes access before clearing the previous document;
-access stays revoked if clearing fails. Request and redirect checks use the
-in-memory grant and window trust gates, keeping disk reads off the request path.
+read/action. Local identity/enrollment results are cached per host/server pair for
+at most one second measured with a monotonic clock, so these checks can use
+enrollment information up to one second old. A failed check revokes access before
+clearing the previous document; access stays revoked if clearing fails. Request
+and redirect checks use the in-memory grant and window trust gates, keeping disk
+reads off the request path.
 
 Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.
@@ -602,7 +605,7 @@ other browser permissions remain denied.
 This controls Chromium's local-network permission answers, **not a network
 firewall**: Electron versions may not gate every local-network fetch on this
 permission. Approval does not bypass CORS, TLS certificate validation, or the
-agent navigation policy. A helper that rejects this origin through its own CORS
+browser navigation policy. A helper that rejects this origin through its own CORS
 policy must be configured to allow it; the pane does not rewrite those headers.
 
 ### Browser implementation
@@ -610,7 +613,8 @@ policy must be configured to allow it; the pane does not rewrite those headers.
 The browser runs on the user's machine (a native `WebContentsView`); the agent —
 which may run on a different host — drives it purely by messages: an action
 request fans out over the session stream, the renderer claims and executes it
-against its local Chromium, and the result is posted back.
+against its local Chromium, and the result is posted back. Every renderer navigation,
+including the address bar, chat links, and agent actions, enforces this policy.
 
 **Pieces:**
 
@@ -622,25 +626,35 @@ against its local Chromium, and the result is posted back.
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
   Page-initiated `window.open` / `target=_blank` never spawns a window: an
   http(s) target navigates the same view in place (still allowlist-checked on
-  an agent-locked view), and right-click offers "Open Link in Browser" /
+  a policy-enforced view), and right-click offers "Open Link in Browser" /
   "Copy Link Address".
-- `src/browserUrlPolicy.js` — the agent navigation policy: http(s) only, and
+- `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
   any literal form, except exact loopback hosts for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
-  policy to every document request (frames, `<object>`/`<embed>`) of an
-  agent-locked view through `webRequest`, covering redirects and in-place
-  window opens. Scripts, images, fetch/XHR, and WebSockets are outside this
-  guard and can still reach internal addresses; Electron 42 does not enforce
-  Chromium's Local Network Access checks here.
-  Those requests skip HTTP-cache reads so every response reports
-  the address Chromium connected to, and a response whose address is missing
+  policy to every HTTP(S) and WebSocket request of a policy-enforced view through
+  `webRequest`, including frames, `<object>`/`<embed>`, scripts, styles, images,
+  media, and fetch/XHR. Worker network requests use the owning view's policy;
+  requests without a registered view use the most restrictive owner in the
+  partition, or public-only access if no owners remain. A never-navigated blank
+  tab makes sibling service-worker requests public-only until it navigates
+  with an eligible context. Every guarded request to a named host resolves DNS
+  through its partition before sending, including GET/HEAD subresources and
+  WebSockets. IP literals use the URL check without DNS. Exact loopback hosts
+  remain available to eligible Arca and this-machine sessions. Enforcement cancels requests and
+  keeps the view open.
+  Guarded HTTP requests skip cache reads to obtain connected-address metadata;
+  a response whose address is missing
   or non-public (a DNS answer that changed after the check) is cancelled,
-  unless that address belongs to a configured proxy. Limits: that response
-  check runs after the request was sent, so it keeps the response from the
-  page but does not stop the request reaching the server. Pages restored from
-  the back-forward cache and navigations answered by a service worker make no
+  unless that address belongs to a configured proxy. Skipping cache reads adds
+  network round trips and may increase latency and bandwidth. WebSocket upgrades
+  can omit the connected IP; those repeat the partition DNS check at the 101
+  response. This is not connected-IP verification and cannot rule out a DNS
+  change between check and connection. Limits: a DNS
+  change between preflight and connection can still send a request to a private
+  address; the HTTP response check prevents the page from reading its response.
+  Pages restored from the back-forward cache and navigations answered by a service worker make no
   request these hooks see. Electron reports the connected IP but not its port
   or whether a proxy was used, so when an internal proxy with a `DIRECT`
   fallback is down and the destination rebinds to that proxy's IP, a direct
@@ -648,8 +662,8 @@ against its local Chromium, and the result is posted back.
   agent browsing through such proxies. For a proxied request, the reported IP
   belongs to the proxy, not the destination it fetched; destination enforcement
   therefore also depends on the proxy's own policy. Preflight still requires
-  successful local destination DNS, so proxy-only DNS configurations are not
-  supported. Classification conservatively excludes all of `2001::/23`,
+  successful local destination DNS for every named host,
+  so proxy-only DNS configurations are not supported. Classification conservatively excludes all of `2001::/23`,
   including the global exceptions recognized by the Python policy.
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
@@ -865,6 +879,20 @@ server (see below), Connect, and you're in.
 > Note: this loads the UI from whatever server URL you give it — it does
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
+
+### Close Tab shortcut
+
+Cmd/Ctrl+W closes the selected visible workspace tab in an ordinary conversation.
+File tabs confirm unsaved edits before closing; terminal and side-chat tabs use
+their existing close behavior. With no closable visible tab, it returns to the
+new-session page. Outside a conversation, including grid workspaces, it closes
+the window. Grid panels do not participate in this shortcut yet.
+Cmd/Ctrl+Shift+W always requests window closure.
+
+The web app and shell must both support the Close Tab bridge; older combinations
+keep the window-close behavior. Verify on each supported desktop OS with focus
+inside an embedded browser: Cmd/Ctrl+W must close only its tab, and
+Cmd/Ctrl+Shift+W must close the window.
 
 ### Test desktop updates
 

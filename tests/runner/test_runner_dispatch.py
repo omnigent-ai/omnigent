@@ -8441,6 +8441,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     event_bodies: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_bundle_model_override": True})
         if request.method == "POST" and request.url.path == "/v1/sessions":
             create_requests.append(request)
             return httpx.Response(
@@ -8463,7 +8465,13 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         output = await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
+                {
+                    "config_path": "helper.yaml",
+                    "title": "auth",
+                    "message": "start",
+                    "model": "databricks-claude-sonnet-4-6",
+                    "reasoning_effort": "low",
+                }
             ),
             server_client=server_client,
             conversation_id="conv_caller",
@@ -8471,12 +8479,18 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         )
 
     # Exactly one multipart create; parent forced to the caller
-    # (child-only) and the title threaded into the metadata part.
+    # (child-only), and title, model and effort threaded into the
+    # metadata part as the agent_id create sends them.
     assert len(create_requests) == 1, (
         f"expected exactly one create POST, got {len(create_requests)}"
     )
     parts = _parse_multipart_create(create_requests[0])
-    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+    assert parts["metadata"] == {
+        "parent_session_id": "conv_caller",
+        "title": "auth",
+        "model_override": "databricks-claude-sonnet-4-6",
+        "reasoning_effort": "low",
+    }
 
     # The uploaded bundle is a gzipped tar holding the authored config
     # verbatim — proves the local file traversed materialize → tar.
@@ -8498,6 +8512,111 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     # not the caller's args — the orchestrator needs the NEW agent's id.
     assert handle["agent_id"] == "ag_new"
     assert handle["agent_name"] == "helper"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("info", "args", "error"),
+    [
+        pytest.param(
+            {}, {"model": "databricks-claude-sonnet-4-6"}, "server_too_old", id="old-server"
+        ),
+        pytest.param(
+            None, {"model": "databricks-claude-sonnet-4-6"}, "could not check", id="no-info"
+        ),
+        pytest.param(
+            {"session_bundle_model_override": True},
+            {"reasoning_effort": 3},
+            "must be a string",
+            id="non-string-effort",
+        ),
+    ],
+)
+async def test_sys_session_create_config_path_refuses_unsendable_overrides(
+    tmp_path: Path, info: dict[str, Any] | None, args: dict[str, Any], error: str
+) -> None:
+    """
+    A config_path create never drops a requested override: a server that does
+    not report ``session_bundle_model_override`` (or whose info cannot be read)
+    and a non-string value both fail with a named error before any upload.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: help\n")
+    creates: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=info) if info is not None else httpx.Response(503)
+        creates.append(request)
+        return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", **args}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    assert error in output
+    assert creates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "effort", "sent"),
+    [
+        pytest.param("claude-sdk", "ultra", "xhigh", id="alias-folds"),
+        pytest.param("claude-sdk", "minimal", None, id="outside-vocabulary"),
+        pytest.param("cursor", "low", None, id="no-effort-support"),
+        pytest.param(None, "low", "low", id="unclassified-harness-passes"),
+    ],
+)
+async def test_sys_session_create_config_path_checks_effort_against_the_bundle_harness(
+    tmp_path: Path, harness: str | None, effort: str, sent: str | None
+) -> None:
+    """
+    A config_path effort the bundled child's harness cannot use fails before
+    any upload instead of being stored and dropped at every turn; an alias
+    folds to the harness's value, and an unclassified harness passes through.
+
+    :param harness: The local config's harness, or ``None`` for none set.
+    :param effort: The requested effort.
+    :param sent: The effort the metadata carries, or ``None`` when refused.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    config = "name: helper\nprompt: help\n"
+    if harness is not None:
+        config += f"executor:\n  harness: {harness}\n"
+    (tmp_path / "helper.yaml").write_text(config)
+    creates: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        creates.append(request)
+        return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", "reasoning_effort": effort}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    if sent is None:
+        assert "invalid 'reasoning_effort'" in output
+        assert creates == []
+        return
+    assert len(creates) == 1, output
+    assert _parse_multipart_create(creates[0])["metadata"]["reasoning_effort"] == sent
 
 
 @pytest.mark.asyncio
