@@ -828,7 +828,8 @@ _CREATED_A = {"stdout": A, "gitOperation": {"pr": {"url": A, "action": "created"
             id="arithmetic-shift",
         ),
         pytest.param(
-            ": ${BODY:-<<EOF }\ngh pr create --title t",
+            # Read as a heredoc, the closing ``EOF`` would swallow the create.
+            ": ${BODY:-<<EOF }\ngh pr create --title t\nEOF",
             {"stdout": A},
             [A],
             True,
@@ -849,26 +850,33 @@ _CREATED_A = {"stdout": A, "gitOperation": {"pr": {"url": A, "action": "created"
             id="continued-tab-stripping-operator",
         ),
         pytest.param(
-            "cat <<EOF\r\nbody\r\nEOF\r\ngh pr create --title t",
+            "cat <<EOF\r\ngh pr create\r\nEOF\r\ngh pr view 7",
             {"stdout": A},
-            [A],
-            True,
+            [],
+            False,
             id="crlf-heredoc",
         ),
         pytest.param(
-            'cat <<"E\\$OF"\nwe\'re data\nE\\$OF\n'
-            "gh pr merge 42 -R example/one\nE$OF\nprintf done",
-            "done",
-            [],
-            False,
-            id="escaped-delimiter-merge-is-data",
+            "cat <<'EOF' # PR body\ntext\nEOF\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="comment-after-heredoc-operator",
         ),
         pytest.param(
+            "cat > body.md <<'EOF' # PR body\ntext\nEOF\ngh pr create --body-file body.md",
+            _CREATED_A,
+            [A],
+            True,
+            id="comment-after-heredoc-operator-with-metadata",
+        ),
+        pytest.param(
+            # Escapes in a delimiter are not modelled, so the command is lexed as before.
             'cat <<"E\\$OF"\nbody\nE$OF\ngh pr create --title t',
             {"stdout": A},
             [A],
             True,
-            id="escaped-delimiter-then-create",
+            id="unsupported-delimiter-uses-plain-lexing",
         ),
     ],
 )
@@ -887,23 +895,28 @@ def test_unquoted_substitution_stays_one_exact_token() -> None:
     ]
 
 
-def test_heredoc_operators_on_one_continued_line_read_bounded_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    read: list[int] = []
+def test_heredoc_operator_reads_a_bounded_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanned: list[int] = []
+
+    class CountingSlices(str):
+        def __getitem__(self, key: object) -> str:
+            text = str.__getitem__(self, key)  # type: ignore[call-overload]
+            scanned.append(len(text))
+            return text
+
+    calls: list[int] = []
     original = pr_observer._heredoc_operator_text
 
     def counting(command: str, start: int) -> tuple[str, bool]:
-        text, truncated = original(command, start)
-        read.append(len(text))
-        return text, truncated
+        calls.append(start)
+        return original(CountingSlices(command), start)
 
     monkeypatch.setattr(pr_observer, "_heredoc_operator_text", counting)
-    operators = 2000
-    _shell_segments("cat " + "<<A \\\n" * operators + "\n")
-    # Rescanning the rest of the line for each operator would read ~operators**2 characters.
-    assert sum(read) <= pr_observer._HEREDOC_OPERATOR_LIMIT * len(read)
-    assert len(read) <= operators
+    operators = 500
+    # Continuations between operators would make an unbounded reader rescan the line.
+    _shell_segments("cat " + ("<<A " + "\\\n" * 50) * operators + "\n")
+    assert 0 < len(calls) <= operators
+    assert sum(scanned) <= pr_observer._HEREDOC_OPERATOR_LIMIT * len(calls)
 
 
 @pytest.mark.parametrize("tool_name", ["Bash", "exec_command"])

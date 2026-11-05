@@ -108,18 +108,22 @@ _HEREDOC_OPERATOR_LIMIT = 256
 
 
 def _heredoc_operator_text(command: str, start: int) -> tuple[str, bool]:
-    """Return the operator text at *start* without continuations, and whether it was cut short."""
+    """Return the operator text at *start* without continuations, and whether it was cut short.
+
+    Only a fixed-size window is read, so each operator costs at most the limit.
+    """
+    window = command[start : start + _HEREDOC_OPERATOR_LIMIT]
     text: list[str] = []
-    index = start
-    while index < len(command) and len(text) < _HEREDOC_OPERATOR_LIMIT:
-        if command.startswith("\\\n", index):
+    index = 0
+    while index < len(window):
+        if window.startswith("\\\n", index):
             index += 2
-        elif command[index] == "\n":
+        elif window[index] == "\n":
             return "".join(text), False
         else:
-            text.append(command[index])
+            text.append(window[index])
             index += 1
-    return "".join(text), index < len(command)
+    return "".join(text), start + len(window) < len(command)
 
 
 def _logical_line(command: str, start: int, *, join: bool = True) -> tuple[str, int]:
@@ -195,11 +199,10 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
             index += 2
             continue
         if quote is None and char == "#" and (index == 0 or command[index - 1] in " \t\r\n;&|()"):
+            # Drop the comment but keep its newline: shlex would swallow both.
             end = command.find("\n", index)
             if end == -1:
-                result.append(command[index:])
                 break
-            result.append(command[index:end])
             index = end
             continue
         if model_syntax and quote is None and command.startswith("$(", index):
