@@ -95,6 +95,40 @@ def side_chat_question_from_text(text: str) -> str | None:
     return question or None
 
 
+def side_chat_text_from_content(content: object) -> str:
+    """
+    Join the user text of message content blocks, as the runner reads a message.
+
+    :param content: A message body's ``content`` list, e.g.
+        ``[{"type": "input_text", "text": "and why?"}]``.
+    :returns: The concatenated text with leading indentation preserved, or
+        ``""`` when there is none.
+    """
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts).rstrip()
+
+
+def side_chat_question_from_content(content: object) -> str | None:
+    """
+    Return the question when a message's content is a ``/side`` command.
+
+    Reads the content exactly as the runner does before it forks, so a check
+    on the server sees every command the runner would act on.
+
+    :param content: A message body's ``content`` list, e.g.
+        ``[{"type": "input_text", "text": "/side why?"}]``.
+    :returns: The question, or ``None`` when the message is not a ``/side`` command.
+    """
+    return side_chat_question_from_text(side_chat_text_from_content(content).lstrip())
+
+
 def is_side_chat_child(labels: Mapping[str, str] | None) -> bool:
     """Whether a child conversation's labels mark it as a ``/side`` fork, not a sub-agent."""
     return (labels or {}).get(_NICKNAME_LABEL_KEY) == SIDE_CHAT_DISPLAY_NAME

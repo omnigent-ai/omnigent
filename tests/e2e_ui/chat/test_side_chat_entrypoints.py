@@ -643,6 +643,7 @@ def test_side_chat_follows_the_user_to_another_device(
     base_url, session_id = seeded_session
     parent_reply = "The parent chat answered first."
     side_reply = "Your phone can read this side-chat answer too."
+    phone_reply = "Sent from the phone, answered in the side chat."
     question = f"devices-side-{session_id}: will my phone see this?"
     configure_mock_llm(
         mock_llm_server_url,
@@ -652,7 +653,7 @@ def test_side_chat_follows_the_user_to_another_device(
     )
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": side_reply}],
+        [{"text": side_reply}, {"text": phone_reply}],
         key=f"devices-side-{session_id}",
         match=f"devices-side-{session_id}",
     )
@@ -679,6 +680,15 @@ def test_side_chat_follows_the_user_to_another_device(
         # The parent history the fork copied stays hidden here too.
         expect(drawer.locator(_ASSISTANT).filter(has_text=parent_reply)).to_have_count(0)
         expect(drawer.get_by_test_id("side-chat-input")).to_be_visible()
+        # The phone can carry the side chat on, without touching the parent.
+        drawer.get_by_test_id("side-chat-input").fill(f"devices-side-{session_id}: and now?")
+        drawer.get_by_test_id("side-chat-send").click()
+        expect(drawer.locator(_ASSISTANT).filter(has_text=phone_reply)).to_be_visible(
+            timeout=30_000
+        )
+        parent_items = httpx.get(f"{base_url}/v1/sessions/{session_id}/items", timeout=10.0)
+        assert parent_items.status_code == 200, parent_items.text
+        assert phone_reply not in parent_items.text
 
         with phone.expect_response(f"**/v1/sessions/{side_chat_forks[0]}/events") as stopped:
             drawer.get_by_role("button", name="Close Side chat 1", exact=True).click()

@@ -1783,6 +1783,18 @@ describe("stopSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({ type: "stop_session", data: {} });
     expect(out.queued).toBe(false);
   });
+
+  it("says when the stop closes a side chat's tab", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
+
+    await stopSession("conv_side", { closeTab: true });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "stop_session",
+      data: { close_tab: true },
+    });
+  });
 });
 
 describe("continueFailedTurn", () => {

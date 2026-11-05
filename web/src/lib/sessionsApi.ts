@@ -1579,8 +1579,15 @@ export function interrupt(sessionId: string, responseId?: string): Promise<PostE
  * hard-kills the tmux pane the `claude` binary runs in — the analog
  * of exiting from inside tmux, but driven from the web UI.
  */
-export function stopSession(sessionId: string): Promise<PostEventResponse> {
-  return postEvent(sessionId, { type: "stop_session", data: {} });
+/**
+ * Stop a session. `closeTab` marks a side chat's tab closed too, so the user's
+ * other devices drop it; any other stop leaves the tab alone.
+ */
+export function stopSession(
+  sessionId: string,
+  { closeTab = false }: { closeTab?: boolean } = {},
+): Promise<PostEventResponse> {
+  return postEvent(sessionId, { type: "stop_session", data: closeTab ? { close_tab: true } : {} });
 }
 
 /** Reconnect or relaunch the existing runner without replaying user input. */

@@ -54,7 +54,6 @@ from omnigent.server.schemas import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import SIDE_CHAT_CLOSED_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 # ``?descendants=true`` depth: the default matches the CLI tree and the web
 # Agents rail; the cap bounds the in-memory walk.
@@ -371,18 +370,15 @@ def register_items_routes(
         has_more = len(ids) > limit
         ids = ids[:limit]
         rows = await asyncio.to_thread(
-            conversation_store.get_created_at_and_labels,
-            ids,
-            (SIDE_CHAT_CLOSED_LABEL_KEY, CLOSED_LABEL_KEY),
+            conversation_store.get_created_at_and_labels, ids, (SIDE_CHAT_CLOSED_LABEL_KEY,)
         )
         return PaginatedList(
             data=[
                 SideChatSummary(
                     id=side_id,
                     created_at=rows[side_id][0],
-                    # A closed tab, or a Codex side chat that has ended.
-                    closed=SIDE_CHAT_CLOSED_LABEL_KEY in rows[side_id][1]
-                    or rows[side_id][1].get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE,
+                    # Only a closed tab; an ended Codex side chat stays readable.
+                    closed=SIDE_CHAT_CLOSED_LABEL_KEY in rows[side_id][1],
                 )
                 for side_id in ids
                 if side_id in rows

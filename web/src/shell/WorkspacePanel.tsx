@@ -1128,7 +1128,7 @@ function WorkspacePanelImpl({
     const queued = useChatStore.getState().clearQueuedMessages(childId);
     if (!childId.startsWith("pending:")) {
       try {
-        await stopSession(childId);
+        await stopSession(childId, { closeTab: true });
       } catch {
         useChatStore.getState().restoreQueuedMessages(queued);
         toast.error("Couldn't close side chat. Try again.");

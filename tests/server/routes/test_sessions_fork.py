@@ -735,10 +735,10 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
     )
     await codex_child({"thread_id": "thread_worker", "agent_nickname": "Worker"})
     store.set_labels(closed_side_chat["id"], {SIDE_CHAT_CLOSED_LABEL_KEY: "1"})
-    # A Codex side chat that ended counts as closed too.
+    # A Codex side chat that ended stays listed, so its transcript stays readable.
     store.set_labels(codex_side_chat, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
 
-    expected = {side_chat["id"]: False, closed_side_chat["id"]: True, codex_side_chat: True}
+    expected = {side_chat["id"]: False, closed_side_chat["id"]: True, codex_side_chat: False}
     assert await _side_chat_ids(client, parent.id) == expected
     snapshot = await client.get(f"/v1/sessions/{side_chat['id']}")
     assert snapshot.json()["side_chat_parent_id"] == parent.id
@@ -788,6 +788,17 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         headers=headers[editor],
     )
     assert side_command.status_code == 403, side_command.text
+    # The check reads /side the way the runner does, in any text block and at any length.
+    for content in (
+        [{"type": "text", "text": "/side why?"}],
+        [{"type": "input_text", "text": "/side " + " " * 4000 + "why?"}],
+    ):
+        smuggled = await auth_client.post(
+            f"/v1/sessions/{parent.id}/events",
+            json={"type": "message", "data": {"role": "user", "content": content}},
+            headers=headers[editor],
+        )
+        assert smuggled.status_code == 403, smuggled.text
     # Ordinary forks still need only read access.
     assert (await fork(reader, {})).status_code == 201
     started = await fork(owner, {"side_chat": True})

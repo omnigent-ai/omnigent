@@ -7005,11 +7005,12 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
 
 
 def _opens_codex_side_chat(conv: Conversation, body: SessionEventInput) -> bool:
-    """Whether a message to *conv* is a Codex ``/side`` command, which forks a side chat."""
-    from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
+    """Whether a message to *conv* is a Codex ``/side`` command, read as the runner reads it."""
+    from omnigent.harnesses.codex_native.side_chat import side_chat_question_from_content
 
-    return _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
-        _extract_user_text_for_routing(body)
+    return (
+        _native_pane_harness(conv) == "codex-native"
+        and side_chat_question_from_content(body.data.get("content")) is not None
     )
 
 

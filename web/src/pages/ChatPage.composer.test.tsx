@@ -145,6 +145,7 @@ const { composerSessionSnapshot } = vi.hoisted(() => ({
     workspace: null as string | null,
     labels: {} as Record<string, string>,
     gitBranch: null as string | null,
+    sideChatAllowed: null as boolean | null,
   },
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
@@ -5861,6 +5862,31 @@ describe("Composer reply quotes", () => {
       quotes: [{ before: "", text: "Explain /help" }],
       text: "/help",
     });
+  });
+});
+
+describe("Composer side-chat entry points", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [], sessionHarness: "openai-agents" });
+  });
+  afterEach(() => {
+    cleanup();
+    composerSessionSnapshot.sideChatAllowed = null;
+  });
+
+  // An admin has owner level, but only the root session's owner starts side chats.
+  it.each([
+    [true, true],
+    [false, false],
+  ])("follow the server's side_chat_allowed=%s at owner level", (allowed, offered) => {
+    composerSessionSnapshot.sideChatAllowed = allowed;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+
+    fireEvent.change(textarea(), { target: { value: "/side" } });
+    expect(screen.queryByTestId("slash-menu-item-side") !== null).toBe(offered);
+    fireEvent.change(textarea(), { target: { value: "" } });
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    expect(screen.queryByTestId("composer-side-chat-action") !== null).toBe(offered);
   });
 });
 

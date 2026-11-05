@@ -1226,8 +1226,9 @@ def register_events_routes(
           kills its tmux pane) and 204s otherwise. Stop is non-sticky:
           it writes no persistent marker, so the next message
           auto-relaunches the session on its (still-online) host via
-          the normal message-dispatch relaunch path. Stopping a side chat
-          also records that its tab was closed, for the user's other devices.
+          the normal message-dispatch relaunch path. With
+          ``data.close_tab``, stopping a side chat also records that its tab
+          was closed, so the user's other devices drop it.
         - ``"retry_session"`` reconnects or relaunches the existing runner
           and retries a failed saved startup input, if one is present.
         - ``"message"`` on an ``omnigent claude`` terminal session
@@ -1907,7 +1908,16 @@ def register_events_routes(
             and _is_codex_native_subagent(conv)
             and is_side_chat_child(conv.labels)
         )
+        # Closing a side chat's tab, rather than any other stop, drops it on the
+        # user's other devices too.
+        tab_closed = (
+            {SIDE_CHAT_CLOSED_LABEL_KEY: "1"}
+            if body.type == _STOP_SESSION_TYPE and body.data.get("close_tab") is True
+            else {}
+        )
         if stop_codex_side_chat and is_session_closed(conv.labels, conv.title):
+            if tab_closed:
+                await asyncio.to_thread(conversation_store.set_labels, session_id, tab_closed)
             return {"queued": False}
         if body.type == _INTERRUPT_TYPE or stop_codex_side_chat:
             target_session_id = session_id
@@ -1934,7 +1944,7 @@ def register_events_routes(
                         await asyncio.to_thread(
                             conversation_store.set_labels,
                             session_id,
-                            {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                            {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE, **tab_closed},
                         )
                     return {"queued": False}
                 if (
@@ -1994,7 +2004,7 @@ def register_events_routes(
                 await asyncio.to_thread(
                     conversation_store.set_labels,
                     session_id,
-                    {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                    {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE, **tab_closed},
                 )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
@@ -2114,14 +2124,9 @@ def register_events_routes(
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
-            if (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY):
-                # Stopping a side chat closes its tab; record that so the user's
-                # other devices drop it too. The side chat stays writable.
-                await asyncio.to_thread(
-                    conversation_store.set_labels,
-                    session_id,
-                    {SIDE_CHAT_CLOSED_LABEL_KEY: "1"},
-                )
+            if tab_closed and (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY):
+                # The side chat stays writable; only its tab closes everywhere.
+                await asyncio.to_thread(conversation_store.set_labels, session_id, tab_closed)
             # The stop itself is non-sticky: nothing seals the session. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on

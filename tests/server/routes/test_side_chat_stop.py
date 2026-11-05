@@ -17,10 +17,12 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 
+@pytest.mark.parametrize("close_tab", [True, False])
 async def test_close_side_chat_preserves_shared_runner_and_transcript(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    close_tab: bool,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     agent_id = generate_agent_id()
@@ -57,8 +59,10 @@ async def test_close_side_chat_preserves_shared_runner_and_transcript(
         transport=httpx.MockTransport(handle), base_url="http://runner"
     ) as runner_client:
         monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner_client))
+        # Closing the tab says so; any other stop (the CLI, an agent tool) doesn't.
         response = await client.post(
-            f"/v1/sessions/{side.id}/events", json={"type": "stop_session"}
+            f"/v1/sessions/{side.id}/events",
+            json={"type": "stop_session", "data": {"close_tab": True} if close_tab else {}},
         )
         assert response.status_code == 202, response.text
         assert requests == [
@@ -70,8 +74,8 @@ async def test_close_side_chat_preserves_shared_runner_and_transcript(
         for row in (parent, side, sibling):
             saved = store.get_conversation(row.id)
             assert saved is not None and saved.runner_id == "runner-shared"
-            # Closing is recorded for the user's other devices, without sealing.
-            assert (SIDE_CHAT_CLOSED_LABEL_KEY in saved.labels) == (row is side)
+            # A closed tab is recorded for the user's other devices, without sealing.
+            assert (SIDE_CHAT_CLOSED_LABEL_KEY in saved.labels) == (close_tab and row is side)
             assert CLOSED_LABEL_KEY not in saved.labels
 
         response = await client.post(
@@ -119,7 +123,8 @@ async def test_side_chat_close_surfaces_runner_failure(
     ) as runner_client:
         monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner_client))
         response = await client.post(
-            f"/v1/sessions/{side.id}/events", json={"type": "stop_session"}
+            f"/v1/sessions/{side.id}/events",
+            json={"type": "stop_session", "data": {"close_tab": True}},
         )
 
         assert response.status_code == 503, response.text
@@ -139,3 +144,33 @@ async def test_side_chat_close_surfaces_runner_failure(
     assert side.id not in routes_events._interrupt_fenced_sessions
     saved = store.get_conversation(side.id)
     assert saved is not None and SIDE_CHAT_CLOSED_LABEL_KEY not in saved.labels
+
+
+async def test_closing_an_ended_codex_side_chat_tab_drops_it_everywhere(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A Codex side chat sealed when its fork died still closes its tab everywhere."""
+    store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    SqlAlchemyAgentStore(db_uri).create(agent_id, name="test", bundle_location="test:///bundle")
+    parent = store.create_conversation(agent_id=agent_id)
+    side = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        agent_id=agent_id,
+        labels={
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+            CLOSED_LABEL_KEY: "true",
+        },
+        side_chat_parent_id=parent.id,
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{side.id}/events",
+        json={"type": "stop_session", "data": {"close_tab": True}},
+    )
+
+    assert response.status_code == 202, response.text
+    saved = store.get_conversation(side.id)
+    assert saved is not None and saved.labels.get(SIDE_CHAT_CLOSED_LABEL_KEY) == "1"
