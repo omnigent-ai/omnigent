@@ -4006,6 +4006,78 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
         await executor.close_session("managed")
 
 
+@pytest.mark.asyncio
+async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A relay outlives no CLI: a turn cancelled mid-reconnect evicts its client and one
+    whose CLI fails to connect never keeps it."""
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    _deploy_managed_mcp(tmp_path, monkeypatch, {"omnigent": bridge.managed_mcp_relay_entry()})
+    status_file = tmp_path / "mcp-auth-status.json"
+    monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(status_file))
+
+    def report(status: str) -> None:
+        entry = {"harness": "claude", "name": "notes", "status": status}
+        status_file.write_text(json.dumps({"servers": [entry]}))
+
+    reconnect_hung = asyncio.Event()
+    fail_connect = False
+    fake_sdk = _make_recovery_fake_sdk()
+
+    class _Client(fake_sdk.ClaudeSDKClient):
+        async def connect(self) -> None:
+            if fail_connect:
+                raise RuntimeError("claude exited")
+
+        async def get_mcp_status(self) -> dict[str, object]:
+            return {"mcpServers": [{"name": "notes", "status": "failed"}]}
+
+        async def reconnect_mcp_server(self, server_name: str) -> None:
+            reconnect_hung.set()
+            await asyncio.Event().wait()
+
+    fake_sdk.ClaudeSDKClient = _Client
+    executor = ClaudeSDKExecutor()
+
+    async def tool_executor(name: str, arguments: dict) -> dict:
+        return {}
+
+    executor._tool_executor = tool_executor
+    tools = [{"name": "sys_ping", "parameters": {"type": "object", "properties": {}}}]
+    messages = [{"role": "user", "content": "q0", "session_id": "managed"}]
+
+    def relay_dir(client: _Client) -> Path:
+        return Path(client.options.env[bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV])
+
+    report("sign_in_required")
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        [event async for event in executor.run_turn(messages, tools, "")]
+        first = executor._clients["managed"].client
+        assert relay_dir(first).is_dir()
+
+        report("connected")
+        messages += [{"role": "assistant", "content": "a0"}, {"role": "user", "content": "q1"}]
+        cancelled = asyncio.ensure_future(executor.run_turn(messages, tools, "").__anext__())
+        await asyncio.wait_for(reconnect_hung.wait(), timeout=5)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await asyncio.gather(*executor._cancel_close_tasks)
+        assert "managed" not in executor._clients
+        assert not relay_dir(first).exists()
+
+        fail_connect = True
+        with pytest.raises(RuntimeError, match="claude exited"):
+            [event async for event in executor.run_turn(messages, tools, "")]
+        failed = fake_sdk.created_clients[-1]
+        assert failed is not first
+        assert "managed" not in executor._clients
+        assert not relay_dir(failed).exists()
+
+
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
     """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
     against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd
