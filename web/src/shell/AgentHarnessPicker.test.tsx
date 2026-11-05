@@ -87,9 +87,10 @@ function renderPicker(props: {
   harnessEntries: AvailableAgent[];
   agentEntries?: AvailableAgent[];
   effectiveAgentId?: string | null;
+  agentLabel?: string;
   allowCreateCustomAgent?: boolean;
   sandboxSelected?: boolean;
-  /** The deployment's curated roster, as only the New Chat landing passes it. */
+  /** The deployment's curated roster. */
   curatedEntries?: AvailableAgent[];
   entriesFailed?: boolean;
   hasAgents?: boolean;
@@ -107,7 +108,7 @@ function renderPicker(props: {
             entriesFailed={props.entriesFailed}
             onPrefetchEntries={props.onPrefetchEntries}
             effectiveAgentId={props.effectiveAgentId ?? null}
-            agentLabel="Picker"
+            agentLabel={props.agentLabel ?? "Picker"}
             hasAgents={props.hasAgents ?? true}
             host={props.host ?? readyHost}
             onSelectAgent={() => undefined}
@@ -268,15 +269,24 @@ describe("a curated New Chat picker", () => {
     expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
   });
 
-  it("still opens when the curation matches nothing, so the empty state can explain", async () => {
-    // The caller reports no agents, which would normally disable the trigger.
-    renderPicker({ harnessEntries: [claude], curatedEntries: [], hasAgents: false });
+  it.each([false, true])("opens an empty curated menu with saved selection=%s", async (saved) => {
+    renderPicker({
+      harnessEntries: [],
+      curatedEntries: [],
+      hasAgents: saved,
+      agentLabel: "Cursor",
+      effectiveAgentId: saved ? "saved-cursor" : null,
+    });
 
-    expect(screen.getByTestId("new-chat-landing-agent-select")).toBeEnabled();
+    const trigger = screen.getByTestId("new-chat-landing-agent-select");
+    expect(trigger).toBeEnabled();
+    expect(trigger).toHaveAccessibleName(saved ? "Cursor" : "No agents");
+    expect(trigger).toHaveTextContent(saved ? "Cursor" : "No agents");
     await openPicker();
     expect(screen.getByTestId("new-chat-landing-no-agents")).toHaveTextContent(
       "limits which agents New Chat offers",
     );
+    expect(row("saved-cursor")).toBeNull();
   });
 
   it("leaves the grouped menu alone when no curation is handed down", async () => {

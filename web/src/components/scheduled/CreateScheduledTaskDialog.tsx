@@ -166,15 +166,14 @@ export function CreateScheduledTaskDialog({
   );
   // Resolve the effective selection: the explicit pick if it's still in the
   // list, else the edited task's own agent (which may be hidden from the picker
-  // — never silently retarget it), else the first agent (so a fresh picker
-  // always has a concrete value).
-  const effectiveAgentId =
-    (agentList.some((a) => a.id === pickedAgentId)
-      ? pickedAgentId
-      : isEdit
-        ? editingTask?.agentId
-        : (agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
-          agentList[0]?.id)) ?? null;
+  // — never silently retarget it), else the deployment default or first agent.
+  const defaultAgentId =
+    agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+    agentList[0]?.id ??
+    null;
+  let effectiveAgentId: string | null = defaultAgentId;
+  if (agentList.some((agent) => agent.id === pickedAgentId)) effectiveAgentId = pickedAgentId;
+  else if (editingTask) effectiveAgentId = editingTask.agentId;
   const selectedAgent = agents?.find((agent) => agent.id === effectiveAgentId);
   const agentLabel = selectedAgent
     ? selectedAgent.display_name
@@ -1092,7 +1091,7 @@ export function CreateScheduledTaskDialog({
                 harnessEntries={harnessEntries}
                 effectiveAgentId={effectiveAgentId}
                 agentLabel={agentLabel}
-                hasAgents={agentList.length > 0}
+                hasAgents={selectedAgent !== undefined || agentList.length > 0}
                 curatedEntries={curation.restrictToAgentNames.size > 0 ? agentList : undefined}
                 // Sandboxes provision their own harnesses; host badges only apply to hosts.
                 host={sandboxMode ? undefined : badgeHost}

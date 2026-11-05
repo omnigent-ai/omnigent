@@ -109,6 +109,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
     agentEntries,
     curatedEntries,
     sandboxSelected,
+    hasAgents,
   }: {
     onSelectAgent: (a: AvailableAgent) => void;
     onOpenChange?: (open: boolean) => void;
@@ -121,6 +122,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
     agentEntries: AvailableAgent[];
     curatedEntries?: AvailableAgent[];
     sandboxSelected: boolean;
+    hasAgents: boolean;
   }) => (
     <div
       data-testid="agent-picker-stub"
@@ -135,7 +137,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
       data-curated-entries={curatedEntries?.map((agent) => agent.name).join(",")}
       data-sandbox-selected={String(sandboxSelected)}
     >
-      <span>{agentLabel}</span>
+      <span>{hasAgents ? agentLabel : "No agents"}</span>
       {harnessEntries
         .filter((agent) => agent.name !== "claude-native-ui")
         .map((agent) => (
@@ -290,54 +292,76 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
 }
 
 describe("agent picker readiness (needs-setup badges)", () => {
-  it.each([false, true])("honors deployment curation when editing=%s", async (editing) => {
-    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
-      data: [
-        ...AGENTS,
-        testAgent("ag_cursor", "cursor-native-ui", {
-          display_name: "Cursor",
-          harness: "cursor-native",
-        }),
-        testAgent("ag_pi", "pi-native-ui", { harness: "pi-native" }),
-      ],
-    } as ReturnType<typeof agentsHook.useAvailableAgents>);
-    render(
-      <CapabilitiesProvider
-        info={{
-          ...SERVER_INFO_OFFLINE_FALLBACK,
-          managed_sandboxes_enabled: true,
-          sandbox_provider: "arclet",
-          picker: {
-            restrictToAgentNames: new Set(["polly", "claude-native-ui", "pi-native-ui"]),
-            defaultAgentName: "pi-native-ui",
-          },
-        }}
-      >
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          editingTask={
-            editing
-              ? scheduledTask({ agentId: "ag_cursor", executionTarget: "managed_sandbox" })
-              : null
-          }
-        />
-      </CapabilitiesProvider>,
-    );
-    const picker = screen.getByTestId("agent-picker-stub");
-    expect(picker).toHaveAttribute("data-harness-entries", "claude-native-ui,pi-native-ui");
-    expect(picker).toHaveAttribute("data-agent-entries", "polly");
-    expect(picker).toHaveAttribute("data-curated-entries", "polly,claude-native-ui,pi-native-ui");
-    expect(picker).toHaveAttribute("data-effective", editing ? "ag_cursor" : "ag_pi");
-    expect(picker).toHaveAttribute("data-sandbox-selected", "true");
-    expect(picker).toHaveAttribute("data-badge-host", "");
-    if (editing) {
-      expect(picker).toHaveTextContent("Cursor");
-      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-      expect(updateMutateAsync.mock.calls[0][0].input.agentId).toBeUndefined();
-    }
-  });
+  it.each([
+    { editing: false, empty: false },
+    { editing: true, empty: false },
+    { editing: false, empty: true },
+    { editing: true, empty: true },
+  ])(
+    "honors deployment curation when editing=$editing and empty=$empty",
+    async ({ editing, empty }) => {
+      vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+        data: [
+          ...AGENTS,
+          testAgent("ag_cursor", "cursor-native-ui", {
+            display_name: "Cursor",
+            harness: "cursor-native",
+          }),
+          testAgent("ag_pi", "pi-native-ui", { harness: "pi-native" }),
+        ],
+      } as ReturnType<typeof agentsHook.useAvailableAgents>);
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "arclet",
+            picker: {
+              restrictToAgentNames: new Set(
+                empty ? ["not-installed"] : ["polly", "claude-native-ui", "pi-native-ui"],
+              ),
+              defaultAgentName: "pi-native-ui",
+            },
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={
+              editing
+                ? scheduledTask({ agentId: "ag_cursor", executionTarget: "managed_sandbox" })
+                : null
+            }
+          />
+        </CapabilitiesProvider>,
+      );
+      const picker = screen.getByTestId("agent-picker-stub");
+      expect(picker).toHaveAttribute(
+        "data-harness-entries",
+        empty ? "" : "claude-native-ui,pi-native-ui",
+      );
+      expect(picker).toHaveAttribute("data-agent-entries", empty ? "" : "polly");
+      expect(picker).toHaveAttribute(
+        "data-curated-entries",
+        empty ? "" : "polly,claude-native-ui,pi-native-ui",
+      );
+      expect(picker).toHaveAttribute("data-sandbox-selected", "true");
+      expect(picker).toHaveAttribute("data-badge-host", "");
+      if (editing) {
+        expect(picker).toHaveAttribute("data-effective", "ag_cursor");
+        expect(picker).toHaveTextContent("Cursor");
+        fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+        await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+        expect(updateMutateAsync.mock.calls[0][0].input.agentId).toBeUndefined();
+      } else if (empty) {
+        expect(picker).toHaveAttribute("data-effective", "");
+        expect(picker).toHaveTextContent("No agents");
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      } else {
+        expect(picker).toHaveAttribute("data-effective", "ag_pi");
+      }
+    },
+  );
 
   it("shows the model + effort controls for the default (Claude-native) agent", () => {
     renderDialog();
