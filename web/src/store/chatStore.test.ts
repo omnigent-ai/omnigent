@@ -3915,6 +3915,36 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 
+  it("offers a failed launch's input again when its stream died before the composer took it", async () => {
+    seedSession("conv_real");
+    seedSession("conv_other");
+    failManagedLaunch("conv_real", "saved on server");
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    await useChatStore.getState().switchTo("conv_other");
+    const recovered = {
+      conversationId: "conv_real",
+      text: "saved on server",
+      files: [],
+      startupInputIds: ["pending_first"],
+      recovered: true,
+    };
+    const entry = conversationRegistry.peek("conv_real")!;
+    expect(entry.getState().failedSendDraft).toEqual(recovered);
+    // A terminal 401 or 403 ends the background stream, so reopening rebuilds the entry.
+    entry.setState({ abortController: null });
+
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    expect(useChatStore.getState().failedSendDraft).toEqual(recovered);
+
+    await useChatStore.getState().send("something else", "agent_xyz");
+    const [, sent] =
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/conv_real/events")).at(-1) ??
+      [];
+    expect(JSON.parse(String(sent?.body))).not.toHaveProperty("replaces_failed_inputs");
+  });
+
   it.each(["after", "before"])(
     "leaves out the failed startup inputs a reloaded draft already holds, cleared %s they're read",
     async (cleared) => {

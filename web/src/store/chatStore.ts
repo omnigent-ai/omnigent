@@ -8376,8 +8376,13 @@ const startupSettlements = new WeakMap<ConversationEntry, number>();
 const disposedReturnedStartupInputs = new Map<string, string[]>();
 conversationRegistry.subscribeDisposed((id, state) => {
   const carried = disposedReturnedStartupInputs.get(id) ?? [];
-  const returned = [...new Set([...carried, ...state.returnedStartupInputs])];
+  // An untaken recovered draft is lost with its entry, so a later read offers its inputs again.
+  const untaken = state.failedSendDraft?.startupInputIds ?? [];
+  const returned = [...new Set([...carried, ...state.returnedStartupInputs])].filter(
+    (inputId) => !untaken.includes(inputId),
+  );
   if (returned.length > 0) disposedReturnedStartupInputs.set(id, returned);
+  else disposedReturnedStartupInputs.delete(id);
 });
 
 /** Startup inputs each entry adopted as returned, until a read names the files they lack. */
