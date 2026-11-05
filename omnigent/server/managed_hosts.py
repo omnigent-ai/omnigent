@@ -263,22 +263,15 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 MANAGED_HOST_ONLINE_TIMEOUT_S = 120
 _ONLINE_POLL_INTERVAL_S = 1.0
 
-# Launch-token lifetime for the YAML modal path: Modal's 24h sandbox
-# cap plus an hour of slack, so a live sandbox can always
-# re-authenticate its tunnel across reconnects, while a token leaked
-# from a long-dead sandbox cannot. Scoped to the token, not the host:
-# the host row is durable, and a relaunch mints a fresh token + expiry.
-# Deployments injecting their own launcher choose their own TTL on
-# ManagedSandboxConfig.
+# Authenticated hosts renew these windows halfway through their TTL.
+# Tokens expire after the last renewal; resume/relaunch rotates the token.
+
+# Modal's 24h sandbox cap plus an hour of slack. Embedding deployments
+# choose their own window through ManagedSandboxConfig.
 MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 
-# Launch-token lifetime for the YAML daytona path. Daytona sandboxes
-# have no platform lifetime cap (idle auto-stop is disabled at
-# provision), so the bound is policy, not platform: 7 days keeps a
-# long-lived sandbox re-authenticating across tunnel reconnects while
-# still expiring tokens of sandboxes nobody deleted. A relaunch (or a
-# session past 7 days going through the dead-host relaunch path) mints
-# a fresh token.
+# Daytona has no platform lifetime cap. Seven days bounds disconnected
+# credentials while authenticated heartbeats keep active sandboxes usable.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The blaxel launch-token TTL is NOT a constant: Blaxel reaps a sandbox at its
@@ -684,10 +677,10 @@ class ManagedSandboxConfig:
         (launchers may cache provider handles internally). May raise
         ``HTTPException`` to report an unusable backend — the YAML
         path uses this for providers without managed support.
-    :param token_ttl_s: Launch-token lifetime in seconds, e.g.
-        ``90000`` (25h) for Modal. Must comfortably exceed the
-        provider's maximum sandbox lifetime so a live sandbox can
-        always re-authenticate its tunnel across reconnects.
+    :param token_ttl_s: Launch-token validity window in seconds, e.g.
+        ``90000`` (25h) for Modal. Authenticated hosts renew halfway through
+        this window, allowing long-lived sandboxes to reconnect after an
+        outage. Tokens expire after the last renewal plus this window.
     :param managed_launch_supported: Whether ``launcher_factory`` can
         actually serve a managed launch. The YAML path sets this from
         :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
