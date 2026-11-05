@@ -81,7 +81,15 @@ pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "c2d81b1a6812ae1cf32221c5a2a70ba0"
 _OTHER_HOST_ID = "5f0e9d8c7b6a49382716f5e4d3c2b1a0"
+_THIRD_HOST_ID = "8e7d6c5b4a3948271605f4e3d2c1b0a9"
 _WORKSPACE = "/work/repo"
+# Indirect ``app`` parameters: feature defaults, then the sandbox profile catalog.
+_PROFILE_CATALOG_OFF_AND_ON = pytest.mark.parametrize(
+    "app",
+    [None, FeatureFlags(enabled_features=frozenset({Feature.SANDBOX_PROFILES}))],
+    ids=["profiles-off", "profiles-on"],
+    indirect=True,
+)
 _RUNNER_NOT_AVAILABLE = (
     "The runner for this session is not available — it may have failed to start. "
     "See the host logs."
@@ -4579,9 +4587,17 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
 class _HostFrameResponder:
     """Answer host round-trips in the background and record every stop request."""
 
-    def __init__(self, comm: ApplicationCommunicator, *, launch_status: str = "launched") -> None:
+    def __init__(
+        self,
+        comm: ApplicationCommunicator,
+        *,
+        launch_status: str = "launched",
+        launch_gate: asyncio.Event | None = None,
+    ) -> None:
         self._comm = comm
         self._launch_status = launch_status
+        # When set, a launch reply (and every frame after it) waits for the gate.
+        self._launch_gate = launch_gate
         self.stopped_runner_ids: list[str] = []
         self.launch_frames: list[HostLaunchRunnerFrame] = []
         self._task: asyncio.Task[None] | None = None
@@ -4619,6 +4635,8 @@ class _HostFrameResponder:
                 reply = HostStopRunnerResultFrame(request_id=frame.request_id, status="stopped")
             elif isinstance(frame, HostLaunchRunnerFrame):
                 self.launch_frames.append(frame)
+                if self._launch_gate is not None:
+                    await self._launch_gate.wait()
                 launched = self._launch_status == "launched"
                 reply = HostLaunchRunnerResultFrame(
                     request_id=frame.request_id,
@@ -4890,12 +4908,7 @@ async def test_archiving_grandchild_on_roots_shared_runner_does_not_stop_it(
     )
 
 
-@pytest.mark.parametrize(
-    "app",
-    [None, FeatureFlags(enabled_features=frozenset({Feature.SANDBOX_PROFILES}))],
-    ids=["profiles-off", "profiles-on"],
-    indirect=True,
-)
+@_PROFILE_CATALOG_OFF_AND_ON
 @pytest.mark.parametrize("launch_status", ["launched", "failed"])
 async def test_switching_host_stops_the_runner_on_the_host_it_left(
     client: httpx.AsyncClient,
@@ -4982,6 +4995,7 @@ async def test_switching_host_stops_a_shared_runner_only_for_its_owner(
         assert store.get_conversation(parent["id"]).runner_id == parent["runner_id"]
 
 
+@_PROFILE_CATALOG_OFF_AND_ON
 async def test_switching_host_refuses_a_binding_that_changed_mid_request(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -4991,7 +5005,8 @@ async def test_switching_host_refuses_a_binding_that_changed_mid_request(
     """A move releases only the binding it read, never a runner bound since.
 
     A relaunch can rebind the session between the launch's authorization read
-    and its release. The move is refused and the new runner keeps serving.
+    and its release. The move is refused with a conflict, through the profile
+    catalog too, and the new runner keeps serving.
     """
     origin = await _connect_host(app)
     session = await _inline_launch_session(client, origin)
@@ -5076,6 +5091,55 @@ async def test_cancelled_switch_still_stops_the_runner_it_released(
         f"its runner (stops: {origin_host.stopped_runner_ids})"
     )
     assert target_host.launch_frames == []
+
+
+async def test_failed_switch_keeps_a_later_switch_binding(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A move that fails after a later move replaced its binding leaves that binding.
+
+    The first launch waits for its host outside the launch lock, so a second
+    move can replace its runner meanwhile. Rolling the first one back must not
+    detach the session from the second move's runner.
+    """
+    origin = await _connect_host(app)
+    session = await _inline_launch_session(client, origin)
+    first_target = await _connect_host(app, host_id=_OTHER_HOST_ID, name="desktop")
+    second_target = await _connect_host(app, host_id=_THIRD_HOST_ID, name="server")
+    first_reply = asyncio.Event()
+
+    def move_to(host_id: str) -> Any:
+        return client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session["id"], "workspace": "/work/other", "replace_runner": True},
+        )
+
+    async with (
+        _HostFrameResponder(origin),
+        _HostFrameResponder(
+            first_target, launch_status="failed", launch_gate=first_reply
+        ) as first_host,
+        _HostFrameResponder(second_target),
+    ):
+        first_move = asyncio.create_task(move_to(_OTHER_HOST_ID))
+        deadline = time.monotonic() + budget(10.0)
+        while not first_host.launch_frames and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert first_host.launch_frames, "the first move never reached its host"
+        second_move = await move_to(_THIRD_HOST_ID)
+        first_reply.set()
+        first_response = await first_move
+        await _drain_superseded_runner_stops()
+
+    assert second_move.status_code == 200, second_move.text
+    assert first_response.status_code == 502, first_response.text
+    row = SqlAlchemyConversationStore(db_uri).get_conversation(session["id"])
+    assert row is not None
+    assert (row.host_id, row.runner_id) == (_THIRD_HOST_ID, second_move.json()["runner_id"]), (
+        "the first move's rollback detached the session from the second move's runner"
+    )
 
 
 class _StagedRunners:

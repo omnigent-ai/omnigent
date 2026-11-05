@@ -28,6 +28,7 @@ import { normalizeWorkspacePath } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
+import { useSession } from "@/hooks/useSession";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { getSession, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -111,6 +112,7 @@ function SupportedSwitchHostDialog({
   const queryClient = useQueryClient();
   const { data: hosts } = useHosts({ enabled: open });
   const markRunnerLaunched = useChatStore((s) => s.markRunnerLaunched);
+  const { session } = useSession(sessionId);
   const serverInfo = useServerInfo();
   const launchReplacesRunner =
     serverInfo !== "loading" && serverInfo.host_launch_replace_runner === true;
@@ -219,13 +221,10 @@ function SupportedSwitchHostDialog({
     if (!selectedHostId || !workspaceValid) return;
     setSubmitting(true);
     setError(null);
+    const previousModelOverride = session?.modelOverride ?? null;
     try {
-      // Drop the model override before the new runner reads it. A model id is
-      // host-bound — the catalog depends on that machine's credentials — so
-      // carrying it over lands the next turn on "model may not exist or you
-      // may not have access to it". Cleared, the new runner resolves the
-      // harness default, which is by definition available there. `silent`
-      // keeps this off the transcript: it's part of the move, not a /model.
+      // Model ids are host-bound, so clear the override for the new runner to use
+      // its harness default. `silent` keeps this off the transcript (part of the move).
       if (launchReplacesRunner) {
         await updateSession(sessionId, { modelOverride: null, silent: true });
         await launchRunner(selectedHostId, sessionId, workspaceTrimmed, undefined, {
@@ -260,10 +259,17 @@ function SupportedSwitchHostDialog({
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't switch hosts. Try again.");
       if (launchReplacesRunner) {
-        // A launch refused before the server released the old runner (a bad
-        // directory, say) leaves the session where it was.
+        // A move refused before the server released the runner (a bad directory,
+        // say) leaves the session on its host, so it gets its model back.
         const current = await getSession(sessionId).catch(() => null);
-        if (current !== null && !current.runnerId) setStranded(true);
+        if (current === null || !current.runnerId) {
+          setStranded(true);
+        } else if (previousModelOverride !== null) {
+          await updateSession(sessionId, {
+            modelOverride: previousModelOverride,
+            silent: true,
+          }).catch(() => undefined);
+        }
       }
     } finally {
       setSubmitting(false);

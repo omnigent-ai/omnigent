@@ -6203,18 +6203,11 @@ def _spawn_superseded_runner_stop(
     host_registry: HostRegistry,
 ) -> None:
     """
-    Stop a runner its session was just moved off, as a retained background task.
+    Stop a runner its session was just moved off, in the background.
 
-    A relaunch or a host switch has already moved the session's binding, so
-    the old runner serves nothing — but left alive it idles forever (tunnel
-    still authenticating, transcript forwarder still tailing the session),
-    each one holding a native pane. Detached so the caller's latency never
-    waits out the stop's ack timeout. For a relaunch the host connection is
-    live by construction (the launch frame just went over it) and the
-    host-side supersession check covers a lost frame. After a host switch
-    the old host can be offline or on another replica, and the stop then
-    only logs a warning. Any failure is logged rather than left as an
-    unretrieved task exception.
+    Best effort after a relaunch or a host switch moved the binding: left
+    alive, the old runner idles forever and keeps its native pane. The task is
+    retained and any failure is logged.
 
     :param session_id: Session/conversation identifier.
     :param host_id: Host the runner runs on.

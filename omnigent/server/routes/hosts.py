@@ -177,6 +177,11 @@ async def _release_runner_for_move(
             )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OmnigentError as exc:
+        # Releasing through the catalog, a changed binding is its only invalid input.
+        if exc.code != ErrorCode.INVALID_INPUT:
+            raise
+        raise HTTPException(status_code=409, detail=exc.message) from exc
     _logger.info(
         "Session unbound from runner",
         extra=debug_event(
@@ -1304,7 +1309,15 @@ def create_hosts_router(
                         await _rollback_worktree()
                         return
             else:
-                await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
+                # Only this launch's binding: a later move may have replaced it.
+                current = await asyncio.to_thread(
+                    conversation_store.clear_host_binding,
+                    body.session_id,
+                    expected_runner_id=runner_id,
+                )
+                if current.runner_id not in (None, runner_id):
+                    await _rollback_worktree()
+                    return
             try:
                 if worktree is not None or (body.git is not None and body.git.existing_worktree):
                     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
@@ -1378,8 +1391,7 @@ def create_hosts_router(
                     transfer_from_host_id=target.conv.host_id,
                 )
                 if body.replace_runner and target.conv.runner_id is not None:
-                    # Shielded so a cancelled request still stops a runner it released.
-                    await asyncio.shield(
+                    release = asyncio.create_task(
                         _release_runner_for_move(
                             target.conv,
                             conversation_store=conversation_store,
@@ -1389,6 +1401,12 @@ def create_hosts_router(
                             user_id=user_id,
                         )
                     )
+                    try:
+                        # Shielded so a cancelled request still stops a runner it released.
+                        await asyncio.shield(release)
+                    except asyncio.CancelledError:
+                        _track_runner_launch_cleanup(release)
+                        raise
             except BaseException:
                 await _rollback_worktree()
                 raise

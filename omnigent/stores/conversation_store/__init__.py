@@ -1776,6 +1776,7 @@ class ConversationStore(ABC):
         conversation_id: str,
         *,
         expected_host_id: str | None = None,
+        expected_runner_id: str | None = None,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -1801,6 +1802,8 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param expected_host_id: When supplied, clear only if the current host
             still matches this identity; otherwise leave every binding field unchanged.
+        :param expected_runner_id: When supplied, clear only if the session is still
+            bound to this runner; otherwise leave every binding field unchanged.
         :param clear_profile: Allow detaching a profiled session from a live host.
             When false, that binding is left unchanged. Accepted profile labels are retained.
         :returns: The current :class:`Conversation` after the conditional clear.

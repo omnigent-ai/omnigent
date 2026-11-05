@@ -139,6 +139,30 @@ function sessionBoundTo(runnerId: string | null): Awaited<ReturnType<typeof getS
   return { id: "conv_1", runnerId } as Awaited<ReturnType<typeof getSession>>;
 }
 
+/** The live session the dialog opens on, running a model its old host offers. */
+function liveSessionWithModel(modelOverride: string): ReturnType<typeof useSession> {
+  return {
+    session: {
+      id: "conv_1",
+      agentId: "agent_1",
+      agentName: null,
+      status: "idle",
+      title: null,
+      createdAt: 0,
+      items: [],
+      permissionLevel: null,
+      parentSessionId: null,
+      subAgentName: null,
+      kind: "default",
+      hostId: "host_old",
+      labels: {},
+      modelOverride,
+    },
+    isLoading: false,
+    error: null,
+  } as ReturnType<typeof useSession>;
+}
+
 beforeEach(() => {
   vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
   useHostsMock.mockReset();
@@ -340,9 +364,14 @@ describe("SwitchHostDialog", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_1") });
   });
 
-  it("offers the origin host again when a failed move left the session unbound", async () => {
+  it.each([
+    ["left unbound", () => getSessionMock.mockResolvedValue(sessionBoundTo(null))],
+    ["unreadable", () => getSessionMock.mockRejectedValue(new Error("network error"))],
+  ])("offers the origin host again when a failed move left the session %s", async (_, readBack) => {
+    // Unknown counts as stranded: offering the origin is the safe way back.
     launchRunnerMock.mockRejectedValue(new Error("host failed to launch runner"));
-    getSessionMock.mockResolvedValue(sessionBoundTo(null));
+    vi.mocked(useSession).mockReturnValue(liveSessionWithModel("model-picked-on-old-host"));
+    readBack();
     renderDialog(REPLACING_SERVER);
     expect(screen.queryByTestId("switch-host-option-host_old")).toBeNull();
 
@@ -354,12 +383,16 @@ describe("SwitchHostDialog", () => {
     await waitFor(() => expect(error.textContent).toContain("isn't running anywhere"));
     expect(error.textContent).toContain("host failed to launch runner");
     expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
+    // The next launch may land anywhere, so the override stays cleared.
+    expect(updateSessionMock).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the session's host when the server refused the move", async () => {
+  it("keeps the session's host and model when the server refused the move", async () => {
     // A refusal before the release (a bad directory, say) leaves the session
-    // on its old runner, so the copy must not claim it stopped anywhere.
+    // on its old runner, so it gets its model back and the copy must not claim
+    // it stopped anywhere.
     launchRunnerMock.mockRejectedValue(new Error("workspace path does not exist"));
+    vi.mocked(useSession).mockReturnValue(liveSessionWithModel("model-picked-on-old-host"));
     getSessionMock.mockResolvedValue(sessionBoundTo("runner_old"));
     renderDialog(REPLACING_SERVER);
 
@@ -369,8 +402,12 @@ describe("SwitchHostDialog", () => {
 
     const error = await screen.findByTestId("switch-host-error");
     expect(error.textContent).toContain("workspace path does not exist");
-    await waitFor(() => expect(getSessionMock).toHaveBeenCalledWith("conv_1"));
     await waitFor(() => expect(button).not.toHaveAttribute("aria-busy", "true"));
+    expect(getSessionMock).toHaveBeenCalledWith("conv_1");
+    expect(updateSessionMock.mock.calls).toEqual([
+      ["conv_1", { modelOverride: null, silent: true }],
+      ["conv_1", { modelOverride: "model-picked-on-old-host", silent: true }],
+    ]);
     expect(error.textContent).not.toContain("isn't running anywhere");
     expect(screen.queryByTestId("switch-host-option-host_old")).toBeNull();
   });

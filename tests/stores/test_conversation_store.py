@@ -9112,6 +9112,27 @@ def test_clear_host_binding_requires_the_expected_host(
     assert conversation_store.get_conversation(session.id) == cleared
 
 
+def test_clear_host_binding_requires_the_expected_runner(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    session = conversation_store.create_conversation()
+    conversation_store.set_host_id(session.id, uuid.uuid4().hex, "/work")
+    conversation_store.replace_runner_id(session.id, "later-runner")
+    current = conversation_store.get_conversation(session.id)
+    assert current is not None
+
+    unchanged = conversation_store.clear_host_binding(
+        session.id, expected_runner_id="earlier-runner"
+    )
+    assert unchanged == current
+    assert conversation_store.get_conversation(session.id) == current
+
+    cleared = conversation_store.clear_host_binding(session.id, expected_runner_id="later-runner")
+    assert cleared.host_id is None and cleared.workspace is None
+    assert cleared.git_branch is None and cleared.runner_id is None
+    assert conversation_store.get_conversation(session.id) == cleared
+
+
 _ACCEPTED_PROFILE = {
     "id": "build",
     "provider": "company",
