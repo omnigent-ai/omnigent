@@ -55,7 +55,8 @@ Merge this into the file's `mcpServers` and keep the organization's other server
   and Claude Code drops a denied entry just as silently. Omnigent reads only
   `managed-mcp.json`, not this policy, so with the entry denied or left off the
   allowlist, sessions start without Omnigent's tools and without the missing-entry
-  warning, and claude-sdk still tells the model the tools exist.
+  warning. claude-sdk tells the model that a missing `mcp__omnigent__` tool means the
+  managed server didn't load, so it reports that instead of retrying.
 
 > **Security note.** This entry hands its executable (`${OMNIGENT_MCP_RELAY_PYTHON}`)
 > and its tool surface (the bridge directory) to whatever environment launches Claude
