@@ -108,6 +108,7 @@ class ListCommentsTool(Tool):
         status_filter: str | None = args.get("status")
 
         comments = store.list_for_conversation(ctx.conversation_id, path=path)
+        comments = [comment for comment in comments if comment.anchor_metadata is None]
         if status_filter is not None:
             comments = [c for c in comments if c.status == status_filter]
 

@@ -15,21 +15,28 @@ schema. Ordinary ORM comment queries still omit the column in this release.
 1. Merge and release this schema-only change first. Run the normal database
    migration deployment (`omnigent debug db-upgrade <database-uri>`) and verify
    the database reached `f9b3e6c2a401`. Database startup also runs this chain.
-2. Deploy the local PR-review feature only after all databases it uses have
-   the column. That release adds the ORM mapping, API capability, and readers
-   and writers. Its client requires explicit server support before writing.
+2. Deploy the reader-compatibility application to every server and runner that
+   reads these databases. It maps the column, excludes anchored rows from legacy
+   Files lists, and rejects them in legacy sends before changing any statuses.
+   It does not advertise the PR-anchor capability or accept anchored creation.
+3. Only after every reader is upgraded, deploy the local PR-review feature,
+   which enables anchored writes and advertises the capability to clients.
 
-Existing application readers and writers ignore the column and may continue
-using the old fields. In particular, inserting an ordinary comment without
-anchor metadata remains valid.
+Before step 3, no PR rows may be written. Schema-only readers cannot distinguish
+those rows from Files comments. Ordinary comment writers can continue omitting
+the nullable column throughout the rollout.
 
 ## Rollback
 
-Roll the feature application back to the schema-only release and leave the
-column and stored anchors in place. That release knows the migration revision
-but does not consume the new field. A binary predating this schema release may
-reject a database whose revision it does not recognize, so it is not the
-restart/rollback baseline after migration.
+Once PR rows exist, roll the feature application back only to the
+reader-compatibility release and leave the column and stored anchors in place.
+The reader release is the rollback floor: schema-only readers would expose PR
+rows as offset-zero Files comments. Do not roll readers back further while
+anchored rows remain, even after disabling new writes.
+
+Before any anchored writes, the reader release can roll back to the schema-only
+release. A binary predating the schema release may reject the migration revision
+on restart, so it is not a rollback target after migration.
 
 The migration's downgrade removes the column and all stored anchors; it is
 tested for development recovery, not the normal production rollback. Do not

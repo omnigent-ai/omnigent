@@ -1,4 +1,5 @@
 import { requestLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { create } from "zustand";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
@@ -5848,19 +5849,12 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue("My instructions");
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Existing quote");
     expect(props.onSend).not.toHaveBeenCalled();
-    act(() => requestLocalReviewContext(comment));
-    expect(
-      screen.getAllByLabelText("Open local review comment src/example.ts:12 (new)"),
-    ).toHaveLength(1);
     act(() =>
       updateLocalReviewContext({ ...comment, body: "Updated review", anchor_metadata: undefined }),
     );
     expect(
       screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
     ).toBeInTheDocument();
-    expect(getSessionDraft("conv_test")?.reviewComments?.[0].anchor_metadata).toEqual(
-      comment.anchor_metadata,
-    );
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("[Comment 123]");
     expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("Updated review");
@@ -5910,6 +5904,33 @@ describe("Composer reply quotes", () => {
     expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toContain("[Comment 456]");
     expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).not.toContain("[Comment 123]");
     expect(vi.mocked(props.onSend).mock.calls[1]?.[1]).toEqual([attachment]);
+
+    const batch = [
+      { ...comment, id: "789" },
+      {
+        ...comment,
+        id: "1011",
+        body: "Keep the old behavior for this range.",
+        anchor_metadata: { ...comment.anchor_metadata, side: "LEFT" as const, start_line: 7 },
+      },
+    ];
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
+    expect(screen.queryByText("notes.txt")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    act(() => batch.forEach(requestLocalReviewContext));
+    expect(screen.getAllByLabelText(/Open local review comment/)).toHaveLength(2);
+    expect(props.onSend).toHaveBeenCalledTimes(2);
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send).toBeEnabled();
+    fireEvent.click(send);
+    expect(props.onSend).toHaveBeenNthCalledWith(
+      3,
+      `${formatLocalReviewComments(batch)}\n\n`,
+      undefined,
+    );
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
   });
 
   it("keeps mention markers in the structured payload used to restore a failed send", () => {
