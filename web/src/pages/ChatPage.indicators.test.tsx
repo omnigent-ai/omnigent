@@ -171,19 +171,31 @@ describe("RunnerStartingIndicator", () => {
 });
 
 describe("WorkingIndicator", () => {
-  it("stays hidden when only background tasks remain and returns for foreground work", () => {
+  it("shows a background-task spinner after the turn ends and the shimmer for foreground work", () => {
     useChatStore.setState({
-      backgroundTaskCount: 1,
+      backgroundTaskCount: 2,
       blockedOn: null,
       sessionStatus: "idle",
       status: "idle",
     });
     const { rerender } = render(<WorkingIndicator />);
     expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveTextContent(
+      "2 background tasks running",
+    );
+    expect(screen.getByTestId("running-dot")).toBeInTheDocument();
+    // The composer pill owns the announcement; the transcript log must not repeat it.
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.queryByRole("status")).toBeNull();
 
     act(() => useChatStore.setState({ sessionStatus: "running" }));
     rerender(<WorkingIndicator />);
     expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+    expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
+
+    act(() => useChatStore.setState({ sessionStatus: "idle", backgroundTaskCount: 0 }));
+    rerender(<WorkingIndicator />);
+    expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
   });
 
   describe("parked on a terminal permission prompt", () => {
