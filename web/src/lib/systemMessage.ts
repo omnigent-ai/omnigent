@@ -268,3 +268,13 @@ export function taskNotificationMarkerContent(
   }
   return null;
 }
+
+/** Hide only the trailing framework note; the stored message still reaches the agent. */
+export function stripAutomationContext(text: string): string {
+  const start = text.lastIndexOf(
+    "\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message,",
+  );
+  return start >= 0 && text.trimEnd().endsWith("\n</omnigent-automation-context>")
+    ? text.slice(0, start)
+    : text;
+}

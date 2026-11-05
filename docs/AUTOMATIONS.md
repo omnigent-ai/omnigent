@@ -202,3 +202,5 @@ All scheduler backends must support `scheduled_task_harness_settings` before usi
 
 - [Agent YAML spec](AGENT_YAML_SPEC.md) -- defining the agent an automation binds to.
 - [Policies](POLICIES.md) -- gates and spend caps that apply to sessions an automation creates.
+
+The transcript hides the tagged unattended-run context appended by the scheduler. The agent still receives it, and stored messages retain it. Older untagged messages are displayed unchanged.

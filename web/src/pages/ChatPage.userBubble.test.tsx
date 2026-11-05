@@ -53,6 +53,16 @@ function renderBubble(bubble: Bubble) {
 }
 
 describe("UserBubble markdown rendering", () => {
+  it("shows the automation task without its trailing framework context", () => {
+    renderBubble(
+      userBubble(
+        "Summarize **today**.\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message, and no one is watching this run.\n</omnigent-automation-context>",
+      ),
+    );
+    expect(screen.getByText("today")).toBeInTheDocument();
+    expect(screen.queryByText(/no one is watching/)).not.toBeInTheDocument();
+  });
+
   it("renders **bold** markdown as a strong node, not literal asterisks", () => {
     renderBubble(userBubble("hello **world**"));
     // Streamdown emits bold as an element tagged data-streamdown="strong"

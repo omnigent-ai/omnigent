@@ -6,6 +6,7 @@ import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
   parseSystemMessage,
+  stripAutomationContext,
 } from "./systemMessage";
 
 describe("isClaudeAgentMessageContent", () => {
@@ -298,5 +299,17 @@ describe("Claude background-task notifications", () => {
           'Background command "air run" completed (exit code 0)',
       },
     ]);
+  });
+});
+
+describe("stripAutomationContext", () => {
+  it("preserves ordinary and incomplete messages", () => {
+    for (const text of [
+      "Note: an Omnigent automation sent this message, and no one is watching.",
+      "Explain <omnigent-automation-context> in this example.",
+      "Task\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message,",
+      "Task\n\n<omnigent-automation-context>\nUser text\n</omnigent-automation-context>",
+    ])
+      expect(stripAutomationContext(text)).toBe(text);
   });
 });
