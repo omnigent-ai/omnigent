@@ -92,7 +92,6 @@ class HostSkillDiscovery:
                     harness=frame.harness,
                     skills_filter=frame.skills_filter,
                     warnings=problems,
-                    wait_for_launch_plugins=False,
                 )
                 skills = resolve_harness_skills(ctx, frame.harness)
             else:
@@ -115,11 +114,7 @@ class HostSkillDiscovery:
                     if frame.sub_agent_name:
                         spec, directory = _subagent_bundle(spec, directory, frame.sub_agent_name)
                     skills = resolve_session_skills(
-                        spec,
-                        (root, directory),
-                        directory,
-                        warnings=problems,
-                        wait_for_launch_plugins=False,
+                        spec, (root, directory), directory, warnings=problems
                     )
             result = [
                 {"name": skill.name, "description": skill.description}

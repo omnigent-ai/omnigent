@@ -36,7 +36,7 @@ _logger = logging.getLogger("omnigent.runner.app")
 
 class _ResolveSessionSkillsFn(Protocol):
     async def __call__(
-        self, session_id: str, *, wait_for_launch_plugins: bool = True
+        self, session_id: str, *, wait_for_launch_plugins: bool = False
     ) -> list[SkillSpec]: ...
 
 
@@ -421,10 +421,10 @@ def register_model_option_routes(
                 content={"error": "invalid_request", "detail": "'arguments' must be a string."},
             )
         # Only a skill not listed yet waits for a configured Claude launch to report.
-        skills = await _resolve_session_skills(session_id, wait_for_launch_plugins=False)
+        skills = await _resolve_session_skills(session_id)
         skill = find_skill_by_name(skills, name)
         if skill is None:
-            skills = await _resolve_session_skills(session_id)
+            skills = await _resolve_session_skills(session_id, wait_for_launch_plugins=True)
             skill = find_skill_by_name(skills, name)
         if skill is None:
             return JSONResponse(

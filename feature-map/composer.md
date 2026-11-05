@@ -145,9 +145,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   the home directory, so plugins it adds relative to a workspace are not listed.
   States: loading, error/retry, unavailable while disconnected, and an
   incomplete catalog, including a launch that has not reported its plugins yet
-  (the host asks it in the background) or cannot report them. A runner asks the
-  launch separately: its first use of a listed launch-loaded skill waits up to 7 s,
-  and a slower launch reports the skill as not found until it answers.
+  (the host asks it in the background) or cannot report them. A runner reuses
+  the host's answer from the last hour; without one, its first use of a listed
+  launch-loaded skill waits up to 7 s, and a slower launch reports the skill as
+  not found until it answers.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited

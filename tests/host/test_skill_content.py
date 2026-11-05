@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from omnigent.host.skill_content import MAX_SKILL_CONTENT_BYTES, read_skill_content
-from omnigent.spec.skill_sources import resolve_harness_skills
 
 
 def test_plain_plugin_and_private_diagnostics(tmp_path, monkeypatch, caplog):
@@ -45,17 +44,8 @@ def test_plain_plugin_and_private_diagnostics(tmp_path, monkeypatch, caplog):
     assert "synthetic-private-frontmatter" not in caplog.text
     assert "private-body" not in caplog.text
     assert "Private instructions" not in caplog.text
-    walks = []
-
-    def counted_walk(ctx, harness):
-        walks.append(ctx.wait_for_launch_plugins)
-        return resolve_harness_skills(ctx, harness)
-
-    monkeypatch.setattr("omnigent.host.skill_content.resolve_harness_skills", counted_walk)
     with pytest.raises(LookupError):
         read_skill_content("claude-native", "../other.md")
-    # With no Claude launch loading, a missing name is not looked up again.
-    assert walks == [False]
 
 
 @pytest.mark.parametrize(

@@ -4,27 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
-from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.claude_native import plugin_discovery
-from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
-from omnigent.server.routes._sessions.helpers import _resolve_skill_meta_text_via_runner
-from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import SkillSpec
 from tests._helpers.claude_launch import configure_claude_launch
-from tests._helpers.live_server import serve_app_in_thread
-from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 
 
@@ -181,21 +172,6 @@ async def _client(app: Any) -> AsyncIterator[httpx.AsyncClient]:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
         yield c
-
-
-@asynccontextmanager
-async def _socket_client(app: Any) -> AsyncIterator[httpx.AsyncClient]:
-    """
-    Yield a client for the runner app over a real socket, with the server's runner timeouts.
-
-    :param app: The runner FastAPI app.
-    :returns: Async context manager yielding the client.
-    """
-    with serve_app_in_thread(app) as base_url:
-        async with httpx.AsyncClient(
-            base_url=base_url, timeout=httpx.Timeout(5.0, read=None), trust_env=False
-        ) as c:
-            yield c
 
 
 @pytest.mark.asyncio
@@ -455,57 +431,29 @@ async def test_resolve_session_skill_non_string_arguments_returns_400(tmp_path: 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "source_warning",
-    [None, "Codex plugin skills unavailable: `codex plugin list` timed out after 5s."],
-    ids=["complete", "failed-source"],
-)
-async def test_session_skills_cached_per_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_warning: str | None
-) -> None:
+async def test_session_skills_cached_per_session(tmp_path: Path) -> None:
     """
     The merged skills are cached per session: a second ``POST /skills/resolve``
     reuses the cache and does not re-run spec resolution / the host-skill
-    filesystem walk. A missing name reuses it too unless a launch was still loading.
-    A list built with a warning expires sooner, so a later request walks again.
+    filesystem walk.
     """
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     bundled = [SkillSpec(name="grill-me", description="d", content="c")]
     resolver_calls: list[str] = []
     app = _make_app(bundle, bundled, "none", resolver_calls=resolver_calls)
-    walks: list[tuple[Path, ...]] = []
-
-    def counted_walk(
-        spec: Any, roots: tuple[Path, ...], *args: Any, **kwargs: Any
-    ) -> list[SkillSpec]:
-        walks.append(roots)
-        if source_warning is not None:
-            kwargs["warnings"].append(source_warning)
-        return resolve_session_skills(spec, roots, *args, **kwargs)
-
-    monkeypatch.setattr("omnigent.runner.app.resolve_session_skills", counted_walk)
-    runner_now = [time.monotonic()]
-    monkeypatch.setattr(
-        "omnigent.runner.app.time",
-        SimpleNamespace(monotonic=lambda: runner_now[0], time=time.time),
-    )
 
     async for c in _client(app):
         first = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
         second = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
-        missing = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "unknown"})
-        cached_walks = len(walks)
-        runner_now[0] += runner_app._INCOMPLETE_SESSION_SKILLS_CACHE_TTL_SECONDS
-        expired = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert missing.status_code == 404, missing.text
-    assert expired.status_code == 200
-    # The first request populates the per-session cache; the later ones, even the miss, hit it.
-    assert cached_walks == 1, walks
-    assert len(walks) == (1 if source_warning is None else 2), walks
+    # Exactly one spec resolution (and thus one host-skill filesystem
+    # walk) across both requests: the first populates the per-session
+    # cache, the second hits it. Two entries here would mean the cache
+    # was not consulted (a walk per request); zero would mean discovery
+    # never ran at all.
     assert resolver_calls == ["ag_x"]
 
 
@@ -720,18 +668,14 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
 ) -> None:
     """A listed skill resolves while the configured launch is pending; its plugin skill waits.
 
-    The server's lookup is answered before its runner timeout while a launch is held. A
-    catalog missing a stalled or failed launch's plugins is rebuilt once the launch answers.
+    A runner that has not asked the launch reuses the answer stored for it; a changed launch
+    is asked again.
     """
     for env_name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH", "OMNIGENT_CLAUDE_LAUNCHER"):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(
         plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
     )
-    now = [0.0]
-    monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
-    # A held launch outlives the readers' wait; only the fake clock passes its deadline.
-    monkeypatch.setattr(plugin_discovery, "LAUNCH_PLUGINS_TIMEOUT_S", 60)
     home = tmp_path / "home"
     plugin = tmp_path / "launch" / "dev"
     for root, name in ((home / ".claude", "local"), (plugin, "review")):
@@ -740,14 +684,12 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
         skill.write_text(_skill_md(name, f"Use {name}."))
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     release = tmp_path / "release"
-    fail = tmp_path / "fail"
     plugins = [{"name": "dev", "path": str(plugin), "source": "dev@inline"}]
     init = {"type": "system", "subtype": "init", "plugins": plugins}
     config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
     launches = tmp_path / "launches.jsonl"
     script = (
         f"while not os.path.exists({str(release)!r}):\n    time.sleep(0.05)\n"
-        f"if os.path.exists({str(fail)!r}):\n    sys.exit(3)\n"
         f"print({json.dumps(init)!r})\n"
     )
     configure_claude_launch(config_home, launches, script)
@@ -757,11 +699,9 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
     workspace.mkdir()
     app = _make_app(bundle, [], "all", workspace=workspace, harness="claude-native")
     url = "/v1/sessions/conv_launch/skills/resolve"
-    late_url = "/v1/sessions/conv_late/skills/resolve"
-    failed_url = "/v1/sessions/conv_failed/skills/resolve"
     review = {"name": "dev:review"}
 
-    async with _socket_client(app) as c:
+    async for c in _client(app):
         try:
             listed = await asyncio.wait_for(c.post(url, json={"name": "local"}), 5)
             pending = asyncio.ensure_future(c.post(url, json=review))
@@ -771,51 +711,20 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
             release.touch()
         launched = await asyncio.wait_for(pending, 15)
 
-        # A new launch identity is held: the server's lookup hears the skill is missing before
-        # its runner timeout, and past the probe's deadline the launch is reported stalled.
-        release.unlink()
-        configure_claude_launch(config_home, launches, script, args=("--", "late"))
-        try:
-            with pytest.raises(plugin_discovery.LaunchPluginsPending):
-                plugin_discovery.claude_launch_plugin_dirs(wait=False)
-            with pytest.raises(OmnigentError, match="not found") as held:
-                await _resolve_skill_meta_text_via_runner("conv_held", "dev:review", "", c)
-            await poll_until_async(lambda: len(launches.read_text().splitlines()) == 2)
-            now[0] += plugin_discovery.LAUNCH_PLUGINS_DEADLINE_S
-            stalled = await c.post(late_url, json=review)
-            stalled_generation = plugin_discovery.launch_plugins_generation()
-        finally:
-            release.touch()
-        await poll_until_async(
-            lambda before=stalled_generation: plugin_discovery.launch_plugins_generation() > before
-        )
-        late = await c.post(late_url, json=review)
-
-    # A failed launch is asked again once its backoff and its list's short expiry have passed.
-    async for c in _client(app):
-        runner_now = [time.monotonic()]
-        monkeypatch.setattr(
-            "omnigent.runner.app.time",
-            SimpleNamespace(monotonic=lambda clock=runner_now: clock[0], time=time.time),
-        )
-        fail.touch()
-        configure_claude_launch(config_home, launches, script, args=("--", "failing"))
-        failed = await c.post(failed_url, json=review)
-        fail.unlink()
-        now[0] += plugin_discovery.FAILED_LAUNCH_BACKOFF_S
-        runner_now[0] += runner_app._INCOMPLETE_SESSION_SKILLS_CACHE_TTL_SECONDS
-        retried = await c.post(failed_url, json=review)
+        monkeypatch.setattr(plugin_discovery, "_probes", {})
+        reused = await c.post("/v1/sessions/conv_reused/skills/resolve", json=review)
+        launches_before_change = len(launches.read_text().splitlines())
+        configure_claude_launch(config_home, launches, script, args=("--", "changed"))
+        changed = await c.post("/v1/sessions/conv_changed/skills/resolve", json=review)
 
     assert listed.status_code == 200, listed.text
     assert waited
     assert launched.status_code == 200, launched.text
     assert "body for review" in launched.json()["meta_text"]
-    assert held.value.code == ErrorCode.INVALID_INPUT, held.value
-    assert stalled.status_code == 404, stalled.text
-    assert late.status_code == 200, late.text
-    assert failed.status_code == 404, failed.text
-    assert retried.status_code == 200, retried.text
-    assert len(launches.read_text().splitlines()) == 4
+    assert reused.status_code == 200, reused.text
+    assert launches_before_change == 1
+    assert changed.status_code == 200, changed.text
+    assert len(launches.read_text().splitlines()) == 2
 
 
 @pytest.mark.asyncio

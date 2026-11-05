@@ -110,8 +110,9 @@ class SkillSourceContext:
         ``codex plugin list``), so callers can show an incomplete catalog as
         incomplete rather than empty.
     :param wait_for_launch_plugins: Wait for a customized Claude launch to
-        report its plugins. A menu passes ``False`` to list the rest at once
-        while the launch is probed in the background.
+        report its plugins. Only a lookup of a skill not listed yet passes
+        ``True``; by default the rest are listed at once while the launch is
+        probed in the background.
     """
 
     roots: tuple[Path, ...]
@@ -122,7 +123,7 @@ class SkillSourceContext:
     codex_home: Path | None = None
     is_native: bool = False
     warnings: list[str] | None = None
-    wait_for_launch_plugins: bool = True
+    wait_for_launch_plugins: bool = False
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -135,7 +136,7 @@ def skill_source_context_from_env(
     skills_filter: str | list[str] = "all",
     bundle_dir: Path | None = None,
     warnings: list[str] | None = None,
-    wait_for_launch_plugins: bool = True,
+    wait_for_launch_plugins: bool = False,
 ) -> SkillSourceContext:
     """Use the same ambient harness configuration for host and runner discovery."""
     configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -290,7 +291,7 @@ def resolve_session_skills(
     bundle_dir: Path | None,
     *,
     warnings: list[str] | None = None,
-    wait_for_launch_plugins: bool = True,
+    wait_for_launch_plugins: bool = False,
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation."""
     from omnigent.harness_aliases import canonicalize_harness

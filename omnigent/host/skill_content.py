@@ -21,13 +21,11 @@ def read_skill_content(
     if source_id is None:
         # Only a skill not listed while a configured Claude launch is loading waits for it.
         problems: list[str] = []
-        skills = resolve_harness_skills(
-            replace(ctx, warnings=problems, wait_for_launch_plugins=False), harness
-        )
+        skills = resolve_harness_skills(replace(ctx, warnings=problems), harness)
         if CLAUDE_LAUNCH_PLUGINS_LOADING in problems and all(
             skill.name != name for skill in skills
         ):
-            skills = resolve_harness_skills(ctx, harness)
+            skills = resolve_harness_skills(replace(ctx, wait_for_launch_plugins=True), harness)
     else:
         if harness != "claude-native":
             raise LookupError("plugin skill unavailable")

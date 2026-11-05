@@ -481,6 +481,8 @@ def _no_configured_claude_launch(monkeypatch: pytest.MonkeyPatch) -> Callable[[]
     monkeypatch.setattr(plugin_discovery, "_probes", {})
     # A runner lifespan's shutdown would otherwise stop probes for later tests.
     monkeypatch.setattr(plugin_discovery, "_exiting", False)
+    # Tests share one data dir, so an answer stored by one must not serve the next.
+    shutil.rmtree(plugin_discovery.stored_answers_dir(), ignore_errors=True)
     return real
 
 

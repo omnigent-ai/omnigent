@@ -7984,7 +7984,7 @@ def create_runner_app(
             return None
 
     async def _resolve_session_skills(
-        session_id: str, *, wait_for_launch_plugins: bool = True
+        session_id: str, *, wait_for_launch_plugins: bool = False
     ) -> list[SkillSpec]:
         from omnigent.harnesses.claude_native.plugin_discovery import launch_plugins_generation
 

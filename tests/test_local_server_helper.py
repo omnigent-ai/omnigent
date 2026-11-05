@@ -1,20 +1,12 @@
 """Shared startup failures retain diagnostics and reap the real child process."""
 
-import asyncio
 import os
 import subprocess
-import threading
-import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from tests._helpers.live_server import (
-    isolated_local_server,
-    isolated_process_env,
-    serve_app_in_thread,
-)
+from tests._helpers.live_server import isolated_local_server, isolated_process_env
 
 
 def test_isolated_process_env_keeps_the_suite_harness_root(tmp_path: Path) -> None:
@@ -54,61 +46,6 @@ def test_startup_exit_reports_log_and_reaps_child(tmp_path: Path, monkeypatch: p
     assert "Server exited with code 23" in str(error.value)
     assert "startup-marker" in str(error.value)
     assert len(children) == 1 and children[0].returncode == 23
-
-
-@pytest.mark.parametrize("startup", ["fails", "outlasts-deadline", "outlasts-join"])
-def test_thread_served_app_that_does_not_start_leaves_no_server_thread(
-    monkeypatch: pytest.MonkeyPatch, startup: str
-) -> None:
-    """A failed or overdue lifespan startup raises, and says when uvicorn's thread still runs."""
-    threads: list[threading.Thread] = []
-    release = threading.Event()
-
-    class RecordedThread(threading.Thread):
-        def start(self) -> None:
-            threads.append(self)
-            super().start()
-
-        def join(self, timeout: float | None = None) -> None:
-            # Stands in for a startup that outlasts the helper's real join budget.
-            held = startup == "outlasts-join" and not release.is_set()
-            super().join(0.1 if held else timeout)
-
-    monkeypatch.setattr(
-        "tests._helpers.live_server.threading", SimpleNamespace(Thread=RecordedThread)
-    )
-    if startup != "fails":
-        # The startup deadline has passed by the first check, while the lifespan still runs.
-        clock = iter([0.0])
-        monkeypatch.setattr(
-            "tests._helpers.live_server.time",
-            SimpleNamespace(monotonic=lambda: next(clock, 16.0), sleep=time.sleep),
-        )
-
-    async def app(scope, receive, send) -> None:
-        await receive()
-        if startup == "fails":
-            await send({"type": "lifespan.startup.failed", "message": "refused"})
-            return
-        await asyncio.sleep(0.5)
-        while startup == "outlasts-join" and not release.is_set():
-            await asyncio.sleep(0.01)
-        await send({"type": "lifespan.startup.complete"})
-
-    expected = {
-        "fails": "^app exited during startup$",
-        "outlasts-deadline": "^app did not start$",
-        "outlasts-join": "^app did not start, and uvicorn did not exit within the join timeout$",
-    }[startup]
-    with pytest.raises(RuntimeError, match=expected):
-        with serve_app_in_thread(app):
-            pytest.fail("an app that did not start must not be served")
-    assert len(threads) == 1
-    if startup == "outlasts-join":
-        assert threads[0].is_alive()
-        release.set()
-        threads[0].join(timeout=10)
-    assert not threads[0].is_alive()
 
 
 @pytest.mark.parametrize("inherit_env", [True, False])

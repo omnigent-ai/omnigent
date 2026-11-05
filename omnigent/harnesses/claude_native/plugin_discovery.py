@@ -120,18 +120,19 @@ def _configured_launch() -> tuple[Mapping[str, object], str, list[str]]:
 
 
 def launch_plugins_generation() -> int:
-    """Count finished launch probes; a change means catalogs built earlier may be stale."""
+    """Count launch answers and failures; a change means catalogs built earlier may be stale."""
     return _generation
 
 
 def prewarm_claude_launch_plugins() -> None:
     """Start probing a customized launch, so the first skill menu can already list its plugins.
 
+    A stored answer is not reused, so a restarted host asks a launcher plugin it reloaded.
     Config and probe failures are left for the menu to report; anything else is logged.
     """
     try:
         if claude_launch_is_customized():
-            claude_launch_plugin_dirs(wait=False)
+            claude_launch_plugin_dirs(wait=False, reuse_stored=False)
     except (LaunchPluginsPending, LaunchPluginsFailed, *CONFIG_READ_ERRORS):
         pass
     except Exception:  # noqa: BLE001 — a background prewarm has no caller to report to
@@ -156,7 +157,7 @@ def _plugin_dirs(plugins: object) -> dict[str, Path]:
     return out
 
 
-def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
+def claude_launch_plugin_dirs(*, wait: bool = True, reuse_stored: bool = True) -> dict[str, Path]:
     """Map each plugin the native launch loads to its directory, keyed ``<plugin>@<source>``.
 
     Claude's init event lists loaded plugins, including session-only ones a
@@ -168,11 +169,14 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
 
     :param wait: Wait for a first answer, up to :data:`LAUNCH_PLUGINS_WAIT_S` and the
         probe's deadline, rather than raise :class:`LaunchPluginsPending` at once.
+    :param reuse_stored: Reuse a fresh answer another process stored instead of
+        probing, as a runner does with its host's.
     :raises LaunchPluginsPending: The launch has not answered yet.
     :raises LaunchPluginsFailed: The last probe failed or could not start, or the running
         one missed its deadline.
     :raises CONFIG_READ_ERRORS: The Omnigent config could not be read.
     """
+    global _generation
     from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR
     from omnigent.models.model_catalog_store import binary_identity
 
@@ -183,7 +187,9 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
     with _probes_lock:
         probe = _probes.get(key)
         executable = probe.executable if probe is not None else None
+        due = probe is None or (probe.running is None and probe.refresh_at <= time.monotonic())
     executable_identity = binary_identity(executable)
+    stored = _read_stored_answer(key) if due and reuse_stored else None
     with _probes_lock:
         # Only the current launch's answer is reused, so idle earlier launches are dropped.
         for idle in [k for k, probe in _probes.items() if k != key and probe.running is None]:
@@ -195,13 +201,20 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
             and probe.executable_identity != executable_identity
         ):
             probe = _probes[key] = _LaunchProbe()
-        if probe.running is None and probe.refresh_at <= time.monotonic():
+        if probe.running is None and probe.refresh_at <= time.monotonic() and stored is not None:
+            # Another process, such as the host for its runners, already asked this launch.
+            probe = _probes[key] = stored
+            _generation += 1
+        elif probe.running is None and probe.refresh_at <= time.monotonic():
             probe.running = threading.Event()
             probe.deadline = time.monotonic() + LAUNCH_PLUGINS_DEADLINE_S
             try:
                 # A daemon, so a hung launcher plugin cannot keep the process from exiting.
                 threading.Thread(
-                    target=_refresh, args=(probe, cfg), name="claude-launch-plugins", daemon=True
+                    target=_refresh,
+                    args=(key, probe, cfg),
+                    name="claude-launch-plugins",
+                    daemon=True,
                 ).start()
             except RuntimeError as exc:
                 probe.running = None
@@ -223,14 +236,74 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
         raise LaunchPluginsFailed(probe.failure)
 
 
-def _refresh(probe: _LaunchProbe, cfg: Mapping[str, object]) -> None:
+def stored_answers_dir() -> Path:
+    """Where launch answers are shared with this host's other processes, such as its runners."""
+    from omnigent.process_logging import data_dir
+
+    return data_dir() / "cache" / "claude-launch-plugins"
+
+
+def _answer_path(key: tuple[object, ...]) -> Path:
+    from omnigent.models.model_catalog_store import fingerprint_of
+
+    return stored_answers_dir() / f"{fingerprint_of(*key)}.json"
+
+
+def _store_answer(
+    key: tuple[object, ...],
+    executable: str | None,
+    executable_identity: tuple[str, int, int] | None,
+    plugins: dict[str, Path],
+) -> None:
+    from omnigent.install_ledger import atomic_write_json
+
+    payload: dict[str, object] = {
+        "written_at": time.time(),
+        "executable": executable,
+        "executable_identity": executable_identity,
+        "plugins": [{"source": source, "path": str(path)} for source, path in plugins.items()],
+    }
+    try:
+        atomic_write_json(_answer_path(key), payload)
+    except OSError as exc:
+        _log.warning("Could not store the Claude launch's plugins: %s", describe_config_error(exc))
+
+
+def _read_stored_answer(key: tuple[object, ...]) -> _LaunchProbe | None:
+    """A stored answer for this launch that is fresh and whose executable is unchanged."""
+    from omnigent.models.model_catalog_store import binary_identity
+
+    try:
+        payload = json.loads(_answer_path(key).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    written_at, executable = payload.get("written_at"), payload.get("executable")
+    if not isinstance(written_at, (int, float)) or not isinstance(executable, str):
+        return None
+    remaining = written_at + LAUNCH_PLUGINS_TTL_S - time.time()
+    identity = binary_identity(executable)
+    if not 0 < remaining <= LAUNCH_PLUGINS_TTL_S or payload.get("executable_identity") != (
+        list(identity) if identity is not None else None
+    ):
+        return None
+    return _LaunchProbe(
+        plugins=_plugin_dirs(payload.get("plugins")),
+        refresh_at=time.monotonic() + remaining,
+        executable=executable,
+        executable_identity=identity,
+    )
+
+
+def _refresh(key: tuple[object, ...], probe: _LaunchProbe, cfg: Mapping[str, object]) -> None:
     global _generation
     from omnigent.harnesses.claude_native.main import _claude_model_probe_invocation
     from omnigent.models.model_catalog_store import binary_identity
 
     plugins: dict[str, Path] | None = None
     executable: str | None = None
-    executable_identity: object = None
+    executable_identity: tuple[str, int, int] | None = None
     failure = "did not report its plugins"
     try:
         # The config the key was read from, so a changed config cannot answer for this launch.
@@ -258,6 +331,8 @@ def _refresh(probe: _LaunchProbe, cfg: Mapping[str, object]) -> None:
                 probe.refresh_at = time.monotonic() + LAUNCH_PLUGINS_TTL_S
             done, probe.running = probe.running, None
             _generation += 1
+        if plugins is not None:
+            _store_answer(key, executable, executable_identity, plugins)
         if done is not None:
             done.set()
 
