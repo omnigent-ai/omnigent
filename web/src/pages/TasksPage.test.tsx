@@ -139,9 +139,18 @@ afterEach(() => {
   setOmnigentHostConfig({});
 });
 
+// The introduction and the template gallery ship behind automations_v2.
+const V2_INFO = { ...SERVER_INFO_OFFLINE_FALLBACK, features: { automations_v2: true } };
+
 const TRIGGER_INFO = {
   ...SERVER_INFO_OFFLINE_FALLBACK,
   scheduled_task_session_modes: true,
+  features: { automations_v2: true, session_orchestration: true },
+};
+
+// A stock server: session modes and orchestration on, automations_v2 off.
+const STOCK_INFO = {
+  ...TRIGGER_INFO,
   features: { session_orchestration: true },
 };
 
@@ -177,7 +186,7 @@ describe("TasksPage list", () => {
     setTasks([]);
     render(
       <MemoryRouter>
-        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+        <CapabilitiesProvider info={V2_INFO}>
           <TasksPage />
         </CapabilitiesProvider>
       </MemoryRouter>,
@@ -200,7 +209,7 @@ describe("TasksPage list", () => {
     vi.mocked(useViewerId).mockReturnValue("alice");
     const content = () => (
       <MemoryRouter>
-        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+        <CapabilitiesProvider info={V2_INFO}>
           <TasksPage />
         </CapabilitiesProvider>
       </MemoryRouter>
@@ -648,9 +657,12 @@ describe("trigger templates", () => {
 
   it.each([
     ["can't keep one session per automation", { scheduled_task_session_modes: false }],
-    ["has session orchestration turned off", { features: { session_orchestration: false } }],
+    [
+      "has session orchestration turned off",
+      { features: { automations_v2: true, session_orchestration: false } },
+    ],
     // Older servers don't report the feature at all.
-    ["doesn't report session orchestration", { features: {} }],
+    ["doesn't report session orchestration", { features: { automations_v2: true } }],
   ])("hides the templates when the server %s", (_name, overrides) => {
     setTasks([]);
     renderPage("/tasks?view=templates", "", { ...TRIGGER_INFO, ...overrides });
@@ -665,5 +677,30 @@ describe("trigger templates", () => {
     selectView("Your automations");
     expect(screen.getByText("No automations yet")).toBeVisible();
     expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+  });
+});
+
+describe("without automations_v2", () => {
+  it("shows only the list and New automation: no guide, tabs or templates", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
+    setTasks([]);
+    renderPage("/tasks", "", STOCK_INFO);
+    expect(screen.getByText("No automations yet")).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "About automations" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-trigger", "");
+  });
+
+  it.each(["/tasks?view=templates", "/tasks/templates"])("opens %s as the list", (path) => {
+    setTasks([task()]);
+    renderPage(path, "", STOCK_INFO);
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Automation templates" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Templates" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+    expect(analytics).not.toHaveBeenCalledWith({ type: "page_view", pageId: "tasks.templates" });
   });
 });

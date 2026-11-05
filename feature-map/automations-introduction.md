@@ -1,7 +1,8 @@
 # Automations introduction
 
-The first visit to the Your automations tab opens a short walkthrough of recurring runs and
-the deployment's available features. Finishing or dismissing it is remembered
+With `automations_v2` enabled, the first visit to the Your automations tab opens a short
+walkthrough of recurring runs and the deployment's available features. Without it, neither
+the walkthrough nor its info button appears. Finishing or dismissing it is remembered
 in this browser for the current user, server, and app mount. The info button
 beside the Automations heading reopens it.
 

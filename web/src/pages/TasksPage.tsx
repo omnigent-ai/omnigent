@@ -1,7 +1,8 @@
 /**
  * Scheduled tasks page (`/tasks`) — the list of the user's recurring agent
- * tasks, a search + Active/Paused filter, a "New automation" button,
- * and tabs for existing automations and reusable templates.
+ * tasks, a search + Active/Paused filter, a "New automation" button, and,
+ * with `automations_v2`, the introduction and tabs for existing automations
+ * and reusable templates.
  *
  * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
  * update/delete mutations, which invalidate the list.
@@ -69,7 +70,15 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const selectedTemplate = AUTOMATION_TEMPLATES.find((template) => template.id === templateId);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const view = templatesOnly || searchParams.get("view") === "templates" ? "templates" : "yours";
+  const info = useServerInfo();
+  // The introduction and the template gallery ship behind automations_v2.
+  // Without it, the page is the plain list and template links open the list.
+  const automationsV2 = isFeatureEnabled(info, "automations_v2");
+  const templatesHidden = info !== "loading" && !automationsV2;
+  const view =
+    !templatesHidden && (templatesOnly || searchParams.get("view") === "templates")
+      ? "templates"
+      : "yours";
   useOmnigentPageView(view === "templates" ? "tasks.templates" : "tasks");
   const requestedView = useRef<string>(view);
   useEffect(() => {
@@ -80,9 +89,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }, [templatesOnly, navigate]);
   // A trigger's manager keeps one session and starts its workers from it, so
   // the templates need "continue in the same session" and session orchestration.
-  const info = useServerInfo();
   const triggersSupported =
     info !== "loading" &&
+    automationsV2 &&
     info.scheduled_task_session_modes === true &&
     isFeatureEnabled(info, "session_orchestration");
   // Workers' links are posted outside Omnigent, so they go through the same
@@ -197,7 +206,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
 
   return (
     <PageScroll className="[scrollbar-gutter:stable]" contentClassName="px-4 md:px-6">
-      {tasks !== undefined && (view === "yours" || introOpens > 0) && (
+      {tasks !== undefined && automationsV2 && (view === "yours" || introOpens > 0) && (
         <AutomationsIntro
           openCount={introOpens}
           onClose={() => (introOpens > 0 ? introButtonRef : newTaskButtonRef).current?.focus()}
@@ -207,18 +216,20 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-1">
             <h1 className="text-2xl font-semibold">Automations</h1>
-            <Button
-              ref={introButtonRef}
-              variant="ghost"
-              size="icon-xs"
-              aria-label="About automations"
-              data-testid="tasks-intro-button"
-              componentId="tasks.intro.open"
-              className="text-muted-foreground"
-              onClick={() => setIntroOpens((n) => n + 1)}
-            >
-              <InfoIcon className="size-4" />
-            </Button>
+            {automationsV2 && (
+              <Button
+                ref={introButtonRef}
+                variant="ghost"
+                size="icon-xs"
+                aria-label="About automations"
+                data-testid="tasks-intro-button"
+                componentId="tasks.intro.open"
+                className="text-muted-foreground"
+                onClick={() => setIntroOpens((n) => n + 1)}
+              >
+                <InfoIcon className="size-4" />
+              </Button>
+            )}
           </div>
           <p className="text-ui text-muted-foreground">
             Run agent sessions on a recurring schedule.
@@ -250,36 +261,39 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           });
         }}
       >
-        <TabsList
-          variant="pill"
-          aria-label="Automation views"
-          // Programmatic tab focus can retain :focus-visible after a pointer click.
-          onPointerDownCapture={() => setPointerTabInteraction(true)}
-          onKeyDownCapture={() => setPointerTabInteraction(false)}
-          onFocus={(event) => {
-            // After a pointer click, Radix can leave keyboard re-entry on the container.
-            if (event.target === event.currentTarget) {
-              event.currentTarget
-                .querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')
-                ?.focus();
-            }
-          }}
-          onBlurCapture={(event) => {
-            if (!event.currentTarget.contains(event.relatedTarget)) setPointerTabInteraction(false);
-          }}
-          className={cn(
-            "gap-1",
-            pointerTabInteraction &&
-              "[&_[role=tab]:focus-visible]:border-transparent [&_[role=tab]:focus-visible]:ring-0 [&_[role=tab]:focus-visible]:outline-none",
-          )}
-        >
-          <TabsTrigger value="yours" className="h-8 flex-none px-3">
-            Your automations
-          </TabsTrigger>
-          <TabsTrigger value="templates" className="h-8 flex-none px-3">
-            Templates
-          </TabsTrigger>
-        </TabsList>
+        {automationsV2 && (
+          <TabsList
+            variant="pill"
+            aria-label="Automation views"
+            // Programmatic tab focus can retain :focus-visible after a pointer click.
+            onPointerDownCapture={() => setPointerTabInteraction(true)}
+            onKeyDownCapture={() => setPointerTabInteraction(false)}
+            onFocus={(event) => {
+              // After a pointer click, Radix can leave keyboard re-entry on the container.
+              if (event.target === event.currentTarget) {
+                event.currentTarget
+                  .querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')
+                  ?.focus();
+              }
+            }}
+            onBlurCapture={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget))
+                setPointerTabInteraction(false);
+            }}
+            className={cn(
+              "gap-1",
+              pointerTabInteraction &&
+                "[&_[role=tab]:focus-visible]:border-transparent [&_[role=tab]:focus-visible]:ring-0 [&_[role=tab]:focus-visible]:outline-none",
+            )}
+          >
+            <TabsTrigger value="yours" className="h-8 flex-none px-3">
+              Your automations
+            </TabsTrigger>
+            <TabsTrigger value="templates" className="h-8 flex-none px-3">
+              Templates
+            </TabsTrigger>
+          </TabsList>
+        )}
         <TabsContent value="yours" className="mt-4">
           <div className="mb-4 flex flex-col gap-5">
             <div className="relative">

@@ -62,8 +62,8 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
-- On Automations, pick a *Jira tickets*, *Slack messages*, or *GitHub issues*
-  card from suggestions on **Your automations** or the **Templates** tab at
+- On Automations with `automations_v2` enabled, pick a *Jira tickets*,
+  *Slack messages*, or *GitHub issues* card from suggestions on **Your automations** or the **Templates** tab at
   `/tasks?view=templates`. Suggestions appear below saved automations or the
   empty-state message with All selected and search cleared. The old
   `/tasks/templates` URL redirects to the Templates tab.

@@ -218,22 +218,54 @@ def _pick_minute(page: Page, minute: int) -> None:
     expect(popover_content).to_have_count(0)
 
 
+def _automations_v2_enabled(base_url: str) -> bool:
+    response = httpx.get(f"{base_url}/v1/info", timeout=10.0)
+    response.raise_for_status()
+    return response.json().get("features", {}).get("automations_v2") is True
+
+
 def _open_automations_page(page: Page, base_url: str) -> None:
-    """Open Automations and dismiss the first-visit introduction."""
+    """Open Automations and dismiss the first-visit introduction.
+
+    The introduction ships behind ``automations_v2``; without it the page opens
+    straight to the list.
+    """
     page.goto(f"{base_url}/tasks")
+    if not _automations_v2_enabled(base_url):
+        expect(page.get_by_test_id("new-task-button")).to_be_visible(timeout=30_000)
+        return
     intro = page.get_by_role("dialog", name="Introducing Automations")
     expect(intro).to_be_visible(timeout=30_000)
     intro.get_by_role("button", name="Maybe later").click()
     expect(intro).not_to_be_visible()
 
 
+def test_automations_page_without_automations_v2_has_no_intro_or_templates(
+    page: Page, live_server: str
+) -> None:
+    """A stock server shows the list and New automation, without v2's surfaces."""
+    page.goto(live_server)
+    page.get_by_test_id("scheduled-tasks-nav").click()
+    lists = page.get_by_test_id("tasks-empty-state").or_(page.get_by_test_id("tasks-list"))
+    expect(lists).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("dialog", name="Introducing Automations")).to_have_count(0)
+    expect(page.get_by_role("button", name="About automations")).to_have_count(0)
+    expect(page.get_by_role("tab", name="Templates", exact=True)).to_have_count(0)
+    expect(page.get_by_test_id("tasks-suggestions")).to_have_count(0)
+    page.goto(f"{live_server}/tasks/templates")
+    expect(lists).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("region", name="Automation templates")).to_have_count(0)
+    expect(page.get_by_role("tab", name="Templates", exact=True)).to_have_count(0)
+
+
 @pytest.mark.parametrize(
     "viewport", [{"width": 1440, "height": 1000}, {"width": 390, "height": 844}]
 )
 def test_automations_introduction_first_visit(
-    page: Page, live_server: str, viewport: dict[str, int]
+    page: Page, automations_v2_server: str, viewport: dict[str, int]
 ) -> None:
     """Walk through first-visit onboarding and keep it dismissed after a reload."""
+    live_server = automations_v2_server
     page.set_viewport_size(viewport)
     if viewport["width"] < 768:
         page.goto(f"{live_server}/tasks")

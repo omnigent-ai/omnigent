@@ -1,7 +1,9 @@
 # Automation templates
 
-Automations has Your automations and Templates tabs. The template gallery is
-also previewed below Your automations, including when automations already exist.
+With `automations_v2` enabled, Automations has Your automations and Templates
+tabs. The template gallery is also previewed below Your automations, including
+when automations already exist. Without it, the page shows only the list and New
+automation, and template links open the list.
 Selecting a template opens the creation modal with its integration settings ready
 to customize.
 
