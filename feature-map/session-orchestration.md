@@ -3,9 +3,10 @@
 An agent in a session that is private or shared read-only can send work to
 another session owned by the same user, then read its status/history. It can also create private sibling
 workers grouped in the left sidebar on its host or a new managed sandbox when
-`sibling_sessions` is enabled in `OMNIGENT_FEATURES`. Peer messaging is enabled
+`sibling_sessions` is enabled in `OMNIGENT_FEATURES`; otherwise workers appear
+as standalone sessions. Peer messaging is enabled
 by default; `-session_orchestration` is its server kill switch and also blocks
-MCP sibling creation.
+MCP independent creation.
 
 ## Sub-features
 
@@ -25,8 +26,9 @@ MCP sibling creation.
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
-  and `managed` placements create independent, initially private sibling sessions.
-  Siblings share one sidebar family and do not appear as child agents.
+  and `managed` placements create independent, initially private sessions.
+  With `sibling_sessions` enabled they share one sidebar family and do not appear
+  as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A
   sibling stays in its creator's project; a different requested project or an
   unavailable source project is rejected before creation. Project defaults do
@@ -43,7 +45,7 @@ MCP sibling creation.
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
-- `refusal`: disabled flag, another owner, edit-shared sender or wrong runner binding
+- `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
   acknowledgements are uncertain and must not auto-retry. After uncertain
@@ -78,7 +80,7 @@ MCP sibling creation.
 ## Driving it with the repro environment
 
 Preconditions: use an isolated test server with `OMNIGENT_FEATURES=sibling_sessions`
-for creation journeys; peer messaging uses the default feature settings.
+for nested creation journeys; peer messaging and standalone creation use the default settings.
 Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
 server's sandbox configuration (for example, Modal or Daytona). Internal deployments
@@ -118,7 +120,9 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   uncertainty without retrying creation. Queue tests check refusal before saving
   and replay after sharing. Scheduled-origin tests cover sends and
   creates from a scheduled run, its full fork after schedule-history deletion,
-  and its children.
+  and its children. Off/on/off request-scoped flag changes verify that MCP and
+  the orchestration endpoint create private standalone roots when nesting is off
+  and siblings when on; explicit sibling requests still refuse while off.
 - Browser/terminal manual check: send a distinctive task to a second session;
   open its Chat and confirm the source label and result. Ask the manager to
   read it. Share the manager read-only and repeat: the task must still arrive.
@@ -132,7 +136,7 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
 
 ## Gotchas
 
-- "Created by" records origin only: workers remain top-level and have their own
+- "Created by" records origin only: workers remain independent and have their own
   permissions and lifecycle. Sharing a worker does not share its creator; the
   opaque creator ID remains in worker metadata, but the UI resolves its title
   through a separate authorized read. Forks drop the creator label. Older

@@ -29,7 +29,7 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 def orchestration_environment(monkeypatch):
-    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    monkeypatch.setenv("OMNIGENT_FEATURES", "sibling_sessions")
 
 
 @pytest.fixture

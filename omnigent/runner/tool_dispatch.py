@@ -3610,23 +3610,14 @@ async def _execute_session_create(
         "title": args.get("title"),
     }
     create_requested = False
-    info_data: dict[str, object] = {}
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
-        if placement != "child":
-            info = await server_client.get("/v1/info")
-            info.raise_for_status()
-            info_data = info.json()
-            if info_data.get("sibling_sessions") is not True:
-                return json.dumps(
-                    {
-                        "error": "This server does not support sibling sessions; "
-                        "no session was created."
-                    }
-                )
         if placement == "managed":
             from omnigent.runner.session_requests import post_on_host
 
+            info = await server_client.get("/v1/info")
+            info.raise_for_status()
+            info_data = info.json()
             if selection.get("sandbox_profile_id"):
                 features = info_data.get("features") if isinstance(info_data, dict) else None
                 if not isinstance(features, dict) or features.get("sandbox_profiles") is not True:

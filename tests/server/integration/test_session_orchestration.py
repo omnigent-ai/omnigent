@@ -505,17 +505,22 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
 
 
 @pytest.mark.parametrize("placement", ["same_host", "managed"])
+@pytest.mark.parametrize("siblings_enabled", [False, True])
 @pytest.mark.parametrize(
     "condition,orchestration_environment",
     [("flag_off", "-session_orchestration"), ("shared", None), ("binding", None)],
     indirect=["orchestration_environment"],
 )
 async def test_creation_refuses_before_launch(
-    auth_client, auth_app, peers, db_uri, placement, condition
+    auth_client, auth_app, peers, db_uri, placement, condition, siblings_enabled
 ):
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
     source, _, captured = peers
+    if not siblings_enabled:
+        auth_app.state.feature_flags = FeatureFlags(
+            auth_app.state.feature_flags.enabled_features - {Feature.SIBLING_SESSIONS}
+        )
     host_id = uuid4().hex
     _register_online_host(auth_app, host_id, "alice")
     SqlAlchemyConversationStore(db_uri).set_host_id(source["id"], host_id, workspace="/tmp")
@@ -1262,12 +1267,15 @@ async def test_same_host_creation_across_replicas(
         assert len(launches) == 1 and launches[0].session_id == worker.id
 
 
-@pytest.mark.parametrize("entry", ["json", "multipart", "same_host", "managed"])
+@pytest.mark.parametrize(
+    "entry", ["json", "multipart", "same_host", "managed", "mcp_same_host", "mcp_managed"]
+)
 async def test_nested_agent_gate_tracks_request_context_before_creation(
     auth_client, auth_app, peers, db_uri, monkeypatch, entry
 ):
     from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
     from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.sharing_settings import DefaultPublicSessions
     from tests.server.integration.test_sessions_permissions import (
         _register_online_host,
         build_agent_bundle,
@@ -1275,6 +1283,8 @@ async def test_nested_agent_gate_tracks_request_context_before_creation(
 
     source, _, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    auth_app.state.default_public_sessions = lambda: DefaultPublicSessions.ALL
     host_id = uuid4().hex
     _register_online_host(auth_app, host_id, "alice")
     store.set_host_id(source["id"], host_id, workspace="/tmp")
@@ -1335,8 +1345,23 @@ async def test_nested_agent_gate_tracks_request_context_before_creation(
                 response = await auth_client.post(
                     "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
                 )
+            elif entry.startswith("mcp_"):
+                result = json.loads(
+                    await execute_tool(
+                        tool_name="sys_session_create",
+                        arguments=json.dumps(
+                            {
+                                "agent_id": source["agent_id"],
+                                "placement": entry.removeprefix("mcp_"),
+                            }
+                        ),
+                        server_client=auth_client,
+                        conversation_id=source["id"],
+                    )
+                )
+                assert "error" not in result, result
+                created_id = result["conversation_id"]
             else:
-                # Call the endpoint directly to prove stale MCP clients cannot bypass the gate.
                 response = await auth_client.post(
                     "/v1/sessions/orchestrated",
                     headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
@@ -1345,15 +1370,26 @@ async def test_nested_agent_gate_tracks_request_context_before_creation(
                         "host_type": "managed" if entry == "managed" else "external",
                     },
                 )
-            if active:
-                assert response.status_code == 201, response.text
-                sibling_id = response.json().get("id") or response.json()["session_id"]
-                assert store.get_conversation(sibling_id).family_id == source["id"]
-            else:
+            if not active and entry in ("json", "multipart"):
                 assert response.status_code == 403, response.text
                 assert "Nested agents are disabled" in response.text
                 assert {row.id for row in store.list_conversations().data} == before
                 assert len(launched) == launches_before
+                continue
+            if not entry.startswith("mcp_"):
+                assert response.status_code == 201, response.text
+                created_id = response.json().get("id") or response.json()["session_id"]
+            created = store.get_conversation(created_id)
+            assert created.parent_conversation_id is None
+            assert created.family_id == (source["id"] if active else None)
+            assert {row.id for row in store.list_conversations().data} == before | {created_id}
+            assert all(
+                grant.user_id == "alice" for grant in permissions.list_for_session(created_id)[0]
+            )
+            if entry not in ("json", "multipart"):
+                assert len(launched) == launches_before + 1
+            if active:
+                sibling_id = created_id
         finally:
             enabled.reset(token)
     assert sibling_id is not None

@@ -643,13 +643,25 @@ async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("capability", [None, False, "true"])
-async def test_sibling_creation_requires_explicit_server_capability(capability):
+@pytest.mark.parametrize("placement", ["same_host", "managed"])
+@pytest.mark.parametrize("capability", [None, False, True])
+async def test_independent_creation_supports_disabled_or_missing_sibling_capability(
+    placement, capability
+):
     paths = []
+    session_id = uuid4().hex
+    family = {"id": "manager"} if capability is True else None
 
     def handle(request):
         paths.append(request.url.path)
-        return httpx.Response(200, json={"sibling_sessions": capability})
+        if request.url.path == "/v1/info":
+            return httpx.Response(
+                200, json={} if capability is None else {"sibling_sessions": capability}
+            )
+        assert request.url.path == "/v1/sessions/orchestrated"
+        assert request.headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
+        assert "parent_session_id" not in json.loads(request.content)
+        return httpx.Response(201, json={"id": session_id, "family": family})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handle), base_url="http://server"
@@ -657,10 +669,14 @@ async def test_sibling_creation_requires_explicit_server_capability(capability):
         result = json.loads(
             await execute_tool(
                 tool_name="sys_session_create",
-                arguments=json.dumps({"agent_id": "worker", "placement": "same_host"}),
+                arguments=json.dumps({"agent_id": "worker", "placement": placement}),
                 server_client=client,
                 conversation_id="manager",
             )
         )
-    assert "no session was created" in result["error"]
-    assert paths == ["/v1/info"]
+    assert "error" not in result, result
+    assert result["conversation_id"] == session_id
+    assert result["kind"] == "default"
+    assert result["family"] == family
+    assert paths.count("/v1/sessions/orchestrated") == 1
+    assert "/v1/sessions" not in paths

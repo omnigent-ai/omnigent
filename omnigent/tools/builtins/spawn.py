@@ -933,10 +933,11 @@ class SysSessionCreateTool(Tool):
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. By default the new session is a child of the caller. "
-            "With agent_id, placement='same_host' creates a private sibling session "
-            "on the caller's host/workspace; placement='managed' creates a sibling "
-            "on a new sandbox "
-            "using the server's configured default provider. Managed creation requires a "
+            "With agent_id, placement='same_host' creates a private independent session "
+            "on the caller's host/workspace; placement='managed' creates one on a new sandbox "
+            "using the server's configured default provider. These sessions are grouped as "
+            "nested agents when enabled on the server; otherwise they appear at the top level. "
+            "Managed creation requires a "
             "configured sandbox provider; use same_host for an existing connected host. "
             "These placements require orchestration enabled "
             "and a sending session that is private or shared read-only, including its "
@@ -974,7 +975,8 @@ class SysSessionCreateTool(Tool):
                             "enum": ["child", "same_host", "managed"],
                             "description": (
                                 "Default child; same_host or managed launches a private "
-                                "sibling in this session family (agent_id only)."
+                                "independent session (agent_id only), grouped in this family "
+                                "when nested agents are enabled."
                             ),
                         },
                         "sandbox_provider": {
