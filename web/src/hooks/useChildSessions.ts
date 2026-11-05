@@ -12,6 +12,12 @@ import { isTempConvId } from "@/lib/tempConversationId";
  */
 export const MAX_TREE_DEPTH = 3;
 
+/**
+ * Largest page ``GET /v1/sessions/{id}/child_sessions`` serves. Callers that
+ * must see every child (not just the server's default first 20) request it.
+ */
+export const CHILD_SESSIONS_MAX_LIMIT = 1000;
+
 export interface ChildSessionError {
   code: string;
   message: string;
@@ -87,6 +93,20 @@ interface ChildSessionWire {
 interface ChildSessionsResponse {
   object: "list";
   data: ChildSessionWire[];
+  has_more?: boolean;
+  last_id?: string | null;
+}
+
+/** Fetch options for ``fetchChildSessions`` / ``useChildSessions``. */
+export interface ChildSessionsFetchOptions {
+  /** Page size to request instead of the server default (20). */
+  limit?: number;
+  /**
+   * Follow ``has_more`` / ``last_id`` cursors until the list is exhausted.
+   * The endpoint pages newest-first, so a caller that must not miss an old
+   * child (the Clone dialog's running sub-agent warning) needs every page.
+   */
+  allPages?: boolean;
 }
 
 /**
@@ -102,6 +122,19 @@ export function childSessionsQueryKey(conversationId: string): readonly unknown[
 /** True for any key built by ``childSessionsQueryKey``. */
 function isChildSessionsQueryKey(key: readonly unknown[]): boolean {
   return key.length === 3 && key[0] === "conversation" && key[2] === "child_sessions";
+}
+
+/**
+ * Extend the base key for non-default options so prefix invalidation still
+ * applies; the rail's descendant lookups read only the default list.
+ */
+function childSessionsQueryKeyFor(
+  sessionId: string | null,
+  options: ChildSessionsFetchOptions,
+): readonly unknown[] {
+  if (sessionId === null) return ["conversation", null, "child_sessions"];
+  const base = childSessionsQueryKey(sessionId);
+  return options.limit === undefined && !options.allPages ? base : [...base, options];
 }
 
 /**
@@ -193,8 +226,38 @@ function parseChildSessionError(value: unknown): ChildSessionError | null {
 
 interface UseChildSessionsResult {
   children: ChildSessionInfo[];
+  /** No data yet (first load). */
   isLoading: boolean;
+  /**
+   * A fetch is in flight, including a background refetch of cached data.
+   * Optional so existing hook mocks stay valid; absent reads as false.
+   */
+  isFetching?: boolean;
   error: Error | null;
+}
+
+/** Fetch one page and, when requested, follow continuation cursors; reject repeated cursors. */
+async function fetchChildSessionPages(
+  sessionId: string,
+  options: ChildSessionsFetchOptions,
+  after: string | null,
+  seen: Set<string>,
+): Promise<ChildSessionWire[]> {
+  const params = new URLSearchParams();
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
+  if (after !== null) params.set("after", after);
+  const search = params.toString();
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions${search ? `?${search}` : ""}`,
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const json = (await res.json()) as ChildSessionsResponse;
+  if (!options.allPages || !json.has_more) return json.data;
+  // A page that claims more without a cursor would otherwise truncate silently.
+  if (!json.last_id) throw new Error("child_sessions reported more pages without a cursor");
+  if (seen.has(json.last_id)) throw new Error("child_sessions cursor did not advance");
+  seen.add(json.last_id);
+  return [...json.data, ...(await fetchChildSessionPages(sessionId, options, json.last_id, seen))];
 }
 
 /**
@@ -203,17 +266,16 @@ interface UseChildSessionsResult {
  * Exported for unit testing of the HTTP-shape contract; production
  * code should call ``useChildSessions``.
  */
-export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
-  );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as ChildSessionsResponse;
+export async function fetchChildSessions(
+  sessionId: string,
+  options: ChildSessionsFetchOptions = {},
+): Promise<ChildSessionInfo[]> {
+  const rows = await fetchChildSessionPages(sessionId, options, null, new Set());
   // Children run on this session's runner: record the link so their
   // session-scoped requests key by this session's host before their own
   // snapshot loads.
-  for (const row of json.data) setSessionParent(row.id, sessionId);
-  return json.data.map((row) => ({
+  for (const row of rows) setSessionParent(row.id, sessionId);
+  return rows.map((row) => ({
     id: row.id,
     title: row.title,
     task_summary: row.task_summary ?? null,
@@ -244,18 +306,21 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
  *     tab is backgrounded). The execution-logs panel passes a value
  *     here so the dropdown updates when new sub-agents spawn;
  *     callers that just need a snapshot (the rail card) can omit it.
+ * :param options: Page size and whether to follow continuation cursors
+ *     (see ``ChildSessionsFetchOptions``). Callers that must see every
+ *     child pass ``{ limit: CHILD_SESSIONS_MAX_LIMIT, allPages: true }``;
+ *     the entry is keyed under the same ``childSessionsQueryKey`` prefix,
+ *     so one invalidation refreshes it together with the default list.
  */
 export function useChildSessions(
   conversationId: string | null,
   pollMs?: number | null,
+  options: ChildSessionsFetchOptions = {},
 ): UseChildSessionsResult {
   const sessionId = isTempConvId(conversationId) ? null : conversationId;
-  const { data, isLoading, error } = useQuery({
-    queryKey:
-      sessionId === null
-        ? ["conversation", null, "child_sessions"]
-        : childSessionsQueryKey(sessionId),
-    queryFn: () => fetchChildSessions(sessionId as string),
+  const { data, isLoading, isFetching, error } = useQuery({
+    queryKey: childSessionsQueryKeyFor(sessionId, options),
+    queryFn: () => fetchChildSessions(sessionId as string, options),
     enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,
@@ -265,6 +330,7 @@ export function useChildSessions(
   return {
     children: data ?? [],
     isLoading,
+    isFetching,
     error: (error as Error | null) ?? null,
   };
 }
