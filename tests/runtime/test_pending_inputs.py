@@ -1195,3 +1195,39 @@ def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
     [skipped] = match.skipped
     assert skipped.content == [_text_block(older)]
     assert match.uncertain == []
+
+
+@pytest.mark.parametrize("restored", [False, True])
+@pytest.mark.parametrize("attempt_present", [False, True])
+def test_stable_receipt_fallback_requires_restored_input_without_current_attempt(
+    restored: bool, attempt_present: bool
+) -> None:
+    older = pending_inputs.record("conv", [_text_block("older")])
+    stable_id = "c" * 32
+    own = pending_inputs.record(
+        "conv", [_text_block("own")], stable_id=stable_id, restored=restored
+    )
+    identity = pending_inputs.delivery_attributes_for("conv", own)
+    attempt = "b" * 32 if attempt_present else None
+    if restored:
+        held = pending_inputs.resolve_delivery_attempt(
+            "conv", own, attempt, stable_id=stable_id, hold=True
+        )
+        assert held is not None and held.restored
+        assert held.delivery_attempt_id is None
+        assert pending_inputs.pending_ids("conv") == [older]
+        with pytest.raises(ValueError):
+            pending_inputs.resolve_delivery_attempt("conv", own, attempt, stable_id=stable_id)
+        pending_inputs.restore("conv", held)
+        pending_inputs.record("conv", [_text_block("own")], stable_id=stable_id)
+        promoted = pending_inputs.delivery_attributes_for("conv", own)
+        assert isinstance(promoted["delivery_attempt_id"], str)
+        assert promoted["delivery_attempt_id"] != attempt
+    with pytest.raises(ValueError):
+        pending_inputs.resolve_delivery_attempt("conv", own, attempt, stable_id=stable_id)
+    assert pending_inputs.pending_ids("conv") == [older, own]
+    if not restored:
+        current = pending_inputs.delivery_attributes_for("conv", own)
+        assert {key: value for key, value in current.items() if key != "pending_age_ms"} == {
+            key: value for key, value in identity.items() if key != "pending_age_ms"
+        }

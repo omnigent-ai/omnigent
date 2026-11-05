@@ -57,6 +57,7 @@ from omnigent.host.frames import (
 )
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
+from omnigent.native.input_receipt import NATIVE_INPUT_RECEIPT_EVENT
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
@@ -820,6 +821,7 @@ class _RunnerEventContext:
 _RUNNER_EVENT_TYPES = frozenset(
     {
         _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        NATIVE_INPUT_RECEIPT_EVENT,
         _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
@@ -1003,7 +1005,7 @@ def register_events_routes(
             event_type = payload.get("type")
             if event_type not in _RUNNER_EVENT_TYPES:
                 return EventAckFrame(batch.id, index, "event type is not allowed on runner tunnel")
-            if event_type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+            if event_type in {_EXTERNAL_CONVERSATION_ITEM_TYPE, NATIVE_INPUT_RECEIPT_EVENT}:
                 data = payload.get("data")
                 if not isinstance(data, dict) or not isinstance(data.get("source_id"), str):
                     return EventAckFrame(batch.id, index, "source_id required for tunnel replay")
@@ -1180,6 +1182,7 @@ def register_events_routes(
             external_transcript=body.type
             in (
                 _EXTERNAL_CONVERSATION_ITEM_TYPE,
+                NATIVE_INPUT_RECEIPT_EVENT,
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
@@ -1305,6 +1308,7 @@ def register_events_routes(
             _RETRY_SESSION_TYPE,
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
+            NATIVE_INPUT_RECEIPT_EVENT,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
             _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
             _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
@@ -2192,7 +2196,7 @@ def register_events_routes(
                 conversation_store,
             )
             return {"queued": False, "item_id": item_id}
-        if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+        if body.type in {_EXTERNAL_CONVERSATION_ITEM_TYPE, NATIVE_INPUT_RECEIPT_EVENT}:
             item_id = await _persist_external_conversation_item(
                 session_id,
                 conv,

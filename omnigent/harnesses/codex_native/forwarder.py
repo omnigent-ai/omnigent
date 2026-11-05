@@ -16,6 +16,7 @@ from collections.abc import AsyncIterator, Callable, Collection
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -67,7 +68,11 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
-from omnigent.inner.native_attachments import restore_spilled_text
+from omnigent.inner.native_attachments import (
+    SpilledTextUnavailable,
+    restore_spilled_text,
+    spilled_input_receipt,
+)
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -85,6 +90,7 @@ from omnigent.native._native_supersession import (
     post_clear_supersession,
     unfiled_clear_replacement_body,
 )
+from omnigent.native.input_receipt import NATIVE_INPUT_RECEIPT_EVENT
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -6684,7 +6690,19 @@ async def _post_user_message(
     :returns: Whether the item was accepted by the server.
     """
     text = _user_message_text(item)
-    if bridge_dir is not None:
+    receipt_context: dict[str, Any] | None = None
+    client_message_id = item.get("clientId")
+    if isinstance(client_message_id, str) and re.fullmatch(
+        r"omnigent-paste-[0-9a-f]{32}-[0-9a-f]{64}", client_message_id
+    ):
+        if bridge_dir is None:
+            raise SpilledTextUnavailable("Generated input receipt has no owning bridge")
+        receipt_context = await asyncio.to_thread(
+            spilled_input_receipt, text, bridge_dir, client_message_id
+        )
+        if receipt_context is None:
+            raise SpilledTextUnavailable("Generated input receipt is unavailable or changed")
+    elif bridge_dir is not None:
         client_message_id = item.get("clientId")
         text = await asyncio.to_thread(
             _with_spilled_pastes_restored,
@@ -6704,25 +6722,45 @@ async def _post_user_message(
         return False
     # Text-only / text+image post the text; image-only posts empty content and
     # relies on the server-side pending fold to supply the image block.
-    content: list[_JsonObject] = [{"type": "input_text", "text": text}] if text else []
+    content: list[_JsonObject] = (
+        receipt_context["content"]
+        if receipt_context is not None
+        else [{"type": "input_text", "text": text}]
+        if text
+        else []
+    )
     item_data: _JsonObject = {
         "role": "user",
         "content": content,
     }
-    if _is_codex_skill_wrapper(text):
+    if receipt_context is None and _is_codex_skill_wrapper(text):
         item_data["is_meta"] = True
         _logger.debug(
             "Marked Codex skill wrapper as meta for session=%s source_id=%s",
             session_id,
             _source_id(params, item),
         )
+    receipt = (
+        {
+            "version": receipt_context["version"],
+            "identity": receipt_context["identity"],
+            "receipt_id": client_message_id,
+        }
+        if receipt_context is not None
+        else None
+    )
     return await _post_external_item(
         client,
         session_id,
         item_type="message",
         item_data=item_data,
         response_id=_response_id(params),
-        source_id=source_id or _source_id(params, item),
+        source_id=(
+            f"codex-spill:{client_message_id}"
+            if receipt is not None
+            else source_id or _source_id(params, item)
+        ),
+        native_input_receipt=receipt,
     )
 
 
@@ -7354,6 +7392,7 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
+    native_input_receipt: _JsonObject | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -7380,12 +7419,19 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
+    if native_input_receipt is not None:
+        data["native_input_receipt"] = native_input_receipt
+    event_type = (
+        NATIVE_INPUT_RECEIPT_EVENT
+        if native_input_receipt is not None
+        else "external_conversation_item"
+    )
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(
             client,
             session_id,
-            event_type="external_conversation_item",
+            event_type=event_type,
             data=data,
             max_attempts=None if source_id is not None else _POST_MAX_ATTEMPTS,
             timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS if source_id is not None else None,
@@ -7399,7 +7445,7 @@ async def _post_external_item(
             append_dead_letter(
                 dl_dir,
                 session_id=session_id,
-                event_type="external_conversation_item",
+                event_type=event_type,
                 payload=data,
                 reason="delivery interrupted before acknowledgement",
                 delivered_ambiguous=True,
@@ -8216,7 +8262,9 @@ async def _conversation_item_delivery_scope(session_id: str) -> AsyncIterator[No
 
 
 # Durable event types worth dead-lettering (not ephemeral deltas).
-_DEAD_LETTER_EVENT_TYPES = frozenset({"external_conversation_item", "external_session_usage"})
+_DEAD_LETTER_EVENT_TYPES = frozenset(
+    {"external_conversation_item", NATIVE_INPUT_RECEIPT_EVENT, "external_session_usage"}
+)
 
 
 def _reset_forward_health() -> None:
@@ -8513,7 +8561,7 @@ async def _post_session_event_inner(
             # retried. Completed Codex items carry a stable source id and are
             # safe to retry until the relay recovers.
             if (
-                event_type == "external_conversation_item"
+                event_type in {"external_conversation_item", NATIVE_INPUT_RECEIPT_EVENT}
                 and not idempotent
                 and post_may_have_been_delivered(exc)
             ):
@@ -8607,7 +8655,7 @@ def _session_event_is_idempotent(event_type: str, data: _JsonObject) -> bool:
     """Return whether retrying this event cannot append a duplicate item."""
     source_id = data.get("source_id")
     return (
-        event_type == "external_conversation_item"
+        event_type in {"external_conversation_item", NATIVE_INPUT_RECEIPT_EVENT}
         and isinstance(source_id, str)
         and bool(source_id.strip())
     )

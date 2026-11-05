@@ -1162,6 +1162,8 @@ class CreateResponseRequest(BaseModel):
     input_enqueued_at_ms: int | None = None
     # Runner-validated authorization for one delivery, separate from user content/history.
     authorized_native_shell_command: str | None = None
+    # Original native input and receipt protocol, transported separately from diagnostics.
+    native_input_receipt: dict[str, Any] | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None

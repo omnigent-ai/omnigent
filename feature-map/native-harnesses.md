@@ -905,8 +905,9 @@ Cross-harness journeys:
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_oversized_input_survives_real_codex_transport`
   uses real server, runner, Codex and tmux with local mock Responses. Its paste,
   aggregate and uploaded-resource cases check bounded native input, complete
-  inline/file contents, exact history and an ordinary follow-up. Older peers
-  must refuse authored pastes without inference. Start/steer refusal and cache
+  inline/file contents and original history blocks. Codex 0.142 refuses every
+  spill before native submission; 0.166 echoes the receipt and prepared files.
+  Provider completion is outside this transport proof. Start/steer refusal and cache
   integrity matrices are in `tests/inner/test_codex_native_executor.py`;
   `tests/harnesses/codex_native/forwarder/test_user_messages.py` and
   `tests/server/routes/test_session_resources.py` cover literal references,

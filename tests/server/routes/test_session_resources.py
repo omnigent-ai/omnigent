@@ -6024,10 +6024,14 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails(
 async def test_codex_spilled_paste_is_mirrored_as_sent_and_settles_its_own_input(
     earlier_pending: str, paste_size: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A paste Codex got as a file is recorded as sent, on any server, and survives the cache."""
+    """A spilled paste keeps its original blocks after its cache is gone."""
     from omnigent.harnesses.codex_native import forwarder
     from omnigent.inner import codex_native_executor
     from omnigent.inner.native_attachments import pasted_text_cache_dir
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        native_input_receipt_scope,
+    )
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
     from tests.harnesses.codex_native.forwarder._support import _RecordingClient
@@ -6058,7 +6062,10 @@ async def test_codex_spilled_paste_is_mirrored_as_sent_and_settles_its_own_input
     second = pending_inputs.record(
         sid, original, created_by="paste@example.test", stable_id="b" * 32
     )
-    items = codex_native_executor._content_to_input_items(original, bridge)
+    with native_input_receipt_scope(
+        build_native_input_receipt(original, pending_inputs.delivery_attributes_for(sid, second))
+    ):
+        items = codex_native_executor._content_to_input_items(original, bridge)
     assert "pasted_text_" in str(items[0]["text"])
     echoed = {
         "type": "userMessage",
@@ -6083,16 +6090,10 @@ async def test_codex_spilled_paste_is_mirrored_as_sent_and_settles_its_own_input
         )
         committed = store.get_item(sid, item_id)
         assert committed.created_by == "paste@example.test"
-        assert committed.data.content == [
-            {"type": "input_text", "text": f"{paste}\n\nkeep this tail inline"}
-        ]
+        assert committed.data.content == original
         assert second not in pending_inputs.pending_ids(sid)
-        if earlier_pending == "source_less":
-            assert pending_inputs.pending_ids(sid) == [first]
-        elif earlier_pending == "source_id":
-            assert store.appended_items[0].data.content[0]["text"] == "summarize the readme"
-            assert store.appended_items[0].created_by == "earlier@example.test"
-            assert store.appended_items[1].type == "error"
+        assert pending_inputs.pending_ids(sid) == ([first] if first else [])
+        assert [item.type for item in store.appended_items] == ["message"]
 
         if paste_size == "small":
             remaining = pending_inputs.pending_ids(sid)
@@ -6145,6 +6146,10 @@ async def test_codex_text_upload_beside_a_spilled_paste_settles_with_the_whole_m
     from omnigent.harnesses.codex_native import forwarder
     from omnigent.inner import codex_native_executor
     from omnigent.inner.native_attachments import attachment_cache_dir, attachment_content_digest
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        native_input_receipt_scope,
+    )
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
     from tests.harnesses.codex_native.forwarder._support import _RecordingClient
@@ -6165,7 +6170,7 @@ async def test_codex_text_upload_beside_a_spilled_paste_settles_with_the_whole_m
         else f"pasted_text_{attachment_content_digest(csv.encode())}.txt"
     )
     upload = {"type": "input_file", "file_id": "file_csv", "filename": filename}
-    pending_inputs.record(
+    earlier = pending_inputs.record(
         sid,
         [{"type": "input_text", "text": "an earlier ambiguous send"}],
         created_by="earlier@example.test",
@@ -6177,9 +6182,15 @@ async def test_codex_text_upload_beside_a_spilled_paste_settles_with_the_whole_m
         **upload,
         "file_data": "data:text/csv;base64," + base64.b64encode(csv.encode()).decode(),
     }
-    items = codex_native_executor._content_to_input_items(
-        [{"type": "input_text", "text": paste}, resolved_upload], bridge
-    )
+    with native_input_receipt_scope(
+        build_native_input_receipt(
+            [upload, {"type": "input_text", "text": paste}],
+            pending_inputs.delivery_attributes_for(sid, queued),
+        )
+    ):
+        items = codex_native_executor._content_to_input_items(
+            [{"type": "input_text", "text": paste}, resolved_upload], bridge
+        )
     csv_path = attachment_cache_dir(bridge) / filename
     assert items[0] == {"type": "text", "text": f"[Attached file: {csv_path}]"}
     assert csv_path.read_text(encoding="utf-8") == csv
@@ -6209,15 +6220,11 @@ async def test_codex_text_upload_beside_a_spilled_paste_settles_with_the_whole_m
         assert committed.created_by == "paste@example.test"
         assert committed.data.content == [
             upload,
-            {"type": "input_text", "text": f"[Attached file: {csv_path}]\n\n{paste}"},
+            {"type": "input_text", "text": paste},
         ]
         assert queued not in pending_inputs.pending_ids(sid)
-        assert pending_inputs.pending_ids(sid) == []
-        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
-        assert store.appended_items[0].created_by == "earlier@example.test"
-        assert store.appended_items[0].data.content == [
-            {"type": "input_text", "text": "an earlier ambiguous send"}
-        ]
+        assert pending_inputs.pending_ids(sid) == [earlier]
+        assert [item.type for item in store.appended_items] == ["message"]
     finally:
         pending_inputs.reset_for_tests()
 
@@ -8919,6 +8926,7 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
         [{"type": "input_text", "text": "set up the worktree"}],
         created_by="alice@example.com",
         stable_id=stable_id,
+        restored=True,
     )
     next_pending = pending_inputs.record(
         session_id,
@@ -8992,8 +9000,13 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
         (True, identity)
         for identity in (
             "legacy_stable_id",
+            "live_stable_id",
             "server_attempt",
             "pending_only",
+            "attempt_only",
+            "mismatched_attempt",
+            "malformed_attempt",
+            "mismatched_pending",
             "attempt_only",
             "mismatched_pending",
             "mismatched_attempt",
@@ -9022,19 +9035,25 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     conv = store.get_conversation(sid)
     assert conv is not None
     first_stable_id = (
-        "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d" if identity_case == "legacy_stable_id" else None
+        "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+        if identity_case in {"legacy_stable_id", "live_stable_id"}
+        else None
     )
     first_content = [{"type": "input_text", "text": "set up the worktree"}]
     next_content = [{"type": "input_text", "text": "then run the tests"}]
     first_pending = pending_inputs.record(
-        sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
+        sid,
+        first_content,
+        created_by="alice@example.com",
+        stable_id=first_stable_id,
+        restored=identity_case == "legacy_stable_id",
     )
     identity = {
         key: value
         for key, value in pending_inputs.delivery_attributes_for(sid, first_pending).items()
         if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
     }
-    if identity_case == "legacy_stable_id":
+    if identity_case in {"legacy_stable_id", "live_stable_id"}:
         identity = {"input_stable_id": first_stable_id}
     elif identity_case == "pending_only":
         identity.pop("delivery_attempt_id")
@@ -11579,3 +11598,303 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
         )
     else:
         assert response.json()["error"]["code"] == "runner_unavailable"
+
+
+def _encoded_spilled_content(content: object) -> bytes:
+    return json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "owned_multiblock",
+        "owned_upload",
+        "wrong_attempt",
+        "same_source_replay",
+        "distinct_source_replay",
+        "delayed_older_echo",
+        "stable_attempt_replaced",
+        "restored",
+        "restored_resent",
+        "queue_absent",
+        "append_failure",
+        "metadata_missing",
+        "metadata_unknown",
+        "wrong_content",
+        "reprepared_replay",
+        "settled_stable_attempt_replaced",
+    ],
+)
+async def test_spilled_receipt_preserves_exact_queue_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    import copy
+
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.inner import codex_native_executor, native_attachments
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        native_input_receipt_scope,
+    )
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    monkeypatch.setattr(pending_inputs, "_pending", {})
+    store = _ConversationStore()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    monkeypatch.setattr(native_attachments, "data_dir", lambda: tmp_path / "data")
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 500)
+
+    older_content = [{"type": "input_text", "text": "earlier input still awaiting its echo"}]
+    older_id = pending_inputs.record(session_id, older_content, created_by="older@example.test")
+    pending_inputs.mark_delivery_stage(session_id, older_id, "forward_accepted")
+    older_identity = dict(pending_inputs.delivery_attributes_for(session_id, older_id))
+    original = [
+        {"type": "input_text", "text": "  synthetic résumé line\r\n" * 100},
+        {"type": "input_text", "text": "\tkeep the original tail\n"},
+    ]
+    if scenario == "owned_upload":
+        original.insert(
+            0,
+            {"type": "input_file", "file_id": "file_report", "filename": "report.txt"},
+        )
+    stable_id = (
+        "c" * 32
+        if scenario
+        in {
+            "stable_attempt_replaced",
+            "restored",
+            "restored_resent",
+            "settled_stable_attempt_replaced",
+        }
+        else None
+    )
+    owned_id = pending_inputs.record(
+        session_id, original, created_by="owner@example.test", stable_id=stable_id
+    )
+    owned_identity = dict(pending_inputs.delivery_attributes_for(session_id, owned_id))
+    pending_inputs.mark_delivery_stage(session_id, owned_id, "forward_accepted")
+
+    async def mirror_body(
+        content: list[dict[str, Any]], identity: dict[str, Any], native_item_id: str
+    ) -> SessionEventInput:
+        resolved = copy.deepcopy(content)
+        for block in resolved:
+            if block.get("type") == "input_file":
+                block["file_data"] = (
+                    "data:text/plain;base64,"
+                    + base64.b64encode(b"synthetic upload bytes\n").decode()
+                )
+        with native_input_receipt_scope(build_native_input_receipt(content, identity)):
+            items = codex_native_executor._content_to_input_items(resolved, tmp_path / "bridge")
+        client_id = getattr(items, "client_message_id", identity["delivery_attempt_id"])
+        item = {
+            "type": "userMessage",
+            "id": native_item_id,
+            "clientId": client_id,
+            "content": [dict(entry) for entry in items],
+        }
+        recorder = _RecordingClient()
+        await forwarder._post_user_message(
+            recorder,
+            session_id,
+            {"threadId": "thread_owned", "turnId": "turn_owned"},
+            item,
+            bridge_dir=tmp_path / "bridge",
+        )
+        assert len(recorder.posts) == 1
+        return SessionEventInput.model_validate(recorder.posts[0][1])
+
+    wire_identity = dict(owned_identity)
+    if scenario == "wrong_attempt":
+        wire_identity["delivery_attempt_id"] = "f" * 32
+        assert wire_identity["delivery_attempt_id"] != owned_identity["delivery_attempt_id"]
+    body = await mirror_body(original, wire_identity, "native_owned")
+    if scenario == "metadata_missing":
+        body.data.pop("native_input_receipt")
+    elif scenario == "metadata_unknown":
+        body.data["native_input_receipt"]["version"] = 2
+    elif scenario == "wrong_content":
+        body.data["item_data"]["content"][0]["text"] += " changed"
+    if scenario in {"restored", "restored_resent"}:
+        pending_inputs.resolve(session_id, owned_id)
+        assert (
+            pending_inputs.record(
+                session_id,
+                original,
+                created_by="owner@example.test",
+                stable_id=stable_id,
+                restored=True,
+            )
+            == owned_id
+        )
+        if scenario == "restored_resent":
+            pending_inputs.record(session_id, original, stable_id=stable_id)
+    if scenario == "queue_absent":
+        pending_inputs.resolve(session_id, owned_id)
+    if scenario == "stable_attempt_replaced":
+        pending_inputs.resolve(session_id, owned_id)
+        replacement_id = pending_inputs.record(
+            session_id, original, created_by="owner@example.test", stable_id=stable_id
+        )
+        assert replacement_id == owned_id
+        replacement_identity = pending_inputs.delivery_attributes_for(session_id, replacement_id)
+        assert replacement_identity["delivery_attempt_id"] != owned_identity["delivery_attempt_id"]
+
+    async def persist(event: SessionEventInput) -> tuple[str | None, str | None]:
+        try:
+            item_id = await _persist_external_conversation_item(
+                session_id, conv, event, store, created_by="owner@example.test"
+            )
+            return item_id, None
+        except OmnigentError as error:
+            return None, error.code
+
+    if scenario == "settled_stable_attempt_replaced":
+        pending_inputs.resolve(session_id, owned_id)
+        replacement = pending_inputs.record(
+            session_id, original, created_by="owner@example.test", stable_id=stable_id
+        )
+        replacement_body = await mirror_body(
+            original,
+            dict(pending_inputs.delivery_attributes_for(session_id, replacement)),
+            "newer_native",
+        )
+        replacement_item_id, replacement_error = await persist(replacement_body)
+        assert replacement_error is None
+        before_count = len(store.appended_items)
+        replay_id, replay_error = await persist(body)
+        assert replay_error is None and replay_id == replacement_item_id
+        assert len(store.appended_items) == before_count == 1
+        assert pending_inputs.pending_ids(session_id) == [older_id]
+        assert _encoded_spilled_content(
+            store.appended_items[0].data.content
+        ) == _encoded_spilled_content(original)
+        return
+    if scenario == "append_failure":
+        original_append = store.append
+
+        def fail_append(*_args, **_kwargs):
+            raise RuntimeError("injected store failure")
+
+        monkeypatch.setattr(store, "append", fail_append)
+        with pytest.raises(RuntimeError, match="injected store failure"):
+            await persist(body)
+        assert pending_inputs.pending_ids(session_id) == [older_id, owned_id]
+        assert (
+            pending_inputs.delivery_attributes_for(session_id, owned_id)["delivery_attempt_id"]
+            == owned_identity["delivery_attempt_id"]
+        )
+        assert store.appended_items == []
+        monkeypatch.setattr(store, "append", original_append)
+    item_id, error_code = await persist(body)
+    committed = store.get_item(session_id, item_id) if item_id else None
+    observation = {
+        "scenario": scenario,
+        "accepted": item_id is not None,
+        "error_code": error_code,
+        "receipt_carries_server_identity": "native_input_receipt" in body.data,
+        "older_preserved": older_id in pending_inputs.pending_ids(session_id),
+        "original_blocks_exact": (
+            committed is not None
+            and _encoded_spilled_content(committed.data.content)
+            == _encoded_spilled_content(original)
+        ),
+        "owner_attribution_correct": (
+            committed is not None
+            and committed.created_by
+            == (None if scenario == "queue_absent" else "owner@example.test")
+        ),
+        "appended_items": len(store.appended_items),
+        "false_lost_errors": sum(item.type == "error" for item in store.appended_items),
+    }
+
+    if scenario in {
+        "wrong_attempt",
+        "stable_attempt_replaced",
+        "restored_resent",
+        "metadata_missing",
+        "metadata_unknown",
+        "wrong_content",
+    }:
+        expected = {
+            "rejected": True,
+            "queue_unchanged": True,
+            "no_append": True,
+        }
+        actual = {
+            "rejected": item_id is None,
+            "queue_unchanged": pending_inputs.pending_ids(session_id) == [older_id, owned_id],
+            "no_append": store.appended_items == [],
+        }
+    elif scenario in {"same_source_replay", "distinct_source_replay", "reprepared_replay"}:
+        assert committed is not None
+        newer_id = pending_inputs.record(session_id, original, created_by="newer@example.test")
+        before_queue = pending_inputs.pending_ids(session_id)
+        before_count = len(store.appended_items)
+        replay = copy.deepcopy(body)
+        if scenario == "distinct_source_replay":
+            replay.data["source_id"] = str(body.data["source_id"]) + ":resume-alias"
+        if scenario == "reprepared_replay":
+            replay = await mirror_body(original, owned_identity, "new_native_alias")
+            assert (
+                replay.data["native_input_receipt"]["receipt_id"]
+                != body.data["native_input_receipt"]["receipt_id"]
+            )
+        replay_id, replay_error = await persist(replay)
+        observation["replay_accepted"] = replay_id is not None
+        observation["replay_error"] = replay_error
+        expected = {
+            "newer_preserved": True,
+            "queue_unchanged": True,
+            "no_extra_append": True,
+        }
+        actual = {
+            "newer_preserved": newer_id in pending_inputs.pending_ids(session_id),
+            "queue_unchanged": pending_inputs.pending_ids(session_id) == before_queue,
+            "no_extra_append": len(store.appended_items) == before_count,
+        }
+    elif scenario == "delayed_older_echo":
+        delayed_body = await mirror_body(older_content, older_identity, "native_older")
+        delayed_id, delayed_error = await persist(delayed_body)
+        older_items = [
+            item
+            for item in store.appended_items
+            if item.type == "message"
+            and _encoded_spilled_content(item.data.content)
+            == _encoded_spilled_content(older_content)
+        ]
+        observation["delayed_older_accepted"] = delayed_id is not None
+        observation["delayed_older_error"] = delayed_error
+        expected = {
+            "older_was_not_prematurely_settled": True,
+            "older_recorded_once": True,
+            "no_false_lost_error": True,
+        }
+        actual = {
+            "older_was_not_prematurely_settled": observation["older_preserved"],
+            "older_recorded_once": len(older_items) == 1,
+            "no_false_lost_error": not any(item.type == "error" for item in store.appended_items),
+        }
+    else:
+        expected = {
+            "older_preserved": True,
+            "original_blocks_exact": True,
+            "owner_attribution_correct": True,
+            "only_owned_input_settled": True,
+            "no_false_lost_error": True,
+        }
+        actual = {
+            "older_preserved": observation["older_preserved"],
+            "original_blocks_exact": observation["original_blocks_exact"],
+            "owner_attribution_correct": observation["owner_attribution_correct"],
+            "only_owned_input_settled": pending_inputs.pending_ids(session_id) == [older_id],
+            "no_false_lost_error": observation["false_lost_errors"] == 0,
+        }
+    observation["assertions"] = actual
+    assert actual == expected, observation

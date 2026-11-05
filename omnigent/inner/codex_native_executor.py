@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -87,6 +88,7 @@ from omnigent.inner.native_attachments import (
     parse_data_uri,
     record_spilled_text,
     restore_spilled_text,
+    spilled_input_receipt,
     unresolved_attachment_marker,
     uses_filesystem_delivery,
 )
@@ -95,7 +97,12 @@ from omnigent.native.input_diagnostics import (
     log_input_event,
     with_input_attributes,
 )
+from omnigent.native.input_receipt import (
+    NATIVE_INPUT_RECEIPT_EVENT,
+    current_native_input_receipt,
+)
 from omnigent.process_logging import log_once
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     effort_for_model_switch,
@@ -158,14 +165,22 @@ _MIRROR_TOO_LARGE_FAILURE = CodexStartupFailure(
 
 _SPILL_RECORD_FAILURE = CodexStartupFailure(
     message="The large paste could not be recorded safely; this message was not sent.",
+    code=_INPUT_TOO_LARGE_CODE,
     remediation="Check local disk space and try again, or attach the text as a file.",
 )
 
 _SPILL_UNSUPPORTED_FAILURE = CodexStartupFailure(
     message="This Codex version cannot preserve a large paste in history; "
     "this message was not sent.",
+    code=_INPUT_TOO_LARGE_CODE,
     remediation="Upgrade Codex to 0.154.0 or later and restart this native session after "
     "current work finishes, or attach the text as a file.",
+)
+_SPILL_SERVER_UNSUPPORTED_FAILURE = CodexStartupFailure(
+    message="This Omnigent server cannot preserve a large native input safely; "
+    "this message was not sent.",
+    code=_INPUT_TOO_LARGE_CODE,
+    remediation="Update the Omnigent server and runner, then retry.",
 )
 
 
@@ -195,6 +210,30 @@ def _spilled_mirror_fits(input_items: list[dict[str, object]], bridge_dir: Path)
         input_items.expected_ranges if isinstance(input_items, _SpilledInputItems) else None
     )
     try:
+        if isinstance(input_items, _SpilledInputItems):
+            context = spilled_input_receipt(text, bridge_dir, message_id)
+            if context is None:
+                failure = (
+                    _SPILL_SERVER_UNSUPPORTED_FAILURE
+                    if current_native_input_receipt() is None
+                    else _SPILL_RECORD_FAILURE
+                )
+                raise _CodexNativeInputUndelivered(failure)
+            payload = {
+                "type": NATIVE_INPUT_RECEIPT_EVENT,
+                "data": {
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": context["content"]},
+                    "native_input_receipt": {
+                        "version": context["version"],
+                        "identity": context["identity"],
+                        "receipt_id": message_id,
+                    },
+                },
+            }
+            encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            if len(encoded) > MAX_SESSION_EVENT_REQUEST_BYTES - 4096:
+                return False
         return (
             restore_spilled_text(text, bridge_dir, message_id, expected_ranges=expected_ranges)
             is not None
@@ -1603,11 +1642,27 @@ def _content_to_input_items(
             if index in spilled and inline[index].kind == "text":
                 ranges.append([start, offset])
         items = [items[index] for index in order]
-        if ranges:
-            message_id = record_spilled_text("\n\n".join(texts), ranges, bridge_dir)
-            items = _SpilledInputItems(
-                items, message_id, tuple((start, end) for start, end in ranges)
-            )
+        cache_files = []
+        for index in spilled:
+            entry = inline[index]
+            if entry.block is None:
+                raw_bytes = entry.text.encode("utf-8")
+            else:
+                data_uri = entry.block.get("file_data")
+                if not isinstance(data_uri, str):
+                    continue
+                raw_bytes = base64.b64decode(parse_data_uri(data_uri).base64_payload)
+            reference = str(items[order.index(index)]["text"])
+            path = Path(reference.removeprefix("[Attached file: ").removesuffix("]"))
+            cache_files.append((path, hashlib.sha256(raw_bytes).hexdigest(), len(raw_bytes)))
+        message_id = record_spilled_text(
+            "\n\n".join(texts),
+            ranges,
+            bridge_dir,
+            input_receipt=current_native_input_receipt(),
+            cache_files=cache_files,
+        )
+        items = _SpilledInputItems(items, message_id, tuple((start, end) for start, end in ranges))
     return items
 
 

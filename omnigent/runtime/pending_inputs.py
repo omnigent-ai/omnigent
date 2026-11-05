@@ -250,6 +250,7 @@ class DrainedInput:
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
     uncertain: bool = False
+    restored: bool = False
 
 
 @dataclass
@@ -327,6 +328,7 @@ class _Entry:
     reason_code: str | None = None
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
+    restored: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -376,6 +378,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    restored: bool = False,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -414,6 +417,11 @@ def record(
         if stable_id is not None:
             for existing in _pending.get(conversation_id, {}).values():
                 if existing.stable_id == stable_id:
+                    if existing.restored and not restored:
+                        existing.restored = False
+                        existing.delivery_attempt_id = uuid.uuid4().hex
+                        existing.input_enqueued_at_ms = int(time.time() * 1000)
+                        existing.last_delivery_stage = "server_queued"
                     return existing.pending_id
         pending_id = make_pending_id(conversation_id, stable_id)
         entry = _Entry(
@@ -422,6 +430,8 @@ def record(
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            restored=restored,
+            delivery_attempt_id=None if restored else uuid.uuid4().hex,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -655,6 +665,56 @@ def resolve(
         return _drained_input(entry) if entry is not None else None
 
 
+def resolve_delivery_attempt(
+    conversation_id: str,
+    pending_id: str,
+    delivery_attempt_id: str | None,
+    *,
+    stable_id: str | None = None,
+    hold: bool = False,
+) -> DrainedInput | None:
+    """Resolve one receipt without using text or consuming older queued inputs."""
+    identity = {
+        "pending_id": pending_id,
+        **(
+            {"delivery_attempt_id": delivery_attempt_id} if delivery_attempt_id is not None else {}
+        ),
+        **({"input_stable_id": stable_id} if stable_id is not None else {}),
+    }
+    if input_attributes(identity) != identity:
+        raise ValueError("Invalid native input receipt identity")
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        entry = entries.get(pending_id) if entries is not None else None
+        if entry is None:
+            return None
+        restored_match = (
+            entry.restored
+            and entry.delivery_attempt_id is None
+            and stable_id is not None
+            and entry.stable_id == stable_id
+        )
+        if (
+            entry.held
+            or (stable_id is not None and entry.stable_id != stable_id)
+            or (
+                not restored_match
+                and (
+                    delivery_attempt_id is None or entry.delivery_attempt_id != delivery_attempt_id
+                )
+            )
+        ):
+            raise ValueError("Native input delivery attempt changed")
+        if hold:
+            entry.held = True
+        elif entries is not None:
+            entries.pop(pending_id)
+            if not entries:
+                _pending.pop(conversation_id, None)
+        return _drained_input(entry)
+
+
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.
@@ -804,6 +864,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         reason_code=drained.reason_code,
         native_turn_id=drained.native_turn_id,
         lifecycle_response_id=drained.lifecycle_response_id,
+        restored=drained.restored,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1030,6 +1091,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         reason_code=entry.reason_code,
         native_turn_id=entry.native_turn_id,
         lifecycle_response_id=entry.lifecycle_response_id,
+        restored=entry.restored,
     )
 
 

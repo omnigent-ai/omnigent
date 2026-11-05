@@ -5639,6 +5639,8 @@ def create_runner_app(
         _authorized_shell = msg_body.get("authorized_native_shell_command")
         if isinstance(_authorized_shell, str):
             harness_body["authorized_native_shell_command"] = _authorized_shell
+        if isinstance(msg_body.get("native_input_receipt"), dict):
+            harness_body["native_input_receipt"] = msg_body["native_input_receipt"]
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and

@@ -30,7 +30,10 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.harnesses.codex_native.app_server import client_for_transport
+from omnigent.harnesses.codex_native.app_server import (
+    CodexAppServerResponseError,
+    client_for_transport,
+)
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
 from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
@@ -141,177 +144,181 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
                 pass
 
 
-@pytest.mark.parametrize(
-    ("input_kind", "characters"),
-    [("paste", 4_548_608), ("text-upload", 1_100_000), ("aggregate", 2_516_946)],
-)
+@pytest.mark.parametrize("input_kind", ["paste", "text-upload", "aggregate"])
 def test_oversized_input_survives_real_codex_transport(
-    codex_effort_rig: _Rig, input_kind: str, characters: int
+    codex_effort_rig: _Rig, input_kind: str
 ) -> None:
-    """Preserve supported large inputs and prove older peers refuse before inference."""
+    """Real Codex either echoes a spill receipt or refuses before creating a native turn."""
     rig = codex_effort_rig
+    version_match = re.search(r"\b(\d+)\.(\d+)\.(\d+)", rig.codex_version)
+    assert version_match is not None, rig.codex_version
+    supports_spill_receipts = tuple(int(part) for part in version_match.groups()) >= (0, 154, 0)
     with _session(rig, _STANDARD_MODEL, "medium") as session:
-        native = asyncio.run(_native_settings(session, _STANDARD_MODEL))
-        version = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", rig.codex_version)
-        assert version is not None, rig.codex_version
-        expected_support = tuple(int(part) for part in version.groups()) >= (0, 154, 0)
-        expect_refusal = input_kind != "text-upload" and not expected_support
-        refusal_message = (
-            "This Codex version cannot preserve a large paste in history; "
-            "this message was not sent."
+        end_marker = f"END_OF_LARGE_INPUT_{uuid.uuid4().hex}"
+        text = (
+            "synthetic input line\n" * (230_000 if input_kind == "paste" else 70_000) + end_marker
         )
-        marker = f"LARGE_INPUT_{uuid.uuid4().hex}"
-        first_line, last_line = marker + "\n", "\nLAST_LINE_preserved"
-        authored = first_line + "x" * (characters - len(first_line + last_line)) + last_line
-        _json(rig.model.post("/mock/configure", json={"key": _STANDARD_MODEL, "responses": []}))
-        _json(rig.model.post("/mock/set_fallback", json={"key": _STANDARD_MODEL, "text": marker}))
-        before = len(_json(rig.model.get("/mock/requests"))["requests"])
-        file_id = None
+        stable_id = uuid.uuid4().hex
         if input_kind == "text-upload":
-            upload = _json(
+            uploaded = _json(
                 rig.api.post(
                     f"/v1/sessions/{session.id}/resources/files",
-                    files={"file": ("large-input.txt", authored.encode(), "text/plain")},
+                    files={"file": ("large-input.txt", text.encode(), "text/plain")},
                 )
             )
-            file_id = upload["id"]
-            content = [
-                {
-                    "type": "input_file",
-                    "filename": "large-input.txt",
-                    "file_id": file_id,
-                }
+            original_content = [
+                {"type": "input_file", "filename": "large-input.txt", "file_id": uploaded["id"]}
             ]
         elif input_kind == "aggregate":
-            content = [
-                {"type": "input_text", "text": chunk}
-                for chunk in (authored[:600_000], authored[600_000:])
+            original_content = [
+                {"type": "input_text", "text": chunk} for chunk in (text[:600_000], text[600_000:])
             ]
         else:
-            content = [{"type": "input_text", "text": authored}]
-        _json(
-            rig.api.post(
-                f"/v1/sessions/{session.id}/events",
-                json={"type": "message", "data": {"role": "user", "content": content}},
-            )
+            original_content = [{"type": "input_text", "text": text}]
+        _json(rig.model.post("/mock/reset"))
+
+        response = rig.api.post(
+            f"/v1/sessions/{session.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "stable_id": stable_id,
+                    "content": original_content,
+                },
+            },
+            timeout=30,
         )
-        deadline = time.monotonic() + 90
-        items = []
+        response.raise_for_status()
+
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
             items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
                 "data"
             ]
-            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
-            state = read_bridge_state(session.bridge)
-            replies = [
+            user_matches = [
                 item
                 for item in items
-                if item.get("role") == "assistant" and marker in json.dumps(item.get("content"))
+                if item.get("role") == "user" and item.get("content") == original_content
             ]
             refusals = [
                 item
                 for item in items
-                if item.get("type") == "error" and refusal_message in item.get("message", "")
+                if item.get("type") == "error" and item.get("code") == "input_too_large"
             ]
-            if expect_refusal:
-                if (
-                    refusals
-                    and snapshot.get("status") == "failed"
-                    and state is not None
-                    and state.active_turn_id is None
-                ):
-                    break
-            else:
-                assert snapshot.get("status") != "failed", (
-                    snapshot.get("last_task_error"),
-                    [item.get("message") for item in items if item.get("type") == "error"],
-                )
-                if replies and state is not None and state.active_turn_id is None:
-                    break
+            state = read_bridge_state(session.bridge)
+            if (
+                user_matches
+                and state is not None
+                and not snapshot.get("pending_inputs")
+                and (supports_spill_receipts or refusals)
+            ):
+                break
             time.sleep(0.2)
         else:
             pytest.fail(
-                f"Oversized-input outcome did not settle (expect_refusal={expect_refusal}).\n"
-                f"{session.tmux('capture-pane', '-p')}\n"
+                f"Oversized input did not complete.\n{session.tmux('capture-pane', '-p')}\n"
                 f"{rig.stack.log_tail()}"
             )
-        assert len(replies) == (0 if expect_refusal else 1)
-        assert len(refusals) == (1 if expect_refusal else 0)
-        assert native["supports_user_message_ids"] is expected_support
-        users = [item for item in items if item.get("role") == "user"]
-        assert len(users) == 1, "native echo must not duplicate the pending authored message"
-        requests = _json(rig.model.get("/mock/requests"))["requests"][before:]
-        assert state is not None
-        own_requests = [
-            request for request in requests if request.get("prompt_cache_key") == state.thread_id
+
+        async def read_thread() -> dict[str, Any]:
+            assert state is not None
+            client = client_for_transport(state.socket_path, client_name="spill-e2e-observer")
+            await client.connect()
+            try:
+                assert client.supports_user_message_ids is supports_spill_receipts
+                result = await client.request(
+                    "thread/read", {"threadId": state.thread_id, "includeTurns": True}
+                )
+                payload = result.get("result")
+                assert isinstance(payload, dict)
+                thread = payload.get("thread")
+                assert isinstance(thread, dict)
+                return thread
+            finally:
+                await client.close()
+
+        assert len(user_matches) == 1
+        assert len([item for item in items if item.get("role") == "user"]) == 1
+        assert snapshot["pending_inputs"] == []
+        if not supports_spill_receipts:
+            assert len(refusals) == 1
+            assert user_matches[0]["id"] == stable_id
+            assert refusals[0]["message"] == (
+                "This Codex version cannot preserve a large paste in history; "
+                "this message was not sent."
+            )
+            assert (
+                refusals[0]["remediation"]
+                == "Upgrade Codex to 0.154.0 or later and restart this native session after "
+                "current work finishes, or attach the text as a file."
+            )
+            assert state.active_turn_id is None
+            with pytest.raises(
+                CodexAppServerResponseError, match="is not materialized yet"
+            ) as unmaterialized:
+                asyncio.run(read_thread())
+            assert unmaterialized.value.code == -32600
+            return
+
+        assert refusals == []
+        deadline = time.monotonic() + 30
+        last_read_error: CodexAppServerResponseError | None = None
+        while time.monotonic() < deadline:
+            try:
+                thread = asyncio.run(read_thread())
+                break
+            except CodexAppServerResponseError as exc:
+                if "is not materialized yet" not in str(exc):
+                    raise
+                last_read_error = exc
+                time.sleep(0.2)
+        else:
+            pytest.fail(
+                "Codex thread did not materialize after the oversized input: "
+                f"{last_read_error}\n{rig.stack.log_tail()}"
+            )
+        native_user_items = [
+            item
+            for turn in thread["turns"]
+            for item in turn.get("items", [])
+            if item.get("type") == "userMessage"
+            and str(item.get("clientId", "")).startswith("omnigent-paste-")
+        ]
+        wire = json.dumps(native_user_items)
+        assert len(native_user_items) == 1
+        assert "[Attached file:" in wire
+        native_texts = [
+            entry["text"]
+            for entry in native_user_items[0]["content"]
+            if entry.get("type") == "text"
         ]
         cached = {}
-        wire_text = ""
-        if expect_refusal:
-            assert not own_requests, "refused authored input must never reach inference"
-            assert not requests, "refusal must not trigger background inference either"
-        else:
-            assert len(own_requests) == 1, "one submitted input must cause one mock inference"
-            assert "[Attached file:" in json.dumps(own_requests[0]["input"])
-            paths = re.findall(
-                r"\[Attached file: ([^\]]+)\]", json.dumps(own_requests[0]["input"])
-            )
-            cached = {Path(path).name: Path(path).read_text() for path in paths}
-            wire_text = "\n\n".join(
-                block["text"]
-                for item in own_requests[0]["input"]
-                if item.get("role") == "user"
-                for block in item.get("content", [])
-                if block.get("type") == "input_text"
-            )
-            assert len(wire_text) < 1_048_576
-            for path in paths:
-                wire_text = wire_text.replace(f"[Attached file: {path}]", cached[Path(path).name])
-        normalized = (
-            authored
-            if input_kind != "aggregate"
-            else authored[:600_000] + "\n\n" + authored[600_000:]
+        for entry in native_texts:
+            if entry.startswith("[Attached file: "):
+                path = Path(entry.removeprefix("[Attached file: ").removesuffix("]"))
+                cached[entry] = path.read_text(encoding="utf-8")
+        assert cached, "the real CLI must receive the complete prepared file"
+        restored = [cached.get(entry, entry) for entry in native_texts]
+        expected = (
+            [text]
+            if input_kind == "text-upload"
+            else [entry["text"] for entry in original_content]
         )
-        if not expect_refusal:
-            assert normalized in wire_text, "inline text and files must preserve the whole input"
-        if expect_refusal:
-            assert users[0]["content"] == content, (
-                "refusal must retain the authored blocks exactly"
-            )
-        elif input_kind != "text-upload":
-            assert "".join(block.get("text", "") for block in users[0]["content"]) == normalized
-        else:
-            assert any(block.get("file_id") == file_id for block in users[0]["content"])
-        (rig.stack.root / f"oversized-{input_kind}-evidence.json").write_text(
+        assert restored == expected
+        (rig.stack.root / f"oversized-{input_kind}-receipt.json").write_text(
             json.dumps(
                 {
-                    "thread_id": state.thread_id,
-                    "supports_user_message_ids": native["supports_user_message_ids"],
-                    "expected_refusal": expect_refusal,
-                    "refusal_items": len(refusals),
-                    "authored_characters": len(authored),
-                    "authored_sha256": hashlib.sha256(authored.encode()).hexdigest(),
-                    "cached_files": {
-                        name: {
-                            "characters": len(text),
-                            "sha256": hashlib.sha256(text.encode()).hexdigest(),
-                        }
-                        for name, text in cached.items()
-                    },
-                    "requests": own_requests,
-                    "user_items": len(users),
-                    "reply_items": len(replies),
+                    "native_client_id": native_user_items[0]["clientId"],
+                    "user_items": len(user_matches),
+                    "original_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                    "cached_sha256": [
+                        hashlib.sha256(value.encode()).hexdigest() for value in cached.values()
+                    ],
                 },
                 indent=2,
             )
-        )
-        _assert_turn(rig, session, _STANDARD_MODEL, "medium")
-        settled = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
-            "data"
-        ]
-        assert len([item for item in settled if item.get("role") == "user"]) == 2
-        assert len([item for item in settled if item.get("role") == "assistant"]) == (
-            1 if expect_refusal else 2
         )
 
 

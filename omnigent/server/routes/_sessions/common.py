@@ -45,6 +45,7 @@ from omnigent.harness_plugins import (
     PI_NATIVE_CODING_AGENT,
     harness_capabilities,
 )
+from omnigent.native.input_receipt import NATIVE_INPUT_RECEIPT_EVENT
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
@@ -584,6 +585,7 @@ _RUNNER_SESSION_EVENT_TYPES: frozenset[str] = frozenset(
     {
         _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
         _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        NATIVE_INPUT_RECEIPT_EVENT,
         _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
         _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
         _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,

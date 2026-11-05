@@ -42,6 +42,7 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.native_attachments import attachment_cache_dir, pasted_text_cache_dir
 from omnigent.native.input_diagnostics import input_delivery_scope
+from omnigent.native.input_receipt import build_native_input_receipt, native_input_receipt_scope
 
 # A 1x1 transparent PNG, base64-encoded — a real decodable image small
 # enough to embed, used to prove image blocks are materialized to disk
@@ -155,7 +156,11 @@ class _FakeCodexNativeClient:
 
 
 def _collect_turn_events(
-    executor: CodexNativeExecutor, text: str, *, shell_authorized: bool = False
+    executor: CodexNativeExecutor,
+    text: str,
+    *,
+    shell_authorized: bool = False,
+    receipt_supported: bool = True,
 ) -> list[Any]:
     """
     Run one native executor turn and collect its events.
@@ -173,7 +178,12 @@ def _collect_turn_events(
         :returns: Events yielded by the turn.
         """
         command = codex_native_executor._shell_command_from_content(text)
-        with native_shell_authorization(command if shell_authorized else None):
+        with (
+            native_shell_authorization(command if shell_authorized else None),
+            native_input_receipt_scope(
+                _input_receipt([_input_text(text)]) if receipt_supported else None
+            ),
+        ):
             return [
                 event
                 async for event in executor.run_turn(
@@ -593,7 +603,10 @@ def test_draining_delivery_reconnects_and_accepts_input_once(
         draining_client.on_reconnect = lambda: monkeypatch.setattr(
             draining_client, "supports_user_message_ids", False
         )
-    with input_delivery_scope({"input_stable_id": "a" * 32, "delivery_attempt_id": "b" * 32}):
+    with (
+        input_delivery_scope({"input_stable_id": "a" * 32, "delivery_attempt_id": "b" * 32}),
+        native_input_receipt_scope(_input_receipt([_input_text(text)])),
+    ):
         if live_injection:
             accepted = asyncio.run(executor.enqueue_session_message("main", text))
             assert accepted is (input_case != "capability-lost")
@@ -2282,6 +2295,12 @@ def _input_text(text: str) -> dict[str, Any]:
     return {"type": "input_text", "text": text}
 
 
+def _input_receipt(content: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return build_native_input_receipt(
+        content, {"pending_id": "pending_" + "a" * 32, "delivery_attempt_id": "b" * 32}
+    )
+
+
 def _text_file_block(text: str, filename: str | None = None) -> dict[str, Any]:
     """
     Build a ``text/plain`` ``input_file`` block carrying *text*.
@@ -2567,14 +2586,15 @@ async def test_slow_paste_materialization_keeps_the_event_loop_responsive(
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
     async def deliver():
-        if delivery_path == "steer":
-            return await executor.enqueue_session_message("main", [_input_text(text)])
-        return [
-            event
-            async for event in executor.run_turn(
-                messages=[{"role": "user", "content": text}], tools=[], system_prompt=""
-            )
-        ]
+        with native_input_receipt_scope(_input_receipt([_input_text(text)])):
+            if delivery_path == "steer":
+                return await executor.enqueue_session_message("main", [_input_text(text)])
+            return [
+                event
+                async for event in executor.run_turn(
+                    messages=[{"role": "user", "content": text}], tools=[], system_prompt=""
+                )
+            ]
 
     delivery = asyncio.create_task(deliver())
     try:
@@ -2658,6 +2678,9 @@ async def test_slow_paste_restoration_keeps_the_event_loop_responsive(
         "symlink_receipt",
         "missing_paste",
         "edited_paste",
+        "edited_upload",
+        "receipt_content",
+        "receipt_identity",
     ],
 )
 @pytest.mark.parametrize("active_turn_id", [None, "turn_live"])
@@ -2680,45 +2703,67 @@ async def test_spilled_paste_is_not_sent_without_delivery_provenance(
     if failure == "unsupported_codex":
         monkeypatch.setattr(_FakeCodexNativeClient, "supports_user_message_ids", False)
     elif failure == "receipt_write":
-        monkeypatch.setattr(codex_native_executor, "record_spilled_text", lambda *_args: None)
+        monkeypatch.setattr(
+            codex_native_executor, "record_spilled_text", lambda *_args, **_kwargs: None
+        )
     content = [_input_text("large paste\n" * 100_000)]
+    if failure == "edited_upload":
+        content = [
+            {
+                "type": "input_file",
+                "filename": "large.txt",
+                "file_data": "data:text/plain;base64,"
+                + base64.b64encode(b"large upload\n" * 100_000).decode(),
+            }
+        ]
     if failure == "unicode_sibling":
         content.append(_input_text("\ud800"))
-    items = codex_native_executor._content_to_input_items(content, tmp_path)
-    assert isinstance(items, codex_native_executor._SpilledInputItems)
-    receipt = pasted_text_cache_dir(tmp_path) / f"{items.client_message_id}.json"
-    if failure == "missing_receipt":
-        receipt.unlink()
-    elif failure == "invalid_receipt":
-        receipt.write_text("invalid JSON")
-    elif failure in {"wire_digest_mismatch", "empty_ranges", "changed_ranges"}:
-        evidence = json.loads(receipt.read_text())
-        if failure == "wire_digest_mismatch":
-            evidence["text_digest"] = "f" * 64
-        else:
-            evidence["ranges"] = [] if failure == "empty_ranges" else [[1, 2]]
-        receipt.write_text(json.dumps(evidence))
-    elif failure == "symlink_receipt":
-        outside = tmp_path / "receipt.json"
-        receipt.rename(outside)
-        receipt.symlink_to(outside)
-    elif failure == "missing_paste":
-        _referenced_file(items[0]).unlink()
-    elif failure == "edited_paste":
-        _referenced_file(items[0]).write_text("edited paste")
+    with native_input_receipt_scope(_input_receipt(content)):
+        items = codex_native_executor._content_to_input_items(content, tmp_path)
+        assert isinstance(items, codex_native_executor._SpilledInputItems)
+        receipt = pasted_text_cache_dir(tmp_path) / f"{items.client_message_id}.json"
+        if failure == "missing_receipt":
+            receipt.unlink()
+        elif failure == "invalid_receipt":
+            receipt.write_text("invalid JSON")
+        elif failure in {
+            "wire_digest_mismatch",
+            "empty_ranges",
+            "changed_ranges",
+            "receipt_content",
+            "receipt_identity",
+        }:
+            evidence = json.loads(receipt.read_text())
+            if failure == "wire_digest_mismatch":
+                evidence["text_digest"] = "f" * 64
+            elif failure == "receipt_content":
+                evidence["input_receipt"]["content"][0]["text"] = "changed original"
+            elif failure == "receipt_identity":
+                evidence["input_receipt"]["identity"]["delivery_attempt_id"] = "f" * 32
+            else:
+                evidence["ranges"] = [] if failure == "empty_ranges" else [[1, 2]]
+            receipt.write_text(json.dumps(evidence))
+        elif failure == "symlink_receipt":
+            outside = tmp_path / "receipt.json"
+            receipt.rename(outside)
+            receipt.symlink_to(outside)
+        elif failure == "missing_paste":
+            _referenced_file(items[0]).unlink()
+        elif failure in {"edited_paste", "edited_upload"}:
+            _referenced_file(items[0]).write_text("edited paste")
 
-    with pytest.raises(codex_native_executor._CodexNativeInputUndelivered) as caught:
-        await codex_native_executor._inject_codex_turn_once(
-            _FakeCodexNativeClient(),
-            bridge_dir=tmp_path,
-            state=state,
-            input_items=items,
-            settings_overrides={"model": "gpt-5.6-luna", "effort": "high"},
-        )
-    assert _FakeCodexNativeClient.requests == []
-    assert mirrored_settings == []
-    if failure != "unsupported_codex":
-        assert caught.value.failure == codex_native_executor._SPILL_RECORD_FAILURE
+        with pytest.raises(codex_native_executor._CodexNativeInputUndelivered) as caught:
+            await codex_native_executor._inject_codex_turn_once(
+                _FakeCodexNativeClient(),
+                bridge_dir=tmp_path,
+                state=state,
+                input_items=items,
+                settings_overrides={"model": "gpt-5.6-luna", "effort": "high"},
+            )
+        assert _FakeCodexNativeClient.requests == []
+        assert mirrored_settings == []
+        if failure != "unsupported_codex":
+            assert caught.value.failure == codex_native_executor._SPILL_RECORD_FAILURE
 
 
 def test_literal_paste_references_do_not_expand_during_mirror_preflight(tmp_path: Path) -> None:
@@ -5012,3 +5057,24 @@ def test_interrupt_reraises_unrelated_rejections(
     assert state is not None and state.active_turn_id == "turn_active", (
         f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
     )
+
+
+@pytest.mark.parametrize("active_turn_id", [None, "turn_live"])
+def test_large_input_without_server_receipt_contract_is_refused_before_native_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active_turn_id: str | None
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _FakeCodexNativeClient
+    )
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    [failure] = _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path),
+        "large original input\n" * 60_000,
+        receipt_supported=False,
+    )
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == "input_too_large"
+    assert failure.message == codex_native_executor._SPILL_SERVER_UNSUPPORTED_FAILURE.message
+    assert _FakeCodexNativeClient.requests == []

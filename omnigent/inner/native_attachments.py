@@ -36,6 +36,7 @@ from typing import Any, Literal
 import httpx
 
 from omnigent.debug_logging import debug_event
+from omnigent.native.input_receipt import validate_native_input_receipt
 from omnigent.process_logging import data_dir
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 
@@ -343,20 +344,141 @@ class SpilledTextUnavailable(ValueError):
     """Generated input cannot be reconstructed from its recorded delivery."""
 
 
-def record_spilled_text(text: str, ranges: list[list[int]], bridge_dir: Path) -> str | None:
+def record_spilled_text(
+    text: str,
+    ranges: list[list[int]],
+    bridge_dir: Path,
+    *,
+    input_receipt: object = None,
+    cache_files: list[tuple[Path, str, int]] | None = None,
+) -> str | None:
     """Record generated reference occurrences under one native delivery identity."""
     try:
         text_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     except UnicodeEncodeError:
         return None
-    message_id = f"omnigent-paste-{uuid.uuid4().hex}"
-    receipt = json.dumps(
-        {"text_digest": text_digest, "ranges": ranges},
-        separators=(",", ":"),
-    ).encode("utf-8")
+    files = []
+    for path, digest, size in cache_files or []:
+        namespace = next(
+            (
+                label
+                for label, cache in (
+                    ("attachments", attachment_cache_dir(bridge_dir)),
+                    ("pasted-text", pasted_text_cache_dir(bridge_dir)),
+                )
+                if path.parent == cache
+            ),
+            None,
+        )
+        if namespace is None:
+            return None
+        files.append({"namespace": namespace, "name": path.name, "sha256": digest, "size": size})
+    payload = {
+        "text_digest": text_digest,
+        "ranges": ranges,
+        "input_receipt": validate_native_input_receipt(input_receipt),
+        "files": files,
+    }
+    try:
+        receipt = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None
+    message_id = f"omnigent-paste-{uuid.uuid4().hex}-{hashlib.sha256(receipt).hexdigest()}"
     name = f"{message_id}.json"
     path = _materialize_bytes(receipt, name, pasted_text_cache_dir(bridge_dir))
     return message_id if path is not None and path.name == name else None
+
+
+def _read_spilled_receipt(
+    text: str, bridge_dir: Path, client_message_id: object
+) -> dict[str, Any] | None:
+    """Validate receipt bytes against the digest carried by native history."""
+    match = re.fullmatch(
+        r"omnigent-paste-[0-9a-f]{32}-([0-9a-f]{64})",
+        client_message_id if isinstance(client_message_id, str) else "",
+    )
+    if match is None:
+        return None
+    try:
+        raw = _read_cached_file(pasted_text_cache_dir(bridge_dir), f"{client_message_id}.json")
+        if raw is None or hashlib.sha256(raw).hexdigest() != match.group(1):
+            return None
+        receipt = json.loads(raw)
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    except (ValueError, UnicodeEncodeError, _SpilledTextTooLarge):
+        return None
+    if not isinstance(receipt, dict) or receipt.get("text_digest") != digest:
+        return None
+    return receipt
+
+
+def _verify_spilled_files(receipt: Mapping[str, Any], bridge_dir: Path) -> bool:
+    """Check every prepared file against the bytes bound into the native receipt."""
+    files = receipt.get("files")
+    if not isinstance(files, list):
+        return False
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != {"namespace", "name", "sha256", "size"}:
+            return False
+        namespace, name, digest, size = (
+            entry["namespace"],
+            entry["name"],
+            entry["sha256"],
+            entry["size"],
+        )
+        if (
+            not isinstance(namespace, str)
+            or namespace not in {"attachments", "pasted-text"}
+            or not isinstance(name, str)
+            or Path(name).name != name
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or type(size) is not int
+            or not 0 <= size <= MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
+        ):
+            return False
+        cache = (
+            attachment_cache_dir(bridge_dir)
+            if namespace == "attachments"
+            else pasted_text_cache_dir(bridge_dir)
+        )
+        try:
+            raw = _read_cached_file(cache, name, max_bytes=MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES)
+        except _SpilledTextTooLarge:
+            return False
+        if raw is None or len(raw) != size or hashlib.sha256(raw).hexdigest() != digest:
+            return False
+    return True
+
+
+def spilled_input_receipt(
+    text: str, bridge_dir: Path, client_message_id: object
+) -> dict[str, Any] | None:
+    """Return original input only after receipt, wire text and prepared files agree."""
+    receipt = _read_spilled_receipt(text, bridge_dir, client_message_id)
+    if receipt is None:
+        return None
+    context = validate_native_input_receipt(receipt.get("input_receipt"))
+    if context is None or not _verify_spilled_files(receipt, bridge_dir):
+        return None
+    ranges = receipt.get("ranges")
+    if not isinstance(ranges, list) or any(
+        not isinstance(entry, list)
+        or len(entry) != 2
+        or any(type(value) is not int for value in entry)
+        for entry in ranges
+    ):
+        return None
+    try:
+        restored = restore_spilled_text(
+            text,
+            bridge_dir,
+            client_message_id if isinstance(client_message_id, str) else None,
+            expected_ranges=tuple((entry[0], entry[1]) for entry in ranges),
+        )
+    except SpilledTextUnavailable:
+        return None
+    return context if restored is not None else None
 
 
 def restore_spilled_text(
@@ -388,22 +510,10 @@ def restore_spilled_text(
             raise SpilledTextUnavailable("Generated paste delivery evidence is unavailable")
         return text
 
-    if "pasted_text_" not in text or not isinstance(client_message_id, str):
-        return unavailable()
-    if re.fullmatch(r"omnigent-paste-[0-9a-f]{32}", client_message_id) is None:
+    receipt = _read_spilled_receipt(text, bridge_dir, client_message_id)
+    if receipt is None:
         return unavailable()
     cache = pasted_text_cache_dir(bridge_dir)
-    try:
-        raw_receipt = _read_cached_file(cache, f"{client_message_id}.json")
-        receipt = json.loads(raw_receipt) if raw_receipt is not None else None
-    except (ValueError, _SpilledTextTooLarge):
-        return unavailable()
-    try:
-        text_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    except UnicodeEncodeError:
-        return unavailable()
-    if not isinstance(receipt, dict) or receipt.get("text_digest") != text_digest:
-        return unavailable()
     raw_ranges = receipt.get("ranges")
     if not isinstance(raw_ranges, list):
         return unavailable()
@@ -415,7 +525,7 @@ def restore_spilled_text(
         and all(type(offset) is int for offset in entry)
     }
     if expected_ranges is not None and (
-        not expected_ranges or ranges != set(expected_ranges) or len(ranges) != len(raw_ranges)
+        ranges != set(expected_ranges) or len(ranges) != len(raw_ranges)
     ):
         return unavailable()
     reference = re.compile(
@@ -464,7 +574,9 @@ def restore_spilled_text(
     return restored if len(encoded) <= budget else None
 
 
-def _read_cached_file(cache: Path, name: str) -> bytes | None:
+def _read_cached_file(
+    cache: Path, name: str, *, max_bytes: int = MAX_SESSION_EVENT_REQUEST_BYTES
+) -> bytes | None:
     """
     Read the regular file *name* from *cache* without following symlinks.
 
@@ -490,7 +602,7 @@ def _read_cached_file(cache: Path, name: str) -> bytes | None:
             if not stat.S_ISREG(info.st_mode):
                 return None
             # No restorable paste exceeds one session event, so a larger file is never read.
-            if info.st_size > MAX_SESSION_EVENT_REQUEST_BYTES:
+            if info.st_size > max_bytes:
                 raise _SpilledTextTooLarge
             return _read_fd(fd, info.st_size)
         finally:

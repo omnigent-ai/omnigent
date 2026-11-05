@@ -80,6 +80,7 @@ async def restore_pending_inputs(store: ConversationStore, session_id: str) -> N
                 stable_id=item.id,
                 created_by=item.created_by,
                 background_titles_enabled=bool(options and options.background_titles_enabled),
+                restored=True,
             )
             conv = await asyncio.to_thread(store.get_conversation, session_id)
             if conv is not None and conv.labels.get(STARTUP_LABEL) == "cancelled":

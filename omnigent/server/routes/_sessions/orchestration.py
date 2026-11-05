@@ -81,6 +81,12 @@ from omnigent.native.input_diagnostics import (
     log_input_event,
     with_input_attributes,
 )
+from omnigent.native.input_receipt import (
+    NATIVE_INPUT_RECEIPT_EVENT,
+    NATIVE_INPUT_RECEIPT_VERSION,
+    build_native_input_receipt,
+    native_input_identity,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -3123,7 +3129,38 @@ async def _persist_external_conversation_item_unlocked(
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
-    if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
+    receipt = _external_native_input_receipt(body)
+    if receipt is not None:
+        identity = receipt["identity"]
+        try:
+            drained = pending_inputs.resolve_delivery_attempt(
+                session_id,
+                identity["pending_id"],
+                identity["delivery_attempt_id"],
+                stable_id=identity.get("input_stable_id"),
+                hold=True,
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        if drained is not None:
+            assert isinstance(item.data, MessageData)
+            if drained.content != item.data.content:
+                pending_inputs.restore(session_id, drained)
+                raise OmnigentError(
+                    "Native input receipt content differs from its pending input",
+                    code=ErrorCode.CONFLICT,
+                )
+            cleared_pending_id = drained.pending_id
+            match_method = "delivery_attempt"
+            item = item.model_copy(
+                update={
+                    "data": item.data.model_copy(
+                        update={"content": drained.content, "user_authored": True}
+                    ),
+                    "created_by": drained.created_by,
+                }
+            )
+    elif drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
         # Match the mirror to its entry by text: a pasted message the TUI never
         # recorded leaves a stale head entry, and draining by position would
         # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
@@ -3327,11 +3364,58 @@ async def _persist_external_conversation_item_unlocked(
     return persisted.id
 
 
+def _external_native_input_receipt(body: SessionEventInput) -> dict[str, Any] | None:
+    """Validate the versioned receipt before any pending-input queue operation."""
+    value = body.data.get("native_input_receipt")
+    if body.type != NATIVE_INPUT_RECEIPT_EVENT:
+        if value is not None:
+            raise OmnigentError(
+                "Native input receipt requires its versioned event", code=ErrorCode.INVALID_INPUT
+            )
+        return None
+    if not isinstance(value, dict) or set(value) != {"version", "identity", "receipt_id"}:
+        raise OmnigentError("Invalid native input receipt metadata", code=ErrorCode.INVALID_INPUT)
+    identity = value.get("identity")
+    receipt_id = value.get("receipt_id")
+    if (
+        type(value.get("version")) is not int
+        or value["version"] != NATIVE_INPUT_RECEIPT_VERSION
+        or not isinstance(identity, dict)
+        or native_input_identity(identity) != identity
+        or not isinstance(receipt_id, str)
+        or re.fullmatch(r"omnigent-paste-[0-9a-f]{32}-[0-9a-f]{64}", receipt_id) is None
+    ):
+        raise OmnigentError("Invalid native input receipt identity", code=ErrorCode.INVALID_INPUT)
+    return value
+
+
 def _new_external_conversation_item(
     session_id: str, body: SessionEventInput
 ) -> NewConversationItem:
-    """Parse an external item event, keyed by its ``source_id`` when it has one."""
+    """Parse a native mirror with its logical input or source identity."""
+    receipt = _external_native_input_receipt(body)
     item = _parse_external_conversation_item(body)
+    if receipt is not None:
+        if (
+            item.type != "message"
+            or not isinstance(item.data, MessageData)
+            or item.data.role != "user"
+            or item.data.is_meta
+            or build_native_input_receipt(item.data.content, receipt["identity"]) is None
+        ):
+            raise OmnigentError(
+                "Native input receipt requires original user content", code=ErrorCode.INVALID_INPUT
+            )
+        logical_input_id = receipt["identity"]["pending_id"]
+        return item.model_copy(
+            update={
+                "stable_id": uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-native-input-receipt:{session_id}:{logical_input_id}",
+                ).hex,
+                "data": item.data.model_copy(update={"user_authored": True}),
+            }
+        )
     return_id = body.data.get("subagent_return_id")
     if (
         isinstance(return_id, str)
@@ -3537,56 +3621,49 @@ async def _settle_undelivered_native_input(
     :param input_identity: Identity from a failure the harness explicitly marked
         undelivered. Without a client id, both pending and attempt ids are required.
     """
-    raw_input_stable_id = input_identity.get("input_stable_id")
-    input_stable_id = raw_input_stable_id if isinstance(raw_input_stable_id, str) else None
-    delivery_attempt_id: str | None = None
-    if input_stable_id is not None:
-        pending_inputs.mark_lifecycle(
-            session_id,
-            input_stable_id,
-            stage="rejected_before_handoff",
-            cause_class="rejected_before_handoff",
-            reason_code=reason_code or "reported_undelivered",
-            lifecycle_response_id=response_id,
-        )
-        if conversation_store is None:
-            return
-        matched_pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
-        if matched_pending_id is None:
-            # Restored startup inputs keep their stable id, but not the old
-            # process's delivery attempt. Preserve stable-id receipt matching.
-            await restore_pending_inputs(conversation_store, session_id)
-            matched_pending_id = pending_inputs.pending_id_for_stable_id(
-                session_id, input_stable_id
-            )
-    else:
-        identity = input_attributes(input_identity)
-        if any(
-            key in input_identity and key not in identity
-            for key in ("input_stable_id", "pending_id", "delivery_attempt_id")
-        ):
-            return
-        pending_id = identity.get("pending_id")
-        attempt = identity.get("delivery_attempt_id")
-        if not isinstance(pending_id, str) or not isinstance(attempt, str):
-            return
-        delivery_attempt_id = attempt
-        matched_pending_id = pending_inputs.mark_lifecycle(
-            session_id,
-            pending_id=pending_id,
-            delivery_attempt_id=delivery_attempt_id,
-            stage="rejected_before_handoff",
-            cause_class="rejected_before_handoff",
-            reason_code=reason_code or "reported_undelivered",
-            lifecycle_response_id=response_id,
-        )
-    if conversation_store is None or matched_pending_id is None:
+    identity = input_attributes(input_identity)
+    if any(
+        key in input_identity and key not in identity
+        for key in ("input_stable_id", "pending_id", "delivery_attempt_id")
+    ):
         return
-    drained = pending_inputs.resolve(
-        session_id, matched_pending_id, delivery_attempt_id=delivery_attempt_id
-    )
+    input_stable_id = identity.get("input_stable_id")
+    pending_id = identity.get("pending_id")
+    attempt = identity.get("delivery_attempt_id")
+    if (pending_id is None) != (attempt is None):
+        return
+    if conversation_store is None:
+        return
+    if pending_id is None:
+        if not isinstance(input_stable_id, str):
+            return
+        pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
+        if pending_id is None:
+            await restore_pending_inputs(conversation_store, session_id)
+            pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
+    if not isinstance(pending_id, str):
+        return
+    try:
+        drained = pending_inputs.resolve_delivery_attempt(
+            session_id,
+            pending_id,
+            attempt if isinstance(attempt, str) else None,
+            stable_id=input_stable_id if isinstance(input_stable_id, str) else None,
+            hold=True,
+        )
+    except ValueError:
+        return
     if drained is None:
         return
+    pending_inputs.mark_lifecycle(
+        session_id,
+        pending_id=pending_id,
+        stable_id=drained.stable_id,
+        stage="rejected_before_handoff",
+        cause_class="rejected_before_handoff",
+        reason_code=reason_code or "reported_undelivered",
+        lifecycle_response_id=response_id,
+    )
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
@@ -3609,6 +3686,7 @@ async def _settle_undelivered_native_input(
         )
         pending_inputs.restore(session_id, drained)
         return
+    pending_inputs.release(session_id, drained)
     if not persisted[0].deduplicated:
         log_input_event(
             _logger,
@@ -6538,6 +6616,10 @@ def _build_native_terminal_message_event(
     if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id):
         event["stable_id"] = raw_stable_id
     event.update(input_attributes(input_delivery))
+    if harness == "codex-native":
+        receipt = build_native_input_receipt(data.content, input_delivery)
+        if receipt is not None:
+            event["native_input_receipt"] = receipt
     # Carry the persisted override in-band like the non-native forwards: a
     # runner whose session cache is cold (fresh process, missed init) must
     # not resolve this turn from the spec and evict the override harness.
