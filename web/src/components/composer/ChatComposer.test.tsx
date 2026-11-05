@@ -570,24 +570,28 @@ describe("ChatComposer label collapse", () => {
     expect(row).not.toHaveAttribute("data-labels");
   });
 
-  it("restores labels after a control group settles without changing the row width", () => {
-    const { row, layout } = renderMeasuredComposer({
-      leading: <span>Manual</span>,
-      trailing: <span>Sonnet</span>,
-    });
-    layout.rowWidth = 300;
-    const leading = screen.getByTestId("leading");
-    let naturalWidth = 350;
-    Object.defineProperty(leading, "scrollWidth", {
-      configurable: true,
-      get: () => naturalWidth,
-    });
-    fireResize();
-    expect(row).toHaveAttribute("data-labels", "collapsed");
-    naturalWidth = 80;
-    fireResize(leading);
-    expect(row).not.toHaveAttribute("data-labels");
-  });
+  it.each(["resize", "class"])(
+    "restores labels after a control group settles without changing the row width (%s)",
+    async (change) => {
+      const { row, layout } = renderMeasuredComposer({
+        leading: <span>Manual</span>,
+        trailing: <span>Sonnet</span>,
+      });
+      layout.rowWidth = 300;
+      const leading = screen.getByTestId("leading");
+      let naturalWidth = 350;
+      Object.defineProperty(leading, "scrollWidth", {
+        configurable: true,
+        get: () => naturalWidth,
+      });
+      fireResize();
+      expect(row).toHaveAttribute("data-labels", "collapsed");
+      naturalWidth = 80;
+      if (change === "resize") fireResize(leading);
+      else leading.firstElementChild!.classList.add("desktop-control");
+      await waitFor(() => expect(row).not.toHaveAttribute("data-labels"));
+    },
+  );
 
   it("re-measures after crossing the mobile breakpoint without a row resize", () => {
     let mobile = false;
