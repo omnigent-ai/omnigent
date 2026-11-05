@@ -143,20 +143,20 @@
   --shadow-dialog: 0 16px 48px rgb(var(--ui-shadow-neutral-rgb) / 0.2);
 }
 
-/* The two body text steps. Keep these non-inline: `@theme inline` bakes the
- * literal value into each utility, which would make the runtime typography
- * mapping below a no-op. Line heights are unitless so both tiers keep their
- * 1.6 rhythm at every size the Appearance setting allows. */
+/* Keep these non-inline: `@theme inline` bakes values into utilities and
+ * bypasses the runtime typography mapping. Unitless line heights scale with
+ * font size: 1.8 for body text and 1.4 for captions. */
 @theme {
   /* App-default interface/body text — every control, label, and menu item. */
+  --font-weight-normal: 450;
   --text-ui: 1rem;
-  --text-ui--line-height: 1.6;
+  --text-ui--line-height: 1.8;
   --text-message: var(--text-ui);
-  --text-message--line-height: 1.6;
-  /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
-   * body step, mapped below so it tracks the Appearance setting. */
-  --text-sm: 0.9rem;
-  --text-sm--line-height: 1.6;
+  --text-message--line-height: 1.8;
+  /* Captions, descriptions, and sub/group titles stay 1px below body text
+   * as the Appearance font size changes. */
+  --text-sm: calc(var(--text-ui) - 1px);
+  --text-sm--line-height: 1.4;
   /* `text-xs` is retired in favour of `text-sm`. Aliased rather than left on
    * Tailwind's 0.75rem, which against the fixed 16px root is a hard 12px that
    * ignores the Appearance setting — the same trap the ramp test guards. Keeps
@@ -1230,9 +1230,6 @@ aside[aria-label="Workspace"][data-maximized] {
 html[data-electron-mac] {
   --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
   --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
-  /* Grayscale antialiasing gives the thinner, crisper text of native Mac apps;
-   * Chromium's default draws heavier glyphs. Inherited, so portals get it too. */
-  -webkit-font-smoothing: antialiased;
 }
 @media (min-width: 48rem) {
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
@@ -1697,6 +1694,9 @@ html[data-electron-mac] .breadcrumb-folder {
      * documentElement by the Appearance setting / lib/uiFontPreferences.ts)
      * with the system stack as the fallback when it's unset. */
     font-family: var(--ui-font-family, var(--font-sans));
+    font-weight: var(--font-weight-normal);
+    letter-spacing: 0em;
+    -webkit-font-smoothing: antialiased;
     /* Keep the desktop rem grid fixed so font preferences cannot resize icons,
      * controls, spacing, or radii. Typography is mapped separately below. */
     font-size: 16px;
@@ -1726,11 +1726,9 @@ html[data-electron-mac] .breadcrumb-folder {
      * they need the preference on that scale. Multiplying the raw 13px shrinks
      * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
     --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
-    /* Body and caption tiers come off the raw preference, not the anchor: the
-     * anchor is the 16px-equivalent grid the title ratios need, and running the
-     * caption factor through it put text-sm at 14.4px against a 13px body —
-     * a caption step larger than the text it captions. */
-    --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
+    /* Body and caption sizes use the raw preference; the anchor is only
+     * for title ratios. Captions stay 1px below body text. */
+    --text-sm: calc(var(--desktop-ui-font-size) - 1px);
     --text-ui: var(--desktop-ui-font-size);
     --text-base: var(--desktop-ui-font-size);
     /* Title steps keep the anchor so each stays on its Tailwind ratio. */
@@ -1747,14 +1745,14 @@ html[data-electron-mac] .breadcrumb-folder {
 /* Mobile typography and sidebar geometry. The root remains at the global 16px
  * so rem-based controls and spacing keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile defaults to 14px when no preference is saved. An inline value from
+  /* Mobile defaults to 15px when no preference is saved. An inline value from
    * the Appearance setting overrides this directly, without rescaling. */
   :root {
-    --desktop-ui-font-size: 14px;
+    --desktop-ui-font-size: 15px;
     --mobile-ui-font-size: var(--desktop-ui-font-size);
     --omnigent-header-height: 76px;
     --ui-ramp-anchor: var(--mobile-ui-font-size);
-    --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
+    --text-sm: calc(var(--mobile-ui-font-size) - 1px);
     --text-ui: var(--mobile-ui-font-size);
     --text-base: var(--mobile-ui-font-size);
     --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
@@ -1784,13 +1782,8 @@ html[data-electron-mac] .breadcrumb-folder {
   font-size: var(--text-sm);
 }
 
-/* Touch devices retain conversation sizing when rotation changes the layout.
- * The saved override is separate from the viewport-specific interface default. */
+/* Plain-text message fallbacks use the body tier on touch and narrow screens. */
 @media (width < 48rem), (pointer: coarse) {
-  :root {
-    --text-message: var(--mobile-message-font-size, 16px);
-  }
-
   .plain-text-fallback.text-message {
     font-size: var(--text-message);
   }

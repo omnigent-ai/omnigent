@@ -137,8 +137,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
-  to the active harness, and a host lookup failure leaves known agent entries
-  visible. It is absent before a session starts and from side chat. When the
+  to the active harness; a claude-sdk session on a host lists its Claude servers,
+  only the organization-managed ones when its agent sets `skills: none` (or, with a
+  status saying why, while the session-agent request is loading or after it
+  fails). A host lookup failure leaves known agent entries visible. It is absent before a session starts and from side chat. When the
   server has the MCP registry on, each registry service row also shows its
   account state. States: connected; sign-in required, with an inline **Sign in**
   that runs the popup sign-in and flips the row to connected, or a **Sign in
@@ -150,8 +152,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   reports it (via `~/.omnigent/mcp-auth-status.json`, see
   `docs/MCP_AUTH_STATUS.md`); its **Sign
   in** opens the reported URL in a new tab and the panel re-reads the host
-  inventory every few seconds until the row is connected. Custom agent servers
-  carry no account state.
+  inventory every few seconds until the row is connected. In a claude-sdk
+  session, the next turn after the row turns connected reaches that server
+  without starting a new session. Custom agent servers carry no account state.
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -624,8 +627,17 @@ Other connection providers alone do not enable the managed MCP picker.
   Native host entries must match the active harness; a host error is shown
   without hiding MCPs declared by the bound session agent. While the host loads,
   its loading status stays visible alongside agent entries; a session without a
-  known host shows unavailable status rather than an empty inventory. Click
-  **Go to Settings** and confirm the session’s harness and host are selected.
+  known host shows unavailable status rather than an empty inventory (a claude-sdk session
+  without a host lists only its agent's servers). In a
+  claude-sdk session on a host with Claude MCP servers, expect them listed, and
+  only the managed ones when the agent sets `skills: none`. Click
+  **Go to Settings** and confirm the session’s harness and host are selected
+  (Claude’s page for a claude-sdk session). For the post-sign-in journey, start
+  a claude-sdk session while a Claude server needs sign-in, finish the sign-in
+  outside Omnigent, then send another message and expect the agent to use that
+  server's tool. Covered by
+  `tests/e2e_ui/chat/test_claude_sdk_host_mcp_servers.py::test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session`
+  and, for a reconnect that hangs, `tests/e2e/test_claude_sdk_mcp_reconnect_timeout_e2e.py`.
   Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
   row labels, the Sign in / Signing in… / error renderings and the Settings
   link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the
