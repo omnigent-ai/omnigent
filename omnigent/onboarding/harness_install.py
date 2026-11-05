@@ -935,15 +935,18 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
 
 
 def harness_cli_binary(key: str) -> str | None:
-    """Resolve the CLI selected for an install key, including Pi's path override."""
+    """Resolve the selected CLI without substituting a different installed binary."""
+    from omnigent.harness_startup_config import resolve_harness_path
+
     spec = harness_install_spec(key)
     if spec is None:
         return None
-    command = spec.binary
-    if key == PI_KEY:
-        from omnigent.harness_startup_config import resolve_harness_path
-
-        command = resolve_harness_path("pi") or command
+    path_key = {
+        ANTHROPIC_FAMILY: "claude",
+        OPENAI_FAMILY: "codex",
+        GEMINI_FAMILY: "antigravity",
+    }.get(key, key)
+    command = resolve_harness_path(path_key) or spec.binary
     return resolve_cli_binary(command)
 
 
@@ -1299,22 +1302,12 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
-    # Resolve the freshly-installed binary via the SAME ladder readiness uses
-    # (:func:`resolve_cli_binary` — ``PATH`` plus the nvm/npm-global/homebrew
-    # fallback dirs), so the install verdict and the readiness badge can never
-    # disagree. A bare ``shutil.which`` here would report "not found" for a
-    # binary the host daemon's frozen ``PATH`` omits but readiness still resolves
-    # via the ladder — the spurious "failed" toast next to a green "ready" tick.
-    resolved = resolve_cli_binary(spec.binary)
+    # Installation and readiness must inspect the same selected executable.
+    resolved = harness_cli_binary(key)
     # A failed upgrade leaves the outdated binary resolving, so success also needs
     # the version check readiness applies.
     if resolved is not None and harness_cli_installed(key):
-        # Put the resolving dir on ``PATH`` for this process so the setup
-        # wizard's *later* steps — harness_login / harness_cli_logged_in /
-        # harness_logout — which shell out with the bare binary name and only
-        # bare ``shutil.which``, can find it too. Without this, an install that
-        # succeeded via a fallback dir (nvm/homebrew/…) would be followed by a
-        # login step that can't locate the very binary just installed.
+        # Later setup steps may still use the selected executable's directory.
         resolved_dir = str(Path(resolved).resolve().parent)
         path_entries = os.environ.get("PATH", "").split(os.pathsep)
         if resolved_dir not in path_entries:
@@ -1382,7 +1375,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None or spec.status_args is None:
         return False
-    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return False
     probe_cwd = _cli_probe_cwd()
@@ -1457,10 +1450,9 @@ def harness_login(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None or spec.login_args is None:
         return False
-    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return False
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     if harness_cli_logged_in(key):
         return True
     try:
@@ -1476,7 +1468,7 @@ def harness_login(key: str) -> bool:
                 tty_fd = os.open("/dev/tty", os.O_RDWR)
             except OSError:
                 tty_fd = None
-        argv = [argv_binary, *spec.login_args]
+        argv = [binary, *spec.login_args]
         try:
             if tty_fd is not None:
                 subprocess.run(
@@ -1510,10 +1502,11 @@ def harness_logout(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None or spec.logout_args is None:
         return False
-    if shutil.which(spec.binary) is None:
+    binary = harness_cli_binary(key)
+    if binary is None:
         return False
     try:
-        subprocess.run([spec.binary, *spec.logout_args], check=False, timeout=60)
+        subprocess.run([binary, *spec.logout_args], check=False, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return False
     # Drop cached logged-in verdicts so the confirmation below re-probes —

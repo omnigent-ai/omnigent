@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -103,6 +104,81 @@ class FakeInstaller:
 
     def kill(self) -> None:
         self.killed = True
+
+
+@pytest.mark.parametrize(
+    ("key", "path_variable"),
+    [
+        (ANTHROPIC_FAMILY, "OMNIGENT_CLAUDE_PATH"),
+        (OPENAI_FAMILY, "OMNIGENT_CODEX_PATH"),
+        (GEMINI_FAMILY, "OMNIGENT_ANTIGRAVITY_PATH"),
+        (hi.PI_KEY, "OMNIGENT_PI_PATH"),
+        (hi.KIMI_KEY, "OMNIGENT_KIMI_PATH"),
+        (hi.CURSOR_KEY, "OMNIGENT_CURSOR_PATH"),
+        (hi.KIRO_KEY, "OMNIGENT_KIRO_PATH"),
+        (hi.OPENCODE_KEY, "OMNIGENT_OPENCODE_PATH"),
+        (hi.QWEN_KEY, "OMNIGENT_QWEN_PATH"),
+        (hi.GOOSE_KEY, "OMNIGENT_GOOSE_PATH"),
+        (hi.HERMES_KEY, "OMNIGENT_HERMES_PATH"),
+        (hi.DEVIN_KEY, "OMNIGENT_DEVIN_PATH"),
+    ],
+)
+@pytest.mark.parametrize("selected_exists", [True, False])
+def test_harness_cli_binary_uses_selected_path(
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    path_variable: str,
+    selected_exists: bool,
+) -> None:
+    selected = "/test/custom vendor/selected-cli"
+    monkeypatch.setenv(path_variable, selected)
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: (
+            (selected if selected_exists else None) if name == selected else f"/test/path/{name}"
+        ),
+    )
+    assert hi.harness_cli_binary(key) == (selected if selected_exists else None)
+
+
+@pytest.mark.parametrize("key", [ANTHROPIC_FAMILY, OPENAI_FAMILY, hi.CURSOR_KEY])
+def test_harness_auth_operations_use_the_selected_binary(
+    monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    spec = hi.harness_install_spec(key)
+    assert spec is not None and spec.status_args and spec.login_args and spec.logout_args
+    selected = "/test/selected/vendor"
+    monkeypatch.setattr(
+        hi, "harness_cli_binary", lambda actual: selected if actual == key else None
+    )
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.setattr(hi.sys.stdin, "isatty", lambda: True)
+    logged_in = False
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal logged_in
+        assert argv[0] == selected
+        calls.append(argv)
+        if argv[1:] == list(spec.login_args):
+            logged_in = True
+        elif argv[1:] == list(spec.logout_args):
+            logged_in = False
+        else:
+            assert argv[1:] == list(spec.status_args)
+        return subprocess.CompletedProcess(
+            argv,
+            0 if logged_in else 1,
+            stdout=json.dumps({spec.login_status_key: logged_in}),
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", run)
+    assert hi.harness_cli_logged_in(key) is False
+    assert hi.harness_login(key) is True
+    assert hi.harness_logout(key) is True
+    assert [selected, *spec.login_args] in calls
+    assert [selected, *spec.logout_args] in calls
 
 
 def fake_installer(
@@ -1339,8 +1415,8 @@ def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPa
 @pytest.mark.parametrize(
     "key,expected_argv",
     [
-        (ANTHROPIC_FAMILY, ["claude", "auth", "login", "--claudeai"]),
-        (OPENAI_FAMILY, ["codex", "login"]),
+        (ANTHROPIC_FAMILY, ["/usr/bin/claude", "auth", "login", "--claudeai"]),
+        (OPENAI_FAMILY, ["/usr/bin/codex", "login"]),
         (GEMINI_FAMILY, ["/usr/bin/agy"]),
     ],
 )
@@ -1516,8 +1592,8 @@ def test_harness_login_false_for_harness_without_login(monkeypatch: pytest.Monke
 @pytest.mark.parametrize(
     "key,expected_argv",
     [
-        (ANTHROPIC_FAMILY, ["claude", "auth", "logout"]),
-        (OPENAI_FAMILY, ["codex", "logout"]),
+        (ANTHROPIC_FAMILY, ["/usr/bin/claude", "auth", "logout"]),
+        (OPENAI_FAMILY, ["/usr/bin/codex", "logout"]),
     ],
 )
 def test_harness_logout_runs_cli_logout_then_verifies(
