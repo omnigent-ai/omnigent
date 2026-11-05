@@ -176,7 +176,6 @@ stores into ``create_app``):
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import itertools
 import logging
 import math
@@ -4031,19 +4030,20 @@ async def relaunch_managed_host(
         return result
     finally:
         heartbeat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat
         try:
-            await asyncio.to_thread(
-                host_store.update_managed_recovery,
-                host.host_id,
-                token,
-                finished=True,
-                workspace=result.workspace if result else None,
-                sandbox_id=result.sandbox_id if result else None,
-            )
-        except Exception:
-            _logger.warning("Failed to finish sandbox recovery lease", exc_info=True)
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        finally:
+            try:
+                await asyncio.to_thread(
+                    host_store.update_managed_recovery,
+                    host.host_id,
+                    token,
+                    finished=True,
+                    workspace=result.workspace if result else None,
+                    sandbox_id=result.sandbox_id if result else None,
+                )
+            except Exception:
+                _logger.warning("Failed to finish sandbox recovery lease", exc_info=True)
 
 
 async def _relaunch_managed_host(

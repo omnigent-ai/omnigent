@@ -6358,10 +6358,8 @@ async def test_siblings_share_one_recovery_across_host_stores(
         )
 
 
-@pytest.mark.parametrize("launch_fails", [False, True])
-async def test_recovery_bookkeeping_errors_preserve_launch_outcome(
-    db_uri, monkeypatch, launch_fails
-):
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+async def test_recovery_bookkeeping_errors_preserve_launch_outcome(db_uri, monkeypatch, outcome):
     from omnigent.server import managed_hosts
 
     store = HostStore(db_uri)
@@ -6389,18 +6387,27 @@ async def test_recovery_bookkeeping_errors_preserve_launch_outcome(
 
     async def launch(**kwargs):
         await asyncio.wait_for(heartbeat_seen.wait(), timeout=2)
-        if launch_fails:
+        if outcome == "error":
             raise ValueError("original provision failure")
+        if outcome == "cancel":
+            task = asyncio.current_task()
+            assert task is not None
+            loop.call_soon(task.cancel)
         return expected
 
     monkeypatch.setattr(store, "update_managed_recovery", unavailable)
     monkeypatch.setattr(managed_hosts, "_MANAGED_RECOVERY_HEARTBEAT_S", 0.001)
     monkeypatch.setattr(managed_hosts, "_relaunch_managed_host", launch)
-    request = relaunch_managed_host(
-        config=_injected_config(FakeSandboxLauncher()), host=host, host_store=store
+    request = asyncio.create_task(
+        relaunch_managed_host(
+            config=_injected_config(FakeSandboxLauncher()), host=host, host_store=store
+        )
     )
-    if launch_fails:
+    if outcome == "error":
         with pytest.raises(ValueError, match="original provision failure"):
+            await request
+    elif outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
             await request
     else:
         assert await request == expected
