@@ -442,12 +442,19 @@ def test_slow_claude_launch_probe_does_not_delay_catalogs(
         skills = discovery.discover(frame, workspace, warnings=warnings)
         return [skill["name"] for skill in skills], warnings
 
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            loading = list(pool.map(catalog, discoveries, workspaces))
-    finally:
-        resolve.set()
-        release.touch()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            pending = [
+                pool.submit(catalog, discovery, workspace)
+                for discovery, workspace in zip(discoveries, workspaces, strict=True)
+            ]
+            # Shorter than a lookup's wait on a launch, so a catalog that waited is still running.
+            _, still_running = futures_wait(pending, timeout=5)
+        finally:
+            resolve.set()
+            release.touch()
+        loading = [future.result() for future in pending]
+    assert not still_running, "a catalog waited on the gated launch"
     plugin_discovery.claude_launch_plugin_dirs()
     # Catalogs built from the stored answer must not run the launcher plugin again.
     resolve.clear()

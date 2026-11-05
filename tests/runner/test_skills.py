@@ -762,7 +762,8 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
         )
         late = await c.post(late_url, json=review)
 
-        # A failed launch's list is reused briefly, then rebuilt when the launch is asked again.
+    # A failed launch's list is reused briefly, then rebuilt when the launch is asked again.
+    async for c in _client(app):
         runner_now = [time.monotonic()]
         monkeypatch.setattr(
             "omnigent.runner.app.time",

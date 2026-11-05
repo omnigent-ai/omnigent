@@ -111,6 +111,8 @@ def serve_app_in_thread(app: ASGIApp) -> Iterator[str]:
     thread.start()
     deadline = time.monotonic() + 15
     while not server.started:
+        if not thread.is_alive():
+            raise RuntimeError("app exited during startup")
         if time.monotonic() > deadline:
             # Stop the daemon thread too, or it outlives the failed caller.
             server.should_exit = True
