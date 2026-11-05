@@ -195,6 +195,18 @@ export interface Conversation {
   harness?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
+  /**
+   * Work outlives the session's ended turn, such as a background shell or a
+   * Codex goal. The sidebar shows the session as working; `status` stays as
+   * reported.
+   */
+  background_work_running?: boolean;
+  /**
+   * Why a running session's agent is parked on a terminal prompt, e.g.
+   * `"permission prompt"`. The sidebar shows the session as needing input even
+   * when no web card exists for the prompt.
+   */
+  blocked_on?: string | null;
   status?: "idle" | "running" | "failed";
   /**
    * Whether the session's runner is reachable, matching `GET /health`.

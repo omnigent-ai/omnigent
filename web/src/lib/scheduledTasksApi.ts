@@ -95,6 +95,8 @@ export interface ScheduledTask {
 export interface ScheduledTaskRun {
   /** Current cumulative session cost; null when not reported (not a per-run delta). */
   sessionCostUsd: number | null;
+  /** Current session approvals, shared by every run using that session. */
+  conversationPendingApprovals?: number;
   id: string;
   scheduledTaskId: string;
   status: ScheduledTaskRunStatus;
@@ -237,6 +239,7 @@ interface ScheduledTaskWire {
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
 interface ScheduledTaskRunWire {
   session_cost_usd?: number | null;
+  conversation_pending_approvals?: number;
   id: string;
   scheduled_task_id: string;
   status: ScheduledTaskRunStatus;
@@ -323,6 +326,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
 function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
   return {
     sessionCostUsd: wire.session_cost_usd ?? null,
+    conversationPendingApprovals: wire.conversation_pending_approvals ?? 0,
     id: wire.id,
     scheduledTaskId: wire.scheduled_task_id,
     status: wire.status,

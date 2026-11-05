@@ -105,6 +105,7 @@ from omnigent.runner.background_titles import (
     generate_background_title as run_background_title,
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
+from omnigent.runner.background_work_reports import BackgroundWorkReporter
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.launch_failure import (
     TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
@@ -1538,7 +1539,7 @@ def create_runner_app(
     # subprocess. The release closes the httpx client an in-flight
     # ``proxy_stream`` is reading, which surfaces there as a transport error;
     # the stream's failure handler consumes the record to report the exit.
-    _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
+    _required_terminal_exit_errors: dict[str, dict[str, Any]] = {}
     app.state.required_terminal_exit_errors = _required_terminal_exit_errors
     _clean_terminal_exit_responses: dict[str, str | None] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
@@ -1875,6 +1876,17 @@ def create_runner_app(
         )
     )
 
+    # A session event over HTTP, so a server that predates the flag answers
+    # "Unknown event type" instead of relaying it into its public stream.
+    background_reports = BackgroundWorkReporter(
+        lambda *args, **kwargs: server_client.post(*args, **kwargs)
+    )
+
+    def _publish_session_background(session_id: str, running: bool) -> None:
+        background_reports.report(session_id, running)
+
+    resource_registry.set_session_background_publisher(_publish_session_background)
+
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
         if event.command is None:
             return "unknown"
@@ -1927,13 +1939,14 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
-    def _build_delivery_timeout_error(event: TerminalExitEvent) -> dict[str, str]:
+    def _build_delivery_timeout_error(event: TerminalExitEvent) -> dict[str, Any]:
         """Build the failure for a pane the delivery timeout closed.
 
         Stands in for the turn's own readiness error when releasing the harness
         severs its stream first. The executor reports that error as a
-        ``RuntimeError``; the same code keeps both readings of one failure
-        together.
+        ``RuntimeError`` with ``undelivered`` set, since nothing reached the
+        pane; the same shape keeps both readings of one failure together and
+        lets the server keep the queued message.
 
         :param event: The exit of the pane Omnigent closed.
         """
@@ -1945,11 +1958,11 @@ def create_runner_app(
         )
         if event.last_output:
             message = f"{message}\n\nLast captured terminal output:\n{event.last_output}"
-        return {"code": "RuntimeError", "message": message}
+        return {"code": "RuntimeError", "message": message, "undelivered": True}
 
     def _build_required_terminal_error(
         event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Build the structured ``session.status`` error for a required-terminal exit.
 
         Always carries ``code`` + a fully-composed ``message`` (back-compat: the
@@ -1961,7 +1974,7 @@ def create_runner_app(
         :param diagnosis: The exit's :func:`classify_terminal_failure` result.
         """
         message = _format_required_terminal_exit_output(event, diagnosis)
-        error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
+        error: dict[str, Any] = {"code": "required_terminal_exited", "message": message}
         if diagnosis is not None:
             error["title"] = diagnosis.title
             error["cause"] = diagnosis.cause
@@ -8432,6 +8445,8 @@ def create_runner_app(
         # native session mid-turn during the restart would sit on a stale
         # ``idle`` for the rest of the turn. Re-arm them before the item scan
         # below (which skips native harnesses entirely).
+        # A server that rejected the background flag may have been upgraded.
+        background_reports.resume()
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()

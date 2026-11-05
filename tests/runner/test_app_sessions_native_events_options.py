@@ -1896,6 +1896,7 @@ async def _post_model_change_with_status_sequence(
     pane_idle_after_polls: int | None = None,
     model_env: dict[str, str] | None = None,
     expected_command: str | None = None,
+    acknowledged_after_polls: int | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -1961,6 +1962,20 @@ async def _post_model_change_with_status_sequence(
         return script.pop(0) if len(script) > 1 else script[0]
 
     monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", _scripted_status)
+    acknowledgement_polls = 0
+
+    def _acknowledged(_bridge_dir: Any, *, command: str) -> bool:
+        nonlocal acknowledgement_polls
+        del command
+        acknowledgement_polls += 1
+        return (
+            acknowledged_after_polls is not None
+            and acknowledgement_polls >= acknowledged_after_polls
+        )
+
+    monkeypatch.setattr(
+        claude_native_bridge, "model_switch_acknowledged", _acknowledged, raising=False
+    )
     # No tmux behind these tests: the in-loop dialog check must not spend a
     # real 1 s tmux-info wait per poll.
     monkeypatch.setattr(
@@ -2199,6 +2214,42 @@ async def test_bound_claude_switch_preserves_private_model_id(
     assert response.status_code == 204, response.text
 
 
+async def test_bound_claude_1m_pick_is_confirmed_by_the_unmarked_status_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound 1M pick is confirmed by the statusLine's unmarked model name.
+
+    Claude Code's statusLine never carries ``[1m]``, so a bound session that
+    already runs the model and picks its 1M variant reads the same name before
+    and after. The unmarked name confirms the pick, as it does for a session
+    whose model is not bound.
+    """
+    from omnigent.inference_config import inference_config_scope
+
+    plain = "system.ai.claude-fable-5-1"
+    selected = f"{plain}[1m]"
+    config = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": plain,
+                    "model_allowlist": [plain, selected],
+                }
+            }
+        },
+    }
+    with inference_config_scope(config):
+        response = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            [plain],
+            model=selected,
+            expected_command=f"/model {selected}",
+        )
+    assert response.status_code == 204, response.text
+
+
 async def test_bound_claude_switch_does_not_fold_private_model_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2320,6 +2371,24 @@ async def test_events_model_change_unconfirmed_switch_answers_503(
     body = resp.json()
     assert body["error"] == "claude_native_model_unconfirmed"
     assert "did not confirm" in body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_confirmed_by_claudes_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude Code's own "Set model to" line confirms a switch the statusLine never does.
+
+    In production the statusLine snapshot kept its old reading for the whole
+    budget on an idle pane while the pane itself showed the acknowledgement, so
+    an applied switch was reported as "did not confirm the switch".
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        acknowledged_after_polls=2,
+    )
+    assert resp.status_code == 204, resp.text
 
 
 @pytest.mark.asyncio

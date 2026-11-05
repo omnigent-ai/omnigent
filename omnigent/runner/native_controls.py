@@ -1389,6 +1389,7 @@ def build_native_controls(
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
             inject_slash_command,
+            model_switch_acknowledged,
             read_claude_status_model,
             read_model_env,
             read_model_picker_values,
@@ -1563,6 +1564,10 @@ def build_native_controls(
             expected.update(
                 canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
             )
+        elif model_arg.lower().endswith("[1m]"):
+            # A bound 1M pick is typed with its marker too, and the statusLine
+            # names the model without it; the unmarked name confirms the pick.
+            unmarked_expected = {normalized_model_id(value) for value in expected}
 
         def _switched(current: str | None) -> bool:
             comparable = current if bound_model or not current else canonical_claude_id(current)
@@ -1616,6 +1621,18 @@ def build_native_controls(
                 # The pane switched. When it landed somewhere other than the
                 # expected spelling, the forwarder's verbatim report is the
                 # truth the UI will settle on — the command still took effect.
+                return Response(status_code=204)
+            if await asyncio.to_thread(model_switch_acknowledged, bridge_dir, command=command):
+                # Claude Code acknowledged the command on the pane while the
+                # statusLine snapshot still reads otherwise; the forwarder's
+                # report settles the row on what the pane actually runs.
+                _logger.info(
+                    "claude-native model change for session=%s confirmed by Claude Code's "
+                    "acknowledgement; statusLine still reports %r",
+                    conv_id,
+                    current,
+                    extra={"session_id": conv_id},
+                )
                 return Response(status_code=204)
             if baseline is None and current is None:
                 # No statusLine snapshot on either side of the injection: a

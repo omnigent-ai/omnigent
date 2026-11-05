@@ -150,7 +150,7 @@ def test_automation_sandbox_repository(
 
 
 @pytest.mark.parametrize("prompt_kind", ["scheduled", "trigger", "custom-trigger"])
-def test_reused_automation_explains_locked_settings(
+def test_reused_automation_settings(
     page: Page, browser_contract: BrowserContract, prompt_kind: str
 ) -> None:
     trigger = prompt_kind != "scheduled"
@@ -169,6 +169,9 @@ def test_reused_automation_explains_locked_settings(
         prompt = (
             "This automation watches Jira and starts one Omnigent session "
             "for each new ticket.\n\n"
+            "Each run:\n1. For each other ticket, oldest first, call sys_session_create with "
+            'agent_id set to your agent ID, placement "same_host", title "[Jira] <key>", '
+            "and a message under 8000 characters.\n\n"
             "Instructions for each session:\nTriage the ticket.\n\n"
             "Posting instructions for each session:\nSign the reply."
             if trigger
@@ -202,10 +205,69 @@ def test_reused_automation_explains_locked_settings(
             "next_run_at": None,
         }
         contract.json("/v1/scheduled-tasks", {"scheduled_tasks": [task]})
+        if prompt_kind == "trigger":
+            contract.json(
+                "/v1/agents",
+                list_payload(
+                    [
+                        {
+                            "id": chat.agent_id,
+                            "name": "codex-native-ui",
+                            "harness": "codex-native",
+                            "builtin": True,
+                        },
+                        {
+                            "id": "worker-claude",
+                            "name": "claude-native-ui",
+                            "harness": "claude-native",
+                            "builtin": True,
+                        },
+                    ]
+                ),
+            )
+            contract.json("/v1/scheduled-tasks/settings-automation", lambda _: task)
+            contract.json("/v1/scheduled-tasks/settings-automation/runs", {"runs": []})
+
+            def update(request: Request) -> dict[str, Any]:
+                body = request.post_data_json
+                assert not {
+                    "agent_id",
+                    "model_override",
+                    "reasoning_effort",
+                    "permission_mode",
+                    "session_id",
+                }.intersection(body)
+                assert 'agent_id "worker-claude"' in body["prompt"]
+                assert 'model "opus", reasoning_effort "high"' in body["prompt"]
+                assert "Triage the ticket." in body["prompt"]
+                task.update(body)
+                return task
+
+            contract.json("/v1/scheduled-tasks/settings-automation", update, method="PATCH")
         page.goto(f"{contract.base_url}/tasks")
         page.get_by_role("button", name="Maybe later", exact=True).click()
         page.get_by_role("button", name="Actions for Repository maintenance").click()
         page.get_by_role("menuitem", name="Edit", exact=True).click()
+        if prompt_kind == "trigger":
+            worker_agent = page.get_by_test_id("task-worker-agent-trigger")
+            expect(worker_agent).to_contain_text("Codex")
+            worker_agent.click()
+            page.get_by_role("option", name="Claude Code", exact=True).click()
+            page.get_by_test_id("task-model-trigger").click()
+            page.get_by_role("option", name="Opus", exact=True).click()
+            page.get_by_test_id("task-effort-trigger").click()
+            page.get_by_role("option", name="High", exact=True).click()
+            page.get_by_test_id("create-scheduled-task-submit").click()
+            expect(page.get_by_role("dialog")).to_have_count(0)
+            assert task["session_id"] == chat.session_id
+            assert task["agent_id"] == chat.agent_id
+            page.get_by_test_id("task-row-open").click()
+            page.get_by_test_id("task-detail-edit").click()
+            expect(worker_agent).to_contain_text("Claude Code")
+            expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
+            expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
+            page.get_by_test_id("task-worker-settings").scroll_into_view_if_needed()
+            return
         note = page.get_by_test_id("task-session-settings-note")
         note.scroll_into_view_if_needed()
         expect(note).to_contain_text("This automation continues in an existing session")
@@ -226,3 +288,59 @@ def test_reused_automation_explains_locked_settings(
             expect(
                 page.get_by_role("button", name="Edit worker instructions", exact=True)
             ).to_have_count(0)
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_automation_pending_approval_links_to_session(
+    page: Page, browser_contract: BrowserContract, width: int
+) -> None:
+    page.set_viewport_size({"width": width, "height": 900})
+    with contextmanager(chat_session_handle)(page, browser_contract) as chat:
+        contract = browser_contract
+        contract.json(
+            "/v1/info",
+            {
+                "single_user": True,
+                "automations_enabled": True,
+                "features": {"automations_v2": True},
+            },
+        )
+        task = {
+            "id": "approval-task",
+            "name": "Repository maintenance",
+            "prompt": "Review stale documentation.",
+            "agent_id": chat.agent_id,
+            "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+            "timezone": "UTC",
+            "owner_user_id": "local",
+            "created_at": 1,
+            "updated_at": 1,
+            "state": "active",
+            "session_mode": "continue",
+            "session_id": chat.session_id,
+            "execution_target": "connected_host",
+            "next_run_at": None,
+        }
+        run = {
+            "id": "approval-run",
+            "scheduled_task_id": task["id"],
+            "status": "succeeded",
+            "scheduled_at": 1,
+            "fired_at": 1,
+            "finished_at": 2,
+            "conversation_id": chat.session_id,
+            "conversation_pending_approvals": 1,
+        }
+        contract.json("/v1/scheduled-tasks/approval-task", task)
+        contract.json(
+            "/v1/scheduled-tasks/approval-task/runs", {"runs": [run], "next_cursor": None}
+        )
+        page.goto(f"{contract.base_url}/tasks/approval-task")
+        notice = page.get_by_test_id("run-pending-approval")
+        expect(notice).to_have_text("Session needs approval · Open to review")
+        page.get_by_test_id("run-open").click()
+        expect(page).to_have_url(chat.url)
+        page.go_back()
+        expect(notice).to_have_text("Session needs approval · Open to review")
+        page.get_by_test_id("run-open").hover()
+        expect(notice).to_be_visible()
