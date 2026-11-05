@@ -15,6 +15,7 @@ short polling deadline — the same shape as the host-tunnel route tests'
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -53,6 +54,7 @@ class _RecordingStore:
     def __init__(self) -> None:
         self.status_writes: list[tuple[str, str]] = []
         self.pending_writes: list[tuple[str, int]] = []
+        self.background_writes: list[tuple[str, bool]] = []
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
 
@@ -61,6 +63,19 @@ class _RecordingStore:
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         self.pending_writes.append((conversation_id, count))
+
+    def set_background_work_running(
+        self,
+        conversation_id: str,
+        running: bool,
+        *,
+        runner_id: str | None = None,
+        unseen_since: int | None = None,
+        reported_at: int | None = None,
+    ) -> None:
+        guard = () if runner_id is None else (runner_id, unseen_since)
+        stamp = () if reported_at is None else (reported_at,)
+        self.background_writes.append((conversation_id, running, *guard, *stamp))
 
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         del now
@@ -97,6 +112,71 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
         ("conv_1", "idle"),
         ("conv_2", "idle"),
     ]
+
+
+def test_every_background_report_is_written_with_its_runner_and_time(
+    recording_store: _RecordingStore,
+) -> None:
+    """
+    Each report reaches the store, which keeps the newest by its time.
+
+    A replica cannot know what other replicas wrote since, so nothing is skipped
+    as a repeat. The write's future says that it ran.
+    """
+    first = session_live_state.persist_background_work_running(
+        "conv_1", True, runner_id="runner_a", reported_at=1
+    )
+    session_live_state.persist_background_work_running(
+        "conv_1", True, runner_id="runner_a", reported_at=2
+    )
+    assert first is not None and first.result(timeout=10) is True
+    _wait_until(lambda: len(recording_store.background_writes) >= 2)
+    assert recording_store.background_writes == [
+        ("conv_1", True, "runner_a", None, 1),
+        ("conv_1", True, "runner_a", None, 2),
+    ]
+
+
+def test_clearing_a_departed_runners_flag_is_guarded(
+    recording_store: _RecordingStore,
+) -> None:
+    """The clear names the departed runner, and the runner's next report is written again."""
+    session_live_state.persist_background_work_running("conv_1", True)
+    session_live_state.clear_background_work_running("conv_1", "runner_gone", unseen_since=1_000)
+    session_live_state.persist_background_work_running("conv_1", True)
+    _wait_until(lambda: len(recording_store.background_writes) >= 3)
+    assert recording_store.background_writes == [
+        ("conv_1", True),
+        ("conv_1", False, "runner_gone", 1_000),
+        ("conv_1", True),
+    ]
+
+
+def test_a_flag_write_queued_before_a_handoff_never_lands(
+    recording_store: _RecordingStore,
+) -> None:
+    """A write still queued when the session moves away cannot overwrite the new owner's."""
+    release = threading.Event()
+    session_live_state.submit("hold", release.wait, 10)
+    session_live_state.persist_background_work_running("conv_1", True)
+    session_live_state.forget_live_status("conv_1")
+    session_live_state.persist_background_work_running("conv_2", True)
+    release.set()
+    _wait_until(lambda: bool(recording_store.background_writes))
+    assert recording_store.background_writes == [("conv_2", True)]
+
+
+def test_a_report_begun_before_a_handoff_never_lands(
+    recording_store: _RecordingStore,
+) -> None:
+    """A report that arrived before the session moved away is not written, even if queued after."""
+    began = session_live_state.handoff_count("conv_1")
+    session_live_state.forget_live_status("conv_1")
+    skipped = session_live_state.persist_background_work_running("conv_1", True, handoffs=began)
+    session_live_state.persist_background_work_running("conv_2", True)
+    assert skipped is not None and skipped.result(timeout=10) is None
+    _wait_until(lambda: bool(recording_store.background_writes))
+    assert recording_store.background_writes == [("conv_2", True)]
 
 
 def test_forget_live_status_drops_dedupe_state() -> None:
@@ -421,6 +501,7 @@ async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
             created_at=1,
             updated_at=1,
             pending_elicitations_count=3,
+            background_work_running=True,
         )
 
     items = [_item("conv_dead"), _item("conv_live")]
@@ -431,7 +512,10 @@ async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
 
     await _apply_liveness_to_items(items, lambda ids: {i: liveness[i] for i in ids})
 
-    assert [(i.runner_online, i.pending_elicitations_count) for i in items] == [
-        (False, 0),
-        (True, 3),
+    # A dead runner's background shells died with it too.
+    assert [
+        (i.runner_online, i.pending_elicitations_count, i.background_work_running) for i in items
+    ] == [
+        (False, 0, False),
+        (True, 3, True),
     ]

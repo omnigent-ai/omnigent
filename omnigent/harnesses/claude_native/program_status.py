@@ -137,6 +137,9 @@ class ClaudeProgramStatusPoller:
                     publish = self._on_status if changed else self._on_replay
                     publish(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)
+            # OSC reports ``done`` while a background shell still runs; only the
+            # file says ``shell``, so keep reading it for that one signal.
+            self._fallback.observe()
         else:
             if self._last is not None:
                 self._observation_version += 1
