@@ -102,6 +102,7 @@ import {
   isTempConvId,
   initChatStore,
   pumpStreamEvents,
+  retryConversationLoad,
   SSE_STALE_RECYCLE_MS,
   setPendingInitialPrompt,
   startStreamPump,
@@ -3111,10 +3112,11 @@ describe("chatStore — send (first-send ordering)", () => {
         return mockResponse(null, { bodyStream: pushableStream().stream });
       }
       // Fail only the FIRST snapshot GET, so the bind errors with its pump live.
+      // A 404 isn't retried, so the bind fails at once.
       if (url.split("?")[0] === "/v1/sessions/conv_two_subs" && (init?.method ?? "GET") === "GET") {
         if (failSnapshot) {
           failSnapshot = false;
-          return mockResponse({}, { ok: false, status: 500 });
+          return mockResponse({}, { ok: false, status: 404 });
         }
       }
       return defaultFetchHandler(input, init);
@@ -3135,6 +3137,98 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(openedStreams[0]!.aborted).toBe(true);
     expect(openedStreams[1]!.aborted).toBe(false);
     expect(entry.getState().conversationLoadError).toBeNull();
+  });
+
+  describe("a session snapshot that fails to load", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** Answer the session's next snapshot GETs with `statuses`; returns every GET made. */
+    function failSnapshots(id: string, statuses: number[]): string[] {
+      const gets: string[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+          gets.push(url);
+          const status = statuses.shift();
+          if (status !== undefined) return mockResponse({}, { ok: false, status });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      return gets;
+    }
+
+    it("retries a failure a retry can fix", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_flaky", []);
+      const gets = failSnapshots("conv_flaky", [503]);
+
+      const switched = useChatStore.getState().switchTo("conv_flaky");
+      await vi.advanceTimersByTimeAsync(2_000);
+      await switched;
+
+      expect(conversationRegistry.peek("conv_flaky")!.getState().conversationLoadError).toBeNull();
+      expect(gets).toHaveLength(2);
+    });
+
+    it("fails a missing session at once", async () => {
+      seedSession("conv_missing", []);
+      const gets = failSnapshots("conv_missing", [404, 404, 404]);
+
+      await useChatStore.getState().switchTo("conv_missing");
+
+      const error = conversationRegistry.peek("conv_missing")!.getState().conversationLoadError;
+      expect(error).toMatchObject({ status: 404 });
+      expect(gets).toHaveLength(1);
+    });
+
+    it("loads again in place once the retries run out", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_down", []);
+      const gets = failSnapshots("conv_down", [503, 503, 503]);
+
+      const switched = useChatStore.getState().switchTo("conv_down");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await switched;
+      const entry = conversationRegistry.peek("conv_down")!;
+      expect(entry.getState().conversationLoadError).not.toBeNull();
+      expect(gets).toHaveLength(3);
+
+      await retryConversationLoad("conv_down");
+      expect(entry.getState().conversationLoadError).toBeNull();
+      expect(gets).toHaveLength(4);
+    });
+
+    it("keeps the stream slot for the stream that replaced a failed load", async () => {
+      const slots = makeFakeSlotManager();
+      setStreamSlotManagerForTest(slots);
+      seedSession("conv_slot", []);
+      failSnapshots("conv_slot", [404]);
+      const failing = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) !== "/v1/sessions/conv_slot/stream") return failing(input, init);
+        // Like a real fetch, the body errors once its request is aborted.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            init?.signal?.addEventListener("abort", () => {
+              controller.error(new DOMException("Aborted", "AbortError"));
+            });
+          },
+        });
+        return mockResponse(null, { bodyStream: body });
+      });
+      await useChatStore.getState().switchTo("conv_slot");
+      expect(slots.heldByTab()).toBe(1);
+
+      await retryConversationLoad("conv_slot");
+      // Let the replaced pump finish exiting.
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 50);
+      });
+
+      expect(slots.heldByTab()).toBe(1);
+    });
   });
 
   it("degrades gracefully when stream rebind fails — message still posts", async () => {
@@ -3862,12 +3956,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
   it("B2: a bind failure after navigate-away settles the real session, not the visible one", async () => {
     // The real session's snapshot fails, so ensureBoundSession rethrows the
     // load error BEFORE postedSessionId is assigned — the catch's B2 path.
+    // A 404 isn't retried, so the bind fails at once.
     seedSession("conv_visible");
     fetchMock.mockImplementation((input, init) => {
       const url = String(input);
       const path = url.split("?")[0];
       if (path === "/v1/sessions/conv_real" && (init?.method ?? "GET") === "GET") {
-        return mockResponse({}, { ok: false, status: 500 });
+        return mockResponse({}, { ok: false, status: 404 });
       }
       return defaultFetchHandler(input, init);
     });
