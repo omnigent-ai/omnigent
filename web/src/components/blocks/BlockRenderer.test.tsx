@@ -14,7 +14,7 @@ import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { BlockRenderer, rendersOnlyWorkedFold } from "./BlockRenderer";
+import { BlockRenderer, mayDefineReferenceLink, rendersOnlyWorkedFold } from "./BlockRenderer";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 afterEach(cleanup);
@@ -394,7 +394,10 @@ describe("BlockRenderer dispatch", () => {
     expect(container.querySelector("em")).toBeNull();
   });
 
-  it("resolves a settled streamed reply's reference links", () => {
+  it.each([
+    ["at the top level", "[docs]: https://example.com/docs"],
+    ["in a blockquote", "> [docs]: https://example.com/docs"],
+  ])("resolves a settled streamed reply's reference link defined %s", (_where, definition) => {
     // Streamed text stays in streaming mode, which renders each block alone, so a
     // reply with a link definition in another block settles into static mode.
     render(
@@ -404,7 +407,7 @@ describe("BlockRenderer dispatch", () => {
             {
               kind: "text",
               itemId: "t1",
-              text: "See [the docs][docs].\n\n[docs]: https://example.com/docs",
+              text: `See [the docs][docs].\n\n${definition}`,
               final: true,
               streamKey: "text#0",
             },
@@ -414,8 +417,37 @@ describe("BlockRenderer dispatch", () => {
       </TestProviders>,
     );
 
-    expect(screen.getByText("the docs")).toBeInTheDocument();
-    expect(screen.queryByText(/\[docs\]/)).toBeNull();
+    expect(screen.getByRole("link", { name: "the docs" })).toHaveAttribute(
+      "href",
+      "https://example.com/docs",
+    );
+  });
+
+  it.each([
+    ["a definition", "See [a][docs].\n\n[docs]: https://example.com", true],
+    ["no space after the colon", "[docs]:/docs", true],
+    ["an escaped bracket in the label", String.raw`[foo\]]: /url`, true],
+    ["a definition in a list item", "- [docs]: https://example.com", true],
+    ["a definition on a list item's continuation", "10. See [docs][].\n\n    [docs]: /url", true],
+    ["a label split across lines", "See [foo bar][].\n\n[foo\nbar]: /url", true],
+    ["a label split across blockquote lines", "> [foo\n> bar]: /url", true],
+    // Code isn't parsed: matching there only keeps the static rendering.
+    ["a definition-like line in code", "```ini\n[docs]: x\n```", true],
+    ["an unescaped bracket in the label", "[foo[bar]: text", false],
+    ["a split label broken by a blank line", "[foo\n\nbar]: /url", false],
+    ["a footnote definition", "[^1]: A note.", false],
+    ["plain prose", "Done. There are two names in the file.", false],
+  ])("mayDefineReferenceLink: %s", (_case, text, expected) => {
+    expect(mayDefineReferenceLink(text)).toBe(expected);
+  });
+
+  it("scans long pathological text in linear time", () => {
+    const started = performance.now();
+    expect(mayDefineReferenceLink("`".repeat(64_000))).toBe(false);
+    expect(mayDefineReferenceLink("[" + "a".repeat(64_000))).toBe(false);
+    expect(mayDefineReferenceLink("[a\n".repeat(20_000))).toBe(false);
+    expect(mayDefineReferenceLink(" ".repeat(64_000) + "x")).toBe(false);
+    expect(performance.now() - started).toBeLessThan(250);
   });
 
   it("uses streaming markdown mode only for the live trailing text item", () => {

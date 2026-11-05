@@ -738,7 +738,7 @@ def test_streamed_reply_stays_mounted_as_its_turn_commits_and_ends(
     """A streamed reply keeps its elements, and the reader's selection, until the turn ends.
 
     The relay commits the tool call that closed the text, then stamps the text's id,
-    and the turn ends. Each one used to rebuild the reply's markdown.
+    and the turn ends. None of these may rebuild the reply's markdown.
     """
     chat = chat_session_contract
     response_id = "mounted-reply"

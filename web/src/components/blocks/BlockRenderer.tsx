@@ -1019,17 +1019,46 @@ function renderItem(
   }
 }
 
-// A reference link definition resolves only when static mode renders the whole document.
-const REFERENCE_DEFINITION = /^ {0,3}\[(?!\^)(?:[^[\]\\]|\\.)+\]:/m;
-const FENCED_CODE = /^ {0,3}(`{3,}|~{3,})[^\n]*\n[\s\S]*?^ {0,3}\1/gm;
+// Any indent: a list item's continuation lines carry its content indent.
+const REFERENCE_DEFINITION = /^\s*\[(?!\^)(?:[^[\]\\]|\\.)+\]:/;
+// A label opened on this line and still open at its end, then the rest of one.
+const LABEL_OPEN = /^\s*\[(?!\^)((?:[^[\]\\]|\\.)*)$/;
+const LABEL_REST = /^((?:[^[\]\\]|\\.)*)(\]:)?/;
+const MAX_LABEL_LENGTH = 999;
+const CONTAINER_PREFIX = /^(?: {0,3}(?:>|[-*+]|\d{1,9}[.)])[ \t]?)+/;
+
+/**
+ * Whether markdown may define a reference link, including inside a blockquote or list
+ * item. Such a link resolves only when static mode renders the whole document. Lines
+ * in code count too: a false match only keeps the static rendering every reply used
+ * to get. One pass over the lines, so long or pathological text stays linear.
+ */
+export function mayDefineReferenceLink(text: string): boolean {
+  // Length of a label left open by earlier lines, or -1.
+  let openLabel = -1;
+  for (const line of text.split("\n")) {
+    const content = line.replace(CONTAINER_PREFIX, "");
+    if (openLabel >= 0) {
+      // A label continues over non-blank lines of label characters, up to 999 of them.
+      const [matched = "", chars = "", closed] = LABEL_REST.exec(content) ?? [];
+      openLabel += chars.length + 1;
+      if (closed && openLabel <= MAX_LABEL_LENGTH) return true;
+      const continues = matched === content && content.trim() !== "";
+      openLabel = continues && openLabel <= MAX_LABEL_LENGTH ? openLabel : -1;
+      if (openLabel >= 0) continue;
+    }
+    if (REFERENCE_DEFINITION.test(content)) return true;
+    openLabel = LABEL_OPEN.exec(content)?.[1]?.length ?? -1;
+  }
+  return false;
+}
 
 /**
  * Streamed text stays in streaming mode once it settles: static mode renders a
  * different tree, so switching would remount every block of the reply.
  */
 function keepsStreamingMode(item: Extract<RenderItem, { kind: "text" }>): boolean {
-  if (item.streamKey === undefined) return false;
-  return !REFERENCE_DEFINITION.test(item.text.replace(FENCED_CODE, ""));
+  return item.streamKey !== undefined && !mayDefineReferenceLink(item.text);
 }
 
 /**

@@ -1654,7 +1654,9 @@ function buildAssistantItems(
       for (let k = 0; k < run.length; k += 1) {
         if (run[k]!.type === "text_done") {
           const slice = run.slice(chunkStart, k + 1);
+          // Every segment takes an ordinal, so dropping an empty one doesn't renumber the rest.
           const item = textItem(slice, textCount);
+          textCount += 1;
           // Drop empty trailing TextDones when a non-empty one exists
           // in the same bubble. Without this, the server's empty
           // trailing message item would render as a blank bubble line.
@@ -1663,7 +1665,6 @@ function buildAssistantItems(
           if (item.kind !== "text") continue;
           if (!(item.text === "" && item.final && hasNonEmptyTextDone)) {
             items.push(item);
-            textCount += 1;
           }
           chunkStart = k + 1;
         }
