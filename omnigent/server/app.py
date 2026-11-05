@@ -2324,6 +2324,13 @@ def create_app(
     app.state.feature_flags = resolved_feature_flags
     app.state.harness_install = app_harness_install
     app.state.automations = True if automations is None else automations
+
+    def automations_available() -> bool:
+        return scheduled_task_store is not None and deployment_gate_enabled(
+            app.state.automations, "automations"
+        )
+
+    app.state.automations_available = automations_available
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -3611,9 +3618,7 @@ def create_app(
 
         dictation_available, _ = engine_availability()
         filesystem_attachment_policy = app.state.filesystem_attachment_policy()
-        automations_available = scheduled_task_store is not None and deployment_gate_enabled(
-            app.state.automations, "automations"
-        )
+        automations_enabled = app.state.automations_available()
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -3655,8 +3660,8 @@ def create_app(
                     "all_types": filesystem_attachment_policy.all_types,
                 },
                 "scheduled_task_projects": project_store is not None,
-                "scheduled_task_inbox": automations_available,
-                "automations_enabled": automations_available,
+                "scheduled_task_inbox": automations_enabled,
+                "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
