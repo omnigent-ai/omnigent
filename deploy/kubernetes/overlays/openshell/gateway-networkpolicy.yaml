@@ -34,8 +34,8 @@ spec:
       to:
         - ipBlock:
             cidr: 0.0.0.0/0
-    # In-cluster gateway — ports match the gateway pod's port, not its
-    # Service port. Adjust the namespace and port to your gateway install.
+    # In-cluster gateway — ports match the gateway pod's port, not its Service
+    # port. Adjust the namespace and port, and add a podSelector for its labels.
     - ports:
         - protocol: TCP
           port: 8080

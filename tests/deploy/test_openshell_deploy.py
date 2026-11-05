@@ -62,6 +62,7 @@ def test_host_openshell_image_runs_from_the_seeded_sandbox_home() -> None:
     """The Kubernetes driver copies /sandbox into a PVC as UID 10001; Landlock denies /opt."""
     builder = _stage_instructions("openshell-venv-builder")
     image = _stage_instructions("host-openshell")
+    base = re.search(r"^FROM\s+(\S+)\s+AS\s+host-openshell\s*$", _DOCKERFILE.read_text(), re.M)
     env_lines = " ".join(line for line in image if line.startswith("ENV "))
     environment = dict(re.findall(r"\b(PATH|VIRTUAL_ENV)=\"?([^\s\"]+)", env_lines))
 
@@ -73,6 +74,10 @@ def test_host_openshell_image_runs_from_the_seeded_sandbox_home() -> None:
     assert environment["VIRTUAL_ENV"] == "/sandbox/.venv"
     assert environment["PATH"].split(":")[0] == "/sandbox/.venv/bin"
     assert "/opt/venv" not in environment["PATH"]
+    # Inheriting the host venv's layers would ship a second, unused venv.
+    assert base and not any(
+        re.match(r"(COPY|RUN)\b.*\s/opt/venv\b", line) for line in _stage_instructions(base[1])
+    )
     # Launcher execs use `bash -lc`, whose /etc/profile resets PATH before profile.d.
     assert any(
         "/sandbox/.venv/bin" in line and "/etc/profile.d/omnigent-venv.sh" in line
