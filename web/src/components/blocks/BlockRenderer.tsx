@@ -892,7 +892,7 @@ function renderItem(
         >
           <FilePathAwareMessageResponse
             className="chat-markdown text-message"
-            mode={isTextStreaming ? "streaming" : "static"}
+            mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
           >
             {item.text}
           </FilePathAwareMessageResponse>
@@ -1019,13 +1019,27 @@ function renderItem(
   }
 }
 
+// A reference link definition resolves only when static mode renders the whole document.
+const REFERENCE_DEFINITION = /^ {0,3}\[(?!\^)(?:[^[\]\\]|\\.)+\]:/m;
+const FENCED_CODE = /^ {0,3}(`{3,}|~{3,})[^\n]*\n[\s\S]*?^ {0,3}\1/gm;
+
 /**
- * Stable key for each render item. Prefer the server-assigned item id;
- * fall back to call_id for tools (unique within a response) or to
- * position for pre-finalization fragments that don't carry an item id
- * yet (text/reasoning chunks emitted before their `output_item.done`).
+ * Streamed text stays in streaming mode once it settles: static mode renders a
+ * different tree, so switching would remount every block of the reply.
+ */
+function keepsStreamingMode(item: Extract<RenderItem, { kind: "text" }>): boolean {
+  if (item.streamKey === undefined) return false;
+  return !REFERENCE_DEFINITION.test(item.text.replace(FENCED_CODE, ""));
+}
+
+/**
+ * Stable key for each render item. Text that streamed into this page keeps
+ * its `streamKey` while its item id commits; otherwise prefer the
+ * server-assigned item id, then call_id for tools (unique within a
+ * response), then position for fragments that don't carry an item id yet.
  */
 function keyFor(item: RenderItem, index: number): string {
+  if (item.kind === "text" && item.streamKey) return item.streamKey;
   if (item.itemId) return `${item.kind}:${item.itemId}`;
   if (item.kind === "tool") return `tool:${item.execution.callId}`;
   if (item.kind === "elicitation") return `elicitation:${item.elicitationId}`;

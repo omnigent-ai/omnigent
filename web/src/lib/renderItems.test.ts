@@ -4357,6 +4357,49 @@ describe("buildBubbles — anonymous blocks join the surrounding turn", () => {
     );
     expect(assistants(bubbles)[0]!.stableId).toBe("m2");
   });
+
+  it("keeps a streaming reply's keys while its turn's items commit", () => {
+    // The relay stamps a streamed text's id after the tool call that closed it has
+    // committed, and a step-wise turn moves to a new response id. Re-keying on any
+    // of these would remount the reply mid-turn.
+    const live = (block: AnyBlock): AnyBlock => ({
+      ...block,
+      ctx: { ...block.ctx, clientCreatedAtS: 1_700_000_000 },
+    });
+    const user: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "u1", responseId: "" }),
+      content: [{ type: "input_text", text: "Read the file." }],
+    };
+    const streamed = live(textDone(null, "resp_1", "Reading it."));
+    const call = live({
+      type: "tool_group",
+      ctx: ctx({ itemId: "fc_1", responseId: "resp_1" }),
+      executions: [mkExec("shell", "c1")],
+      iteration: 0,
+    });
+    const stamped: AnyBlock = { ...streamed, ctx: { ...streamed.ctx, itemId: "msg_1" } };
+    const nextStep = live(textDone(null, "resp_2", "Next step."));
+    const reply = (blocks: AnyBlock[]) => assistants(buildBubbles(blocks, null))[0]!;
+
+    const opened = reply([user, streamed]);
+    for (const blocks of [
+      [user, streamed, call],
+      [user, stamped, call],
+      [user, stamped, call, nextStep],
+    ]) {
+      const bubble = reply(blocks);
+      expect(bubble.stableId).toBe(opened.stableId);
+      expect(bubble.items[0]).toMatchObject({ kind: "text", streamKey: "text#0" });
+    }
+    // History from the server keys by its first item id as before.
+    expect(reply([user, textDone("msg_1", "resp_1", "Reading it."), call]).stableId).toBe("msg_1");
+    // A queued message splits the response; the next streamed bubble gets its own key.
+    const queued: AnyBlock = { ...user, ctx: ctx({ itemId: "u2", responseId: "" }) };
+    const more = live(textDone(null, "resp_1", "Two names."));
+    const [first, second] = assistants(buildBubbles([user, stamped, call, queued, more], null));
+    expect(second!.stableId).not.toBe(first!.stableId);
+  });
 });
 
 describe("lastRenderableAssistantIndex", () => {

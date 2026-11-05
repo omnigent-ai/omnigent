@@ -394,6 +394,30 @@ describe("BlockRenderer dispatch", () => {
     expect(container.querySelector("em")).toBeNull();
   });
 
+  it("resolves a settled streamed reply's reference links", () => {
+    // Streamed text stays in streaming mode, which renders each block alone, so a
+    // reply with a link definition in another block settles into static mode.
+    render(
+      <TestProviders queryClient={new QueryClient()} fileViewerContext={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            {
+              kind: "text",
+              itemId: "t1",
+              text: "See [the docs][docs].\n\n[docs]: https://example.com/docs",
+              final: true,
+              streamKey: "text#0",
+            },
+          ]}
+          sessionStatus="idle"
+        />
+      </TestProviders>,
+    );
+
+    expect(screen.getByText("the docs")).toBeInTheDocument();
+    expect(screen.queryByText(/\[docs\]/)).toBeNull();
+  });
+
   it("uses streaming markdown mode only for the live trailing text item", () => {
     const items: RenderItem[] = [
       { kind: "text", itemId: "t1", text: "*settled", final: true },
