@@ -51,6 +51,7 @@ from omnigent.inner.executor import (
     ExecutorError,
     ExecutorEvent,
     Message,
+    TextChunk,
     ToolSpec,
     TurnComplete,
     describe_exception,
@@ -84,9 +85,10 @@ _INPUT_BOX_REPAINT_INTERVAL_S = 10.0
 # Below this much free space Claude Code fails to append its transcript
 # ("Transcript write failed (ENOSPC)"), so a message would run unseen by the web.
 _MIN_TRANSCRIPT_FREE_BYTES = 1024 * 1024
-_HOST_DISK_FULL_MESSAGE = (
-    "The host's disk is full, so Claude Code can't save this conversation and the "
-    "message was not sent."
+_HOST_DISK_POLL_S = 5.0
+_HOST_DISK_WAIT_MESSAGE = (
+    "The host's disk is full, so Claude Code can't save this conversation. "
+    "Free up disk space on the host; this message will be sent when there is room."
 )
 _INACTIVE_SESSION_MESSAGE = (
     "Claude native session is no longer active after /clear; "
@@ -434,17 +436,12 @@ class ClaudeNativeExecutor(Executor):
             return
         if await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
             _logger.warning(
-                "claude-native: host disk is full; message not delivered",
+                "claude-native: host disk is full; holding the message",
                 extra={"session_id": self._request_session_id},
             )
-            yield ExecutorError(
-                message=_HOST_DISK_FULL_MESSAGE,
-                code="host_disk_full",
-                title="Host storage is full",
-                remediation="Free up disk space on the host, then send your message again.",
-                undelivered=True,
-            )
-            return
+            yield TextChunk(text=_HOST_DISK_WAIT_MESSAGE)
+            while await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
+                await asyncio.sleep(_HOST_DISK_POLL_S)
         from omnigent.runtime import telemetry
 
         # Span the tmux send-keys inject — the input half of the decoupled

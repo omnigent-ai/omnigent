@@ -167,7 +167,7 @@ async def test_launch_adopts_managed_connect_providers_plugins_and_model(
     )
     assert written["providers"]["databricks-ws"]["models"]["served-model"]["headers"] == {
         "Databricks-Custom-Coding-Agent": "opencode",
-        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop",
+        "Databricks-Custom-Client-Surfaces": "omnigent-desktop",
     }
     assert written["plugins"] == [ucode_plugin, str(bridge_dir / "omnigent-policy")]
     assert written["model"] == "databricks-ws/served-model"

@@ -131,7 +131,9 @@ The cache key derives from the session's native bridge path. Claude Code and
 Codex can recreate copies from the artifact store when rebuilding session
 history. Native session cleanup removes both corresponding caches; the cache
 is not the durable copy of an upload. Other native harnesses use the same
-cache for their existing supported attachment types.
+cache for their existing supported attachment types. Claude Code sessions get a
+`Read` allow rule for their own cache directory, so reading an attachment does
+not ask for approval; Claude deny and ask rules still apply.
 
 Custom sandbox and provider configurations must allow the runner to write
 these caches and the harness's file-reading tools to read the emitted absolute

@@ -436,7 +436,7 @@ export const ComposerActionGroup = forwardRef<
         "flex min-w-0 items-center gap-1 mobile-app:max-w-full",
         side === "left"
           ? "flex-none overflow-visible mobile-app:flex-wrap mobile-app:shrink"
-          : "ml-auto max-w-full shrink-0",
+          : "ml-auto max-w-full shrink",
         className,
       )}
       {...props}

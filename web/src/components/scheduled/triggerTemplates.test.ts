@@ -77,6 +77,17 @@ describe("saved trigger prompts", () => {
     expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "New user prompt.", systemPrompt });
   });
 
+  it.each(["", "  \n"])("preserves intentionally cleared posting instructions (%j)", (posting) => {
+    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields(), CTX));
+    const [manager] = parts.systemPrompt!.split("\n\nPosting instructions for each session:\n");
+    const systemPrompt = `${manager}\n\nPosting instructions for each session:\n${posting}`;
+    const saved = combineTriggerPrompt(parts.userPrompt, systemPrompt);
+    expect(saved).toBe(
+      `${manager}\n\nInstructions for each session:\n${parts.userPrompt}\n\nPosting instructions for each session:\n${posting}`,
+    );
+    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: parts.userPrompt, systemPrompt });
+  });
+
   it("preserves an independently specified saved template", () => {
     const saved =
       'This automation watches Jira issues.\n\nEach run:\nStart a session for each match.\n\nInstructions for each session:\nTriage the ticket.\nAnything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "Sent with Omnigent", since it posts with the owner\'s account.';
@@ -124,6 +135,10 @@ describe("triggerFieldsComplete", () => {
   it.each<[string, Partial<TriggerFields>, boolean]>([
     ["scope and instructions, no conditions", { conditions: [] }, true],
     ["blank scope", { scope: "  " }, false],
+    ["equals matches one scope", { scopeOperator: "is", scope: "ES" }, true],
+    ["equals rejects lists", { scopeOperator: "is", scope: "ES, OPS" }, false],
+    ["in accepts one scope", { scopeOperator: "in", scope: "ES" }, true],
+    ["in accepts multiple scopes", { scopeOperator: "in", scope: "ES, OPS" }, true],
     // Commas alone parse to no entries, which would drop GitHub's repo filter.
     ["comma-only scope", { scope: " , ," }, false],
     ["a condition with no value", { conditions: [{ ...LABEL_OMNIGENT, value: " " }] }, false],
@@ -152,6 +167,12 @@ describe("splitJqlOrderBy", () => {
 });
 
 describe("compileJiraJql", () => {
+  it.each(["is", "in"] as const)("compiles an explicit %s scope operator", (scopeOperator) => {
+    expect(compileJiraJql(fields({ scopeOperator, scope: "ES", conditions: [] }))).toBe(
+      scopeOperator === "is" ? 'project = "ES"' : 'project in ("ES")',
+    );
+  });
+
   const jql = (scope: string, ...conditions: TriggerCondition[]) =>
     compileJiraJql(fields({ scope, conditions }));
 
@@ -360,6 +381,27 @@ describe("renderTriggerPrompt", () => {
     expect(sorted).not.toContain("ORDER BY created DESC");
   });
 
+  it.each([true, false])("puts Slack links in the worker result with linkBack=%s", (linkBack) => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      fields({ event: "posted", scope: "#support", linkBack }),
+      CTX,
+    );
+    const [manager, worker] = prompt.split("Instructions for each session:\n");
+    expect(manager).not.toContain("Link-back pending:");
+    expect(manager).not.toContain('Reply "Omnigent session:');
+    expect(worker).toContain(
+      "Reply in the source thread when you have a useful result or a blocker",
+    );
+    expect(worker).toContain("Do not send an acknowledgement or a separate session-link message");
+    expect(worker).toContain(
+      linkBack ? "Include your own session link at the bottom" : "Do not add a session link",
+    );
+    const parts = splitTriggerPrompt(prompt);
+    expect(parts.userPrompt).toBe(fields().instructions);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+  });
+
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
 
@@ -528,7 +570,7 @@ describe("renderTriggerPrompt", () => {
     );
     expect(filtered).toContain("Only messages that are about bug reports count.");
     expect(filtered).toContain('title "Slack <channel> <message ts>"');
-    expect(filtered).toContain("in the thread of each message");
+    expect(filtered).toContain("Reply in the source thread when you have a useful result");
 
     const unfiltered = renderTriggerPrompt(
       "slack",
@@ -590,6 +632,29 @@ describe("renderTriggerPrompt", () => {
     expect(prompt).toContain(
       `-f q='repo:acme/app is:issue label:"won'\\''t fix" created:>=<that time>' -f sort=created`,
     );
+  });
+
+  it("checks repository access in both the GitHub manager and worker instructions", () => {
+    const prompt = renderTriggerPrompt(
+      "github",
+      fields({ event: "issue", scope: "acme/app" }),
+      CTX,
+    );
+    const parts = splitTriggerPrompt(prompt);
+    expect(parts.userPrompt).toBe(fields().instructions);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+    const [manager, worker] = prompt.split("Instructions for each session:\n");
+    for (const instructions of [manager, worker]) {
+      expect(instructions).toContain("gh auth status --hostname github.com");
+      expect(instructions).toContain("gh auth token --hostname github.com --user <account>");
+      expect(instructions).toContain("scope its token to each gh command with GH_TOKEN");
+      expect(instructions).toContain("without printing or recording it");
+      expect(instructions).toContain("Do not use gh auth switch");
+      expect(instructions).toContain(
+        "If no configured account has access, report the blocker without attempting to grant access",
+      );
+      expect(instructions).toContain("do not treat an access failure as no matches");
+    }
   });
 
   it("builds the GitHub search from the repository, event and conditions", () => {

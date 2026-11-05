@@ -60,6 +60,9 @@ const mobileMenu = {
   onOpenSubagents: () => {},
   githubPanelOpen: false,
   onOpenGithub: () => {},
+  contentSearchPanelOpen: false,
+  showContentSearch: false,
+  onOpenContentSearch: () => {},
   sideChatsPanelOpen: false,
   showSideChats: false,
   onOpenSideChats: () => {},
@@ -1026,6 +1029,26 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(onOpenFiles).toHaveBeenCalled();
   });
 
+  it("opens the content-search drawer from the kebab when the feature is available", () => {
+    const onOpenContentSearch = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, showContentSearch: true, onOpenContentSearch },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Content search" }));
+    expect(onOpenContentSearch).toHaveBeenCalled();
+  });
+
   it("opens the side-chats drawer from the kebab when the harness supports it", () => {
     const onOpenSideChats = vi.fn();
     isMobileMock.mockReturnValue(true);
@@ -1080,24 +1103,28 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getByRole("menuitem", { name: "Files" })).toBeInTheDocument();
   });
 
-  it("drops the rail entries while a push panel owns the right side", () => {
-    isMobileMock.mockReturnValue(true);
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: conversation.id,
-      conversationTitle: conversation.title,
-      actionConversation: conversation,
-      hasRailContent: true,
-      showFilesPanel: true,
-      mobileMenu: { ...mobileMenu, filesPanelOpen: true },
-    });
+  it.each(["filesPanelOpen", "contentSearchPanelOpen"] as const)(
+    "drops the rail entries while a push panel owns the right side (%s)",
+    (openPanel) => {
+      isMobileMock.mockReturnValue(true);
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: conversation.id,
+        conversationTitle: conversation.title,
+        actionConversation: conversation,
+        hasRailContent: true,
+        showFilesPanel: true,
+        mobileMenu: { ...mobileMenu, showContentSearch: true, [openPanel]: true },
+      });
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
-      button: 0,
-    });
-    expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
-    expect(screen.getByRole("menuitem", { name: "Pin" })).toBeInTheDocument();
-  });
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+        button: 0,
+      });
+      expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
+      expect(screen.queryByRole("menuitem", { name: "Content search" })).toBeNull();
+      expect(screen.getByRole("menuitem", { name: "Pin" })).toBeInTheDocument();
+    },
+  );
 
   it("does not add a management menu to a sub-agent breadcrumb", () => {
     renderHeader({

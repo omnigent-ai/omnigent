@@ -32,6 +32,20 @@ describe("useChangesViewState", () => {
     }
   });
 
+  it("keeps the dismissed reset head across remounts and isolates PRs", () => {
+    const prUrl = "https://github.com/o/r/pull/3";
+    const first = renderHook(() => useChangesViewState("view-state-dismiss", prUrl));
+    act(() => first.result.current.setDismissedResetHead("head2"));
+    first.unmount();
+
+    const remounted = renderHook(() => useChangesViewState("view-state-dismiss", prUrl));
+    expect(remounted.result.current.dismissedResetHead).toBe("head2");
+    const otherPr = renderHook(() =>
+      useChangesViewState("view-state-dismiss", "https://github.com/o/r/pull/4"),
+    );
+    expect(otherPr.result.current.dismissedResetHead).toBeNull();
+  });
+
   it("clears a reveal with stable actions", () => {
     const { result } = renderHook(() => useChangesViewState("view-state-c", "pr"));
     const { reveal } = result.current;
