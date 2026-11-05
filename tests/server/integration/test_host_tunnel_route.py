@@ -51,7 +51,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.server import tunnel_handshake
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
-from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+from omnigent.server.managed_hosts import (
+    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
+    parse_sandbox_config,
+)
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
@@ -1794,25 +1798,23 @@ async def test_managed_heartbeat_renews_token_for_reconnect(
             raise ValueError("invalid launcher configuration")
         return launcher
 
-    config = ManagedSandboxConfig(
-        server_url="https://managed-test.example.com",
-        launcher_factory=launcher_factory,
-        token_ttl_s=token_ttl_s,
-        provider=provider,
-    )
-    deployment = ManagedSandboxDeployment.single(config)
-    if provider == "modal":
-        deployment = ManagedSandboxDeployment(
-            configs=(
-                ManagedSandboxConfig(
-                    server_url=config.server_url,
-                    launcher_factory=FakeSandboxLauncher,
-                    token_ttl_s=1200,
-                    provider="daytona",
-                ),
-                config,
+    server_url = "https://managed-test.example.com"
+    if provider is None:
+        deployment = ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url=server_url,
+                launcher_factory=launcher_factory,
+                token_ttl_s=token_ttl_s,
             )
         )
+    else:
+        providers: list[dict[str, object]] = [{"provider": "daytona"}]
+        if provider == "modal":
+            providers.append({"provider": "modal", "token_ttl_s": token_ttl_s})
+        deployment = parse_sandbox_config(
+            {"server_url": server_url, "token_ttl_s": 1200, "providers": providers}
+        )
+        assert deployment is not None
     registry, store = HostRegistry(), HostStore(db_uri)
     app = FastAPI()
     app.include_router(
