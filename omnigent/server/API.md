@@ -1419,10 +1419,13 @@ data: [DONE]
 events, no sequence numbers exposed on the wire. Reconnecting clients
 reconcile via the snapshot endpoint — see "Reconnect Contract".
 
-The stream stays open until the client disconnects or the conversation
-is closed; events flow in publish order. Multiple subscribers to the
-same session receive the same events. The stream terminates with
-`data: [DONE]\n\n`.
+The stream stays open until the client disconnects, the conversation
+is closed, or the stream is 270 seconds old; events flow in publish
+order. Multiple subscribers to the same session receive the same
+events. Closing the conversation terminates the stream with
+`data: [DONE]\n\n`. The 270-second close, server shutdown and a
+subscriber that falls too far behind end it without `[DONE]`; clients
+reconnect and reconcile via the snapshot endpoint.
 
 ### Stream Events
 
