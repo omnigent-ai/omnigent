@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import tarfile
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -18,6 +19,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.claude_launcher import ClaudeLauncher
 from omnigent.harnesses.claude_native import plugin_discovery
 from omnigent.host.frames import HostSkillsFrame
 from omnigent.host.skills import (
@@ -365,23 +367,38 @@ def test_incomplete_codex_catalog_reports_warnings_and_is_cached_only_briefly(
 
 
 @pytest.mark.posix_only
+@pytest.mark.parametrize("blocked", ["launcher-plugin", "launch"])
 @pytest.mark.parametrize("shared_discovery", [True, False], ids=["shared", "separate"])
 def test_slow_claude_launch_probe_does_not_delay_catalogs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     shared_discovery: bool,
+    blocked: str,
     _no_configured_claude_launch: Callable[[], bool],
 ) -> None:
     """Catalogs answer while one probe waits on the launch, then list its plugins once it reports.
 
-    The launch blocks until released, so a catalog returned before then did not wait for it.
-    Catalog expiry is frozen, so only the finished probe can make the cached entry stale.
+    The launcher plugin or the launch blocks until released, so a catalog returned before
+    then did not wait for it. Catalog expiry is frozen, so only the finished probe can make
+    the cached entry stale.
     """
-    for name in ("OMNIGENT_CLAUDE_LAUNCHER", "OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
+    for name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
         plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
     )
+    resolve = threading.Event()
+    if blocked == "launch":
+        resolve.set()
+    resolved: list[bool] = []
+
+    class GatedLauncher(ClaudeLauncher):
+        def launch(self, command: str, args: list[str]) -> tuple[str, list[str]]:
+            resolved.append(resolve.wait(10))
+            return command, args
+
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "gated")
+    monkeypatch.setattr("omnigent.claude_launcher._load_launcher", lambda _name: GatedLauncher())
     monkeypatch.setattr("omnigent.host.skills.time", SimpleNamespace(monotonic=lambda: 0.0))
     home = tmp_path / "home"
     for root, name in ((home / ".claude", "local"), (tmp_path / "launch" / "dev", "review")):
@@ -417,11 +434,15 @@ def test_slow_claude_launch_probe_does_not_delay_catalogs(
         with ThreadPoolExecutor(max_workers=2) as pool:
             loading = list(pool.map(catalog, discoveries, workspaces))
     finally:
+        resolve.set()
         release.touch()
     plugin_discovery.claude_launch_plugin_dirs()
+    # Catalogs built from the stored answer must not run the launcher plugin again.
+    resolve.clear()
     loaded = list(map(catalog, discoveries, workspaces))
 
     note = "Claude plugins added by the configured launch are still loading; retry in a moment."
     assert loading == [(["local"], [note])] * 2
     assert loaded == [(["local", "dev:review"], [])] * 2
+    assert resolved == [True]
     assert len(launches.read_text().splitlines()) == 1

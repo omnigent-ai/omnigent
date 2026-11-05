@@ -47,6 +47,9 @@ class _LaunchProbe:
     backoff_s: float = 0.0
     refresh_at: float = 0.0
     running: threading.Event | None = None
+    # A launcher plugin can resolve to an executable outside the configured launch.
+    executable: str | None = None
+    executable_identity: object = None
 
 
 _probes_lock = threading.Lock()
@@ -60,14 +63,24 @@ def claude_launch_is_customized() -> bool:
     :raises CONFIG_READ_ERRORS: The Omnigent config could not be read.
     """
     from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR
-    from omnigent.config import load_effective_config
-    from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
 
     if os.environ.get(CLAUDE_LAUNCHER_ENV_VAR, "").strip():
         return True
+    command, args = _configured_command()
+    return command != "claude" or bool(args)
+
+
+def _configured_command() -> tuple[str, list[str]]:
+    """The native Claude command and arguments the Omnigent config sets.
+
+    :raises CONFIG_READ_ERRORS: The Omnigent config could not be read.
+    """
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
+
     cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
-    return command != "claude" or bool(resolve_harness_args("claude-native", (), cfg=cfg))
+    return command, resolve_harness_args("claude-native", (), cfg=cfg)
 
 
 def launch_plugins_generation() -> int:
@@ -112,34 +125,43 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
 
     Claude's init event lists loaded plugins, including session-only ones a
     launcher adds with ``--plugin-dir``, before it would contact a model. One
-    background probe at a time asks each launch; its answer is reused until the
-    command, arguments or executable change.
+    background probe at a time resolves each launch, including any launcher
+    plugin, and asks it; its answer is reused until the configured launch or an
+    executable it runs changes.
 
     :param wait: Wait for a first answer rather than raise :class:`LaunchPluginsPending`.
     :raises LaunchPluginsPending: The launch has not answered yet.
     :raises LaunchPluginsFailed: The last probe failed and the next waits out a backoff.
     :raises CONFIG_READ_ERRORS: The Omnigent config could not be read.
     """
-    from omnigent.harnesses.claude_native.main import _claude_model_probe_invocation
+    from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR
     from omnigent.models.model_catalog_store import binary_identity
 
-    command, launch_args, env = _claude_model_probe_invocation(
-        None, ("--settings", _PROBE_SETTINGS)
-    )
-    key = (command, *launch_args, binary_identity(command))
+    # Resolving the launch can run a launcher plugin, so only the background probe does.
+    command, args = _configured_command()
+    launcher = os.environ.get(CLAUDE_LAUNCHER_ENV_VAR, "").strip()
+    key = (launcher, command, *args, binary_identity(command))
+    with _probes_lock:
+        probe = _probes.get(key)
+        executable = probe.executable if probe is not None else None
+    executable_identity = binary_identity(executable)
     with _probes_lock:
         # Only the current launch's answer is reused, so idle earlier launches are dropped.
         for idle in [k for k, probe in _probes.items() if k != key and probe.running is None]:
             del _probes[idle]
-        probe = _probes.setdefault(key, _LaunchProbe())
+        probe = _probes.get(key)
+        if probe is None or (
+            probe.running is None
+            and probe.executable == executable
+            and probe.executable_identity != executable_identity
+        ):
+            probe = _probes[key] = _LaunchProbe()
         if probe.running is None and probe.refresh_at <= time.monotonic():
             probe.running = threading.Event()
             try:
                 # Not a daemon, so exiting still waits for a stalled launch to be killed.
                 threading.Thread(
-                    target=_refresh,
-                    args=(probe, command, launch_args, env),
-                    name="claude-launch-plugins",
+                    target=_refresh, args=(probe,), name="claude-launch-plugins"
                 ).start()
             except RuntimeError:
                 probe.running = None
@@ -155,22 +177,30 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
         raise LaunchPluginsFailed(probe.failure)
 
 
-def _refresh(
-    probe: _LaunchProbe, command: str, launch_args: list[str], env: dict[str, str]
-) -> None:
+def _refresh(probe: _LaunchProbe) -> None:
     global _generation
+    from omnigent.harnesses.claude_native.main import _claude_model_probe_invocation
+    from omnigent.models.model_catalog_store import binary_identity
+
     plugins: dict[str, Path] | None = None
+    executable: str | None = None
+    executable_identity: object = None
     failure = "did not report its plugins"
     try:
+        command, launch_args, env = _claude_model_probe_invocation(
+            None, ("--settings", _PROBE_SETTINGS)
+        )
+        executable, executable_identity = command, binary_identity(command)
         plugins = _probe_plugin_dirs(command, launch_args, env)
     except subprocess.TimeoutExpired as exc:
         failure = f"timed out after {exc.timeout:g}s"
         # The exception's text includes the launch's arguments, which can carry credentials.
         _log.warning("The configured Claude launch %s", failure)
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+    except (subprocess.SubprocessError, *CONFIG_READ_ERRORS) as exc:
         _log.warning("The configured Claude launch %s: %s", failure, exc)
     finally:
         with _probes_lock:
+            probe.executable, probe.executable_identity = executable, executable_identity
             if plugins is None:
                 # A refresh that fails keeps serving the plugins this launch reported before.
                 probe.failure = failure
@@ -196,14 +226,15 @@ def _probe_plugin_dirs(
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        # Stderr can echo the launch's arguments, so only the exit status is reported.
+        stderr=subprocess.DEVNULL,
         text=True,
         errors="replace",
         **_proc.spawn_kwargs(),
     )
     _proc.remember_process_group(process)
     try:
-        stdout, stderr = process.communicate(timeout=LAUNCH_PLUGINS_TIMEOUT_S)
+        stdout, _ = process.communicate(timeout=LAUNCH_PLUGINS_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         _proc.kill_tree(process)
         with suppress(Exception):
@@ -220,4 +251,4 @@ def _probe_plugin_dirs(
             and event.get("subtype") == "init"
         ):
             return _plugin_dirs(event.get("plugins"))
-    raise ValueError(f"exited {process.returncode} without an init event: {stderr.strip()[-500:]}")
+    raise ValueError(f"exited {process.returncode} without an init event")

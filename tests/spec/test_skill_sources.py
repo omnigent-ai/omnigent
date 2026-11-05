@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from omnigent.claude_launcher import ClaudeLauncher
 from omnigent.harnesses.claude_native import plugin_discovery
 from omnigent.spec.skill_sources import (
     SkillSourceContext,
@@ -1145,7 +1146,7 @@ def test_claude_launch_customization_triggers(
     ("script", "timeout_s", "summary"),
     [
         (
-            "sys.stderr.write('/home/private/launcher failed\\n')\nsys.exit(3)\n",
+            "sys.stderr.write(f'{sys.argv} failed\\n')\nsys.exit(3)\n",
             10.0,
             "did not report its plugins",
         ),
@@ -1259,10 +1260,14 @@ def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
 
 
 @pytest.mark.posix_only
+@pytest.mark.parametrize("launched_by", ["command", "launcher-plugin"])
 def test_unchanged_claude_launch_is_probed_once_until_it_changes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launched_by: str
 ) -> None:
-    """Repeated catalogs reuse one answer until the launcher changes or the safety TTL passes."""
+    """Repeated catalogs reuse one answer until the launcher changes or the safety TTL passes.
+
+    A launcher plugin picks its executable itself, so that executable is checked too.
+    """
     now = [0.0]
     monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
     home = tmp_path / "home"
@@ -1270,7 +1275,24 @@ def test_unchanged_claude_launch_is_probed_once_until_it_changes(
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
     launches = tmp_path / "launches.jsonl"
-    configure_claude_launch(config_home, launches, _print_init([]))
+    wrapper = tmp_path / "wrapper"
+
+    def install(script: str) -> None:
+        if launched_by == "command":
+            configure_claude_launch(config_home, launches, script)
+        else:
+            write_launch_recorder(wrapper, launches, script)
+
+    class WrapperLauncher(ClaudeLauncher):
+        def launch(self, command: str, args: list[str]) -> tuple[str, list[str]]:
+            return str(wrapper), args
+
+    if launched_by == "launcher-plugin":
+        monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "wrapper")
+        monkeypatch.setattr(
+            "omnigent.claude_launcher._load_launcher", lambda _name: WrapperLauncher()
+        )
+    install(_print_init([]))
 
     def launch_count(workspace: str) -> int:
         resolve_harness_skills(_ctx(tmp_path / workspace, home), "claude-native")
@@ -1279,7 +1301,7 @@ def test_unchanged_claude_launch_is_probed_once_until_it_changes(
     assert [launch_count(workspace) for workspace in ("first", "second", "first")] == [1, 1, 1]
     now[0] = plugin_discovery.LAUNCH_PLUGINS_TTL_S - 1
     assert launch_count("second") == 1
-    configure_claude_launch(config_home, launches, _print_init([]) + "# upgraded\n")
+    install(_print_init([]) + "# upgraded\n")
     assert launch_count("second") == 2
     # Past the TTL the last answer is served while one background probe refreshes it.
     generation = plugin_discovery.launch_plugins_generation()
@@ -1305,11 +1327,14 @@ def test_failing_claude_launch_backs_off_until_it_reports_its_plugins(
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     failing = tmp_path / "failing"
     failing.touch()
+    plugin = tmp_path / "dev"
+    plugin.mkdir()
     launches = tmp_path / "launches.jsonl"
     configure_claude_launch(
         isolate_provider_resolution(monkeypatch, tmp_path / "config"),
         launches,
-        f"if os.path.exists({str(failing)!r}):\n    sys.exit(3)\n" + _print_init([]),
+        f"if os.path.exists({str(failing)!r}):\n    sys.exit(3)\n"
+        + _print_init([{"name": "dev", "path": str(plugin), "source": "dev@inline"}]),
     )
     missing = [
         "Claude plugins added by the configured launch are missing: the launch "
@@ -1347,6 +1372,7 @@ def test_failing_claude_launch_backs_off_until_it_reports_its_plugins(
     # A failed refresh keeps the last answer and backs off from 30s again.
     now[0] += 29
     assert catalog() == (10, [])
+    assert plugin_discovery.claude_launch_plugin_dirs() == {"dev@inline": plugin}
     generation = plugin_discovery.launch_plugins_generation()
     now[0] += 1
     catalog()
