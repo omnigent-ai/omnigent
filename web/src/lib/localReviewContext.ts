@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { Comment } from "@/hooks/useComments";
+import { isLocalReviewComment, sameLocalReviewAnchor } from "./localReviewComments";
 import { getSessionDraft, setSessionDraft } from "./sessionDrafts";
 
 export { useSessionReviewComments as usePendingLocalReviewContexts } from "./sessionDrafts";
@@ -18,7 +19,7 @@ function setContexts(sessionId: string, reviewComments: Comment[]) {
 
 /** Queue a saved PR comment as context for its session's chat composer. */
 export function requestLocalReviewContext(comment: Comment) {
-  if (!comment.anchor_metadata || comment.status !== "draft") return;
+  if (!isLocalReviewComment(comment)) return;
   const current = getSessionDraft(comment.conversation_id)?.reviewComments ?? [];
   if (current.some((existing) => existing.id === comment.id)) return;
   setContexts(comment.conversation_id, [...current, comment]);
@@ -27,12 +28,30 @@ export function requestLocalReviewContext(comment: Comment) {
 /** Keep already-attached context current without reattaching removed chips. */
 export function updateLocalReviewContext(comment: Comment) {
   const current = getSessionDraft(comment.conversation_id)?.reviewComments;
-  if (!current?.some((item) => item.id === comment.id)) return;
-  if (comment.status !== "draft") removeLocalReviewContext(comment.conversation_id, comment.id);
+  const attached = current?.find((item) => item.id === comment.id);
+  if (!current || !attached) return;
+  // Legacy edit responses omit the anchor; only mutable fields may replace the snapshot.
+  const updated = {
+    ...attached,
+    body: comment.body,
+    status: comment.status,
+    updated_at: comment.updated_at,
+  };
+  if (
+    comment.path !== attached.path ||
+    (comment.anchor_metadata != null &&
+      !sameLocalReviewAnchor(attached.anchor_metadata!, comment.anchor_metadata)) ||
+    (comment.status !== "addressed" && !isLocalReviewComment(updated))
+  ) {
+    throw new Error(
+      "This server returned an incompatible review comment. Your attached comment is unchanged.",
+    );
+  }
+  if (comment.status === "addressed") removeLocalReviewContext(comment.conversation_id, comment.id);
   else
     setContexts(
       comment.conversation_id,
-      current.map((item) => (item.id === comment.id ? comment : item)),
+      current.map((item) => (item.id === comment.id ? updated : item)),
     );
 }
 

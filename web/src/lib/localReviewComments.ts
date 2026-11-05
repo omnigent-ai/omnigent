@@ -7,6 +7,18 @@ export function isFileComment(comment: Comment): boolean {
   return !comment.anchor_metadata;
 }
 
+/** Compare every immutable coordinate, normalizing the optional range start. */
+export function sameLocalReviewAnchor(expected: LocalReviewAnchor, actual: LocalReviewAnchor) {
+  return (
+    expected.pr_url === actual.pr_url &&
+    expected.side === actual.side &&
+    expected.line === actual.line &&
+    (expected.start_line ?? null) === (actual.start_line ?? null) &&
+    expected.head_sha === actual.head_sha &&
+    expected.base_sha === actual.base_sha
+  );
+}
+
 /** Validate persisted draft context before using its coordinates or body. */
 export function isLocalReviewComment(value: unknown): value is Comment {
   if (!value || typeof value !== "object") return false;

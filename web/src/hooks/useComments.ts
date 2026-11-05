@@ -1,4 +1,8 @@
-import { isLocalReviewComment, type LocalReviewAnchor } from "@/lib/localReviewComments";
+import {
+  isLocalReviewComment,
+  sameLocalReviewAnchor,
+  type LocalReviewAnchor,
+} from "@/lib/localReviewComments";
 import { removeLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -121,10 +125,7 @@ export async function createComment(
     (!isLocalReviewComment(comment) ||
       comment.conversation_id !== sessionId ||
       comment.path !== payload.path ||
-      !Object.entries(payload.anchor_metadata).every(
-        ([key, value]) =>
-          (comment.anchor_metadata?.[key as keyof LocalReviewAnchor] ?? null) === (value ?? null),
-      ))
+      !sameLocalReviewAnchor(payload.anchor_metadata, comment.anchor_metadata!))
   ) {
     const message = "This server did not preserve the review location. Your draft is saved.";
     // A mixed-version deployment may accept the request as an ordinary Files comment.
@@ -194,7 +195,13 @@ export function useUpdateComment(sessionId: string) {
         },
       );
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as Comment;
+      const comment: Comment = await res.json();
+      if (comment.id !== commentId || comment.conversation_id !== sessionId) {
+        throw new Error(
+          "This server returned a different comment. Your attached context is unchanged.",
+        );
+      }
+      return comment;
     },
     onSuccess: (comment) => {
       updateLocalReviewContext(comment);
