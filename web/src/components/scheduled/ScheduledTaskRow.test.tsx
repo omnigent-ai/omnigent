@@ -197,18 +197,29 @@ describe("last-run failure warning", () => {
   });
 });
 
-it("shows trigger status and hides Run now and next-run time for template tasks", async () => {
-  renderRow(
-    task({
-      prompt: "This automation watches Slack and starts one Omnigent session",
-      nextRunAt: "2026-03-10T14:00:00Z",
-    }),
-    {},
-    { triggerUi: true },
-  );
-  expect(screen.getByTestId("task-schedule-line")).toHaveTextContent("Runs when new items match");
-  expect(screen.queryByTestId("task-next-run")).not.toBeInTheDocument();
-  fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
-  expect(await screen.findByTestId("task-edit")).toBeInTheDocument();
-  expect(screen.queryByTestId("task-run-now")).not.toBeInTheDocument();
-});
+it.each(["continue", "new"] as const)(
+  "uses trigger controls only for continued templates: %s",
+  async (sessionMode) => {
+    renderRow(
+      task({
+        prompt: "This automation watches Slack and starts one Omnigent session",
+        sessionMode,
+        nextRunAt: "2026-03-10T14:00:00Z",
+      }),
+      {},
+      { triggerUi: true },
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(await screen.findByTestId("task-edit")).toBeInTheDocument();
+    if (sessionMode === "continue") {
+      expect(screen.getByTestId("task-schedule-line")).toHaveTextContent(
+        "Runs when new items match",
+      );
+      expect(screen.queryByTestId("task-next-run")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-run-now")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByTestId("task-next-run")).toBeInTheDocument();
+      expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    }
+  },
+);

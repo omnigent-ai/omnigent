@@ -254,7 +254,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
   }
 
   const triggerMode =
-    isFeatureEnabled(info, "automation_trigger_ui") && isTriggerPrompt(task.prompt);
+    isFeatureEnabled(info, "automation_trigger_ui") &&
+    task.sessionMode === "continue" &&
+    isTriggerPrompt(task.prompt);
   const paused = task.state === "paused";
   const { userPrompt, systemPrompt } = splitTriggerPrompt(task.prompt);
   const permissionOption = nativePermissionOptions(harness).find(

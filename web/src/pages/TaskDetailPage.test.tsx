@@ -1066,18 +1066,35 @@ describe("auto-mark runs unread", () => {
   });
 });
 
-it("presents a trigger without a Run now action or next-run timestamp", () => {
-  setTask(task({ prompt: "This automation watches Jira and starts one Omnigent session" }));
-  render(
-    <CapabilitiesProvider
-      info={{
-        ...SERVER_INFO_OFFLINE_FALLBACK,
-        features: { automations_v2: true, automation_trigger_ui: true },
-      }}
-    >
-      {pageTree()}
-    </CapabilitiesProvider>,
-  );
-  expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent("Runs when new items match");
-  expect(screen.queryByTestId("task-detail-run-now")).not.toBeInTheDocument();
-});
+it.each(["continue", "new"] as const)(
+  "keeps manual controls for new-session template prompts: %s",
+  (sessionMode) => {
+    setTask(
+      task({
+        prompt: "This automation watches Jira and starts one Omnigent session",
+        sessionMode,
+        nextRunAt: "2026-03-10T14:00:00Z",
+      }),
+    );
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true, automation_trigger_ui: true },
+        }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+    if (sessionMode === "continue") {
+      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent(
+        "Runs when new items match",
+      );
+      expect(screen.getByTestId("task-detail-schedule")).not.toHaveTextContent("Next run");
+      expect(screen.queryByTestId("task-detail-run-now")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent("Next run");
+      expect(screen.getByTestId("task-detail-run-now")).toBeInTheDocument();
+    }
+  },
+);

@@ -535,7 +535,9 @@ export function CreateScheduledTaskDialog({
       : "";
   const effectivePrompt =
     trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
-  const triggerMode = triggerUiEnabled && (trigger !== null || isTriggerPrompt(effectivePrompt));
+  const triggerMode =
+    triggerUiEnabled &&
+    (trigger !== null || (sessionMode === "continue" && isTriggerPrompt(effectivePrompt)));
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;

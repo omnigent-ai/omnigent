@@ -2459,6 +2459,24 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     });
   });
 
+  it("restores schedule controls after converting a template to new-session mode", async () => {
+    renderTrigger("jira", {
+      features: { automations_v2: true, automation_trigger_ui: true },
+      scheduled_task_subhour: true,
+    });
+    fillJira();
+    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
+    expect(screen.getByTestId("task-trigger-cadence")).toBeInTheDocument();
+    const sessionMode = screen.getByTestId("task-session-mode-trigger");
+    fireEvent.keyDown(sessionMode, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "New session each run" }));
+    expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
+    expect(screen.getByTestId("schedule-preset-trigger")).toBeInTheDocument();
+    await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
+  });
+
   it("replaces the prompt with a trigger builder, runs hourly and keeps one session", async () => {
     const user = userEvent.setup();
     const { onOpenChange } = renderTrigger("jira");

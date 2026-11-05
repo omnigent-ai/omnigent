@@ -54,6 +54,11 @@ to customize.
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
   failures still allow Default.
+- `trigger-controls`: with `automation_trigger_ui` enabled, continued trigger templates
+  show polling cadence instead of schedule controls, Run now, or next-run times.
+  New templates poll every ten minutes when supported, otherwise hourly; saved
+  schedules are preserved. Edit as prompt → New session each run restores the
+  scheduling controls, even when the prompt retains its template signature.
 - `schedule`: the shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
 - `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
@@ -63,7 +68,8 @@ to customize.
   nor editing a task saved from one shows the Session choice; templates always
   keep one session, and editing keeps only the reset to a new session.
 - `responsive`: gallery items have icons, descriptions, access requirements,
-  pointer cursors, and keyboard focus indicators; cadence is chosen in the form.
+  pointer cursors, and keyboard focus indicators. Continued trigger cadence is
+  fixed when `automation_trigger_ui` is enabled; other tasks expose schedule controls.
   Host occupies a full row above Schedule. Project and Workspace (or Repository)
   share a row on desktop and stack on narrow screens. Gallery cards use two
   columns on desktop and one on narrow screens.
@@ -98,7 +104,10 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`
   covers the preview and Templates tab with reload. It creates
-  a Jira automation and cross-checks the hourly schedule and prompt through REST.
+  a Jira automation and cross-checks the saved schedule and prompt through REST
+  with trigger controls enabled and disabled. With the flag enabled, it also
+  converts a template to new-session mode and verifies schedule controls, list
+  Run now/next-run, and detail Run now/next-run remain available.
   It edits the user prompt through the row menu and the system prompt through
   the detail page, checks persistence through REST, and reopens the editor. The
   preview entry runs at mobile width; the Templates entry runs at desktop width.
@@ -153,7 +162,8 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 
 ## Gotchas
 
-- These templates poll every hour; they do not receive service webhooks.
+- Templates poll every hour, or every ten minutes for new templates with
+  `automation_trigger_ui` and sub-hour support enabled; they do not receive webhooks.
 - Templates remain available even if loading the user's automation list fails.
 - Selecting a template does not create an automation until the modal is submitted.
 - The introduction's Example automations are read-only educational content and

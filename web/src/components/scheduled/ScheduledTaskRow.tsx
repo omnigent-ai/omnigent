@@ -65,7 +65,9 @@ export function ScheduledTaskRow({
   const info = useServerInfo();
   const detailPageEnabled = isFeatureEnabled(info, "automations_v2");
   const triggerMode =
-    isFeatureEnabled(info, "automation_trigger_ui") && isTriggerPrompt(task.prompt);
+    isFeatureEnabled(info, "automation_trigger_ui") &&
+    task.sessionMode === "continue" &&
+    isTriggerPrompt(task.prompt);
   const [menuOpen, setMenuOpen] = useState(false);
   const { trackClick } = useOmnigentAnalytics();
   const failureLabelId = useId();

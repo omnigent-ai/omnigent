@@ -1010,9 +1010,19 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page: Page,
     automations_v2_server: str,
     entry: str,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Create from either gallery and edit user/system prompts independently."""
     live_server = automations_v2_server
+    trigger_ui = "automation_trigger_ui" in request.node.callspec.params[
+        "automations_v2_server"
+    ].split(",")
+    assert (
+        httpx.get(f"{live_server}/v1/info", timeout=10)
+        .json()["features"]
+        .get("automation_trigger_ui", False)
+        == trigger_ui
+    )
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
     page.set_viewport_size({"width": 390 if entry == "preview" else 1280, "height": 900})
     _open_automations_page(page, live_server)
@@ -1073,11 +1083,6 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == name)
     assert created["session_mode"] == "continue", created
-    trigger_ui = (
-        httpx.get(f"{live_server}/v1/info", timeout=10)
-        .json()["features"]
-        .get("automation_trigger_ui", False)
-    )
     assert created["rrule"].startswith(
         "FREQ=MINUTELY;INTERVAL=10" if trigger_ui else "FREQ=HOURLY"
     ), created
@@ -1145,6 +1150,25 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     if trigger_ui:
         expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
         expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
+        manual_name = f"Manual from template {uuid.uuid4().hex[:8]}"
+        page.get_by_test_id("task-name-input").fill(manual_name)
+        page.get_by_test_id("task-trigger-scope").fill("#support")
+        page.get_by_test_id("task-trigger-instructions").fill("Summarize new messages.")
+        page.get_by_test_id("task-trigger-preview").locator("summary").click()
+        page.get_by_test_id("task-trigger-edit-as-prompt").click()
+        _pick_select_option(page, "task-session-mode-trigger", "New session each run")
+        expect(page.get_by_test_id("schedule-preset-trigger")).to_be_visible()
+        expect(page.get_by_test_id("task-trigger-cadence")).to_have_count(0)
+        page.get_by_test_id("create-scheduled-task-submit").click()
+        expect(page.get_by_role("dialog")).to_have_count(0)
+        manual_row = _row_by_name(page, manual_name)
+        expect(manual_row.get_by_test_id("task-next-run")).to_be_visible()
+        manual_row.get_by_test_id("task-row-menu").click()
+        expect(page.get_by_test_id("task-run-now")).to_be_visible()
+        page.keyboard.press("Escape")
+        manual_row.get_by_test_id("task-row-open").click()
+        expect(page.get_by_test_id("task-detail-run-now")).to_be_visible()
+        expect(page.get_by_test_id("task-detail-schedule")).to_contain_text("Next run")
 
 
 def test_ten_minute_host_schedule_round_trip(
