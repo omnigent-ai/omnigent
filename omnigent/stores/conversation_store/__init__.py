@@ -2438,7 +2438,9 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    async def delete_conversation(self, conversation_id: str) -> bool:
+    async def delete_conversation(
+        self, conversation_id: str, *, preserve_host_binding: str | None = None
+    ) -> bool:
         """
         Delete a conversation and all its items.
 
@@ -2447,6 +2449,8 @@ class ConversationStore(ABC):
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param preserve_host_binding: Keep the root's metadata reservation when
+            it is bound to this host, for replacement under the same session id.
         :returns: ``True`` if the conversation existed,
             ``False`` otherwise.
         """

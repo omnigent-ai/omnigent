@@ -145,6 +145,7 @@ from omnigent.stores.sandbox_profile_store import (
 _logger = logging.getLogger(__name__)
 
 _DELETE_METADATA_BATCH_SIZE = 100
+_DELETE_LABEL_BATCH_SIZE = 100
 _FAMILY_READ_BATCH_SIZE = 10
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
@@ -1242,6 +1243,16 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             def insert_metadata(meta_sess: Session) -> SqlConversationMetadata:
                 lock_host_for_binding(meta_sess, host_id)
+                previous = meta_sess.get(SqlConversationMetadata, (current_workspace_id(), new_id))
+                if previous is not None:
+                    # ponytail: keep the binding so replacement can resume after a crash.
+                    if previous.host_id != host_id:
+                        raise OmnigentError(
+                            "Incomplete conversation replacement must reuse its host",
+                            code=ErrorCode.CONFLICT,
+                        )
+                    meta_sess.delete(previous)
+                    meta_sess.flush()
                 meta = SqlConversationMetadata(
                     id=new_id,
                     kind=encoded_kind,
@@ -1301,18 +1312,39 @@ class SqlAlchemyConversationStore(ConversationStore):
         if self._get_meta(conversation_id) is not None:
             return
 
-        def write(session: Session) -> None:
-            for model, identity in (
-                (SqlConversationLabel, SqlConversationLabel.conversation_id),
-                (SqlConversation, SqlConversation.id),
-            ):
+        def write(session: Session) -> bool:
+            keys = list(
+                session.scalars(
+                    select(SqlConversationLabel.key)
+                    .where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                    )
+                    .order_by(SqlConversationLabel.key)
+                    .limit(_DELETE_LABEL_BATCH_SIZE)
+                )
+            )
+            if keys:
                 session.execute(
-                    delete(model).where(
-                        model.workspace_id == current_workspace_id(), identity == conversation_id
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key.in_(keys),
                     )
                 )
+            else:
+                session.execute(
+                    delete(SqlConversation).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                    )
+                )
+            return bool(keys)
 
-        run_write_transaction(self._conv_session_immediate, "discard_unbound_conversation", write)
+        while run_write_transaction(
+            self._conv_session_immediate, "discard_unbound_conversation", write
+        ):
+            pass
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
@@ -6612,7 +6644,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 is not None
             )
 
-    async def delete_conversation(self, conversation_id: str) -> bool:
+    async def delete_conversation(
+        self, conversation_id: str, *, preserve_host_binding: str | None = None
+    ) -> bool:
         """
         Delete a conversation and all of its descendants, cleaning up
         every related row explicitly (no DB-level CASCADE).
@@ -6624,6 +6658,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param preserve_host_binding: Keep the root's metadata reservation for
+            same-host replacement. Creation consumes it under the host lock.
         :returns: ``True`` if the conversation existed,
             ``False`` otherwise.
         """
@@ -6740,12 +6776,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionPermission.conversation_id.in_(batch_ids),
                 )
             )
-            session.execute(
-                delete(SqlConversationMetadata).where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id.in_(batch_ids),
-                )
+            metadata_delete = delete(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id.in_(batch_ids),
             )
+            if preserve_host_binding is not None:
+                metadata_delete = metadata_delete.where(
+                    or_(
+                        SqlConversationMetadata.id != conversation_id,
+                        SqlConversationMetadata.host_id.is_(None),
+                        SqlConversationMetadata.host_id != preserve_host_binding,
+                    )
+                )
+            session.execute(metadata_delete)
 
             for host in hosts:
                 task_id = retained_tasks.get(host.host_id)

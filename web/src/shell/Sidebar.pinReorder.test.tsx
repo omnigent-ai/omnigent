@@ -68,7 +68,9 @@ async function dropOnto(
   targetId: string,
   { expectTarget = true, whileOver = () => {} } = {},
 ) {
-  const source = screen.getAllByRole("link", { name: sourceId })[0].closest("li")!;
+  const sources = document.querySelectorAll(`li[data-sidebar-session-id="${sourceId}"]`);
+  expect(sources).toHaveLength(1);
+  const source = sources[0];
   const start = rowCenter(sourceId);
   const target = rowCenter(targetId);
   fireEvent.mouseDown(source, { button: 0, ...start });

@@ -726,6 +726,16 @@ describe("NewChatLandingScreen nested agent creation", () => {
   it.each([false, true])(
     "submits the clicked source for JSON and uploaded agents (bundle=%s)",
     async (bundled) => {
+      vi.mocked(getSessionSlim).mockImplementation(async (id) => ({ ...SOURCE_SESSION, id }));
+      searchParams = new URLSearchParams("sibling=other");
+      renderLanding({ sibling_sessions: true });
+      fireEvent.change(await screen.findByTestId("new-chat-landing-input"), {
+        target: { value: "Keep this other draft" },
+      });
+      fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+        target: { files: [new File(["other"], "other.txt", { type: "text/plain" })] },
+      });
+      cleanup();
       searchParams = new URLSearchParams("sibling=source");
       renderLanding({ sibling_sessions: true });
       await screen.findByRole("heading", { name: "Add nested agent" });
@@ -734,6 +744,9 @@ describe("NewChatLandingScreen nested agent creation", () => {
         "aria-label",
         "Host: This machine, Online",
       );
+      fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+        target: { files: [new File(["submitted"], "submitted.txt", { type: "text/plain" })] },
+      });
       if (bundled) {
         fireEvent.click(screen.getByTestId("test-create-pending"));
         fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -756,6 +769,19 @@ describe("NewChatLandingScreen nested agent creation", () => {
           workspace: REPO,
         });
       }
+      await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+      cleanup();
+      renderLanding({ sibling_sessions: true });
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("");
+      expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+      cleanup();
+      searchParams = new URLSearchParams("sibling=other");
+      renderLanding({ sibling_sessions: true });
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(
+        "Keep this other draft",
+      );
+      expect(screen.getByText("other.txt")).toBeVisible();
+      expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
     },
   );
 });

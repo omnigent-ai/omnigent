@@ -500,8 +500,8 @@ be selected. Older servers keep the fresh-sandbox choices. A fork
 of any sandbox session defaults to a fresh sandbox from the source's provider
 when the server offers it, otherwise to its reusable online sandbox, then to a
 connected host.
-**Continue in another directory…** on these sessions continues on a connected
-host; like any recovery, it never offers a new sandbox. The composer's host
+**Continue in another directory…** can use a connected host or the same online
+sandbox, with an explicitly chosen existing directory; it never offers a new sandbox. The composer's host
 menu shows a disabled **Switch host…** item when you have write access.
 Read-only viewers retain the existing host menu without switching controls.
 Hover or focus a disabled action to read why it is unsupported.

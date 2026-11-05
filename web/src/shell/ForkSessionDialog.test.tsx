@@ -1051,31 +1051,45 @@ describe("ForkSessionDialog", () => {
     };
 
     it.each([
-      ["plain directory", "/Users/a/repo", null],
-      ["worktree", RECOVERY.sourceWorkspace, RECOVERY.sourceGitBranch],
-      ["worktree without a recorded branch", RECOVERY.sourceWorkspace, null],
-    ])("requires a directory instead of prefilling the missing %s", (_name, workspace, branch) => {
-      renderDialog({ ...RECOVERY, sourceWorkspace: workspace, sourceGitBranch: branch });
+      ["plain directory", "/Users/a/repo", null, null],
+      ["worktree", RECOVERY.sourceWorkspace, RECOVERY.sourceGitBranch, null],
+      ["worktree without a recorded branch", RECOVERY.sourceWorkspace, null, null],
+      ["sandbox directory", "/Users/a/repo", null, "modal"],
+    ])(
+      "requires a directory instead of prefilling the missing %s",
+      (_name, workspace, branch, provider) => {
+        if (provider) setHosts([host({ sandbox_provider: provider })]);
+        renderDialog({
+          ...RECOVERY,
+          sourceWorkspace: workspace,
+          sourceGitBranch: branch,
+          info: { sibling_sessions: true },
+        });
 
-      expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
-      expect(
-        screen.getByText(
-          "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.",
-        ),
-      ).toBeVisible();
-      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
-      expect(screen.getByTestId("workspace-path-input")).toBeVisible();
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
-      // Offered up front, but never prefilled with the missing worktree's branch.
-      expect(screen.getByTestId("fork-session-branch-input")).toBeVisible();
-      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
-      expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Continue" })).toHaveAttribute(
-        "aria-disabled",
-        "true",
-      );
-      expect(forkSessionMock).not.toHaveBeenCalled();
-    });
+        expect(
+          screen.getByRole("heading", { name: "Continue in another directory" }),
+        ).toBeVisible();
+        expect(
+          screen.getByText(
+            "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.",
+          ),
+        ).toBeVisible();
+        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent(
+          provider ? "Same sandbox" : "serena-laptop",
+        );
+        expect(screen.getByTestId("workspace-path-input")).toBeVisible();
+        expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+        // Offered up front, but never prefilled with the missing worktree's branch.
+        expect(screen.getByTestId("fork-session-branch-input")).toBeVisible();
+        expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
+        expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Continue" })).toHaveAttribute(
+          "aria-disabled",
+          "true",
+        );
+        expect(forkSessionMock).not.toHaveBeenCalled();
+      },
+    );
 
     it("rejects a missing chosen path without recreating its worktree or creating a session", async () => {
       checkHostDirectoryMock.mockResolvedValue("The working directory doesn't exist on this host.");

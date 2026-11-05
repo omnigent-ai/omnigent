@@ -54,8 +54,9 @@ def _set_updated_at(db_uri: str, host_id: str, value: int) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("split_database", [False, True])
 async def test_session_delete_keeps_shared_sandbox_until_last_binding(
-    host_store: HostStore, db_uri: str, archived: bool
+    host_store: HostStore, db_uri: str, archived: bool, split_database, tmp_path, monkeypatch
 ) -> None:
     host_id = uuid.uuid4().hex
     host_store.register_managed_host(
@@ -67,7 +68,9 @@ async def test_session_delete_keeps_shared_sandbox_until_last_binding(
         sandbox_id="shared-sandbox",
         token_expires_at=now_epoch() + 1000,
     )
-    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations = SqlAlchemyConversationStore(
+        db_uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
     first = conversations.create_conversation(host_id=host_id, workspace="/work")
     other = conversations.create_conversation(host_id=host_id, workspace="/work")
     if archived:
@@ -78,15 +81,39 @@ async def test_session_delete_keeps_shared_sandbox_until_last_binding(
     assert await conversations.delete_conversation(first.id)
     assert host_store.get_host(host_id) is not None
     assert conversations.get_conversation(other.id).host_id == host_id
+    assert await conversations.delete_conversation(other.id, preserve_host_binding=host_id)
+    assert conversations.get_conversation(other.id) is None
+    assert host_store.delete_host(host_id, keep_if_bound=True) is None
+    conversations.create_conversation(
+        conversation_id=other.id, host_id=host_id, workspace="/replacement"
+    )
+    assert host_store.resolve_launch_token(host_id, "shared-token") is not None
     assert await conversations.delete_conversation(other.id)
     assert host_store.get_host(host_id) is None
     pending = host_store.get_host(host_id, include_deleted=True)
     assert pending is not None and pending.deleted_at is not None
     assert pending.sandbox_id == "shared-sandbox"
-    with pytest.raises(OmnigentError, match="being deleted"):
-        conversations.create_conversation(
-            conversation_id=first.id, host_id=host_id, workspace="/work", labels={"test": "1"}
-        )
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "_DELETE_LABEL_BATCH_SIZE", 2)
+    deleted_labels = []
+
+    def capture_cleanup(_connection, cursor, statement, _parameters, _context, _many):
+        if statement.startswith("DELETE FROM conversation_labels"):
+            deleted_labels.append(cursor.rowcount)
+
+    event.listen(conversations._conv_engine, "after_cursor_execute", capture_cleanup)
+    try:
+        with pytest.raises(OmnigentError, match="being deleted"):
+            conversations.create_conversation(
+                conversation_id=first.id,
+                host_id=host_id,
+                workspace="/work",
+                labels={f"label-{index}": "1" for index in range(7)},
+            )
+    finally:
+        event.remove(conversations._conv_engine, "after_cursor_execute", capture_cleanup)
+    assert deleted_labels == [2, 2, 2, 1]
     assert conversations.get_conversation(first.id) is None
 
 
