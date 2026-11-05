@@ -338,6 +338,26 @@ function isDotMarker(state: SessionState | null): boolean {
 }
 const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
 
+// Per trailing slot: the title's right reserve, and with the w-6 shared icon,
+// a wider reserve plus the icon offset that sits it just left of the slot.
+const TRAILING_SLOT_LAYOUT = {
+  awaiting: { reserve: "pr-29", sharedReserve: "pr-36", sharedIcon: "right-29" },
+  marker: { reserve: "pr-8", sharedReserve: "pr-14", sharedIcon: "right-8" },
+  updated: { reserve: "pr-11", sharedReserve: "pr-18", sharedIcon: "right-11" },
+  none: { reserve: "pr-2", sharedReserve: "pr-8", sharedIcon: "right-1" },
+} as const;
+
+function trailingSlotKind(
+  state: SessionState | null,
+  hasSessionIndicator: boolean,
+  showUpdated: boolean,
+): keyof typeof TRAILING_SLOT_LAYOUT {
+  if (state?.kind === "awaiting") return "awaiting";
+  if (hasSessionIndicator) return "marker";
+  if (showUpdated) return "updated";
+  return "none";
+}
+
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 // Stable sensor options keep dnd-kit from rerendering every row on list updates.
@@ -5169,7 +5189,8 @@ function ConversationRowImpl({
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
-  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
+  const trailingLayout =
+    TRAILING_SLOT_LAYOUT[trailingSlotKind(sessionState, hasSessionIndicator, showUpdated)];
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -5430,19 +5451,7 @@ function ConversationRowImpl({
         // reserves only what the badge needs — the same width desktop uses at
         // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? showSharedIndicator
-              ? "pr-36"
-              : "pr-29"
-            : showUpdated
-              ? showSharedIndicator
-                ? "pr-18"
-                : "pr-11"
-              : hasSessionIndicator && showSharedIndicator
-                ? "pr-14"
-                : hasTrailingIndicator
-                  ? "pr-8"
-                  : "pr-2"),
+          (showSharedIndicator ? trailingLayout.sharedReserve : trailingLayout.reserve),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -5691,7 +5700,7 @@ function ConversationRowImpl({
           className={cn(
             "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
             overlayTop,
-            hasSessionIndicator ? "right-8" : showUpdated ? "right-11" : "right-1",
+            trailingLayout.sharedIcon,
           )}
         >
           <UsersIcon className="size-3.5" aria-hidden="true" />

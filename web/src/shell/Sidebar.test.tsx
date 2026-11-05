@@ -450,6 +450,11 @@ describe("Sidebar session list", () => {
           shared_with_others: true,
           status: "running",
         }),
+        conv("owned_shared_awaiting", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: true,
+          pending_elicitations_count: 1,
+        }),
         conv("owned_private", "Claude Code", {
           owner: "viewer@example.com",
           shared_with_others: false,
@@ -472,6 +477,13 @@ describe("Sidebar session list", () => {
       expect(within(runningRow).getByTestId("session-state-badge").parentElement).toHaveClass(
         "right-1",
       );
+      // The natural-width "Needs response" pill reserves pr-29, so the icon sits
+      // at that edge and the title reserve grows to cover both.
+      const awaitingRow = screen.getByText("owned_shared_awaiting").closest("li")!;
+      expect(within(awaitingRow).getByRole("img", { name: "Shared session" })).toHaveClass(
+        "right-29",
+      );
+      expect(awaitingRow.querySelector("a")).toHaveClass("pr-36");
       const privateRow = screen.getByText("owned_private").closest("li")!;
       expect(within(privateRow).queryByRole("img", { name: "Shared session" })).toBeNull();
       const legacyRow = screen.getByText("owned_legacy").closest("li")!;
