@@ -479,14 +479,23 @@ describe("ChatComposer", () => {
 describe("ChatComposer label collapse", () => {
   class StubResizeObserver {
     static callbacks: ResizeObserverCallback[] = [];
+    static targets = new Map<Element, ResizeObserverCallback>();
+    callback: ResizeObserverCallback;
     constructor(callback: ResizeObserverCallback) {
+      this.callback = callback;
       StubResizeObserver.callbacks.push(callback);
     }
-    observe(): void {}
+    observe(target: Element): void {
+      StubResizeObserver.targets.set(target, this.callback);
+    }
     unobserve(): void {}
     disconnect(): void {}
   }
-  const fireResize = () => {
+  const fireResize = (target?: Element) => {
+    if (target) {
+      StubResizeObserver.targets.get(target)?.([], {} as ResizeObserver);
+      return;
+    }
     for (const callback of StubResizeObserver.callbacks) callback([], {} as ResizeObserver);
   };
   // Width of a group once its label is hidden and only the icon remains.
@@ -495,6 +504,7 @@ describe("ChatComposer label collapse", () => {
 
   afterEach(() => {
     StubResizeObserver.callbacks = [];
+    StubResizeObserver.targets.clear();
     vi.unstubAllGlobals();
   });
 
@@ -557,6 +567,25 @@ describe("ChatComposer label collapse", () => {
     expect(row).toHaveAttribute("data-labels", "collapsed");
     layout.rowWidth = 180 + 150 + COMPOSER_LABELS_MIN_GAP_PX + ROW_PADDING;
     fireResize();
+    expect(row).not.toHaveAttribute("data-labels");
+  });
+
+  it("restores labels after a control group settles without changing the row width", () => {
+    const { row, layout } = renderMeasuredComposer({
+      leading: <span>Manual</span>,
+      trailing: <span>Sonnet</span>,
+    });
+    layout.rowWidth = 300;
+    const leading = screen.getByTestId("leading");
+    let naturalWidth = 350;
+    Object.defineProperty(leading, "scrollWidth", {
+      configurable: true,
+      get: () => naturalWidth,
+    });
+    fireResize();
+    expect(row).toHaveAttribute("data-labels", "collapsed");
+    naturalWidth = 80;
+    fireResize(leading);
     expect(row).not.toHaveAttribute("data-labels");
   });
 

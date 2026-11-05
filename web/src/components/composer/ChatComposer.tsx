@@ -243,6 +243,8 @@ function useCollapsedComposerLabels(
     if (typeof ResizeObserver === "undefined") return;
     const resizeObserver = new ResizeObserver(measure);
     resizeObserver.observe(width);
+    resizeObserver.observe(leading);
+    resizeObserver.observe(trailing);
     const mutationObserver = new MutationObserver(measure);
     mutationObserver.observe(row, { childList: true, characterData: true, subtree: true });
     return () => {
