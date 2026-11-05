@@ -91,7 +91,7 @@ beforeEach(() => {
   vi.mocked(api.createScheduledTask).mockResolvedValue(TASK);
   vi.mocked(api.updateScheduledTask).mockResolvedValue({ ...TASK, state: "paused" });
   vi.mocked(api.deleteScheduledTask).mockResolvedValue(undefined);
-  vi.mocked(api.runScheduledTaskNow).mockResolvedValue(undefined);
+  vi.mocked(api.runScheduledTaskNow).mockResolvedValue("run_1");
 });
 
 afterEach(() => {
@@ -158,9 +158,15 @@ describe("mutations invalidate the list", () => {
 
   it("run-now calls the API and immediately invalidates the list, detail + runs", async () => {
     const { queryClient, wrapper } = makeWrapper();
+    queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [RUN]);
+    const runs = renderHook(() => useScheduledTaskRuns("st_1"), { wrapper });
+    expect(runs.result.current.isFetchedAfterMount).toBe(false);
+    expect(api.listScheduledTaskRuns).not.toHaveBeenCalled();
     const spy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
-    await result.current.mutateAsync("st_1");
+    expect(await result.current.mutateAsync("st_1")).toBe("run_1");
+    await waitFor(() => expect(runs.result.current.isFetchedAfterMount).toBe(true));
+    expect(api.listScheduledTaskRuns).toHaveBeenCalledTimes(1);
     expect(api.runScheduledTaskNow).toHaveBeenCalledWith("st_1");
     // Refreshes the list (so the completion badge updates)…
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });

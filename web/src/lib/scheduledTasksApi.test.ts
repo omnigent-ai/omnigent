@@ -16,6 +16,7 @@ import {
   listScheduledTaskRuns,
   listScheduledTasks,
   listAutomationFailures,
+  runScheduledTaskNow,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -61,6 +62,20 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   setOmnigentHostConfig({});
+});
+
+describe("runScheduledTaskNow", () => {
+  it.each([
+    [{ triggered: true, id: "st_1", run_id: "run_1" }, "run_1"],
+    [{ triggered: true, id: "st_1" }, null],
+  ])("returns the run ID when the server provides one: %j", async (body, expected) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(body, { status: 202 }));
+    expect(await runScheduledTaskNow("st_1")).toBe(expected);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/scheduled-tasks/st_1/run",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
 });
 
 describe("listScheduledTasks", () => {
@@ -142,6 +157,7 @@ describe("listScheduledTaskRuns", () => {
       viewerLastSeen: null,
       viewerUnread: null,
       sessionCostUsd: null,
+      conversationPendingApprovals: 0,
     });
   });
 
@@ -187,6 +203,7 @@ describe("listScheduledTaskRuns", () => {
               },
             ],
             more_objectives: true,
+            conversation_pending_approvals: 2,
           },
         ],
       }),
@@ -208,6 +225,7 @@ describe("listScheduledTaskRuns", () => {
         { id: "o2", objective: null, createdAt: 1_700_000_020, outcome: null },
       ],
       moreObjectives: true,
+      conversationPendingApprovals: 2,
     });
   });
 });

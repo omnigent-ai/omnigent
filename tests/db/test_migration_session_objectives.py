@@ -22,7 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from omnigent.db.db_models import SqlSessionObjective
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 
-_PREVIOUS = "e5b2c8d4f1a7"
+_PREVIOUS = "c7cd88f24c1c"
 _REVISION = "74b9abb2854c"
 _TABLE = "session_objectives"
 _SESSION = bytes.fromhex("0123456789abcdef0123456789abcdef")

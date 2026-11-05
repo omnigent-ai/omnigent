@@ -1,7 +1,7 @@
 """Add the objectives and outcomes an agent records for its session.
 
 Revision ID: 74b9abb2854c
-Revises: e5b2c8d4f1a7
+Revises: c7cd88f24c1c
 
 A session's status says whether its turns finished, not whether the agent did
 what it set out to do. The new ``session_objectives`` table holds what an
@@ -32,7 +32,7 @@ revision the build does not know.
 
 Rollback: stop the servers, downgrade with a build that includes this
 migration (``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini
-downgrade e5b2c8d4f1a7``), then start the older build. Downgrade drops the
+downgrade c7cd88f24c1c``), then start the older build. Downgrade drops the
 table and every recorded objective and outcome.
 """
 
@@ -44,7 +44,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "74b9abb2854c"
-down_revision: str | None = "e5b2c8d4f1a7"
+down_revision: str | None = "c7cd88f24c1c"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 

@@ -165,11 +165,6 @@
   --text-xs--line-height: var(--text-sm--line-height);
 }
 
-/* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
- * ~#007AFF light, ~#0A84FF dark). Reserved for focus rings, charts,
- * unread state, and the active sidebar highlight; surfaces and primary
- * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
- * describes the older cobalt direction). */
 :root {
   /* User-controlled UI font size (see Appearance settings /
    * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
@@ -1948,19 +1943,9 @@ html[data-electron-mac] .breadcrumb-folder {
   animation: shimmer-sweep var(--shimmer-duration, 2s) linear infinite;
 }
 
-/* Otto working indicator: gentle bob + periodic blink (see OttoIcon.tsx).
+/* Otto working indicator: periodic blink (see OttoIcon.tsx).
  * Opt-in via .otto-working so the mascot can also render static. The global
- * reduced-motion gate below freezes both animations. */
-@keyframes otto-bob {
-  0%,
-  100% {
-    transform: translateY(5%);
-  }
-  50% {
-    transform: translateY(-5%);
-  }
-}
-
+ * reduced-motion gate below freezes the blink. */
 @keyframes otto-blink {
   0%,
   88%,
@@ -1971,10 +1956,6 @@ html[data-electron-mac] .breadcrumb-folder {
   92% {
     transform: scaleY(0.1);
   }
-}
-
-.otto-working {
-  animation: otto-bob 1.6s ease-in-out infinite;
 }
 
 .otto-working .otto-eye {
