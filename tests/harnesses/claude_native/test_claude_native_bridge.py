@@ -11334,16 +11334,24 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     assert len(captures) == 2
 
 
-def test_wait_for_claude_prompt_ready_holds_for_a_launcher_update(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "banner",
+    [
+        "Updating Claude Code from 2.1.314 to 2.1.316\n",
+        "No Claude Code installation found; installing it now.\n",
+    ],
+    ids=["update", "install"],
+)
+def test_wait_for_claude_prompt_ready_holds_for_a_launcher_install(
+    monkeypatch: pytest.MonkeyPatch, banner: str
 ) -> None:
-    """A launcher still updating Claude Code is reported as awaiting, not waited out and reaped."""
+    """A launcher still installing Claude Code is reported as awaiting; the pane is not reaped."""
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captures: list[int] = []
 
     def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
         captures.append(1)
-        return "Updating Claude Code from 2.1.314 to 2.1.316\n"
+        return banner
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
     monkeypatch.setattr(
@@ -11357,7 +11365,7 @@ def test_wait_for_claude_prompt_ready_holds_for_a_launcher_update(
             timeout_s=30.0,
         )
     assert str(raised.value).startswith(
-        "Claude Code's launch command is still updating Claude Code in its terminal"
+        "Claude Code's launch command is still installing Claude Code in its terminal"
     )
     assert raised.value.awaits_answer is True
     assert len(captures) == 2

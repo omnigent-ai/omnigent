@@ -160,8 +160,9 @@ def test_an_occupied_input_box_refusal_awaits_no_answer(
         # The launcher's install question is answered in the same terminal.
         ("No Claude Code installation found. Would you like to install it? [Y/n]:", True),
         ("Would you like to install it? [Y/n]: y\nInstalling Claude Code...", False),
-        # The launcher's update holds the terminal until Claude Code redraws it.
+        # The launcher's install or update holds the terminal until Claude Code redraws it.
         ("Updating Claude Code from 2.1.314 to 2.1.316\n", True),
+        ("No Claude Code installation found; installing it now.\n", True),
         (
             "Updating Claude Code from 2.1.314 to 2.1.316\n"
             f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n",
@@ -179,6 +180,7 @@ def test_an_occupied_input_box_refusal_awaits_no_answer(
         "install-prompt",
         "install-answered",
         "updating",
+        "installing",
         "updated-and-ready",
         "update-failed",
         "composer",
