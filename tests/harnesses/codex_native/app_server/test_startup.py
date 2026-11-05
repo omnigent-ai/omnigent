@@ -1137,8 +1137,32 @@ async def test_readiness_failure_records_app_server_state_before_cleanup(
     assert "--listen" not in repr(snapshot)
 
 
+@pytest.mark.parametrize(
+    ("wrapper", "client_surface", "expected_prefix"),
+    [
+        (
+            ("env", "MODE=omni", "isaac", "codex", "--"),
+            "web",
+            ("MODE=omni", "isaac", "codex", "--"),
+        ),
+        (
+            ("/usr/local/bin/isaac", "codex", "--"),
+            "web",
+            ("--surface", "omnigent-web", "codex", "--"),
+        ),
+        (
+            ("/usr/local/bin/dbexec", "repo", "run", "isaac", "--", "codex", "--"),
+            "desktop",
+            ("repo", "run", "isaac", "--", "--surface", "omnigent-desktop", "codex", "--"),
+        ),
+    ],
+)
 async def test_session_app_server_launches_through_the_configured_wrapper(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper: tuple[str, ...],
+    client_surface: str,
+    expected_prefix: tuple[str, ...],
 ) -> None:
     """A configured wrapper replaces the Codex executable; Omnigent's argv follows its args."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
@@ -1161,20 +1185,19 @@ async def test_session_app_server_launches_through_the_configured_wrapper(
     workspace = tmp_path / "work"
     workspace.mkdir()
     server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
-    server.app_server_command = ("env", "MODE=omni", "isaac", "codex", "--")
+    server.app_server_command = wrapper
+    server.env["OMNIGENT_CLIENT_SURFACE"] = client_surface
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "cli")
     server.config_overrides = ['model_provider="p"', 'model="m"']
 
     await server._spawn_app_server_process("unix:///tmp/codex.sock")
     if server.stderr_task is not None:
         await server.stderr_task
 
-    assert spawned["executable"] == "env"
+    assert spawned["executable"] == wrapper[0]
     # Wrapper args, then Omnigent's -c (joining the wrapper's top-level group), then app-server.
     assert spawned["argv"][1:] == (
-        "MODE=omni",
-        "isaac",
-        "codex",
-        "--",
+        *expected_prefix,
         "-c",
         'model_provider="p"',
         "-c",

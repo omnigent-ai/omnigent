@@ -14,7 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import Final, TypeVar
 from urllib.parse import urlparse
 
@@ -242,6 +243,21 @@ _ATTRIBUTION_HEADER_NAMES: Final[tuple[str, str]] = (CODING_AGENT_HEADER, CLIENT
 _ATTRIBUTION_HEADER_KEYS: Final[frozenset[str]] = frozenset(
     name.lower() for name in _ATTRIBUTION_HEADER_NAMES
 )
+
+
+def with_isaac_client_surface(
+    command: str, args: Sequence[str], *, client_surface: str | None
+) -> list[str]:
+    """Attribute the inner Isaac launch before its harness passthrough separator."""
+    launch_args = list(args)
+    if Path(command).name == "isaac":
+        offset = 0
+    elif Path(command).name == "dbexec" and launch_args[:4] == ["repo", "run", "isaac", "--"]:
+        offset = 4
+    else:
+        return launch_args
+    surface = _OMNIGENT_CLIENT_SURFACES.get(client_surface or "", "omnigent")
+    return [*launch_args[:offset], "--surface", surface, *launch_args[offset:]]
 
 
 def gateway_attribution_headers(

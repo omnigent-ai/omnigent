@@ -35,6 +35,13 @@ outranks it.
 The wrapper chooses which Codex it runs; ``OMNIGENT_CODEX_PATH`` still names the
 binary Omnigent version-checks and keys the model catalog on, so keep them the same.
 
+Native Claude and Codex app-server launches through ``isaac`` or
+``dbexec repo run isaac --`` receive ``--surface`` from the session's creating
+client (for example, ``omnigent-web`` or ``omnigent-desktop``). These wrappers
+must use an Isaac version supporting that flag; verify on the execution host
+with ``isaac --surface omnigent-web --help``. Other custom wrappers own their
+argument forwarding.
+
 Validation is warn+skip: an unknown harness id or a structurally
 malformed entry warns and is ignored, so a bad config never crashes
 ``config list`` / ``doctor`` / every command's config load.

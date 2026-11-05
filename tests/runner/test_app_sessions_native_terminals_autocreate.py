@@ -1892,11 +1892,28 @@ async def test_native_launch_arms_resolve_agent_spec_for_terminal(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
+@pytest.mark.parametrize(
+    ("launch_command", "base_args", "client_surface", "expected_prefix"),
+    [
+        ("user-claude", [], "web", []),
+        ("isaac", ["--"], "desktop", ["--surface", "omnigent-desktop", "--"]),
+        (
+            "/usr/local/bin/dbexec",
+            ["repo", "run", "isaac", "--", "--"],
+            "web",
+            ["repo", "run", "isaac", "--", "--surface", "omnigent-web", "--"],
+        ),
+    ],
+)
 async def test_auto_create_claude_terminal_passes_session_effort(
     use_envelope: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    launch_command: str,
+    base_args: list[str],
+    client_surface: str,
+    expected_prefix: list[str],
 ) -> None:
     """
     Host-spawned terminal launch reads session effort and passes ``--effort``.
@@ -1922,7 +1939,8 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     config_home = tmp_path / "config-home"
     config_home.mkdir()
     (config_home / "config.yaml").write_text(
-        "harness:\n  claude-native:\n    command: user-claude\n"
+        f"harness:\n  claude-native:\n    command: {launch_command}\n"
+        f"    args: {json.dumps(base_args)}\n"
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
     monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
@@ -1974,10 +1992,13 @@ async def test_auto_create_claude_terminal_passes_session_effort(
         else None
     )
 
+    registry = _RecordingClaudeRegistry(captured)
+    registry.set_client_surface(session_id, client_surface)
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "cli")
     with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
         await _auto_create_claude_terminal(
             session_id,
-            _RecordingClaudeRegistry(captured),
+            registry,
             lambda _sid, _evt: None,
             server_client=fake_client,
             session_init=session_init,
@@ -1985,7 +2006,10 @@ async def test_auto_create_claude_terminal_passes_session_effort(
 
     args = captured["spec"].args
     assert captured["spec"].os_env.cwd == str(workspace)
-    assert captured["spec"].command == "user-claude"
+    assert captured["spec"].command == launch_command
+    assert args[: len(expected_prefix)] == expected_prefix
+    if not expected_prefix:
+        assert "--surface" not in args
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
