@@ -825,7 +825,7 @@ describe("undelivered startup messages", () => {
     );
 
     expect(screen.getByTestId("message-undelivered")).toHaveTextContent("Not delivered");
-    fireEvent.click(screen.getByRole("button", { name: "Start a new session with this message" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy message to new session" }));
 
     await waitFor(() => expect(screen.getByTestId("location").textContent).toMatch(/^\/\?/));
     window.removeEventListener("omnigent:toast", recordToast);
@@ -837,7 +837,7 @@ describe("undelivered startup messages", () => {
     expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);
   });
 
-  it("say why when the server can't try again", async () => {
+  it("say why when the server can't relaunch the sandbox", async () => {
     fetchMock.mockResolvedValue(
       jsonResponse(
         {
@@ -861,7 +861,7 @@ describe("undelivered startup messages", () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    fireEvent.click(screen.getByRole("button", { name: "Relaunch sandbox" }));
 
     await waitFor(() =>
       expect(toasts).toEqual(["No runner is available to recover this session."]),
@@ -870,6 +870,6 @@ describe("undelivered startup messages", () => {
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(String(url)).toBe("/v1/sessions/conv_failed/events");
     expect(JSON.parse(String(init?.body))).toMatchObject({ type: "retry_session" });
-    expect(screen.getByRole("button", { name: "Try again" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Relaunch sandbox" })).toBeEnabled();
   });
 });

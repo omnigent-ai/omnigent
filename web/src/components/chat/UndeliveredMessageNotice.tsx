@@ -39,10 +39,10 @@ async function recoverAttachments(
 }
 
 /**
- * The status line under a startup message the server never delivered. "Try
- * again" asks the server to deliver it in this session, starting a new sandbox
- * when the first one never came up; "Start a new session" moves the message
- * (text and attachments) to the new-session composer instead.
+ * The status line under a startup message the server never delivered.
+ * "Relaunch sandbox" asks the server to deliver it in this session, starting a
+ * new sandbox when the first one never came up; "Copy message to new session"
+ * moves the message (text and attachments) to the new-session composer instead.
  *
  * @param sessionId - The session the message was saved in.
  * @param text - The message text, as the bubble's Copy action copies it.
@@ -67,7 +67,9 @@ export function UndeliveredMessageNotice({
     try {
       await retryFailedStartup(sessionId);
     } catch (error) {
-      showToast(error instanceof Error ? error.message : "Couldn't retry. Try again later.");
+      showToast(
+        error instanceof Error ? error.message : "Couldn't relaunch the sandbox. Try again later.",
+      );
     } finally {
       setRetrying(false);
     }
@@ -96,7 +98,7 @@ export function UndeliveredMessageNotice({
         disabled={retrying || starting || sessionId === null}
         onClick={() => void tryAgain()}
       >
-        Try again
+        Relaunch sandbox
       </Button>
       <span aria-hidden>·</span>
       <Button
@@ -106,7 +108,7 @@ export function UndeliveredMessageNotice({
         disabled={retrying || starting}
         onClick={() => void startNewSession()}
       >
-        Start a new session with this message
+        Copy message to new session
       </Button>
     </div>
   );

@@ -162,7 +162,7 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
                 await expect(prompt).to_have_count(1)
                 await page.screenshot(path=str(rig.logs / f"undelivered-{reloaded}.png"))
 
-            await page.get_by_role("button", name="Start a new session with this message").click()
+            await page.get_by_role("button", name="Copy message to new session").click()
             await expect(page.get_by_test_id("new-chat-landing-input")).to_have_value(_PROMPT)
             await expect(page.get_by_role("button", name="Remove context.txt")).to_be_visible()
             await page.screenshot(path=str(rig.logs / "new-session-prefilled.png"))
@@ -173,7 +173,7 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
             for replica in (rig.a, rig.b):
                 (await client.post(f"{replica}/__test/provision/succeed")).raise_for_status()
                 (await client.post(f"{replica}/__test/provision/release")).raise_for_status()
-            await page.get_by_role("button", name="Try again").click()
+            await page.get_by_role("button", name="Relaunch sandbox").click()
             await expect(page.get_by_test_id("message-undelivered")).to_have_count(0)
             reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
             await expect(reply.filter(has_text=_REPLY)).to_have_count(1, timeout=120_000)
