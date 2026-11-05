@@ -387,8 +387,7 @@ def test_claude_menu_lists_plugin_skills_a_launcher_loads(
     (plugin / ".claude-plugin" / "plugin.json").write_text(
         json.dumps({"name": _PLUGIN, "version": "1.0.0", "description": "e2e plugin"})
     )
-    for name in ("review", "review-add-rule", "review-add-guideline"):
-        _seed_skill(plugin / "skills", name, f"{name} skill")
+    _seed_skill(plugin / "skills", "review", "review skill")
     launcher = _plugin_dir_launcher(tmp_path, plugin)
     claude_config_dir = tmp_path / "claude-config"
     claude_config_dir.mkdir()
@@ -399,4 +398,6 @@ def test_claude_menu_lists_plugin_skills_a_launcher_loads(
         _type_plugin_in_terminal(page, live_server, session_id, "review")
         _fill_chat_composer(page, f"/{_PLUGIN}:review")
         _expect_menu_lists(page, client, session_id, "review")
-        page.wait_for_timeout(1_500)
+        if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+            # Hold the menu on screen so a recorded video shows it.
+            page.wait_for_timeout(1_500)
