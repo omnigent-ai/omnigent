@@ -1379,6 +1379,56 @@ def test_unchanged_claude_launch_is_probed_once_until_it_changes(
 
 
 @pytest.mark.posix_only
+def test_claude_launch_answer_stays_with_the_config_it_was_asked_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config change while a probe starts cannot store the new launch's plugins for the old."""
+    release_probe = threading.Event()
+
+    class HeldThread(threading.Thread):
+        def run(self) -> None:
+            release_probe.wait(10)
+            super().run()
+
+    monkeypatch.setattr(
+        plugin_discovery, "threading", SimpleNamespace(Event=threading.Event, Thread=HeldThread)
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    for name in ("a", "b"):
+        _write_skill(tmp_path / "plugins" / name / "skills", "review")
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    # The launch reports the plugin its configured arguments name.
+    configure_claude_launch(
+        config_home,
+        tmp_path / "launches.jsonl",
+        "name = sys.argv[sys.argv.index('--report') + 1]\n"
+        f"path = os.path.join({str(tmp_path / 'plugins')!r}, name)\n"
+        "plugin = {'name': name, 'path': path, 'source': name + '@inline'}\n"
+        "print(json.dumps({'type': 'system', 'subtype': 'init', 'plugins': [plugin]}))\n",
+        args=("--report", "a"),
+    )
+    config = config_home / "config.yaml"
+    config_a = config.read_text()
+
+    with pytest.raises(plugin_discovery.LaunchPluginsPending):
+        plugin_discovery.claude_launch_plugin_dirs(wait=False)
+    config.write_text(config_a.replace('"a"]', '"b"]'))
+    generation = plugin_discovery.launch_plugins_generation()
+    release_probe.set()
+    poll_until(
+        lambda: plugin_discovery.launch_plugins_generation() > generation,
+        timeout_s=10,
+        interval_s=0.05,
+    )
+    config.write_text(config_a)
+
+    skills = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    assert [skill.name for skill in skills] == ["a:review"]
+
+
+@pytest.mark.posix_only
 def test_failing_claude_launch_backs_off_until_it_reports_its_plugins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

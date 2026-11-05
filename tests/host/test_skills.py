@@ -542,6 +542,7 @@ def test_skill_reads_wait_for_a_claude_launch_until_its_deadline(
     try:
         with pytest.raises(plugin_discovery.LaunchPluginsPending):
             plugin_discovery.claude_launch_plugin_dirs(wait=False)
+        poll_until(lambda: len(entered) == 2 or None, timeout_s=10, interval_s=0.05)
         now[0] += plugin_discovery.LAUNCH_PLUGINS_DEADLINE_S
         stalled = (
             "Claude plugins added by the configured launch are missing: the launch "

@@ -9,6 +9,7 @@ import os
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,12 +99,12 @@ def claude_launch_is_customized() -> bool:
 
     if os.environ.get(CLAUDE_LAUNCHER_ENV_VAR, "").strip():
         return True
-    command, args = _configured_command()
+    _, command, args = _configured_launch()
     return command != "claude" or bool(args)
 
 
-def _configured_command() -> tuple[str, list[str]]:
-    """The native Claude command and arguments the Omnigent config sets.
+def _configured_launch() -> tuple[Mapping[str, object], str, list[str]]:
+    """The Omnigent config, and the native Claude command and arguments it sets.
 
     :raises CONFIG_READ_ERRORS: The Omnigent config could not be read.
     """
@@ -112,7 +113,7 @@ def _configured_command() -> tuple[str, list[str]]:
 
     cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
-    return command, resolve_harness_args("claude-native", (), cfg=cfg)
+    return cfg, command, resolve_harness_args("claude-native", (), cfg=cfg)
 
 
 def launch_plugins_generation() -> int:
@@ -173,7 +174,7 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
     from omnigent.models.model_catalog_store import binary_identity
 
     # Resolving the launch can run a launcher plugin, so only the background probe does.
-    command, args = _configured_command()
+    cfg, command, args = _configured_launch()
     launcher = os.environ.get(CLAUDE_LAUNCHER_ENV_VAR, "").strip()
     key = (launcher, command, *args, binary_identity(command))
     with _probes_lock:
@@ -197,7 +198,7 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
             try:
                 # A daemon, so a hung launcher plugin cannot keep the process from exiting.
                 threading.Thread(
-                    target=_refresh, args=(probe,), name="claude-launch-plugins", daemon=True
+                    target=_refresh, args=(probe, cfg), name="claude-launch-plugins", daemon=True
                 ).start()
             except RuntimeError as exc:
                 probe.running = None
@@ -219,7 +220,7 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
         raise LaunchPluginsFailed(probe.failure)
 
 
-def _refresh(probe: _LaunchProbe) -> None:
+def _refresh(probe: _LaunchProbe, cfg: Mapping[str, object]) -> None:
     global _generation
     from omnigent.harnesses.claude_native.main import _claude_model_probe_invocation
     from omnigent.models.model_catalog_store import binary_identity
@@ -229,8 +230,9 @@ def _refresh(probe: _LaunchProbe) -> None:
     executable_identity: object = None
     failure = "did not report its plugins"
     try:
+        # The config the key was read from, so a changed config cannot answer for this launch.
         command, launch_args, env = _claude_model_probe_invocation(
-            None, ("--settings", _PROBE_SETTINGS)
+            None, ("--settings", _PROBE_SETTINGS), cfg=cfg
         )
         executable, executable_identity = command, binary_identity(command)
         plugins = _probe_plugin_dirs(command, launch_args, env)
