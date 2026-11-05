@@ -263,11 +263,11 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 MANAGED_HOST_ONLINE_TIMEOUT_S = 120
 _ONLINE_POLL_INTERVAL_S = 1.0
 
-# Authenticated hosts renew these windows halfway through their TTL.
+# Provider defaults; sandbox.token_ttl_s can override these windows.
+# Authenticated hosts renew halfway through their TTL.
 # Tokens expire after the last renewal; resume/relaunch rotates the token.
 
-# Modal's 24h sandbox cap plus an hour of slack. Embedding deployments
-# choose their own window through ManagedSandboxConfig.
+# Modal's 24h sandbox cap plus an hour of slack.
 MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 
 # Daytona has no platform lifetime cap. Seven days bounds disconnected
@@ -1475,7 +1475,8 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxDeployment | None:
 
     Takes either a scalar ``provider:`` (one provider) or a ``providers:``
     list (several, offered side by side), never both. ``server_url`` /
-    ``host_config`` stay top-level and apply to every entry::
+    ``host_config`` stay top-level and apply to every entry. ``token_ttl_s``
+    overrides provider defaults and can also be set per entry::
 
         sandbox:
           server_url: https://omnigent.example.com
@@ -1954,6 +1955,18 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         # Never consulted (the factory rejects before any token is
         # minted); the conservative modal TTL keeps the field total.
         token_ttl_s = MODAL_MANAGED_TOKEN_TTL_S
+    configured_token_ttl_s = raw.get("token_ttl_s")
+    if configured_token_ttl_s is not None:
+        if (
+            not isinstance(configured_token_ttl_s, int)
+            or isinstance(configured_token_ttl_s, bool)
+            or not 300 <= configured_token_ttl_s <= 365 * 24 * 3600
+        ):
+            raise ValueError(
+                "server config 'sandbox.token_ttl_s' must be an integer from "
+                "300 to 31536000 seconds (5 minutes to 365 days), or null for the provider default"
+            )
+        token_ttl_s = configured_token_ttl_s
     return ManagedSandboxConfig(
         server_url=server_url.strip().rstrip("/"),
         launcher_factory=launcher_factory,
