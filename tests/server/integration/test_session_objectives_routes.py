@@ -179,12 +179,9 @@ async def test_reading_needs_read_access_and_recording_needs_edit(
 @pytest.mark.parametrize(
     ("path", "content", "status"),
     [
-        ("", '{"objective": " "}', 422),
         ("", '{"objective": "a\\ud800"}', 422),
-        ("/outcome", '{"success": "yes", "emoji": "✅", "text": "Done"}', 422),
         ("/outcome", '{"success": true, "emoji": "ok", "text": "Done"}', 422),
         ("/outcome", '{"success": true, "emoji": "✅", "text": "a\\ud800"}', 422),
-        ("/outcome", '{"success": true, "emoji": "✅", "text": "x", "objective_id": "x"}', 422),
         (
             "/outcome",
             '{"success": true, "emoji": "✅", "text": "x", "objective_id": "' + "a" * 32 + '"}',
@@ -195,7 +192,10 @@ async def test_reading_needs_read_access_and_recording_needs_edit(
 async def test_invalid_requests_are_refused_without_writing(
     client: httpx.AsyncClient, db_uri: str, path: str, content: str, status: int
 ) -> None:
-    """A lone surrogate in raw JSON is a 422 like any other invalid value, not a 500."""
+    """A lone surrogate in raw JSON is a 422 like any other invalid value, not a 500.
+
+    The request models' own tests cover the other invalid values.
+    """
     session_id = _session(db_uri)
     url = f"/v1/sessions/{session_id}/objectives"
     resp = await client.request(

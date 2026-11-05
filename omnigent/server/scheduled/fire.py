@@ -898,32 +898,36 @@ async def _continue_session(
             error_code="continued_session_budget_conflict",
         )
         return
-    previous_run = conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
     progress = _PromptSendProgress()
     progress_token = _PROMPT_SEND_PROGRESS.set(progress)
-    stamped = False
-    try:
-        # Stamped before the prompt goes in, so what the agent records about this
-        # run is attributed to it on any replica, even after a restart.
-        await asyncio.to_thread(
-            deps.conversation_store.set_labels,
+    # Stamped before the prompt goes in, so what the agent records about this run
+    # is attributed to it on any replica, even after a restart. A task, so a
+    # cancelled fire can still learn whether the write landed.
+    stamp = asyncio.ensure_future(
+        asyncio.to_thread(
+            deps.conversation_store.swap_label,
             session_id,
-            {SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id},
+            SCHEDULED_TASK_RUN_LABEL_KEY,
+            recorder.run_id,
         )
-        stamped = True
+    )
+    try:
+        await asyncio.shield(stamp)
         # The dispatch derives the agent revision from these labels, so a session
         # the automation just started serving rebuilds its tools for this turn.
         conv.labels[SCHEDULED_TASK_RUN_LABEL_KEY] = recorder.run_id
         start_fire_stage("runner_start", session_id=session_id)
         await dispatch(conv, task)
-    except Exception:
+    except BaseException as exc:
+        if not progress.started:
+            await _undo_run_label(deps, session_id, recorder.run_id, stamp)
+        if not isinstance(exc, Exception):
+            raise
         _logger.exception(
             "scheduled fire: dispatch into continued session %s failed for task %s",
             session_id,
             task.id,
         )
-        if stamped and not progress.started:
-            await _restore_run_label(deps, session_id, recorder.run_id, previous_run)
         await recorder.finish(
             "failed",
             conversation_id=session_id,
@@ -937,28 +941,38 @@ async def _continue_session(
     _logger.info("scheduled fire: task %s continued session %s", task.id, session_id)
 
 
-async def _restore_run_label(
-    deps: FireDeps, session_id: str, run_id: str, previous_run: str | None
+async def _undo_run_label(
+    deps: FireDeps, session_id: str, run_id: str, stamp: asyncio.Future[str | None]
 ) -> None:
     """Give attribution back to the session's previous run after a prompt that never went in.
 
     An earlier run may still be working in the session, and what it records
-    belongs to it. Conditional on the label still naming *run_id*, so a later
-    run's stamp is never overwritten.
+    belongs to it. Waits for an outstanding *stamp* first, and is shielded, so
+    a cancelled fire still restores the label. Conditional on the label still
+    naming *run_id*, so a later run's stamp is never overwritten.
     """
-    try:
-        await asyncio.to_thread(
-            deps.conversation_store.replace_label_if,
-            session_id,
-            SCHEDULED_TASK_RUN_LABEL_KEY,
-            expected=run_id,
-            value=previous_run,
-        )
-    except Exception:
-        # The run fails either way; a kept label only misattributes until the next run.
-        _logger.exception(
-            "scheduled fire: could not restore the previous run label on session %s", session_id
-        )
+
+    async def undo() -> None:
+        await asyncio.wait([stamp])
+        if stamp.cancelled() or stamp.exception() is not None:
+            return  # The stamp never landed.
+        previous_run = stamp.result()
+        try:
+            await asyncio.to_thread(
+                deps.conversation_store.replace_label_if,
+                session_id,
+                SCHEDULED_TASK_RUN_LABEL_KEY,
+                expected=run_id,
+                value=previous_run,
+            )
+        except Exception:
+            # The run fails either way; a kept label only misattributes until the next run.
+            _logger.exception(
+                "scheduled fire: could not restore the previous run label on session %s",
+                session_id,
+            )
+
+    await asyncio.shield(asyncio.ensure_future(undo()))
 
 
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"

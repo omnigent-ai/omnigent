@@ -349,14 +349,17 @@ independent of the fire's progress:
   for legacy timers one chosen when the recorder is made and used for the row
   written at the end.
 - A new session is created with the `omnigent.scheduled_task_run` label set to
-  that ID. A continued session gets the label written just before dispatch; if
-  the write fails, the run fails with `launch_failed` and nothing is sent.
-- A continued dispatch that fails before `_send_prompt` reaches its send stage
-  sent nothing, so the label goes back to the session's previous run (an
-  earlier run may still be working there). A conditional write
+  that ID. A continued session gets the label written just before dispatch
+  with `ConversationStore.swap_label`, a compare-and-swap that returns the
+  value it replaced; if the write fails, the run fails with `launch_failed` and
+  nothing is sent.
+- A continued dispatch that fails or is cancelled before `_send_prompt` reaches
+  its send stage sent nothing, so the label goes back to the value the stamp
+  replaced (an earlier run may still be working there). A conditional write
   (`ConversationStore.replace_label_if`) restores it only while it still names
-  the failed run. Once sending began, the prompt may have gone in, and the
-  label stays.
+  the failed run. The restore is shielded and first waits for an outstanding
+  stamp write, so a cancelled fire still restores it. Once sending began, the
+  prompt may have gone in, and the label stays.
 - What the agent records reads the label from the session, so it goes to the
   run that sent the latest prompt on any replica, also after a restart, even
   though a continued run's row names its session only once the prompt is

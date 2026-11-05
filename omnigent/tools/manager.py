@@ -233,15 +233,7 @@ class ToolManager:
             self._tools[tool.name()] = tool
 
     def _register_objective_tools(self) -> None:
-        """
-        Register ``sys_record_objective`` and ``sys_record_outcome`` when enabled.
-
-        Only ``tool_groups.objectives: true`` registers them. A spec that
-        leaves the group unset (``None``) gets them from the runner, which
-        turns the group on in sessions an automation serves. The runner
-        dispatches both via the server's ``/v1/sessions/{id}/objectives``
-        endpoints.
-        """
+        """Register the objective tools only when explicitly enabled on the resolved spec."""
         if self._spec.tool_groups.objectives is not True:
             return
         for tool in (SysRecordObjectiveTool(), SysRecordOutcomeTool()):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import sqlalchemy as sa
@@ -164,8 +166,34 @@ def test_a_full_session_refuses_more_objectives(
         store.record_objective(SESSION, "Three")
     # Resolving an existing objective still works on a full session.
     assert _outcome(store, text="Updated").objective == "Two"
+    # A run with no objective of its own needs a new row for its outcome.
+    with pytest.raises(SessionObjectiveLimitError):
+        _outcome(store, scheduled_task_run_id="b" * 32)
     # The cap is per session.
     store.record_objective(OTHER, "One")
+
+
+def test_writers_racing_for_the_last_place_get_one_objective_in(
+    store: SessionObjectiveStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_objective_store, "MAX_OBJECTIVES_PER_SESSION", 3)
+    store.record_objective(SESSION, "One")
+    store.record_objective(SESSION, "Two")
+    start = threading.Barrier(4)
+
+    def record(i: int) -> str:
+        start.wait()
+        try:
+            store.record_objective(SESSION, f"Racer {i}")
+        except SessionObjectiveLimitError:
+            return "refused"
+        return "recorded"
+
+    with ThreadPoolExecutor(4) as pool:
+        results = list(pool.map(record, range(4)))
+
+    assert sorted(results) == ["recorded", "refused", "refused", "refused"]
+    assert len(store.list_objectives(SESSION).data) == 3
 
 
 def test_listing_pages_forward_without_gaps(store: SessionObjectiveStore) -> None:

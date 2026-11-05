@@ -110,6 +110,63 @@ def test_replace_label_if_changes_only_the_expected_value(
     assert not conversation_store.replace_label_if(source.id, "absent", expected="x", value="y")
 
 
+def test_replace_label_if_can_require_the_label_to_be_absent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``expected=None`` sets a label only if no writer has set it yet."""
+    source = conversation_store.create_conversation()
+
+    assert conversation_store.replace_label_if(source.id, "k", expected=None, value="first")
+    assert not conversation_store.replace_label_if(source.id, "k", expected=None, value="second")
+    assert conversation_store.get_conversation(source.id).labels["k"] == "first"
+    with pytest.raises(ValueError, match="expected value or a new value"):
+        conversation_store.replace_label_if(source.id, "other", expected=None, value=None)
+
+
+def test_swap_label_returns_the_value_it_replaced(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The previous value comes from the write itself, even when another writer gets in first."""
+    source = conversation_store.create_conversation()
+    assert conversation_store.swap_label(source.id, "k", "a") is None
+    assert conversation_store.swap_label(source.id, "k", "b") == "a"
+
+    read = conversation_store.get_conversation
+    reads = 0
+
+    def read_then_lose_the_race(conversation_id: str) -> Any:
+        nonlocal reads
+        reads += 1
+        conversation = read(conversation_id)
+        if reads == 1:
+            conversation_store.set_labels(conversation_id, {"k": "c"})
+        return conversation
+
+    monkeypatch.setattr(conversation_store, "get_conversation", read_then_lose_the_race)
+
+    assert conversation_store.swap_label(source.id, "k", "d") == "c"
+    assert (reads, read(source.id).labels["k"]) == (2, "d")
+
+
+def test_swap_label_gives_up_on_a_label_that_keeps_changing(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = conversation_store.create_conversation()
+    read = conversation_store.get_conversation
+    writes = iter(range(100))
+
+    def read_then_lose_the_race(conversation_id: str) -> Any:
+        conversation = read(conversation_id)
+        conversation_store.set_labels(conversation_id, {"k": f"other-{next(writes)}"})
+        return conversation
+
+    monkeypatch.setattr(conversation_store, "get_conversation", read_then_lose_the_race)
+
+    with pytest.raises(RuntimeError, match="kept changing"):
+        conversation_store.swap_label(source.id, "k", "mine")
+    assert read(source.id).labels["k"].startswith("other-")
+
+
 def test_fork_drops_the_automation_run_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

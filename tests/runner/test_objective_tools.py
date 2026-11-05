@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 import httpx
 import pytest
@@ -111,20 +110,19 @@ def test_only_an_undecided_spec_follows_the_session(
     assert spec.tool_groups.objectives is objectives
 
 
-class _Client:
-    """Records requests and answers with one fixed response."""
+def _client(response: httpx.Response) -> tuple[httpx.AsyncClient, list[httpx.Request]]:
+    """A real client whose server records each request and answers with *response*."""
+    requests: list[httpx.Request] = []
 
-    def __init__(self, response: httpx.Response) -> None:
-        self.calls: list[tuple[str, str, Any, dict[str, str]]] = []
-        self._response = response
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            response.status_code, content=response.content, headers=response.headers
+        )
 
-    async def post(self, url: str, *, json: Any, headers: dict[str, str], timeout: float):
-        self.calls.append(("POST", url, json, headers))
-        return self._response
-
-    async def put(self, url: str, *, json: Any, headers: dict[str, str], timeout: float):
-        self.calls.append(("PUT", url, json, headers))
-        return self._response
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://server"
+    ), requests
 
 
 def _recorded(**overrides: object) -> httpx.Response:
@@ -133,12 +131,11 @@ def _recorded(**overrides: object) -> httpx.Response:
     return httpx.Response(200, json=body)
 
 
-async def _call(client: _Client, tool: str, args: object, session: str | None = _SESSION_ID):
+async def _call(
+    client: httpx.AsyncClient, tool: str, args: object, session: str | None = _SESSION_ID
+):
     out = await _execute_objective_tool(
-        tool,
-        json.dumps(args),
-        server_client=client,  # type: ignore[arg-type]
-        conversation_id=session,
+        tool, json.dumps(args), server_client=client, conversation_id=session
     )
     return json.loads(out)
 
@@ -146,7 +143,7 @@ async def _call(client: _Client, tool: str, args: object, session: str | None = 
 @pytest.mark.asyncio
 async def test_objectives_and_outcomes_are_sent_for_the_calling_session() -> None:
     """A session id in the arguments is never forwarded: the caller's own is used."""
-    client = _Client(_recorded())
+    client, requests = _client(_recorded())
     assert await _call(
         client, "sys_record_objective", {"objective": "Ship it", "session_id": "0" * 32}
     ) == {"recorded": True, "objective_id": "o1", "objective": "Ship it", "outcome": None}
@@ -155,14 +152,12 @@ async def test_objectives_and_outcomes_are_sent_for_the_calling_session() -> Non
     await _call(client, "sys_record_outcome", {**outcome, "objective_id": "o1"})
 
     url = f"/v1/sessions/{_SESSION_ID}/objectives"
-    assert [(method, path, body) for method, path, body, _ in client.calls] == [
+    assert [(r.method, r.url.path, json.loads(r.content)) for r in requests] == [
         ("POST", url, {"objective": "Ship it"}),
         ("PUT", f"{url}/outcome", outcome),
         ("PUT", f"{url}/outcome", {**outcome, "objective_id": "o1"}),
     ]
-    assert {tuple(headers.items()) for *_, headers in client.calls} == {
-        ((ORCHESTRATION_SOURCE_HEADER, _SESSION_ID),)
-    }
+    assert {r.headers.get(ORCHESTRATION_SOURCE_HEADER) for r in requests} == {_SESSION_ID}
 
 
 @pytest.mark.asyncio
@@ -187,9 +182,8 @@ async def test_objectives_and_outcomes_are_sent_for_the_calling_session() -> Non
     ],
 )
 async def test_server_refusals_are_explained(response: httpx.Response, message: str) -> None:
-    out = await _call(
-        _Client(response), "sys_record_outcome", {"success": True, "emoji": "✅", "text": "x"}
-    )
+    client, _ = _client(response)
+    out = await _call(client, "sys_record_outcome", {"success": True, "emoji": "✅", "text": "x"})
     assert message in out["error"]
 
 
@@ -218,6 +212,6 @@ async def test_server_refusals_are_explained(response: httpx.Response, message: 
 async def test_bad_calls_never_reach_the_server(
     tool: str, args: object, session: str | None, message: str
 ) -> None:
-    client = _Client(_recorded())
+    client, requests = _client(_recorded())
     assert message in (await _call(client, tool, args, session))["error"]
-    assert client.calls == []
+    assert requests == []

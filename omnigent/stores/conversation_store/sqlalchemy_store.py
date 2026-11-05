@@ -3034,10 +3034,35 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str,
         key: str,
         *,
-        expected: str,
+        expected: str | None,
         value: str | None,
     ) -> bool:
         """Change one label in a single conditional write. See base class for contract."""
+        from sqlalchemy.exc import IntegrityError
+
+        reject_profile_labels({key: ""})
+        if expected is None:
+            if value is None:
+                raise ValueError("replace_label_if needs an expected value or a new value")
+
+            def insert_absent(session: Session) -> None:
+                session.execute(
+                    insert(SqlConversationLabel).values(
+                        conversation_id=conversation_id,
+                        key=key,
+                        value=value,
+                        updated_at=now_epoch(),
+                    )
+                )
+
+            try:
+                run_write_transaction(
+                    self._conv_session_immediate, "replace_label_if", insert_absent
+                )
+            except IntegrityError:
+                # Another writer set the label first.
+                return False
+            return True
         match = (
             SqlConversationLabel.workspace_id == current_workspace_id(),
             SqlConversationLabel.conversation_id == conversation_id,
@@ -3056,7 +3081,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             result = cast("CursorResult[Any]", session.execute(statement))
             return result.rowcount > 0
 
-        reject_profile_labels({key: ""})
         return run_write_transaction(self._conv_session_immediate, "replace_label_if", write)
 
     def list_conversations(
