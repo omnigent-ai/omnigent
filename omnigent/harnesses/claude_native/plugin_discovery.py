@@ -196,8 +196,8 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
                 ).start()
             except RuntimeError as exc:
                 probe.running = None
+                _record_failure(probe, "could not be probed")
                 _log.warning("Could not start probing the configured Claude launch: %s", exc)
-                raise LaunchPluginsFailed("could not be probed") from exc
         running, deadline = probe.running, probe.deadline
     if wait and running is not None and probe.plugins is None:
         running.wait(max(0.0, deadline - time.monotonic()))
@@ -241,12 +241,7 @@ def _refresh(probe: _LaunchProbe) -> None:
         with _probes_lock:
             probe.executable, probe.executable_identity = executable, executable_identity
             if plugins is None:
-                # A refresh that fails keeps serving the plugins this launch reported before.
-                probe.failure = failure
-                probe.backoff_s = min(
-                    2 * probe.backoff_s or FAILED_LAUNCH_BACKOFF_S, MAX_FAILED_LAUNCH_BACKOFF_S
-                )
-                probe.refresh_at = time.monotonic() + probe.backoff_s
+                _record_failure(probe, failure)
             else:
                 probe.plugins, probe.failure, probe.backoff_s = plugins, None, 0.0
                 probe.refresh_at = time.monotonic() + LAUNCH_PLUGINS_TTL_S
@@ -254,6 +249,16 @@ def _refresh(probe: _LaunchProbe) -> None:
             _generation += 1
         if done is not None:
             done.set()
+
+
+def _record_failure(probe: _LaunchProbe, failure: str) -> None:
+    """Back off before asking the launch again; callers hold ``_probes_lock``."""
+    # A refresh that fails keeps serving the plugins this launch reported before.
+    probe.failure = failure
+    probe.backoff_s = min(
+        2 * probe.backoff_s or FAILED_LAUNCH_BACKOFF_S, MAX_FAILED_LAUNCH_BACKOFF_S
+    )
+    probe.refresh_at = time.monotonic() + probe.backoff_s
 
 
 def _probe_plugin_dirs(

@@ -1482,15 +1482,23 @@ def test_prewarm_logs_a_launch_it_could_not_start_probing(
 
 
 @pytest.mark.posix_only
-def test_claude_launch_probe_that_cannot_start_warns_and_keeps_installed_plugins(
+def test_claude_launch_probe_that_cannot_start_backs_off_and_keeps_installed_plugins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    class CannotStart(threading.Thread):
+    now = [0.0]
+    monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    thread_starts_fail = [True]
+
+    class SometimesCannotStart(threading.Thread):
         def start(self) -> None:
-            raise RuntimeError("can't start new thread")
+            if thread_starts_fail[0]:
+                raise RuntimeError("can't start new thread")
+            super().start()
 
     monkeypatch.setattr(
-        plugin_discovery, "threading", SimpleNamespace(Event=threading.Event, Thread=CannotStart)
+        plugin_discovery,
+        "threading",
+        SimpleNamespace(Event=threading.Event, Thread=SometimesCannotStart),
     )
     home = _claude_home_with_plugin(
         tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
@@ -1500,20 +1508,38 @@ def test_claude_launch_probe_that_cannot_start_warns_and_keeps_installed_plugins
     configure_claude_launch(
         isolate_provider_resolution(monkeypatch, tmp_path / "config"), launches, _print_init([])
     )
-    warnings: list[str] = []
+
+    def catalog() -> tuple[bool, list[str]]:
+        warnings: list[str] = []
+        ctx = replace(_ctx(tmp_path / "ws", home), warnings=warnings)
+        skills = resolve_harness_skills(ctx, "claude-native")
+        return "sp:installed" in {s.name for s in skills}, warnings
+
+    def start_failures_logged() -> int:
+        return caplog.text.count("Could not start probing the configured Claude launch")
 
     plugin_discovery.prewarm_claude_launch_plugins()
-    skills = resolve_harness_skills(
-        replace(_ctx(tmp_path / "ws", home), warnings=warnings), "claude-native"
+    now[0] += plugin_discovery.FAILED_LAUNCH_BACKOFF_S - 1
+    assert catalog() == (
+        True,
+        [
+            "Claude plugins added by the configured launch are missing: the launch "
+            "could not be probed; see the host log for details."
+        ],
     )
-
-    assert "sp:installed" in {s.name for s in skills}
-    assert warnings == [
-        "Claude plugins added by the configured launch are missing: the launch "
-        "could not be probed; see the host log for details."
-    ]
-    assert caplog.text.count("Could not start probing the configured Claude launch") == 2
+    assert start_failures_logged() == 1
     assert not launches.exists()
+
+    thread_starts_fail[0] = False
+    now[0] += 1
+    assert catalog() == (True, [])
+    assert len(launches.read_text().splitlines()) == 1
+
+    # A refresh that cannot start keeps the launch's earlier answer.
+    thread_starts_fail[0] = True
+    now[0] += plugin_discovery.LAUNCH_PLUGINS_TTL_S
+    assert catalog() == (True, [])
+    assert start_failures_logged() == 2
 
 
 def _process_running(pid: int) -> bool:
