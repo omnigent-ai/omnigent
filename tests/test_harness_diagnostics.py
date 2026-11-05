@@ -11,6 +11,7 @@ from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
     launcher_install_prompt,
     launcher_password_prompt,
+    launcher_update_in_progress,
     sanitize_diagnostic_text,
     sign_in_next_step,
 )
@@ -427,3 +428,30 @@ def test_launcher_install_prompt_requires_an_unanswered_confirmation(
 ) -> None:
     """A launcher waiting to install its agent requires a terminal answer."""
     assert launcher_install_prompt(screen) is expected
+
+
+@pytest.mark.parametrize(
+    ("screen", "expected"),
+    [
+        ("Updating Claude Code from 2.1.314 to 2.1.316", True),
+        (
+            "Updating Claude Code from 2.1.314 to\n2.1.316\n"
+            "Generating claude-code MCP client config...",
+            True,
+        ),
+        (
+            "Updating Claude Code from 2.1.314 to 2.1.316\n"
+            "╭─ Error ─╮\n│ Claude Code exited with code 127 │\n╰─────────╯",
+            False,
+        ),
+        ("Generating claude-code MCP client config...", False),
+        ("", False),
+        (None, False),
+    ],
+    ids=["banner", "banner-wrapped", "exit-box-after-banner", "no-banner", "empty", "none"],
+)
+def test_launcher_update_in_progress_requires_a_banner_without_an_exit(
+    screen: str | None, expected: bool
+) -> None:
+    """A launcher is updating Claude Code while its banner shows and no start has failed."""
+    assert launcher_update_in_progress(screen) is expected

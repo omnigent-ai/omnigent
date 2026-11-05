@@ -11334,6 +11334,35 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     assert len(captures) == 2
 
 
+def test_wait_for_claude_prompt_ready_holds_for_a_launcher_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launcher still updating Claude Code is reported as awaiting, not waited out and reaped."""
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    captures: list[int] = []
+
+    def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        captures.append(1)
+        return "Updating Claude Code from 2.1.314 to 2.1.316\n"
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert str(raised.value).startswith(
+        "Claude Code's launch command is still updating Claude Code in its terminal"
+    )
+    assert raised.value.awaits_answer is True
+    assert len(captures) == 2
+
+
 def test_wait_for_claude_prompt_ready_prefers_a_rendered_prompt_over_a_link(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
