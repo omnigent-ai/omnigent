@@ -4821,6 +4821,16 @@ function sessionBindingPatch(
     // A reload that shows the launch moved on ends the dismissal of its last warning.
     sandboxActionDismissed:
       session.sandboxStatus?.stage === "action_required" ? state.sandboxActionDismissed : null,
+    ...startupInputsPatch(session),
+    ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
+  };
+}
+
+/** The managed-startup state a session snapshot reports. */
+function startupInputsPatch(
+  session: Session,
+): Pick<ConversationState, "startupPending" | "failedInputs"> {
+  return {
     // "ready" with saved inputs left: a native first input awaits its transcript
     // receipt, and the server still saves new messages behind it.
     startupPending:
@@ -4828,7 +4838,6 @@ function sessionBindingPatch(
       (session.labels?.["omnigent.startup"] === "ready" &&
         (session.pendingInputs ?? []).length > 0),
     failedInputs: session.failedInputs ?? [],
-    ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
   };
 }
 
@@ -4927,7 +4936,6 @@ const startupReads = new Map<string, number>();
 async function refreshStartupInputs(id: string, showQueued = false): Promise<void> {
   const read = (startupReads.get(id) ?? 0) + 1;
   startupReads.set(id, read);
-  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, setterForState(id));
   let session: Session | null = null;
   try {
     session = await getSessionSlim(id);
@@ -4945,8 +4953,10 @@ async function refreshStartupInputs(id: string, showQueued = false): Promise<voi
     const queued = showQueued
       ? (fresh.pendingInputs ?? []).filter((input) => !shown.has(input.pendingId))
       : [];
+    // Only the startup fields: live events stay newer than this read for the
+    // rest, e.g. a "failed" launch stage a replica without the launch doesn't know.
     return {
-      ...sessionBindingPatch(fresh, s, launchBeforeFetch),
+      ...startupInputsPatch(fresh),
       pendingUserMessages: [...pending, ...queued.map(pendingBubbleFromSnapshot)],
     };
   });

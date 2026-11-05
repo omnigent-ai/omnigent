@@ -7786,7 +7786,8 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   describe("session.sandbox_status", () => {
     it("turns the sent first message into an undelivered one when the launch fails", async () => {
       // A launch reports "failed" early and again once the server has marked its
-      // saved inputs failed; the earlier read answering last must not win.
+      // saved inputs failed; the earlier read answering last must not win. Neither
+      // read may undo the live "failed" stage a replica without the launch lacks.
       const lost = { type: "input_text" as const, text: "Summarize the open PRs" };
       const snapshot = (startup: string, failedInputs: unknown[]) =>
         mockResponse({
@@ -7796,6 +7797,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
           created_at: 0,
           items: [],
           labels: { "omnigent.startup": startup },
+          sandbox_status: { stage: "provisioning" },
           pending_elicitations: [],
           pending_inputs: [],
           failed_inputs: failedInputs,
@@ -7833,6 +7835,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         failedInputs: [{ pendingId: "pending_first", content: [lost] }],
         pendingUserMessages: [],
         startupPending: false,
+        sandboxStatus: { stage: "failed", error: "managed host did not come online" },
       });
     });
 
