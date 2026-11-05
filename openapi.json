@@ -9040,6 +9040,17 @@
             "title": "Share Workspace Files",
             "type": "boolean"
           },
+          "side_chat_allowed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Side Chat Allowed"
+          },
           "side_chat_parent_id": {
             "anyOf": [
               {

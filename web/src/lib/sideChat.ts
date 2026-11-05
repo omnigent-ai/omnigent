@@ -9,8 +9,6 @@
  * place (`supportsSideChat`).
  */
 
-import { isOwnerLevel } from "@/lib/permissionsApi";
-
 /** Prefix that opens a side chat. The trailing space keeps `/sidebar` out. */
 export const SIDE_CHAT_COMMAND_PREFIX = "/side ";
 
@@ -36,13 +34,14 @@ export function newPendingSideChatId(): string {
  * on for all of them. Codex uses its native ephemeral fork
  * (:func:`usesNativeSideChatFork`); the rest fork server-side and run in the
  * parent's workspace. To withhold side chat from a future harness, gate it here.
- * Only the session's owner can start side chats; the server enforces it too.
+ * Only the owner of the session's root can start side chats (see
+ * `useCanStartSideChat`); the server enforces it too.
  */
 export function supportsSideChat(
   harness: string | null | undefined,
-  permissionLevel: number | null,
+  canStartSideChat: boolean,
 ): boolean {
-  return typeof harness === "string" && harness.length > 0 && isOwnerLevel(permissionLevel);
+  return typeof harness === "string" && harness.length > 0 && canStartSideChat;
 }
 
 /**

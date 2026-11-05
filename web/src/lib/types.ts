@@ -288,6 +288,11 @@ export interface Session {
    * anything else, including side chats from before the rail was server-listed.
    */
   sideChatParentId?: string | null;
+  /**
+   * Whether the viewer may start side chats here (only the owner of the
+   * session's root can); `null` when the server didn't say.
+   */
+  sideChatAllowed?: boolean | null;
   id: string;
   agentId: string;
   /**

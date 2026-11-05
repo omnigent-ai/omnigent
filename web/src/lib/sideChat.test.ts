@@ -18,22 +18,19 @@ describe("isSideChatCommand", () => {
 
 describe("supportsSideChat", () => {
   it("enables side chat for every harness (generic fork-and-continue)", () => {
-    expect(supportsSideChat("codex-native", 4)).toBe(true);
-    expect(supportsSideChat("claude-native", 4)).toBe(true);
-    expect(supportsSideChat("codex-sdk", 4)).toBe(true);
+    expect(supportsSideChat("codex-native", true)).toBe(true);
+    expect(supportsSideChat("claude-native", true)).toBe(true);
+    expect(supportsSideChat("codex-sdk", true)).toBe(true);
   });
 
   it("is off when there is no harness", () => {
-    expect(supportsSideChat(null, 4)).toBe(false);
-    expect(supportsSideChat(undefined, 4)).toBe(false);
-    expect(supportsSideChat("", 4)).toBe(false);
+    expect(supportsSideChat(null, true)).toBe(false);
+    expect(supportsSideChat(undefined, true)).toBe(false);
+    expect(supportsSideChat("", true)).toBe(false);
   });
 
-  it("is only for the session's owner", () => {
-    expect(supportsSideChat("codex-native", 3)).toBe(false);
-    expect(supportsSideChat("claude-native", 1)).toBe(false);
-    // Single-user mode resolves no level and treats the viewer as the owner.
-    expect(supportsSideChat("claude-native", null)).toBe(true);
+  it("is off for a viewer who can't start side chats", () => {
+    expect(supportsSideChat("claude-native", false)).toBe(false);
   });
 });
 

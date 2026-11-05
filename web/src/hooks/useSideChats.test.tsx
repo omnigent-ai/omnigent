@@ -438,6 +438,48 @@ describe("side chats opened on another device", () => {
     expect(readSessionWorkspaceState("session-a").openSideChats).toEqual([]);
   });
 
+  it("stay closed when a focus refresh is in flight and the next one fails", async () => {
+    serverSideChats([{ id: "conv_side", created_at: 1 }]);
+    const { result, rerender } = renderHook(({ id }) => useSideChats(id), {
+      initialProps: { id: "session-a" },
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.tabs).toEqual(["conv_side"]));
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The refresh still in flight was read before the close and names it open.
+    vi.mocked(authenticatedFetch).mockImplementationOnce(async () => {
+      await held;
+      return new Response(
+        JSON.stringify({ data: [{ id: "conv_side", created_at: 1 }], last_id: "conv_side" }),
+      );
+    });
+    try {
+      act(() => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await waitFor(() => expect(vi.mocked(authenticatedFetch)).toHaveBeenCalledTimes(2));
+      serverSideChats(null);
+      act(() => result.current.close("conv_side"));
+      release();
+      await waitFor(() => expect(vi.mocked(authenticatedFetch)).toHaveBeenCalledTimes(3));
+      await waitFor(() =>
+        expect(queryClient.getQueryCache().getAll()[0]?.state.fetchStatus).toBe("idle"),
+      );
+    } finally {
+      focusManager.setFocused(undefined);
+    }
+    rerender({ id: "session-b" });
+    rerender({ id: "session-a" });
+
+    expect(result.current.tabs).toEqual([]);
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual([]);
+  });
+
   it("stay closed when closed before the first list arrives", async () => {
     writeSessionWorkspaceState("session-a", { openSideChats: ["conv_side"] });
     let release!: () => void;

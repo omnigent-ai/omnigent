@@ -2508,6 +2508,9 @@ class SessionResponse(BaseModel):
     # The session whose Workspace rail lists this one as a side chat; ``None``
     # otherwise, including side chats from before the rail was server-listed.
     side_chat_parent_id: str | None = None
+    # Whether the viewer may start side chats here: only the owner of the
+    # session's root can. ``None`` where the response doesn't compute it.
+    side_chat_allowed: bool | None = None
 
 
 class UpdateSessionRequest(BaseModel):

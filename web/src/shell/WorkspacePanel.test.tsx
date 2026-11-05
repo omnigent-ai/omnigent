@@ -1591,6 +1591,36 @@ describe("WorkspacePanel mobile side chats", () => {
     }
   });
 
+  it("hides a new side chat when the server says this viewer can't start one", () => {
+    isMobileMock.mockReturnValue(true);
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // An admin sees owner level without owning the session.
+    queryClient.setQueryData(["session", "conv_ws"], {
+      id: "conv_ws",
+      agentId: "agent",
+      status: "idle",
+      createdAt: 0,
+      labels: {},
+      permissionLevel: 4,
+      sideChatAllowed: false,
+    });
+    try {
+      renderWorkspace({
+        rightRailTab: "sidechat",
+        mobileSideChatsOpen: true,
+        permissionLevel: 4,
+        queryClient,
+      });
+
+      const drawer = screen.getByTestId("side-chats-panel-drawer");
+      expect(within(drawer).queryByRole("button", { name: "New side chat" })).toBeNull();
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+
   it("shows the selected side chat in the drawer, not the hidden rail", () => {
     isMobileMock.mockReturnValue(true);
     openTabs();

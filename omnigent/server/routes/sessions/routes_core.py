@@ -1010,6 +1010,23 @@ def register_core_routes(
             )
         return runner_id, launch_failed
 
+    async def side_chat_allowed(
+        user_id: str | None, session_id: str, conversation: Conversation | None = None
+    ) -> bool:
+        """Whether *user_id* may start side chats in a session: its root's owner only."""
+        if auth_provider is None or permission_store is None:
+            return True
+        conv = conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        return conv is not None and await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            conv,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        )
+
     @router.post(
         "/sessions/orchestrated",
         status_code=201,
@@ -1821,7 +1838,7 @@ def register_core_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             access.level,
@@ -1839,6 +1856,10 @@ def register_core_routes(
             viewer_id=user_id,
             request=request,
         )
+        snapshot.side_chat_allowed = await side_chat_allowed(
+            user_id, session_id, access.conversation
+        )
+        return snapshot
 
     @router.get(
         "/sessions/{session_id}/labels",
@@ -3918,7 +3939,7 @@ def register_core_routes(
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the
         # items read — it dominated this response's size and build time.
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             level,
@@ -3931,6 +3952,8 @@ def register_core_routes(
             viewer_id=user_id,
             request=request,
         )
+        snapshot.side_chat_allowed = await side_chat_allowed(user_id, session_id)
+        return snapshot
 
     # ── POST /sessions/{source_id}/fork ─────────────────────────
 
@@ -4669,7 +4692,7 @@ def register_core_routes(
             order="desc",
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
-        return _build_session_response(
+        response = _build_session_response(
             new_conv,
             list(reversed(fork_items.data)),
             "idle",
@@ -4677,6 +4700,8 @@ def register_core_routes(
             last_task_error=None,
             agent_name=base_agent.name,
         )
+        response.side_chat_allowed = await side_chat_allowed(user_id, new_conv.id, new_conv)
+        return response
 
     # ── POST /sessions/{session_id}/switch-agent (reserved) ──────
     # Placeholder: in-place agent switching was retired and will return with a

@@ -74,6 +74,7 @@ import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } fr
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
+import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
 import { createSideChat, stopSession } from "@/lib/sessionsApi";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
@@ -960,7 +961,8 @@ function WorkspacePanelImpl({
   // that supports side chat.
   const activeAgentId = useChatStore((s) => s.boundAgentId);
   const parentAgentId = agentId === undefined ? activeAgentId : agentId;
-  const onNewSideChat = supportsSideChat(sideChatHarness, permissionLevel)
+  const canStartSideChat = useCanStartSideChat(conversationId, permissionLevel);
+  const onNewSideChat = supportsSideChat(sideChatHarness, canStartSideChat)
     ? () => {
         useChatStore.getState().requestSideChatFocus(sideChats.openPending());
         onRightRailTabChange("sidechat");

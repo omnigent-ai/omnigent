@@ -70,7 +70,7 @@ import {
   useBrainHarnessLabels,
   useHarnessEffortFamilies,
 } from "@/lib/agentLabels";
-import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
+import { useCanStartSideChat, usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
@@ -1632,6 +1632,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // Cold selector (harness rarely changes) — gates the selection popup's "Ask
   // in side chat" action to harnesses that support side chat.
   const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
+  const canStartSideChat = useCanStartSideChat(conversationId, permissionLevel);
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1874,7 +1875,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
               containerRef={conversationRef}
               onReply={(text) => composerRef.current?.appendReplyQuote(text)}
               onAskInSideChat={
-                supportsSideChat(selectionSessionHarness, permissionLevel)
+                supportsSideChat(selectionSessionHarness, canStartSideChat)
                   ? (text) => composerRef.current?.startSideChat(text)
                   : undefined
               }
@@ -2948,7 +2949,8 @@ function ComposerImpl(
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
-  const showSide = supportsSideChat(sessionHarness, permissionLevel);
+  const canStartSideChat = useCanStartSideChat(composerSessionId, permissionLevel);
+  const showSide = supportsSideChat(sessionHarness, canStartSideChat);
   const slashCommands = useMemo(
     () =>
       buildSlashCommandMap(
@@ -4287,7 +4289,7 @@ function ComposerImpl(
                 onSideChat={
                   composerSessionId &&
                   !isReadOnly &&
-                  supportsSideChat(sessionHarness, permissionLevel)
+                  supportsSideChat(sessionHarness, canStartSideChat)
                     ? () => {
                         if (usesNativeSideChatFork(sessionHarness)) {
                           // Codex forks in-process from a typed /side; prefill so

@@ -211,6 +211,7 @@ describe("createSession", () => {
       labels: undefined,
       projectId: null,
       sideChatParentId: null,
+      sideChatAllowed: null,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       usageIncluded: true,
@@ -1168,19 +1169,6 @@ describe("getSession", () => {
     expect((await getSession("side")).sideChatSettingsSupported).toBe(supported === true);
   });
 
-  it("reads the parent that lists a side chat", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "side",
-        agent_id: "agent",
-        status: "idle",
-        created_at: 0,
-        side_chat_parent_id: "conv_parent",
-      }),
-    );
-    expect((await getSession("side")).sideChatParentId).toBe("conv_parent");
-  });
-
   it("GETs the sessions endpoint and parses the response", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -1189,6 +1177,8 @@ describe("getSession", () => {
         status: "running",
         created_at: 1704067200,
         items: [],
+        side_chat_parent_id: "conv_parent",
+        side_chat_allowed: false,
       }),
     );
 
@@ -1198,6 +1188,8 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.createdAt).toBe(1704067200);
+    expect(session.sideChatParentId).toBe("conv_parent");
+    expect(session.sideChatAllowed).toBe(false);
   });
 
   it("url-encodes the session id", async () => {

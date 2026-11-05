@@ -26,6 +26,7 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -811,6 +812,17 @@ async def test_only_the_owner_starts_and_lists_side_chats(
     )
     assert forged.status_code == 202, forged.text
 
+    async def snapshot(user: str) -> dict[str, Any]:
+        response = await auth_client.get(f"/v1/sessions/{parent.id}", headers=headers[user])
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    assert (await snapshot(owner))["side_chat_allowed"] is True
+    # An admin sees owner level but, without the owner grant, no side chats.
+    assert (await snapshot(admin))["permission_level"] == LEVEL_OWNER
+    for user in (editor, reader, admin):
+        assert (await snapshot(user))["side_chat_allowed"] is False
+
     assert await _side_chat_ids(auth_client, parent.id, headers=headers[owner]) == {
         started.json()["id"]: False,
         registered.json()["child_session_id"]: False,
@@ -842,6 +854,28 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         nested.json()["child_session_id"]: False
     }
     assert await _side_chat_ids(auth_client, child.id, headers=headers[editor]) == {}
+
+    # The session's own runner registers its side chats, whoever it signs in as.
+    token = "side-chat-runner-token"
+    bound = store.create_conversation(
+        agent_id=agent["id"],
+        harness_override="codex-native",
+        runner_id=token_bound_runner_id(token),
+    )
+    permissions.grant(owner, bound.id, LEVEL_OWNER)
+    permissions.grant(editor, bound.id, LEVEL_EDIT)
+    from_runner = await auth_client.post(
+        f"/v1/sessions/{bound.id}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_runner", "agent_nickname": "Side chat"},
+        },
+        headers={**headers[editor], RUNNER_TUNNEL_TOKEN_HEADER: token},
+    )
+    assert from_runner.status_code == 202, from_runner.text
+    assert await _side_chat_ids(auth_client, bound.id, headers=headers[owner]) == {
+        from_runner.json()["child_session_id"]: False
+    }
 
 
 @pytest.mark.asyncio
