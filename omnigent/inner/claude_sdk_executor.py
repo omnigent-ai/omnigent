@@ -1194,6 +1194,8 @@ def _build_mcp_tools(
 def _augment_system_prompt_for_omnigent_mcp_tools(
     system_prompt: str,
     tool_schemas: list[ToolSpec],
+    *,
+    managed_entry: bool = False,
 ) -> str:
     """
     Add Claude SDK-specific MCP tool-name guidance to the system prompt.
@@ -1203,6 +1205,10 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
     as ``mcp__omnigent__<bare_name>``. Bundled agent prompts and skills use
     bare names because other executors call those directly, so the SDK needs
     a bridge note to stop the model from trying a non-existent bare tool first.
+
+    With ``managed_entry`` the tools come from the ``omnigent`` entry in
+    ``managed-mcp.json``, which managed policy Omnigent can't read may still drop,
+    so the note says what a missing tool means.
     """
     tool_names = [
         name for schema in tool_schemas if isinstance((name := schema.get("name")), str) and name
@@ -1229,6 +1235,12 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
             "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
             "When instructions mention a bare Omnigent tool name, invoke "
             "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+    if managed_entry:
+        note += (
+            " They come from your organization's managed `omnigent` MCP server; "
+            "if no `mcp__omnigent__` tool is available, that server did not load in "
+            "this session, so say so instead of retrying."
         )
 
     if not system_prompt:
@@ -3105,6 +3117,7 @@ class ClaudeSDKExecutor(Executor):
             system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
                 system_prompt,
                 tools,
+                managed_entry=managed_relay_tools is not None,
             )
 
         # Build allowed_tools list.  OS-environment operations route

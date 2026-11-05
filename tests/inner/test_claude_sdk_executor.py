@@ -3993,6 +3993,8 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
         assert "pong" in json.dumps(result)
         assert called == ["sys_ping"]
         assert "mcp__omnigent__" in first.options.system_prompt
+        # Policy Omnigent can't read may still drop the entry, so the prompt hedges.
+        assert "if no `mcp__omnigent__` tool is available" in first.options.system_prompt
         # The live CLI keeps its relay; closing the session stops it.
         assert await turn("q1") is first
         await executor.close_session("managed")
