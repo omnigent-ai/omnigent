@@ -34,9 +34,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import {
   decodeTriggerPrompt,
+  hasTriggerHeader,
   isTriggerPrompt,
   SESSION_LINK_ID_PLACEHOLDER,
   splitTriggerPrompt,
+  stripTriggerHeader,
 } from "@/components/scheduled/triggerTemplates";
 import {
   useDeleteScheduledTask,
@@ -287,9 +289,16 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
   const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const paused = task.state === "paused";
-  // Only the instructions are shown; the template text around them stays hidden.
-  const instructions =
-    decodeTriggerPrompt(task.prompt)?.instructions ?? splitTriggerPrompt(task.prompt).userPrompt;
+  const triggerConfig = triggerMode ? decodeTriggerPrompt(task.prompt) : null;
+  const legacyParts = splitTriggerPrompt(task.prompt);
+  // Generated template text is hidden only where it can be told apart from the
+  // user's instructions; otherwise the page shows the prompt the model runs.
+  const instructionsOnly =
+    triggerConfig !== null ||
+    (triggerMode && !hasTriggerHeader(task.prompt) && legacyParts.systemPrompt !== null);
+  const shownPrompt =
+    triggerConfig?.instructions ??
+    (instructionsOnly ? legacyParts.userPrompt : stripTriggerHeader(task.prompt));
   const permissionOption = nativePermissionOptions(harness).find(
     (option) => option.value === task.permissionMode,
   );
@@ -436,12 +445,12 @@ function TaskDetail({ taskId }: { taskId: string }) {
       </div>
 
       {/* Prompt. */}
-      <Section title={triggerMode ? "Instructions" : "Prompt"}>
+      <Section title={instructionsOnly ? "Instructions" : "Prompt"}>
         <p
           className="whitespace-pre-wrap text-sm text-foreground/90"
           data-testid="task-detail-prompt"
         >
-          {instructions}
+          {shownPrompt}
         </p>
       </Section>
 

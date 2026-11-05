@@ -39,10 +39,12 @@ import {
   decodeTriggerPrompt,
   emptyTriggerFields,
   encodeTriggerPrompt,
+  hasTriggerHeader,
   isTriggerPrompt,
   readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
   splitTriggerPrompt,
+  stripTriggerHeader,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
   updateTriggerWorkerSettings,
@@ -170,7 +172,8 @@ export function CreateScheduledTaskDialog({
     editingTask !== null &&
     editingTask.sessionMode === "continue" &&
     isTriggerPrompt(editingTask.prompt);
-  // A trigger saved with a header reopens in its form; older ones open as their instructions.
+  // A trigger with a valid header reopens in its form. One edited outside the form
+  // opens as its full prompt; one saved before headers, as its instructions.
   const editingTriggerConfig = useMemo(
     () => (editingTemplateTrigger ? decodeTriggerPrompt(editingTask?.prompt ?? "") : null),
     [editingTemplateTrigger, editingTask],
@@ -389,11 +392,16 @@ export function CreateScheduledTaskDialog({
       setTriggerType(initialTrigger ?? "schedule");
       resetMenus();
       setAdvancedOpen(false);
+      const savedPrompt = editingTask?.prompt ?? initialPrompt ?? "";
       if (editingTriggerConfig !== null) {
         setPrompt("");
         setSystemPrompt(null);
+      } else if (hasTriggerHeader(savedPrompt)) {
+        // The header no longer matches, so trust only the text the model runs.
+        setPrompt(stripTriggerHeader(savedPrompt));
+        setSystemPrompt(null);
       } else {
-        const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
+        const parts = splitTriggerPrompt(savedPrompt);
         setPrompt(parts.userPrompt);
         setSystemPrompt(parts.systemPrompt);
       }
@@ -1063,7 +1071,7 @@ export function CreateScheduledTaskDialog({
                     )}
                   </div>
 
-                  {/* A trigger needs its one kept session, so its form leaves the choice out. */}
+                  {/* A trigger keeps one session: the mode switch stays hidden, but an edit can restart it. */}
                   {sessionModesSupported &&
                     (trigger === null || isEdit) &&
                     (!editingTemplateTrigger || editingTask?.sessionId) && (

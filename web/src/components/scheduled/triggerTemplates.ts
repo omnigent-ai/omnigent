@@ -478,6 +478,48 @@ export function stripTriggerHeader(prompt: string): string {
   return prompt.replace(TRIGGER_HEADER_PATTERN, "");
 }
 
+/** Whether `prompt` starts with a trigger header line, readable or not. */
+export function hasTriggerHeader(prompt: string): boolean {
+  return TRIGGER_HEADER_PATTERN.test(prompt);
+}
+
+/** `config` with its keys in one fixed order, so equal configs serialize equally. */
+function canonicalConfig(config: TriggerConfig): TriggerConfig {
+  return {
+    source: config.source,
+    event: config.event,
+    scope: config.scope,
+    ...(config.scopeOperator !== undefined ? { scopeOperator: config.scopeOperator } : {}),
+    conditions: config.conditions.map(({ field, operator, value }) => ({ field, operator, value })),
+    instructions: config.instructions,
+    linkBack: config.linkBack,
+    worker: {
+      placement: config.worker.placement,
+      agentId: config.worker.agentId,
+      model: config.worker.model,
+      effort: config.worker.effort,
+    },
+  };
+}
+
+/**
+ * Detects edits made outside the form: a hash of the config and the body it
+ * rendered. Change detection only (cyrb53), not a security boundary.
+ */
+function triggerFingerprint(config: TriggerConfig, body: string): string {
+  const text = `${JSON.stringify(canonicalConfig(config))}\n${body}`;
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, "0");
+}
+
 /**
  * The saved prompt for a trigger: a one-line header holding `config`, which
  * the edit form reads back, then the rendered prompt the model receives.
@@ -486,9 +528,8 @@ export function encodeTriggerPrompt(
   config: TriggerConfig,
   ctx: Pick<TriggerPromptContext, "sessionLink" | "pollingIntervalMinutes">,
 ): string {
-  const { source, worker, ...fields } = config;
-  // Escaping < and > keeps a value such as "-->" from ending the comment early.
-  const json = JSON.stringify(config).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+  const canonical = canonicalConfig(config);
+  const { source, worker, ...fields } = canonical;
   const body = renderTriggerPrompt(source, fields, {
     ...ctx,
     placement: worker.placement,
@@ -496,6 +537,9 @@ export function encodeTriggerPrompt(
     model: worker.model || undefined,
     effort: worker.effort || undefined,
   });
+  const header = { ...canonical, fingerprint: triggerFingerprint(canonical, body) };
+  // Escaping < and > keeps a value such as "-->" from ending the comment early.
+  const json = JSON.stringify(header).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
   return `<!-- omnigent-trigger v${TRIGGER_HEADER_VERSION} ${json} -->\n${body}`;
 }
 
@@ -522,7 +566,8 @@ function decodeWorker(value: unknown): TriggerWorkerConfig | null {
 
 /**
  * The trigger form state saved in `prompt`'s header, or null when the prompt
- * has no header or one this version can't read, so it opens as free text.
+ * has no header, one this version can't read, or one whose fingerprint shows
+ * the header or body was edited outside the form, so it opens as free text.
  */
 export function decodeTriggerPrompt(prompt: string): TriggerConfig | null {
   const match = TRIGGER_HEADER_PATTERN.exec(prompt);
@@ -551,7 +596,7 @@ export function decodeTriggerPrompt(prompt: string): TriggerConfig | null {
   const decodedConditions = conditions.map((condition) => decodeCondition(condition, template));
   const worker = decodeWorker(raw.worker);
   if (decodedConditions.some((condition) => condition === null) || worker === null) return null;
-  return {
+  const config: TriggerConfig = {
     source,
     event,
     scope,
@@ -561,6 +606,8 @@ export function decodeTriggerPrompt(prompt: string): TriggerConfig | null {
     linkBack,
     worker,
   };
+  const body = prompt.slice(match[0].length);
+  return raw.fingerprint === triggerFingerprint(config, body) ? config : null;
 }
 
 /**

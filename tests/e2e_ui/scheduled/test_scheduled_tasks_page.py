@@ -1123,6 +1123,7 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     expect(page.get_by_role("dialog")).to_have_count(0)
     updated = httpx.get(f"{live_server}/v1/scheduled-tasks/{created['id']}", timeout=10).json()
     assert 'labels = "triage"' in updated["prompt"], updated
+    assert 'labels = "omnigent"' not in updated["prompt"], updated
     page.get_by_test_id("task-detail-edit").click()
     expect(condition).to_have_value("triage")
     page.get_by_role("button", name="Cancel", exact=True).click()

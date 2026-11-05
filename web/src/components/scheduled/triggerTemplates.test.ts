@@ -7,6 +7,7 @@ import {
   compileJiraJql,
   describeLinearFilter,
   describeSlackFilter,
+  hasTriggerHeader,
   isTriggerPrompt,
   readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
@@ -514,6 +515,39 @@ describe("trigger header", () => {
     ["a header after the first line", (saved: string) => `Note\n${saved}`],
   ])("opens a prompt with %s as free text", (_case, mutate) => {
     expect(decodeTriggerPrompt(mutate(encodeTriggerPrompt(config("jira"), CTX)))).toBeNull();
+  });
+
+  it("distrusts a header once its body is edited outside the form", () => {
+    const saved = encodeTriggerPrompt(
+      config("slack", { instructions: "Reply with a greeting." }),
+      CTX,
+    );
+    expect(decodeTriggerPrompt(saved)).not.toBeNull();
+    const bodyEdited = saved.replace(
+      "Instructions for each session:\nReply with a greeting.",
+      "Instructions for each session:\nDo nothing.",
+    );
+    expect(bodyEdited).not.toBe(saved);
+    expect(decodeTriggerPrompt(bodyEdited)).toBeNull();
+    expect(hasTriggerHeader(bodyEdited)).toBe(true);
+    expect(isTriggerPrompt(bodyEdited)).toBe(true);
+  });
+
+  it("distrusts a header whose valid values were changed without the body", () => {
+    const saved = encodeTriggerPrompt(config("slack", { scope: "abc" }), CTX);
+    const scopeEdited = saved.replace('"scope":"abc"', '"scope":"xyz"');
+    expect(scopeEdited).not.toBe(saved);
+    expect(decodeTriggerPrompt(scopeEdited)).toBeNull();
+    expect(decodeTriggerPrompt(saved.replace(/,"fingerprint":"[0-9a-f]+"/, ""))).toBeNull();
+  });
+
+  it("still trusts a header whose keys were only reordered", () => {
+    const saved = encodeTriggerPrompt(config("jira"), CTX);
+    const [header, ...body] = saved.split("\n");
+    const json = JSON.parse(header.slice("<!-- omnigent-trigger v1 ".length, -" -->".length));
+    const reordered = Object.fromEntries(Object.entries(json).reverse());
+    const rewritten = `<!-- omnigent-trigger v1 ${JSON.stringify(reordered)} -->\n${body.join("\n")}`;
+    expect(decodeTriggerPrompt(rewritten)).toEqual(config("jira"));
   });
 
   it("leaves prompts without a first-line header unchanged when stripping", () => {

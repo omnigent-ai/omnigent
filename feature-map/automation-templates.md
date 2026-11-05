@@ -28,7 +28,10 @@ to customize.
   Edit automation reads that header and reopens the trigger form with its scope,
   conditions, instructions, link-back and worker settings; saving re-renders the
   prompt from the form. The server strips the header before the message reaches the
-  model. Triggers saved before headers open as their Instructions only, with the
+  model. The header carries a fingerprint of its fields and the prompt below it; if
+  either was changed outside the form (for example through the REST API), Edit and the
+  detail page ignore the header and show the full prompt as one editable field, and
+  saving keeps that text. Triggers saved before headers open as their Instructions only, with the
   template text kept hidden and unchanged on save; prompts that can't be split stay
   one editable Instructions field (Prompt on the detail page). For a recognized trigger
   creation call, **Harness for matching sessions**, Model, and Effort update future

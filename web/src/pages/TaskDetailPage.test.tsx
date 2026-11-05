@@ -258,6 +258,34 @@ describe("header, prompt, configuration", () => {
     },
   );
 
+  it.each([
+    [
+      "edited outside the form",
+      "continue",
+      (prompt: string) => prompt.replace("Summarize new messages.", "Do nothing."),
+    ],
+    ["on a task that starts new sessions", "new", (prompt: string) => prompt],
+  ] as const)("shows the full prompt for a header %s", (_case, sessionMode, mutate) => {
+    const prompt = mutate(
+      encodeTriggerPrompt(
+        {
+          source: "slack",
+          ...emptyTriggerFields("slack"),
+          scope: "abc",
+          instructions: "Summarize new messages.",
+          worker: { placement: "same_host", agentId: null, model: "", effort: "" },
+        },
+        { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+      ),
+    );
+    setTask(task({ prompt, sessionMode }));
+    renderPage();
+    expect(screen.getByRole("heading", { name: "Prompt" })).toBeVisible();
+    const shown = screen.getByTestId("task-detail-prompt").textContent ?? "";
+    expect(shown).toContain("This automation watches Slack");
+    expect(shown).not.toContain("omnigent-trigger");
+  });
+
   it("collapses and reopens configuration while keeping run history visible", () => {
     setTask(task({ modelOverride: "opus" }));
     setRuns([run({ sessionCostUsd: 1.23 })]);
