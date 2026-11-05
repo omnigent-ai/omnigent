@@ -175,6 +175,7 @@ def test_webfonts_is_a_frontend_visible_feature() -> None:
     assert flags.enabled_names() == (
         "claude_osc_status",
         "codex_plan_at_launch",
+        "custom_agents_settings_ui",
         "session_orchestration",
         "webfonts",
     )
