@@ -113,6 +113,7 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { releasePendingRenames } from "@/lib/pendingRenames";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
   forgetUnsentSend,
@@ -8238,6 +8239,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // needed (this stream only carries the open session anyway).
       // Sessions renamed while NOT open converge via the
       // `WS /v1/sessions/updates` diff instead.
+      // The terminal title supersedes any sidebar rename still being kept.
+      releasePendingRenames(event.conversationId);
       if (queryClient !== null) {
         overlayTitleIntoCaches(queryClient, event.conversationId, event.title);
       }

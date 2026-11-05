@@ -25,9 +25,9 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import {
   isSessionArchiving,
   isSessionDeleting,
-  keepPendingRenamesInLists,
   markRecentlyCreated,
 } from "@/hooks/useConversations";
+import { keepPendingRenamesInLists } from "@/lib/pendingRenames";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,

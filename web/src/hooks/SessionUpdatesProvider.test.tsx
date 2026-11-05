@@ -592,6 +592,7 @@ describe("SessionUpdatesProvider list invalidation", () => {
           <QueryClientProvider client={client}>{children}</QueryClientProvider>
         ),
       });
+      // Idle past the one-minute active reconcile window so the next frame refetches the list.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(65_000);
       });

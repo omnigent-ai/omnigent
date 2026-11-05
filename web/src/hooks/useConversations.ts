@@ -50,6 +50,13 @@ import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
+import {
+  clearPendingRenames,
+  confirmRename,
+  failRename,
+  isRenameSuperseded,
+  startRename,
+} from "@/lib/pendingRenames";
 import { showToast } from "@/components/ui/toast";
 import {
   conversationDisplayLabel,
@@ -399,113 +406,11 @@ export function isSessionArchiving(id: string): boolean {
   return archivingSessions.has(id);
 }
 
-// A rename paints its title in place, but the search-indexed list keeps
-// serving the old title for a while; list rows still carrying a title the
-// rename replaced get the new one back until the reindex window passes.
-interface PendingRename {
-  title: string | null;
-  replaced: Set<string | null>;
-  /** Titles from superseded renames that failed; never kept or restored. */
-  failed: Set<string | null>;
-  /** Server `updated_at` of the confirmed rename; newer rows are not lagging. */
-  updatedAt?: number;
-  timer?: ReturnType<typeof setTimeout>;
-}
-
-const pendingRenames = new Map<string, PendingRename>();
-
-function markSessionRenaming(
-  id: string,
-  title: string,
-  replaced: (string | null | undefined)[],
-): PendingRename {
-  const earlier = pendingRenames.get(id);
-  if (earlier?.timer !== undefined) clearTimeout(earlier.timer);
-  const entry: PendingRename = {
-    title,
-    replaced: new Set(earlier?.replaced),
-    failed: new Set(earlier?.failed),
-  };
-  for (const value of replaced) if (value !== undefined) entry.replaced.add(value);
-  entry.replaced.delete(title);
-  entry.failed.delete(title);
-  pendingRenames.set(id, entry);
-  // A PATCH that never settles must not hold the guard forever.
-  entry.timer = setTimeout(() => unmarkSessionRenaming(id, entry), DELETED_TOMBSTONE_MS);
-  return entry;
-}
-
-function unmarkSessionRenaming(id: string, entry?: PendingRename): void {
-  const live = pendingRenames.get(id);
-  if (live === undefined || (entry !== undefined && live !== entry)) return;
-  if (live.timer !== undefined) clearTimeout(live.timer);
-  pendingRenames.delete(id);
-}
-
-function expireSessionRenaming(
-  id: string,
-  entry: PendingRename,
-  title: string | null,
-  updatedAt?: number,
-): void {
-  if (pendingRenames.get(id) !== entry) return;
-  if (entry.timer !== undefined) clearTimeout(entry.timer);
-  entry.title = title;
-  entry.updatedAt = updatedAt;
-  entry.replaced.delete(title);
-  entry.failed.delete(title);
-  entry.timer = setTimeout(() => unmarkSessionRenaming(id, entry), DELETED_TOMBSTONE_MS);
-}
-
-function withPendingRenameTitles(
-  data: ConversationsInfiniteData | undefined,
-): ConversationsInfiniteData | undefined {
-  if (!data || pendingRenames.size === 0) return data;
-  let changed = false;
-  const pages = data.pages.map((page) => {
-    let pageChanged = false;
-    const rows = page.data.map((row) => {
-      const pending = pendingRenames.get(row.id);
-      if (!pending?.replaced.has(row.title ?? null) || pending.failed.has(pending.title)) {
-        return row;
-      }
-      if (pending.updatedAt !== undefined && row.updated_at > pending.updatedAt) {
-        unmarkSessionRenaming(row.id, pending);
-        return row;
-      }
-      pageChanged = true;
-      return { ...row, title: pending.title };
-    });
-    if (!pageChanged) return page;
-    changed = true;
-    return { ...page, data: rows };
-  });
-  return changed ? { ...data, pages } : data;
-}
-
-/**
- * Keep pending renames in every session-list cache, whichever write (a list
- * refetch, a stream frame, another mutation's rollback) brings an old title back.
- *
- * @returns The cache unsubscribe.
- */
-export function keepPendingRenamesInLists(queryClient: QueryClient): () => void {
-  return queryClient.getQueryCache().subscribe((event) => {
-    if (pendingRenames.size === 0 || event.type !== "updated") return;
-    if (event.action.type !== "success") return;
-    const key = event.query.queryKey;
-    if (key[0] !== "conversations" && key[0] !== "project-sessions") return;
-    const data = event.query.state.data as ConversationsInfiniteData | undefined;
-    const next = withPendingRenameTitles(data);
-    if (next !== data) queryClient.setQueryData(key, next);
-  });
-}
-
 /** Wipe module-level tombstones between tests. */
 export function clearSessionTombstones(): void {
   unmarkSessionsDeleting();
   unmarkSessionsArchiving();
-  for (const id of [...pendingRenames.keys()]) unmarkSessionRenaming(id);
+  clearPendingRenames();
 }
 
 /**
@@ -1030,36 +935,28 @@ export function useRenameConversation() {
         backfill: queryClient.getQueryData<Conversation | null>(["conversation-backfill", id])
           ?.title,
       };
-      const earlier = pendingRenames.get(id);
-      const pending = markSessionRenaming(id, title, Object.values(previous));
-      overlayTitle(id, title);
-      return { ...previous, pending, earlier };
-    },
-    onError: (err, { id, title }, previous) => {
       // Restore the first title we managed to snapshot. A snapshotted null
       // (previously-untitled row) is a real value to restore; only skip
       // when we never captured a title at all (all sources undefined).
-      const restored =
-        previous?.list !== undefined
+      const restore =
+        previous.list !== undefined
           ? previous.list
-          : previous?.session !== undefined
+          : previous.session !== undefined
             ? previous.session
-            : previous?.backfill;
-      if (previous) {
-        const live = pendingRenames.get(id);
-        if (live !== undefined && live !== previous.pending) {
-          // A newer rename superseded this one; its title must never be kept.
-          live.failed.add(title);
-        } else if (restored === undefined || previous.pending.failed.has(restored)) {
-          unmarkSessionRenaming(id, previous.pending);
-        } else {
-          // The restored title can be an earlier rename the list still lags behind.
-          const confirmedAt =
-            previous.earlier?.title === restored ? previous.earlier.updatedAt : undefined;
-          expireSessionRenaming(id, previous.pending, restored, confirmedAt);
+            : previous.backfill;
+      const rename = startRename(id, title, restore, Object.values(previous));
+      overlayTitle(id, title);
+      return { rename };
+    },
+    onError: (err, { id, title }, context) => {
+      if (context) {
+        // A newer rename still owns the painted title; rolling back would undo it.
+        const superseded = isRenameSuperseded(id, context.rename);
+        failRename(id, context.rename);
+        if (!superseded && context.rename.restore !== undefined) {
+          overlayTitle(id, context.rename.restore);
         }
       }
-      if (restored !== undefined) overlayTitle(id, restored);
       // The inline editor has unmounted by the time the PATCH settles, so
       // (like a failed delete) the toast is the only failure signal — without
       // it the row just flickers back to the old name. Keep it until dismiss
@@ -1067,16 +964,15 @@ export function useRenameConversation() {
       showToast(renameFailedToast(title, err), { duration: 0 });
     },
     onSuccess: (updated, _variables, context) => {
-      if (context) {
-        expireSessionRenaming(updated.id, context.pending, updated.title, updated.updated_at);
-      }
+      const superseded = context !== undefined && isRenameSuperseded(updated.id, context.rename);
+      if (context) confirmRename(updated.id, context.rename, updated.title, updated.updated_at);
       // The PATCH bumps server `updated_at`, which the unseen tracker
       // would otherwise read as new messages even though the user
       // initiated this themselves. Anchor the seen-baseline to the
       // server's new updated_at so the next refetch reports not unseen.
       markConversationSeen(updated.id, updated.updated_at);
       // Reconcile with the server-confirmed title + authoritative updated_at.
-      overlayTitle(updated.id, updated.title, updated.updated_at);
+      if (!superseded) overlayTitle(updated.id, updated.title, updated.updated_at);
     },
   });
 }

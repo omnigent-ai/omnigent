@@ -41,13 +41,13 @@ import {
   fetchPinnedConversations,
   usePinnedConversations,
   clearSessionTombstones,
-  keepPendingRenamesInLists,
   markRecentlyCreated,
   clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
   type Conversation,
   type PinnedConversationsResult,
 } from "./useConversations";
+import { keepPendingRenamesInLists } from "@/lib/pendingRenames";
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
@@ -1503,36 +1503,45 @@ describe("useRenameConversation cache patching", () => {
     }
   });
 
-  it("lets a row newer than the rename bring an old title back", async () => {
-    const { queryClient, rendered } = seedAndRename();
-    const stopGuard = keepPendingRenamesInLists(queryClient);
-    const key = ["conversations", "", false];
-    const writeOldTitle = (updatedAt: number) =>
-      queryClient.setQueryData(
-        key,
-        infinitePage([conversation({ id: "conv_x", updated_at: updatedAt })]),
-      );
-    const title = () =>
-      queryClient.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0].title;
-    try {
-      await act(() => rendered.result.current.mutateAsync({ id: "conv_x", title: "New name" }));
-      fetchMock.mockResolvedValueOnce(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
-      await act(() =>
-        rendered.result.current
-          .mutateAsync({ id: "conv_x", title: "Newer name" })
-          .catch(() => undefined),
-      );
-      writeOldTitle(150);
-      expect(title()).toBe("New name");
-      // Renamed back elsewhere after the confirmed rename landed at updated_at 200.
-      writeOldTitle(300);
-      expect(title()).toBe("Old name");
-      writeOldTitle(150);
-      expect(title()).toBe("Old name");
-    } finally {
-      stopGuard();
-    }
-  });
+  it.each(["Old name", "Renamed elsewhere"])(
+    "lets a row newer than the rename change its title to %s",
+    async (newerTitle) => {
+      const { queryClient, rendered } = seedAndRename();
+      const stopGuard = keepPendingRenamesInLists(queryClient);
+      const key = ["conversations", "", false];
+      const writeTitle = (title: string, updatedAt: number) =>
+        queryClient.setQueryData(
+          key,
+          infinitePage([conversation({ id: "conv_x", title, updated_at: updatedAt })]),
+        );
+      const title = () =>
+        queryClient.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0].title;
+      try {
+        await act(() => rendered.result.current.mutateAsync({ id: "conv_x", title: "New name" }));
+        fetchMock.mockResolvedValueOnce(
+          mockResponse({ error: "boom" }, { ok: false, status: 500 }),
+        );
+        await act(() =>
+          rendered.result.current
+            .mutateAsync({ id: "conv_x", title: "Newer name" })
+            .catch(() => undefined),
+        );
+        writeTitle("Old name", 150);
+        expect(title()).toBe("New name");
+        // Activity after the rename landed at updated_at 200 still carries its title.
+        writeTitle("New name", 300);
+        writeTitle("Old name", 150);
+        expect(title()).toBe("New name");
+
+        writeTitle(newerTitle, 300);
+        expect(title()).toBe(newerTitle);
+        writeTitle("Old name", 150);
+        expect(title()).toBe("Old name");
+      } finally {
+        stopGuard();
+      }
+    },
+  );
 
   function renameWithGuard(...patches: Promise<Response>[]) {
     fetchMock.mockReset();
@@ -1541,21 +1550,30 @@ describe("useRenameConversation cache patching", () => {
       defaultOptions: { mutations: { retry: false } },
     });
     const key = ["conversations", "", false];
-    const writeTitle = (title: string | null | undefined) =>
-      queryClient.setQueryData(key, infinitePage([conversation({ id: "conv_x", title })]));
+    const writeTitle = (title: string | null | undefined, updatedAt = 100) =>
+      queryClient.setQueryData(
+        key,
+        infinitePage([conversation({ id: "conv_x", title, updated_at: updatedAt })]),
+      );
     const writeOldTitle = () => writeTitle("Old name");
     writeOldTitle();
+    queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const rendered = renderHook(() => useRenameConversation(), { wrapper });
     const stopGuard = keepPendingRenamesInLists(queryClient);
     const title = () =>
       queryClient.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0].title;
-    return { rendered, stopGuard, writeTitle, writeOldTitle, title };
+    const titles = () => ({
+      list: title(),
+      backfill: queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_x"])!.title,
+    });
+    return { rendered, stopGuard, writeTitle, writeOldTitle, title, titles };
   }
 
-  const renamedResponse = () =>
-    mockResponse({ ...conversation({ id: "conv_x" }), title: "New name", updated_at: 200 });
+  const renamedResponse = (title = "New name") =>
+    mockResponse({ ...conversation({ id: "conv_x" }), title, updated_at: 200 });
+  const rejectedResponse = () => mockResponse({ error: "boom" }, { ok: false, status: 500 });
 
   it("keeps a rename of an untitled row whose streamed title is absent", async () => {
     const { rendered, stopGuard, writeTitle, title } = renameWithGuard(
@@ -1571,30 +1589,92 @@ describe("useRenameConversation cache patching", () => {
     }
   });
 
-  it("keeps a slow rename for a minute after its PATCH settles", async () => {
-    vi.useFakeTimers();
-    let settlePatch: (response: Response) => void = () => {};
-    const { rendered, stopGuard, writeOldTitle, title } = renameWithGuard(
-      new Promise<Response>((resolve) => {
-        settlePatch = resolve;
-      }),
-    );
-    try {
-      act(() => rendered.result.current.mutate({ id: "conv_x", title: "New name" }));
-      await act(() => vi.advanceTimersByTimeAsync(50_000));
-      settlePatch(renamedResponse());
-      await act(() => vi.advanceTimersByTimeAsync(30_000));
-      writeOldTitle();
-      expect(title()).toBe("New name");
+  it.each([50_000, 70_000])(
+    "keeps a slow rename for a minute after its PATCH settles at %i ms",
+    async (settlesAt) => {
+      vi.useFakeTimers();
+      let settlePatch: (response: Response) => void = () => {};
+      const { rendered, stopGuard, writeOldTitle, title } = renameWithGuard(
+        new Promise<Response>((resolve) => {
+          settlePatch = resolve;
+        }),
+      );
+      try {
+        act(() => rendered.result.current.mutate({ id: "conv_x", title: "New name" }));
+        await act(() => vi.advanceTimersByTimeAsync(settlesAt));
+        settlePatch(renamedResponse());
+        await act(() => vi.advanceTimersByTimeAsync(30_000));
+        writeOldTitle();
+        expect(title()).toBe("New name");
 
-      await act(() => vi.advanceTimersByTimeAsync(30_000));
-      writeOldTitle();
-      expect(title()).toBe("Old name");
-    } finally {
-      stopGuard();
-      vi.useRealTimers();
-    }
-  });
+        await act(() => vi.advanceTimersByTimeAsync(30_000));
+        writeOldTitle();
+        expect(title()).toBe("Old name");
+      } finally {
+        stopGuard();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["before", "after"] as const)(
+    "keeps an earlier rename that settles %s a newer one fails",
+    async (settles) => {
+      vi.useFakeTimers();
+      let settleFirst: (response: Response) => void = () => {};
+      let failSecond: (response: Response) => void = () => {};
+      const { rendered, stopGuard, writeTitle, writeOldTitle, title, titles } = renameWithGuard(
+        new Promise<Response>((resolve) => {
+          settleFirst = resolve;
+        }),
+        new Promise<Response>((resolve) => {
+          failSecond = resolve;
+        }),
+      );
+      try {
+        const first = rendered.result.current.mutateAsync({ id: "conv_x", title: "Title A" });
+        await act(() => vi.advanceTimersByTimeAsync(1_000));
+        const second = rendered.result.current
+          .mutateAsync({ id: "conv_x", title: "Title B" })
+          .catch(() => undefined);
+        await act(() => vi.advanceTimersByTimeAsync(1_000));
+        const settleFirstPatch = async () => {
+          settleFirst(renamedResponse("Title A"));
+          await act(async () => {
+            await first;
+          });
+        };
+        const failSecondPatch = async () => {
+          failSecond(rejectedResponse());
+          await act(async () => {
+            await second;
+          });
+        };
+
+        if (settles === "before") {
+          await settleFirstPatch();
+          expect(titles()).toEqual({ list: "Title B", backfill: "Title B" });
+          await failSecondPatch();
+        } else {
+          await failSecondPatch();
+          await act(() => vi.advanceTimersByTimeAsync(48_000));
+          await settleFirstPatch();
+        }
+        expect(title()).toBe("Title A");
+        await act(() => vi.advanceTimersByTimeAsync(13_000));
+        writeOldTitle();
+        expect(title()).toBe("Title A");
+
+        writeTitle("Renamed elsewhere", 300);
+        expect(title()).toBe("Renamed elsewhere");
+        writeOldTitle();
+        expect(title()).toBe("Old name");
+      } finally {
+        stopGuard();
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("stops keeping a rename whose PATCH never settles", async () => {
     vi.useFakeTimers();
@@ -1622,7 +1702,7 @@ describe("useRenameConversation cache patching", () => {
         new Promise<Response>((resolve) => {
           failPatch[which] = resolve;
         });
-      const { rendered, stopGuard, writeOldTitle, title } = renameWithGuard(
+      const { rendered, stopGuard, writeOldTitle, title, titles } = renameWithGuard(
         heldPatch("first"),
         heldPatch("second"),
       );
@@ -1635,16 +1715,21 @@ describe("useRenameConversation cache patching", () => {
           .mutateAsync({ id: "conv_x", title: "Title B" })
           .catch(() => undefined);
         await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+        writeOldTitle();
+        expect(title()).toBe("Title B");
         const settled = { first, second };
         const fail = async (which: keyof typeof settled) => {
-          failPatch[which](mockResponse({ error: "boom" }, { ok: false, status: 500 }));
+          failPatch[which](rejectedResponse());
           await act(async () => {
             await settled[which];
           });
         };
 
         await fail(failsFirst);
+        const pending = failsFirst === "first" ? "Title B" : "Title A";
+        expect(titles()).toEqual({ list: pending, backfill: pending });
         await fail(failsFirst === "first" ? "second" : "first");
+        expect(titles()).toEqual({ list: "Old name", backfill: "Old name" });
         writeOldTitle();
         expect(title()).toBe("Old name");
       } finally {

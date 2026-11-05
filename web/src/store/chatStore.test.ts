@@ -80,6 +80,7 @@ import type {
 } from "@/lib/events";
 import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
+import { clearPendingRenames, keepPendingRenamesInLists, startRename } from "@/lib/pendingRenames";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
   ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
@@ -7031,6 +7032,25 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   // deliberately bind something else, or name another conversation in the event.
   beforeEach(() => {
     useChatStore.setState({ conversationId: "conv_abc" });
+  });
+
+  describe("session.title", () => {
+    it("lets a terminal rename replace a sidebar rename still being kept", () => {
+      seedConversationsCache([{ ...conv("conv_abc", "idle"), title: "New name" }]);
+      const stopGuard = keepPendingRenamesInLists(client);
+      try {
+        startRename("conv_abc", "New name", "Old name", ["Old name"]);
+        handleSessionEvent({
+          type: "session_title",
+          conversationId: "conv_abc",
+          title: "Old name",
+        });
+        expect(readConversationRows()[0].title).toBe("Old name");
+      } finally {
+        stopGuard();
+        clearPendingRenames();
+      }
+    });
   });
 
   describe("session.presence", () => {
