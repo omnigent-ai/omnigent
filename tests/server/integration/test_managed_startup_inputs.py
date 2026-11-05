@@ -39,6 +39,7 @@ from omnigent.server.startup_inputs import (
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store import MAX_PENDING_INPUTS
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
@@ -1185,6 +1186,43 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     assert await read_all("bob") == (["from bob"], 1)
     startup.conversations.set_runner_id(session_id, uuid4().hex)
     assert await read_all("bob") == ([], 1)
+
+
+async def test_discarding_replaced_inputs_reads_a_single_page() -> None:
+    def page(*rows: tuple[str, str | None, str]) -> list[tuple[Mock, int]]:
+        return [
+            (Mock(id=item_id, status=status, created_by=sender), position)
+            for position, (item_id, status, sender) in enumerate(rows)
+        ]
+
+    conversations = Mock()
+    conversations.list_pending_inputs_by_id.side_effect = [
+        (
+            page(
+                ("item_mine", "failed", "alice"),
+                ("item_bobs", "failed", "bob"),
+                ("item_queued", None, "alice"),
+                ("item_kept", "failed", "alice"),
+            ),
+            "item_kept",
+        ),
+        # The startup cap fits every input on one page, so the discard doesn't read on.
+        (page(("item_later", "failed", "alice")), None),
+    ]
+    startup = ManagedStartupInputs(conversations, Mock())
+    replaced = {
+        pending_inputs.make_pending_id("conv", item_id)
+        for item_id in ("item_mine", "item_bobs", "item_queued", "item_later")
+    }
+
+    await startup.discard_failed("conv", "alice", replaced)
+
+    conversations.list_pending_inputs_by_id.assert_called_once_with(
+        "conv", limit=MAX_PENDING_INPUTS
+    )
+    conversations.transition_pending_input.assert_called_once_with(
+        "conv", "item_mine", expected="failed", status=None
+    )
 
 
 async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input(

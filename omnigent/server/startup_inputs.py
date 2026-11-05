@@ -37,6 +37,7 @@ from omnigent.server.scheduled.telemetry import (
 )
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
 from omnigent.stores.conversation_store import (
+    MAX_PENDING_INPUTS,
     PENDING_INPUT_RESPONSE_ID,
     ConversationNotFoundError,
     ConversationStore,
@@ -311,27 +312,27 @@ class ManagedStartupInputs:
     async def discard_failed(
         self, session_id: str, viewer_id: str | None, pending_ids: Collection[str]
     ) -> None:
-        """Drop the viewer's undelivered inputs that a send replaces, so none returns twice."""
-        after: str | None = None
-        while True:
-            items, after = await asyncio.to_thread(
-                self.conversations.list_pending_inputs_by_id, session_id, after=after
-            )
-            for item, _position in items:
-                if (
-                    item.status == "failed"
-                    and item.created_by == viewer_id
-                    and pending_inputs.make_pending_id(session_id, item.id) in pending_ids
-                ):
-                    await asyncio.to_thread(
-                        self.conversations.transition_pending_input,
-                        session_id,
-                        item.id,
-                        expected="failed",
-                        status=None,
-                    )
-            if after is None:
-                return
+        """Drop the viewer's undelivered inputs that a send replaces, so none returns twice.
+
+        Reads one page, which holds every input the startup cap admits; any
+        past it stay listed, as they do when the discard fails.
+        """
+        items, _after = await asyncio.to_thread(
+            self.conversations.list_pending_inputs_by_id, session_id, limit=MAX_PENDING_INPUTS
+        )
+        for item, _position in items:
+            if (
+                item.status == "failed"
+                and item.created_by == viewer_id
+                and pending_inputs.make_pending_id(session_id, item.id) in pending_ids
+            ):
+                await asyncio.to_thread(
+                    self.conversations.transition_pending_input,
+                    session_id,
+                    item.id,
+                    expected="failed",
+                    status=None,
+                )
 
     def host_changed(self, app: Any, host_id: str) -> None:
         key = (current_workspace_id(), host_id)
