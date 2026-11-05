@@ -246,7 +246,14 @@ function useCollapsedComposerLabels(
     resizeObserver.observe(leading);
     resizeObserver.observe(trailing);
     const mutationObserver = new MutationObserver(measure);
-    mutationObserver.observe(row, { childList: true, characterData: true, subtree: true });
+    // Portaled controls can change appearance without resizing their collapsed groups.
+    mutationObserver.observe(row, {
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["class"],
+      subtree: true,
+    });
     return () => {
       resizeObserver.disconnect();
       mutationObserver.disconnect();
