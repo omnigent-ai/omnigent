@@ -14716,6 +14716,7 @@
             }
           },
           {
+            "description": "Add owned family context to matching rows, including members outside the agent, pin, and page filters. Ownership and archive filters still apply; search disables expansion. Pagination cursors refer to the original filtered page.",
             "in": "query",
             "name": "expand_families",
             "required": false,

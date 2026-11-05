@@ -1313,6 +1313,17 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     assert [row["id"] for row in expanded.json()["data"]] == [sibling_id]
     expanded = await auth_client.get("/v1/sessions", params={"limit": 1, "expand_families": True})
     assert {row["id"] for row in expanded.json()["data"]} == {source["id"], sibling_id}
+    pinned = await auth_client.patch(
+        f"/v1/sessions/{sibling_id}", json={"labels": {"omnigent.pinned": "1"}}
+    )
+    assert pinned.status_code == 200, pinned.text
+    for expand in (False, True):
+        pinned_page = await auth_client.get(
+            "/v1/sessions", params={"pinned": True, "expand_families": expand}
+        )
+        assert {row["id"] for row in pinned_page.json()["data"]} == (
+            {source["id"], sibling_id} if expand else {sibling_id}
+        )
     ids = []
     after = None
     while True:

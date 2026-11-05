@@ -2088,6 +2088,10 @@ def register_core_routes(
             has pinned (the ``omnigent.pinned`` label). Lets the
             sidebar enumerate pinned sessions that fall outside the
             loaded pagination window. ``False`` (default) disables it.
+        :param expand_families: Add owned family context to matching rows,
+            including members outside the agent, pin, and page filters.
+            Ownership and archive filters still apply; search disables expansion.
+            Pagination cursors refer to the original filtered page.
         :param visibility: Ownership/archive filter for the sidebar tabs.
             ``"mine"`` returns only sessions the caller owns (owner-level
             grant). ``"shared"`` returns only sessions accessible but not
@@ -2243,27 +2247,8 @@ def register_core_routes(
             pending_counts = pending_elicitations.counts_for(conv_ids)
             comments_fingerprints = await _comments_fingerprints_for(conv_ids)
             pull_requests = await _pull_requests_for(conv_ids)
-            # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
-            # A session whose persisted live_status is still running/waiting but
-            # whose runner is confirmed gone — a replica that restarted and
-            # outlived its runner, a crashed host, a graceful disconnect
-            # mid-turn — would otherwise read "running" forever: no executor is
-            # left to emit the terminal edge that clears it. Settle that exact
-            # subset here so the sidebar (and every other reader) stops showing a
-            # turn that isn't happening. The list still does NOT compute liveness
-            # for the general case (see the note below the item build): the probe
-            # is bounded to a tiny suspect set so the common path pays nothing.
-            #
-            # Suspect = a row that (a) still says running/waiting, (b) has a bound
-            # runner, (c) has NO live entry in this replica's status cache — i.e.
-            # its "running" came from the cross-replica DB mirror, not a runner
-            # this replica is actively relaying — and (d) has a stale/absent
-            # runner_last_seen heartbeat. The freshness check reads the stamp
-            # already carried on the list row (no extra query): a runner up on
-            # another replica keeps it fresh, so such a session is filtered out
-            # here and never reaches the probe. Only stamp-stale candidates fall
-            # through to liveness_lookup, which additionally rules out a runner
-            # whose tunnel is live on THIS replica before we settle.
+            # Settle orphaned running/waiting rows only after stale heartbeats
+            # and a missing local cache entry justify a cross-replica probe.
             if liveness_lookup is not None:
                 orphan_suspects = [
                     conv
@@ -2289,10 +2274,8 @@ def register_core_routes(
                     )
                     for conv in orphan_suspects:
                         result = orphan_liveness.get(conv.id)
-                        # runner_online is False only once the runner is gone from
-                        # every replica (no tunnel anywhere AND runner_last_seen
-                        # stale past the TTL), so this fires for a genuinely
-                        # orphaned runner, never one mid-reconnect within grace.
+                        # False means no replica has a tunnel and the heartbeat
+                        # expired, so reconnecting runners within grace survive.
                         if result is not None and not result.runner_online:
                             await asyncio.to_thread(
                                 reconcile_orphaned_running_status,
@@ -4020,14 +4003,8 @@ def register_core_routes(
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True:
             _prune_session_read_state(session_id)
-            # Defer the stop now that the flag is committed, so a request
-            # rejected after this point can't leave a live runner on a session
-            # that ends up archived. Detached, not awaited: the response must
-            # not wait out the stop's per-runner timeouts (seconds against a
-            # wedged or asleep runner). The teardown sleeps past the Undo
-            # window, then re-reads the archived flag and skips if undone, so
-            # undoing keeps the runner alive. Archive has no client-side stop,
-            # so this also carries the host-runner teardown.
+            # Stop asynchronously after the archive commits and Undo grace elapses.
+            # The deferred archived-flag check keeps an undone session's runner alive.
             _spawn_archive_stop(
                 session_id,
                 conversation_store,
@@ -4037,11 +4014,8 @@ def register_core_routes(
                 host_store=getattr(request.app.state, "host_store", None),
             )
         elif body.archived is False:
-            # Unarchive (including Undo, which re-PATCHes archived=false within
-            # the pill's window): cancel a still-pending archive stop so the
-            # runner is kept alive instead of torn down for a session the user
-            # decided to keep. Same-replica fast path; the deferred stop's
-            # archived-flag re-check covers a cross-replica Undo.
+            # Cancel local teardown immediately; the deferred flag check handles
+            # Undo arriving on another replica.
             _cancel_pending_archive_stop(session_id)
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
