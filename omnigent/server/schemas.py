@@ -4004,6 +4004,43 @@ class SessionInputConsumedEvent(_SSEEventBase):
     data: SessionInputConsumedPayload
 
 
+class SessionInputEditedPayload(BaseModel):
+    """
+    Inner payload of a :class:`SessionInputEditedEvent`.
+
+    :param pending_id: The queued entry whose content changed, e.g.
+        ``"pending_a1b2c3"``; matches the ``pending_id`` the send returned.
+    :param content: The entry's new content blocks, e.g.
+        ``[{"type": "input_text", "text": "Then summarize"}]``.
+    :param merged_pending_ids: Queued entries folded into this one; clients
+        drop their bubbles, e.g. ``["pending_d4e5f6"]``.
+    """
+
+    pending_id: str
+    content: list[dict[str, Any]]
+    merged_pending_ids: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class SessionInputEditedEvent(_SSEEventBase):
+    """
+    A queued native-terminal message was edited before the agent took it.
+
+    Published when Claude Code's queue records show the person pulled a
+    queued prompt back into its composer with Up and queued edited text.
+    Wire shape uses the nested envelope: ``{"type": "session.input.edited",
+    "data": <:class:`SessionInputEditedPayload`>}``. Transient: a reconnecting
+    client reads the edited text from the snapshot's pending inputs.
+
+    :param type: Always ``"session.input.edited"``.
+    :param data: See :class:`SessionInputEditedPayload`.
+    """
+
+    type: Literal["session.input.edited"]
+    data: SessionInputEditedPayload
+
+
 class SessionInterruptedPayload(BaseModel):
     """
     Inner payload of a :class:`SessionInterruptedEvent`.
@@ -5178,6 +5215,7 @@ ServerStreamEvent = Annotated[
     | SessionMcpStartupEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
+    | SessionInputEditedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent
     | SessionSupersededEvent

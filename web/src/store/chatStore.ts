@@ -1430,6 +1430,12 @@ export interface ChatActions {
   /** Run the native harness's /clear in the session terminal. */
   clearContext: () => Promise<void>;
   /**
+   * Replace the text of a queued claude-native message, as Up does in the
+   * terminal. Resolves `false` when the message is no longer queued or the
+   * terminal edit failed; the bubble then keeps its original text.
+   */
+  editQueuedMessage: (pendingId: string, text: string) => Promise<boolean>;
+  /**
    * Refetch runner-backed session state for the active conversation.
    *
    * Used when a native runner comes online after being unreachable: the
@@ -3586,6 +3592,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     await postEvent(conversationId, { type: "clear", data: {} });
+  },
+  editQueuedMessage: async (pendingId, text) => {
+    const { conversationId, pendingUserMessages } = get();
+    const original = pendingUserMessages.find((p) => isPendingInput(p, pendingId))?.content;
+    if (!conversationId || original === undefined) return false;
+    const edited: MessageContentBlock[] = [{ type: "input_text", text }];
+    setterFor(conversationId)((s) => ({
+      pendingUserMessages: withPendingContent(s.pendingUserMessages, pendingId, edited),
+    }));
+    try {
+      await postEvent(conversationId, {
+        type: "queued_message_edit",
+        data: { pending_id: pendingId, content: text },
+      });
+      return true;
+    } catch {
+      setterFor(conversationId)((s) => ({
+        pendingUserMessages: withPendingContent(s.pendingUserMessages, pendingId, original),
+      }));
+      return false;
+    }
   },
 
   refreshSessionState: async (conversationId) => {
@@ -7407,13 +7434,7 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   if (event.data.role !== "user") return null;
   const raw = event.data.content;
   if (!Array.isArray(raw)) return null;
-  const content = raw.filter(
-    (b): b is MessageContentBlock =>
-      typeof b === "object" &&
-      b !== null &&
-      "type" in b &&
-      (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
-  );
+  const content = userInputBlocksOf(raw);
   if (event.isMeta !== true && isHumanAuthoredInput(event)) return content;
   // A Claude background-task wake is hidden context (`is_meta`) that still
   // has to start a new turn on screen: render it as a system marker. Every
@@ -7422,6 +7443,31 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   if (marker !== null) return marker;
   if (event.isMeta === true) return null;
   return content;
+}
+
+function userInputBlocksOf(raw: unknown[]): MessageContentBlock[] {
+  return raw.filter(
+    (b): b is MessageContentBlock =>
+      typeof b === "object" &&
+      b !== null &&
+      "type" in b &&
+      (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
+  );
+}
+
+/** Whether a bubble is the server pending input `pendingId` (replayed bubbles use it as `tempId`). */
+function isPendingInput(message: PendingUserMessage, pendingId: string): boolean {
+  return message.pendingId === pendingId || message.tempId === pendingId;
+}
+
+function withPendingContent(
+  messages: PendingUserMessage[],
+  pendingId: string,
+  content: MessageContentBlock[],
+): PendingUserMessage[] {
+  return messages.some((p) => isPendingInput(p, pendingId))
+    ? messages.map((p) => (isPendingInput(p, pendingId) ? { ...p, content } : p))
+    : messages;
 }
 
 export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
@@ -8649,6 +8695,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // here — a single "flush on the idle event" is fragile: a message queued
       // just after the idle edge, or an SSE reconnect that replays state
       // without a fresh transition, would strand the queue forever.
+      return;
+    }
+    case "session_input_edited": {
+      const content = userInputBlocksOf(event.content);
+      applyToConversation((s) => {
+        const kept =
+          event.mergedPendingIds.length === 0
+            ? s.pendingUserMessages
+            : s.pendingUserMessages.filter(
+                (p) => !event.mergedPendingIds.some((id) => isPendingInput(p, id)),
+              );
+        const pendingUserMessages = withPendingContent(kept, event.pendingId, content);
+        return pendingUserMessages === s.pendingUserMessages ? {} : { pendingUserMessages };
+      });
       return;
     }
     case "session_input_consumed":

@@ -801,6 +801,19 @@ export interface SessionInputConsumedEvent {
 }
 
 /**
+ * `session.input.edited` — a queued native-terminal message was edited
+ * before the agent took it (Claude Code's Up-arrow queue edit, from the
+ * terminal or the web composer). The bubble for `pendingId` takes the
+ * new content; `mergedPendingIds` were folded into it and are gone.
+ */
+export interface SessionInputEditedEvent {
+  type: "session_input_edited";
+  pendingId: string;
+  content: Record<string, unknown>[];
+  mergedPendingIds: string[];
+}
+
+/**
  * `session.interrupted` — user-triggered cancel reached the loop.
  *
  * Co-emitted with `response.incomplete` (whose underlying
@@ -1056,6 +1069,7 @@ export type StreamEvent =
   | SessionSandboxStatusEvent
   | SessionMcpStartupEvent
   | SessionInputConsumedEvent
+  | SessionInputEditedEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent
   | SessionSupersededEvent

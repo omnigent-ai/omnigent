@@ -2536,6 +2536,7 @@ function ComposerImpl(
   const steerMessage = useChatStore((s) => s.steerMessage);
   const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
   const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
+  const editQueuedMessage = useChatStore((s) => s.editQueuedMessage);
   // Drain the queue whenever idle with a waiting head — level-triggered so a
   // message queued right after the turn ended (or after an SSE reconnect that
   // carries no fresh idle transition) still sends instead of stranding. Hold
@@ -3566,6 +3567,11 @@ function ComposerImpl(
   // Allow continued navigation through recalled entries with quote cards.
   // User edits and quote changes leave recall mode.
   const recallingRef = useRef(false);
+  // Pending id of the queued Claude Code message ArrowUp recalled for editing.
+  const editingQueuedIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    editingQueuedIdRef.current = null;
+  }, [conversationId]);
 
   const replyQuoteInsertedRef = useRef(false);
   useImperativeHandle(ref, () => ({
@@ -3657,6 +3663,34 @@ function ComposerImpl(
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
+
+    const editingQueuedId = editingQueuedIdRef.current;
+    editingQueuedIdRef.current = null;
+    if (
+      editingQueuedId !== null &&
+      trimmed &&
+      files.length === 0 &&
+      mentionedItems.length === 0 &&
+      draft.quotes.length === 0
+    ) {
+      const edited = fullText.trimEnd();
+      const editedIn = conversationId;
+      dirtyRef.current = true;
+      setValue("");
+      setCommandError(null);
+      void editQueuedMessage(editingQueuedId, edited).then((ok) => {
+        if (ok) return;
+        toast.error("Couldn't edit the queued message. Your edit is back in the composer.");
+        // Restore the edit to resend it, unless the user has moved on.
+        if (
+          useChatStore.getState().conversationId === editedIn &&
+          !tailTextareaRef.current?.value
+        ) {
+          replaceText(edited);
+        }
+      });
+      return;
+    }
 
     // A generic (non-Codex) side chat forks the conversation and runs it on the
     // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
@@ -3908,16 +3942,30 @@ function ComposerImpl(
             applyRecall(ta, target);
             return;
           }
+          // Like Claude Code's own Up, recall a message it has queued for editing.
+          const queued =
+            sessionHarness === "claude-native"
+              ? editableQueuedInput(useChatStore.getState().pendingUserMessages)
+              : null;
+          if (queued !== null) {
+            e.preventDefault();
+            resetCursor();
+            applyRecall(ta, { text: queued.text });
+            editingQueuedIdRef.current = queued.pendingId;
+            return;
+          }
         }
         const recalled = recallPrevious(fullText, storedReplyDraft);
         if (recalled !== null) {
           e.preventDefault();
+          editingQueuedIdRef.current = null;
           applyRecall(ta, recalled);
         }
       } else if (e.key === "ArrowDown" && ta.selectionEnd === ta.value.length) {
         const recalled = recallNext();
         if (recalled !== null) {
           e.preventDefault();
+          editingQueuedIdRef.current = null;
           applyRecall(ta, recalled);
         }
       }
@@ -3927,6 +3975,7 @@ function ComposerImpl(
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
     slashCompletion.onSelectionChange(e.target);
     editText(id, e.target.value);
+    if (!e.target.value) editingQueuedIdRef.current = null;
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
@@ -4464,6 +4513,26 @@ export function hasSentNativeInputPending(
       (message) => message.initialDraft === undefined && message.createdAtS !== undefined,
     )
   );
+}
+
+/**
+ * The latest queued native message, when the composer can edit it in place: the
+ * server has accepted it (so it holds a pending id) and its content is plain text.
+ *
+ * @param pendingUserMessages - The conversation's optimistic and replayed bubbles.
+ * @returns Its server pending id and text, or `null` when it is not editable.
+ */
+export function editableQueuedInput(
+  pendingUserMessages: PendingUserMessage[],
+): { pendingId: string; text: string } | null {
+  const message = pendingUserMessages.at(-1);
+  if (message === undefined || message.initialDraft !== undefined) return null;
+  const pendingId =
+    message.pendingId ?? (message.tempId.startsWith("pending_") ? message.tempId : null);
+  if (pendingId === null || message.content.length === 0) return null;
+  if (!message.content.every((block) => block.type === "input_text")) return null;
+  const text = message.content.map((block) => block.text).join("\n");
+  return text.trim() && !text.startsWith("!") ? { pendingId, text } : null;
 }
 
 /**

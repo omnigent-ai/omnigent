@@ -42,6 +42,7 @@ import type {
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
+  SessionInputEditedEvent,
   SessionInterruptedEvent,
   SessionPresenceEvent,
   SessionResource,
@@ -868,6 +869,24 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       data: payload,
       clearedPendingId: typeof clearedPendingId === "string" ? clearedPendingId : null,
     } satisfies SessionInputConsumedEvent;
+  }
+  if (eventType === "session.input.edited") {
+    // Nested envelope: `{type, data: {pending_id, content, merged_pending_ids}}`.
+    const inner = data.data;
+    if (!inner || typeof inner !== "object" || Array.isArray(inner)) return null;
+    const p = inner as Record<string, unknown>;
+    if (typeof p.pending_id !== "string" || !p.pending_id) return null;
+    if (!Array.isArray(p.content)) return null;
+    const merged = Array.isArray(p.merged_pending_ids) ? p.merged_pending_ids : [];
+    return {
+      type: "session_input_edited",
+      pendingId: p.pending_id,
+      content: p.content.filter(
+        (block): block is Record<string, unknown> =>
+          !!block && typeof block === "object" && !Array.isArray(block),
+      ),
+      mergedPendingIds: merged.filter((id): id is string => typeof id === "string"),
+    } satisfies SessionInputEditedEvent;
   }
   if (eventType === "session.interrupted") {
     // Nested envelope: `{type, data: {requested_at}}`.

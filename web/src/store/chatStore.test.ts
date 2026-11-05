@@ -7030,6 +7030,67 @@ describe("chatStore — stop", () => {
   });
 });
 
+describe("chatStore — queued native message edits", () => {
+  const text = (value: string) => [{ type: "input_text" as const, text: value }];
+
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      pendingUserMessages: [
+        { tempId: "tmp_1", pendingId: "pending_1", content: text("Then summarize") },
+        { tempId: "pending_2", content: text("and list them") },
+      ],
+    });
+  });
+
+  it("session_input_edited replaces the bubble's text and drops the merged bubbles", () => {
+    handleSessionEvent({
+      type: "session_input_edited",
+      pendingId: "pending_1",
+      content: [{ type: "input_text", text: "Then summarize the logs" }],
+      mergedPendingIds: ["pending_2"],
+    });
+
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      { tempId: "tmp_1", pendingId: "pending_1", content: text("Then summarize the logs") },
+    ]);
+  });
+
+  it("editQueuedMessage posts the edit and shows the new text", async () => {
+    await expect(
+      useChatStore.getState().editQueuedMessage("pending_2", "and list the errors"),
+    ).resolves.toBe(true);
+
+    const events = fetchMock.mock.calls.filter(([url]) =>
+      String(url).endsWith("/v1/sessions/conv_abc/events"),
+    );
+    expect(events.map(([, init]) => JSON.parse((init as RequestInit).body as string))).toEqual([
+      {
+        type: "queued_message_edit",
+        data: { pending_id: "pending_2", content: "and list the errors" },
+      },
+    ]);
+    expect(useChatStore.getState().pendingUserMessages[1]?.content).toEqual(
+      text("and list the errors"),
+    );
+  });
+
+  it("editQueuedMessage restores the original text when the edit is refused", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return mockResponse({ error: "conflict" }, { ok: false, status: 409 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await expect(
+      useChatStore.getState().editQueuedMessage("pending_1", "Then summarize the logs"),
+    ).resolves.toBe(false);
+
+    expect(useChatStore.getState().pendingUserMessages[0]?.content).toEqual(text("Then summarize"));
+  });
+});
+
 describe("chatStore — handleSessionEvent (session.* events)", () => {
   // These cases call `handleSessionEvent` directly, without the stream that
   // normally names the delivering conversation. Bind `conv_abc` — the id their

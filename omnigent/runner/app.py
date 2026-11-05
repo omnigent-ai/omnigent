@@ -7721,6 +7721,23 @@ def create_runner_app(
                 return await _handle_claude_native_btw_dismiss(conversation_id)
             return Response(status_code=204)
 
+        if body_type == "queued_message_edit":
+            if _session_harness_name(conversation_id) != "claude-native":
+                return Response(status_code=204)
+            original = body.get("original") if isinstance(body, dict) else None
+            replacement = body.get("replacement") if isinstance(body, dict) else None
+            if not isinstance(original, str) or not isinstance(replacement, str):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Body 'original' and 'replacement' must be strings",
+                    },
+                )
+            return await _handle_claude_native_queued_message_edit(
+                conversation_id, original, replacement
+            )
+
         if body_type == "codex_approval_mode_change":
             harness = _session_harness_name(conversation_id)
             if harness == "codex-native":
@@ -8090,6 +8107,9 @@ def create_runner_app(
     _handle_claude_native_model_change = _native_controls.handle_claude_native_model_change
     _handle_claude_native_permission_mode_change = (
         _native_controls.handle_claude_native_permission_mode_change
+    )
+    _handle_claude_native_queued_message_edit = (
+        _native_controls.handle_claude_native_queued_message_edit
     )
     _handle_claude_sdk_compact = _native_controls.handle_claude_sdk_compact
     _handle_codex_native_approval_mode_change = (

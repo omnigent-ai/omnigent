@@ -311,6 +311,9 @@ class NativeControls:
     handle_claude_native_permission_mode_change: Callable[
         [str, str | None], Coroutine[Any, Any, Response]
     ]
+    handle_claude_native_queued_message_edit: Callable[
+        [str, str, str], Coroutine[Any, Any, Response]
+    ]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
     handle_codex_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
@@ -1219,6 +1222,49 @@ def build_native_controls(
         except (RuntimeError, ValueError):
             # Nothing to recover: the pane overlay closes on the next inject.
             return Response(status_code=204)
+        return Response(status_code=200)
+
+    async def _handle_claude_native_queued_message_edit(
+        conv_id: str, original: str, replacement: str
+    ) -> Response:
+        """
+        Replace a message waiting in a claude-native pane's queue with edited text.
+
+        :returns: 200 once the pane queued the edit, 409 when the message is no
+            longer queued, or 503 when the pane could not be driven.
+        """
+        from omnigent.harnesses.claude_native.bridge import (
+            ClaudeQueuedMessageMissing,
+            bridge_dir_for_bridge_id,
+            edit_queued_user_message,
+        )
+
+        deadline = _ClaudeControlDeadline()
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        try:
+            await _drive_claude_pane(
+                deadline,
+                edit_queued_user_message,
+                bridge_dir,
+                original=original,
+                replacement=replacement,
+            )
+        except ClaudeQueuedMessageMissing:
+            return JSONResponse(status_code=409, content={"error": "queued_message_missing"})
+        except (RuntimeError, ValueError, OSError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_queued_message_edit_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="claude-native queued message edit"
+                    ),
+                },
+            )
         return Response(status_code=200)
 
     async def _prepare_claude_native_pane_for_injection(
@@ -2551,6 +2597,7 @@ def build_native_controls(
         handle_claude_native_effort_change=_handle_claude_native_effort_change,
         handle_claude_native_model_change=_handle_claude_native_model_change,
         handle_claude_native_permission_mode_change=_handle_claude_native_permission_mode_change,
+        handle_claude_native_queued_message_edit=_handle_claude_native_queued_message_edit,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
         handle_codex_native_clear=_handle_codex_native_clear,

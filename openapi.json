@@ -6392,6 +6392,7 @@
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
+            "session.input.edited": "#/components/schemas/SessionInputEditedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
@@ -6465,6 +6466,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionInputConsumedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionInputEditedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionInterruptedEvent"
@@ -7328,6 +7332,73 @@
           "data"
         ],
         "title": "SessionInputConsumedPayload",
+        "type": "object"
+      },
+      "SessionInputEditedEvent": {
+        "description": "A queued native-terminal message was edited before the agent took it.\n\nPublished when Claude Code's queue records show the person pulled a\nqueued prompt back into its composer with Up and queued edited text.\nWire shape uses the nested envelope: `{\"type\": \"session.input.edited\", \"data\": <SessionInputEditedPayload>}`. Transient: a reconnecting\nclient reads the edited text from the snapshot's pending inputs.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SessionInputEditedPayload",
+            "description": "See `SessionInputEditedPayload`."
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.input.edited",
+            "description": "Always `\"session.input.edited\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "data"
+        ],
+        "title": "SessionInputEditedEvent",
+        "type": "object"
+      },
+      "SessionInputEditedPayload": {
+        "description": "Inner payload of a `SessionInputEditedEvent`.",
+        "properties": {
+          "content": {
+            "description": "The entry's new content blocks, e.g. `[{\"type\": \"input_text\", \"text\": \"Then summarize\"}]`.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Content",
+            "type": "array"
+          },
+          "merged_pending_ids": {
+            "description": "Queued entries folded into this one; clients drop their bubbles, e.g. `[\"pending_d4e5f6\"]`.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Merged Pending Ids",
+            "type": "array"
+          },
+          "pending_id": {
+            "description": "The queued entry whose content changed, e.g. `\"pending_a1b2c3\"`; matches the `pending_id` the send returned.",
+            "title": "Pending Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pending_id",
+          "content"
+        ],
+        "title": "SessionInputEditedPayload",
         "type": "object"
       },
       "SessionInterruptedEvent": {

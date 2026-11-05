@@ -92,6 +92,12 @@ Limitations (identical to :mod:`pending_elicitations`):
   entry its image can land on the wrong message. This is the positional
   behavior that predates text matching, kept as a known limitation.
 
+Claude Code lets the person pull queued prompts back into its composer with
+Up, edit them, and queue the result again. Its transcript logs those moves as
+``queue-operation`` records, which the forwarder reports here
+(:func:`apply_queue_operations`) so the matching entry takes the edited text
+and its bubble updates instead of keeping the text Claude no longer holds.
+
 A forwarded message the vendor TUI never accepts (runner crash, dropped
 keystrokes) is never persisted, so no mirror drains its entry. The next
 text-matched mirror skips it (see :func:`resolve_matching_text`) and the
@@ -109,9 +115,12 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
+
+from cachetools import LRUCache
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
@@ -138,6 +147,13 @@ _MAX_ENTRIES_PER_CONVERSATION = 64
 # the person typed is never mistaken for a generated one.
 _ONE_LEADING_ATTACHMENT_MARKER_RE = re.compile(rf"^\s*(?:{ATTACHMENT_MARKER_STRIP_PATTERN})\s*")
 _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
+
+# Applied queue-operation keys remembered per conversation, so a transcript
+# region the forwarder re-reads after a failed post is not applied twice.
+_MAX_APPLIED_QUEUE_OPERATIONS = 256
+
+# How long a web edit waits for the pane's queue records to confirm it.
+_PLANNED_EDIT_TTL_S = 60.0
 
 # Words Claude Code's composer treats as /exit when sent on their own.
 _CLAUDE_EXIT_WORDS = frozenset({"exit", "quit", ":q", ":q!", ":wq", ":wq!"})
@@ -335,6 +351,56 @@ class _Entry:
 # dicts are popped eagerly so the index doesn't accrete stale keys.
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 _lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class QueueOperation:
+    """
+    One Claude Code prompt-queue record reported by the transcript forwarder.
+
+    :param operation: ``"enqueue"``, ``"popAll"`` or ``"popOne"``.
+    :param content: The queued prompt text, e.g. ``"Then summarize"``.
+    :param timestamp: Claude's ISO timestamp for the record, e.g.
+        ``"2026-11-05T09:45:15.794Z"``. Up pops every queued prompt in one
+        batch that shares a timestamp.
+    """
+
+    operation: str
+    content: str
+    timestamp: str = ""
+
+
+@dataclass(frozen=True)
+class QueueEdit:
+    """
+    A pending entry whose text changed because the queued prompt was edited.
+
+    :param pending_id: The edited entry's id, e.g. ``"pending_a1b2c3"``.
+    :param content: The entry's new content blocks.
+    :param merged_pending_ids: Entries folded into this one, e.g. when Up
+        pulled two queued prompts into one draft. They are no longer pending.
+    """
+
+    pending_id: str
+    content: list[dict[str, Any]]
+    merged_pending_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _QueueMirror:
+    """Per-conversation view of the prompts Up moved out of Claude's queue."""
+
+    # (whitespace-collapsed text, pending id or None for a prompt typed in the TUI)
+    popped: list[tuple[str, str | None]] = field(default_factory=list)
+    pop_batch: str | None = None
+    applied: deque[tuple[str, str, str, int]] = field(default_factory=deque)
+    # pending id -> (replacement text, created at)
+    planned_edits: dict[str, tuple[str, float]] = field(default_factory=dict)
+
+
+_queue_mirrors: WorkspaceScopedCache[str, _QueueMirror] = WorkspaceScopedCache(
+    lambda: LRUCache(maxsize=4096)
+)
 
 
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
@@ -1002,6 +1068,199 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
         ]
 
 
+def plan_queued_edit(conversation_id: str, pending_id: str, replacement: str) -> str | None:
+    """
+    Register a web edit of a queued message and return the text to replace.
+
+    The pane edit resubmits every prompt Up pulled out of Claude's queue, so
+    :func:`apply_queue_operations` uses this plan to give the replacement to
+    this entry alone instead of treating it as a merged draft.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The queued entry to edit, e.g. ``"pending_a1b2c3"``.
+    :param replacement: The edited message text.
+    :returns: The entry's current text, or ``None`` when it is no longer a
+        live text-only queued message.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is None or entry.held or entry.interrupted or _attachment_count(entry.content):
+            return None
+        text = _content_text(entry.content)
+        if not text.strip():
+            return None
+        mirror = _queue_mirrors.get(conversation_id)
+        if mirror is None:
+            mirror = _QueueMirror()
+            _queue_mirrors[conversation_id] = mirror
+        mirror.planned_edits[pending_id] = (replacement, _now())
+        return text
+
+
+def cancel_queued_edit(conversation_id: str, pending_id: str) -> None:
+    """Forget a planned web edit whose pane edit failed."""
+    with _lock:
+        mirror = _queue_mirrors.get(conversation_id)
+        if mirror is not None:
+            mirror.planned_edits.pop(pending_id, None)
+
+
+def confirm_queued_edit(conversation_id: str, pending_id: str) -> QueueEdit | None:
+    """
+    Apply a planned web edit the pane confirmed, unless its queue records did.
+
+    Covers a forwarder that has not reported the records yet, and a turn that
+    ended mid-edit so Claude took the replacement without queueing it.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The edited entry, e.g. ``"pending_a1b2c3"``.
+    :returns: The edit to publish, or ``None`` when it was already applied
+        or the entry is gone.
+    """
+    with _lock:
+        mirror = _queue_mirrors.get(conversation_id)
+        plan = mirror.planned_edits.pop(pending_id, None) if mirror is not None else None
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if mirror is None or plan is None or entry is None:
+            return None
+        mirror.popped = [item for item in mirror.popped if item[1] != pending_id]
+        entry.content = _with_text(entry.content, plan[0])
+        return QueueEdit(pending_id=pending_id, content=copy.deepcopy(entry.content))
+
+
+def apply_queue_operations(
+    conversation_id: str, operations: Sequence[QueueOperation]
+) -> list[QueueEdit]:
+    """
+    Mirror Claude Code's queued-prompt edits onto the pending entries.
+
+    Up logs one ``popAll`` per queued prompt it moves into the composer, and
+    submitting the draft logs one ``enqueue`` of the combined text. An
+    ``enqueue`` equal to a popped prompt puts it back unchanged; any other
+    ``enqueue`` after a pop is the edited draft, so the oldest popped entry
+    takes its text and the other popped entries are merged into it. A
+    planned web edit (:func:`plan_queued_edit`) instead edits only its own
+    entry. Records already applied are skipped.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param operations: Queue records in transcript order.
+    :returns: The entries whose content changed, in the order they changed.
+    """
+    edits: list[QueueEdit] = []
+    with _lock:
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
+        entries = _pending.get(conversation_id)
+        if entries is None:
+            _queue_mirrors.pop(conversation_id, None)
+            return edits
+        mirror = _queue_mirrors.get(conversation_id)
+        if mirror is None:
+            mirror = _QueueMirror()
+            _queue_mirrors[conversation_id] = mirror
+        mirror.planned_edits = {
+            pid: plan
+            for pid, plan in mirror.planned_edits.items()
+            if now - plan[1] <= _PLANNED_EDIT_TTL_S
+        }
+        occurrences: dict[tuple[str, str, str], int] = {}
+        for operation in operations:
+            triple = (operation.timestamp, operation.operation, operation.content)
+            occurrences[triple] = occurrences.get(triple, 0) + 1
+            key = (*triple, occurrences[triple])
+            text = _collapse_whitespace(operation.content)
+            if key in mirror.applied or not text:
+                continue
+            mirror.applied.append(key)
+            if len(mirror.applied) > _MAX_APPLIED_QUEUE_OPERATIONS:
+                mirror.applied.popleft()
+            if operation.operation == "popAll" and mirror.pop_batch != operation.timestamp:
+                # Up pops everything queued, so prompts left over from an earlier pop are gone.
+                mirror.popped.clear()
+                mirror.pop_batch = operation.timestamp
+            popped_ids = {pid for _text, pid in mirror.popped if pid is not None}
+            live = [
+                entry
+                for entry in entries.values()
+                if not entry.held and not entry.interrupted and entry.pending_id not in popped_ids
+            ]
+            if operation.operation in {"popAll", "popOne"}:
+                match = next((entry for entry in live if _queued_text_matches(entry, text)), None)
+                mirror.popped.append((text, match.pending_id if match else None))
+                continue
+            if operation.operation != "enqueue":
+                continue
+            returned = next(
+                (index for index, (popped, _pid) in enumerate(mirror.popped) if popped == text),
+                None,
+            )
+            if returned is not None:
+                mirror.popped.pop(returned)
+                continue
+            if any(_queued_text_matches(entry, text) for entry in live):
+                continue
+            popped_entries = [pid for _text, pid in mirror.popped if pid in entries]
+            if not popped_entries:
+                mirror.popped.clear()
+                continue
+            planned = next(
+                (
+                    pid
+                    for pid in popped_entries
+                    if _collapse_whitespace(mirror.planned_edits.get(pid, ("", 0.0))[0]) == text
+                ),
+                None,
+            )
+            if planned is not None:
+                target, merged = planned, []
+                mirror.planned_edits.pop(planned, None)
+                mirror.popped = [item for item in mirror.popped if item[1] != planned]
+            else:
+                target, merged = popped_entries[0], popped_entries[1:]
+                mirror.popped.clear()
+            entry = entries[target]
+            for merged_id in merged:
+                merged_entry = entries.pop(merged_id)
+                entry.content.extend(
+                    block
+                    for block in merged_entry.content
+                    if isinstance(block, dict) and block.get("type") in _ATTACHMENT_BLOCK_TYPES
+                )
+            entry.content = _with_text(entry.content, operation.content)
+            edits.append(
+                QueueEdit(
+                    pending_id=target,
+                    content=copy.deepcopy(entry.content),
+                    merged_pending_ids=merged,
+                )
+            )
+    return edits
+
+
+def _queued_text_matches(entry: _Entry, text: str) -> bool:
+    """Whether collapsed queue-record ``text`` is this entry's pasted message."""
+    own = _collapse_whitespace(_content_text(entry.content))
+    if not own:
+        return False
+    attachments = _attachment_count(entry.content)
+    return own == text or (
+        attachments > 0
+        and _collapse_whitespace(_strip_generated_markers(text, attachments)) == own
+    )
+
+
+def _with_text(content: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    """Replace the text blocks of queued content, keeping its file blocks."""
+    attachments = _attachment_count(content)
+    files = [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") in _ATTACHMENT_BLOCK_TYPES
+    ]
+    return [*files, {"type": "input_text", "text": _strip_generated_markers(text, attachments)}]
+
+
 def _drained_input(entry: _Entry) -> DrainedInput:
     """Copy a pending entry into the public drained shape."""
     return DrainedInput(
@@ -1167,3 +1426,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _queue_mirrors.clear()

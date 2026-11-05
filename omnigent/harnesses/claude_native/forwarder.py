@@ -28,6 +28,7 @@ from omnigent.harnesses.claude_native.bridge import (
     BtwOverlay,
     ClaudeHookRecord,
     ClaudeMessageDelta,
+    ClaudeQueueOperation,
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptReadResult,
@@ -5213,6 +5214,11 @@ async def _forward_available_items(
         dedupe.pending_settled_response_id,
         dedupe.pending_settled_at,
     )
+    # Before items, so an edited queued prompt updates its entry before Claude takes it.
+    if result.queue_operations and not await _post_external_queue_operations(
+        client, session_id=session_id, operations=result.queue_operations
+    ):
+        return state
     items = result.items
     if not items:
         if result.line_cursor == state.line_cursor and result.byte_offset == (
@@ -6390,6 +6396,55 @@ async def _post_external_btw_sidechat(
         },
     )
     resp.raise_for_status()
+
+
+async def _post_external_queue_operations(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    operations: tuple[ClaudeQueueOperation, ...],
+) -> bool:
+    """
+    Report Claude's prompt-queue records so edited queued bubbles follow the pane.
+
+    The server skips records it already applied, so a transcript region the
+    forwarder re-reads after a failed post is safe to report again.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param operations: Queue records in transcript order.
+    :returns: ``False`` when a transient failure should retry this region on
+        the next poll; ``True`` once posted or permanently rejected.
+    """
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_queue_operations",
+                "data": {
+                    "operations": [
+                        {
+                            "operation": operation.operation,
+                            "content": operation.content,
+                            "timestamp": operation.timestamp,
+                        }
+                        for operation in operations
+                    ]
+                },
+            },
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        permanent = _is_permanent_http_error(exc)
+        _logger.warning(
+            "Failed to forward Claude queue operations; session=%s http_status=%s permanent=%s",
+            session_id,
+            _http_status_for_log(exc),
+            permanent,
+            extra={"session_id": session_id},
+        )
+        return permanent
+    return True
 
 
 async def _post_external_model_change(

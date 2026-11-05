@@ -118,6 +118,11 @@ _EXTERNAL_BTW_SIDECHAT_TYPE: str = "external_btw_sidechat"
 # the side-chat overlay (Escape / ✕), and the server forwards an Escape to the
 # pane so the terminal's own ``/btw`` overlay closes in lockstep.
 _EXTERNAL_BTW_DISMISS_TYPE: str = "external_btw_dismiss"
+# The web edits a claude-native message still queued behind a busy turn.
+_QUEUED_MESSAGE_EDIT_TYPE: str = "queued_message_edit"
+# Claude Code prompt-queue records the claude-native forwarder mirrors onto the
+# pending web messages, so a queued prompt edited in the pane updates its bubble.
+_EXTERNAL_QUEUE_OPERATIONS_TYPE: str = "external_queue_operations"
 
 
 _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
@@ -581,6 +586,7 @@ CLIENT_SESSION_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.key
     _RETRY_SESSION_TYPE,
     # The web posts this when the user closes its /btw side chat.
     _EXTERNAL_BTW_DISMISS_TYPE,
+    _QUEUED_MESSAGE_EDIT_TYPE,
 }
 
 
@@ -595,6 +601,7 @@ _RUNNER_SESSION_EVENT_TYPES: frozenset[str] = frozenset(
         _EXTERNAL_SESSION_INTERRUPTED_TYPE,
         _EXTERNAL_SESSION_SUPERSEDED_TYPE,
         _EXTERNAL_BTW_SIDECHAT_TYPE,
+        _EXTERNAL_QUEUE_OPERATIONS_TYPE,
         _EXTERNAL_ELICITATION_RESOLVED_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
         _EXTERNAL_BACKGROUND_WORK_TYPE,
@@ -1191,6 +1198,7 @@ __all__ = [
     "_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE",
     "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
     "_EXTERNAL_PULL_REQUESTS_TYPE",
+    "_EXTERNAL_QUEUE_OPERATIONS_TYPE",
     "_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE",
     "_EXTERNAL_SESSION_INTERRUPTED_TYPE",
     "_EXTERNAL_SESSION_STATUS_TYPE",
@@ -1239,6 +1247,7 @@ __all__ = [
     "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE",
     "_PI_EXTENSION_UI_HOOK_TIMEOUT_S",
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
+    "_QUEUED_MESSAGE_EDIT_TYPE",
     "_RACE_TASK_REAP_TIMEOUT_S",
     "_RETRY_SESSION_TYPE",
     "_RUNNER_CLIENT_RESOLVE_ATTEMPTS",

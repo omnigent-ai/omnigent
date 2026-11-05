@@ -501,6 +501,67 @@ async def test_events_compact_on_native_session_types_slash_command(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "body", "pane_error", "expected_status"),
+    [
+        ("claude-native", {"original": "Then summarize", "replacement": "Then list"}, None, 200),
+        (
+            "claude-native",
+            {"original": "Then summarize", "replacement": "Then list"},
+            claude_native_bridge.ClaudeQueuedMessageMissing("no longer queued"),
+            409,
+        ),
+        (
+            "claude-native",
+            {"original": "Then summarize", "replacement": "Then list"},
+            RuntimeError("tmux send-keys failed"),
+            503,
+        ),
+        ("claude-native", {"original": "Then summarize"}, None, 400),
+        ("codex-native", {"original": "Then summarize", "replacement": "Then list"}, None, 204),
+    ],
+    ids=["edited", "no-longer-queued", "pane-failed", "missing-replacement", "other-harness"],
+)
+async def test_events_queued_message_edit_drives_the_claude_native_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    body: dict[str, str],
+    pane_error: Exception | None,
+    expected_status: int,
+) -> None:
+    """The runner edits a queued Claude Code prompt and reports why an edit failed."""
+    edits: list[tuple[Path, str, str]] = []
+
+    def _fake_edit(bridge_dir: Path, *, original: str, replacement: str) -> None:
+        edits.append((bridge_dir, original, replacement))
+        if pane_error is not None:
+            raise pane_error
+
+    monkeypatch.setattr(claude_native_bridge, "edit_queued_user_message", _fake_edit)
+    app, _ = await _build_app_for_spec(_harness_spec(harness))
+    session_id = "0b6f2a7c8d9e4f1a2b3c4d5e6f7a8b9c"
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "queued_message_edit", **body},
+        )
+
+    assert resp.status_code == expected_status, resp.text
+    expected_edits = (
+        [(bridge_dir_for_conversation_id(session_id), "Then summarize", "Then list")]
+        if expected_status in {200, 409, 503}
+        else []
+    )
+    assert edits == expected_edits
+
+
+@pytest.mark.asyncio
 async def test_events_clear_on_claude_native_types_clear_into_the_tui(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

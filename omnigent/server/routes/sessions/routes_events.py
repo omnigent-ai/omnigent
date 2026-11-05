@@ -153,6 +153,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_PULL_REQUESTS_TYPE,
+    _EXTERNAL_QUEUE_OPERATIONS_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
@@ -166,6 +167,7 @@ from omnigent.server.routes._sessions.common import (
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     _INTERRUPT_TYPE,
     _MCP_ELICITATION_TYPE,
+    _QUEUED_MESSAGE_EDIT_TYPE,
     _RETRY_SESSION_TYPE,
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
@@ -229,6 +231,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_external_output_text_delta,
     _publish_external_tool_output_delta,
     _publish_input_deny_terminal,
+    _publish_input_edited,
     _publish_interrupted,
     _publish_mcp_startup,
     _publish_policy_deny,
@@ -705,6 +708,108 @@ def _refuse_offline_host_send(
     if client_holds:
         raise OmnigentError(_host_offline_hold_message(), code=ErrorCode.HOST_OFFLINE)
     raise OmnigentError(_host_offline_message(), code=ErrorCode.RUNNER_UNAVAILABLE)
+
+
+def _queue_operations_from_event(data: Mapping[str, Any]) -> list[pending_inputs.QueueOperation]:
+    """
+    Parse an ``external_queue_operations`` payload.
+
+    :param data: Event data, e.g. ``{"operations": [{"operation": "popAll",
+        "content": "Then summarize", "timestamp": "2026-11-05T09:45:15.794Z"}]}``.
+    :returns: The queue records in transcript order.
+    :raises OmnigentError: ``INVALID_INPUT`` for a malformed payload.
+    """
+    raw_operations = data.get("operations")
+    if not isinstance(raw_operations, list):
+        raise OmnigentError(
+            "external_queue_operations requires a list data.operations",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    operations: list[pending_inputs.QueueOperation] = []
+    for raw in raw_operations:
+        timestamp = raw.get("timestamp", "") if isinstance(raw, dict) else None
+        if (
+            not isinstance(raw, dict)
+            or not isinstance(raw.get("operation"), str)
+            or not isinstance(raw.get("content"), str)
+            or not isinstance(timestamp, str)
+        ):
+            raise OmnigentError(
+                "external_queue_operations entries require string operation, "
+                "content and timestamp",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        operations.append(
+            pending_inputs.QueueOperation(
+                operation=raw["operation"], content=raw["content"], timestamp=timestamp
+            )
+        )
+    return operations
+
+
+async def _edit_queued_native_message(
+    session_id: str,
+    conv: Conversation,
+    data: Mapping[str, Any],
+    *,
+    runner_router: RunnerRouter | None,
+    agent_store: AgentStore,
+    agent_cache: AgentCache | None,
+) -> None:
+    """
+    Replace a queued claude-native message with edited text in its pane.
+
+    The pane's queue records report the edit back through
+    ``external_queue_operations``; once the runner confirms the edit, any
+    part those records have not applied yet is applied here.
+
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :param conv: The session's conversation.
+    :param data: Event data, e.g. ``{"pending_id": "pending_a1b2c3",
+        "content": "Then summarize the logs"}``.
+    :param runner_router: The session's runner router.
+    :param agent_store: Agent store used to resolve the harness.
+    :param agent_cache: Agent cache used to resolve the harness.
+    :raises OmnigentError: ``INVALID_INPUT`` for a malformed payload or a
+        non-claude-native session, ``CONFLICT`` when the message is no longer
+        queued, and ``RUNNER_UNAVAILABLE`` when the pane edit failed.
+    """
+    pending_id = data.get("pending_id")
+    content = data.get("content")
+    if not isinstance(pending_id, str) or not isinstance(content, str) or not content.strip():
+        raise OmnigentError(
+            "queued_message_edit requires string data.pending_id and non-empty data.content",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    harness = await asyncio.to_thread(
+        _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+    )
+    if harness != "claude-native":
+        raise OmnigentError(
+            "Queued messages can only be edited in Claude Code sessions.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    original = pending_inputs.plan_queued_edit(session_id, pending_id, content)
+    if original is None:
+        raise OmnigentError("This message is no longer queued.", code=ErrorCode.CONFLICT)
+    result = await _forward_session_change_to_runner(
+        session_id,
+        runner_router,
+        {"type": _QUEUED_MESSAGE_EDIT_TYPE, "original": original, "replacement": content},
+        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+    )
+    if result is not None and result.status_code == 200:
+        edit = pending_inputs.confirm_queued_edit(session_id, pending_id)
+        if edit is not None:
+            _publish_input_edited(session_id, edit)
+        return
+    pending_inputs.cancel_queued_edit(session_id, pending_id)
+    if result is not None and result.status_code == 409:
+        raise OmnigentError("This message is no longer queued.", code=ErrorCode.CONFLICT)
+    raise OmnigentError(
+        "Couldn't edit the queued message in the terminal.",
+        code=ErrorCode.RUNNER_UNAVAILABLE,
+    )
 
 
 async def _recover_retry_session(
@@ -1291,6 +1396,7 @@ def register_events_routes(
         if body.type in {
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
             _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
+            _EXTERNAL_QUEUE_OPERATIONS_TYPE,
         } and not _has_bound_runner_authority(request, conv):
             # Owner-authenticated local forwarders also report native settings.
             await _require_access_and_level(
@@ -1372,6 +1478,8 @@ def register_events_routes(
             _EXTERNAL_SESSION_SUPERSEDED_TYPE,
             _EXTERNAL_BTW_SIDECHAT_TYPE,
             _EXTERNAL_BTW_DISMISS_TYPE,
+            _QUEUED_MESSAGE_EDIT_TYPE,
+            _EXTERNAL_QUEUE_OPERATIONS_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
             _EXTERNAL_BACKGROUND_WORK_TYPE,
@@ -2318,6 +2426,22 @@ def register_events_routes(
                 session_id,
                 runner_router,
                 {"type": "btw_dismiss"},
+            )
+            return {"queued": False}
+        if body.type == _EXTERNAL_QUEUE_OPERATIONS_TYPE:
+            for edit in pending_inputs.apply_queue_operations(
+                session_id, _queue_operations_from_event(body.data)
+            ):
+                _publish_input_edited(session_id, edit)
+            return {"queued": False}
+        if body.type == _QUEUED_MESSAGE_EDIT_TYPE:
+            await _edit_queued_native_message(
+                session_id,
+                conv,
+                body.data,
+                runner_router=runner_router,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
             )
             return {"queued": False}
         if body.type == _EXTERNAL_ELICITATION_RESOLVED_TYPE:

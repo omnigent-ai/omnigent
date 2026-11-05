@@ -845,6 +845,100 @@ async def test_forwarder_retries_user_item_on_connect_error(tmp_path: Path) -> N
     assert second.byte_offset == 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rejection_status", "reposted"),
+    [(None, True), (422, False)],
+    ids=["transient-retried", "permanent-dropped"],
+)
+async def test_forwarder_posts_queue_operations_before_the_items_after_them(
+    tmp_path: Path, rejection_status: int | None, reposted: bool
+) -> None:
+    """
+    Queue records reach the server before the user item read with them.
+
+    An edited queued prompt must update its pending entry before Claude's
+    user record consumes it. A transient failure holds the cursor so both
+    are reported again; a permanent rejection is dropped like a poison item.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "queue-operation",
+                        "operation": "enqueue",
+                        "content": "Then summarize the logs",
+                        "timestamp": "2026-11-05T09:45:21.000Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "user-msg-3",
+                        "message": {"role": "user", "content": "Then summarize the logs"},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        requests.append(payload)
+        first_queue_post = payload["type"] == "external_queue_operations" and (
+            sum(1 for r in requests if r["type"] == "external_queue_operations") == 1
+        )
+        if first_queue_post and rejection_status is None:
+            raise httpx.ConnectError("connection refused", request=request)
+        if first_queue_post:
+            return httpx.Response(rejection_status, json={"error": "invalid_input"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        dedupe = forwarder._ForwardDedupeState()
+        retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+        for _ in range(2):
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=tmp_path / "bridge",
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=retry_tracker,
+                dedupe=dedupe,
+            )
+
+    posted = [r["type"] for r in requests if r["type"] != "external_session_status"]
+    assert posted == [
+        "external_queue_operations",
+        *(["external_queue_operations"] if reposted else []),
+        "external_conversation_item",
+    ]
+    assert requests[0]["data"] == {
+        "operations": [
+            {
+                "operation": "enqueue",
+                "content": "Then summarize the logs",
+                "timestamp": "2026-11-05T09:45:21.000Z",
+            }
+        ]
+    }
+    assert state.byte_offset == transcript_path.stat().st_size
+
+
 def test_parse_json_response_returns_value_on_valid_json() -> None:
     """
     A normal JSON body parses through ``_parse_json_response`` unchanged.

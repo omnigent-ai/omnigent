@@ -1429,6 +1429,7 @@ stream and surface queue/interrupt semantics.
 | `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |
 | `session.background_tasks` | `SessionBackgroundTasksEvent` | `{type, conversation_id, background_task_count: int, background_tasks: BackgroundTaskInfo[]}` |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
+| `session.input.edited` | `SessionInputEditedEvent` | `{type, data: {pending_id, content, merged_pending_ids}}` — a queued Claude Code message was edited with Up (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |
 

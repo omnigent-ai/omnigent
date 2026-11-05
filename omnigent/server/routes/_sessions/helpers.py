@@ -291,6 +291,8 @@ from omnigent.server.schemas import (
     SessionGitOptions,
     SessionInputConsumedEvent,
     SessionInputConsumedPayload,
+    SessionInputEditedEvent,
+    SessionInputEditedPayload,
     SessionInterruptedEvent,
     SessionInterruptedPayload,
     SessionListItem,
@@ -1857,6 +1859,24 @@ def _publish_input_consumed(
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
             cleared_pending_id=cleared_pending_id,
+        ),
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_input_edited(session_id: str, edit: pending_inputs.QueueEdit) -> None:
+    """
+    Publish a ``session.input.edited`` event for a queued message whose text changed.
+
+    :param session_id: The session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param edit: The edited pending entry and any entries merged into it.
+    """
+    event = SessionInputEditedEvent(
+        type="session.input.edited",
+        data=SessionInputEditedPayload(
+            pending_id=edit.pending_id,
+            content=edit.content,
+            merged_pending_ids=edit.merged_pending_ids,
         ),
     )
     session_stream.publish(session_id, event.model_dump())
@@ -12607,6 +12627,7 @@ __all__ = [
     "_publish_external_tool_output_delta",
     "_publish_input_consumed",
     "_publish_input_deny_terminal",
+    "_publish_input_edited",
     "_publish_interrupted",
     "_publish_mcp_startup",
     "_publish_model_options",
