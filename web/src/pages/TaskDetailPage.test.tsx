@@ -18,8 +18,8 @@ import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { TaskDetailPage } from "./TaskDetailPage";
 import {
   emptyTriggerFields,
+  encodeTriggerPrompt,
   renderTriggerPrompt,
-  splitTriggerPrompt,
 } from "@/components/scheduled/triggerTemplates";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as hooks from "@/hooks/useScheduledTasks";
@@ -229,29 +229,34 @@ function renderPage() {
 }
 
 describe("header, prompt, configuration", () => {
-  it("shows the user prompt first and keeps generated instructions collapsed and read-only", () => {
-    const prompt = renderTriggerPrompt(
-      "slack",
-      { ...emptyTriggerFields("slack"), scope: "abc", instructions: "Summarize new messages." },
-      { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
-    );
-    setTask(task({ prompt }));
-    renderPage();
-    expect(screen.getByRole("heading", { name: "Your prompt" })).toBeVisible();
-    expect(screen.getByTestId("task-detail-prompt").textContent).toBe("Summarize new messages.");
-    const toggle = screen.getByRole("button", { name: "System prompt" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
-
-    fireEvent.click(toggle);
-    expect(screen.getByTestId("task-detail-system-prompt").textContent).toBe(
-      splitTriggerPrompt(prompt).systemPrompt,
-    );
-    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
-    fireEvent.click(toggle);
-    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
-    expect(screen.getByTestId("task-detail-prompt")).toBeVisible();
-  });
+  it.each([false, true])(
+    "shows only a trigger's instructions, never its template text (header: %s)",
+    (withHeader) => {
+      const fields = {
+        ...emptyTriggerFields("slack"),
+        scope: "abc",
+        instructions: "Summarize new messages.",
+      };
+      const sessionLink = "https://example.test/c/CONVERSATION_ID";
+      const prompt = withHeader
+        ? encodeTriggerPrompt(
+            {
+              source: "slack",
+              ...fields,
+              worker: { placement: "same_host", agentId: null, model: "", effort: "" },
+            },
+            { sessionLink },
+          )
+        : renderTriggerPrompt("slack", fields, { placement: "same_host", sessionLink });
+      setTask(task({ prompt, sessionMode: "continue" }));
+      renderPage();
+      expect(screen.getByRole("heading", { name: "Instructions" })).toBeVisible();
+      expect(screen.getByTestId("task-detail-prompt").textContent).toBe("Summarize new messages.");
+      expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
+      expect(screen.queryByText(/This automation watches Slack/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/omnigent-trigger/)).not.toBeInTheDocument();
+    },
+  );
 
   it("collapses and reopens configuration while keeping run history visible", () => {
     setTask(task({ modelOverride: "opus" }));

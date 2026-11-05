@@ -61,6 +61,8 @@ export interface TriggerPromptContext {
    * ID, e.g. `https://omnigent.example.com/c/CONVERSATION_ID`.
    */
   sessionLink: string;
+  /** Agent each worker starts with; null or omitted keeps the polling session's agent. */
+  agentId?: string | null;
   /** The task's model override; workers otherwise use the agent's default. */
   model?: string;
   /** The task's reasoning effort override. */
@@ -447,11 +449,118 @@ function triggerPromptOpening(source: TriggerSource): string {
 }
 
 /**
- * Whether `prompt` was rendered from a trigger template. A saved task doesn't
- * record its template, so the edit form recognizes the prompt's opening line.
+ * Whether `prompt` was rendered from a trigger template: it has a trigger
+ * header, or (for tasks saved before headers) the rendered opening line.
  */
 export function isTriggerPrompt(prompt: string): boolean {
-  return TRIGGER_SOURCES.some((source) => prompt.startsWith(triggerPromptOpening(source)));
+  const body = stripTriggerHeader(prompt);
+  return TRIGGER_SOURCES.some((source) => body.startsWith(triggerPromptOpening(source)));
+}
+
+/** Who each worker session is and where it starts. */
+export interface TriggerWorkerConfig extends TriggerWorkerSettings {
+  placement: WorkerPlacement;
+}
+
+/** Everything the trigger form edits; saved as the prompt's first line. */
+export interface TriggerConfig extends TriggerFields {
+  source: TriggerSource;
+  worker: TriggerWorkerConfig;
+}
+
+const TRIGGER_HEADER_VERSION = 1;
+// Keep in sync with TRIGGER_HEADER_PATTERN in omnigent/server/scheduled/fire.py,
+// which strips this line before the prompt reaches the model.
+const TRIGGER_HEADER_PATTERN = /^<!-- omnigent-trigger v(\d+) ([^\n]*) -->\n/;
+
+/** The prompt without its trigger header line, if it has one. */
+export function stripTriggerHeader(prompt: string): string {
+  return prompt.replace(TRIGGER_HEADER_PATTERN, "");
+}
+
+/**
+ * The saved prompt for a trigger: a one-line header holding `config`, which
+ * the edit form reads back, then the rendered prompt the model receives.
+ */
+export function encodeTriggerPrompt(
+  config: TriggerConfig,
+  ctx: Pick<TriggerPromptContext, "sessionLink" | "pollingIntervalMinutes">,
+): string {
+  const { source, worker, ...fields } = config;
+  // Escaping < and > keeps a value such as "-->" from ending the comment early.
+  const json = JSON.stringify(config).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+  const body = renderTriggerPrompt(source, fields, {
+    ...ctx,
+    placement: worker.placement,
+    agentId: worker.agentId,
+    model: worker.model || undefined,
+    effort: worker.effort || undefined,
+  });
+  return `<!-- omnigent-trigger v${TRIGGER_HEADER_VERSION} ${json} -->\n${body}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeCondition(value: unknown, template: TriggerTemplate): TriggerCondition | null {
+  if (!isRecord(value) || typeof value.value !== "string") return null;
+  const field = template.fields.find((candidate) => candidate.id === value.field);
+  const operator = value.operator as TriggerOperator;
+  if (field === undefined || !field.operators.includes(operator)) return null;
+  return { field: field.id, operator, value: value.value };
+}
+
+function decodeWorker(value: unknown): TriggerWorkerConfig | null {
+  if (!isRecord(value)) return null;
+  const { placement, agentId, model, effort } = value;
+  if (placement !== "same_host" && placement !== "managed") return null;
+  if (agentId !== null && typeof agentId !== "string") return null;
+  if (typeof model !== "string" || typeof effort !== "string") return null;
+  return { placement, agentId, model, effort };
+}
+
+/**
+ * The trigger form state saved in `prompt`'s header, or null when the prompt
+ * has no header or one this version can't read, so it opens as free text.
+ */
+export function decodeTriggerPrompt(prompt: string): TriggerConfig | null {
+  const match = TRIGGER_HEADER_PATTERN.exec(prompt);
+  if (match === null || Number(match[1]) !== TRIGGER_HEADER_VERSION) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(match[2]);
+  } catch {
+    return null;
+  }
+  if (!isRecord(raw) || !TRIGGER_SOURCES.includes(raw.source as TriggerSource)) return null;
+  const source = raw.source as TriggerSource;
+  const template = TRIGGER_TEMPLATES[source];
+  const { event, scope, scopeOperator, conditions, instructions, linkBack } = raw;
+  if (
+    typeof event !== "string" ||
+    !template.events.some((candidate) => candidate.id === event) ||
+    typeof scope !== "string" ||
+    (scopeOperator !== undefined && scopeOperator !== "is" && scopeOperator !== "in") ||
+    !Array.isArray(conditions) ||
+    typeof instructions !== "string" ||
+    typeof linkBack !== "boolean"
+  ) {
+    return null;
+  }
+  const decodedConditions = conditions.map((condition) => decodeCondition(condition, template));
+  const worker = decodeWorker(raw.worker);
+  if (decodedConditions.some((condition) => condition === null) || worker === null) return null;
+  return {
+    source,
+    event,
+    scope,
+    ...(scopeOperator !== undefined ? { scopeOperator } : {}),
+    conditions: decodedConditions as TriggerCondition[],
+    instructions,
+    linkBack,
+    worker,
+  };
 }
 
 /**
@@ -766,7 +875,7 @@ export function renderTriggerPrompt(
   const initialLookback =
     initialLookbackMinutes === 60 ? "one hour" : `${initialLookbackMinutes} minutes`;
   const createArgs = [
-    "agent_id set to your agent ID",
+    ctx.agentId ? `agent_id ${JSON.stringify(ctx.agentId)}` : "agent_id set to your agent ID",
     `placement "${ctx.placement}"`,
     `title ${text.title}`,
     ...(ctx.model ? [`model "${ctx.model}"`] : []),
