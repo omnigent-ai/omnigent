@@ -762,6 +762,51 @@ def test_mixed_operations_do_not_claim_creation() -> None:
     assert not created
 
 
+_CREATED_A = {"stdout": A, "gitOperation": {"pr": {"url": A, "action": "created"}}}
+
+
+@pytest.mark.parametrize(
+    "command,result,urls,created",
+    [
+        pytest.param(
+            "cd /worktree && GH_TOKEN=$(gh auth token --user example-user) gh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="unquoted-substitution-assignment",
+        ),
+        pytest.param(
+            "cat > /tmp/body.md <<'EOF'\n## Summary\nWe don't wait (anymore.\ngh pr view 7\nEOF\n"
+            "gh pr create --title t --body-file /tmp/body.md",
+            _CREATED_A,
+            [A],
+            True,
+            id="heredoc-body-then-create",
+        ),
+        pytest.param(
+            "cat > /tmp/body.md <<-EOF\n\tIt's done.\n\tEOF\ngh pr create --body-file body.md",
+            _CREATED_A,
+            [A],
+            True,
+            id="tab-stripped-heredoc",
+        ),
+        pytest.param(
+            "cat > notes.md <<'EOF'\ngh pr create\nEOF\ngh pr view 42",
+            A,
+            [],
+            False,
+            id="heredoc-body-is-not-run",
+        ),
+    ],
+)
+def test_create_beside_substitution_and_heredoc(
+    command: str, result: object, urls: list[str], created: bool
+) -> None:
+    refs, was_created = extract_prs("Bash", {"command": command}, result)
+    assert [ref.url for ref in refs] == urls
+    assert was_created is created
+
+
 @pytest.mark.parametrize("tool_name", ["Bash", "exec_command"])
 @pytest.mark.parametrize("structured", [False, True])
 def test_auth_switch_before_creating_two_prs(

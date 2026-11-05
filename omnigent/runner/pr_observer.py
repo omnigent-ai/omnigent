@@ -60,11 +60,91 @@ def _failed(result: object) -> bool:
     )
 
 
+def _substitution_end(command: str, start: int) -> int | None:
+    """Return the index just past the ``)`` closing the ``$(`` at *start*, or ``None``.
+
+    A here-document inside gives up, since its body may hold unbalanced parentheses.
+    """
+    arithmetic = command.startswith("$((", start)
+    depth = 0
+    quote: str | None = None
+    index = start + 1
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "\\":
+            index += 1
+        elif quote == '"':
+            if char == '"':
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        elif not arithmetic and command.startswith("<<", index):
+            return None
+        index += 1
+    return None
+
+
+def _heredoc_delimiter(command: str, start: int) -> tuple[str, bool] | None:
+    """Read the delimiter word after a ``<<`` and whether ``<<-`` strips leading tabs."""
+    strip_tabs = command.startswith("-", start)
+    index = start + strip_tabs
+    while index < len(command) and command[index] in " \t":
+        index += 1
+    word: list[str] = []
+    quote: str | None = None
+    while index < len(command):
+        char = command[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            else:
+                word.append(char)
+        elif char in "'\"":
+            quote = char
+        elif char == "\\" and index + 1 < len(command):
+            index += 1
+            word.append(command[index])
+        elif char in " \t\r\n;&|<>()":
+            break
+        else:
+            word.append(char)
+        index += 1
+    return ("".join(word), strip_tabs) if word else None
+
+
+def _heredoc_body_end(command: str, start: int, delimiter: str, strip_tabs: bool) -> int:
+    """Return the index just past the delimiter line closing a body that starts at *start*."""
+    index = start
+    while index < len(command):
+        end = command.find("\n", index)
+        line = command[index:] if end == -1 else command[index:end]
+        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+            return len(command) if end == -1 else end + 1
+        if end == -1:
+            break
+        index = end + 1
+    return len(command)
+
+
 def _prepare_shell_text(command: str) -> tuple[str, bool]:
-    """Join shell continuations and detect unquoted redirection without changing argv."""
+    """Join shell continuations and detect unquoted redirection without changing argv.
+
+    An unquoted ``$(...)`` stays one word, and here-document bodies are dropped
+    because they are data rather than commands.
+    """
     result: list[str] = []
     quote: str | None = None
     redirected = False
+    heredocs: list[tuple[str, bool]] = []
     index = 0
     while index < len(command):
         char = command[index]
@@ -81,6 +161,32 @@ def _prepare_shell_text(command: str) -> tuple[str, bool]:
                 break
             result.append(command[index:end])
             index = end
+            continue
+        if quote is None and command.startswith("$(", index):
+            end = _substitution_end(command, index)
+            if end is not None:
+                # Escaping every symbol keeps the substitution's text as one shlex word.
+                result.extend(c if c.isalnum() else "\\" + c for c in command[index:end])
+                index = end
+                continue
+        if quote is None and command.startswith("<<<", index):
+            redirected = True
+            result.append("<<<")
+            index += 3
+            continue
+        if quote is None and command.startswith("<<", index):
+            redirected = True
+            if heredoc := _heredoc_delimiter(command, index + 2):
+                heredocs.append(heredoc)
+            result.append("<<")
+            index += 2
+            continue
+        if quote is None and char == "\n" and heredocs:
+            result.append(char)
+            index += 1
+            for delimiter, strip_tabs in heredocs:
+                index = _heredoc_body_end(command, index, delimiter, strip_tabs)
+            heredocs.clear()
             continue
         if quote is None and char in "<>":
             redirected = True
