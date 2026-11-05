@@ -73,6 +73,9 @@ Merge this into the file's `mcpServers` and keep the organization's other server
 - **Outside Omnigent:** a plain `claude` started by hand doesn't have these
   variables, so `claude mcp list` reports the `omnigent` entry as failed to connect.
   Nothing else is affected.
+- **In a Linux bubblewrap sandbox:** each claude-sdk Claude Code process can read the
+  managed config directory and use only its own session's relay directory. Other
+  sessions' relay directories stay hidden.
 
 `/mcp` in an Omnigent session lists only the servers in `managed-mcp.json` while the
 file exists, because those are the only ones Claude Code loads. The `omnigent` entry
