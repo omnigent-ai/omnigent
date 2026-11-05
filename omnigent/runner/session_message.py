@@ -6,27 +6,24 @@ from typing import Any
 import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.runner.session_requests import is_wrong_replica, post_on_host, session_host_id
-from omnigent.util.uuid import uuid_to_bytes
+from omnigent.runner.session_requests import (
+    is_wrong_replica,
+    normalize_session_id,
+    post_on_host,
+    session_host_id,
+)
 
 
 async def execute_message_tool(
     args: dict[str, Any], client: httpx.AsyncClient | None, source_id: str | None
 ) -> str:
-    target = args.get("session_id")
     try:
-        target = uuid_to_bytes(target).hex() if isinstance(target, str) else None
+        target = normalize_session_id(args.get("session_id"))
     except ValueError:
-        target = None
+        return json.dumps({"error": "Provide a valid session_id (UUID or numeric managed ID)"})
     message = args.get("message")
-    if (
-        not target
-        or len(target) != 32
-        or not isinstance(message, str)
-        or not message.strip()
-        or len(message) > 8000
-    ):
-        return json.dumps({"error": "Provide a session_id and a message of 1–8000 characters"})
+    if not isinstance(message, str) or not message.strip() or len(message) > 8000:
+        return json.dumps({"error": "Provide a non-blank message of 1–8000 characters"})
     if client is None or source_id is None:
         return json.dumps({"error": "Session messaging requires an authenticated runner"})
     try:

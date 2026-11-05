@@ -223,6 +223,15 @@ const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
     stage: "Settings",
     reason: "The agent, model or workspace is invalid. Edit the automation to fix it.",
   },
+  permission_harness_unresolved: {
+    stage: "Permissions",
+    reason: "Couldn't load the agent's permission settings. Restore access to the agent and retry.",
+  },
+  permission_mode_unsupported: {
+    stage: "Permissions",
+    reason:
+      "The saved permission isn't supported by this agent. Edit the automation to change or clear it.",
+  },
   not_found: {
     stage: "Settings",
     reason: "The agent or workspace no longer exists. Edit the automation to fix it.",
@@ -338,6 +347,15 @@ export function describeSchedule(rrule: string): string {
   const timeSuffix = ` at ${formatClockTime(hour, minute)}`;
   const days = normalizeWeekdays(o.byweekday);
   const interval = typeof o.interval === "number" && o.interval > 1 ? o.interval : 1;
+
+  if (o.freq === RRule.MINUTELY) {
+    // The library's toText() drops minute-rule filters; preserve them verbatim.
+    const filtered = Object.entries(o).some(
+      ([name, value]) => name.startsWith("by") && value !== null && value !== undefined,
+    );
+    if (filtered) return rrule;
+    return interval === 1 ? "Every minute" : `Every ${interval} minutes`;
+  }
 
   if (o.freq === RRule.HOURLY) {
     // Time-of-day is meaningless hourly; show the minute offset instead.
