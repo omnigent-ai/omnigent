@@ -29,9 +29,9 @@ const toast = vi.hoisted(() =>
   Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() }),
 );
 const mocks = vi.hoisted(() => ({ copyText: vi.fn(async () => {}), mobile: false }));
-const comments = vi.hoisted(() => ({ data: [] as Comment[] }));
+const comments = vi.hoisted(() => ({ data: [] as Comment[], isSuccess: true }));
 vi.mock("@/hooks/useComments", () => ({
-  useComments: () => ({ data: comments.data, isSuccess: true, isFetching: false }),
+  useComments: () => ({ ...comments, isFetching: false }),
 }));
 vi.mock("./LocalReviewComment", () => ({
   LocalReviewComment: ({ comment }: { comment: Comment }) => (
@@ -208,6 +208,7 @@ const sectionHeader = (path: string, expanded: boolean) =>
 describe("PullRequestChangesTab", () => {
   afterEach(() => {
     comments.data = [];
+    comments.isSuccess = true;
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -244,9 +245,22 @@ describe("PullRequestChangesTab", () => {
         });
         expect(navigation.result.current).toBe(comment);
         expect(scroll).not.toHaveBeenCalled();
+        const frame = vi.spyOn(window, "requestAnimationFrame");
+        comments.data = [];
+        comments.isSuccess = false;
+        tab.rerender(PATCH);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+        expect(frame).not.toHaveBeenCalled();
+        expect(navigation.result.current).toBe(comment);
+        expect(scroll).not.toHaveBeenCalled();
+        frame.mockRestore();
       } finally {
         vi.useRealTimers();
       }
+      comments.data = [comment];
+      comments.isSuccess = true;
       const focus = vi.spyOn(HTMLElement.prototype, "focus").mockImplementationOnce(() => {});
       tab.rerender(PATCH);
       await waitFor(() =>

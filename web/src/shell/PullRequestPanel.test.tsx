@@ -3546,12 +3546,14 @@ it("saves a local comment as agent context and retains earlier revisions", async
   const other = {
     ...comments[0]!,
     id: "other",
+    body: "Feedback on a different PR",
     anchor_metadata: { ...comments[0]!.anchor_metadata!, pr_url: "https://example.com/pr/other" },
   };
   const addressed = { ...comments[0]!, id: "addressed", status: "addressed" as const };
   await act(async () => {
     client.setQueryData(["comments", "conv_1"], [...comments, other, addressed]);
   });
+  expect(screen.queryByText("Feedback on a different PR")).not.toBeInTheDocument();
   expect(screen.queryByText(/Add to chat/)).not.toBeInTheDocument();
   state.diff = { ...state.diff!, head_sha: "c".repeat(40) };
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));

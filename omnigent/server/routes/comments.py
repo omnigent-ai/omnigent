@@ -51,15 +51,7 @@ def _format_message(comments: list[Comment]) -> str:
         lines.append(f"File: {path}")
         for c in sorted(by_path[path], key=lambda c: c.start_index):
             anchor = f'"{c.anchor_content.strip()}" ' if c.anchor_content else ""
-            if c.anchor_metadata:
-                review = c.anchor_metadata
-                location = f"{review.side} lines {review.start_line or review.line}–{review.line}"
-                lines.append(
-                    f"• [{c.id}] {review.pr_url} ({location}, "
-                    f"base {review.base_sha}, head {review.head_sha}): {c.body}"
-                )
-            else:
-                lines.append(f"• {anchor}(offset {c.start_index}–{c.end_index}): {c.body}")
+            lines.append(f"• {anchor}(offset {c.start_index}–{c.end_index}): {c.body}")
 
     return "\n".join(lines)
 
@@ -256,6 +248,7 @@ def create_comments_router(
         request: Request,
         session_id: str,
         path: str | None = None,
+        include_pr_comments: bool = False,
     ) -> list[dict[str, Any]]:
         """List comments for a session, optionally filtered by file.
 
@@ -265,13 +258,15 @@ def create_comments_router(
         :param session_id: The session to query, e.g. ``"conv_abc123"``.
         :param path: When provided, only return comments for this file,
             e.g. ``"src/App.tsx"``.
+        :param include_pr_comments: Opt in to revision-anchored comments that
+            legacy clients cannot locate using workspace character offsets.
         :returns: List of serialized comment dicts.
         :raises OmnigentError: 401/403/404 if the user lacks read permission.
         """
         user_id = get_user_id(request, auth_provider)
         await _require_session_access(user_id, session_id, LEVEL_READ)
         comments = store.list_for_conversation(session_id, path=path)
-        return [asdict(c) for c in comments]
+        return [asdict(c) for c in comments if include_pr_comments or c.anchor_metadata is None]
 
     @router.patch("/sessions/{session_id}/comments/{comment_id}")
     async def update_comment(
@@ -357,7 +352,7 @@ def create_comments_router(
         session_id: str,
         body: SendCommentsRequest,
     ) -> dict[str, Any]:
-        """Mark comments as addressed and format them into an agent message.
+        """Mark Files comments addressed and format them into an agent message.
 
         Fetches each requested comment, marks it ``addressed``,
         and formats the full set into a grouped, sorted message string
@@ -373,7 +368,7 @@ def create_comments_router(
         :returns: ``{"formatted_message": str, "sent_comment_ids": list[str]}``.
         :raises OmnigentError: 401/403/404 if the user lacks edit permission,
             or 404 if any requested comment is not found or does not belong to
-            this session.
+            this session; 400 if a requested comment belongs to a PR review.
         """
         user_id = get_user_id(request, auth_provider)
         await _require_session_access(user_id, session_id, LEVEL_EDIT)
@@ -389,6 +384,11 @@ def create_comments_router(
                 comment = store.get(cid, session_id)
                 if comment is None:
                     raise OmnigentError(f"Comment not found: {cid}", code=ErrorCode.NOT_FOUND)
+                if comment.anchor_metadata is not None:
+                    raise OmnigentError(
+                        "PR review comments must be sent through the chat composer",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
                 fetched.append(comment)
             for comment in fetched:
                 store.update_comment(comment.id, session_id, status="addressed")

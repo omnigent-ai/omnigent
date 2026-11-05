@@ -1181,7 +1181,9 @@ def test_reply_to_inline_review_conversation(
             file.get_by_role("region", name="Local review comment").filter(has_text=body)
         ).to_be_visible()
     assert len(new_posts) == 2
-    response = page.request.get(f"{base_url}/v1/sessions/{session_id}/comments")
+    response = page.request.get(
+        f"{base_url}/v1/sessions/{session_id}/comments?include_pr_comments=true"
+    )
     assert response.ok
     local_comments = response.json()
     assert len(local_comments) == 2
@@ -1218,7 +1220,9 @@ def test_reply_to_inline_review_conversation(
     expect(page.get_by_role("button", name=re.compile("Open local review comment"))).to_have_count(
         1
     )
-    response = page.request.get(f"{base_url}/v1/sessions/{session_id}/comments")
+    response = page.request.get(
+        f"{base_url}/v1/sessions/{session_id}/comments?include_pr_comments=true"
+    )
     assert response.ok
     assert [comment["id"] for comment in response.json()] == [old_comment["id"]]
     chip.click()
@@ -1230,7 +1234,9 @@ def test_reply_to_inline_review_conversation(
     expect(page.get_by_role("button", name=re.compile("Open local review comment"))).to_have_count(
         0
     )
-    response = page.request.get(f"{base_url}/v1/sessions/{session_id}/comments")
+    response = page.request.get(
+        f"{base_url}/v1/sessions/{session_id}/comments?include_pr_comments=true"
+    )
     assert response.ok
     assert response.json() == []
 

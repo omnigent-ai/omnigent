@@ -195,7 +195,7 @@ async def test_send_comments_not_found(client: httpx.AsyncClient, session_id: st
 
 
 async def test_local_pr_comment_round_trip(client: httpx.AsyncClient, session_id: str) -> None:
-    """Local PR comments use session CRUD and retain coordinates in agent handoff."""
+    """PR feedback stays separate from legacy Files reads and batch handoff."""
     anchor = {
         "pr_url": "https://github.com/acme/app/pull/1",
         "side": "LEFT",
@@ -211,13 +211,46 @@ async def test_local_pr_comment_round_trip(client: httpx.AsyncClient, session_id
     assert response.status_code == 200
     comment = response.json()
     assert comment["anchor_metadata"] == anchor
-    listed = await client.get(f"/v1/sessions/{session_id}/comments")
-    assert listed.json()[0]["anchor_metadata"] == anchor
-    formatted = await client.post(
-        f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": [comment["id"]]}
+    file_response = await client.post(
+        f"/v1/sessions/{session_id}/comments", json=_comment_payload()
     )
-    assert formatted.status_code == 200
-    message = formatted.json()["formatted_message"]
-    assert "LEFT lines 7–9" in message
-    assert anchor["head_sha"] in message
-    assert comment["id"] in message
+    file_id = file_response.json()["id"]
+    for params in ({}, {"path": "src/App.tsx"}):
+        legacy = await client.get(f"/v1/sessions/{session_id}/comments", params=params)
+        assert legacy.status_code == 200
+        assert [item["id"] for item in legacy.json()] == [file_id]
+        listed = await client.get(
+            f"/v1/sessions/{session_id}/comments",
+            params={**params, "include_pr_comments": "true"},
+        )
+        assert listed.status_code == 200
+        assert {item["id"] for item in listed.json()} == {comment["id"], file_id}
+        assert (
+            next(item for item in listed.json() if item["id"] == comment["id"])["anchor_metadata"]
+            == anchor
+        )
+
+    for ids in ([comment["id"]], [file_id, comment["id"]]):
+        rejected = await client.post(
+            f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": ids}
+        )
+        assert rejected.status_code == 400
+        assert "chat composer" in rejected.text
+        unchanged = await client.get(
+            f"/v1/sessions/{session_id}/comments", params={"include_pr_comments": "true"}
+        )
+        assert {item["status"] for item in unchanged.json()} == {"draft"}
+
+    sent = await client.post(
+        f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": [file_id]}
+    )
+    assert sent.status_code == 200
+    assert sent.json()["sent_comment_ids"] == [file_id]
+    assert "offset 0–10" in sent.json()["formatted_message"]
+    listed = await client.get(
+        f"/v1/sessions/{session_id}/comments", params={"include_pr_comments": "true"}
+    )
+    assert {item["id"]: item["status"] for item in listed.json()} == {
+        file_id: "addressed",
+        comment["id"]: "draft",
+    }

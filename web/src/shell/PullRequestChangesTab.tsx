@@ -476,14 +476,11 @@ export function PullRequestChangesTab({
       prDiff.isLoading ||
       prDiff.isFetching ||
       sessionComments.isFetching ||
+      !sessionComments.isSuccess ||
       navigationTarget.anchor_metadata?.pr_url !== selectedPrUrl
     )
       return;
-    if (
-      sessionComments.isSuccess &&
-      !sessionComments.isFetching &&
-      !localComments.some((comment) => comment.id === navigationTarget.id)
-    ) {
+    if (!localComments.some((comment) => comment.id === navigationTarget.id)) {
       toast.error("This review comment is no longer available.");
       consumeLocalReviewNavigation(conversationId);
       return;
