@@ -39,6 +39,7 @@ import {
   combineTriggerPrompt,
   emptyTriggerFields,
   isTriggerPrompt,
+  readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
@@ -144,6 +145,9 @@ export function CreateScheduledTaskDialog({
     editingTask !== null &&
     editingTask.sessionMode === "continue" &&
     isTriggerPrompt(editingTask.prompt);
+  // Temporary prompt edits must not expose controls that can rebind the poller.
+  const editingWorkerSettings =
+    editingTemplateTrigger && readTriggerWorkerSettings(editingTask.prompt) !== null;
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -422,16 +426,20 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
-  const workerSettings = editingTemplateTrigger
+  const workerSettings = editingWorkerSettings
     ? readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt))
     : null;
+  const workerPlacement = editingWorkerSettings
+    ? readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt))
+    : null;
+  const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
   const workerAgent = agents?.find(
     (agent) => agent.id === (workerSettings?.agentId ?? editingTask?.agentId),
   );
   const workerHarnessSettings = useScheduledHarnessSettings(
     workerAgent,
-    selectedHost,
-    sandboxMode,
+    workerSandboxMode ? undefined : selectedHost,
+    workerSandboxMode,
     workerSettings?.model ?? "",
     open && workerSettings !== null,
   );
@@ -558,7 +566,9 @@ export function CreateScheduledTaskDialog({
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
-    !(workerSettings === null ? harnessSettings : workerHarnessSettings).blockedReason &&
+    !(editingWorkerSettings
+      ? workerSettings !== null && workerHarnessSettings.blockedReason
+      : harnessSettings.blockedReason) &&
     !mutationPending;
 
   function resetForm() {
@@ -1107,7 +1117,7 @@ export function CreateScheduledTaskDialog({
             </p>
           )}
 
-          {workerSettings !== null && editingTask ? (
+          {editingWorkerSettings && workerSettings !== null && editingTask ? (
             <TriggerWorkerSettingsFields
               value={workerSettings}
               pollingAgentId={editingTask.agentId}
@@ -1124,6 +1134,11 @@ export function CreateScheduledTaskDialog({
                 setSystemPrompt(parts.systemPrompt);
               }}
             />
+          ) : editingWorkerSettings ? (
+            <p className="text-sm text-muted-foreground" role="status">
+              Worker controls are unavailable for these customized instructions. Edit the prompt or
+              system prompt above to configure matching sessions.
+            </p>
           ) : (
             <>
               <div className="flex flex-col gap-1.5">

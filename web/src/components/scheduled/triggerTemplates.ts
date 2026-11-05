@@ -396,6 +396,13 @@ export function readTriggerWorkerSettings(prompt: string): TriggerWorkerSettings
   return workerSettingsMatch(prompt)?.settings ?? null;
 }
 
+/** Placement remains part of the authored instructions when the poller moves. */
+export function readTriggerWorkerPlacement(prompt: string): "managed" | "same_host" | null {
+  const parsed = workerSettingsMatch(prompt);
+  if (parsed === null) return null;
+  return parsed.match[2].startsWith('placement "managed"') ? "managed" : "same_host";
+}
+
 /** Change only the creation-call settings, preserving the rest of the authored prompt. */
 export function updateTriggerWorkerSettings(
   prompt: string,

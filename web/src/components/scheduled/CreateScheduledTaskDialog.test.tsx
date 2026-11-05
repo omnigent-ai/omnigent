@@ -2968,9 +2968,59 @@ describe("editing template prompts", () => {
     });
   });
 
-  it.each([true, false])(
-    "validates the worker preview when the poller is unsupported (worker ready: %s)",
-    async (workerReady) => {
+  it.each(["Your prompt", "System prompt"])(
+    "keeps polling settings unchanged while clearing and restoring %s",
+    async (field) => {
+      render(
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({
+            prompt: original,
+            sessionMode: "continue",
+            sessionId: "poller",
+          })}
+        />,
+      );
+      if (field === "System prompt") {
+        fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+        fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+      }
+      const editor = screen.getByRole("textbox", { name: field }) as HTMLTextAreaElement;
+      const saved = editor.value;
+      fireEvent.change(editor, { target: { value: "" } });
+      const pollerPicker = screen.queryByTestId("pick-harness-claude");
+      if (pollerPicker) fireEvent.click(pollerPicker);
+      fireEvent.change(editor, { target: { value: saved } });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(input.prompt).toBe(original);
+      for (const key of [
+        "agentId",
+        "sessionId",
+        "modelOverride",
+        "reasoningEffort",
+        "permissionMode",
+      ])
+        expect(input).not.toHaveProperty(key);
+      expect(pollerPicker).toBeNull();
+    },
+  );
+
+  it.each(
+    [true, false].flatMap((workerReady) =>
+      [true, false].flatMap((moveToHost) =>
+        (["managed", "same_host"] as const).map((placement) => ({
+          workerReady,
+          moveToHost,
+          placement,
+        })),
+      ),
+    ),
+  )(
+    "validates worker placement $placement after moving to host=$moveToHost (worker ready: $workerReady)",
+    async ({ workerReady, moveToHost, placement }) => {
       vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockImplementation(
         (_provider, _harness, agentId) =>
           ({
@@ -2996,7 +3046,7 @@ describe("editing template prompts", () => {
             open
             onOpenChange={vi.fn()}
             editingTask={scheduledTask({
-              prompt: original.replace('placement "same_host"', 'placement "managed"'),
+              prompt: original.replace('placement "same_host"', `placement "${placement}"`),
               executionTarget: "managed_sandbox",
               sessionMode: "continue",
               sessionId: "poller",
@@ -3005,15 +3055,20 @@ describe("editing template prompts", () => {
         </CapabilitiesProvider>,
       );
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      if (moveToHost) {
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+      }
       fireEvent.keyDown(screen.getByTestId("task-worker-agent-trigger"), { key: "Enter" });
       fireEvent.click(await screen.findByRole("option", { name: "Claude Code" }));
       const submit = screen.getByTestId("create-scheduled-task-submit");
-      if (workerReady) {
+      if (workerReady || (moveToHost && placement === "same_host")) {
         expect(submit).toBeEnabled();
         fireEvent.click(submit);
         await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
         const input = updateMutateAsync.mock.calls[0][0].input;
         expect(readTriggerWorkerSettings(input.prompt)?.agentId).toBe("ag_claude_native");
+        expect(input.prompt).toContain(`placement "${placement}"`);
         expect(input).not.toHaveProperty("agentId");
         expect(input).not.toHaveProperty("sessionId");
       } else {
