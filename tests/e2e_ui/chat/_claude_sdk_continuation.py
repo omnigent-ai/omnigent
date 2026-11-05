@@ -1,4 +1,4 @@
-"""Shared lifecycle for the claude-sdk ``/clear`` and ``/rewind`` browser journeys."""
+"""Shared lifecycle and page helpers for the claude-sdk ``/clear`` and ``/rewind`` journeys."""
 
 from __future__ import annotations
 
@@ -7,8 +7,30 @@ from dataclasses import dataclass, field
 
 import httpx
 import pytest
+from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state
+
+ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
+USER = '[data-testid="message-bubble"][data-role="user"]'
+WORKING = '[data-testid="working-indicator"]'
+COMPOSER = "Send a message…"
+
+
+def send_and_wait(page: Page, text: str, reply: str) -> None:
+    """Send *text* from the composer and wait for *reply* and an idle turn."""
+    page.get_by_placeholder(COMPOSER).fill(text)
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(ASSISTANT).filter(has_text=reply)).to_be_visible(timeout=180_000)
+    expect(page.locator(WORKING)).to_have_count(0, timeout=180_000)
+
+
+def session_mentions(base_url: str, session_id: str, text: str) -> bool:
+    """Whether one of *session_id*'s newest messages contains *text*."""
+    items = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/items", params={"order": "desc", "limit": 5}
+    ).json()["data"]
+    return any(text in part.get("text", "") for item in items for part in item.get("content", []))
 
 
 @dataclass
