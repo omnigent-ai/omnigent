@@ -46,7 +46,7 @@ _REAL_SUBPROCESS_RUN = subprocess.run
 
 
 @pytest.fixture(autouse=True)
-def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Reduce ``resolve_cli_binary`` to a pure ``PATH`` probe under test.
 
     ``harness_cli_installed`` / ``missing_harness_cli`` resolve via
@@ -62,6 +62,8 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     the stub explicitly.
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    # A user's harness.claude-native.command would redirect the native Claude check.
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
     monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
 

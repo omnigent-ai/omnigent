@@ -1478,6 +1478,71 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
     assert host._runners == {}
 
 
+@pytest.mark.parametrize("launcher_installed", [True, False])
+async def test_handle_launch_native_claude_checks_the_configured_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launcher_installed: bool,
+) -> None:
+    """
+    A native Claude launch through a configured launcher needs that launcher,
+    not ``claude``, on the host.
+
+    Isaac's managed config sets ``harness.claude-native.command`` to its own
+    launcher, which installs the Claude Code it starts. With no ``claude`` on
+    PATH the launch still spawns; without the launcher the refusal names it.
+    The readiness check and hint are the real functions here.
+    """
+    from omnigent import _platform
+    from omnigent.host import harness_startup
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    if launcher_installed:
+        launcher = bin_dir / "isaac"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    config = {"harness": {"claude-native": {"command": "isaac", "args": ["--"]}}}
+    monkeypatch.setattr(harness_startup, "load_global_config", lambda: config)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        # PATH holds only the launcher, so start the stand-in runner by absolute path.
+        return original_popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_launcher",
+        binding_token="token_launcher",
+        workspace=str(workspace),
+        harness="claude-native",
+    )
+    try:
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await asyncio.wait_for(host._handle_launch(frame), timeout=5.0)
+        if launcher_installed:
+            assert result.status == "launched", result.error
+            assert result.error_code is None
+        else:
+            assert result.status == "failed"
+            assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+            message = result.error or ""
+            assert "`isaac`, the command harness.claude-native.command runs" in message
+            assert "claude.ai/install.sh" not in message
+            assert host._runners == {}
+    finally:
+        _cleanup_host(host)
+
+
 @pytest.mark.parametrize("discovery_pending", [False, True])
 @pytest.mark.parametrize(
     ("harness", "pi_version"),

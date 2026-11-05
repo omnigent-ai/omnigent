@@ -47,16 +47,19 @@ from collections import deque
 from pathlib import Path
 from typing import NamedTuple
 
+import yaml
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
+from omnigent.harness_startup_config import resolve_harness_config
 from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.host import harness_startup
 from omnigent.inner import _proc
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
@@ -692,6 +695,40 @@ def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key) if key is not None else None
 
 
+# Native Claude spellings whose terminal launch ``harness.claude-native.command`` sets.
+_NATIVE_CLAUDE_HARNESSES = frozenset({"claude-native", "native-claude"})
+
+
+def configured_native_claude_launcher(harness: str) -> harness_startup.HarnessStartup | None:
+    """
+    Describe the configured command a native Claude launch runs instead of ``claude``.
+
+    The managed-host runner spawns ``harness.claude-native.command``, unwrapping
+    an ``env`` wrapper to the command it runs. An integration such as
+    Databricks' Isaac points it at its own launcher, which installs and pins the
+    Claude Code it starts, so that command must be present rather than ``claude``.
+
+    :param harness: A harness id, e.g. ``"claude-native"``.
+    :returns: The launch description when *harness* is native Claude and the
+        config runs another command, e.g. one whose ``command`` is ``"isaac"``;
+        ``None`` for other harnesses, the default ``claude``, an
+        ``OMNIGENT_CLAUDE_PATH`` override, a configured ``claude`` path, or an
+        unreadable config.
+    """
+    if harness not in _NATIVE_CLAUDE_HARNESSES:
+        return None
+    try:
+        _, overrides = resolve_harness_config(harness_startup.load_global_config())
+        if "command" not in overrides.get("claude-native", {}):
+            return None
+        startup = harness_startup.describe_harness_startup("claude-native")
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+    if startup.command_source != "config" or Path(startup.command).name == "claude":
+        return None
+    return startup
+
+
 def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
     """Return a harness's required CLI spec when that CLI can't be used.
 
@@ -713,6 +750,9 @@ def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
     spec = required_cli_for_harness(harness)
     if spec is None:
         return None
+    launcher = configured_native_claude_launcher(harness)
+    if launcher is not None:
+        return None if launcher.resolved_path is not None else spec
     install_key = _all_harness_name_to_key().get(harness)
     if install_key is not None and harness_cli_installed(install_key):
         return None
@@ -739,6 +779,12 @@ def harness_setup_hint(harness: str | None) -> str:
         https://cursor.com/install -fsS | bash`, then run `cursor-agent
         login`"`` for native Cursor, or the ``omni setup`` hint otherwise.
     """
+    launcher = configured_native_claude_launcher(harness or "")
+    if launcher is not None and launcher.resolved_path is None:
+        return (
+            f"install `{launcher.command}`, the command harness.claude-native.command "
+            "runs, on that machine"
+        )
     spec = required_cli_for_harness(harness or "")
     if spec is not None and spec.binary == "agy":
         from omnigent.errors import ErrorCode, OmnigentError
