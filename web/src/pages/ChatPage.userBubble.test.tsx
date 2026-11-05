@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
+import { AUTOMATION_CONTEXT_NOTE } from "@/lib/systemMessage";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { BubbleView, buildPendingBubbles } from "./ChatPage";
 
@@ -53,6 +54,33 @@ function renderBubble(bubble: Bubble) {
 }
 
 describe("UserBubble markdown rendering", () => {
+  it.each([false, true])(
+    "preserves visible and copied text for modified note=%s",
+    async (modified) => {
+      const note = modified
+        ? AUTOMATION_CONTEXT_NOTE.replace("no one is watching this run.", "include a table.")
+        : AUTOMATION_CONTEXT_NOTE;
+      const text = `Summarize **today**.\n\n${note}`;
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      try {
+        renderBubble(userBubble(text));
+        expect(screen.getByText("today")).toBeInTheDocument();
+        if (modified) {
+          expect(screen.getByText(/include a table/)).toBeInTheDocument();
+        } else {
+          expect(screen.queryByText(/no one is watching/)).not.toBeInTheDocument();
+        }
+        fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+        await waitFor(() =>
+          expect(writeText).toHaveBeenCalledWith(modified ? text : "Summarize **today**."),
+        );
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
   it("renders **bold** markdown as a strong node, not literal asterisks", () => {
     renderBubble(userBubble("hello **world**"));
     // Streamdown emits bold as an element tagged data-streamdown="strong"
@@ -357,12 +385,45 @@ describe("UserBubble entrance motion", () => {
 describe("UserBubble awaiting-agent marker", () => {
   const content: MessageContentBlock[] = [{ type: "input_text", text: "steer" }];
 
-  it("tells the user a mid-turn message waits for the agent's current step", () => {
+  it("shares the timestamp row without adding a separate waiting line", () => {
     const [pending] = buildPendingBubbles([{ tempId: "pend_1", content, sentMidTurn: true }], null);
-    renderBubble(pending!);
-    expect(screen.getByTestId("message-awaiting-agent")).toHaveTextContent(
-      "The agent will read this after its current step",
+    if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+    renderBubble({ ...pending, createdAtS: 1_762_000_000 });
+    const explanation = screen.getByTestId("message-awaiting-agent");
+    expect(explanation).toHaveTextContent("The agent will read this after its current step");
+    const footer = screen.getByTestId("message-timestamp").parentElement;
+    expect(explanation.parentElement).toBe(footer);
+    expect(explanation.nextElementSibling).toBe(screen.getByTestId("message-timestamp"));
+    expect(footer).toContainElement(screen.getByRole("button", { name: "Copy" }));
+    expect(footer).toHaveClass(
+      "pt-1",
+      "md:opacity-0",
+      "md:group-hover:opacity-100",
+      "md:group-focus-within:opacity-100",
     );
+    expect(explanation).toHaveClass("truncate");
+    expect(explanation.querySelector("svg")).toBeNull();
+  });
+
+  it("keeps an attachment-only explanation visible without a focusable footer control", () => {
+    const [pending] = buildPendingBubbles(
+      [
+        {
+          tempId: "pend_attachment",
+          content: [{ type: "input_file", file_id: "file_1", filename: "notes.txt" }],
+          sentMidTurn: true,
+        },
+      ],
+      null,
+    );
+    if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+    renderBubble({ ...pending, createdAtS: 1_762_000_000 });
+    const explanation = screen.getByTestId("message-awaiting-agent");
+    const footer = explanation.parentElement;
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+    expect(screen.getByTestId("copy-message-link")).toBeDisabled();
+    expect(footer).toHaveClass("opacity-100");
+    expect(footer).not.toHaveClass("md:opacity-0");
   });
 
   it("stays hidden for a send that started a turn and for committed history", () => {
