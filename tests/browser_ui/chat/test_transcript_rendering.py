@@ -735,10 +735,10 @@ def test_streamed_reply_stays_mounted_as_its_turn_commits_and_ends(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """A streamed reply keeps its elements, and the reader's selection, until the turn ends.
+    """A streamed reply keeps its elements, and the reader's selection, through its turn.
 
     The relay commits the tool call that closed the text, then stamps the text's id,
-    and the turn ends. None of these may rebuild the reply's markdown.
+    and the turn ends and folds its trace. None of these may rebuild the reply's markdown.
     """
     chat = chat_session_contract
     response_id = "mounted-reply"
@@ -783,6 +783,8 @@ def test_streamed_reply_stays_mounted_as_its_turn_commits_and_ends(
     )
     chat.emit_idle(response_id)
     expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=10_000)
+    expect(page.get_by_test_id("turn-worked-fold")).to_have_count(1, timeout=15_000)
+    expect(page.locator(".turn-fold-content")).to_be_hidden(timeout=15_000)
 
     assert first_paragraph.evaluate("(p) => p === window.__first"), "the first message was rebuilt"
     assert last_paragraph.evaluate("(p) => p === window.__last"), "the answer was rebuilt"
