@@ -52,6 +52,12 @@ Merge this into the file's `mcpServers` and keep the organization's other server
   `{"serverName": "omnigent"}` there. Claude Code applies that allowlist to any
   managed entry that uses `${VAR}`, and drops the entry silently when it isn't listed.
 
+> **Security note.** This entry hands its executable (`${OMNIGENT_MCP_RELAY_PYTHON}`)
+> and its tool surface (the bridge directory) to whatever environment launches Claude
+> Code. A Claude started separately can set these variables and run another program
+> under the approved `omnigent` name. An organization that needs an
+> administrator-fixed tool catalog shouldn't deploy this entry.
+
 ## What happens
 
 - **With the entry:** claude-sdk sessions start with Omnigent's tools, and
