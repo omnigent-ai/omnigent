@@ -2468,17 +2468,41 @@ def claude_terminal_relay_env(
 
 
 def managed_mcp_relay_configured() -> bool:
-    """Whether the ``managed-mcp.json`` Claude Code applies has the relay entry.
+    """Whether the ``managed-mcp.json`` Claude Code applies has a usable relay entry.
 
-    Only an ``omnigent`` entry that reads the bridge directory from the environment
-    can reach a session's relay.
+    Both Claude harnesses use this one check, so they agree on whether a session
+    gets Omnigent's tools or the missing-entry warning.
     """
     from omnigent.host.mcp_inventory import managed_claude_mcp_config
 
     _present, servers = managed_claude_mcp_config()
-    entry = servers.get(_MCP_SERVER_NAME)
-    return isinstance(entry, Mapping) and (
-        f"${{{MANAGED_MCP_RELAY_BRIDGE_DIR_ENV}" in json.dumps(entry)
+    return _launches_session_relay(servers.get(_MCP_SERVER_NAME))
+
+
+# ``${VAR}`` or ``${VAR:-default}``, as Claude Code expands managed entries.
+_RELAY_BRIDGE_DIR_REFERENCE = re.compile(
+    r"\$\{" + MANAGED_MCP_RELAY_BRIDGE_DIR_ENV + r"(?::-[^}]*)?\}"
+)
+
+
+def _launches_session_relay(entry: object) -> bool:
+    """Whether a stdio entry runs ``serve-mcp`` for the bridge directory Omnigent sets.
+
+    A wrapper may precede the relay, but ``serve-mcp`` and the bridge directory must
+    appear in its command or arguments; an environment value launches nothing.
+    """
+    if not isinstance(entry, Mapping) or entry.get("type", "stdio") != "stdio":
+        return False
+    command, args, env = entry.get("command"), entry.get("args", []), entry.get("env", {})
+    if not (isinstance(command, str) and command.strip()):
+        return False
+    if not (isinstance(args, list) and all(isinstance(arg, str) for arg in args)):
+        return False
+    if not (isinstance(env, Mapping) and all(isinstance(value, str) for value in env.values())):
+        return False
+    launch = [command, *args]
+    return any("serve-mcp" in part for part in launch) and any(
+        _RELAY_BRIDGE_DIR_REFERENCE.search(part) for part in launch
     )
 
 

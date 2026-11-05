@@ -3995,8 +3995,10 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
         assert not bridge_dir.exists()
         assert warnings == []
 
-        # Without the entry nothing reaches the tools, so none are promised to the model.
-        _deploy_managed_mcp(tmp_path, monkeypatch, {"linear": {"url": "https://l.example/mcp"}})
+        # An entry that cannot reach the relay is no entry: nothing reaches the tools, so
+        # none are promised to the model.
+        unusable = {"command": "/bin/false", "env": {"NOTE": entry["args"][-1]}}
+        _deploy_managed_mcp(tmp_path, monkeypatch, {"omnigent": unusable})
         messages.clear()
         bare = await turn("q2")
         assert bare.options.mcp_servers == {}
