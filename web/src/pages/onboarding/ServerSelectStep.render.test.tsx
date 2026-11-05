@@ -146,4 +146,29 @@ describe("ServerSelectStep", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Delete from list" }));
     expect(onRemove).toHaveBeenCalledWith("https://mine.example.com/");
   });
+
+  it("swallows a failed server URL copy instead of leaving an unhandled rejection", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const onCopy = vi.fn().mockRejectedValue(new Error("clipboard denied"));
+      render(
+        <ServerSelectStep
+          {...baseProps}
+          recentServers={["https://team.example.com/"]}
+          onConnect={vi.fn()}
+          onCopy={onCopy}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: /^expand /i }));
+      fireEvent.click(await screen.findByRole("button", { name: /^copy /i }));
+      expect(onCopy).toHaveBeenCalledWith("https://team.example.com/");
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
 });

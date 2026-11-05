@@ -147,3 +147,45 @@ it("keeps remote connections available without a CLI or installer", async () => 
   expect(startLocalServer).not.toHaveBeenCalled();
   expect(installCli).not.toHaveBeenCalled();
 });
+
+async function openFailedLocalSetup(copyText: (text: string) => Promise<unknown>) {
+  stubBridge({
+    getRecentServers: async () => [],
+    getCliStatus: async () => ({ installed: true }),
+    copyText,
+    startLocalServer: async () => ({
+      ok: false,
+      error: "Couldn't start the local server. Check the log and try again.",
+      errorMessage: "Couldn't start the local server.",
+      errorAction: "Check the log and try again.",
+    }),
+  });
+  render(<BridgeSetupApp />);
+  fireEvent.click(await screen.findByRole("button", { name: /get started locally/i }));
+  fireEvent.click(await screen.findByRole("button", { name: "Start Omnigent" }));
+  return screen.findByRole("button", { name: "Copy diagnostics" });
+}
+
+it("copies the failed setup's message and action through the desktop copy bridge", async () => {
+  const copyText = vi.fn(async (_text: string) => {});
+  fireEvent.click(await openFailedLocalSetup(copyText));
+  await waitFor(() =>
+    expect(copyText).toHaveBeenCalledExactlyOnceWith(
+      "Couldn't start the local server.\nCheck the log and try again.",
+    ),
+  );
+  expect(await screen.findByRole("button", { name: "Copied" })).toBeInTheDocument();
+});
+
+it("reports a rejected desktop copy bridge call and lets the user retry", async () => {
+  const copyText = vi
+    .fn<(text: string) => Promise<unknown>>()
+    .mockRejectedValueOnce(new Error("clipboard unavailable"))
+    .mockResolvedValue(undefined);
+  fireEvent.click(await openFailedLocalSetup(copyText));
+  expect(await screen.findByText("Couldn't copy diagnostics. Try again.")).toBeInTheDocument();
+  expect(screen.queryByText("Copied")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Copy diagnostics" }));
+  expect(await screen.findByRole("button", { name: "Copied" })).toBeInTheDocument();
+  expect(copyText).toHaveBeenCalledTimes(2);
+});

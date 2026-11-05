@@ -8,12 +8,25 @@
 // No stream available (older shell / browser preview) → a single phase line.
 
 import { useEffect, useRef, useState } from "react";
-import { RotateCw } from "lucide-react";
+import { Check, Copy, RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { ConnectProgress, SetupResult } from "@/pages/onboarding/ServerSelectorV2";
 import { ConnectStatus } from "@/pages/onboarding/primitives";
 
 type Phase = "installing" | "running" | "ready" | "failed";
+type CopyState = "idle" | "copied" | "failed";
+
+const FALLBACK_ERROR = "Could not set up Omnigent.";
+
+// Collapse a message onto one line so the payload is exactly one line per field.
+const toSingleLine = (text: string | undefined) => text?.replace(/\s+/g, " ").trim() ?? "";
+
+/** The displayed failure and recovery action as separate lines; nothing else. */
+function buildDiagnostics(error: string | undefined, errorAction: string | undefined): string {
+  return [toSingleLine(error ?? FALLBACK_ERROR), toSingleLine(errorAction)]
+    .filter(Boolean)
+    .join("\n");
+}
 
 // Empty-terminal beat before the first install commands stream in, so the
 // install step doesn't flash straight from empty into output.
@@ -30,6 +43,7 @@ export function SetupTerminalStep({
   runningHint = "Starting the local server…",
   connection = null,
   onCancelConnect,
+  onCopy,
 }: {
   /** Install the CLI first (when missing). Absent → skip straight to onRun. */
   onInstallCli?: () => Promise<SetupResult>;
@@ -49,6 +63,8 @@ export function SetupTerminalStep({
   /** Progress of the run phase's server connect (null when not connecting). */
   connection?: ConnectProgress | null;
   onCancelConnect?: () => void;
+  /** Copy text via the shell's clipboard bridge. A rejection reports a failed copy. */
+  onCopy?: (text: string) => void | Promise<unknown>;
 }) {
   const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
@@ -56,6 +72,10 @@ export function SetupTerminalStep({
   const [lines, setLines] = useState<string[]>([]);
   // Bump to re-run the sequence on retry.
   const [attempt, setAttempt] = useState(0);
+  const [copyState, setCopyState] = useState<CopyState>("idle");
+  // Ties a copy result to the failure it was requested for; any new attempt or
+  // another copy click supersedes an in-flight one.
+  const copyRequest = useRef(0);
   // Guard against a resolve landing after unmount (window navigated away).
   const alive = useRef(true);
   const logBox = useRef<HTMLDivElement>(null);
@@ -101,6 +121,8 @@ export function SetupTerminalStep({
     setError(undefined);
     setErrorAction(undefined);
     setLines([]);
+    copyRequest.current += 1;
+    setCopyState("idle");
     (async () => {
       const install = onInstallCliRef.current;
       if (install) {
@@ -137,6 +159,23 @@ export function SetupTerminalStep({
       canceled = true;
     };
   }, [attempt]);
+
+  const diagnostics = phase === "failed" ? buildDiagnostics(error, errorAction) : "";
+  const copyDiagnostics = () => {
+    if (!onCopy || !diagnostics) return;
+    const request = ++copyRequest.current;
+    const settle = (next: CopyState) => {
+      if (alive.current && copyRequest.current === request) setCopyState(next);
+    };
+    setCopyState("idle");
+    // Resolve through a promise so a synchronous throw is a failed copy too.
+    new Promise((resolve) => {
+      resolve(onCopy(diagnostics));
+    }).then(
+      () => settle("copied"),
+      () => settle("failed"),
+    );
+  };
 
   // Cycle "." → ".." → "..." on the in-progress title so a slow install/start
   // still reads as alive.
@@ -212,7 +251,7 @@ export function SetupTerminalStep({
               <span className="select-none" aria-hidden="true">
                 ✕
               </span>{" "}
-              {error ?? "Could not set up Omnigent."}
+              {error ?? FALLBACK_ERROR}
             </div>
             {errorAction && (
               <div className="text-cyan-700 dark:text-cyan-300">
@@ -228,12 +267,28 @@ export function SetupTerminalStep({
 
       <ConnectStatus connection={connection} onCancel={onCancelConnect} />
 
+      {phase === "failed" && onCopy && diagnostics && (
+        <div role="status" className="mt-2 text-[13px] text-destructive">
+          {copyState === "failed" ? "Couldn't copy diagnostics. Try again." : ""}
+        </div>
+      )}
+
       {phase === "failed" && (
         <div className="mt-3 flex justify-between gap-2">
           <Button variant="outline" onClick={onBack}>
             Back
           </Button>
           <div className="flex gap-2">
+            {onCopy && diagnostics && (
+              <Button variant="outline" onClick={copyDiagnostics}>
+                {copyState === "copied" ? (
+                  <Check className="size-4" aria-hidden />
+                ) : (
+                  <Copy className="size-4" aria-hidden />
+                )}
+                {copyState === "copied" ? "Copied" : "Copy diagnostics"}
+              </Button>
+            )}
             {onConnectAnyway && (
               <Button variant="outline" onClick={onConnectAnyway}>
                 Continue anyway

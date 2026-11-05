@@ -124,8 +124,9 @@ export interface ServerSelectorV2Setup {
   onRunnerLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
   onRemoveServer?: (url: string) => void;
-  /** Copy text to the clipboard via the shell's native bridge. */
-  onCopy: (text: string) => void;
+  /** Copy text to the clipboard via the shell's native bridge. A returned
+   *  promise settles when the copy is confirmed; a rejection means it failed. */
+  onCopy: (text: string) => void | Promise<unknown>;
   /** Advisory reachability probe for a just-added server URL. */
   onCheckServer: (url: string) => Promise<ServerCheckResult>;
   /** Open the Cloud deploy docs in the user's browser. */
@@ -502,6 +503,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
               runningHint={terminalCopy.hint}
               connection={connection}
               onCancelConnect={cancelConnect}
+              onCopy={setup.onCopy}
             />
           ))}
         {step === "server" && (

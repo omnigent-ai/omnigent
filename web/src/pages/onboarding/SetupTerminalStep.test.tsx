@@ -214,4 +214,190 @@ describe("SetupTerminalStep", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Back" }));
     expect(onBack).toHaveBeenCalledOnce();
   });
+
+  describe("Copy diagnostics", () => {
+    const errorMessage = "Sign-in to https://team.example.com/ didn't complete.";
+    const errorAction = "Finish signing in and try again.";
+    const failure = {
+      ok: false,
+      error: `${errorMessage} ${errorAction}`,
+      errorMessage,
+      errorAction,
+    };
+
+    it("copies only the displayed failure and action as two separate lines", async () => {
+      const onCopy = vi.fn().mockResolvedValue(undefined);
+      render(
+        <SetupTerminalStep
+          onRun={vi.fn().mockResolvedValue({
+            ...failure,
+            errorMessage: `${errorMessage}\n  `,
+            errorAction: ` ${errorAction}\n`,
+          })}
+          onSetupLog={(cb) => {
+            cb("Authorization: Bearer secret-token https://team.example.com/ticket/abc123");
+            return () => {};
+          }}
+          onBack={vi.fn()}
+          onCopy={onCopy}
+        />,
+      );
+
+      fireEvent.click(await screen.findByRole("button", { name: "Copy diagnostics" }));
+      expect(onCopy).toHaveBeenCalledOnce();
+      expect(onCopy).toHaveBeenCalledWith(`${errorMessage}\n${errorAction}`);
+      expect(await screen.findByRole("button", { name: "Copied" })).toBeInTheDocument();
+    });
+
+    it("copies the legacy fallback line when only an error string is displayed", async () => {
+      const onCopy = vi.fn().mockResolvedValue(undefined);
+      const { unmount } = render(
+        <SetupTerminalStep
+          onRun={vi.fn().mockResolvedValue({ ok: false, error: "omnigent CLI not found" })}
+          onBack={vi.fn()}
+          onCopy={onCopy}
+        />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "Copy diagnostics" }));
+      expect(onCopy).toHaveBeenLastCalledWith("omnigent CLI not found");
+      unmount();
+
+      render(
+        <SetupTerminalStep
+          onRun={vi.fn().mockResolvedValue({ ok: false })}
+          onBack={vi.fn()}
+          onCopy={onCopy}
+        />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "Copy diagnostics" }));
+      expect(onCopy).toHaveBeenLastCalledWith("Could not set up Omnigent.");
+    });
+
+    it("is offered only on a failure, and only when a copy callback is provided", async () => {
+      const onCopy = vi.fn().mockResolvedValue(undefined);
+      let finish: (result: { ok: boolean }) => void = () => {};
+      const { unmount } = render(
+        <SetupTerminalStep
+          onRun={() =>
+            new Promise((resolve) => {
+              finish = resolve;
+            })
+          }
+          onBack={vi.fn()}
+          onCopy={onCopy}
+        />,
+      );
+      expect(screen.queryByRole("button", { name: /copy diagnostics/i })).toBeNull();
+      act(() => finish({ ok: true }));
+      expect(await screen.findByText("Server ready")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /copy diagnostics/i })).toBeNull();
+      unmount();
+
+      render(<SetupTerminalStep onRun={vi.fn().mockResolvedValue(failure)} onBack={vi.fn()} />);
+      expect(await screen.findByText(errorMessage)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /copy diagnostics/i })).toBeNull();
+      expect(onCopy).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["rejects", () => Promise.reject(new Error("clipboard denied"))],
+      [
+        "throws",
+        () => {
+          throw new Error("bridge missing");
+        },
+      ],
+    ])("reports a copy that %s and allows a retry", async (_label, failingCopy) => {
+      const unhandled = vi.fn();
+      process.on("unhandledRejection", unhandled);
+      try {
+        const onCopy = vi.fn().mockImplementationOnce(failingCopy).mockResolvedValue(undefined);
+        render(
+          <SetupTerminalStep
+            onRun={vi.fn().mockResolvedValue(failure)}
+            onBack={vi.fn()}
+            onCopy={onCopy}
+          />,
+        );
+        fireEvent.click(await screen.findByRole("button", { name: "Copy diagnostics" }));
+
+        expect(await screen.findByRole("status")).toHaveTextContent(
+          "Couldn't copy diagnostics. Try again.",
+        );
+        expect(screen.queryByText("Copied")).toBeNull();
+
+        fireEvent.click(screen.getByRole("button", { name: "Copy diagnostics" }));
+        expect(await screen.findByRole("button", { name: "Copied" })).toBeInTheDocument();
+        expect(screen.getByRole("status")).toBeEmptyDOMElement();
+        expect(onCopy).toHaveBeenCalledTimes(2);
+        await new Promise((resolve) => {
+          setTimeout(resolve, 0);
+        });
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        process.off("unhandledRejection", unhandled);
+      }
+    });
+
+    it("does not show Copied until the copy is confirmed", async () => {
+      let confirm: () => void = () => {};
+      const onCopy = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            confirm = resolve;
+          }),
+      );
+      render(
+        <SetupTerminalStep
+          onRun={vi.fn().mockResolvedValue(failure)}
+          onBack={vi.fn()}
+          onCopy={onCopy}
+        />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "Copy diagnostics" }));
+      expect(screen.queryByText("Copied")).toBeNull();
+      await act(async () => confirm());
+      expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
+    });
+
+    it("clears the copied state when Retry starts a new setup attempt", async () => {
+      const onCopy = vi.fn().mockResolvedValue(undefined);
+      const onRun = vi
+        .fn()
+        .mockResolvedValueOnce(failure)
+        .mockResolvedValueOnce({ ok: false, errorMessage: "Second failure." });
+      render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} onCopy={onCopy} />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Copy diagnostics" }));
+      expect(await screen.findByRole("button", { name: "Copied" })).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(await screen.findByText("Second failure.")).toBeInTheDocument();
+      expect(screen.queryByText("Copied")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Copy diagnostics" }));
+      expect(onCopy).toHaveBeenLastCalledWith("Second failure.");
+    });
+
+    it("ignores a copy that settles after a new attempt started", async () => {
+      let confirm: () => void = () => {};
+      const onCopy = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            confirm = resolve;
+          }),
+      );
+      const onRun = vi
+        .fn()
+        .mockResolvedValueOnce(failure)
+        .mockResolvedValueOnce({ ok: false, errorMessage: "Second failure." });
+      render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} onCopy={onCopy} />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Copy diagnostics" }));
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(await screen.findByText("Second failure.")).toBeInTheDocument();
+      await act(async () => confirm());
+      expect(screen.queryByText("Copied")).toBeNull();
+      expect(screen.getByRole("button", { name: "Copy diagnostics" })).toBeInTheDocument();
+    });
+  });
 });
