@@ -16,6 +16,7 @@ import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { showToast } from "@/components/ui/toast";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
@@ -33,7 +34,7 @@ import {
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
@@ -171,7 +172,20 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function handleRunNow(task: ScheduledTask) {
-    runNowMutation.mutate(task.id);
+    runNowMutation.mutate(task.id, {
+      onSuccess: () => {
+        showToast(
+          "Run triggered, it will start shortly. Open automation details to check run history.",
+        );
+      },
+      onError: (err) => {
+        if (err instanceof ScheduledTaskApiError && err.status === 409) {
+          showToast("This run is already in progress");
+        } else {
+          showToast("Couldn't start the run");
+        }
+      },
+    });
   }
 
   function handleEdit(task: ScheduledTask) {
