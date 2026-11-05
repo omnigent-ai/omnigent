@@ -332,11 +332,16 @@ class SessionActivity:
         ``"waiting"``, ``"failed"``), or ``None`` when none is recorded.
     :param total_cost_usd: Recorded cost for this session, excluding descendants;
         ``None`` when unpriced.
+    :param pending_elicitation_count: Current unresolved session approvals/questions;
+        ``None`` when not reported.
+    :param runner_id: Bound runner, or ``None`` for an in-process session.
     """
 
     updated_at: int
     live_status: str | None
     total_cost_usd: float | None = None
+    pending_elicitation_count: int | None = None
+    runner_id: str | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -1712,6 +1717,52 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_background_work_running(
+        self,
+        conversation_id: str,
+        running: bool,
+        *,
+        runner_id: str | None = None,
+        unseen_since: int | None = None,
+        reported_at: int | None = None,
+    ) -> None:
+        """
+        Persist whether a session's background shells outlive its ended turn.
+
+        Every replica's session list reads this value to show the session as
+        working. Must NOT bump ``updated_at``. Changing or clearing the
+        session's runner resets it.
+
+        :param conversation_id: Session/conversation identifier.
+        :param running: ``True`` while a background shell outlives the turn.
+        :param runner_id: When set, write only while the session is still bound
+            to this runner, so clearing a departed runner's flag cannot erase a
+            replacement runner's report.
+        :param unseen_since: When set, write only while ``runner_last_seen`` is
+            NULL or earlier than this epoch second, so a runner that reconnected
+            keeps its report.
+        :param reported_at: When the runner decided *running*, in its epoch
+            nanoseconds. When set, write only if no newer report is stored, and
+            store it with the value.
+        """
+        ...
+
+    @abstractmethod
+    def set_blocked_on(self, conversation_id: str, blocked_on: str | None) -> None:
+        """
+        Persist why a running session's agent is parked on a terminal prompt.
+
+        Written by the replica that published the session's last status edge
+        so any replica's session list can show it as needing input. Must NOT
+        bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param blocked_on: The reason, at most 128 characters, e.g.
+            ``"permission prompt"``, or ``None`` when not parked.
+        """
+        ...
+
+    @abstractmethod
     def replace_runner_id(
         self,
         conversation_id: str,
@@ -2124,9 +2175,13 @@ class ConversationStore(ABC):
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
+        copy_items: bool = True,
+        continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        conversation_id: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -2227,6 +2282,19 @@ class ConversationStore(ABC):
             transcript; when the response is the source's last one, the
             copy is equivalent to a full fork and the directive is kept.
             ``None`` (default) copies the full history.
+        :param before_item_id: When set, copy only the items positioned
+            before this item, e.g. ``"msg_abc123"`` — the item and
+            everything after it are dropped (the first item keeps nothing,
+            as ``/clear`` does). Always a truncation, so the external-session fork
+            directive is dropped. Mutually exclusive with
+            ``up_to_response_id``.
+        :param copy_items: ``False`` copies no items at all, whatever the
+            source holds when the fork commits, e.g. for ``/clear``. A
+            truncation; exclusive with both cutoffs.
+        :param continue_source: Also copy the source's host, workspace and
+            branch (in the same write that creates the fork), its routing
+            switches and its workspace-file sharing, for a same-owner
+            continuation of the source's work.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -2241,11 +2309,16 @@ class ConversationStore(ABC):
         :param created_by: Identity of the forking user, recorded on the
             cloned session-scoped agent so its code can only be mutated by
             the owner. ``None`` in single-user mode or when no clone is made.
+        :param conversation_id: Id for the fork, chosen by a caller that must
+            be able to remove it even if this call is interrupted; ``None``
+            generates one.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
         :raises ValueError: If *up_to_response_id* is set but no item in
-            the source conversation has that ``response_id``.
+            the source conversation has that ``response_id``, if
+            *before_item_id* names no item in the source conversation, or
+            if both are set.
         """
         ...
 

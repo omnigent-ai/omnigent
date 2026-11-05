@@ -6118,6 +6118,12 @@
             "title": "Archive Worktree Cleanup",
             "type": "boolean"
           },
+          "automation_trigger_poll_minutes": {
+            "default": 10,
+            "format": "int64",
+            "title": "Automation Trigger Poll Minutes",
+            "type": "integer"
+          },
           "automations_enabled": {
             "default": false,
             "title": "Automations Enabled",
@@ -6285,6 +6291,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_claude_sdk_clear": {
+            "default": false,
+            "title": "Session Claude Sdk Clear",
+            "type": "boolean"
+          },
           "session_event_types": {
             "default": [],
             "items": {
@@ -6383,6 +6394,7 @@
             "response.reasoning_text.delta": "#/components/schemas/ReasoningTextDeltaEvent",
             "response.retry": "#/components/schemas/RetryEvent",
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
+            "session.background_tasks": "#/components/schemas/SessionBackgroundTasksEvent",
             "session.btw_sidechat": "#/components/schemas/SessionBtwSidechatEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
@@ -6440,6 +6452,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionCodexApprovalModeEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionBackgroundTasksEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -6632,6 +6647,56 @@
           "agent_name"
         ],
         "title": "SessionAgentChangedEvent",
+        "type": "object"
+      },
+      "SessionBackgroundTasksEvent": {
+        "description": "Background tasks of a session changed between its turns.\n\nEmitted when a codex-native forwarder's listing of its thread's background\nterminals changes. Claude's shells ride on its turn's `session.status`\nedge instead, because Claude reports them only when a turn ends.",
+        "properties": {
+          "background_task_count": {
+            "description": "Background tasks still running, e.g. `1`. `0` clears the composer's indicator.",
+            "format": "int64",
+            "title": "Background Task Count",
+            "type": "integer"
+          },
+          "background_tasks": {
+            "description": "Detail for each counted task, e.g. its command. Category: **transient** (SSE-only). The session snapshot carries the same tally, so reconnecting clients restore it.",
+            "items": {
+              "$ref": "#/components/schemas/BackgroundTaskInfo"
+            },
+            "title": "Background Tasks",
+            "type": "array"
+          },
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.background_tasks",
+            "description": "Always `\"session.background_tasks\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "background_task_count"
+        ],
+        "title": "SessionBackgroundTasksEvent",
         "type": "object"
       },
       "SessionBtwSidechatEvent": {
@@ -7434,6 +7499,24 @@
             "description": "Whether the session is archived. Archived sessions are returned by `GET /v1/sessions` only when the request passes `include_archived=true`; the sidebar groups them into a dedicated \"Archived\" section. `False` for normal sessions.",
             "title": "Archived",
             "type": "boolean"
+          },
+          "background_work_running": {
+            "default": false,
+            "description": "`True` while work outlives the session's ended turn, such as a background shell or a Codex goal that keeps running between turns. The sidebar shows such a session as working; `status` stays as reported, so the session still takes a new message. `False` while the session's runner is offline.",
+            "title": "Background Work Running",
+            "type": "boolean"
+          },
+          "blocked_on": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the session's agent is parked on a terminal prompt, e.g. `\"permission prompt\"`, from the last status edge, truncated to 128 characters. The sidebar shows such a session as needing input even when no web card exists for the prompt. `None` when it is not parked or its runner is offline.",
+            "title": "Blocked On"
           },
           "comments_count": {
             "default": 0,
@@ -8637,6 +8720,15 @@
             ],
             "description": "Runtime-native session id this conversation wraps, e.g. a Claude Code session uuid for `omnigent claude` sessions. `None` for regular AP-only conversations. Populated by the wrapper bridge.",
             "title": "External Session Id"
+          },
+          "failed_inputs": {
+            "description": "Durable managed-startup inputs that were never delivered, e.g. because the sandbox host did not come online. Same shape as `pending_inputs`, in submission order; their file blocks keep ids that still resolve under this session. Empty when nothing failed.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Failed Inputs",
+            "type": "array"
           },
           "git_branch": {
             "anyOf": [

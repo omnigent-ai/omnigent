@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -329,6 +331,8 @@ def test_get_session_activity(
     a = conversation_store.create_conversation(title="alpha")
     b = conversation_store.create_conversation(title="beta")
     conversation_store.set_session_live_status(a.id, "waiting")
+    conversation_store.set_runner_id(a.id, "runner_activity")
+    conversation_store.set_pending_elicitation_count(a.id, 2)
     conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
     conversation_store.set_session_usage(a.id, {"total_cost_usd": cost})
     child = conversation_store.create_conversation(
@@ -343,10 +347,13 @@ def test_get_session_activity(
     assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
     assert result[a.id].live_status == "waiting"
+    assert result[a.id].runner_id == "runner_activity"
+    assert result[a.id].pending_elicitation_count == 2
     assert result[a.id].total_cost_usd == cost
     assert result[child.id].total_cost_usd == 5.0
     # A session that never reported a status has none recorded.
     assert result[b.id].live_status is None
+    assert result[b.id].runner_id is None
     assert result[b.id].total_cost_usd is None
     assert conversation_store.get_session_activity([]) == {}
 
@@ -4795,6 +4802,28 @@ def test_update_conversation_share_workspace_files_round_trips(
     assert conversation_store.get_conversation(conv_id).share_workspace_files is False
 
 
+@pytest.mark.parametrize("continue_source", [True, False])
+def test_only_a_continuation_keeps_the_shared_workspace_files(
+    conversation_store: SqlAlchemyConversationStore, continue_source: bool
+) -> None:
+    """A continuation of a session sharing its files shares them too; a fork starts unshared.
+
+    The continuation carries on the same chat in the same workspace and is
+    shared exactly as its source, so the owner's opt-in carries over. An
+    ordinary fork is a new session the owner has not shared files for.
+    """
+    source = conversation_store.create_conversation(host_id=uuid.uuid4().hex, workspace="/work")
+    conversation_store.update_conversation(source.id, share_workspace_files=True)
+
+    fork = conversation_store.fork_conversation(
+        source.id, copy_items=False, continue_source=continue_source
+    )
+
+    forked = conversation_store.get_conversation(fork.id)
+    assert forked is not None
+    assert forked.share_workspace_files is continue_source
+
+
 def test_set_host_id_no_workspace_fails_when_row_has_none(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -6374,6 +6403,126 @@ def test_fork_conversation_up_to_unknown_response_raises(
         conversation_store.fork_conversation(source.id, up_to_response_id="resp_nope")
 
 
+def test_fork_conversation_before_item_drops_the_item_and_later_history(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """``before_item_id`` copies only the items positioned before that item.
+
+    The fork keeps everything before the item, drops the item and the turns
+    after it, and never resumes the source's full native transcript. The
+    first item leaves nothing to copy; unknown or combined cutoffs fail. A
+    fork that copies no items behaves the same and accepts no cutoff.
+    """
+    from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
+
+    agent_store.create(
+        agent_id="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b",
+        name="fork-before-item",
+        bundle_location="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b/fakehash",
+    )
+    source = conversation_store.create_conversation(agent_id="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b")
+    conversation_store.set_external_session_id(source.id, "claude-uuid-before")
+    _append_three_responses(conversation_store, source.id)
+    source_items = conversation_store.list_items(source.id).data
+    second_prompt, first_prompt = source_items[2], source_items[0]
+
+    def fork_texts(fork_id: str) -> list[str]:
+        return [
+            part["text"]
+            for item in conversation_store.list_items(fork_id).data
+            for part in item.data.content  # type: ignore[union-attr]
+        ]
+
+    fork = conversation_store.fork_conversation(source.id, before_item_id=second_prompt.id)
+    assert fork_texts(fork.id) == ["Q1", "A1"]
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+
+    first = conversation_store.fork_conversation(source.id, before_item_id=first_prompt.id)
+    assert fork_texts(first.id) == []
+    assert len(conversation_store.list_items(source.id).data) == 6
+
+    missing_item_id = "f" * 32
+    with pytest.raises(ValueError, match=missing_item_id):
+        conversation_store.fork_conversation(source.id, before_item_id=missing_item_id)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        conversation_store.fork_conversation(
+            source.id, up_to_response_id="resp_001", before_item_id=second_prompt.id
+        )
+
+    # ``copy_items=False`` copies nothing and, as a truncation, never resumes
+    # the source's native transcript; it takes no cutoff.
+    empty = conversation_store.fork_conversation(source.id, copy_items=False)
+    assert fork_texts(empty.id) == []
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in empty.labels
+    for cutoff in ({"before_item_id": second_prompt.id}, {"up_to_response_id": "resp_001"}):
+        with pytest.raises(ValueError, match="copy_items=False"):
+            conversation_store.fork_conversation(source.id, copy_items=False, **cutoff)
+
+
+def test_continuation_fork_and_host_teardown_serialize_on_the_host_row(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """A teardown racing a continuation's fork waits for it, then keeps the host.
+
+    The continuation copies its source's host while holding the host row lock
+    that host deletion takes. Deleting the source and its host while the
+    continuation's metadata is mid-insert must block on that lock and then see
+    the continuation, rather than tear the host down under it. (SQLite already
+    serializes the two writes; the row lock matters on Postgres and MySQL.)
+    """
+    from omnigent.db.utils import now_epoch
+
+    hosts = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="continued-sandbox",
+        user_id=RESERVED_USER_LOCAL,
+        token="launch-token",
+        provider="modal",
+        sandbox_id="sb-continued",
+        token_expires_at=now_epoch() + 3600,
+    )
+    source = conversation_store.create_conversation(host_id=host_id, workspace="/work")
+    torn_down: list[object] = []
+
+    def delete_source_and_host() -> None:
+        asyncio.run(conversation_store.delete_conversation(source.id))
+        torn_down.append(hosts.delete_host(host_id, keep_if_bound=True))
+
+    deleter = threading.Thread(target=delete_source_and_host)
+
+    def race_the_insert(_conn: object, _cursor: object, statement: str, *_args: object) -> None:
+        if (
+            deleter.is_alive()
+            or torn_down
+            or not statement.lstrip()
+            .upper()
+            .startswith("INSERT INTO OMNIGENT_CONVERSATION_METADATA")
+        ):
+            return
+        deleter.start()
+        # A teardown that skipped the host lock would finish in this window.
+        deleter.join(timeout=1.0)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", race_the_insert)
+    try:
+        fork = conversation_store.fork_conversation(
+            source.id, copy_items=False, continue_source=True
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", race_the_insert)
+    deleter.join(timeout=30)
+
+    assert not deleter.is_alive()
+    assert torn_down == [None]
+    assert hosts.get_host(host_id) is not None
+    continuation = conversation_store.get_conversation(fork.id)
+    assert continuation is not None
+    assert (continuation.host_id, continuation.workspace) == (host_id, "/work")
+
+
 def test_fork_clone_agent_is_session_scoped(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -7726,9 +7875,10 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
 
     ``updated_at`` drives sidebar ordering, so the tunnel replica's
     per-tunnel liveness stamps and per-transition status/pending writes
-    must not reorder the list. Round-trips all three columns:
+    must not reorder the list. Round-trips every live-state column:
     ``runner_last_seen`` (bulk by runner, cleared on disconnect),
-    ``live_status`` (enum round-trip), ``pending_elicitation_count``.
+    ``live_status`` (enum round-trip), ``pending_elicitation_count``,
+    ``background_work_running``, ``blocked_on``.
     """
     from omnigent.stores.conversation_store import runner_seen_is_fresh
 
@@ -7759,19 +7909,172 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     connectivity = conversation_store.get_session_connectivity([conv_a.id])
     assert connectivity[conv_a.id].runner_last_seen is None
 
-    # Status + pending count round-trip through the entity.
+    # Status, pending count and background flag round-trip through the entity.
+    assert before.background_work_running is None
     conversation_store.set_session_live_status(conv_a.id, "running")
     conversation_store.set_pending_elicitation_count(conv_a.id, 2)
+    conversation_store.set_background_work_running(conv_a.id, True)
     updated = conversation_store.get_conversation(conv_a.id)
     assert updated is not None
     assert updated.live_status == "running"
     assert updated.pending_elicitation_count == 2
+    assert updated.background_work_running is True
+    # A guarded clear for another runner leaves the flag; one for the bound runner clears it.
+    conversation_store.set_background_work_running(conv_a.id, False, runner_id="runner_other")
+    kept = conversation_store.get_conversation(conv_a.id)
+    assert kept is not None and kept.background_work_running is True
+    # The runner reconnected at 2,000: a clear for "unseen since 2,000" keeps its report.
+    conversation_store.touch_runner_liveness(["runner_live"], now=2_000)
+    conversation_store.set_background_work_running(
+        conv_a.id, False, runner_id="runner_live", unseen_since=2_000
+    )
+    kept = conversation_store.get_conversation(conv_a.id)
+    assert kept is not None and kept.background_work_running is True
+    conversation_store.set_background_work_running(
+        conv_a.id, False, runner_id="runner_live", unseen_since=2_001
+    )
+    conversation_store.set_blocked_on(conv_a.id, "permission prompt")
+    cleared = conversation_store.get_conversation(conv_a.id)
+    assert cleared is not None and cleared.background_work_running is False
+    assert cleared.blocked_on == "permission prompt"
+    conversation_store.set_blocked_on(conv_a.id, None)
+    unparked = conversation_store.get_conversation(conv_a.id)
+    assert unparked is not None and unparked.blocked_on is None
 
     # None of the live-state writes moved updated_at.
     assert updated.updated_at == before.updated_at
 
     # Empty runner list is a no-op (no query, no error).
     conversation_store.touch_runner_liveness([], now=1)
+
+
+def test_background_flag_keeps_the_newest_report_and_resets_with_the_runner(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    An older report never overwrites a newer one, and a runner change resets the flag.
+
+    Only the bound runner reports the flag, so a session moved to another runner
+    or unbound from one would otherwise keep the old runner's value forever.
+    """
+    conv = conversation_store.create_conversation(title="background")
+    assert conversation_store.set_runner_id(conv.id, "runner_a")
+
+    def flag() -> bool | None:
+        current = conversation_store.get_conversation(conv.id)
+        assert current is not None
+        return current.background_work_running
+
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_a", reported_at=2_000
+    )
+    conversation_store.set_background_work_running(
+        conv.id, False, runner_id="runner_a", reported_at=1_000
+    )
+    assert flag() is True
+    conversation_store.set_background_work_running(
+        conv.id, False, runner_id="runner_a", reported_at=3_000
+    )
+    assert flag() is False
+
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_a", reported_at=4_000
+    )
+    conversation_store.replace_runner_id(conv.id, "runner_b")
+    assert flag() is None
+    # The new runner's clock is not compared with the old one's.
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_b", reported_at=10
+    )
+    assert flag() is True
+
+    conversation_store.clear_runner_id(conv.id)
+    assert flag() is None
+
+    conversation_store.set_background_work_running(conv.id, True, reported_at=5_000)
+    assert conversation_store.set_runner_id(conv.id, "runner_c")
+    assert flag() is None
+
+
+def test_runner_change_resets_a_flag_stored_after_the_row_was_read(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A runner change resets a flag the old runner stored after the row was read.
+
+    Without a row lock, as on MySQL and PostgreSQL, the old runner's report can
+    commit between the store reading the session and writing the new runner.
+    """
+    from sqlalchemy.orm import object_session
+
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    conv = conversation_store.create_conversation(title="background")
+    assert conversation_store.set_runner_id(conv.id, "runner_a")
+    bind_runner = store_mod._bind_runner
+    table = SqlConversationMetadata.__table__
+
+    def report_lands_then_bind(meta: SqlConversationMetadata, runner_id: str | None) -> None:
+        # The old runner's report reaches the row, but not the copy already loaded.
+        session = object_session(meta)
+        assert session is not None
+        session.execute(
+            table.update()
+            .where(table.c.workspace_id == meta.workspace_id, table.c.id == meta.id)
+            .values(background_work_running=True, background_work_reported_at=4_000)
+        )
+        bind_runner(meta, runner_id)
+
+    monkeypatch.setattr(store_mod, "_bind_runner", report_lands_then_bind)
+    conversation_store.replace_runner_id(conv.id, "runner_b")
+    monkeypatch.setattr(store_mod, "_bind_runner", bind_runner)
+
+    moved = conversation_store.get_conversation(conv.id)
+    assert moved is not None and moved.background_work_running is None
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_b", reported_at=10
+    )
+    reported = conversation_store.get_conversation(conv.id)
+    assert reported is not None and reported.background_work_running is True
+
+
+def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    Moving a session to another host's runner, and moving it back, reset the flag.
+
+    Each runner's reports are compared only with its own, so the new runner's
+    first report is accepted whatever its time.
+    """
+    store = conversation_store
+    host_id = "c" * 32
+    _register_host(db_uri, host_id)
+    store.create_conversation(
+        runner_id="runner_b", host_id=host_id, workspace="/repo", git_branch="main"
+    )
+    target = store.create_conversation(runner_id="runner_a")
+    store.set_background_work_running(target.id, True, runner_id="runner_a", reported_at=4_000)
+    previous = store.get_conversation(target.id)
+    assert previous is not None
+
+    def flag() -> bool | None:
+        current = store.get_conversation(target.id)
+        assert current is not None
+        return current.background_work_running
+
+    store.reassign_runner_with_host(target.id, host_id, "runner_b", expected_runner_id="runner_a")
+    assert flag() is None
+    store.set_background_work_running(target.id, True, runner_id="runner_b", reported_at=10)
+    assert flag() is True
+
+    assert store.rollback_runner_reassignment(
+        previous, expected_runner_id="runner_b", expected_host_id=host_id
+    )
+    assert flag() is None
+    store.set_background_work_running(target.id, False, runner_id="runner_a", reported_at=1)
+    assert flag() is False
 
 
 def test_clear_runner_liveness_not_after_spares_a_newer_stamp(

@@ -158,6 +158,11 @@ import {
 } from "@/lib/newChatPickerCache";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { clearSessionDrafts } from "@/lib/sessionDrafts";
+import {
+  NEW_SESSION_HANDOFF_PARAM,
+  newSessionLocation,
+  peekNewSessionHandoff,
+} from "@/lib/newSessionHandoff";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 describe("ComposerAddMenu", () => {
@@ -1505,6 +1510,40 @@ describe("prompt URL handoff", () => {
     renderLanding({}, "/?prompt=Linked&task=Unrelated");
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked");
     expect(screen.getByTestId("landing-location")).toHaveTextContent("/?task=Unrelated");
+  });
+
+  it("fills in a handed-off message, then releases it", () => {
+    const notes = new File(["meeting notes"], "notes.txt", { type: "text/plain" });
+    const link = newSessionLocation("Linked", [notes]);
+    const token = new URLSearchParams(link.split("?")[1]).get(NEW_SESSION_HANDOFF_PARAM);
+    // Strict Mode runs the read twice; the files must still land once.
+    renderLanding({}, link, undefined, true);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked");
+    expect(screen.getAllByRole("button", { name: "Remove notes.txt" })).toHaveLength(1);
+    expect(screen.getByTestId("landing-location").textContent).toBe("/");
+    expect(peekNewSessionHandoff(token)).toBeNull();
+  });
+
+  it.each([
+    ["text only", "Copied text", [] as File[], []],
+    ["attachments only", "", [new File(["notes"], "notes.txt")], ["notes.txt"]],
+  ])("replaces a parked draft with a handed-off message (%s)", (_case, text, files, names) => {
+    const parked = renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Unrelated draft" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [new File(["data"], "draft.png", { type: "image/png" })] },
+    });
+    expect(screen.getByAltText("draft.png")).toBeTruthy();
+    parked.unmount();
+
+    renderLanding({}, newSessionLocation(text, files));
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(text);
+    expect(screen.queryByAltText("draft.png")).toBeNull();
+    for (const name of names) {
+      expect(screen.getByRole("button", { name: `Remove ${name}` })).toBeTruthy();
+    }
   });
 
   it("does not treat task as a prompt parameter", () => {
@@ -3225,7 +3264,11 @@ describe("Run on this machine (desktop host enrollment)", () => {
     await clickRunOnThisMachine();
 
     const chip = screen.getByTestId("new-chat-landing-host-chip");
-    await waitFor(() => expect(chip).toHaveAccessibleName("Host: Connecting…, Offline"));
+    await waitFor(() => expect(chip).toHaveAccessibleName("Host: Connecting…"));
+    expect(within(chip).getByTestId("new-chat-landing-host-status")).toHaveAttribute(
+      "data-status",
+      "offline",
+    );
     expect(chip.className).toContain("after:animate-pulse");
     expect(chip.className).toContain("after:content-['Connecting…']");
 
@@ -4345,7 +4388,7 @@ describe("NewChatLandingScreen", () => {
       "rounded-lg",
       "px-2",
       "py-0",
-      "text-[13px]",
+      "text-ui",
       "leading-5",
       "md:min-h-7",
     );
@@ -4363,7 +4406,7 @@ describe("NewChatLandingScreen", () => {
     expect(actions).toHaveClass("flex-nowrap");
     expect(leftControls).toHaveClass("min-w-0", "flex-none", "gap-1", "overflow-visible");
     expect(leftControls).not.toHaveClass("overflow-hidden", "shrink-0", "absolute");
-    expect(rightControls).toHaveClass("flex", "shrink-0", "items-center", "gap-1");
+    expect(rightControls).toHaveClass("flex", "shrink", "items-center", "gap-1");
     expect(rightControls).toHaveClass("ml-auto", "max-w-full");
     expect(rightControls).not.toHaveClass("flex-1");
     for (const control of [attach, hostChip, permission]) {
@@ -4841,7 +4884,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass(
       "min-w-0",
       "truncate",
-      "text-[13px]",
+      "text-ui",
       "leading-5",
       "font-medium",
       "text-foreground",
@@ -4883,7 +4926,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass(
       "shrink-0",
-      "text-[13px]",
+      "text-ui",
       "leading-5",
       "font-normal",
       "text-muted-foreground",
@@ -6652,6 +6695,12 @@ describe("NewChatLandingScreen", () => {
     // The chip reads the empty state…
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
     expect(hostChip).toHaveAccessibleName(expect.stringContaining("No host selected"));
+    expect(hostChip).not.toHaveAccessibleName(expect.stringContaining("Offline"));
+    expect(hostChip).toBeEnabled();
+    expect(within(hostChip).getByTestId("new-chat-landing-host-status")).toHaveAttribute(
+      "data-status",
+      "offline",
+    );
     expect(hostChip.querySelector(".bg-success")).toBeNull();
     expect(hostChip.querySelector(".lucide-laptop")).not.toBeNull();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });

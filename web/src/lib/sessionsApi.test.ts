@@ -223,6 +223,7 @@ describe("createSession", () => {
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
+      failedInputs: [],
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
@@ -372,11 +373,12 @@ describe("createSession", () => {
     expect(session.queuedItems).toEqual(queued);
   });
 
-  it("maps pending_inputs (snake) to pendingInputs (camel) with content", async () => {
+  it("maps pending_inputs and failed_inputs (snake) to camel with content", async () => {
     // The snapshot replays un-consumed native web messages here so the
     // store re-hydrates the optimistic bubble on rebind. Each entry's
     // pending_id becomes the bubble's stable key and the content is
-    // carried through verbatim for rendering.
+    // carried through verbatim for rendering. Undelivered startup
+    // messages share the shape.
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -387,12 +389,26 @@ describe("createSession", () => {
         pending_inputs: [
           { pending_id: "pending_1", content: [{ type: "input_text", text: "queued" }] },
         ],
+        failed_inputs: [
+          {
+            pending_id: "pending_2",
+            content: [{ type: "input_text", text: "lost" }],
+            created_by: "alice@example.com",
+          },
+        ],
       }),
     );
 
     const session = await createSession("agent_xyz");
     expect(session.pendingInputs).toEqual([
       { pendingId: "pending_1", content: [{ type: "input_text", text: "queued" }] },
+    ]);
+    expect(session.failedInputs).toEqual([
+      {
+        pendingId: "pending_2",
+        content: [{ type: "input_text", text: "lost" }],
+        createdBy: "alice@example.com",
+      },
     ]);
   });
 
@@ -1668,6 +1684,14 @@ describe("postEvent", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual(event);
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
+  });
+
+  it("reads the session a claude-sdk clear continued in", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, session_id: "conv_new" }));
+
+    const out = await postEvent("conv_abc", { type: "clear", data: {} });
+
+    expect(out.sessionId).toBe("conv_new");
   });
 
   it("surfaces 4xx as a thrown error (does not silently swallow)", async () => {

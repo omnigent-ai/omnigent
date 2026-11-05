@@ -165,16 +165,11 @@
   --text-xs--line-height: var(--text-sm--line-height);
 }
 
-/* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
- * ~#007AFF light, ~#0A84FF dark). Reserved for focus rings, charts,
- * unread state, and the active sidebar highlight; surfaces and primary
- * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
- * describes the older cobalt direction). */
 :root {
   /* User-controlled UI font size (see Appearance settings /
    * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
    * runtime on documentElement. It feeds typography tokens only. */
-  --desktop-ui-font-size: 13px;
+  --desktop-ui-font-size: 14px;
   --icon-size-default: 14px;
   --icon-container-default: 16px;
   --ui-shadow-neutral-rgb: 0 0 0;
@@ -398,7 +393,7 @@
   gap: 8px;
   border-radius: 8px;
   padding: 2px 6px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -407,7 +402,7 @@
   gap: 4px;
   border-radius: 8px;
   padding: 4px 12px 4px 8px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -443,7 +438,7 @@
   gap: 8px;
   border-radius: 8px;
   padding: 4px 12px 4px 8px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -1369,9 +1364,9 @@ html[data-electron-mac] .breadcrumb-folder {
 @media (width >= 48rem) {
   :root {
     /* The step factors below are Tailwind's rem ratios against a 16px base, so
-     * they need the preference on that scale. Multiplying the raw 13px shrinks
-     * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
-    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
+     * they need the preference on that scale. The default 14px body maps to
+     * the 16px title grid without resizing the fixed rem layout. */
+    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 14));
     /* Body and caption sizes use the raw preference; the anchor is only
      * for title ratios. Captions stay 1px below body text. */
     --text-sm: calc(var(--desktop-ui-font-size) - 1px);
@@ -1948,19 +1943,9 @@ html[data-electron-mac] .breadcrumb-folder {
   animation: shimmer-sweep var(--shimmer-duration, 2s) linear infinite;
 }
 
-/* Otto working indicator: gentle bob + periodic blink (see OttoIcon.tsx).
+/* Otto working indicator: periodic blink (see OttoIcon.tsx).
  * Opt-in via .otto-working so the mascot can also render static. The global
- * reduced-motion gate below freezes both animations. */
-@keyframes otto-bob {
-  0%,
-  100% {
-    transform: translateY(5%);
-  }
-  50% {
-    transform: translateY(-5%);
-  }
-}
-
+ * reduced-motion gate below freezes the blink. */
 @keyframes otto-blink {
   0%,
   88%,
@@ -1971,10 +1956,6 @@ html[data-electron-mac] .breadcrumb-folder {
   92% {
     transform: scaleY(0.1);
   }
-}
-
-.otto-working {
-  animation: otto-bob 1.6s ease-in-out infinite;
 }
 
 .otto-working .otto-eye {
