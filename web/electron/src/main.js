@@ -122,6 +122,10 @@ const {
   macApplicationMenu,
   settingsMenuItem,
 } = require("./settingsNavigation");
+const {
+  registerDesktopCommandStateReset,
+  sanitizeDesktopCommandState,
+} = require("./desktopCommands");
 const omnigentCli = require("./omnigent_cli");
 
 const serverManager = require("./server_manager");
@@ -1366,9 +1370,11 @@ function applyDockIcon() {
  *   double-counted), then sums across origins.
  * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
  *   Per-conversation embedded-browser view registry for this window.
- * @property {boolean} [closeTabSupported] True while the loaded SPA handles
- *   Close Tab (CmdOrCtrl+W) itself; cleared on every main-frame navigation so
- *   an older web bundle or the setup page gets the plain window close.
+ * @property {boolean} [unresponsive] True while the page is hung, so Close closes the
+ *   window instead of waiting on it.
+ * @property {import("./desktopCommands").DesktopCommandState | null} [desktopCommands]
+ *   Menu commands this window's SPA last reported it can act on (see
+ *   desktopCommands.js); absent until a supporting web bundle reports.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -2665,24 +2671,18 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
+  // A hung page can't act on Close, so ⌘W closes its window directly meanwhile.
   win.webContents.on("did-navigate", () => {
     const state = windows.get(win);
-    if (state) {
-      state.closeTabSupported = false;
-      state.closeTabUnresponsive = false;
-    }
-  });
-  win.webContents.on("render-process-gone", () => {
-    const state = windows.get(win);
-    if (state) state.closeTabSupported = false;
+    if (state) state.unresponsive = false;
   });
   win.webContents.on("unresponsive", () => {
     const state = windows.get(win);
-    if (state) state.closeTabUnresponsive = true;
+    if (state) state.unresponsive = true;
   });
   win.webContents.on("responsive", () => {
     const state = windows.get(win);
-    if (state) state.closeTabUnresponsive = false;
+    if (state) state.unresponsive = false;
   });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
@@ -2776,6 +2776,12 @@ function createWindow(targetUrl, opts = {}) {
 
   registerNavigationFallbacks(win);
   registerBrowserViewDetachOnNavigate(win);
+  registerDesktopCommandStateReset(win.webContents, () => {
+    const state = windows.get(win);
+    if (!state?.desktopCommands) return;
+    state.desktopCommands = null;
+    if (BrowserWindow.getFocusedWindow() === win) buildMenu();
+  });
 
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop
@@ -3630,6 +3636,12 @@ function buildMenu() {
   const quitItems = [
     { id: "quit", label: `Quit ${app.name}`, accelerator: "CmdOrCtrl+Q", click: () => app.quit() },
   ];
+  // Commands the focused window's SPA performs. Their items stay disabled
+  // until that SPA reports it can run them (see desktopCommands.js).
+  const commandWindow = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
+  const commandState = commandWindow ? windows.get(commandWindow)?.desktopCommands : null;
+  const canRun = (command) => commandState?.commands.has(command) === true;
+  const runCommand = (command) => sendDesktopCommand(desktopCommandTarget(command), command);
 
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const template = [];
@@ -3670,21 +3682,37 @@ function buildMenu() {
         click: () => createWindow(undefined, { ephemeral: true }),
       },
       { type: "separator" },
-      // Windows and Linux have no app menu, so Settings and Quit live here.
-      ...(!isMac ? [settingsItem, { type: "separator" }] : []),
-      // A menu accelerator fires even while an embedded Browser view has focus,
-      // so CmdOrCtrl+W reaches the SPA from anywhere in the window.
       {
-        id: "close_tab",
-        label: "Close Tab",
-        accelerator: "CmdOrCtrl+W",
-        click: () => closeTabOrWindow(BrowserWindow.getFocusedWindow()),
+        id: "new_terminal",
+        label: "New Terminal",
+        // Literal Control on every platform (⌃` on macOS), like most editors.
+        accelerator: "Ctrl+`",
+        enabled: canRun("new-terminal"),
+        click: () => runCommand("new-terminal"),
       },
       {
+        id: "new_browser_tab",
+        label: "New Browser Tab",
+        accelerator: "CmdOrCtrl+T",
+        enabled: canRun("new-browser-tab"),
+        click: () => runCommand("new-browser-tab"),
+      },
+      { type: "separator" },
+      // Windows and Linux have no app menu, so Settings and Quit live here.
+      ...(!isMac ? [settingsItem, { type: "separator" }] : []),
+      {
+        id: "close",
+        label: "Close",
+        accelerator: "CmdOrCtrl+W",
+        click: () => closeFocused(),
+      },
+      // `role: "close"` closes the focused window, including shell-owned ones
+      // such as About.
+      {
         id: "close_window",
+        role: "close",
         label: "Close Window",
         accelerator: "CmdOrCtrl+Shift+W",
-        click: () => BrowserWindow.getFocusedWindow()?.close(),
       },
       ...(!isMac ? [{ type: "separator" }, ...quitItems] : []),
     ],
@@ -3736,6 +3764,32 @@ function buildMenu() {
     ],
   });
   template.push({
+    label: "Session",
+    submenu: [
+      {
+        id: "toggle_pin_session",
+        label: commandState?.sessionPinned ? "Unpin Session" : "Pin Session",
+        accelerator: "CmdOrCtrl+Alt+P",
+        enabled: canRun("toggle-pin-session"),
+        click: () => runCommand("toggle-pin-session"),
+      },
+      {
+        id: "archive_session",
+        label: commandState?.sessionArchived ? "Unarchive Session" : "Archive Session",
+        accelerator: "CmdOrCtrl+Shift+A",
+        enabled: canRun("archive-session"),
+        click: () => runCommand("archive-session"),
+      },
+      {
+        id: "fork_session",
+        label: "Fork Session…",
+        accelerator: "CmdOrCtrl+Alt+F",
+        enabled: canRun("fork-session"),
+        click: () => runCommand("fork-session"),
+      },
+    ],
+  });
+  template.push({
     label: "Server",
     submenu: [
       {
@@ -3765,7 +3819,13 @@ function buildMenu() {
       },
     ],
   });
-  template.push({ role: "windowMenu" });
+  // Off macOS the standard Window role adds its own CmdOrCtrl+W Close, which
+  // would bypass File → Close's focus-aware routing.
+  template.push(
+    isMac
+      ? { role: "windowMenu" }
+      : { label: "Window", submenu: [{ role: "minimize" }, { role: "zoom" }] },
+  );
   if (!isMac) {
     template.push({
       label: "Help",
@@ -4644,25 +4704,6 @@ function registerIpc() {
     void loadSetupPage(win, params.toString());
   });
 
-  // SPA → it handles Close Tab itself (see closeTabOrWindow).
-  ipcMain.on("omnigent:set-close-tab-supported", (event, supported) => {
-    if (!isPinnedOriginSender(event)) {
-      console.warn("[omnigent] set-close-tab-supported from untrusted sender dropped");
-      return;
-    }
-    // isPinnedOriginSender guarantees the sender window is tracked.
-    windows.get(BrowserWindow.fromWebContents(event.sender)).closeTabSupported = supported === true;
-  });
-
-  // SPA → Close Tab found nothing to close, so close the sending window.
-  ipcMain.on("omnigent:close-window", (event) => {
-    if (!isPinnedOriginSender(event)) {
-      console.warn("[omnigent] close-window from untrusted sender dropped");
-      return;
-    }
-    BrowserWindow.fromWebContents(event.sender)?.close();
-  });
-
   // Find bar → run/continue a search in its parent window. Empty text
   // clears the highlight and zeroes the counter (findInPage rejects empty
   // queries, so it never reaches it).
@@ -4694,6 +4735,22 @@ function registerIpc() {
     }
     const bar = BrowserWindow.fromWebContents(event.sender);
     if (bar && !bar.isDestroyed()) bar.close();
+  });
+
+  // Which native menu commands the SPA can act on right now, plus the open
+  // session's pin/archive state for the Session menu labels.
+  ipcMain.on("omnigent:set-desktop-command-state", (event, state) => {
+    if (!isPinnedOriginSender(event)) return;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    windows.get(win).desktopCommands = sanitizeDesktopCommandState(state);
+    if (BrowserWindow.getFocusedWindow() === win) buildMenu();
+  });
+
+  // Close (⌘W) on the new-session page, once the page's own dialog confirmed it.
+  ipcMain.handle("omnigent:close-window", (event) => {
+    if (!isPinnedOriginSender(event)) return false;
+    BrowserWindow.fromWebContents(event.sender)?.close();
+    return true;
   });
 
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the
@@ -5464,25 +5521,68 @@ function focusAndRestore(win) {
 }
 
 /**
- * Close Tab: let a capable SPA close its selected tab (or leave the session),
- * otherwise close the focused window like the standard Close role. Windows the
- * shell doesn't track (find bar, About) and pages that never advertised
- * support always close.
+ * The focused connected window, when its SPA reported it can run `command`.
  *
- * @param {BrowserWindow | null | undefined} win
+ * @param {string} command
+ * @returns {BrowserWindow | null}
  */
-function closeTabOrWindow(win) {
+function desktopCommandTarget(command) {
+  const target = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
+  return target && windows.get(target)?.desktopCommands?.commands.has(command) ? target : null;
+}
+
+/**
+ * Hand a native menu command to a window's SPA (see desktopCommands.js).
+ *
+ * @param {BrowserWindow | null} win
+ * @param {string} command
+ * @param {{ browserViewId?: string | null }} [extra]
+ */
+function sendDesktopCommand(win, command, extra = {}) {
   if (!win || win.isDestroyed()) return;
-  const state = windows.get(win);
-  if (state?.closeTabSupported && !state.closeTabUnresponsive && state.origin) {
-    try {
-      win.webContents.send("omnigent:close-tab");
-      return;
-    } catch {
-      // Renderer torn down between the check and the send; close instead.
-    }
+  try {
+    win.webContents.send("omnigent:desktop-command", { command, ...extra });
+  } catch {
+    // Window torn down between the check and the send; ignore.
   }
-  win.close();
+}
+
+/**
+ * The embedded browser view (by view ID) holding keyboard focus in `win`, or
+ * null. Only the attached view can hold focus, so checking it is enough.
+ *
+ * @param {BrowserWindow} win
+ * @returns {string | null}
+ */
+function focusedBrowserViewId(win) {
+  const registry = windows.get(win)?.browserRegistry;
+  const viewId = registry?.activeConversationId() ?? null;
+  if (viewId === null) return null;
+  try {
+    return registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Close (⌘W / Ctrl+W). A connected SPA closes whatever has focus: a workspace
+ * tab, the open session, or the window itself after a confirmation. Shell-owned
+ * windows (About, the find bar) and pages without that support close the window.
+ */
+function closeFocused() {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (!focused || focused.isDestroyed()) return;
+  const target = desktopCommandTarget("close");
+  if (target && !windows.get(target)?.unresponsive) {
+    sendDesktopCommand(target, "close", {
+      browserViewId: focusedBrowserViewId(target),
+      // Off macOS, closing the last window quits; the page's confirmation says so.
+      closingQuits: process.platform !== "darwin" && windows.size === 1,
+    });
+    return;
+  }
+  focused.close();
 }
 
 /**
@@ -5798,7 +5898,9 @@ if (!gotLock) {
       createWindow();
     }
     updater.init();
-    app.on("browser-window-focus", () => updateSignOutMenuItem());
+    // The menu reflects the focused window: Sign Out of Server, and the
+    // commands (and Pin/Archive labels) its SPA reported.
+    app.on("browser-window-focus", () => buildMenu());
 
     app.on("activate", () => {
       // macOS: re-create the window when the dock icon is clicked and none

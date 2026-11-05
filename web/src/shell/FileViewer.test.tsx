@@ -268,7 +268,6 @@ interface RenderProps {
   /** Spy for the close affordance; defaults to a throwaway mock. */
   onClose?: () => void;
   onCloseTab?: () => void;
-  closeTabRef?: { current: (() => void) | null };
   /** Sort order for the prev/next navigation; defaults to the component default. */
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
@@ -295,7 +294,6 @@ function viewerTree({
   initialSearch = "",
   onClose = vi.fn(),
   onCloseTab,
-  closeTabRef,
   sort,
   onNavigateTo,
 }: RenderProps = {}) {
@@ -317,7 +315,6 @@ function viewerTree({
           path={path}
           onClose={onClose}
           onCloseTab={onCloseTab}
-          closeTabRef={closeTabRef}
           sort={sort}
           onNavigateTo={onNavigateTo}
         />
@@ -2668,6 +2665,50 @@ describe("file position navigation", () => {
     expect(unregister).toHaveBeenCalled();
   });
 
+  it("asks before a closing tab or a session exit drops unsaved edits", () => {
+    let guard: FileNavigationGuard | undefined;
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      return () => {};
+    });
+    function GuardedViewer() {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, path: "file1.md" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    render(<GuardedViewer />);
+    const close = vi.fn();
+    // A clean editor lets the tab close straight away.
+    act(() => guard!(null, undefined, close));
+    expect(close).toHaveBeenCalledTimes(1);
+
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    act(() => guard!(null, undefined, close));
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(draft).toHaveValue("Unsaved draft");
+
+    act(() => guard!(null, undefined, close));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
   it.each([false, true])(
     "keeps unsaved Markdown edits when a line navigation is cancelled (diff preference=%s)",
     (diffActive) => {
@@ -2781,39 +2822,4 @@ it("keeps grid file viewers independent of shared URL parameters and copies a se
   expect(copied.pathname).toBe("/c/conv_1");
   expect(copied.searchParams.get("file")).toBe("file1.py");
   expect(copied.searchParams.has("comment")).toBe(false);
-});
-
-describe("FileViewer Close Tab", () => {
-  beforeEach(() => {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
-  });
-
-  it("retains an unsaved buffer when closing is cancelled, and closes only after confirmation", () => {
-    const closeTabRef: { current: (() => void) | null } = { current: null };
-    const onCloseTab = vi.fn();
-    const { unmount } = renderViewer({ open: true, path: "file1.md", closeTabRef, onCloseTab });
-    const draft = screen.getByRole("textbox", { name: "Draft text" });
-    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
-    act(() => closeTabRef.current?.());
-    expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
-    expect(onCloseTab).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
-    expect(onCloseTab).not.toHaveBeenCalled();
-    expect(draft).toHaveValue("Unsaved draft");
-
-    act(() => closeTabRef.current?.());
-    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
-    expect(onCloseTab).toHaveBeenCalledOnce();
-    unmount();
-    expect(closeTabRef.current).toBeNull();
-  });
-
-  it("closes a clean file without confirmation", () => {
-    const closeTabRef: { current: (() => void) | null } = { current: null };
-    const onCloseTab = vi.fn();
-    renderViewer({ open: true, closeTabRef, onCloseTab });
-    act(() => closeTabRef.current?.());
-    expect(onCloseTab).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
 });

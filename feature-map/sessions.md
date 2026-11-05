@@ -299,6 +299,12 @@ The header controls sit 16px from the top and sides.
 The mobile header omits the session title and fading backdrop,
 retaining a Back link for child sessions.
 
+**Desktop Session menu:** in the desktop app, Session → Pin (⌥⌘P), Archive
+(⇧⌘A) and Fork Session… (⌥⌘F) act on the open session (Ctrl+Alt+P,
+Ctrl+Shift+A and Ctrl+Alt+F on Windows/Linux). They are enabled only while the
+session's header menu offers the action, and the open session's sidebar row
+shows the same chords on its pin button and in its row menu.
+
 **Rename shortcut:** in an owner-managed top-level session on desktop, press
 Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
 With the sidebar open, the session's sidebar row becomes the same inline rename
@@ -1106,7 +1112,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
   orders them, then expand the folder and click Show more.
 
-For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
+For the desktop Close shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
 siblings stay open. If stopping the side chat fails, its tab, draft and queued
 messages must remain. Narrow the desktop window below 768 pixels and repeat:
