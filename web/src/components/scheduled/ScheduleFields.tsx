@@ -1,5 +1,5 @@
-import { ScheduleSelect as Select } from "./ScheduleSelect";
 // Inline recurrence controls share validation with the automation's ending settings.
+import { ScheduleSelect as Select } from "./ScheduleSelect";
 import { pickerTriggerClass } from "./pickerStyles";
 import { useId, useMemo, useState, type ReactNode } from "react";
 import { CheckIcon, ChevronDownIcon } from "lucide-react";
@@ -19,6 +19,7 @@ import { useScheduleEscape } from "./useScheduleEscape";
 import { cn } from "@/lib/utils";
 import { commonTimezones, dateInTimezone, endOfDayInTimezone } from "@/lib/timezones";
 import {
+  DEFAULT_SCHEDULE_MODEL,
   MAX_MINUTE_INTERVAL,
   minimumScheduleInterval,
   MIN_SUBHOUR_MINUTE_INTERVAL,
@@ -104,10 +105,11 @@ export function ScheduleFields({
   children?: (fields: { recurrenceFields: ReactNode; endingFields: ReactNode }) => ReactNode;
 }) {
   const errorId = useId();
+  const endingErrorId = useId();
   const minuteSchedulesSupported =
     minimumScheduleInterval("minutely", sessionMode, subhourSupported, executionTarget) ===
     MIN_SUBHOUR_MINUTE_INTERVAL;
-  // Minute recurrences can be edited through either Interval or Custom.
+  // Both editors save the same minute recurrence; saved rules reopen as Interval.
   const [customMinutes, setCustomMinutes] = useState(false);
   const [timezoneOpen, setTimezoneOpen] = useState(false);
   const zones = useMemo(() => commonTimezones(timezone), [timezone]);
@@ -123,20 +125,22 @@ export function ScheduleFields({
     dateInput.timezone === timezone
       ? dateInput
       : null;
-  const error =
+  const error = validateSchedule(
+    { ...model, end: undefined },
+    { sessionMode, subhourSupported, executionTarget },
+  );
+  const endingError =
     activeDateInput?.error ??
-    validateSchedule(model, { allowPastEnd, sessionMode, subhourSupported, executionTarget });
+    validateSchedule({ ...DEFAULT_SCHEDULE_MODEL, end: model.end }, { allowPastEnd });
   const until = model.end?.type === "until" ? parseUntil(model.end.until) : null;
   const minutely = model.preset === "custom" && model.customFreq === "minutely";
   const custom = model.preset === "custom" && (!minutely || customMinutes);
   const hourly = model.preset === "hourly" || (custom && model.customFreq === "hourly");
   const weekly = model.preset === "weekly" || (custom && model.customFreq === "weekly");
   const monthDays = custom && (model.customFreq === "monthly" || model.customFreq === "yearly");
-  const selectedFrequency = recurrenceUnsupported
-    ? ""
-    : minutely && !custom
-      ? "interval"
-      : model.preset;
+  let selectedFrequency: string = model.preset;
+  if (minutely && !custom) selectedFrequency = "interval";
+  if (recurrenceUnsupported) selectedFrequency = "";
 
   function changePreset(value: string) {
     setCustomMinutes(value === "custom");
@@ -505,6 +509,8 @@ export function ScheduleFields({
             <Input
               type="date"
               aria-label="End date"
+              aria-invalid={endingError ? true : undefined}
+              aria-describedby={endingError ? endingErrorId : undefined}
               className="w-auto"
               value={activeDateInput?.value ?? (until ? dateInTimezone(until, timezone) : "")}
               onChange={(event) => changeEndDate(event.target.value, timezone)}
@@ -517,6 +523,8 @@ export function ScheduleFields({
             <Input
               type="number"
               aria-label="Occurrences"
+              aria-invalid={endingError ? true : undefined}
+              aria-describedby={endingError ? endingErrorId : undefined}
               disabled={!anchoredScheduling}
               min={2}
               max={2147483647}
@@ -540,6 +548,16 @@ export function ScheduleFields({
       {model.end?.type === "count" && (
         <p className="text-sm text-muted-foreground">
           Counts scheduled occurrences since creation.
+        </p>
+      )}
+      {endingError && (
+        <p
+          id={endingErrorId}
+          className="text-sm text-destructive"
+          role="alert"
+          data-testid="schedule-ending-error"
+        >
+          {endingError}
         </p>
       )}
     </div>

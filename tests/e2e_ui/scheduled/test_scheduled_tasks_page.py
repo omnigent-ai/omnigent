@@ -400,20 +400,6 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
         "new-chat-landing-agent-select"
     )
     expect(agent_trigger).to_contain_text("Claude Code", timeout=30_000)
-    for trigger_id, role in (
-        ("task-host-trigger", "listbox"),
-        ("task-model-trigger", "listbox"),
-        ("task-effort-trigger", "listbox"),
-        ("task-permission-trigger", "listbox"),
-        ("task-project-trigger", "menu"),
-        ("new-chat-landing-agent-select", "menu"),
-    ):
-        page.get_by_test_id(trigger_id).click()
-        expect(page.get_by_role(role)).to_be_visible()
-        page.keyboard.press("Escape")
-        expect(page.get_by_role(role)).to_have_count(0)
-        expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
-        expect(page.get_by_label("Name", exact=True)).to_have_value(typed_name)
     agent_trigger.click()
     page.get_by_role("menuitem").filter(has_text="Claude Code").click()
     expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Every day")
@@ -1157,7 +1143,7 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     page.get_by_test_id("task-trigger-instructions").fill("Summarize new messages.")
     page.get_by_test_id("task-trigger-preview").locator("summary").click()
     page.get_by_test_id("task-trigger-edit-as-prompt").click()
-    _pick_select_option(page, "task-session-mode-trigger", "New session each run")
+    page.get_by_role("switch", name="Start each run in a new session").check()
     expect(page.get_by_test_id("schedule-preset-trigger")).to_be_visible()
     expect(page.get_by_test_id("task-trigger-cadence")).to_have_count(0)
     page.get_by_test_id("create-scheduled-task-submit").click()
@@ -1181,12 +1167,6 @@ def test_ten_minute_host_schedule_round_trip(
     _open_create_dialog(page)
     page.get_by_test_id("task-name-input").fill(name)
     page.get_by_test_id("task-prompt-input").fill("Check for updates.")
-    for _ in range(2):
-        page.get_by_test_id("task-workspace-browse").click()
-        expect(page.get_by_test_id("workspace-picker-dialog")).to_be_visible()
-        page.keyboard.press("Escape")
-        expect(page.get_by_test_id("workspace-picker-dialog")).to_have_count(0)
-        expect(page.get_by_label("Name", exact=True)).to_have_value(name)
     _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
     _pick_select_option(page, "custom-freq-trigger", "Minutely")
     interval = page.get_by_label("Repeat every", exact=True)

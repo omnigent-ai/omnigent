@@ -99,12 +99,12 @@ function renderPicker(props: {
   host?: Host;
   onPrefetchEntries?: (ids: string[]) => void;
 }) {
-  return render(
+  const picker = (open = props.open) => (
     <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
       <StoryQueryRouter>
         <TooltipProvider>
           <AgentHarnessPicker
-            open={props.open}
+            open={open}
             onOpenChange={props.onOpenChange}
             agentEntries={props.agentEntries ?? []}
             harnessEntries={props.harnessEntries}
@@ -125,8 +125,10 @@ function renderPicker(props: {
           />
         </TooltipProvider>
       </StoryQueryRouter>
-    </CapabilitiesProvider>,
+    </CapabilitiesProvider>
   );
+  const view = render(picker());
+  return { ...view, rerenderOpen: (open: boolean) => view.rerender(picker(open)) };
 }
 
 async function openPicker(): Promise<void> {
@@ -149,10 +151,14 @@ afterEach(() => {
 describe("AgentHarnessPicker inline harness list", () => {
   it("lets a parent control visibility while reporting close requests", async () => {
     const onOpenChange = vi.fn();
-    renderPicker({ harnessEntries: [claude], open: true, onOpenChange });
+    const view = renderPicker({ harnessEntries: [claude], open: true, onOpenChange });
     expect(screen.getByRole("menu")).toBeVisible();
     await userEvent.click(screen.getByTestId(`new-chat-landing-agent-${claude.id}`));
     expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(screen.getByRole("menu")).toBeVisible();
+    view.rerenderOpen(false);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    view.rerenderOpen(true);
     expect(screen.getByRole("menu")).toBeVisible();
   });
 

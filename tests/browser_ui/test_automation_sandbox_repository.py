@@ -15,7 +15,7 @@ def test_automation_sandbox_repository(
     page: Page, browser_contract: BrowserContract, width: int
 ) -> None:
     page.set_viewport_size({"width": width, "height": 900})
-    with contextmanager(chat_session_handle)(page, browser_contract):
+    with contextmanager(chat_session_handle)(page, browser_contract) as chat:
         contract = browser_contract
         catalog = [
             {"name": name, "url": f"https://github.com/example/{name}"}
@@ -29,6 +29,7 @@ def test_automation_sandbox_repository(
                 "managed_sandboxes_enabled": True,
                 "scheduled_task_sandbox_workspaces": True,
                 "scheduled_task_session_modes": True,
+                "scheduled_task_projects": True,
                 "scheduled_task_subhour": True,
                 "sandbox_provider": "arclet",
                 "sandbox_provider_capabilities": {"arclet": {"repo_catalog": catalog}},
@@ -55,6 +56,12 @@ def test_automation_sandbox_repository(
                     }
                     for harness in ("claude", "codex", "pi", "cursor", "opencode")
                 ]
+            ),
+        )
+        contract.json(
+            "/v1/projects",
+            list_payload(
+                [{"id": "automation-project", "name": "Omnigent Automation", "icon": None}]
             ),
         )
         tasks: list[dict[str, Any]] = []
@@ -115,11 +122,6 @@ def test_automation_sandbox_repository(
         expect(page.get_by_label("Repeat every", exact=True)).to_have_value("60")
         expect(page.get_by_role("button", name="Apply", exact=True)).to_have_count(0)
         session_mode.uncheck()
-        frequency.click()
-        page.get_by_role("option", name="Every day", exact=True).click()
-        frequency.click()
-        page.get_by_role("option", name="Interval", exact=True).click()
-        expect(page.get_by_label("Repeat every", exact=True)).to_have_value("60")
         page.get_by_label("Repeat every", exact=True).fill("10")
         expect(frequency).to_have_text("Interval")
         expect(page.get_by_test_id("custom-schedule-trigger")).to_have_count(0)
@@ -181,6 +183,31 @@ def test_automation_sandbox_repository(
         page.get_by_role("menuitem", name="Edit", exact=True).click()
         page.get_by_role("button", name="Advanced", exact=True).click()
         expect(repository).to_have_text("Provider default")
+        # Portal dismissal needs a browser, without a live scheduler or host process.
+        page.get_by_label("Run on", exact=True).click()
+        page.get_by_role("option", name="Browser host", exact=True).click()
+        for trigger_id, role in (
+            ("task-host-trigger", "listbox"),
+            ("task-model-trigger", "listbox"),
+            ("task-effort-trigger", "listbox"),
+            ("task-permission-trigger", "listbox"),
+            ("task-project-trigger", "menu"),
+            ("new-chat-landing-agent-select", "menu"),
+        ):
+            page.get_by_test_id(trigger_id).click()
+            expect(page.get_by_role(role)).to_be_visible()
+            page.keyboard.press("Escape")
+            expect(page.get_by_role(role)).to_have_count(0)
+            expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
+            expect(page.get_by_label("Name", exact=True)).to_have_value("Repository maintenance")
+        contract.json(f"/v1/hosts/{chat.host_id}/filesystem", list_payload([]))
+        for _ in range(2):
+            page.get_by_test_id("task-workspace-browse").click()
+            expect(page.get_by_test_id("workspace-picker-dialog")).to_be_visible()
+            page.keyboard.press("Escape")
+            expect(page.get_by_test_id("workspace-picker-dialog")).to_have_count(0)
+            expect(page.get_by_label("Name", exact=True)).to_have_value("Repository maintenance")
+        page.get_by_role("button", name="Cancel", exact=True).click()
 
 
 @pytest.mark.parametrize("prompt_kind", ["scheduled", "trigger", "custom-trigger"])
@@ -286,6 +313,10 @@ def test_reused_automation_settings(
         if prompt_kind == "trigger":
             worker_agent = page.get_by_test_id("task-worker-agent-trigger")
             expect(worker_agent).to_contain_text("Codex")
+            worker_agent.click()
+            page.keyboard.press("Escape")
+            expect(page.get_by_role("listbox")).to_have_count(0)
+            expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
             worker_agent.click()
             page.get_by_role("option", name="Claude Code", exact=True).click()
             page.get_by_test_id("task-model-trigger").click()

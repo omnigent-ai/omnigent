@@ -256,6 +256,13 @@ export function CreateScheduledTaskDialog({
     changeProjectMenuOpen(false);
     return true;
   });
+  function resetMenus() {
+    setWorkspaceBrowserOpen(false);
+    setProjectMenuOpen(false);
+    setAgentMenuOpen(false);
+    selectOpenCountRef.current = 0;
+    selectClosedAtRef.current = 0;
+  }
   /** preventDefault the Dialog's outside-dismiss ONLY for the narrow nested-Select
    * cases — a click inside portalled dropdown content (path a) or while a dropdown
    * is open (path b),
@@ -349,6 +356,7 @@ export function CreateScheduledTaskDialog({
   const wasOpen = useRef(false);
   useEffect(() => {
     if (open && !wasOpen.current) {
+      resetMenus();
       setAdvancedOpen(false);
       setSystemPromptOpen(false);
       setEditingSystemPrompt(false);
@@ -593,7 +601,7 @@ export function CreateScheduledTaskDialog({
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
   const pollingBlockedReason =
     editingWorkerSettings && reusesExistingSession ? null : harnessSettings.blockedReason;
-  // Only errors in hidden controls should expand Advanced while editing.
+  // Expand Advanced when a collapsed field has an error.
   const endingInvalid =
     validateSchedule({ ...DEFAULT_SCHEDULE_MODEL, end: schedule.end }, { allowPastEnd }) !== null ||
     (!anchoredScheduling && schedule.end?.type === "count");
@@ -641,9 +649,7 @@ export function CreateScheduledTaskDialog({
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
-    setWorkspaceBrowserOpen(false);
-    setProjectMenuOpen(false);
-    setAgentMenuOpen(false);
+    resetMenus();
     setSandboxMode(false);
     setProjectChoice(null);
     setPickedProjectId(null);
@@ -1038,6 +1044,14 @@ export function CreateScheduledTaskDialog({
                     </Button>
                   </div>
                 )}
+                {!isEdit &&
+                  !curationPending &&
+                  agents !== undefined &&
+                  effectiveAgentId === null && (
+                    <p role="alert" className="text-sm text-destructive">
+                      No agents are available for this automation.
+                    </p>
+                  )}
                 {!triggerMode && scheduleUnsupported && (
                   <p className="text-sm text-destructive" role="alert">
                     This schedule can&apos;t be edited in this form yet. Choose a frequency to
@@ -1113,16 +1127,20 @@ export function CreateScheduledTaskDialog({
                               pickerTriggerClass,
                             )}
                             disabled={workspaceHostOffline}
-                            aria-describedby="task-workspace-help"
+                            aria-describedby={
+                              workspaceHostOffline ? "task-workspace-help" : undefined
+                            }
                             onClick={() => setWorkspaceBrowserOpen(true)}
                             data-testid="task-workspace-browse"
                           >
                             <FolderOpenIcon className="size-4 text-muted-foreground" />
                             <span className="truncate">{workspace || "Browse folders…"}</span>
                           </Button>
-                          <p id="task-workspace-help" className="text-sm text-muted-foreground">
-                            {workspaceHostOffline ? "Connect your host to select a workspace." : ""}
-                          </p>
+                          {workspaceHostOffline && (
+                            <p id="task-workspace-help" className="text-sm text-muted-foreground">
+                              Connect your host to select a workspace.
+                            </p>
+                          )}
                           <WorkspacePickerDialog
                             open={workspaceBrowserOpen && !workspaceHostOffline}
                             onOpenChange={setWorkspaceBrowserOpen}
@@ -1139,7 +1157,7 @@ export function CreateScheduledTaskDialog({
                                 {workspace}
                               </p>
                               {worktreesSupported && !isGitWorkspace && baseBranch !== null && (
-                                <div className="mt-2 text-sm text-muted-foreground">
+                                <div className="col-span-2 mt-2 text-sm text-muted-foreground">
                                   <p>Random worktree is enabled. {worktreeStatus}</p>
                                   <Button
                                     type="button"
@@ -1152,7 +1170,7 @@ export function CreateScheduledTaskDialog({
                               )}
                               {worktreesSupported && isGitWorkspace && (
                                 <>
-                                  <div className="mt-2 flex items-center gap-2">
+                                  <div className="col-span-2 mt-2 flex items-center gap-2">
                                     <Checkbox
                                       id="task-random-worktree"
                                       checked={baseBranch !== null}

@@ -27,10 +27,10 @@ to customize.
   worker instructions when their text changes. Saving preserves both parts;
   reopening collapses and locks the system prompt again. Edit as prompt during creation uses the same
   separation. Unrecognized or ambiguous prompt formats remain fully editable
-  as a single Prompt field. For a recognized trigger creation call, **Harness for matching sessions**, Model,
+  as a single Instructions field in the modal (Prompt on the detail page). For a recognized trigger creation call, **Harness for matching sessions**, Model,
   and Effort update future worker instructions without rebinding the polling session.
   Existing worker sessions retain their settings. Customized or ambiguous creation calls
-  keep **Edit worker instructions**, which opens System prompt or the full Prompt. Clicking it again refocuses an already-open editor. Edits that remove the template signature or add
+  keep **Edit worker instructions**, which opens System prompt or the full Instructions field in the modal. Clicking it again refocuses an already-open editor. Edits that remove the template signature or add
   ambiguous section headings show a notice before saving as a single prompt.
   Your prompt must contain text; clearing it shows a required-field message.
   Explicitly clearing only the posting-rule body in System prompt is supported
