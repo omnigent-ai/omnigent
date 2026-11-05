@@ -159,13 +159,14 @@ def test_mobile_kebab_lists_file_surfaces_and_omits_absent_ones(
 
     A plain ``hello_world`` session has a workspace (os_env), no child
     agents, and is not claude-native — so the menu must list Files and
-    Changes (the two files surfaces — folder tree and changed-files list)
-    and Agents (unconditional — the panel lists at least the main
-    agent, badge "1"), and must NOT list Shells or Tasks. The session's
-    only terminal is the auto-created embedded Omnigent REPL, which is
-    plumbing for the Chat/Terminal pill, not inventory — listing it
-    read as a phantom "main" terminal on agents that don't run a TUI,
-    so ``inventoryTerminals`` excludes it from the kebab/rail.
+    Changes (the two files surfaces — folder tree and changed-files list),
+    Agents (unconditional — the panel lists at least the main agent, badge
+    "1") and Shells (the agent declares no ``terminals:``, so it offers the
+    default shell), and must NOT list Tasks. The session's only terminal is
+    the auto-created embedded Omnigent REPL, which is plumbing for the
+    Chat/Terminal pill, not inventory — listing it read as a phantom "main"
+    terminal on agents that don't run a TUI, so ``inventoryTerminals``
+    excludes it from the Shells drawer.
     """
     base_url, session_id = seeded_session
     page.set_viewport_size(_MOBILE_VIEWPORT)
@@ -180,12 +181,15 @@ def test_mobile_kebab_lists_file_surfaces_and_omits_absent_ones(
     # Agents is always present; "1" = just the main agent. "0" means
     # the main agent was dropped from the count.
     expect(page.get_by_role("menuitem", name=re.compile(r"Agents\s*1"))).to_be_visible()
-    # No Shells entry: the embedded REPL terminal is excluded from
-    # the inventory (reachable via the Chat/Terminal pill instead). An
-    # entry here means the REPL leaked back into the kebab gating.
-    expect(page.get_by_role("menuitem", name="Shells")).to_have_count(0)
     # No todos on a plain hello_world session.
     expect(page.get_by_role("menuitem", name="Tasks")).to_have_count(0)
+    # The drawer offers only the create row: a "main" row means the embedded
+    # REPL leaked into the shell inventory.
+    page.get_by_role("menuitem", name="Shells", exact=True).click()
+    drawer = page.get_by_test_id("shells-panel-drawer")
+    expect(drawer).to_have_attribute("data-state", "open")
+    expect(drawer.get_by_role("button", name="New shell")).to_be_visible()
+    expect(drawer.get_by_role("button", name=re.compile(r"\bmain\b"))).to_have_count(0)
 
 
 def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(

@@ -2,13 +2,10 @@
 // (InlineTerminalsSection, TerminalsPanel, and MainTerminalView's
 // strip on native-wrapper sessions).
 //
-// Gated on the agent's terminal access: the button renders ONLY when
-// the session agent's spec declares a non-empty `terminals:` block
-// (read via `useSessionAgent().terminals` — the same gate the server
-// enforces on POST /resources/terminals and that controls the agent's
-// own sys_terminal_* tool surface). An agent without terminal access
-// never sees the button, and a user-created terminal is always one
-// the agent can list/read/close.
+// Gated on the terminals the server offers this session's user
+// (`useSessionAgent().terminals`: declared `terminals:`, or the server's
+// default shell when the agent declares none — the same set the server
+// enforces on POST /resources/terminals). Renders ONLY when non-empty.
 //
 // Behavior by declared-terminal shape:
 //   - One declared name → creates it directly on click.
@@ -64,7 +61,7 @@ export function NewTerminalButton({
   // shell picker — see the file header.
   const isNativeWrapper = useTerminalFirst()?.isNativeWrapper ?? false;
   const declared = agent?.terminals ?? [];
-  // The iff gate, UI side: no declared terminals → no affordance.
+  // No offered terminals → no affordance; the server decides the set.
   if (declared.length === 0) return null;
 
   const launch = (name: string) => {

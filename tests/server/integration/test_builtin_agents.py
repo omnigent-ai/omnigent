@@ -216,6 +216,30 @@ async def test_list_builtin_agents_exposes_declared_terminals_from_spec(
     assert entry["terminals"] == ["shell", "py"]
 
 
+async def test_list_builtin_agents_offers_default_shell_when_spec_declares_none(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """``GET /v1/agents`` reports the default user shell for an agent
+    without ``terminals:``, matching what ``GET /sessions/{id}/agent``
+    reports for its sessions."""
+    bundle = build_agent_bundle(name="plain-agent")
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="6f0c2b7d7a9e4c1e8b3f5a2d1c0e9f88",
+        name="plain-agent",
+        bundle=bundle,
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["id"] == "6f0c2b7d7a9e4c1e8b3f5a2d1c0e9f88")
+    assert entry["terminals"] == ["bash"]
+
+
 async def test_list_builtin_agents_exposes_bundled_skills_from_spec(
     agent_store: SqlAlchemyAgentStore,
     artifact_store: LocalArtifactStore,
