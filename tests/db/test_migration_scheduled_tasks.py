@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from uuid import uuid4
@@ -37,8 +36,6 @@ _DISPATCH_REVISION = "c8e4f2a6b901"
 _COMPLETED_STATE_REVISION = "9e82957bd115"
 _SESSION_MODE_PREVIOUS = "b2e4f6a8c013"
 _SESSION_MODE_REVISION = "d0a1f879a01d"
-_RUN_OUTCOME_REVISION = "e7c3a1b9d240"
-_RUN_OUTCOME_COLUMNS = {"outcome_success", "outcome_payload", "outcome_recorded_at"}
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -146,15 +143,7 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         "trigger_key",
         "host_id",
         "lease_expires_at",
-        "outcome_success",
-        "outcome_payload",
-        "outcome_recorded_at",
     }
-    for name in _RUN_OUTCOME_COLUMNS:
-        assert columns[name]["nullable"] is True
-    # The CockroachDB dialect reflects INT8 as SQLAlchemy Integer.
-    timestamp_type = sa.Integer if db_engine.dialect.name == "cockroachdb" else sa.BigInteger
-    assert isinstance(columns["outcome_recorded_at"]["type"], timestamp_type)
 
 
 def test_workspace_id_leads_primary_keys(db_engine: Engine) -> None:
@@ -238,13 +227,6 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "workspace_id",
         "conversation_id",
         "status",
-        "id",
-    ]
-    assert runs_idx_cols["ix_scheduled_task_runs_conversation_status_scheduled"] == [
-        "workspace_id",
-        "conversation_id",
-        "status",
-        "scheduled_at",
         "id",
     ]
     unique_keys = {
@@ -444,45 +426,6 @@ def test_scheduled_task_runs_status_check_rejects_bad_code(db_engine: Engine) ->
                     "X'00000000000000000000000000000001', 99, 1)"
                 )
             )
-
-
-@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
-def test_scheduled_task_runs_outcome_payload_size_check(db_engine: Engine) -> None:
-    """The size CHECK caps ``outcome_payload`` at 2,048 stored bytes on insert and update.
-
-    Declared lengths are not enforced on every engine (SQLite ignores them), so the
-    CHECK is what bounds the column on both the migrated and the ORM-built schema.
-    """
-    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
-    row = {"scheduled_task_id": b"a" * 16, "status": 3, "scheduled_at": 1}
-    with db_engine.begin() as conn:
-        conn.execute(runs.insert().values(id=b"1" * 16, outcome_payload=b"x" * 2048, **row))
-        conn.execute(runs.insert().values(id=b"2" * 16, outcome_payload=None, **row))
-        assert (
-            conn.execute(
-                sa.select(sa.func.length(runs.c.outcome_payload)).where(runs.c.id == b"1" * 16)
-            ).scalar_one()
-            == 2048
-        )
-    with _rejected_by_check(), db_engine.begin() as conn:
-        conn.execute(runs.insert().values(id=b"3" * 16, outcome_payload=b"x" * 2049, **row))
-    with _rejected_by_check(), db_engine.begin() as conn:
-        conn.execute(
-            runs.update().where(runs.c.id == b"2" * 16).values(outcome_payload="é".encode() * 1025)
-        )
-
-
-# MySQL reports a CHECK violation as OperationalError 3819 rather than IntegrityError.
-_MYSQL_CHECK_CONSTRAINT_VIOLATED = 3819
-
-
-@contextmanager
-def _rejected_by_check() -> Iterator[None]:
-    """Expect a CHECK violation, accepting MySQL's 3819 but no other operational error."""
-    with pytest.raises((IntegrityError, sa.exc.OperationalError)) as raised:
-        yield
-    if isinstance(raised.value, sa.exc.OperationalError):
-        assert raised.value.orig.args[0] == _MYSQL_CHECK_CONSTRAINT_VIOLATED, raised.value
 
 
 @pytest.mark.parametrize("status_code", [5, 6])
@@ -982,78 +925,3 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
             "id",
         ],
     }
-
-
-def test_run_outcome_migration_keeps_existing_runs_and_round_trips(
-    dispatch_migration_engine: Engine,
-) -> None:
-    """Existing runs get no outcome; downgrade drops recorded outcomes and the index, not runs."""
-    engine = dispatch_migration_engine
-    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _SESSION_MODE_REVISION)
-    run_values = {"scheduled_task_id": b"t" * 16, "status": 3, "scheduled_at": 1}
-    before = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
-    with engine.begin() as conn:
-        conn.execute(before.insert().values(id=b"a" * 16, **run_values))
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _RUN_OUTCOME_REVISION)
-    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
-    outcome_columns = (runs.c.outcome_success, runs.c.outcome_payload, runs.c.outcome_recorded_at)
-    payload = '{"plaintext":{"emoji":"🧯","text":"Build still red"}}'.encode()
-    with engine.begin() as conn:
-        assert conn.execute(sa.select(*outcome_columns)).one() == (None, None, None)
-        conn.execute(
-            runs.insert().values(
-                id=b"b" * 16,
-                outcome_success=False,
-                outcome_payload=payload,
-                outcome_recorded_at=2,
-                **run_values,
-            )
-        )
-        row = conn.execute(sa.select(*outcome_columns).where(runs.c.id == b"b" * 16)).one()
-        # A recorded failure must not read back as "nothing recorded".
-        assert row.outcome_success is not None
-        assert (
-            bool(row.outcome_success),
-            bytes(row.outcome_payload),
-            row.outcome_recorded_at,
-        ) == (
-            False,
-            payload,
-            2,
-        )
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.downgrade(config, _SESSION_MODE_REVISION)
-    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")}
-    assert not columns & _RUN_OUTCOME_COLUMNS
-    assert "ix_scheduled_task_runs_conversation_status_scheduled" not in _conversation_indexes(
-        engine
-    )
-    # Both runs survive the downgrade with their own fields; only the outcome is gone.
-    with engine.begin() as conn:
-        kept = conn.execute(
-            sa.select(before.c.id, before.c.scheduled_task_id, before.c.status).order_by(
-                before.c.id
-            )
-        ).all()
-    assert [(bytes(r.id), bytes(r.scheduled_task_id), r.status) for r in kept] == [
-        (b"a" * 16, b"t" * 16, 3),
-        (b"b" * 16, b"t" * 16, 3),
-    ]
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _RUN_OUTCOME_REVISION)
-    assert _conversation_indexes(engine)[
-        "ix_scheduled_task_runs_conversation_status_scheduled"
-    ] == ["workspace_id", "conversation_id", "status", "scheduled_at", "id"]
-    # Re-upgrading does not bring the dropped outcome back.
-    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
-    with engine.begin() as conn:
-        assert conn.execute(
-            sa.select(*(runs.c[name] for name in sorted(_RUN_OUTCOME_COLUMNS))).order_by(runs.c.id)
-        ).all() == [(None, None, None), (None, None, None)]
