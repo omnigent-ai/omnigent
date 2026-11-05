@@ -5,7 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
-import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
+import {
+  BubbleView,
+  buildUndeliveredBubbles,
+  containsMermaidDiagram,
+  placeUndeliveredBubbles,
+} from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
 const initialStoreState = useChatStore.getState();
@@ -677,6 +684,20 @@ describe("UserBubble long-prompt collapse", () => {
     expect(bubble).not.toHaveTextContent(TAIL);
   });
 
+  it("keeps message typography when expanding a prompt over 50K characters", () => {
+    const text = "Long user prose. ".repeat(3_000) + TAIL;
+    render(<BubbleView bubble={userBubble(text)} isLastAssistant={false} />);
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.querySelector(".break-all")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+
+    const fallback = bubble.querySelector(".break-all");
+    expect(fallback).toHaveClass("text-message", "font-mono", "whitespace-pre-wrap");
+    expect(fallback).not.toHaveClass("text-sm");
+    expect(fallback!.textContent).toBe(text);
+  });
+
   it("Copy always writes the full text to the clipboard regardless of collapse state", async () => {
     const writtenTexts: string[] = [];
     vi.stubGlobal("navigator", {
@@ -754,5 +775,67 @@ describe("AssistantBubble copy", () => {
     expect(await item.items["text/html"].text()).toBe(
       "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
     );
+  });
+});
+
+describe("undelivered startup messages", () => {
+  const lost = {
+    pendingId: "pending_first",
+    content: [
+      { type: "input_file" as const, file_id: "file_notes", filename: "notes.txt" },
+      { type: "input_image" as const, file_id: "file_chart", filename: "chart.png" },
+      { type: "input_text" as const, text: "Summarize these" },
+    ],
+  };
+
+  it("sit above the startup failure notice, or last when it isn't loaded", () => {
+    const user: Bubble = { kind: "user", itemId: "user_1", content: [] };
+    const notice = errorBubble("startup_input_failed");
+    const [undelivered] = buildUndeliveredBubbles([lost], "alice@example.com");
+    expect(undelivered).toMatchObject({ undelivered: true, createdBy: "alice@example.com" });
+    expect(placeUndeliveredBubbles([user, notice], [undelivered!])).toEqual([
+      user,
+      undelivered,
+      notice,
+    ]);
+    expect(placeUndeliveredBubbles([user], [undelivered!])).toEqual([user, undelivered]);
+  });
+
+  it("start a new session carrying the text and the attachments that download", async () => {
+    function LocationProbe() {
+      const location = useLocation();
+      return <output data-testid="location">{location.pathname + location.search}</output>;
+    }
+    fetchMock.mockImplementation(async (url: string) =>
+      url.endsWith("/files/file_notes/content")
+        ? new Response("meeting notes", { headers: { "Content-Type": "text/plain" } })
+        : jsonResponse({ detail: "gone" }, 404),
+    );
+    const toasts: unknown[] = [];
+    const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", recordToast);
+    const [bubble] = buildUndeliveredBubbles([lost], null);
+    render(
+      <MemoryRouter initialEntries={["/c/conv_failed"]}>
+        <ConversationScopeContext.Provider value="conv_failed">
+          <BubbleView bubble={bubble!} isLastAssistant={false} />
+        </ConversationScopeContext.Provider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("message-undelivered")).toHaveTextContent("Not delivered");
+    fireEvent.click(screen.getByRole("button", { name: "Copy message to new session" }));
+
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toMatch(/^\/\?/));
+    window.removeEventListener("omnigent:toast", recordToast);
+    const search = new URLSearchParams(screen.getByTestId("location").textContent!.slice(1));
+    const handoff = peekNewSessionHandoff(search.get(NEW_SESSION_HANDOFF_PARAM));
+    expect(handoff?.text).toBe("Summarize these");
+    const [notes] = handoff?.files ?? [];
+    expect(handoff?.files).toHaveLength(1);
+    expect(notes?.name).toBe("notes.txt");
+    expect(await notes?.text()).toBe("meeting notes");
+    expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);
   });
 });

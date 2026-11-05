@@ -33,6 +33,12 @@ export interface RememberScope {
   host?: string;
 }
 
+/** The untruncated file-edit tool call an approval gates, for rendering as a diff. */
+export interface FileEditRequest {
+  toolName: string;
+  toolInput: Record<string, unknown>;
+}
+
 /** Persistence scopes advertised by Codex for MCP tool approvals. */
 export type CodexPersistMode = "session" | "always";
 
@@ -459,6 +465,12 @@ export interface Session {
    * for non-native sessions (their message is already in `items`).
    */
   pendingInputs?: PendingInput[];
+  /**
+   * Saved startup messages that were never delivered, e.g. because the
+   * managed sandbox host didn't come online. Their file blocks still resolve
+   * under this session. Empty when nothing failed or on older servers.
+   */
+  failedInputs?: PendingInput[];
   /**
    * Requesting user's numeric permission level on this session
    * (1=read, 2=edit, 3=manage, 4=owner). ``null`` when permissions
