@@ -394,6 +394,7 @@ def test_first_observation_preserves_known_or_unknown_original(
         pytest.param(
             "", [("created", "b\n"), ("modified", "")], ["created"], id="created-emptied"
         ),
+        pytest.param("", [("modified", "b\n"), ("modified", "")], [], id="empty-original"),
     ],
 )
 @pytest.mark.asyncio
@@ -406,9 +407,10 @@ async def test_tracked_change_restoring_the_session_original_leaves_changes(
     registry = AgentEditFilesystemRegistry(tmp_path)
     registry.seed_snapshot("file.txt", original, session_id="session")
     for operation, current_text in changes:
-        await registry.record_tracked_change(
-            "file.txt", operation, "session", AsyncMock(return_value=current_text)
-        )
+        read_text = AsyncMock(return_value=current_text)
+        await registry.record_tracked_change("file.txt", operation, "session", read_text)
+        if operation == "deleted":
+            read_text.assert_not_awaited()
     listed = registry.list_changed_files("session", limit=10)
     assert [entry["status"] for entry in listed] == statuses
 
