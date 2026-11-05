@@ -509,6 +509,7 @@ function setup({
   platform = "darwin",
   confirmCookieImport = async () => true,
   getWindowForEvent = () => null,
+  openExternal = async () => {},
 } = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
@@ -523,6 +524,7 @@ function setup({
     platform,
     confirmCookieImport,
     getWindowForEvent,
+    openExternal,
   });
   return { ipcMain, registry, wc, sent, event };
 }
@@ -540,6 +542,7 @@ it("restores URL, title and history state for the requested browser tab only", (
     title: "Restored page",
     canGoBack: true,
     canGoForward: false,
+    googleAccessBlocked: false,
   });
   assert.deepEqual(
     ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" }),
@@ -604,6 +607,7 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-go-forward",
       "omnigent:browser-reload",
       "omnigent:open-browser-devtools",
+      "omnigent:browser-open-in-system-browser",
       "omnigent:browser-enable-design-mode",
       "omnigent:browser-disable-design-mode",
       "omnigent:browser-signal-design-result",
@@ -621,6 +625,7 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-go-forward",
       "omnigent:browser-reload",
       "omnigent:open-browser-devtools",
+      "omnigent:browser-open-in-system-browser",
       "omnigent:browser-perform-action",
       "omnigent:browser-execute",
       "omnigent:browser-chrome-cookie-preview",
@@ -1095,6 +1100,89 @@ describe("browserIpc — Chrome cookie import", () => {
   });
 });
 
+describe("browserIpc — open in system browser", () => {
+  const BLOCKED = "https://access.workspace.google.com/remediate?continue=x";
+
+  function setupHandoff({ url, navigationTrail, openExternal }) {
+    const opened = [];
+    const wc = makeWebContents();
+    wc.getURL = () => url;
+    const ctx = setup({
+      webContents: wc,
+      openExternal:
+        openExternal ??
+        (async (target) => {
+          opened.push(target);
+        }),
+    });
+    if (navigationTrail) ctx.registry.get("conv_1").navigationTrail = navigationTrail;
+    const invoke = (conversationId = "conv_1") =>
+      ctx.ipcMain.invoke("omnigent:browser-open-in-system-browser", ctx.event, {
+        conversationId,
+      });
+    return { ...ctx, opened, invoke };
+  }
+
+  it("opens the tab's current page", async () => {
+    const { invoke, opened } = setupHandoff({ url: "https://example.com/page" });
+    assert.deepEqual(await invoke(), { ok: true, url: "https://example.com/page" });
+    assert.deepEqual(opened, ["https://example.com/page"]);
+  });
+
+  it("opens the page the blocked sign-in was continuing to", async () => {
+    const { invoke, opened } = setupHandoff({
+      url: BLOCKED,
+      navigationTrail: [
+        "https://docs.google.com/document/d/1",
+        "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fdocs.google.com%2Fdocument%2Fd%2F1",
+        BLOCKED,
+      ],
+    });
+    const result = await invoke();
+    assert.equal(result.ok, true);
+    assert.deepEqual(opened, ["https://docs.google.com/document/d/1"]);
+  });
+
+  it("refuses a missing view or a tab with no web page", async () => {
+    const { invoke, opened } = setupHandoff({ url: "about:blank" });
+    assert.deepEqual(await invoke("conv_missing"), { ok: false, error: "No browser view" });
+    assert.deepEqual(await invoke(), { ok: false, error: "This tab has no web page to open." });
+    assert.deepEqual(opened, []);
+  });
+
+  it("reports a failure to launch the browser", async () => {
+    const { invoke } = setupHandoff({
+      url: "https://example.com/",
+      openExternal: async () => {
+        throw new Error("no handler");
+      },
+    });
+    assert.deepEqual(await invoke(), {
+      ok: false,
+      error: "Couldn't open your browser: no handler",
+    });
+  });
+
+  it("flags the Google access-blocked page in view snapshots and url events", async () => {
+    const { ipcMain, event } = setupHandoff({ url: BLOCKED });
+    const snapshot = ipcMain.invoke("omnigent:browser-has-view", event, {
+      conversationId: "conv_1",
+    });
+    assert.equal(snapshot.googleAccessBlocked, true);
+
+    const tracked = setup({ conversationId: null });
+    await tracked.ipcMain.invoke("omnigent:browser-open-or-navigate", tracked.event, {
+      conversationId: "conv_1",
+      url: "https://docs.google.com/",
+    });
+    const wc = tracked.registry.get("conv_1").view.webContents;
+    wc.getURL = () => BLOCKED;
+    wc.emit("did-navigate", BLOCKED);
+    const urlEvents = tracked.sent.filter((s) => s.channel === "browser-url-changed");
+    assert.equal(urlEvents.at(-1).payload.googleAccessBlocked, true);
+  });
+});
+
 describe("browserIpc — devtools toggle", () => {
   it("opens devtools docked bottom when closed, closes when open", async () => {
     const wc = makeWebContents();
@@ -1126,6 +1214,7 @@ describe("browserIpc — url live-tracking", () => {
       conversationId: viewId,
       url: "https://example.com/after-redirect",
       title: "Redirected page",
+      googleAccessBlocked: false,
     });
     assert.equal(navEvents.length, 1);
     assert.equal(navEvents[0].payload.conversationId, viewId);
@@ -1133,7 +1222,12 @@ describe("browserIpc — url live-tracking", () => {
     wc.emit("page-title-updated", "Changed title");
     assert.deepEqual(sent.at(-1), {
       channel: "browser-url-changed",
-      payload: { conversationId: viewId, url: wc.getURL(), title: "Changed title" },
+      payload: {
+        conversationId: viewId,
+        url: wc.getURL(),
+        title: "Changed title",
+        googleAccessBlocked: false,
+      },
     });
 
     wc.getURL = () => "https://example.com/untitled";
@@ -1141,7 +1235,7 @@ describe("browserIpc — url live-tracking", () => {
     wc.emit("did-finish-load");
     assert.deepEqual(sent.at(-1), {
       channel: "browser-url-changed",
-      payload: { conversationId: viewId, url: wc.getURL(), title: "" },
+      payload: { conversationId: viewId, url: wc.getURL(), title: "", googleAccessBlocked: false },
     });
   });
 

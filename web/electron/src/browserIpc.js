@@ -11,6 +11,7 @@ const crypto = require("node:crypto");
 const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
+const { isGoogleAccessBlockedUrl, systemBrowserUrl } = require("./browserSystemHandoff");
 const { buildDesignModeScript } = require("./designModeScript");
 
 const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
@@ -207,7 +208,12 @@ function goForward(wc) {
  */
 function attachNavListeners({ conversationId, webContents, send }) {
   const emitPageMetadata = (url, title = webContents.getTitle()) => {
-    send("browser-url-changed", { conversationId, url, title });
+    send("browser-url-changed", {
+      conversationId,
+      url,
+      title,
+      googleAccessBlocked: isGoogleAccessBlockedUrl(url),
+    });
   };
   const emitUrl = (url) => {
     emitPageMetadata(url);
@@ -364,6 +370,7 @@ function registerBrowserIpc({
   platform = process.platform,
   // Injected so the native confirmation is testable without Electron dialogs.
   confirmCookieImport = askToImportChromeCookies,
+  openExternal = (url) => require("electron").shell.openExternal(url),
 }) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
@@ -609,6 +616,7 @@ function registerBrowserIpc({
       hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
       url,
       title: webContents.getTitle(),
+      googleAccessBlocked: isGoogleAccessBlockedUrl(url),
       ...(pendingUrl ? { pendingUrl } : {}),
       ...readNavState(webContents),
     };
@@ -656,6 +664,35 @@ function registerBrowserIpc({
       /* destroyed */
     }
     return { ok: true };
+  });
+
+  // ── Toolbar: open in the system browser ──────────────────────────────────
+  // Main picks the URL from the view itself (see systemBrowserUrl), so the
+  // renderer can only ask to hand off the page this tab is showing.
+  ipcMain.handle("omnigent:browser-open-in-system-browser", async (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    const entry = g.registry.get(args?.conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    let url;
+    try {
+      url = systemBrowserUrl({
+        currentUrl: entry.view.webContents.getURL(),
+        navigationTrail: entry.navigationTrail,
+      });
+    } catch {
+      return { ok: false, error: "browser closed" };
+    }
+    if (!url) return { ok: false, error: "This tab has no web page to open." };
+    try {
+      await openExternal(url);
+      return { ok: true, url };
+    } catch (e) {
+      return {
+        ok: false,
+        error: `Couldn't open your browser: ${e && e.message ? e.message : String(e)}`,
+      };
+    }
   });
 
   // ── Toolbar: DevTools toggle ─────────────────────────────────────────────

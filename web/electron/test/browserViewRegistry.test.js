@@ -446,6 +446,7 @@ function makeEventCapturingRegistry(extra = {}) {
     },
     fireContextMenu: (params) => handlers["context-menu"]({}, params),
     windowOpen: (url) => windowOpenHandler({ url }),
+    emit: (event, ...args) => handlers[event](...args),
   };
 }
 
@@ -1184,6 +1185,46 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     const alias = { webContentsId, url: "http://lvh.me:5173/", ip: "127.0.0.1" };
     assert.equal(await registry.shouldCancelAgentRequest(alias), true);
     assert.equal(await registry.shouldCancelAgentResponse(alias), true);
+  });
+});
+
+describe("browserViewRegistry — navigation trail", () => {
+  const mainFrame = (url) => ({ url, isMainFrame: true, isSameDocument: false });
+
+  it("records main-frame starts and redirect hops since the last explicit navigation", () => {
+    const { registry, emit } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://docs.google.com/document/d/1");
+    emit("did-redirect-navigation", mainFrame("https://accounts.google.com/ServiceLogin"));
+    emit("did-start-navigation", {
+      url: "https://ads.example/frame",
+      isMainFrame: false,
+      isSameDocument: false,
+    });
+    emit("did-start-navigation", {
+      url: "https://accounts.google.com/ServiceLogin#step",
+      isMainFrame: true,
+      isSameDocument: true,
+    });
+    emit("did-redirect-navigation", mainFrame("https://access.workspace.google.com/remediate"));
+    assert.deepEqual(registry.get("conv_1").navigationTrail, [
+      "https://docs.google.com/document/d/1",
+      "https://accounts.google.com/ServiceLogin",
+      "https://access.workspace.google.com/remediate",
+    ]);
+
+    registry.openOrNavigate("conv_1", "https://example.com/");
+    assert.deepEqual(registry.get("conv_1").navigationTrail, ["https://example.com/"]);
+  });
+
+  it("accepts the deprecated positional navigation arguments", () => {
+    const { registry, emit } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/");
+    emit("did-start-navigation", {}, "https://example.com/next", false, true);
+    emit("did-start-navigation", {}, "https://example.com/frame", false, false);
+    assert.deepEqual(registry.get("conv_1").navigationTrail, [
+      "https://example.com/",
+      "https://example.com/next",
+    ]);
   });
 });
 

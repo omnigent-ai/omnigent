@@ -427,6 +427,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   openBrowserDevTools: (conversationId) =>
     ipcRenderer.invoke("omnigent:open-browser-devtools", { conversationId }),
   /**
+   * Open the conversation's page in the user's default browser. On Google's
+   * access block page, main opens the page the sign-in was heading to instead.
+   * @param {string} conversationId
+   * @returns {Promise<{ ok: boolean, url?: string, error?: string }>}
+   */
+  browserOpenInSystemBrowser: (conversationId) =>
+    ipcRenderer.invoke("omnigent:browser-open-in-system-browser", { conversationId }),
+  /**
    * Inspect the user's local Google Chrome profiles for cookies in the site
    * tree the conversation's view is currently on. Metadata only (profile name +
    * per-scope counts): no Keychain access and no cookie values. macOS only.

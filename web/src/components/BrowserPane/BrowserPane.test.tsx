@@ -546,6 +546,109 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
   });
 });
 
+describe("BrowserPane system-browser handoff", () => {
+  const blockedUrl = "https://access.workspace.google.com/remediate?continue=x";
+
+  async function renderWithView(conversationId: string, overrides: Record<string, unknown> = {}) {
+    let fireUrl:
+      | ((p: { conversationId: string; url: string; googleAccessBlocked?: boolean }) => void)
+      | undefined;
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com/" }),
+      browserOpenInSystemBrowser: vi
+        .fn()
+        .mockResolvedValue({ ok: true, url: "https://example.com/" }),
+      onBrowserUrlChanged: vi.fn((cb: typeof fireUrl) => {
+        fireUrl = cb;
+        return () => {};
+      }),
+      ...overrides,
+    });
+    render(<BrowserPane conversationId={conversationId} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled());
+    return { bridge, fireUrl: () => fireUrl };
+  }
+
+  it("hides the toolbar button on a shell without the bridge method", async () => {
+    await renderWithView("conv_old", { browserOpenInSystemBrowser: undefined });
+    expect(screen.queryByRole("button", { name: "Open in browser" })).toBeNull();
+  });
+
+  it("disables the toolbar button until a page is open", () => {
+    installBridge({ browserOpenInSystemBrowser: vi.fn() });
+    render(<BrowserPane conversationId="conv_empty" />);
+    expect(screen.getByRole("button", { name: "Open in browser" })).toBeDisabled();
+  });
+
+  it("opens the current page in the system browser from the toolbar", async () => {
+    const { bridge } = await renderWithView("conv_open");
+    fireEvent.click(screen.getByRole("button", { name: "Open in browser" }));
+    await waitFor(() =>
+      expect(bridge.browserOpenInSystemBrowser).toHaveBeenCalledWith("conv_open"),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("shows the shell's error when the system browser can't be opened", async () => {
+    await renderWithView("conv_fail", {
+      browserOpenInSystemBrowser: vi
+        .fn()
+        .mockResolvedValue({ ok: false, error: "Couldn't open your browser: no handler" }),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open in browser" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn't open your browser: no handler",
+    );
+  });
+
+  it("offers to continue a blocked Google Workspace sign-in in the system browser", async () => {
+    const { bridge, fireUrl } = await renderWithView("conv_google");
+    expect(screen.queryByText(/doesn't allow sign-in from Omnigent's browser/)).toBeNull();
+
+    act(() => {
+      fireUrl()?.({ conversationId: "conv_google", url: blockedUrl, googleAccessBlocked: true });
+    });
+    const notice = await screen.findByRole("status");
+    expect(notice).toHaveTextContent(
+      "Google Workspace doesn't allow sign-in from Omnigent's browser",
+    );
+    fireEvent.click(within(notice).getByRole("button", { name: "Continue in browser" }));
+    await waitFor(() =>
+      expect(bridge.browserOpenInSystemBrowser).toHaveBeenCalledWith("conv_google"),
+    );
+
+    // Leaving the block page (for example, going back) removes the notice.
+    act(() => {
+      fireUrl()?.({ conversationId: "conv_google", url: "https://example.com/" });
+    });
+    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+  });
+
+  it("restores the notice for a retained view already on the block page", async () => {
+    await renderWithView("conv_retained", {
+      browserHasView: vi
+        .fn()
+        .mockResolvedValue({ exists: true, url: blockedUrl, googleAccessBlocked: true }),
+    });
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Your organization only allows approved browsers",
+    );
+  });
+
+  it("keeps the old pane on a shell that can't hand off", async () => {
+    const { fireUrl } = await renderWithView("conv_legacy", {
+      browserOpenInSystemBrowser: undefined,
+    });
+    act(() => {
+      fireUrl()?.({ conversationId: "conv_legacy", url: blockedUrl, googleAccessBlocked: true });
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(blockedUrl),
+    );
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+});
+
 describe("BrowserPane Chrome cookie import", () => {
   const HOST = "mail.google.com";
   const PARENT = "google.com";

@@ -24,6 +24,7 @@ const {
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
+const { recordNavigation } = require("./browserSystemHandoff");
 
 const DEFAULT_CAP = 10;
 
@@ -181,6 +182,9 @@ function createBrowserViewRegistry({
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
+      // Main-frame URLs, including redirect hops, since the last explicit
+      // navigation; the system-browser handoff reads it.
+      navigationTrail: [],
       // Enables navigation guards; renderer IPC always sets it.
       navigationPolicyEnforced: false,
       agentContext: null,
@@ -219,8 +223,27 @@ function createBrowserViewRegistry({
     installWindowOpenPolicy(entry);
     attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
+    attachNavigationTrail(entry);
     attachRecentSessionInput(entry);
     return { ok: true, entry, created: true };
+  }
+
+  // Redirect hops never commit, so did-navigate alone would miss the sign-in
+  // URLs that name the page a blocked Google sign-in was heading to.
+  function attachNavigationTrail(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    const record = (details, url, isMainFrame) => {
+      const mainFrame = details?.isMainFrame ?? isMainFrame;
+      if (!mainFrame || details?.isSameDocument) return;
+      recordNavigation(entry.navigationTrail, details?.url ?? url);
+    };
+    wc.on("did-start-navigation", (details, url, _isInPlace, isMainFrame) =>
+      record(details, url, isMainFrame),
+    );
+    wc.on("did-redirect-navigation", (details, url, _isInPlace, isMainFrame) =>
+      record(details, url, isMainFrame),
+    );
   }
 
   // Popups stay in this view: an agent-visited page opening the user's system
@@ -570,6 +593,8 @@ function createBrowserViewRegistry({
       // drifts with in-page nav — stops a re-mount from refreshing to the initial URL.
       if (created || force || entry.lastRequestedUrl !== url) {
         entry.lastRequestedUrl = url;
+        entry.navigationTrail = [];
+        recordNavigation(entry.navigationTrail, url);
         try {
           entry.view.webContents.loadURL(url);
         } catch (e) {
