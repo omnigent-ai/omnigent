@@ -3575,6 +3575,7 @@ const ORDERING_LABELS: Record<SidebarOrdering, string> = {
   custom: "Custom",
 };
 const SHOW_LABELS: Record<SidebarShowField, string> = {
+  harness: "Harness",
   updated: "Updated",
   environment: "Environment",
   repo: "Repo",
@@ -4824,6 +4825,43 @@ const TOOLTIP_COLOR_ICONS: Partial<
   Record<NativeCodingAgentIconKind, ComponentType<{ size?: number; className?: string }>>
 > = { antigravity: AntigravityColor, devin: DevinColor, kiro: KiroColor };
 
+// The session's harness glyph. `withFallback` draws the agent's generic icon for
+// sessions without a known harness, the way project rows fall back to a folder.
+function SessionHarnessIcon({
+  conversation,
+  testId,
+  withFallback = false,
+}: {
+  conversation: Conversation;
+  testId: string;
+  withFallback?: boolean;
+}) {
+  const nativeAgent = nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]);
+  const ColorIcon = nativeAgent ? TOOLTIP_COLOR_ICONS[nativeAgent.iconKind] : undefined;
+  const harnessAgent = nativeAgent
+    ? { name: nativeAgent.agentName, harness: nativeAgent.harness }
+    : conversation.agent_name === "nessie"
+      ? { name: "nessie", harness: null }
+      : withFallback
+        ? { name: conversation.agent_name ?? "", harness: conversation.harness ?? null }
+        : null;
+  if (!harnessAgent) return null;
+  return (
+    <span
+      role="img"
+      aria-label={`${getConversationAgentType(conversation)} harness`}
+      data-testid={testId}
+      className="flex shrink-0"
+    >
+      {ColorIcon ? (
+        <ColorIcon size={16} className="shrink-0" />
+      ) : (
+        <ComposerAgentIcon agent={harnessAgent} className="size-4" />
+      )}
+    </span>
+  );
+}
+
 // The tooltip before the sidebar_grouping_ui release flag; remove with the flag
 // (review by 0.19.0).
 function LegacySessionTooltipContent({
@@ -4892,14 +4930,6 @@ function SessionTooltipContent({
       />
     );
   }
-  const nativeAgent = nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]);
-  const ColorIcon = nativeAgent ? TOOLTIP_COLOR_ICONS[nativeAgent.iconKind] : undefined;
-  const harnessAgent = nativeAgent
-    ? { name: nativeAgent.agentName, harness: nativeAgent.harness }
-    : conversation.agent_name === "nessie"
-      ? { name: "nessie", harness: null }
-      : null;
-
   return (
     <TooltipContent
       side="right"
@@ -4916,20 +4946,7 @@ function SessionTooltipContent({
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
         <span className="shrink-0">{relativeTime(conversation.updated_at * 1000)}</span>
         <span aria-hidden>·</span>
-        {harnessAgent && (
-          <span
-            role="img"
-            aria-label={`${getConversationAgentType(conversation)} harness`}
-            data-testid="session-tooltip-harness"
-            className="flex shrink-0"
-          >
-            {ColorIcon ? (
-              <ColorIcon size={16} className="shrink-0" />
-            ) : (
-              <ComposerAgentIcon agent={harnessAgent} className="size-4" />
-            )}
-          </span>
-        )}
+        <SessionHarnessIcon conversation={conversation} testId="session-tooltip-harness" />
         <span data-testid="session-tooltip-location" className="flex min-w-0 items-center gap-1.5">
           <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
           <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
@@ -5166,6 +5183,7 @@ function ConversationRowImpl({
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
+  const showHarness = show.includes("harness");
   const hasTrailingIndicator = hasSessionIndicator || showUpdated;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
@@ -5406,6 +5424,28 @@ function ConversationRowImpl({
     reorder: canReorder && !isProvisionalRow ? { previousId, nextId } : undefined,
   };
 
+  const rowText = (
+    <>
+      {/* Row 1: the session name. Working, needs-approval, unseen, and draft
+          markers render in the shared trailing indicator slot below. */}
+      <div className="flex w-full items-center">
+        <span
+          className={cn(
+            "relative min-w-0 truncate",
+            // The optimistic first-prompt label is a placeholder until the
+            // server's title lands — dim it so it doesn't read as final.
+            isProvisionalLabel && "italic text-muted-foreground",
+          )}
+        >
+          {label}
+          {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
+        </span>
+      </div>
+      {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
+      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
+    </>
+  );
+
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
@@ -5416,7 +5456,10 @@ function ConversationRowImpl({
       onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
       className={cn(
         SIDEBAR_ROW,
-        "relative flex flex-col justify-center text-left text-foreground transition-colors",
+        "relative flex text-left text-foreground transition-colors",
+        // With the harness icon the row takes a project row's shape: a leading
+        // icon centered against the title and meta column.
+        showHarness ? "items-center" : "flex-col justify-center",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
@@ -5477,23 +5520,20 @@ function ConversationRowImpl({
       }}
       title={isMobile ? (conversation.title ?? conversation.id) : undefined}
     >
-      {/* Row 1: the session name. Working, needs-approval, unseen, and draft
-          markers render in the shared trailing indicator slot below. */}
-      <div className="flex w-full items-center">
-        <span
-          className={cn(
-            "relative min-w-0 truncate",
-            // The optimistic first-prompt label is a placeholder until the
-            // server's title lands — dim it so it doesn't read as final.
-            isProvisionalLabel && "italic text-muted-foreground",
-          )}
-        >
-          {label}
-          {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
-        </span>
-      </div>
-      {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
-      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
+      {showHarness ? (
+        <>
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <SessionHarnessIcon
+              conversation={conversation}
+              testId="session-row-harness"
+              withFallback
+            />
+          </span>
+          <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">{rowText}</div>
+        </>
+      ) : (
+        rowText
+      )}
     </Link>
   );
 
