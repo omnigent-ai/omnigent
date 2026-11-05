@@ -659,7 +659,10 @@ including the address bar, chat links, and agent actions, enforces this policy.
   network round trips and may increase latency and bandwidth. WebSocket upgrades
   can omit the connected IP; those repeat the partition DNS check at the 101
   response. This is not connected-IP verification and cannot rule out a DNS
-  change between check and connection. Limits: a DNS
+  change between check and connection. An IP-less `*.localhost` upgrade is
+  accepted only when the partition's proxy lookup returns `DIRECT` alone,
+  because Chromium pins those names to loopback but a proxy could route them
+  elsewhere. Limits: a DNS
   change between preflight and connection can still send a request to a private
   address; the HTTP response check prevents the page from reading its response.
   Pages restored from the back-forward cache and navigations answered by a service worker make no

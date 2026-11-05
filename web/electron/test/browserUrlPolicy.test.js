@@ -13,12 +13,13 @@ const {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isAgentNavigationAllowed,
+  isDirectOnly,
   isProxyAddress,
   proxyHosts,
 } = require("../src/browserUrlPolicy");
 
 describe("browserUrlPolicy — agent navigation allowlist", () => {
-  it("allows only canonical loopback destinations with loopback eligibility", () => {
+  it("allows canonical loopback and *.localhost destinations with loopback eligibility", () => {
     for (const host of [
       "localhost",
       "127.0.0.1",
@@ -360,6 +361,17 @@ describe("browserUrlPolicy — connected address check", () => {
       const verdict = isAgentConnectionAllowed(url, ip, eligible);
       assert.equal(verdict.ok, false, String(ip));
       assert.match(verdict.error, /did not connect to a loopback address/);
+    }
+  });
+});
+
+describe("browserUrlPolicy — direct-only proxy results", () => {
+  it("accepts only results whose every entry is DIRECT", () => {
+    for (const result of ["DIRECT", " direct ", "DIRECT;DIRECT", "DIRECT;"]) {
+      assert.equal(isDirectOnly(result), true, result);
+    }
+    for (const result of ["", undefined, ";", "PROXY a:3128", "DIRECT; PROXY a:3128", "BOGUS"]) {
+      assert.equal(isDirectOnly(result), false, String(result));
     }
   });
 });

@@ -1123,6 +1123,67 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
       [false, false, true, true],
     );
     assert.deepEqual(proxyLookups, []);
+    // Upgrades omit the connected IP, so a proxy route alone cancels them.
+    const upgrade = {
+      webContentsId: idOf("conv_1"),
+      url: "ws://spog.dev.localhost:5173/hmr",
+      resourceType: "webSocket",
+      statusCode: 101,
+    };
+    assert.equal(await registry.shouldCancelAgentResponse(upgrade), true);
+    assert.deepEqual(proxyLookups, ["http://spog.dev.localhost:5173/hmr"]);
+  });
+
+  it("accepts an IP-less *.localhost upgrade only on a direct route for an eligible view", async () => {
+    const context = { hostIsThisMachine: true };
+    const upgradeCancelled = async (resolveProxy, viewId = "local") => {
+      const { registry, idOf, lookups } = makeNetworkGuardRegistry({
+        allowsLocalhost: (ctx) => ctx === context,
+        resolveProxy,
+      });
+      registry.openOrNavigate("local", "http://spog.dev.localhost:5173/", undefined, {
+        agent: true,
+        agentContext: context,
+      });
+      registry.openOrNavigate("remote", "https://example.com/", undefined, { agent: true });
+      const cancel = await registry.shouldCancelAgentResponse({
+        webContentsId: idOf(viewId),
+        url: "ws://spog.dev.localhost:5173/hmr",
+        resourceType: "webSocket",
+        statusCode: 101,
+      });
+      assert.deepEqual(lookups, [], "no DNS lookup for *.localhost");
+      return cancel;
+    };
+    const direct = async () => "DIRECT";
+    assert.equal(
+      await upgradeCancelled(direct),
+      false,
+      "Chromium connects a direct *.localhost to loopback",
+    );
+    assert.equal(
+      await upgradeCancelled(direct, "remote"),
+      true,
+      "an ineligible view never opens *.localhost",
+    );
+    const unsafeRoutes = {
+      empty: async () => "",
+      "proxy fallback": async () => "DIRECT; PROXY proxy.corp:3128",
+      unparsable: async () => "BOGUS",
+      "lookup failure": async () => {
+        throw new Error("no route");
+      },
+    };
+    const verdicts = await Promise.all(
+      Object.entries(unsafeRoutes).map(async ([label, route]) => [
+        label,
+        await upgradeCancelled(route),
+      ]),
+    );
+    assert.deepEqual(
+      verdicts,
+      Object.keys(unsafeRoutes).map((label) => [label, true]),
+    );
   });
 
   it("forces policy-enforced network requests past the HTTP cache", () => {

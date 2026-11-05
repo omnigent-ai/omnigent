@@ -331,6 +331,15 @@ function proxyHosts(pacResult) {
   return hosts;
 }
 
+/** True if a PAC-style `resolveProxy` result lists only DIRECT entries. */
+function isDirectOnly(pacResult) {
+  const entries = String(pacResult ?? "")
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return entries.length > 0 && entries.every((entry) => entry.toUpperCase() === "DIRECT");
+}
+
 /**
  * True if `ip` is an address of a proxy in `pacResult`. Configuration alone
  * proves nothing about a connection — "PROXY a:3128; DIRECT" may fall back to
@@ -369,6 +378,7 @@ module.exports = {
   isBlockedIpv6,
   isInternalAddress,
   isBlockedHostname,
+  isDirectOnly,
   isLocalhostSubdomain,
   isLoopbackName,
   isLoopbackAddress,

@@ -21,6 +21,7 @@ const {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isAgentNavigationAllowed,
+  isDirectOnly,
   isLocalhostSubdomain,
   isProxyAddress,
   lookupHostAddresses,
@@ -495,6 +496,22 @@ function createBrowserViewRegistry({
 
   // IP-less WebSocket upgrades repeat the partition DNS check, not endpoint
   // verification; DNS may change between the check and connection.
+  // WebSocket upgrades omit the connected IP. Chromium pins `*.localhost` to
+  // loopback, so only a proxy could send the upgrade anywhere else.
+  async function checkDirectLocalhostUpgrade(policyUrl, hostname, partition) {
+    let pacResult = "";
+    try {
+      pacResult = await resolveProxy(policyUrl, partition);
+    } catch {
+      // An unknown route fails closed.
+    }
+    if (isDirectOnly(pacResult)) return { ok: true };
+    return {
+      ok: false,
+      error: `navigation blocked: host "${hostname}" may be routed through a proxy`,
+    };
+  }
+
   async function shouldCancelAgentResponse(
     { webContentsId, url, ip, resourceType, statusCode },
     partition,
@@ -502,19 +519,26 @@ function createBrowserViewRegistry({
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
-    const verdict =
-      !ip && resourceType === "webSocket" && statusCode === 101
-        ? await checkAgentNavigationWithPolicy(policyUrl, policy)
-        : isAgentConnectionAllowed(policyUrl, ip, policy);
+    const hostname = URL.canParse(policyUrl) ? new URL(policyUrl).hostname : "";
+    const localhostSubdomain = isLocalhostSubdomain(hostname);
+    let verdict;
+    if (!ip && resourceType === "webSocket" && statusCode === 101) {
+      verdict =
+        policy.allowLocalhost && localhostSubdomain
+          ? await checkDirectLocalhostUpgrade(policyUrl, hostname, policy.partition)
+          : await checkAgentNavigationWithPolicy(policyUrl, policy);
+    } else {
+      verdict = isAgentConnectionAllowed(policyUrl, ip, policy);
+    }
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
     // (same-IP limit documented on isProxyAddress). A proxy would resolve
     // `*.localhost` on its own network, so those must connect to loopback.
     const proxied =
       !!ip &&
-      !(URL.canParse(policyUrl) && isLocalhostSubdomain(new URL(policyUrl).hostname)) &&
-      (await isProxyAddress(ip, await resolveProxy(policyUrl, policy.partition), (hostname) =>
-        resolveHost(hostname, policy.partition),
+      !localhostSubdomain &&
+      (await isProxyAddress(ip, await resolveProxy(policyUrl, policy.partition), (proxyHost) =>
+        resolveHost(proxyHost, policy.partition),
       ));
     if (proxied) return false;
     if (policy.conversationId) {

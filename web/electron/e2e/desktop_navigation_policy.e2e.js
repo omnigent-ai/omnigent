@@ -20,6 +20,57 @@ const deps = desktopDepsAvailable();
 
 const THIS_MACHINE_HOST_ID = "a".repeat(32);
 
+// Accept a WebSocket upgrade, echo one short masked text frame, then close.
+function echoOneWebSocketFrame(request, socket) {
+  const accept = createHash("sha1")
+    .update(request.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    .digest("base64");
+  socket.write(
+    `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+  );
+  let buffered = Buffer.alloc(0);
+  // This fixture echoes one short masked text frame, then closes the socket.
+  socket.on("data", (chunk) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    if (buffered.length < 2) return;
+    const length = buffered[1] & 0x7f;
+    if (buffered[0] !== 0x81 || !(buffered[1] & 0x80) || length > 125) {
+      socket.destroy();
+      return;
+    }
+    if (buffered.length < length + 6) return;
+    const payload = Buffer.from(buffered.subarray(6, length + 6));
+    for (let index = 0; index < length; index++) payload[index] ^= buffered[2 + (index % 4)];
+    socket.end(Buffer.concat([Buffer.from([0x81, length]), payload]));
+  });
+  socket.on("error", () => {});
+}
+
+// Preload that records every response-guard decision in global.allowedNetworkResponses.
+function writeResponseObserver(scratch) {
+  const observer = path.join(scratch, "observe-allowed.cjs");
+  fs.writeFileSync(
+    observer,
+    `
+    const mod = require(${JSON.stringify(path.resolve(__dirname, "../src/browserViewRegistry.js"))});
+    const create = mod.createBrowserViewRegistry;
+    global.allowedNetworkResponses = [];
+    mod.createBrowserViewRegistry = (opts) => {
+      const registry = create(opts);
+      const response = registry.shouldCancelAgentResponse.bind(registry);
+      registry.shouldCancelAgentResponse = async (details, partition) => {
+        const cancel = await response(details, partition);
+        global.allowedNetworkResponses.push({ url: details.url, ip: details.ip,
+          resourceType: details.resourceType, statusCode: details.statusCode, cancel });
+        return cancel;
+      };
+      return registry;
+    };
+  `,
+  );
+  return observer;
+}
+
 // Launch with a live daemon enrolled for this machine; only `backend.sessionId`
 // reports this host ID, every other session reports a remote host.
 async function launchThisMachineDesktop({ backend, scratch, recordDir, preload = [] }) {
@@ -570,55 +621,13 @@ it(
       if (request.method === "OPTIONS") response.writeHead(204).end();
       else response.end("cors-ok");
     });
-    corsFixture.on("upgrade", (request, socket) => {
-      const accept = createHash("sha1")
-        .update(request.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
-        .digest("base64");
-      socket.write(
-        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
-      );
-      let buffered = Buffer.alloc(0);
-      // This fixture echoes one short masked text frame, then closes the socket.
-      socket.on("data", (chunk) => {
-        buffered = Buffer.concat([buffered, chunk]);
-        if (buffered.length < 2) return;
-        const length = buffered[1] & 0x7f;
-        if (buffered[0] !== 0x81 || !(buffered[1] & 0x80) || length > 125) {
-          socket.destroy();
-          return;
-        }
-        if (buffered.length < length + 6) return;
-        const payload = Buffer.from(buffered.subarray(6, length + 6));
-        for (let index = 0; index < length; index++) payload[index] ^= buffered[2 + (index % 4)];
-        socket.end(Buffer.concat([Buffer.from([0x81, length]), payload]));
-      });
-      socket.on("error", () => {});
-    });
+    corsFixture.on("upgrade", echoOneWebSocketFrame);
     await new Promise((resolve) => {
       corsFixture.listen(0, "127.0.0.1", resolve);
     });
     const corsUrl = `http://127.0.0.1:${corsFixture.address().port}/allowed-cors`;
     const socketUrl = `ws://127.0.0.1:${corsFixture.address().port}/echo`;
-    const observeAllowed = path.join(scratch, "observe-allowed.cjs");
-    fs.writeFileSync(
-      observeAllowed,
-      `
-      const mod = require(${JSON.stringify(path.resolve(__dirname, "../src/browserViewRegistry.js"))});
-      const create = mod.createBrowserViewRegistry;
-      global.allowedNetworkResponses = [];
-      mod.createBrowserViewRegistry = (opts) => {
-        const registry = create(opts);
-        const response = registry.shouldCancelAgentResponse.bind(registry);
-        registry.shouldCancelAgentResponse = async (details, partition) => {
-          const cancel = await response(details, partition);
-          global.allowedNetworkResponses.push({ url: details.url, ip: details.ip,
-            resourceType: details.resourceType, statusCode: details.statusCode, cancel });
-          return cancel;
-        };
-        return registry;
-      };
-    `,
-    );
+    const observeAllowed = writeResponseObserver(scratch);
     let backend;
     let desktop;
     try {
@@ -803,6 +812,11 @@ it(
           `<p>Path: <b>${escapeHtml(request.url)}</b></p></body>`,
       );
     });
+    const devUpgrades = [];
+    fixture.on("upgrade", (request, socket) => {
+      devUpgrades.push(request.headers.host);
+      echoOneWebSocketFrame(request, socket);
+    });
     await new Promise((resolve) => {
       fixture.listen(0, "127.0.0.1", resolve);
     });
@@ -817,14 +831,23 @@ it(
       marks.push({ label, seconds: (Date.now() - started) / 1000 });
       console.log(`[${((Date.now() - started) / 1000).toFixed(1)}s] ${label}`);
     };
-    const hold = (ms = 2500) =>
+    // Pauses and slow typing only pace the recording.
+    const recording = Boolean(process.env.OMNIGENT_DESKTOP_RECORD_DIR);
+    const typingDelay = recording ? 25 : 0;
+    const wait = (ms) =>
       new Promise((resolve) => {
         setTimeout(resolve, ms);
       });
+    const hold = (ms) => (recording ? wait(ms) : Promise.resolve());
     try {
       backend = await startDesignBackend(scratch);
       started = Date.now();
-      const local = await launchThisMachineDesktop({ backend, scratch, recordDir });
+      const local = await launchThisMachineDesktop({
+        backend,
+        scratch,
+        recordDir,
+        preload: [writeResponseObserver(scratch)],
+      });
       desktop = local.desktop;
       const { window, electronApp } = desktop;
       const viewAt = (url) =>
@@ -858,9 +881,37 @@ it(
       await openSessionBrowserTab(window, backend.serverUrl, backend.sessionId);
       const bar = window.getByRole("textbox", { name: "Address bar" });
       await bar.click();
-      await bar.pressSequentially(devUrl("address-bar"), { delay: 25 });
+      await bar.pressSequentially(devUrl("address-bar"), { delay: typingDelay });
       await bar.press("Enter");
-      await expectDevPage(devUrl("address-bar"), "address-bar *.localhost preview");
+      const addressView = await expectDevPage(
+        devUrl("address-bar"),
+        "address-bar *.localhost preview",
+      );
+      // Dev servers push hot reloads over a WebSocket on the same host.
+      const socketUrl = `ws://${devHost}/hmr`;
+      const echo = await electronApp.evaluate(
+        async (_electron, { id, url }) =>
+          global.omnigentTestBrowserRegistries[0].get(id).view.webContents.executeJavaScript(`
+            new Promise((resolve) => {
+              const socket = new WebSocket(${JSON.stringify(url)});
+              const timeout = setTimeout(() => resolve("timed out"), 10000);
+              socket.onopen = () => socket.send("hmr-ping");
+              socket.onmessage = (event) => { clearTimeout(timeout); resolve(event.data); };
+              socket.onerror = () => { clearTimeout(timeout); resolve("failed"); };
+            })
+          `),
+        { id: addressView.id, url: socketUrl },
+      );
+      assert.equal(echo, "hmr-ping", "a *.localhost WebSocket upgrade completes");
+      assert.deepEqual(devUpgrades, [devHost]);
+      const upgrades = (await electronApp.evaluate(() => global.allowedNetworkResponses)).filter(
+        (response) => response.url === socketUrl,
+      );
+      assert.deepEqual(
+        upgrades.map(({ ip, statusCode, cancel }) => ({ ip, statusCode, cancel })),
+        [{ ip: undefined, statusCode: 101, cancel: false }],
+        "Chromium omits the upgrade's connected IP, so the direct-route check decides",
+      );
       await hold(3000);
 
       // Opt in to opening chat links in the in-app browser, then return to the session.
@@ -931,12 +982,12 @@ it(
       await openSessionBrowserTab(window, backend.serverUrl, backend.otherSessionId);
       const remoteBar = window.getByRole("textbox", { name: "Address bar" });
       await remoteBar.click();
-      await remoteBar.pressSequentially(devUrl("remote"), { delay: 25 });
+      await remoteBar.pressSequentially(devUrl("remote"), { delay: typingDelay });
       await remoteBar.press("Enter");
       const refusal = window.getByRole("alert").filter({ hasText: "is a loopback/internal host" });
       await refusal.waitFor();
       assert.equal(devRequests.length, 3, "a remote session sends no *.localhost request");
-      await hold(4000);
+      await wait(recording ? 4000 : 1000);
       assert.equal(await refusal.isVisible(), true, "the refusal stays on screen");
       mark("end");
       await desktop.stopDisplayCapture();
