@@ -138,7 +138,7 @@ def test_message_font_size_survives_rotation_and_reload(
             if reload:
                 page.reload()
             assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
-            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 13)
+            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 14)
             message_px = interface_px
             for element in prose:
                 expect(element).to_have_css("font-size", f"{message_px}px")
@@ -178,7 +178,7 @@ def test_large_message_fallback_keeps_message_font_size(
         for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
             fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
             expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
-            expected_px = (15 if width < 768 else 13) if touch else 12
+            expected_px = (15 if width < 768 else 14) if touch else 13
             expect(fallback).to_have_css("font-size", f"{expected_px}px")
 
 

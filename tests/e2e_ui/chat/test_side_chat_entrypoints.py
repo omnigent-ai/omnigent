@@ -323,8 +323,9 @@ def test_side_chat_keeps_reader_scrolled_up_when_follow_up_reply_finishes(
         page.get_by_test_id("side-chat-send").click()
         _wait_for_blocked_reply(page, mock_llm_server_url, "The side-chat follow-up")
         expect(pane.get_by_test_id("working-indicator")).to_be_visible()
-        pane.locator(":scope > div.overflow-y-auto").hover()
-        page.mouse.wheel(0, -900)
+        transcript = pane.locator(":scope > div.overflow-y-auto")
+        transcript.hover()
+        page.mouse.wheel(0, -transcript.evaluate("el => el.scrollHeight"))
         expect(first_paragraph).to_be_in_viewport()
 
         # Release the reply only once the reader has scrolled up.

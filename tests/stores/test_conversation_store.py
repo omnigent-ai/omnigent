@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -4800,6 +4802,28 @@ def test_update_conversation_share_workspace_files_round_trips(
     assert conversation_store.get_conversation(conv_id).share_workspace_files is False
 
 
+@pytest.mark.parametrize("continue_source", [True, False])
+def test_only_a_continuation_keeps_the_shared_workspace_files(
+    conversation_store: SqlAlchemyConversationStore, continue_source: bool
+) -> None:
+    """A continuation of a session sharing its files shares them too; a fork starts unshared.
+
+    The continuation carries on the same chat in the same workspace and is
+    shared exactly as its source, so the owner's opt-in carries over. An
+    ordinary fork is a new session the owner has not shared files for.
+    """
+    source = conversation_store.create_conversation(host_id=uuid.uuid4().hex, workspace="/work")
+    conversation_store.update_conversation(source.id, share_workspace_files=True)
+
+    fork = conversation_store.fork_conversation(
+        source.id, copy_items=False, continue_source=continue_source
+    )
+
+    forked = conversation_store.get_conversation(fork.id)
+    assert forked is not None
+    assert forked.share_workspace_files is continue_source
+
+
 def test_set_host_id_no_workspace_fails_when_row_has_none(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -6377,6 +6401,126 @@ def test_fork_conversation_up_to_unknown_response_raises(
 
     with pytest.raises(ValueError, match="resp_nope"):
         conversation_store.fork_conversation(source.id, up_to_response_id="resp_nope")
+
+
+def test_fork_conversation_before_item_drops_the_item_and_later_history(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """``before_item_id`` copies only the items positioned before that item.
+
+    The fork keeps everything before the item, drops the item and the turns
+    after it, and never resumes the source's full native transcript. The
+    first item leaves nothing to copy; unknown or combined cutoffs fail. A
+    fork that copies no items behaves the same and accepts no cutoff.
+    """
+    from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
+
+    agent_store.create(
+        agent_id="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b",
+        name="fork-before-item",
+        bundle_location="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b/fakehash",
+    )
+    source = conversation_store.create_conversation(agent_id="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b")
+    conversation_store.set_external_session_id(source.id, "claude-uuid-before")
+    _append_three_responses(conversation_store, source.id)
+    source_items = conversation_store.list_items(source.id).data
+    second_prompt, first_prompt = source_items[2], source_items[0]
+
+    def fork_texts(fork_id: str) -> list[str]:
+        return [
+            part["text"]
+            for item in conversation_store.list_items(fork_id).data
+            for part in item.data.content  # type: ignore[union-attr]
+        ]
+
+    fork = conversation_store.fork_conversation(source.id, before_item_id=second_prompt.id)
+    assert fork_texts(fork.id) == ["Q1", "A1"]
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+
+    first = conversation_store.fork_conversation(source.id, before_item_id=first_prompt.id)
+    assert fork_texts(first.id) == []
+    assert len(conversation_store.list_items(source.id).data) == 6
+
+    missing_item_id = "f" * 32
+    with pytest.raises(ValueError, match=missing_item_id):
+        conversation_store.fork_conversation(source.id, before_item_id=missing_item_id)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        conversation_store.fork_conversation(
+            source.id, up_to_response_id="resp_001", before_item_id=second_prompt.id
+        )
+
+    # ``copy_items=False`` copies nothing and, as a truncation, never resumes
+    # the source's native transcript; it takes no cutoff.
+    empty = conversation_store.fork_conversation(source.id, copy_items=False)
+    assert fork_texts(empty.id) == []
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in empty.labels
+    for cutoff in ({"before_item_id": second_prompt.id}, {"up_to_response_id": "resp_001"}):
+        with pytest.raises(ValueError, match="copy_items=False"):
+            conversation_store.fork_conversation(source.id, copy_items=False, **cutoff)
+
+
+def test_continuation_fork_and_host_teardown_serialize_on_the_host_row(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """A teardown racing a continuation's fork waits for it, then keeps the host.
+
+    The continuation copies its source's host while holding the host row lock
+    that host deletion takes. Deleting the source and its host while the
+    continuation's metadata is mid-insert must block on that lock and then see
+    the continuation, rather than tear the host down under it. (SQLite already
+    serializes the two writes; the row lock matters on Postgres and MySQL.)
+    """
+    from omnigent.db.utils import now_epoch
+
+    hosts = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="continued-sandbox",
+        user_id=RESERVED_USER_LOCAL,
+        token="launch-token",
+        provider="modal",
+        sandbox_id="sb-continued",
+        token_expires_at=now_epoch() + 3600,
+    )
+    source = conversation_store.create_conversation(host_id=host_id, workspace="/work")
+    torn_down: list[object] = []
+
+    def delete_source_and_host() -> None:
+        asyncio.run(conversation_store.delete_conversation(source.id))
+        torn_down.append(hosts.delete_host(host_id, keep_if_bound=True))
+
+    deleter = threading.Thread(target=delete_source_and_host)
+
+    def race_the_insert(_conn: object, _cursor: object, statement: str, *_args: object) -> None:
+        if (
+            deleter.is_alive()
+            or torn_down
+            or not statement.lstrip()
+            .upper()
+            .startswith("INSERT INTO OMNIGENT_CONVERSATION_METADATA")
+        ):
+            return
+        deleter.start()
+        # A teardown that skipped the host lock would finish in this window.
+        deleter.join(timeout=1.0)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", race_the_insert)
+    try:
+        fork = conversation_store.fork_conversation(
+            source.id, copy_items=False, continue_source=True
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", race_the_insert)
+    deleter.join(timeout=30)
+
+    assert not deleter.is_alive()
+    assert torn_down == [None]
+    assert hosts.get_host(host_id) is not None
+    continuation = conversation_store.get_conversation(fork.id)
+    assert continuation is not None
+    assert (continuation.host_id, continuation.workspace) == (host_id, "/work")
 
 
 def test_fork_clone_agent_is_session_scoped(

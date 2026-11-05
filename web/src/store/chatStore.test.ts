@@ -7260,6 +7260,86 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("clearContext", () => {
+    /** Answer the clear POST with *body* once *acknowledge* is called. */
+    function answerClear(body: Record<string, unknown>): () => void {
+      let acknowledge = () => {};
+      const answered = new Promise<void>((resolve) => {
+        acknowledge = resolve;
+      });
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) === "/v1/sessions/conv_old/events" && init?.method === "POST") {
+          await answered;
+          return mockResponse(body);
+        }
+        return defaultFetchHandler(input, init);
+      });
+      return acknowledge;
+    }
+
+    it("follows the new session when the live redirect was missed", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerClear({ queued: false, session_id: "conv_new" })();
+
+      await useChatStore.getState().clearContext();
+
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+    });
+
+    it("stays put when the user switched away before the clear was acknowledged", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      const acknowledge = answerClear({ queued: false, session_id: "conv_new" });
+
+      const clearing = useChatStore.getState().clearContext();
+      useChatStore.setState({ conversationId: "conv_other" });
+      acknowledge();
+      await clearing;
+
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
+
+    it("does not redirect again after following the live redirect", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      const acknowledge = answerClear({ queued: false, session_id: "conv_new" });
+
+      const clearing = useChatStore.getState().clearContext();
+      handleSessionEvent({
+        type: "session_superseded",
+        conversationId: "conv_old",
+        targetConversationId: "conv_new",
+        reason: "clear",
+      });
+      // The page follows the redirect and consumes it.
+      useChatStore.setState({ conversationId: "conv_new", redirectToConversationId: null });
+      acknowledge();
+      await clearing;
+
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
+
+    it("keeps a live redirect still pending when the clear is acknowledged", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      const acknowledge = answerClear({ queued: false, session_id: "conv_new" });
+
+      const clearing = useChatStore.getState().clearContext();
+      // The live redirect lands first and has not been followed yet.
+      useChatStore.setState({ redirectToConversationId: "conv_pending" });
+      acknowledge();
+      await clearing;
+
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_pending");
+    });
+
+    it("leaves a native clear, which names no session, to its live redirect", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerClear({ queued: false })();
+
+      await useChatStore.getState().clearContext();
+
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
+  });
+
   describe("session.status", () => {
     it("updates sessionStatus from the event", () => {
       const event: SessionStatusEvent = {

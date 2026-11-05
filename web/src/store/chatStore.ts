@@ -1438,7 +1438,7 @@ export interface ChatActions {
    * there is no active conversation.
    */
   compact: () => Promise<void>;
-  /** Run the native harness's /clear in the session terminal. */
+  /** Run the harness's /clear; the view follows the session that continues the work. */
   clearContext: () => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
@@ -3603,7 +3603,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   clearContext: async () => {
     const { conversationId } = get();
     if (!conversationId) return;
-    await postEvent(conversationId, { type: "clear", data: {} });
+    const { sessionId } = await postEvent(conversationId, { type: "clear", data: {} });
+    // A claude-sdk clear names its new session; follow it if the live
+    // `session.superseded` redirect was missed, unless the user moved on or a
+    // redirect is already pending. A native clear names none.
+    if (!sessionId || sessionId === conversationId) return;
+    useChatStore.setState((s) =>
+      s.conversationId === conversationId && s.redirectToConversationId === null
+        ? { redirectToConversationId: sessionId }
+        : {},
+    );
   },
 
   refreshSessionState: async (conversationId) => {

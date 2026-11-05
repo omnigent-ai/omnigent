@@ -126,7 +126,7 @@ def test_attachment_only_steering_explanation_stays_visible_on_desktop(
     """A text-less steer has no focusable footer control, so it must not hide."""
     chat = chat_session_contract
     chat.harness = "codex-native"
-    chat.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+    chat.update_session(status="running", labels={"omnigent.wrapper": "codex-native-ui"})
     chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
     chat.reject_uploads = False
     page.set_viewport_size({"width": 1280, "height": 900})
@@ -170,6 +170,11 @@ def test_bare_idle_clears_the_live_working_indicator(
 
     chat.emit_busy("browser-turn")
     expect(working).to_be_visible(timeout=10_000)
+    working_font = working.locator(".text-shimmer").evaluate(
+        "element => getComputedStyle(element).fontFamily"
+    )
+    body_font = page.evaluate("() => getComputedStyle(document.body).fontFamily")
+    assert working_font == body_font
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)

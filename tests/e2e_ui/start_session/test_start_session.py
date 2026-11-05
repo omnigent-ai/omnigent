@@ -1436,9 +1436,7 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
                 await page.get_by_test_id("new-chat-button").click()
             await (await landing_hosts.value).finished()
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await expect(chip).to_have_attribute(
-                "aria-label", re.compile("No host selected, Offline")
-            )
+            await expect(chip).to_have_attribute("aria-label", "Host: No host selected")
 
             # A later host refresh reports the continuously preferred VM again.
             # The empty slot lets that saved choice heal automatically.
