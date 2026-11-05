@@ -244,8 +244,10 @@ class FakeStartupInputs:
             {"session_id": session_id, "event": event, "user_id": user_id, "headers": headers}
         )
 
-    async def record_launch_failure(self, session_id: str, reason: str) -> None:
+    async def record_launch_failure(self, session_id: str, reason: Any) -> str:
+        reason = await reason() if callable(reason) else reason
         self.launch_failures.append((session_id, reason))
+        return reason
 
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
@@ -610,17 +612,29 @@ async def test_delete_between_on_fire_and_run_fire_is_noop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_active_creates_session_grant_and_run() -> None:
+@pytest.mark.parametrize("session_mode", ["new", "continue"])
+@pytest.mark.parametrize("trigger", [False, True])
+async def test_active_creates_session_grant_and_run(session_mode: str, trigger: bool) -> None:
     perm = FakePermissionStore()
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    task = _task(
+        prompt="This automation watches Jira and starts one Omnigent session"
+        if trigger
+        else "Do the work.",
+        session_mode=session_mode,
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": task})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append((conv, task))
 
     on_fire = build_on_fire(
-        _deps(store, permission_store=perm, conversation_store=conv_store),
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+        ),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -629,6 +643,9 @@ async def test_active_creates_session_grant_and_run() -> None:
     # A conversation was created bound to the task's agent.
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["agent_id"] == "ag_1"
+    assert conv_store.created[0]["title"] == (
+        "[automation job] nightly" if trigger and session_mode == "continue" else "nightly"
+    )
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
     assert perm.ensured == [RESERVED_USER_LOCAL]
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
@@ -2674,18 +2691,48 @@ async def test_a_first_run_whose_session_record_fails_never_runs_unbound(committ
 
 
 @pytest.mark.asyncio
-async def test_a_first_run_skips_when_another_run_already_started_the_session() -> None:
-    """The run that records its session second deletes it before anything ran in it."""
-    conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(session_mode="continue")})
+@pytest.mark.parametrize(
+    "change,error_code",
+    [
+        ("none", None),
+        ("reset", "session_record_failed"),
+        ("deleted", "session_record_failed"),
+        ("new_mode", "session_record_failed"),
+        ("read_failed", "session_record_failed"),
+        ("incompatible", "continued_session_incompatible"),
+    ],
+)
+async def test_a_first_run_reuses_the_winning_session_if_still_available(
+    monkeypatch: pytest.MonkeyPatch, change: str, error_code: str | None
+) -> None:
+    conv_store = _ExistingConversationStore(
+        _continued_session(workspace="/different" if change == "incompatible" else "/repo")
+    )
+    task = _task(session_mode="continue")
+    store = FakeScheduledTaskStore(rows={"task_1": task})
     store.adopt_outcome = "taken"
+    adopt = store.adopt_session
+
+    def record_winner(*args: Any, **kwargs: Any) -> str:
+        outcome = adopt(*args, **kwargs)
+        store._rows[task.id] = replace(
+            task,
+            session_id=None if change == "reset" else "conv_prev",
+            session_mode="new" if change == "new_mode" else "continue",
+            state="deleted" if change == "deleted" else task.state,
+        )
+        if change == "read_failed":
+            monkeypatch.setattr(store, "get", Mock(side_effect=RuntimeError("read failed")))
+        return outcome
+
+    monkeypatch.setattr(store, "adopt_session", record_winner)
 
     launched = await _fire_once(_deps(store, conversation_store=conv_store))
 
-    assert launched == []
+    assert [conv.id for conv in launched] == ([] if error_code else ["conv_prev"])
     assert conv_store.deleted == ["conv_1"]
     assert [(run["status"], run["error_code"]) for run in store.runs] == [
-        ("skipped", "continued_session_busy")
+        ("failed" if error_code else "succeeded", error_code)
     ]
 
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CircleAlertIcon,
   CommandIcon,
@@ -10,6 +10,8 @@ import {
 import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 
 /**
  * Built-in slash commands the web UI recognises directly. Each entry
@@ -408,7 +410,7 @@ function McpServerMenu({
 interface MenuRow {
   /** Slash-prefixed command name, e.g. ``"/review-pr"``. */
   name: string;
-  /** One-line description shown in the detail card when active. */
+  /** One-line description shown beside the name; a cut-off one also opens in a tooltip. */
   description: string;
   /** Index into the flat ``matches`` list — the caller's keyboard index. */
   flatIndex: number;
@@ -428,52 +430,150 @@ function RetrySkillsButton({ onClick }: { onClick: () => void }) {
   );
 }
 
+/** How long the pointer or keyboard highlight rests on a cut-off row before its tooltip opens. */
+const DESCRIPTION_TOOLTIP_DELAY_MS = 400;
+
+function isCutOff(element: HTMLElement | null): boolean {
+  return element !== null && element.scrollWidth > element.clientWidth;
+}
+
 /** A row inside a section list ("Commands" or "Skills"). */
 function MenuRowButton({
   row,
   active,
+  activeIndex,
+  tooltipOpen,
+  onTooltipOpenChange,
   onSelect,
 }: {
   /** The row to render. */
   row: MenuRow;
   /** Whether this row is the keyboard-highlighted one. */
   active: boolean;
+  /** The menu's highlighted index; moving it closes this row's tooltip. */
+  activeIndex: number;
+  /** Whether this row's description tooltip is the menu's open one. */
+  tooltipOpen: boolean;
+  /** Opens or closes this row's tooltip, called with the row's name. */
+  onTooltipOpenChange: (name: string, open: boolean) => void;
   /** Selection callback, called with the slash-prefixed name. */
   onSelect: (cmd: string) => void;
 }) {
-  const isBuiltin = row.isBuiltin;
+  const { name, isBuiltin } = row;
+  const descriptionRef = useRef<HTMLSpanElement>(null);
+  const hoverTimerRef = useRef<number | undefined>(undefined);
+  const coarsePointer = useIsCoarsePointer();
+  // A highlight resting on a cut-off row opens its tooltip, except on touch screens where most
+  // rows are cut off; a highlight move or new description closes it and drops a pending hover.
+  useEffect(() => {
+    const timer =
+      active && !coarsePointer
+        ? window.setTimeout(
+            () => onTooltipOpenChange(name, isCutOff(descriptionRef.current)),
+            DESCRIPTION_TOOLTIP_DELAY_MS,
+          )
+        : undefined;
+    return () => {
+      window.clearTimeout(timer);
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = undefined;
+      onTooltipOpenChange(name, false);
+    };
+  }, [active, activeIndex, coarsePointer, name, onTooltipOpenChange, row.description]);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
+  useEffect(() => {
+    if (!tooltipOpen) return;
+    function pageDescription(event: KeyboardEvent) {
+      const tooltip = tooltipRef.current;
+      const direction = event.key === "PageDown" ? 1 : event.key === "PageUp" ? -1 : 0;
+      if (!tooltip || direction === 0 || event.defaultPrevented) return;
+      if (event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (tooltip.scrollHeight <= tooltip.clientHeight) return;
+      event.preventDefault();
+      // Stepping two lines short of the box keeps the line cut at its edge in view.
+      const lineHeight = parseFloat(getComputedStyle(tooltip).lineHeight);
+      tooltip.scrollBy({ top: direction * (tooltip.clientHeight - 2 * lineHeight) });
+    }
+    document.addEventListener("keydown", pageDescription);
+    return () => document.removeEventListener("keydown", pageDescription);
+  }, [tooltipOpen]);
   // Wand in pink for skills (per design feedback — distinct from the
   // info-blue slash-command tint, and from plain Sparkles which marks
   // thinking/reasoning blocks), the ⌘ glyph in slate for built-ins.
   const Icon = isBuiltin ? CommandIcon : WandSparklesIcon;
   return (
-    <button
-      type="button"
-      data-testid={`slash-menu-item-${row.name.slice(1)}`}
-      data-active={active ? "true" : undefined}
-      className={cn(
-        "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
-        active && "bg-muted dark:bg-muted/50",
-      )}
-      // preventDefault keeps the textarea focused while the user clicks.
-      onMouseDown={(e) => e.preventDefault()}
-      onClick={() => onSelect(row.name)}
+    <Tooltip
+      open={tooltipOpen}
+      onOpenChange={(open) => onTooltipOpenChange(name, open && isCutOff(descriptionRef.current))}
     >
-      <span className="flex size-4 shrink-0 items-center justify-center">
-        <Icon
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          data-testid={`slash-menu-item-${row.name.slice(1)}`}
+          data-active={active ? "true" : undefined}
           className={cn(
-            "size-3.5",
-            isBuiltin ? "text-slate-500 dark:text-slate-400" : "text-pink-500 dark:text-pink-400",
+            "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
+            active && "bg-muted dark:bg-muted/50",
           )}
-        />
-      </span>
-      <span className="shrink-0">{row.name}</span>
-      {/* Description inline (matching the "+" tray), so the menu is
-          self-describing without a separate detail card. */}
+          // The menu times hovers itself, since a highlight move can't cancel Radix's timer.
+          onPointerMove={(e) => {
+            e.preventDefault();
+            if (e.pointerType === "touch" || tooltipOpen || hoverTimerRef.current !== undefined) {
+              return;
+            }
+            hoverTimerRef.current = window.setTimeout(() => {
+              hoverTimerRef.current = undefined;
+              if (isCutOff(descriptionRef.current)) onTooltipOpenChange(name, true);
+            }, DESCRIPTION_TOOLTIP_DELAY_MS);
+          }}
+          onPointerLeave={() => {
+            window.clearTimeout(hoverTimerRef.current);
+            hoverTimerRef.current = undefined;
+          }}
+          // preventDefault keeps the textarea focused while the user clicks.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => onSelect(row.name)}
+        >
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <Icon
+              className={cn(
+                "size-3.5",
+                isBuiltin
+                  ? "text-slate-500 dark:text-slate-400"
+                  : "text-pink-500 dark:text-pink-400",
+              )}
+            />
+          </span>
+          <span className="shrink-0">{row.name}</span>
+          {/* Description inline (matching the "+" tray), so the menu is
+              self-describing without a separate detail card. */}
+          {row.description && (
+            <span
+              ref={descriptionRef}
+              data-testid={`slash-menu-description-${row.name.slice(1)}`}
+              className="truncate text-xs leading-4 text-muted-foreground"
+            >
+              {row.description}
+            </span>
+          )}
+        </button>
+      </TooltipTrigger>
       {row.description && (
-        <span className="truncate text-xs leading-4 text-muted-foreground">{row.description}</span>
+        <TooltipContent
+          ref={tooltipRef}
+          side="top"
+          align="end"
+          data-testid={`slash-menu-tooltip-${row.name.slice(1)}`}
+          // Top-aligned so a description taller than the cap scrolls from its first line.
+          className="max-h-64 max-w-[min(28rem,calc(100vw-2rem))] items-start overflow-y-auto break-words text-xs leading-4"
+          // Pressing inside the tooltip keeps the textarea focused, so the menu stays open.
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          {row.description}
+        </TooltipContent>
       )}
-    </button>
+    </Tooltip>
   );
 }
 
@@ -481,9 +581,9 @@ function MenuRowButton({
  * Floating suggestions menu rendered above the composer when the user
  * starts a slash command, shared by the in-session composer (ChatPage)
  * and the new-chat landing composer (NewChatDialog). Cursor-style
- * layout: a narrow panel with "Commands" / "Skills" section headers and
- * icon + name rows, plus a detail card beside the panel showing the
- * highlighted entry's full description (hidden on small screens).
+ * layout: a panel with "Commands" / "Skills" section headers and icon +
+ * name + one-line description rows. Resting the pointer or keyboard
+ * highlight on a cut-off row shows its full description in a tooltip.
  * Only commands whose name (sans ``/``) contains the current query as a
  * case-insensitive substring are shown.
  * Positioned via ``absolute bottom-full`` relative to the rounded
@@ -510,6 +610,11 @@ export function SlashCommandMenu({
 }: SlashCommandMenuProps) {
   const matchedNames = rankedSlashCommandNames(commands, query, builtinNames, labels);
   const listRef = useRef<HTMLDivElement>(null);
+  // One description tooltip at a time, so a hover never leaves one beside the highlighted row's.
+  const [tooltipRow, setTooltipRow] = useState<string | null>(null);
+  const setRowTooltipOpen = useCallback((name: string, open: boolean) => {
+    setTooltipRow((current) => (open ? name : current === name ? null : current));
+  }, []);
   // Keep the keyboard-highlighted row visible as the user arrows past the
   // visible window of this capped-height, scrollable list. Without this the
   // selection silently moves off-screen. Mirrors the WorkspacePathField
@@ -552,67 +657,75 @@ export function SlashCommandMenu({
   // with section headers and icon + name + inline description rows. No separate
   // detail card — each row is self-describing.
   return (
-    <div
-      data-testid="slash-command-menu"
-      className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
-    >
-      <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
-        {builtinRows.length > 0 && sectionHeader("Commands")}
-        {builtinRows.map((row) => (
-          <MenuRowButton
-            key={row.name}
-            row={row}
-            active={row.flatIndex === activeIndex}
-            onSelect={onSelect}
-          />
-        ))}
-        {(skillRows.length > 0 || skillsStatus != null) && sectionHeader("Skills")}
-        {skillsStatus === "loading" && (
-          <div
-            role="status"
-            className="flex items-center gap-2 px-1.5 py-1 text-ui text-muted-foreground"
-          >
-            <LoaderCircleIcon aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
-            Loading skills…
-          </div>
-        )}
-        {skillsStatus === "error" && (
-          <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            Couldn’t load skills. {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
-          </div>
-        )}
-        {skillsStatus === "unavailable" && (
-          <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            {skillsUnavailableMessage}
-          </div>
-        )}
-        {/* An incomplete catalog explains itself; "No skills available" is only claimed when complete. */}
-        {skillsStatus === "ready" && skillsWarnings.length > 0 && (
-          <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            {skillsWarnings.map((warning) => (
-              <span key={warning} className="block break-words">
-                {warning}
-              </span>
-            ))}
-            {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
-          </div>
-        )}
-        {skillsStatus === "ready" &&
-          skillRows.length === 0 &&
-          (query !== "" || skillsWarnings.length === 0) && (
-            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-              {query ? "No matching skills" : "No skills available"}
+    <TooltipProvider>
+      <div
+        data-testid="slash-command-menu"
+        className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
+      >
+        <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
+          {builtinRows.length > 0 && sectionHeader("Commands")}
+          {builtinRows.map((row) => (
+            <MenuRowButton
+              key={row.name}
+              row={row}
+              active={row.flatIndex === activeIndex}
+              activeIndex={activeIndex}
+              tooltipOpen={tooltipRow === row.name}
+              onTooltipOpenChange={setRowTooltipOpen}
+              onSelect={onSelect}
+            />
+          ))}
+          {(skillRows.length > 0 || skillsStatus != null) && sectionHeader("Skills")}
+          {skillsStatus === "loading" && (
+            <div
+              role="status"
+              className="flex items-center gap-2 px-1.5 py-1 text-ui text-muted-foreground"
+            >
+              <LoaderCircleIcon aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
+              Loading skills…
             </div>
           )}
-        {skillRows.map((row) => (
-          <MenuRowButton
-            key={row.name}
-            row={row}
-            active={row.flatIndex === activeIndex}
-            onSelect={onSelect}
-          />
-        ))}
+          {skillsStatus === "error" && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              Couldn’t load skills. {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
+            </div>
+          )}
+          {skillsStatus === "unavailable" && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              {skillsUnavailableMessage}
+            </div>
+          )}
+          {/* An incomplete catalog explains itself; "No skills available" is only claimed when complete. */}
+          {skillsStatus === "ready" && skillsWarnings.length > 0 && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              {skillsWarnings.map((warning) => (
+                <span key={warning} className="block break-words">
+                  {warning}
+                </span>
+              ))}
+              {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
+            </div>
+          )}
+          {skillsStatus === "ready" &&
+            skillRows.length === 0 &&
+            (query !== "" || skillsWarnings.length === 0) && (
+              <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+                {query ? "No matching skills" : "No skills available"}
+              </div>
+            )}
+          {skillRows.map((row) => (
+            <MenuRowButton
+              key={row.name}
+              row={row}
+              active={row.flatIndex === activeIndex}
+              activeIndex={activeIndex}
+              tooltipOpen={tooltipRow === row.name}
+              onTooltipOpenChange={setRowTooltipOpen}
+              onSelect={onSelect}
+            />
+          ))}
+        </div>
       </div>
-    </div>
+    </TooltipProvider>
   );
 }

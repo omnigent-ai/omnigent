@@ -659,6 +659,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        # Path to the MCP sign-in status file; the executor must read the
+        # same file the host lists in /mcp to reconnect after sign-in.
+        "OMNIGENT_MCP_AUTH_STATUS_FILE",
         # The workspace this host is bound to (cli_auth.load_databricks_org_id),
         # so runners keep routing to it when the stored record changes.
         "OMNIGENT_DATABRICKS_ORG_PIN",
@@ -1030,6 +1033,9 @@ def _build_runner_env(
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
     }
+    # Runners start in the session workspace, so resolve a relative override here.
+    if auth_status_file := env.get("OMNIGENT_MCP_AUTH_STATUS_FILE"):
+        env["OMNIGENT_MCP_AUTH_STATUS_FILE"] = str(Path(auth_status_file).expanduser().absolute())
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token

@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   apiErrorFromResponse,
+  parseRetryAfterMs,
   approve,
   bindOnlyOnlineRunner,
   createBundledSession,
@@ -97,7 +98,43 @@ describe("fetchSessionRepositoryBranches", () => {
   });
 });
 
+describe("parseRetryAfterMs", () => {
+  it("reads delta-seconds and HTTP dates, and rejects anything else", () => {
+    const now = Date.parse("2026-11-04T00:00:00Z");
+    expect(parseRetryAfterMs("30", now)).toBe(30_000);
+    expect(parseRetryAfterMs(" 0 ", now)).toBe(0);
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:05 GMT", now)).toBe(5_000);
+    // A date already past means "now", not a negative wait.
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:00 GMT", now + 1_000)).toBe(0);
+    expect(parseRetryAfterMs(null, now)).toBeNull();
+    expect(parseRetryAfterMs("soon", now)).toBeNull();
+    // Malformed numbers aren't dates, so they mustn't read as "retry now".
+    expect(parseRetryAfterMs("-1", now)).toBeNull();
+    expect(parseRetryAfterMs("1.5", now)).toBeNull();
+    expect(parseRetryAfterMs("2026-11-04", now)).toBeNull();
+    // Looser date forms Date.parse would accept, read as "now" or a far-off wait.
+    expect(parseRetryAfterMs("Mon 1", now)).toBeNull();
+    expect(parseRetryAfterMs("January 1, 2027", now)).toBeNull();
+    expect(parseRetryAfterMs("Wednesday, 04-Nov-26 00:00:05 GMT", now)).toBeNull();
+  });
+});
+
 describe("apiErrorFromResponse", () => {
+  it("records the response's Retry-After for the retry policy", async () => {
+    const throttled = new Response(JSON.stringify({ error: { code: "rate_limited" } }), {
+      status: 429,
+      headers: { "Retry-After": "7" },
+    });
+    expect((await apiErrorFromResponse(throttled)).retryAfterMs).toBe(7_000);
+
+    const plain = new Response("{}", { status: 503 });
+    expect((await apiErrorFromResponse(plain)).retryAfterMs).toBeNull();
+    // Hand-built stand-ins have no headers at all.
+    expect(
+      (await apiErrorFromResponse(mockJsonResponse({}, { ok: false, status: 503 }))).retryAfterMs,
+    ).toBeNull();
+  });
+
   it("reads the AP `error` envelope (message + code)", async () => {
     const err = await apiErrorFromResponse(
       mockJsonResponse(
@@ -186,6 +223,7 @@ describe("createSession", () => {
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
+      failedInputs: [],
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
@@ -335,11 +373,12 @@ describe("createSession", () => {
     expect(session.queuedItems).toEqual(queued);
   });
 
-  it("maps pending_inputs (snake) to pendingInputs (camel) with content", async () => {
+  it("maps pending_inputs and failed_inputs (snake) to camel with content", async () => {
     // The snapshot replays un-consumed native web messages here so the
     // store re-hydrates the optimistic bubble on rebind. Each entry's
     // pending_id becomes the bubble's stable key and the content is
-    // carried through verbatim for rendering.
+    // carried through verbatim for rendering. Undelivered startup
+    // messages share the shape.
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -350,12 +389,26 @@ describe("createSession", () => {
         pending_inputs: [
           { pending_id: "pending_1", content: [{ type: "input_text", text: "queued" }] },
         ],
+        failed_inputs: [
+          {
+            pending_id: "pending_2",
+            content: [{ type: "input_text", text: "lost" }],
+            created_by: "alice@example.com",
+          },
+        ],
       }),
     );
 
     const session = await createSession("agent_xyz");
     expect(session.pendingInputs).toEqual([
       { pendingId: "pending_1", content: [{ type: "input_text", text: "queued" }] },
+    ]);
+    expect(session.failedInputs).toEqual([
+      {
+        pendingId: "pending_2",
+        content: [{ type: "input_text", text: "lost" }],
+        createdBy: "alice@example.com",
+      },
     ]);
   });
 
