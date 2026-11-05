@@ -1,7 +1,7 @@
 """Add background_task_count to conversation metadata.
 
 Revision ID: a3f8b3a5902c
-Revises: d0a1f879a01d
+Revises: c7cd88f24c1c
 
 Adds a nullable Integer ``background_task_count`` column to
 ``omnigent_conversation_metadata``: the number of background shells still
@@ -11,7 +11,7 @@ runner tunnel so any replica's session list can show them.
 Additive with no default or backfill; NULL means never reported. The ORM maps
 the column, so run this migration before starting a server that includes it.
 Servers already running an older binary ignore the column. To roll back to an
-older binary, downgrade to d0a1f879a01d first: an older binary refuses to start
+older binary, downgrade to c7cd88f24c1c first: an older binary refuses to start
 on a revision it does not know. Downgrade discards the counts, which the next
 turn end reports again.
 """
@@ -24,7 +24,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "a3f8b3a5902c"
-down_revision: str | None = "d0a1f879a01d"
+down_revision: str | None = "c7cd88f24c1c"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

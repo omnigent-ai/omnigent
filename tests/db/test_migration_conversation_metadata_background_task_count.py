@@ -17,7 +17,7 @@ from alembic import command
 from omnigent.db.db_models import SqlConversationMetadata
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache
 
-_PREVIOUS = "d0a1f879a01d"
+_PREVIOUS = "c7cd88f24c1c"
 _REVISION = "a3f8b3a5902c"
 _TABLE = "omnigent_conversation_metadata"
 _SESSION_ID = bytes.fromhex("0123456789abcdef0123456789abcdef")

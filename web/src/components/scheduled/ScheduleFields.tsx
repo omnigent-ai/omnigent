@@ -456,6 +456,7 @@ export function ScheduleFields({
       <div className="flex flex-wrap items-center gap-2">
         <div className="min-w-0 max-w-full">
           <Popover
+            modal
             open={timezoneOpen}
             onOpenChange={(open) => {
               setTimezoneOpen(open);
@@ -465,7 +466,7 @@ export function ScheduleFields({
             <PopoverTrigger asChild>
               <Button
                 variant="outline"
-                className="h-8 max-w-full min-w-0 justify-between gap-2 px-2.5 font-normal"
+                className="h-8 max-w-full min-w-0 justify-between gap-2 border-input bg-transparent px-2.5 font-normal"
                 role="combobox"
                 aria-label="Timezone"
                 aria-expanded={timezoneOpen}
@@ -475,7 +476,10 @@ export function ScheduleFields({
                 <ChevronDownIcon className="size-3.5 shrink-0" />
               </Button>
             </PopoverTrigger>
-            <PopoverContent align="start" className="w-[min(22rem,calc(100vw-2rem))] p-0">
+            <PopoverContent
+              align="start"
+              className="menu-surface w-[min(22rem,calc(100vw-2rem))] p-0"
+            >
               <Command label="Search timezones">
                 <CommandInput placeholder="Search timezones…" aria-label="Search timezones" />
                 <CommandList>
