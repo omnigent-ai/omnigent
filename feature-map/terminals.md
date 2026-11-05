@@ -62,9 +62,9 @@ with their own terminal retain the switcher.
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
-- Press ⌘/Ctrl+Alt+T to open a shell of the remembered default type. The chord
-  is inert while the host is offline, the session is stranded, or a shell is
-  still being created, and it yields to a focused terminal or editor.
+- Press Control+` (on every platform) to open a shell of the remembered default
+  type, also from a focused terminal. The chord is inert while the host is
+  offline, the session is stranded, or a shell is still being created.
 - In the desktop app, Control+` or File → New Terminal does the same, also
   while an embedded browser tab has focus. The menu item is disabled whenever
   the chord would be inert.
@@ -130,9 +130,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `web/src/shell/TerminalSplitControls.test.tsx` and
   `web/src/shell/MainTerminalView.test.tsx` (`pnpm --dir web test`). Manually,
   in a Claude or Codex session with the composer focused: press ⌘/Ctrl+Alt+\
-  twice and expect Terminal view, then Chat view; press ⌘/Ctrl+Alt+T and
-  expect a new shell tab to open and take focus. Repeat ⌘/Ctrl+Alt+T with the
-  shell focused and expect no second shell. With `splittable_terminal_view_ui`,
+  twice and expect Terminal view, then Chat view; press Control+` and
+  expect a new shell tab to open and take focus. With `splittable_terminal_view_ui`,
   in Terminal view with the agent terminal focused, press ⌘/Ctrl+Alt+Shift+\
   and expect a default shell pane on the right that takes typing; press
   ⌘/Ctrl+Alt+Shift+] and expect typing to reach the agent pane again.
