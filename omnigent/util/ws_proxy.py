@@ -427,18 +427,19 @@ def _connect_sync(
         status_line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
         status_parts = status_line.split(" ", 2)
         if len(status_parts) < 2 or not status_parts[0].startswith("HTTP/"):
-            raise OSError(
-                f"proxy sent a non-HTTP response to CONNECT {authority}: {status_line!r}"
-            )
+            raise OSError(f"proxy sent a non-HTTP response to CONNECT {authority}")
         status_text = status_parts[1]
-        status_code = int(status_text) if status_text.isascii() and status_text.isdigit() else 0
+        valid_status = len(status_text) == 3 and status_text.isascii() and status_text.isdigit()
+        status_code = int(status_text) if valid_status else 0
         if not 200 <= status_code < 300:
             hint = (
                 "; the proxy must allow CONNECT to this port, or NO_PROXY must list the server"
                 if status_code in (403, 405)
                 else ""
             )
-            raise OSError(f"proxy refused CONNECT to {authority}: {status_line!r}{hint}")
+            # Status code only: the proxy's reason text is untrusted.
+            status = f"status {status_code}" if status_code else "an invalid status"
+            raise OSError(f"proxy refused CONNECT to {authority} with {status}{hint}")
         if residue:
             # WebSocket is client-first: the origin cannot have spoken yet, so
             # early bytes mean a confused proxy — fail rather than desync.

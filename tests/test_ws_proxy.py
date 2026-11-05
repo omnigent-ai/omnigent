@@ -225,10 +225,11 @@ async def test_connect_tunnel(userinfo, ws_url, authority):
 @pytest.mark.parametrize(
     ("reply", "error"),
     [
-        (b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", "refused CONNECT.*Required'$"),
-        (b"HTTP/1.1 403 Forbidden\r\n\r\n", "refused CONNECT.*NO_PROXY must list the server"),
-        (b"GARBAGE 200 OK\r\n\r\n", "non-HTTP response"),
-        (b"HTTP/1.1 \xb200 OK\r\n\r\n", "refused CONNECT"),
+        (b"HTTP/1.1 407 secret-reason\r\n\r\n", "refused CONNECT.* with status 407$"),
+        (b"HTTP/1.1 403 secret-reason\r\n\r\n", "status 403; .*NO_PROXY must list the server"),
+        (b"GARBAGE 200 secret-reason\r\n\r\n", "non-HTTP response"),
+        (b"HTTP/1.1 \xb200 secret-reason\r\n\r\n", "refused CONNECT.* an invalid status$"),
+        (b"HTTP/1.1 " + b"9" * 5000 + b" secret-reason\r\n\r\n", "an invalid status$"),
         (b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 65607 + b"\r\n\r\n", "oversized"),
         (_OK + b"GARBAGE", "unexpected bytes"),
         (b"", "closed the connection"),
@@ -238,6 +239,7 @@ async def test_connect_tunnel(userinfo, ws_url, authority):
         "forbidden",
         "non-http",
         "non-decimal-status",
+        "overlong-status",
         "oversized",
         "trailing-bytes",
         "eof",
@@ -255,8 +257,9 @@ async def test_connect_error(monkeypatch, reply, error):
 
     monkeypatch.setattr(ws_proxy, "_dial_proxy", recording_dial_proxy)
     async with _connect_proxy(reply) as (port, _requests):
-        with pytest.raises(OSError, match=error):
+        with pytest.raises(OSError, match=error) as raised:
             await open_proxy_connect_socket(f"http://127.0.0.1:{port}", _TUNNEL_URL, timeout=5)
+    assert "secret-reason" not in str(raised.value)
     assert len(dialed) == 1
     assert dialed[0].fileno() == -1
 
