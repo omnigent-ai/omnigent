@@ -11,7 +11,8 @@ import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPrefer
 import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
 import {
   notifyProjectFolderPaginationChanged,
-  PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
 } from "./projectFolderPaginationPreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
@@ -43,7 +44,8 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
-  PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",

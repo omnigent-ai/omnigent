@@ -9,8 +9,11 @@ import {
   writeHiddenPickerAgents,
 } from "./pickerEntryVisibility";
 import {
-  PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
-  useProjectFolderPagination,
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  useProjectFolderCollapse,
+  useProjectFolderPageSize,
 } from "./projectFolderPaginationPreferences";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
 import {
@@ -152,20 +155,22 @@ it("carries hidden picker entries through export and import and tells an open pi
 });
 
 it("carries project folder pagination through export and import and updates mounted readers", () => {
-  localStorage.setItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY, "all");
+  localStorage.setItem(PROJECT_FOLDER_COLLAPSE_STORAGE_KEY, "false");
+  localStorage.setItem(PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY, "3");
   const exported = collectSettings()!;
-  expect(exported.settings[PROJECT_FOLDER_PAGINATION_STORAGE_KEY]).toBe("all");
-  const { result } = renderHook(() => useProjectFolderPagination());
-  expect(result.current).toBe("all");
+  expect(exported.settings[PROJECT_FOLDER_COLLAPSE_STORAGE_KEY]).toBe("false");
+  expect(exported.settings[PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY]).toBe("3");
+  const { result } = renderHook(() => [useProjectFolderCollapse(), useProjectFolderPageSize()]);
+  expect(result.current).toEqual([false, 3]);
 
   act(() => {
     applyImportedSettings({ version: 1, settings: {} });
   });
-  expect(localStorage.getItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY)).toBeNull();
-  expect(result.current).toBe("first-page");
+  expect(localStorage.getItem(PROJECT_FOLDER_COLLAPSE_STORAGE_KEY)).toBeNull();
+  expect(localStorage.getItem(PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY)).toBeNull();
+  expect(result.current).toEqual([true, PROJECT_FOLDER_PAGE_SIZE]);
   act(() => {
     applyImportedSettings(exported);
   });
-  expect(localStorage.getItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY)).toBe("all");
-  expect(result.current).toBe("all");
+  expect(result.current).toEqual([false, 3]);
 });

@@ -9,6 +9,7 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as IdentityModule from "@/lib/identity";
+import { writeProjectFolderCollapse } from "@/lib/projectFolderPaginationPreferences";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
 import { computeShiftSelectRange } from "./Sidebar";
@@ -282,11 +283,12 @@ describe("Sidebar shift-click selection", () => {
   });
 
   it.each([
-    { pagination: "first-page", selected: ["a0", "a1", "a2", "a3", "a4", "b0"] },
-    { pagination: "all", selected: ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "b0"] },
+    { collapse: true, selected: ["a0", "a1", "a2", "a3", "a4", "b0"] },
+    { collapse: false, selected: ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "b0"] },
   ])(
-    "keeps a projects-scope shift range to the listed rows when folders list $pagination",
-    async ({ pagination, selected }) => {
+    "keeps a projects-scope shift range to the listed rows (collapse behind Show more: $collapse)",
+    async ({ collapse, selected }) => {
+      writeProjectFolderCollapse(collapse);
       projectsMock.push("Alpha", "Beta");
       mockConversations([
         ...Array.from({ length: 7 }, (_, i) =>
@@ -300,22 +302,15 @@ describe("Sidebar shift-click selection", () => {
       );
       renderSidebar();
 
-      const openProjectsMenu = () =>
-        fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-          button: 0,
-          ctrlKey: false,
-        });
-      openProjectsMenu();
-      fireEvent.keyDown(await screen.findByTestId("project-folder-pagination-menu"), {
-        key: "ArrowRight",
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+        button: 0,
+        ctrlKey: false,
       });
-      fireEvent.click(await screen.findByTestId(`project-folder-pagination-${pagination}`));
-      openProjectsMenu();
       fireEvent.click(await screen.findByTestId("projects-select-sessions"));
       fireEvent.click(await screen.findByRole("link", { name: "a0" }));
       fireEvent.click(screen.getByRole("link", { name: "b0" }), { shiftKey: true });
 
-      // Listing the first page leaves a5 and a6 behind Alpha's Show more, out of the range.
+      // Collapsing leaves a5 and a6 behind Alpha's Show more, out of the range.
       await waitFor(() => {
         expect(screen.getByText(`${selected.length} selected`)).toBeInTheDocument();
       });

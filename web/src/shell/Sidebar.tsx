@@ -6,10 +6,8 @@ import { gridSessionIds, splitGrid } from "@/grid/gridLayout";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
 import {
-  PROJECT_FOLDER_PAGE_SIZE,
-  type ProjectFolderPagination,
-  useProjectFolderPagination,
-  writeProjectFolderPagination,
+  useProjectFolderCollapse,
+  useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
@@ -1476,13 +1474,13 @@ type ProjectHeaderDrag = ReturnType<typeof useSortable>;
 /**
  * One project folder. Fetches its own sessions server-side (`?project=`) so it
  * shows ALL its members regardless of how far the global sidebar list has been
- * scrolled. It lists PROJECT_FOLDER_PAGE_SIZE rows at a time; "Show more"
- * reveals the next page, fetching another server page once the loaded rows run
- * out. With "Sessions per project" set to All in the Projects menu it lists
- * every loaded row and loads further server pages as the sidebar scrolls. Lazy:
- * the fetch is gated on `expanded`, so a collapsed folder costs nothing. The
- * collapsed `marker` is supplied by the parent (best-effort, from the
- * globally-loaded window) since a collapsed folder hasn't fetched yet.
+ * scrolled. It lists `pageSize` rows at a time; "Show more" reveals the next
+ * page, fetching another server page once the loaded rows run out. With no
+ * `pageSize` (the Appearance setting turned off) it lists every loaded row and
+ * loads further server pages as the sidebar scrolls. Lazy: the fetch is gated
+ * on `expanded`, so a collapsed folder costs nothing. The collapsed `marker` is
+ * supplied by the parent (best-effort, from the globally-loaded window) since a
+ * collapsed folder hasn't fetched yet.
  */
 function ProjectFolder({
   name,
@@ -1507,12 +1505,12 @@ function ProjectFolder({
   reorderable,
   ordering,
   scrollRoot,
-  paginated,
+  pageSize,
 }: {
   /** The sidebar's scroll container, the root for unpaginated auto-loading. */
   scrollRoot: RefObject<HTMLElement | null>;
-  /** Whether the folder lists a page at a time behind Show more. */
-  paginated: boolean;
+  /** Rows listed before, and added by, each Show more; undefined lists them all. */
+  pageSize: number | undefined;
   /** Whether its rows take Custom-order drops and Move up/down. */
   reorderable: boolean;
   ordering: {
@@ -1617,7 +1615,7 @@ function ProjectFolder({
   const display = useSidebarDisplayPagination(
     conversations,
     listScope,
-    paginated ? PROJECT_FOLDER_PAGE_SIZE : undefined,
+    pageSize,
     query.hasNextPage,
     query.fetchNextPage,
     expanded ? conversations.findIndex((c) => c.id === activeConversationId) : -1,
@@ -1700,7 +1698,7 @@ function ProjectFolder({
         </p>
       </div>
     );
-  } else if (!paginated) {
+  } else if (pageSize === undefined) {
     footer = (
       <InfiniteScrollSentinel
         hasMore={query.hasNextPage}
@@ -2298,7 +2296,8 @@ function ConversationList({
   const config = useContext(SidebarConfigContext);
   // Read here, not in ProjectFolder: in React 18, a store change whose render also
   // resets state (the folder's page window) leaves the next change unnoticed.
-  const projectFolderPagination = useProjectFolderPagination();
+  const projectFolderCollapse = useProjectFolderCollapse();
+  const projectFolderPageSize = useProjectFolderPageSize();
   // Shared renders above Sessions, so the display window pages through both in that order.
   const listRows = useMemo(
     () => [...loadedSections.shared, ...loadedSections.sessions],
@@ -3101,8 +3100,6 @@ function ConversationList({
                               onCollapseAll={collapseAllProjects}
                               onProjectCreated={expandProject}
                               onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                              folderPagination={projectFolderPagination}
-                              onFolderPaginationChange={writeProjectFolderPagination}
                             />
                             {unifiedSelection && selectSessionsButton}
                           </>
@@ -3135,7 +3132,7 @@ function ConversationList({
                                   : undefined,
                             }}
                             scrollRoot={scrollContainerRef}
-                            paginated={projectFolderPagination === "first-page"}
+                            pageSize={projectFolderCollapse ? projectFolderPageSize : undefined}
                             name={group.name}
                             projectId={group.id}
                             icon={group.icon}
@@ -3790,11 +3787,6 @@ function SessionFilterMenu({
   );
 }
 
-const PROJECT_FOLDER_PAGINATION_LABELS: Record<ProjectFolderPagination, string> = {
-  "first-page": `First ${PROJECT_FOLDER_PAGE_SIZE}`,
-  all: "All",
-};
-
 function ProjectHeaderActions({
   onOrderChange,
   manualOrder,
@@ -3807,8 +3799,6 @@ function ProjectHeaderActions({
   onCollapseAll,
   onProjectCreated,
   onEnterSelectionMode,
-  folderPagination,
-  onFolderPaginationChange,
 }: {
   onOrderChange: (manual: boolean) => void;
   manualOrder: boolean;
@@ -3823,9 +3813,6 @@ function ProjectHeaderActions({
   onCollapseAll: () => void;
   onProjectCreated: (projectName: string) => void;
   onEnterSelectionMode: () => void;
-  /** How many sessions an expanded folder lists. */
-  folderPagination: ProjectFolderPagination;
-  onFolderPaginationChange: (folderPagination: ProjectFolderPagination) => void;
 }) {
   const showExpandControls = !collapsed && projectNames.length > 0;
   const allExpanded =
@@ -3867,24 +3854,6 @@ function ProjectHeaderActions({
                 </DropdownMenuRadioGroup>
               </DropdownMenuSubContent>
             </DropdownMenuSub>
-            <FilterMenuSub label="Sessions per project" testId="project-folder-pagination-menu">
-              <DropdownMenuRadioGroup
-                value={folderPagination}
-                onValueChange={(next) => onFolderPaginationChange(next as ProjectFolderPagination)}
-              >
-                {Object.entries(PROJECT_FOLDER_PAGINATION_LABELS).map(([choice, label]) => (
-                  <DropdownMenuRadioItem
-                    className="mobile-touch-target"
-                    key={choice}
-                    value={choice}
-                    data-testid={`project-folder-pagination-${choice}`}
-                  >
-                    {label}
-                  </DropdownMenuRadioItem>
-                ))}
-              </DropdownMenuRadioGroup>
-            </FilterMenuSub>
-            {(showExpandControls || hasProjectSessions) && <DropdownMenuSeparator />}
             {/* Gated independently: each hides only when it would be a no-op, so
                 a mixed set offers both. */}
             {showExpandControls && !allExpanded && (
