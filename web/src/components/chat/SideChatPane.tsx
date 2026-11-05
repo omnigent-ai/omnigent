@@ -98,6 +98,18 @@ function isPendingSideChat(id: string): boolean {
   return id.startsWith("pending:");
 }
 
+const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "password", "number", "tel"]);
+
+/** A text field other than `own`: typing there must not be interrupted by a focus request. */
+function isOtherTextInput(target: EventTarget | null, own: HTMLElement | null): boolean {
+  if (!(target instanceof HTMLElement) || target === own) return false;
+  if (target instanceof HTMLInputElement) return TEXT_INPUT_TYPES.has(target.type);
+  return (
+    target instanceof HTMLTextAreaElement ||
+    target.matches('[contenteditable]:not([contenteditable="false"])')
+  );
+}
+
 // The forked-in item ids to hide are captured once per child and PERSISTED, so
 // leaving the tab (which unmounts this pane) or reloading doesn't recapture the
 // side chat's own completed turns as inherited history and blank the transcript.
@@ -283,21 +295,33 @@ export function SideChatPane({
   const showsWorking =
     (!readOnly || fullSession) &&
     (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
+  // Background shells can outlive the child's turn; the indicator shows them.
+  const showsBackgroundTasks = (!readOnly || fullSession) && state.backgroundTaskCount > 0;
   // Native interruption needs an observed turn; local streaming can start before one exists.
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
 
-  // Keep the newest content in view. A side chat is short and non-virtualized,
-  // so a bottom sentinel scrolled on each change is enough.
+  // Keep the newest content in view until the reader scrolls up; sending
+  // follows the tail again. A side chat is short and non-virtualized, so a
+  // bottom sentinel scrolled on each change is enough.
   const transcriptRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const followTail = useRef(true);
   useEffect(() => {
-    if (!fullSession || followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [bubbles.length, activeResponse, fullSession]);
+    if (followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [bubbles.length, activeResponse]);
+  const followSentMessage = useCallback(() => {
+    followTail.current = true;
+    bottomRef.current?.scrollIntoView({ block: "end" });
+  }, []);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
-  const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
+  const isEmpty =
+    bubbles.length === 0 &&
+    !loadingConversation &&
+    !loadFailed &&
+    !showsWorking &&
+    !showsBackgroundTasks;
 
   const startSideChat = async (text: string) => {
     if (!onStart) return;
@@ -387,7 +411,9 @@ export function SideChatPane({
                   recoveryDisabled={readOnly}
                 />
               ))}
-              {shouldShowWorkingIndicator(showsWorking, bubbles) && <WorkingIndicator />}
+              {shouldShowWorkingIndicator(showsWorking || showsBackgroundTasks, bubbles) && (
+                <WorkingIndicator />
+              )}
               <div ref={bottomRef} />
             </div>
           )}
@@ -423,6 +449,7 @@ export function SideChatPane({
                 pending={pending}
                 starting={starting}
                 onStart={onStart ? startSideChat : undefined}
+                onSend={followSentMessage}
               />
             )}
           </div>
@@ -452,6 +479,7 @@ function SideChatComposer({
   pending,
   starting,
   onStart,
+  onSend,
 }: {
   fullSession: boolean;
   childId: string;
@@ -465,6 +493,8 @@ function SideChatComposer({
   pending: boolean;
   starting: boolean;
   onStart?: (text: string) => Promise<void>;
+  /** Called when a live tab sends or queues a follow-up. */
+  onSend: () => void;
 }) {
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
@@ -659,6 +689,33 @@ function SideChatComposer({
   }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels, settingsSaving]);
 
   const ready = (pending ? !starting : agentId !== null) && !settingsSaving;
+  // A tab opened from a "+" is ready to type without a click. A live fork's
+  // input stays disabled until the child's agent binding arrives, so wait for it.
+  const autoFocus = composer?.autoFocus === true;
+  const dropFocusRequest = useCallback(() => {
+    // The tab may have been closed or its draft sent meanwhile; don't recreate it.
+    if (!useChatStore.getState().sideChatComposers[childId]) return;
+    updateComposer(childId, (current) => ({ ...current, autoFocus: false }));
+  }, [childId, updateComposer]);
+  useEffect(() => {
+    if (!autoFocus || !ready) return;
+    // The user may already be typing elsewhere, e.g. during a slow fork before
+    // this pane mounted; leave that field alone and just drop the request.
+    if (!isOtherTextInput(document.activeElement, tailTextareaRef.current)) {
+      tailTextareaRef.current?.focus();
+    }
+    dropFocusRequest();
+  }, [autoFocus, ready, dropFocusRequest]);
+  // Typing elsewhere while the fork binds cancels the request so focus is not
+  // pulled away later; a closing menu returning focus to its button does not.
+  useEffect(() => {
+    if (!autoFocus || ready) return;
+    const cancelOnOtherInput = (event: FocusEvent) => {
+      if (isOtherTextInput(event.target, tailTextareaRef.current)) dropFocusRequest();
+    };
+    document.addEventListener("focusin", cancelOnOtherInput);
+    return () => document.removeEventListener("focusin", cancelOnOtherInput);
+  }, [autoFocus, ready, dropFocusRequest]);
   const canSend =
     serializeReplyDraft({ quotes, text }).trim().length > 0 || (!pending && files.length > 0);
   const addFiles = (incoming: File[]) => {
@@ -817,6 +874,7 @@ function SideChatComposer({
       : null;
     const runSkill = (match: { command: string; args: string }) => {
       clearComposer(childId);
+      onSend();
       void sendSlashCommand(match.command.slice(1), match.args, agentId, {
         pinnedConversationId: childId,
       }).finally(refreshLabels);
@@ -854,12 +912,14 @@ function SideChatComposer({
       )
     ) {
       clearComposer(childId);
+      onSend();
       enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
       return;
     }
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(childId);
+    onSend();
     void send(message, agentId, outgoing, { pinnedConversationId: childId }).finally(refreshLabels);
   };
 

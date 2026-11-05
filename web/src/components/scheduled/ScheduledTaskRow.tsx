@@ -14,7 +14,7 @@
 // and the pill is the sole paused signal. A hover-revealed ellipsis (⋯) action
 // menu (Run now / Pause / Resume / Edit / Delete) sits on the right.
 
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import {
   CirclePlayIcon,
   MoreHorizontalIcon,
@@ -22,6 +22,7 @@ import {
   PencilIcon,
   PlayIcon,
   Trash2Icon,
+  TriangleAlertIcon,
 } from "lucide-react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -35,6 +36,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
+import { isTriggerPrompt } from "./triggerTemplates";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
@@ -60,9 +62,13 @@ export function ScheduledTaskRow({
   busy: boolean;
 }) {
   const navigate = useNavigate();
-  const detailPageEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
+  const info = useServerInfo();
+  const detailPageEnabled = isFeatureEnabled(info, "automations_v2");
+  const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const [menuOpen, setMenuOpen] = useState(false);
   const { trackClick } = useOmnigentAnalytics();
+  const failureLabelId = useId();
+  const failed = task.lastRunStatus === "failed";
   const paused = task.state === "paused";
   // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
   // (active tasks only — a paused task has null nextRunAt). We only format the
@@ -84,6 +90,18 @@ export function ScheduledTaskRow({
     <>
       <span className="flex min-w-0 items-center gap-2">
         <span className="truncate text-[15px] font-semibold">{task.name}</span>
+        {failed && (
+          <span
+            id={failureLabelId}
+            role="img"
+            aria-label="Last run failed"
+            title="Last run failed"
+            className="relative z-10 shrink-0 text-status-red"
+            data-testid="task-failed-warning"
+          >
+            <TriangleAlertIcon className="size-4" aria-hidden="true" />
+          </span>
+        )}
         {paused && (
           <span
             data-testid="task-paused-pill"
@@ -94,8 +112,8 @@ export function ScheduledTaskRow({
         )}
       </span>
       <span className="truncate text-ui text-muted-foreground/80" data-testid="task-schedule-line">
-        {scheduleSummary}
-        {nextRun && (
+        {triggerMode ? "Runs when new items match" : scheduleSummary}
+        {!triggerMode && nextRun && (
           <>
             {" · "}
             <span data-testid="task-next-run">Next run {nextRun}</span>
@@ -131,6 +149,7 @@ export function ScheduledTaskRow({
           data-testid="task-row-open"
           onClick={handleNavigate}
           aria-label={`Open ${task.name}`}
+          aria-describedby={failed ? failureLabelId : undefined}
           className="flex min-w-0 flex-1 cursor-pointer flex-col text-left after:absolute after:inset-0 after:content-['']"
         >
           {body}
@@ -172,16 +191,18 @@ export function ScheduledTaskRow({
           onClick={(e) => e.stopPropagation()}
           onPointerDown={(e) => e.stopPropagation()}
         >
-          <DropdownMenuItem
-            onSelect={() => {
-              trackClick("tasks.scheduled.run_now", "button");
-              onRunNow(task);
-            }}
-            data-testid="task-run-now"
-          >
-            <PlayIcon className="size-4" />
-            Run now
-          </DropdownMenuItem>
+          {!triggerMode && (
+            <DropdownMenuItem
+              onSelect={() => {
+                trackClick("tasks.scheduled.run_now", "button");
+                onRunNow(task);
+              }}
+              data-testid="task-run-now"
+            >
+              <PlayIcon className="size-4" />
+              Run now
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem
             onSelect={() => {
               trackClick("tasks.scheduled.edit", "button");
