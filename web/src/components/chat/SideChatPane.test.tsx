@@ -1039,6 +1039,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("queues a follow-up while the side chat runs and sends it when the turn ends", async () => {
+    writeAlwaysSteer(false);
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     expect(screen.queryByTestId("side-chat-send")).toBeNull();
@@ -1068,6 +1069,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("drains a queued follow-up after its side-chat tab unmounts", async () => {
+    writeAlwaysSteer(false);
     const view = renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Send after I switch tabs" } });
@@ -1087,6 +1089,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("edits, steers, and steers all queued follow-ups like the main composer", () => {
+    writeAlwaysSteer(false);
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     for (const text of ["first", "second", "third"]) {
@@ -1113,6 +1116,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("restores a queued follow-up's quote when it is edited", () => {
+    writeAlwaysSteer(false);
     useChatStore.setState({
       sideChatComposers: {
         [childId]: {
@@ -1141,6 +1145,7 @@ describe("side-chat interrupt", () => {
   });
 
   it("queues /compact for a running Codex side chat with Always steer off", () => {
+    writeAlwaysSteer(false);
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "/compact" } });
@@ -1355,6 +1360,98 @@ describe("side chat sealed by the server", () => {
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", childId] }),
     );
+  });
+});
+
+describe("side-chat scroll position", () => {
+  const earlierAnswer = itemsToBlocks([
+    {
+      id: "earlier",
+      response_id: "turn_earlier",
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "Earlier side-chat answer" }],
+    },
+  ]);
+
+  function scrollReaderUp() {
+    const transcript = screen.getByText("Earlier side-chat answer").closest(".overflow-y-auto")!;
+    Object.defineProperties(transcript, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 300 },
+    });
+    fireEvent.scroll(transcript);
+  }
+
+  it.each([
+    { name: "side chat", fullSession: false },
+    { name: "grid session", fullSession: true },
+  ])("keeps a scrolled-up $name reader in place until they send", ({ fullSession }) => {
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({
+      sessionStatus: "running",
+      activeResponse: { responseId: "turn_reply", state: "streaming", error: null },
+      blocks: earlierAnswer,
+    });
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderPane(<SideChatPane childId={childId} fullSession={fullSession} />);
+    scrollReaderUp();
+    scrollIntoView.mockClear();
+
+    act(() =>
+      entry.setState({
+        sessionStatus: "idle",
+        activeResponse: { responseId: "turn_reply", state: "completed", error: null },
+      }),
+    );
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "One more question" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(send).toHaveBeenCalledOnce();
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+
+    scrollIntoView.mockClear();
+    act(() =>
+      entry.setState({
+        activeResponse: { responseId: "turn_follow_up", state: "completed", error: null },
+      }),
+    );
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+  });
+
+  it.each([
+    {
+      action: "queues a follow-up",
+      draft: "Also check the tests",
+      dispatched: () => useChatStore.getState().queuedMessages.length === 1,
+    },
+    {
+      action: "runs a skill",
+      draft: "/review 123",
+      dispatched: () => sendSlashCommand.mock.calls.length === 1,
+    },
+  ])("follows the tail again when a scrolled-up reader $action", ({ draft, dispatched }) => {
+    writeAlwaysSteer(false);
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", blocks: earlierAnswer });
+    skillsFixture.current = {
+      skills: [{ name: "review", description: "Review code" }],
+      skillsStatus: "ready",
+    };
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderPane(<SideChatPane childId={childId} />);
+    scrollReaderUp();
+    scrollIntoView.mockClear();
+
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: draft } });
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    expect(dispatched()).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
   });
 });
 

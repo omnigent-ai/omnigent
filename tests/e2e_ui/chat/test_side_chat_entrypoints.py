@@ -284,6 +284,62 @@ def test_side_chat_sends_with_stale_branch_metadata(
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
 
 
+def test_side_chat_keeps_reader_scrolled_up_when_follow_up_reply_finishes(
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+    page: Page,
+) -> None:
+    """Scrolling up during a follow-up reply keeps the earlier text in view after it finishes."""
+    base_url, session_id = seeded_session
+    token = f"scroll-side-{session_id}"
+    earlier = "\n\n".join(
+        f"Earlier side-chat paragraph {n}: content the reader scrolls back to." for n in range(30)
+    )
+    streamed = " ".join(f"followupword{n:03d}" for n in range(60))
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": earlier},
+            {"text": streamed, "block": True, "stream": True, "chunk_delay": 0.1},
+        ],
+        key=token,
+        match=token,
+    )
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+        _start_side_chat(page, "panel", f"{token}: explain in detail")
+        pane = page.locator(".side-chat-backdrop")
+        first_paragraph = pane.get_by_text("Earlier side-chat paragraph 0:")
+        expect(pane.get_by_text("Earlier side-chat paragraph 29:")).to_be_in_viewport(
+            timeout=30_000
+        )
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        assert len(side_chat_forks) == 1
+
+        page.get_by_test_id("side-chat-input").fill(f"{token}: a follow-up question")
+        page.get_by_test_id("side-chat-send").click()
+        _wait_for_blocked_reply(page, mock_llm_server_url, "The side-chat follow-up")
+        expect(pane.get_by_test_id("working-indicator")).to_be_visible()
+        pane.locator(":scope > div.overflow-y-auto").hover()
+        page.mouse.wheel(0, -900)
+        expect(first_paragraph).to_be_in_viewport()
+
+        # Release the reply only once the reader has scrolled up.
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+        expect(pane.get_by_text("followupword059", exact=False)).to_be_attached(timeout=30_000)
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        # The snap lands when the turn commits, so hold briefly past completion.
+        page.wait_for_timeout(1_000)
+        expect(
+            first_paragraph, "the side chat scrolled the reader back to the bottom"
+        ).to_be_in_viewport(timeout=1_000)
+    finally:
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+
+
 def test_runner_bound_side_chat_closes_without_stopping_parent(
     page: Page,
     seeded_session: tuple[str, str],

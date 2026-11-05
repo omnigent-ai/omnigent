@@ -24,7 +24,7 @@ from __future__ import annotations
 import builtins
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -184,6 +184,7 @@ class Session:
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
     :param host_id: Host owning this session's runner, or ``None`` when unbound.
+    :param sandbox_status: Managed launch progress or failure details, when available.
     """
 
     id: str
@@ -206,6 +207,7 @@ class Session:
     external_session_id: str | None = None
     archived: bool = False
     host_id: str | None = None
+    sandbox_status: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -243,6 +245,7 @@ class Session:
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
             host_id=raw.get("host_id"),
+            sandbox_status=raw.get("sandbox_status"),
         )
 
 
@@ -458,6 +461,8 @@ class SessionsNamespace:
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
     ) -> Session:
         """
         Create a new session bound to an already-registered agent.
@@ -480,6 +485,10 @@ class SessionsNamespace:
             the session, e.g. ``"/Users/corey/projects/myapp"``.
         :param host_id: Launch the runner on this host; read timeout is at least
             3660 seconds. Longer or unlimited client timeouts are retained.
+        :param host_type: Use ``managed`` to provision a fresh sandbox host.
+            Its optional workspace is a repository URL instead of a host path.
+        :param sandbox_provider: Explicit managed sandbox provider, e.g. ``modal``.
+            Only valid with ``host_type="managed"``; validated by the server.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx status,
             or a host-targeted create times out before its outcome is known.
@@ -495,6 +504,10 @@ class SessionsNamespace:
             body["workspace"] = workspace
         if host_id is not None:
             body["host_id"] = host_id
+        if host_type != "external":
+            body["host_type"] = host_type
+        if sandbox_provider is not None:
+            body["sandbox_provider"] = sandbox_provider
         timeout = httpx.Timeout(self._http.timeout)
         if host_id is not None and timeout.read is not None:
             timeout.read = max(timeout.read, _HOST_LAUNCH_READ_TIMEOUT_S)
@@ -1036,6 +1049,7 @@ class SessionsNamespace:
         *,
         max_depth: int = _DEFAULT_SUBTREE_DEPTH,
         limit: int = 100,
+        expand: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> builtins.list[dict[str, Any]]:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
@@ -1052,6 +1066,11 @@ class SessionsNamespace:
         :param max_depth: Levels to descend (1 = direct children only). Capped
             to match the CLI tree and the web Agents rail.
         :param limit: Per-level page size passed to :meth:`child_sessions`.
+        :param expand: Optional predicate over a returned row deciding whether
+            to fetch that row's own children. ``None`` descends into every row.
+            A poller passes one to skip subtrees it already knows have settled,
+            so their unchanged rows aren't re-fetched; *session_id* itself is
+            always expanded.
         :returns: Flattened list of child-session summary dicts, each carrying a
             ``parent_id`` key (empty when the session has no sub-agents).
         :raises OmnigentError: On non-2xx status (404 when the session does not
@@ -1072,8 +1091,10 @@ class SessionsNamespace:
                     if not isinstance(sid, str) or sid in seen:  # cycle / dupe guard
                         continue
                     seen.add(sid)
-                    nodes.append({**row, "parent_id": parent_id})
-                    next_frontier.append(sid)
+                    node = {**row, "parent_id": parent_id}
+                    nodes.append(node)
+                    if expand is None or expand(node):
+                        next_frontier.append(sid)
             frontier = next_frontier
             depth += 1
         return nodes
@@ -1106,7 +1127,15 @@ class SessionsNamespace:
         nodes = await self.child_sessions_tree(session_id, max_depth=max_depth, limit=limit)
         return any(child_summary_busy(node) for node in nodes)
 
-    async def get(self, session_id: str) -> Session:
+    async def get(
+        self,
+        session_id: str,
+        *,
+        include_items: bool = True,
+        include_liveness: bool = True,
+        include_live_status: bool = True,
+        include_usage: bool = True,
+    ) -> Session:
         """
         Fetch the current snapshot of a session.
 
@@ -1115,14 +1144,34 @@ class SessionsNamespace:
         queued inputs — clients use this on reconnect to reconcile
         state observed via :meth:`stream`.
 
+        The ``include_*`` flags let a poller that reads only a few fields
+        (status, labels) skip the snapshot's expensive parts. Only flags set to
+        ``False`` are sent, so the default request is unchanged and older
+        servers, which ignore unknown parameters, still answer.
+
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param include_items: ``False`` skips the committed-items read
+            (``items`` is then empty).
+        :param include_liveness: ``False`` skips the runner/host liveness
+            lookup (``runner_online`` / ``host_online`` are then unset).
+        :param include_live_status: ``False`` reports the cached status
+            instead of probing the bound runner.
+        :param include_usage: ``False`` skips the subtree usage read.
         :returns: The current :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status (404 when the session does not exist).
         """
+        flags = {
+            "include_items": include_items,
+            "include_liveness": include_liveness,
+            "include_live_status": include_live_status,
+            "include_usage": include_usage,
+        }
+        params = {name: "false" for name, enabled in flags.items() if not enabled}
         resp = await self._http.get(
             f"{self._base}/v1/sessions/{session_id}",
+            params=params or None,
         )
         raise_for_status(resp.status_code, response_body(resp))
         return Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))

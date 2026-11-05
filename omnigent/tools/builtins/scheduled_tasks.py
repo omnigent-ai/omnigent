@@ -21,7 +21,11 @@ from omnigent.tools.base import Tool
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
-    "mornings). Must fire at least twice and no more often than once per hour."
+    "mornings). Must fire at least twice. The minimum is 10 minutes on "
+    "connected hosts in either session mode, or "
+    "in managed sandboxes with session_mode 'continue' "
+    "(e.g. 'FREQ=MINUTELY;INTERVAL=10'). New sandbox sessions, or servers "
+    "without sub-hour support, require 1 hour."
 )
 
 
@@ -39,11 +43,11 @@ class SysScheduledTaskCreateTool(Tool):
         return (
             "Create a scheduled task: a saved prompt that runs an agent session "
             "on a recurring schedule (RRULE). Provide the agent to run, the "
-            "prompt to send it, and the recurrence rule. The workspace is always "
-            "optional and defaults to the launch host's home directory (fine for "
-            "MCP-only / chat tasks that touch no code directory). Optionally PIN "
-            "a connected host and/or a workspace on it; with no pinned host it "
-            "runs on your live host at fire time (the owner must have an online "
+            "prompt to send it, and the recurrence rule. The workspace is optional: "
+            "a connected-host directory (defaulting to its home), or a repository URL "
+            "for managed_sandbox (defaulting to the provider's repository). With "
+            "connected_host, optionally pin a host and/or a workspace on it; with no "
+            "pinned host it runs on your live host at fire time (the owner must have an online "
             "host then, else the run is recorded as failed). The task fires "
             "automatically on its schedule until deleted."
         )
@@ -94,14 +98,18 @@ class SysScheduledTaskCreateTool(Tool):
                             "description": "Optional per-run reasoning-effort hint, e.g. 'high'.",
                         },
                         "permission_mode": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
                                 "Optional permission mode for native coding agents that "
-                                "support one (Claude Code): 'default', 'auto', "
-                                "'acceptEdits', 'plan', 'dontAsk', or 'bypassPermissions'. "
+                                "support one. Use the selected harness's vocabulary: "
+                                "Claude Code (e.g. 'acceptEdits'), Codex ('default', "
+                                "'read-only', 'full-access', 'bypass'), "
+                                "Cursor (e.g. 'auto-review'), "
+                                "Antigravity ('default', 'skip'), or Devin (e.g. 'smart'). "
                                 "Runs are unattended, so a prompting mode ('default'/'plan') "
                                 "stalls waiting for approval — prefer an auto-running mode. "
-                                "Omit for the agent default."
+                                "Set null for the agent default. This field is required so "
+                                "the user can review the effective task setting."
                             ),
                         },
                         "max_cost_usd": {
@@ -134,9 +142,10 @@ class SysScheduledTaskCreateTool(Tool):
                         "workspace": {
                             "type": "string",
                             "description": (
-                                "Optional existing absolute path where the run's runner "
-                                "starts. Omit to default to the launch host's home "
-                                "directory (whether the host is pinned or resolved)."
+                                "For connected_host: an optional existing absolute runner "
+                                "start path; omit for the host's home directory. For "
+                                "managed_sandbox: an optional repository URL, optionally "
+                                "with #branch; omit for the provider default."
                             ),
                         },
                         "host_id": {
@@ -155,8 +164,9 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Where each firing runs. 'connected_host' (default) uses a "
                                 "pinned/resolved connected host. 'managed_sandbox' provisions "
                                 "a fresh server-managed sandbox per firing, using the server's "
-                                "sandbox lifecycle settings. Do not set host_id or workspace "
-                                "with it. Requires managed sandboxes configured on the server."
+                                "sandbox lifecycle settings. Do not set host_id with it; "
+                                "workspace may name a repository URL. Requires managed "
+                                "sandboxes configured on the server."
                             ),
                         },
                         "project_name": {
@@ -175,7 +185,13 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                     },
-                    "required": ["name", "prompt", "rrule", "agent_id"],
+                    "required": [
+                        "name",
+                        "prompt",
+                        "rrule",
+                        "agent_id",
+                        "permission_mode",
+                    ],
                     "additionalProperties": False,
                 },
             },
@@ -225,7 +241,9 @@ class SysScheduledTaskUpdateTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Update a scheduled task's mutable fields. Only the fields you pass "
-            "change; omit the rest. Pass agent_id to switch which agent/harness "
+            "change, except prompt and permission_mode: first list the task and "
+            "resend those complete review fields even when they are unchanged. "
+            "Pass agent_id to switch which agent/harness "
             "it runs. Pass state='paused' to stop it firing without deleting it, "
             "or state='active' to resume. A 'completed' task has no remaining "
             "occurrences; change its rrule to schedule it again."
@@ -265,11 +283,15 @@ class SysScheduledTaskUpdateTool(Tool):
                             "description": "New reasoning-effort hint.",
                         },
                         "permission_mode": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
-                                "New permission mode for native coding agents (Claude "
-                                "Code): 'default', 'auto', 'acceptEdits', 'plan', "
-                                "'dontAsk', or 'bypassPermissions'."
+                                "New permission mode using the selected harness's vocabulary: "
+                                "Claude Code (e.g. 'acceptEdits'), Codex (e.g. 'read-only'), "
+                                "Cursor (e.g. 'auto-review'), Antigravity ('default', 'skip'), "
+                                "or Devin (e.g. 'smart'). Set null for the agent default. "
+                                "Required for approval review; resend the current value "
+                                "when it is unchanged. When switching to a harness "
+                                "without permission-mode support, send null."
                             ),
                         },
                         "max_cost_usd": {
@@ -295,8 +317,13 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                         "workspace": {
-                            "type": "string",
-                            "description": "New existing absolute runner start path.",
+                            "type": ["string", "null"],
+                            "description": (
+                                "For connected_host: a new existing absolute runner start "
+                                "path. For managed_sandbox: a repository URL, optionally "
+                                "with #branch, or null to restore the provider default. "
+                                "Omit to keep the current selection."
+                            ),
                         },
                         "host_id": {
                             "type": "string",
@@ -308,7 +335,8 @@ class SysScheduledTaskUpdateTool(Tool):
                             "description": (
                                 "Switch where firings run. 'managed_sandbox' provisions a "
                                 "fresh server-managed sandbox per firing (clears any pinned "
-                                "host; do not also set host_id or workspace)."
+                                "host; do not also set host_id). workspace may name a "
+                                "repository URL, or be null for the provider default."
                             ),
                         },
                         "state": {
@@ -330,7 +358,7 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                     },
-                    "required": ["scheduled_task_id"],
+                    "required": ["scheduled_task_id", "prompt", "permission_mode"],
                     "additionalProperties": False,
                 },
             },
