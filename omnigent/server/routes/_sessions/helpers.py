@@ -6842,6 +6842,7 @@ async def _provision_managed_sandbox(
             agent_name=agent_name,
             on_stage=_on_stage,
             host_id=host_id,
+            launch_state=tracker.get(session_id),
         )
     except HTTPException as exc:
         _logger.warning(

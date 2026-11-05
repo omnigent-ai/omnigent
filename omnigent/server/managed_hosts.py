@@ -579,11 +579,14 @@ class ManagedLaunch:
     :param bound: Set once the session row records its new host. From
         then on the host's replica can finish the launch and deliver
         saved inputs, so a scheduled fire can hand off at this point.
+    :param host_online_failure_hint: Recovery guidance from the active provider,
+        read off the event loop if a scheduled registration wait times out.
     """
 
     settled: asyncio.Event
     error: str | None = None
     bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
+    host_online_failure_hint: Callable[[], str | None] | None = None
 
 
 class ManagedLaunchTracker:
@@ -3835,6 +3838,7 @@ async def launch_managed_host(
     agent_name: str | None = None,
     on_stage: SandboxStageObserver | None = None,
     host_id: str | None = None,
+    launch_state: ManagedLaunch | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a sandbox, start a host in it, and wait until it registers.
@@ -3880,6 +3884,8 @@ async def launch_managed_host(
     :param host_id: Id to register the host under — a create's
         ``host_id`` — or ``None`` to mint one. A requested id also makes the
         host route by it (see :func:`host_slice_key_enabled`).
+    :param launch_state: In-flight state for callers with an independent
+        registration deadline. Retains provider recovery guidance while launching.
     :returns: The registered host id + in-sandbox workspace path
         (the cloned repository directory when *repo* is set).
     :raises HTTPException: 400 when *provider* is not configured or the
@@ -3905,20 +3911,28 @@ async def launch_managed_host(
             status_code=502,
             detail=f"managed sandbox launch failed: {exc.message}",
         ) from exc
-    workspace = await _register_and_start_host(
-        launcher=launcher,
-        config=entry,
-        host_store=host_store,
-        host_id=host_id,
-        host_name=host_name,
-        owner=owner,
-        sandbox_id=sandbox_id,
-        repos=repos,
-        agent_name=agent_name,
-        on_stage=on_stage,
-        slice_key_enabled=slice_key_enabled,
-        owner_credentials=config.owner_credentials,
-    )
+    if launch_state is not None:
+        launch_state.host_online_failure_hint = partial(
+            launcher.host_online_failure_hint, sandbox_id
+        )
+    try:
+        workspace = await _register_and_start_host(
+            launcher=launcher,
+            config=entry,
+            host_store=host_store,
+            host_id=host_id,
+            host_name=host_name,
+            owner=owner,
+            sandbox_id=sandbox_id,
+            repos=repos,
+            agent_name=agent_name,
+            on_stage=on_stage,
+            slice_key_enabled=slice_key_enabled,
+            owner_credentials=config.owner_credentials,
+        )
+    finally:
+        if launch_state is not None:
+            launch_state.host_online_failure_hint = None
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
 

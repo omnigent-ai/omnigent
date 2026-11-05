@@ -876,7 +876,10 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
         assert reason in (run.error or "")
 
 
-async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, monkeypatch) -> None:
+@pytest.mark.parametrize("hint_outcome", ["absent", "hint", "empty", "raises", "blocked"])
+async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(
+    store, monkeypatch, hint_outcome
+) -> None:
     from omnigent.server import managed_hosts
     from omnigent.server.routes import sessions
 
@@ -886,8 +889,22 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, mo
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
     startup = FakeStartupInputs()
     cancelled = asyncio.Event()
+    release_hint = threading.Event()
+    event_loop_thread = threading.get_ident()
+    monkeypatch.setattr(fire_mod, "_REGISTRATION_HINT_TIMEOUT_S", 0.01)
+
+    def hint() -> str | None:
+        assert threading.get_ident() != event_loop_thread
+        if hint_outcome == "raises":
+            raise RuntimeError("provider unavailable")
+        if hint_outcome == "blocked":
+            release_hint.wait(5)
+        return "Check provider sign-in and retry." if hint_outcome == "hint" else None
 
     async def launch(**kwargs: Any) -> None:
+        state = kwargs["tracker"].get(kwargs["session_id"])
+        if hint_outcome != "absent":
+            state.host_online_failure_hint = hint
         try:
             await asyncio.Event().wait()  # Provisioning never finishes.
         except asyncio.CancelledError:
@@ -909,6 +926,7 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, mo
     try:
         await asyncio.wait_for(executor.fire(claimed.task, claimed.lease), 10)
     finally:
+        release_hint.set()
         await _drain_managed_launches()
 
     [run] = _runs(store, claimed.task)
@@ -917,7 +935,11 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, mo
     assert terminate.await_args.args[0] is hosts.hosts[host_id]
     # The saved prompt fails with the timeout first. The cancelled launch's later
     # attempt finds nothing pending, so a generic shutdown reason never shows.
-    assert "did not register within 0.2 seconds" in startup.launch_failures[0][1]
+    reason = "the sandbox did not register within 0.2 seconds"
+    if hint_outcome == "hint":
+        reason += " — Check provider sign-in and retry."
+    assert startup.launch_failures[0][1] == reason
+    assert run.error == reason
 
 
 async def test_lost_lease_during_the_binding_wait_leaves_the_launch_running(
