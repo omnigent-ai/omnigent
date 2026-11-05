@@ -8,6 +8,8 @@ faked. No live Codex is needed.
 from __future__ import annotations
 
 import asyncio
+import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,6 +33,8 @@ _JsonObject = dict[str, Any]
 
 class _FakeCodexClient:
     """Records app-server ``request`` calls and returns canned envelopes."""
+
+    supports_user_message_ids = True
 
     def __init__(self, responses: dict[str, _JsonObject]) -> None:
         self.responses = responses
@@ -68,6 +72,18 @@ def _write_parent_settings(bridge_dir: Path, model: str | None, effort: str | No
         if value
     ]
     (codex_home / "config.toml").write_text("".join(lines), encoding="utf-8")
+
+
+@pytest.fixture
+def parent_bridge(tmp_path: Path) -> CodexNativeBridgeState:
+    state = CodexNativeBridgeState(
+        session_id="conv_parent",
+        thread_id="thread_parent",
+        socket_path=str(tmp_path / "app-server.sock"),
+        codex_home=str(codex_home_for_bridge_dir(tmp_path)),
+    )
+    write_bridge_state(tmp_path, state)
+    return state
 
 
 def _text_items(text: str) -> list[_JsonObject]:
@@ -289,7 +305,10 @@ async def test_interrupt_side_turn_propagates_unrelated_errors(error: Exception)
 
 
 @pytest.mark.asyncio
-async def test_open_side_chat_forks_then_submits_first_turn() -> None:
+@pytest.mark.parametrize("characters", [100, 1_100_000], ids=["inline", "oversized"])
+async def test_open_side_chat_forks_then_submits_first_turn(
+    tmp_path: Path, characters: int
+) -> None:
     client = _FakeCodexClient(
         {
             "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
@@ -297,14 +316,30 @@ async def test_open_side_chat_forks_then_submits_first_turn() -> None:
         }
     )
 
+    question = "q" * characters
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            thread_id="thread_parent",
+            socket_path="ws://127.0.0.1:43210",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
     child = await side_chat.open_side_chat_on_client(
-        client, parent_thread_id="thread_parent", question="what does this repo do?"
+        client, parent_thread_id="thread_parent", question=question, bridge_dir=tmp_path
     )
 
     assert child == "thread_side"
     # order: fork first, then the first turn on the CHILD (not the main thread)
     assert [m for m, _ in client.calls] == ["thread/fork", "turn/start"]
     assert client.calls[1][1]["threadId"] == "thread_side"
+    params = client.calls[1][1]
+    text = "\n\n".join(item["text"] for item in params["input"])
+    assert len(text) < 1_048_576
+    from omnigent.inner.native_attachments import restore_spilled_text
+
+    assert restore_spilled_text(text, tmp_path, params.get("clientUserMessageId")) == question
 
 
 @pytest.mark.asyncio
@@ -517,7 +552,9 @@ def test_side_fork_thread_started_is_rotation_ignored() -> None:
 # --------------------------------------------------------------------------- #
 # bridge-dir handoff: the executor records, the forwarder forks
 # --------------------------------------------------------------------------- #
-def test_side_chat_requests_peek_does_not_consume_until_discarded(tmp_path: Path) -> None:
+def test_side_chat_requests_peek_does_not_consume_until_discarded(
+    parent_bridge: CodexNativeBridgeState, tmp_path: Path
+) -> None:
     assert side_chat.peek_side_chat_requests(tmp_path) == []  # nothing pending
 
     side_chat.request_side_chat(tmp_path, "why is the sky blue?")
@@ -535,7 +572,9 @@ def test_side_chat_requests_peek_does_not_consume_until_discarded(tmp_path: Path
     assert side_chat.peek_side_chat_requests(tmp_path) == []
 
 
-def test_peek_side_chat_requests_discards_corrupt_payloads(tmp_path: Path) -> None:
+def test_peek_side_chat_requests_discards_corrupt_payloads(
+    parent_bridge: CodexNativeBridgeState, tmp_path: Path
+) -> None:
     (tmp_path / "side_chat_requests").mkdir()
     (tmp_path / "side_chat_requests" / "bad.json").write_text("{not json", encoding="utf-8")
     side_chat.request_side_chat(tmp_path, "good one")
@@ -548,7 +587,7 @@ def test_peek_side_chat_requests_discards_corrupt_payloads(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    parent_bridge: CodexNativeBridgeState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The drain loop must fork on the connection it was handed.
 
@@ -584,7 +623,7 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
 
 @pytest.mark.asyncio
 async def test_drive_side_chat_requests_forks_with_the_parents_switched_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    parent_bridge: CodexNativeBridgeState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The app-server's launch -c model would otherwise pair the old model with the new effort.
     _write_parent_settings(tmp_path, "gpt-6-sol", "max")
@@ -619,7 +658,7 @@ async def test_drive_side_chat_requests_forks_with_the_parents_switched_settings
 
 @pytest.mark.asyncio
 async def test_drive_side_chat_requests_keeps_the_request_until_the_parent_thread_is_ready(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    parent_bridge: CodexNativeBridgeState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Regression for the "dropped when the thread isn't ready yet" bug: the
     # request must SURVIVE (not be consumed) so a later cycle forks it.
@@ -644,8 +683,8 @@ async def test_drive_side_chat_requests_keeps_the_request_until_the_parent_threa
 
 
 @pytest.mark.asyncio
-async def test_drive_side_chat_requests_surfaces_a_notice_and_discards_on_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_drive_side_chat_requests_retains_original_after_failure(
+    parent_bridge: CodexNativeBridgeState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A fork that fails must not vanish silently: surface a visible notice, then
     # discard the request so the same failure isn't retried forever.
@@ -671,7 +710,10 @@ async def test_drive_side_chat_requests_surfaces_a_notice_and_discards_on_failur
         )
 
     assert notices and notices[0][0] == "conv_parent"  # user-visible failure notice
-    assert side_chat.peek_side_chat_requests(tmp_path) == []  # discarded, not retried forever
+    assert side_chat.peek_side_chat_requests(tmp_path) == []
+    [failed] = list((tmp_path / "side_chat_failed").glob("*.json"))
+    assert json.loads(failed.read_text())["question"] == "doomed"
+    assert json.loads(failed.with_suffix(".failure").read_text())["undelivered"] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -701,3 +743,144 @@ async def test_side_effort_reset_without_live_model_does_not_submit() -> None:
     with pytest.raises(ValueError, match="capabilities unavailable"):
         await side_chat.submit_side_turn(client, "thread_side", "hello", reset_effort=True)
     assert client.calls == [("thread/read", {"threadId": "thread_side", "includeTurns": False})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["fork", "followup"])
+@pytest.mark.parametrize(
+    "question", ["short question", "large α\n" * 140_000], ids=["inline", "spilled"]
+)
+async def test_side_input_preserves_authored_text_and_child_routing(
+    tmp_path: Path, parent_bridge: CodexNativeBridgeState, entry: str, question: str
+) -> None:
+    from omnigent.inner.native_attachments import restore_spilled_text
+
+    client = _FakeCodexClient(
+        {
+            "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
+            "turn/start": {"result": {"turn": {"id": "side_turn"}}},
+        }
+    )
+    if entry == "fork":
+        assert (
+            await side_chat.open_side_chat_on_client(
+                client,
+                parent_thread_id=parent_bridge.thread_id,
+                question=question,
+                bridge_dir=tmp_path,
+            )
+            == "thread_side"
+        )
+    else:
+        assert (
+            await side_chat.submit_side_turn(
+                client,
+                "thread_side",
+                question,
+                bridge_dir=tmp_path,
+                parent_state=parent_bridge,
+            )
+            == "side_turn"
+        )
+    [params] = [params for method, params in client.calls if method == "turn/start"]
+    wire_text = "\n\n".join(item["text"] for item in params["input"])
+    assert params["threadId"] == "thread_side"
+    assert len(wire_text) < 900_000
+    if len(question) > 900_000:
+        assert params["clientUserMessageId"].startswith("omnigent-paste-")
+        assert restore_spilled_text(wire_text, tmp_path, params["clientUserMessageId"]) == question
+    else:
+        assert wire_text == question and "clientUserMessageId" not in params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", ["old_peer", "disk", "rebind", "rebind_after_fork", "downgrade", "cancel", "lost_ack"]
+)
+async def test_queued_large_side_request_survives_refusal_without_replay(
+    tmp_path: Path,
+    parent_bridge: CodexNativeBridgeState,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    from omnigent.inner import codex_native_executor
+
+    question = "retained side question " * 50_000
+    side_chat.request_side_chat(tmp_path, question, parent_state=parent_bridge)
+    client = _FakeCodexClient(
+        {
+            "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
+            "turn/start": {"result": {"turn": {"id": "side_turn"}}},
+        }
+    )
+    if fault == "old_peer":
+        client.supports_user_message_ids = False
+    if fault == "disk":
+        monkeypatch.setattr(codex_native_executor, "materialize_text", lambda *_: None)
+    if fault == "rebind":
+        write_bridge_state(tmp_path, replace(parent_bridge, thread_id="replacement"))
+    original_request = client.request
+
+    async def request(method: str, params: _JsonObject) -> _JsonObject:
+        response = await original_request(method, params)
+        if method == "thread/fork" and fault == "downgrade":
+            client.supports_user_message_ids = False
+        if method == "thread/fork" and fault == "rebind_after_fork":
+            write_bridge_state(tmp_path, replace(parent_bridge, session_id="replacement-session"))
+        if method == "turn/start" and fault == "cancel":
+            raise asyncio.CancelledError
+        if method == "turn/start" and fault == "lost_ack":
+            raise TimeoutError("synthetic lost turn acknowledgement")
+        return response
+
+    monkeypatch.setattr(client, "request", request)
+    notices = AsyncMock()
+    monkeypatch.setattr(fwd, "_post_side_chat_failed_notice", notices)
+
+    async def stop(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fwd, "_sleep", stop)
+    for _ in range(2):
+        with pytest.raises(asyncio.CancelledError):
+            await fwd._drive_side_chat_requests(
+                client,
+                ap_client=AsyncMock(),
+                bridge_dir=tmp_path,
+                target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
+            )
+    assert side_chat.peek_side_chat_requests(tmp_path) == []
+    location = "side_chat_claimed" if fault == "cancel" else "side_chat_failed"
+    [record] = list((tmp_path / location).glob("*.json"))
+    assert json.loads(record.read_text())["question"] == question
+    turns = [params for method, params in client.calls if method == "turn/start"]
+    assert len(turns) == int(fault in {"cancel", "lost_ack"})
+    if turns:
+        assert turns[0]["threadId"] == "thread_side"
+    if fault != "cancel":
+        assert notices.await_count == 1
+        assert notices.call_args.args[1] == "conv_parent"
+        assert json.loads(record.with_suffix(".failure").read_text())["undelivered"] == (
+            fault != "lost_ack"
+        )
+
+
+def test_side_request_claim_has_one_owner_and_preserves_storage_limit(
+    tmp_path: Path, parent_bridge: CodexNativeBridgeState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omnigent.inner import native_attachments
+
+    side_chat.request_side_chat(tmp_path, "original", parent_state=parent_bridge)
+    [request] = side_chat.peek_side_chat_requests(tmp_path)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(side_chat.claim_side_chat_request, [request, request]))
+    assert sum(claim is not None for claim in claims) == 1
+    [claimed] = [claim for claim in claims if claim is not None]
+    side_chat.fail_side_chat_request(claimed, "synthetic refusal", undelivered=True)
+    monkeypatch.setattr(native_attachments, "MAX_SESSION_FILESYSTEM_ATTACHMENTS", 1)
+    with pytest.raises(side_chat.SideChatInputNotDelivered, match="storage is full"):
+        side_chat.request_side_chat(tmp_path, "new question", parent_state=parent_bridge)
+    [retained] = list((tmp_path / "side_chat_failed").glob("*.json"))
+    assert json.loads(retained.read_text())["question"] == "original"

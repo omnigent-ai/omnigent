@@ -876,6 +876,21 @@ async def _wait_for_compaction_turn(
         )
 
 
+async def _validate_codex_input(
+    client: CodexAppServerClient,
+    bridge_dir: Path,
+    input_items: list[dict[str, object]],
+) -> None:
+    """Require faithful history restoration and support before sending prepared input."""
+    if isinstance(input_items, _SpilledInputItems) and input_items.client_message_id is None:
+        raise _CodexNativeInputUndelivered(_SPILL_RECORD_FAILURE)
+    if not await asyncio.to_thread(_spilled_mirror_fits, input_items, bridge_dir):
+        raise _CodexNativeInputUndelivered(_MIRROR_TOO_LARGE_FAILURE)
+    # Refuse known unsupported input before model/settings RPCs or config mirroring.
+    if isinstance(input_items, _SpilledInputItems) and not client.supports_user_message_ids:
+        raise _CodexNativeInputUndelivered(_SPILL_UNSUPPORTED_FAILURE)
+
+
 async def _inject_codex_turn_once(
     client: CodexAppServerClient,
     *,
@@ -885,13 +900,7 @@ async def _inject_codex_turn_once(
     settings_overrides: Mapping[str, object],
 ) -> None:
     """Steer an active turn or start one, recovering one proven stale steer."""
-    if isinstance(input_items, _SpilledInputItems) and input_items.client_message_id is None:
-        raise _CodexNativeInputUndelivered(_SPILL_RECORD_FAILURE)
-    if not await asyncio.to_thread(_spilled_mirror_fits, input_items, bridge_dir):
-        raise _CodexNativeInputUndelivered(_MIRROR_TOO_LARGE_FAILURE)
-    # Refuse known unsupported input before model/settings RPCs or config mirroring.
-    if isinstance(input_items, _SpilledInputItems) and not client.supports_user_message_ids:
-        raise _CodexNativeInputUndelivered(_SPILL_UNSUPPORTED_FAILURE)
+    await _validate_codex_input(client, bridge_dir, input_items)
     if state.active_turn_id is None:
         await _start_codex_turn(
             client,
@@ -1318,7 +1327,12 @@ class CodexNativeExecutor(Executor):
                             # it owns the fork's event stream, while this client
                             # closes as soon as the turn is submitted — so hand the
                             # question over and leave the main thread untouched.
-                            side_chat.request_side_chat(self._bridge_dir, side_question)
+                            await asyncio.to_thread(
+                                side_chat.request_side_chat,
+                                self._bridge_dir,
+                                side_question,
+                                parent_state=state,
+                            )
                         else:
                             if goal_objective is not None:
                                 await client.request(
@@ -1558,6 +1572,7 @@ def _content_to_input_items(
     bridge_dir: Path,
     *,
     session_id: str | None = None,
+    preserve_side_command: bool = True,
 ) -> list[dict[str, object]]:
     """
     Normalize executor content into Codex app-server input items.
@@ -1578,11 +1593,12 @@ def _content_to_input_items(
     :param bridge_dir: Session bridge path identifying the attachment cache.
     :param session_id: Omnigent session id that log events are attributed to,
         e.g. ``"conv_abc123"``.
+    :param preserve_side_command: Leave parent `/side` commands for their dedicated driver.
     :returns: Codex input item dicts.
     """
     items, inline, attachments = _collect_input_items(content, bridge_dir)
     # Side-chat commands belong to the fork's own submission path.
-    if side_chat.side_chat_question(items) is not None:
+    if preserve_side_command and side_chat.side_chat_question(items) is not None:
         return items
     spilled = _spill_oversized_text(items, inline, bridge_dir, session_id)
     if spilled:
