@@ -57,7 +57,7 @@ def register_model_option_routes(
     _resolve_session_claude_launch_config: Callable[
         [str], Coroutine[Any, Any, ClaudeNativeUcodeConfig | None]
     ],
-    _resolve_session_skills: Callable[[str], Coroutine[Any, Any, list[SkillSpec]]],
+    _resolve_session_skills: Callable[..., Coroutine[Any, Any, list[SkillSpec]]],
     _session_cursor_model_names: dict[str, dict[str, str]],
     _session_harness_name: Callable[[str], str | None],
     _session_spec_cache: dict[str, _SpecEntry | None],
@@ -414,8 +414,12 @@ def register_model_option_routes(
                 status_code=400,
                 content={"error": "invalid_request", "detail": "'arguments' must be a string."},
             )
-        skills = await _resolve_session_skills(session_id)
+        # Only a skill not listed yet waits for a configured Claude launch to report.
+        skills = await _resolve_session_skills(session_id, wait_for_launch_plugins=False)
         skill = find_skill_by_name(skills, name)
+        if skill is None:
+            skills = await _resolve_session_skills(session_id)
+            skill = find_skill_by_name(skills, name)
         if skill is None:
             return JSONResponse(
                 status_code=404,
