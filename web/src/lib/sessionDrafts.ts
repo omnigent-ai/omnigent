@@ -104,7 +104,7 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   } else {
     const held = sessionDrafts.get(conversationId);
     const { startupInputIds = held?.startupInputIds, sentAs = held?.sentAs, ...rest } = draft;
-    // An explicit empty list clears the held one and is kept as none, as a reload reads it.
+    // Omitted lists keep the held ids; an explicit [] clears them, and empty lists aren't stored.
     sessionDrafts.set(conversationId, {
       ...rest,
       ...(startupInputIds?.length ? { startupInputIds } : {}),
@@ -158,6 +158,7 @@ export function replaceSessionDraftStartupInputs(
   files: File[] = [],
   sentAs: string[] = [],
 ): void {
+  if (retiredDraftIds.has(conversationId)) return;
   const draft = sessionDrafts.get(conversationId) ?? { text, files };
   // Without the old entry, setSessionDraft has no held ids to carry over.
   sessionDrafts.delete(conversationId);

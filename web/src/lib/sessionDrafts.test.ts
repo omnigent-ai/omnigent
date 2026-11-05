@@ -153,7 +153,7 @@ describe("session drafts", () => {
       files: [],
       startupInputIds: ["pending_first"],
     });
-    // The read that named the inputs replaces the sends; a denied send's re-read must offer them again.
+    // Replacing drops the old sends without recording them, so a denied send's re-read offers them again.
     expect(getDroppedDraftSends("conversation")).toEqual([]);
     replaceSessionDraftStartupInputs("conversation", "recalled", []);
     expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ conversation: "held" });
