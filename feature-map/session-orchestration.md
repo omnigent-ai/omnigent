@@ -1,13 +1,13 @@
 # Session orchestration
 
-An agent in a private session can send work to another session owned by the
-same user, then read its status/history. It can also create private top-level
+An agent in a session that is private or shared read-only can send work to
+another session owned by the same user, then read its status/history. It can also create private top-level
 workers on its host or a new managed sandbox. This is enabled by default, with
 `-session_orchestration` in `OMNIGENT_FEATURES` as a server kill switch.
 
 ## Sub-features
 
-- `message`: private sender, same owner and workspace; shared destinations are
+- `message`: sender without edit-level sharing, same owner and workspace; shared destinations are
   allowed and their readers see the message. Normal queue/steering applies.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
@@ -24,17 +24,22 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
-  Managed creation uses the server's configured default sandbox provider.
-- `sharing`: sharing the sender blocks subsequent sends and independent creates.
+  Managed creation uses the server's configured default sandbox provider. An
+  independent session is filed in its creator's project, if that project still
+  exists; the project's agent and workspace defaults don't apply to it.
+- `sharing`: sharing the sender with edit (or higher) access, including public
+  edit, blocks subsequent sends and independent creates. Read-only grants,
+  including public read and default-public sessions, do not: viewers cannot add
+  input, so they cannot steer the owner's other sessions through the sender.
   Side chats and their children also inherit restrictions from the source chain.
-  Accepted work, including tasks saved while a worker starts, continues. Making
-  the sender private restores eligibility.
+  Accepted work, including tasks saved while a worker starts, continues.
+  Downgrading or revoking every edit grant restores eligibility.
 - `scheduled`: scheduled runs, their forks and children use the new sends and
   independent creates like any private session their owner owns, so an
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
-- `refusal`: disabled flag, another owner, shared sender or wrong runner binding
+- `refusal`: disabled flag, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
   acknowledgements are uncertain and must not auto-retry. After uncertain
@@ -52,15 +57,19 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   to choose an authorized profile/revision from the
   [provider catalog](../docs/extending/provider_profiles.md).
 - Use the existing Share dialog to share the sender or receiver, then repeat.
+  A read-only share of the sender keeps both tools working; an edit share
+  refuses them.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
-- On Automations, pick the *Jira tickets*, *Slack messages*, or *GitHub issues*
-  chip, or choose **New automation → Create from template** to browse the same
-  templates at `/tasks/templates`. Pick a template, fill in the trigger builder,
-  and save: the hourly automation's kept session starts one worker per new match
+- On Automations, pick a *Jira tickets*, *Slack messages*, or *GitHub issues*
+  card from suggestions on **Your automations** or the **Templates** tab at
+  `/tasks?view=templates`. Suggestions appear below saved automations or the
+  empty-state message with All selected and search cleared. The old
+  `/tasks/templates` URL redirects to the Templates tab.
+  Pick a template, fill in the trigger builder, and save: the polling automation's kept session starts one worker per new match
   with `sys_session_create`. Covered by
-  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`.
+  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`.
 
 ## Driving it with the repro environment
 
@@ -107,7 +116,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   and its children.
 - Browser/terminal manual check: send a distinctive task to a second session;
   open its Chat and confirm the source label and result. Ask the manager to
-  read it. Share the manager and repeat: the tool must report refusal and the
+  read it. Share the manager read-only and repeat: the task must still arrive.
+  Share it with edit access and repeat: the tool must report refusal and the
   destination must contain no new task. API runs do not prove these UI actions.
   Append `-session_orchestration` to the isolated server's feature settings and
   restart it, then repeat from a private manager: expect a disabled error, no new
@@ -143,7 +153,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   the runner; independent creation has no automatic routing fallback.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
-- A shared receiver can continue working but cannot message back while shared.
+- A receiver shared with edit access can continue working but cannot message
+  back while shared that way. A read-only share does not stop it.
 - Privacy checks govern these tools. They do not confine arbitrary code holding
   owner credentials or sanitize shared content the manager reads.
 - The source token authenticates its runner, not an exact session within that
@@ -151,11 +162,16 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   session on the same runner can be named as the source. Stable-ID runner pools
   using allow-listed tunnel tokens are unsupported;
   this gate requires token-derived runner IDs and refuses other bindings.
-- Side chats must be private and have a private, owned, available source chain
-  to send work or create independent workers. Nested side chats and their children
-  inherit this restriction. Missing or cyclic source chains are refused. Ordinary
-  reads and incoming work remain available; making the source private restores
-  eligibility without erasing copied history.
+- Side chats must have no edit-level grants and an owned, available source chain
+  with none either to send work or create independent workers. Nested side chats
+  and their children inherit this restriction. Missing or cyclic source chains are
+  refused. Ordinary reads and incoming work remain available; removing the edit
+  grants restores eligibility without erasing copied history.
+- Read-only viewers of a manager see its transcript, including orchestration
+  tool calls, worker session IDs and history it reads from the owner's other
+  sessions. Owner-authorized reads already reach shared transcripts, so this
+  adds no new disclosure path; workers still start private. The check uses stored
+  grant levels, so a public grant capped below its stored level still refuses.
 - Peer messages carry only task text and owner attribution. They do not forward
   per-event model/tool overrides or a caller-supplied delivery ID.
   The textual source prefix is a display hint, not an authorization credential
@@ -164,7 +180,7 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
 - Admission is the final source check before delivery or saving a startup task.
   A queued result means acceptance, not execution; destination policy may still
   deny the task during startup replay. Successfully queued tasks can finish after
-  the sender is shared; replay retains
+  the sender is shared with edit access; replay retains
   normal destination permissions and policy checks. The check and subsequent
   dispatch/save are not one atomic transaction. Unsharing does not erase history.
 - For peer messages, an explicit wrong-replica refusal permits a bounded re-address.
