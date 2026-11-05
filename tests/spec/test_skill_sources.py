@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+import sys
+import textwrap
+import threading
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +23,7 @@ from omnigent.spec.skill_sources import (
     resolve_harness_skills,
 )
 from tests._helpers.claude_launch import configure_claude_launch, write_launch_recorder
+from tests._helpers.live_server import local_server_env
 from tests._helpers.polling import poll_until
 from tests._helpers.providers import isolate_provider_resolution
 
@@ -1447,6 +1453,99 @@ def test_prewarm_logs_a_launch_it_could_not_start_probing(
 
     assert "Could not start probing the configured Claude launch" in caplog.text
     assert "can't start new thread" in caplog.text
+
+
+@pytest.mark.posix_only
+def test_claude_launch_probe_that_cannot_start_warns_and_keeps_installed_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class CannotStart(threading.Thread):
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(
+        plugin_discovery, "threading", SimpleNamespace(Event=threading.Event, Thread=CannotStart)
+    )
+    home = _claude_home_with_plugin(
+        tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    launches = tmp_path / "launches.jsonl"
+    configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"), launches, _print_init([])
+    )
+    warnings: list[str] = []
+
+    plugin_discovery.prewarm_claude_launch_plugins()
+    skills = resolve_harness_skills(
+        replace(_ctx(tmp_path / "ws", home), warnings=warnings), "claude-native"
+    )
+
+    assert "sp:installed" in {s.name for s in skills}
+    assert warnings == [
+        "Claude plugins added by the configured launch are missing: the launch "
+        "could not be probed; see the host log for details."
+    ]
+    assert caplog.text.count("Could not start probing the configured Claude launch") == 2
+    assert not launches.exists()
+
+
+def _process_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # An unreaped zombie still accepts signal 0 but no longer runs.
+    with suppress(OSError):
+        return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] != "Z"
+    return True
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("hung", ["launcher-plugin", "launch"])
+def test_exit_does_not_wait_on_a_hung_claude_launch_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hung: str
+) -> None:
+    """A hung launcher plugin does not hold the process open, and exit kills a running launch."""
+    pid_file = tmp_path / "launch.pid"
+    configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
+        tmp_path / "launches.jsonl",
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n",
+    )
+    entered = tmp_path / "entered"
+    if hung == "launcher-plugin":
+        monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "hung")
+    child = textwrap.dedent(
+        f"""
+        import pathlib, threading, time
+        import omnigent.claude_launcher as claude_launcher
+        from omnigent.harnesses.claude_native import plugin_discovery
+
+        class Hung(claude_launcher.ClaudeLauncher):
+            def launch(self, command, args):
+                pathlib.Path({str(entered)!r}).touch()
+                threading.Event().wait()
+
+        claude_launcher._load_launcher = lambda _name: Hung()
+        plugin_discovery.prewarm_claude_launch_plugins()
+        ready = pathlib.Path({str(entered if hung == "launcher-plugin" else pid_file)!r})
+        while not ready.exists():
+            time.sleep(0.05)
+        """
+    )
+
+    subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=tmp_path,
+        env=local_server_env({}),
+        check=True,
+        timeout=30,
+    )
+
+    if hung == "launch":
+        pid = int(pid_file.read_text())
+        poll_until(lambda: not _process_running(pid), timeout_s=10, interval_s=0.05)
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(

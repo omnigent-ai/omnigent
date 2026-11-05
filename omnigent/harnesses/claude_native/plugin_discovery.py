@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -57,6 +58,18 @@ class _LaunchProbe:
 _probes_lock = threading.Lock()
 _probes: dict[tuple[object, ...], _LaunchProbe] = {}
 _generation = 0
+_running_launches: set[subprocess.Popen[str]] = set()
+
+
+def _kill_running_launches() -> None:
+    # Probe threads are daemons, so exit kills the launches they still wait on.
+    with _probes_lock:
+        launches = list(_running_launches)
+    for process in launches:
+        _proc.kill_tree(process)
+
+
+atexit.register(_kill_running_launches)
 
 
 def claude_launch_is_customized() -> bool:
@@ -135,7 +148,8 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
     :param wait: Wait for a first answer, up to the probe's deadline, rather than
         raise :class:`LaunchPluginsPending`.
     :raises LaunchPluginsPending: The launch has not answered yet.
-    :raises LaunchPluginsFailed: The last probe failed, or the running one missed its deadline.
+    :raises LaunchPluginsFailed: The last probe failed or could not start, or the running
+        one missed its deadline.
     :raises CONFIG_READ_ERRORS: The Omnigent config could not be read.
     """
     from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR
@@ -165,13 +179,14 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
             probe.running = threading.Event()
             probe.deadline = time.monotonic() + budget_s
             try:
-                # Not a daemon, so exiting still waits for a stalled launch to be killed.
+                # A daemon, so a hung launcher plugin cannot keep the process from exiting.
                 threading.Thread(
-                    target=_refresh, args=(probe,), name="claude-launch-plugins"
+                    target=_refresh, args=(probe,), name="claude-launch-plugins", daemon=True
                 ).start()
-            except RuntimeError:
+            except RuntimeError as exc:
                 probe.running = None
-                raise
+                _log.warning("Could not start probing the configured Claude launch: %s", exc)
+                raise LaunchPluginsFailed("could not be probed") from exc
         running, deadline = probe.running, probe.deadline
     if wait and running is not None and probe.plugins is None:
         running.wait(max(0.0, deadline - time.monotonic()))
@@ -244,6 +259,8 @@ def _probe_plugin_dirs(
         **_proc.spawn_kwargs(),
     )
     _proc.remember_process_group(process)
+    with _probes_lock:
+        _running_launches.add(process)
     try:
         stdout, _ = process.communicate(timeout=LAUNCH_PLUGINS_TIMEOUT_S)
     except subprocess.TimeoutExpired:
@@ -251,6 +268,9 @@ def _probe_plugin_dirs(
         with suppress(Exception):
             process.communicate(timeout=1)
         raise
+    finally:
+        with _probes_lock:
+            _running_launches.discard(process)
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
