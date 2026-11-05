@@ -385,23 +385,26 @@ class _HiddenInputBoxWatch:
         """
         self._threshold_s = threshold_s
         self._hidden_since: float | None = None
+        self._hidden_turn: int | None = None
 
-    def observe(self, *, input_box_visible: bool, turn_running: bool) -> bool:
+    def observe(self, *, input_box_visible: bool, running_turn: int | None) -> bool:
         """
         Record one pane read and report whether the alert threshold has passed.
 
         :param input_box_visible: Whether the agent's input box is on screen.
-        :param turn_running: Whether the session reads as working with no
-            reported blocking reason, or with this watch's own reason.
+        :param running_turn: Generation of the turn that reads as working with
+            no reported blocking reason (or with this watch's own reason), or
+            ``None`` when no such turn is running.
         :returns: ``True`` once the input box has stayed hidden for the
-            whole threshold while the turn was running.
+            whole threshold within the same running turn.
         """
-        if input_box_visible or not turn_running:
+        if input_box_visible or running_turn is None:
             self._hidden_since = None
             return False
         now = _monotonic()
-        if self._hidden_since is None:
+        if self._hidden_since is None or self._hidden_turn != running_turn:
             self._hidden_since = now
+            self._hidden_turn = running_turn
         return now - self._hidden_since >= self._threshold_s
 
 
@@ -580,6 +583,9 @@ class SessionResourceRegistry:
         self._last_session_status: dict[str, str] = {}
         self._session_activity_epoch: dict[str, int] = {}
         self._active_session_turns: set[str] = set()
+        # Bumped each time a session's turn becomes active, so a watcher can
+        # tell a new turn from the one it was timing.
+        self._session_turn_generation: dict[str, int] = {}
         # Last status *edge published to the server* per session, shared by the
         # watcher and the native forwarders' hook-derived edges so the two
         # dedup against one baseline. Kept separate from the exit memo above,
@@ -701,6 +707,10 @@ class SessionResourceRegistry:
         self, session_id: str, status: str, record_activity: bool
     ) -> None:
         if record_activity and status in {"running", "waiting"}:
+            if session_id not in self._active_session_turns:
+                self._session_turn_generation[session_id] = (
+                    self._session_turn_generation.get(session_id, 0) + 1
+                )
             self._active_session_turns.add(session_id)
             self._session_activity_epoch[session_id] = (
                 self._session_activity_epoch.get(session_id, 0) + 1
@@ -761,37 +771,50 @@ class SessionResourceRegistry:
         with self._lock:
             return self._published_session_status.get(session_id)
 
+    def _active_turn_generation(self, session_id: str) -> int | None:
+        """Return the active turn's generation, or ``None`` between turns."""
+        with self._lock:
+            return self._active_turn_generation_locked(session_id)
+
     def _claim_inferred_status_edge(
         self,
         session_id: str,
         expected: tuple[str, str | None] | None,
+        turn: int,
         claimed: tuple[str, str | None],
     ) -> bool:
         """Compare-and-set an inferred edge while its turn is still active.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param expected: Edge the caller based its inference on.
+        :param turn: Turn generation the inference was made in.
         :param claimed: Edge to record, e.g. ``("running", "terminal prompt")``.
-        :returns: ``True`` when *expected* was still published and is replaced.
+        :returns: ``True`` when *expected* was still published in *turn* and
+            is replaced.
         """
         with self._lock:
             if (
                 self._published_session_status.get(session_id) != expected
-                or session_id not in self._active_session_turns
+                or self._active_turn_generation_locked(session_id) != turn
             ):
                 return False
             self._published_session_status[session_id] = claimed
             return True
 
     def _inferred_status_edge_is_current(
-        self, session_id: str, edge: tuple[str, str | None]
+        self, session_id: str, edge: tuple[str, str | None], turn: int
     ) -> bool:
-        """Whether *edge* is still published for a session whose turn is active."""
+        """Whether *edge* is still published during active turn *turn*."""
         with self._lock:
             return (
                 self._published_session_status.get(session_id) == edge
-                and session_id in self._active_session_turns
+                and self._active_turn_generation_locked(session_id) == turn
             )
+
+    def _active_turn_generation_locked(self, session_id: str) -> int | None:
+        if session_id not in self._active_session_turns:
+            return None
+        return self._session_turn_generation.get(session_id, 0)
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
         """Adopt an external status and let native state reconcile a missing edge."""
@@ -1757,17 +1780,17 @@ class SessionResourceRegistry:
         )
 
         def _publish_inferred_running(
-            expected: tuple[str, str | None] | None, blocked_on: str | None
+            expected: tuple[str, str | None] | None, turn: int, blocked_on: str | None
         ) -> None:
             claimed = ("running", blocked_on)
             if not _owns_terminal() or not self._claim_inferred_status_edge(
-                session_id, expected, claimed
+                session_id, expected, turn, claimed
             ):
                 return
 
             def deliver() -> None:
                 # Completion, failure or a reported reason may land while this is queued.
-                if self._inferred_status_edge_is_current(session_id, claimed):
+                if self._inferred_status_edge_is_current(session_id, claimed, turn):
                     _publish_status_if_current("running", blocked_on)
 
             loop.call_soon_threadsafe(deliver)
@@ -1778,16 +1801,17 @@ class SessionResourceRegistry:
         ) -> None:
             edge = self._published_status_edge(session_id)
             alerting = edge == ("running", NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
-            turn_running = (
-                (edge == ("running", None) or alerting)
-                and _structured_status_active()
-                and self.session_turn_is_active(session_id)
+            turn = self._active_turn_generation(session_id)
+            running_turn = (
+                turn
+                if (edge == ("running", None) or alerting) and _structured_status_active()
+                else None
             )
             input_box_visible = probe(session_id, instance)
             hidden_too_long = watch.observe(
-                input_box_visible=input_box_visible, turn_running=turn_running
+                input_box_visible=input_box_visible, running_turn=running_turn
             )
-            if hidden_too_long and not alerting:
+            if hidden_too_long and not alerting and running_turn is not None:
                 _logger.info(
                     "Native input box hidden during a running turn",
                     extra=debug_event(
@@ -1797,9 +1821,9 @@ class SessionResourceRegistry:
                         terminal_instance_id=instance.diagnostic_id,
                     ),
                 )
-                _publish_inferred_running(edge, NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
-            elif alerting and input_box_visible:
-                _publish_inferred_running(edge, None)
+                _publish_inferred_running(edge, running_turn, NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
+            elif alerting and input_box_visible and turn is not None:
+                _publish_inferred_running(edge, turn, None)
 
         def _on_tick() -> None:
             nonlocal native_input_ready
@@ -1851,8 +1875,14 @@ class SessionResourceRegistry:
                         )
             if hidden_input_box_watch is not None and input_ready_probe is not None:
                 # The alert is advisory; a probe failure must not stop the watcher.
-                with contextlib.suppress(Exception):
+                try:
                     _check_hidden_input_box(input_ready_probe, hidden_input_box_watch)
+                except Exception:
+                    _logger.debug(
+                        "Hidden input box check failed",
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
 
         def _on_activity() -> None:
             if not _owns_terminal():

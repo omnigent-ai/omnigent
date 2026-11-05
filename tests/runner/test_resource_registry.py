@@ -1468,17 +1468,21 @@ async def test_running_turn_with_hidden_input_box_points_chat_at_terminal(
     await session.tick_at(130.0, _CLAUDE_WORKING_PANE)
     assert published == [("running", waiting_for)]
 
+    # A shorter hidden spell restarts the delay once the box returns.
     await session.tick_at(131.0, _CLAUDE_NOTICE_PANE)
-    await session.tick_at(145.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(140.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(141.0, _CLAUDE_WORKING_PANE)
+    await session.tick_at(142.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(156.0, _CLAUDE_NOTICE_PANE)
     assert published == [("running", waiting_for)]
 
-    await session.tick_at(146.0, _CLAUDE_NOTICE_PANE)
-    await session.tick_at(150.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(157.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(160.0, _CLAUDE_NOTICE_PANE)
     assert published[-1] == ("running", expected_reason)
     assert len(published) == (2 if expected_reason == "terminal prompt" else 1)
 
     # Answering the prompt restores the input box, and chat drops the alert.
-    await session.tick_at(151.0, _CLAUDE_WORKING_PANE)
+    await session.tick_at(161.0, _CLAUDE_WORKING_PANE)
     assert published[-1] == ("running", waiting_for)
     assert session.registry.session_turn_is_active("conv_hidden_input_box")
 
@@ -1517,6 +1521,28 @@ async def test_turn_ending_behind_hidden_input_box_alert_stays_idle(
     await session.tick_at(171.0, _CLAUDE_WORKING_PANE)
     assert session.published[2:] == [("idle", None)]
     assert not session.registry.session_turn_is_active("conv_hidden_idle")
+
+
+@pytest.mark.asyncio
+async def test_next_turn_gets_its_own_hidden_input_box_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn that starts between pane reads does not inherit the last turn's timer."""
+    session_id = "conv_hidden_next_turn"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(114.0, _CLAUDE_NOTICE_PANE)
+    assert session.published == [("running", None)]
+
+    session.registry.note_external_session_status(session_id, "idle")
+    session.registry.note_external_session_status(session_id, "running")
+    await session.tick_at(115.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(129.0, _CLAUDE_NOTICE_PANE)
+    assert ("running", "terminal prompt") not in session.published
+
+    await session.tick_at(130.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
 
 
 @pytest.mark.asyncio
