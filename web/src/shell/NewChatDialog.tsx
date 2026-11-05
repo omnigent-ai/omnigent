@@ -2317,9 +2317,11 @@ export function NewChatLandingScreen() {
     remaining.delete("prompt");
     remaining.delete(NEW_SESSION_HANDOFF_PARAM);
     forgetNewSessionHandoff(handoffToken);
+    // Embedded hosts keep state-bearing navigation client-side; a document reload
+    // after removing the prompt would discard the in-memory draft.
     navigate(
       { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
-      { replace: true, state: location.state },
+      { replace: true, state: location.state ?? {} },
     );
   }, [
     linkedPrompt,
