@@ -332,11 +332,16 @@ class SessionActivity:
         ``"waiting"``, ``"failed"``), or ``None`` when none is recorded.
     :param total_cost_usd: Recorded cost for this session, excluding descendants;
         ``None`` when unpriced.
+    :param pending_elicitation_count: Current unresolved session approvals/questions;
+        ``None`` when not reported.
+    :param runner_id: Bound runner, or ``None`` for an in-process session.
     """
 
     updated_at: int
     live_status: str | None
     total_cost_usd: float | None = None
+    pending_elicitation_count: int | None = None
+    runner_id: str | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel

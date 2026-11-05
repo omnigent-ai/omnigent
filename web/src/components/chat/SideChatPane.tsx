@@ -283,6 +283,8 @@ export function SideChatPane({
   const showsWorking =
     (!readOnly || fullSession) &&
     (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
+  // Background shells can outlive the child's turn; the indicator shows them.
+  const showsBackgroundTasks = (!readOnly || fullSession) && state.backgroundTaskCount > 0;
   // Native interruption needs an observed turn; local streaming can start before one exists.
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
@@ -303,7 +305,12 @@ export function SideChatPane({
   }, []);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
-  const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
+  const isEmpty =
+    bubbles.length === 0 &&
+    !loadingConversation &&
+    !loadFailed &&
+    !showsWorking &&
+    !showsBackgroundTasks;
   const showsList =
     !loadFailed && !(fullSession && loadingConversation && bubbles.length === 0) && !isEmpty;
   // A reply's markdown can grow after the render that changed it (streaming
@@ -406,7 +413,9 @@ export function SideChatPane({
                   recoveryDisabled={readOnly}
                 />
               ))}
-              {shouldShowWorkingIndicator(showsWorking, bubbles) && <WorkingIndicator />}
+              {shouldShowWorkingIndicator(showsWorking || showsBackgroundTasks, bubbles) && (
+                <WorkingIndicator />
+              )}
               <div ref={bottomRef} />
             </div>
           )}

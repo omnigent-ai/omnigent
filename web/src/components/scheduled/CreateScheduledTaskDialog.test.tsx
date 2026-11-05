@@ -33,7 +33,12 @@ import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
-import { emptyTriggerFields, renderTriggerPrompt, splitTriggerPrompt } from "./triggerTemplates";
+import {
+  emptyTriggerFields,
+  readTriggerWorkerSettings,
+  renderTriggerPrompt,
+  splitTriggerPrompt,
+} from "./triggerTemplates";
 
 const gitWorkspace = vi.hoisted(() => ({
   available: true as boolean | undefined,
@@ -2505,18 +2510,69 @@ describe("CreateScheduledTaskDialog session mode", () => {
     },
   );
 
-  it.each([undefined, false, true])(
-    "negotiates minute schedules with subhour support %s",
-    async (supported) => {
+  it.each(
+    [undefined, false, true].flatMap((supported) =>
+      [false, true].map((trigger) => ({ supported, trigger })),
+    ),
+  )(
+    "negotiates minute schedules with subhour support $supported for trigger $trigger",
+    async ({ supported, trigger }) => {
       renderWithSessionModes(
-        scheduledTask({ sessionMode: "continue", rrule: "FREQ=MINUTELY;INTERVAL=10" }),
+        scheduledTask({
+          sessionMode: "continue",
+          rrule: "FREQ=MINUTELY;INTERVAL=10",
+          ...(trigger && {
+            prompt: renderTriggerPrompt(
+              "jira",
+              {
+                ...emptyTriggerFields("jira"),
+                scope: "ES",
+                instructions: "Triage it.",
+              },
+              { placement: "same_host", sessionLink: "https://omni.example.com/c/CONVERSATION_ID" },
+            ),
+          }),
+        }),
         {
           features: { automations_v2: true },
+          automation_trigger_poll_minutes: 240,
           ...(supported === undefined ? {} : { scheduled_task_subhour: supported }),
         },
       );
-      expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
       const submit = screen.getByTestId("create-scheduled-task-submit");
+      if (trigger) {
+        expect(screen.queryByTestId("custom-schedule-trigger")).toBeNull();
+        expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
+        if (supported) {
+          expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
+          fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+          fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+          const editor = screen.getByRole("textbox", { name: "System prompt" });
+          fireEvent.change(editor, { target: { value: "Custom polling instructions." } });
+          expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
+          expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
+        } else {
+          expect(submit).toBeDisabled();
+          expect(screen.getByRole("alert")).toHaveTextContent("polling configuration");
+          fireEvent.click(submit);
+          expect(updateMutateAsync).not.toHaveBeenCalled();
+          fireEvent.click(
+            screen.getByRole("button", { name: "Use server default (Every 240 minutes)" }),
+          );
+          expect(screen.queryByRole("alert")).toBeNull();
+          expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 240 minutes");
+        }
+        expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
+        expect(submit).toBeEnabled();
+        fireEvent.click(submit);
+        await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+        expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
+          supported ? "FREQ=MINUTELY;INTERVAL=10" : "FREQ=MINUTELY;INTERVAL=240",
+        );
+        expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("sessionMode");
+        return;
+      }
+      expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
       if (supported) expect(submit).toBeEnabled();
       else {
         expect(submit).toBeDisabled();
@@ -2532,11 +2588,13 @@ describe("CreateScheduledTaskDialog session mode", () => {
       fireEvent.click(screen.getByRole("option", { name: "Hours" }));
       expect(screen.getByTestId("custom-interval")).toHaveValue(1);
       fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+      expect(submit).toBeEnabled();
       fireEvent.click(submit);
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
         "FREQ=HOURLY;INTERVAL=1;BYMINUTE=0",
       );
+      expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("sessionMode");
     },
   );
 
@@ -2613,6 +2671,54 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     return mutateAsync.mock.calls[0][0].prompt;
   }
 
+  it.each([
+    { configured: undefined, subhour: true, minutes: 10 },
+    { configured: 30, subhour: true, minutes: 30 },
+    { configured: 240, subhour: true, minutes: 240 },
+    { configured: 240, subhour: false, minutes: 240 },
+    { configured: 10, subhour: false, minutes: 60 },
+  ])(
+    "uses server polling $configured with subhour support $subhour",
+    async ({ configured, subhour, minutes }) => {
+      renderTrigger("jira", {
+        features: { automations_v2: true },
+        scheduled_task_subhour: subhour,
+        automation_trigger_poll_minutes: configured,
+      });
+      fillJira();
+      expect(screen.queryByLabelText("Frequency")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent(
+        minutes === 60 ? "Hourly" : `Every ${minutes} minutes`,
+      );
+      const prompt = await submittedPrompt();
+      expect(prompt).toContain(
+        `On the first run, use ${minutes > 60 ? `${minutes} minutes` : "one hour"} ago and nothing pending.`,
+      );
+      expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+        rrule: minutes === 60 ? "FREQ=HOURLY;BYMINUTE=0" : `FREQ=MINUTELY;INTERVAL=${minutes}`,
+        sessionMode: "continue",
+      });
+    },
+  );
+
+  it("restores schedule controls after converting a template to new-session mode", async () => {
+    renderTrigger("jira", {
+      features: { automations_v2: true },
+      scheduled_task_subhour: true,
+    });
+    fillJira();
+    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
+    expect(screen.getByTestId("task-trigger-cadence")).toBeInTheDocument();
+    const sessionMode = screen.getByTestId("task-session-mode-trigger");
+    fireEvent.keyDown(sessionMode, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "New session each run" }));
+    expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
+    expect(screen.getByTestId("schedule-preset-trigger")).toBeInTheDocument();
+    await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
+  });
+
   it("replaces the prompt with a trigger builder, runs hourly and keeps one session", async () => {
     const user = userEvent.setup();
     const { onOpenChange } = renderTrigger("jira");
@@ -2620,7 +2726,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");
     expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where project");
-    expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every hour");
+    expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Hourly");
     // The trigger always keeps one session, so the form doesn't ask.
     expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
     expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
@@ -2915,6 +3021,222 @@ describe("editing template prompts", () => {
     { ...emptyTriggerFields("jira"), scope: "ENG", instructions: "Triage the ticket." },
     { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
   );
+
+  it("saves worker harness, model, and effort without rebinding the polling session", async () => {
+    const task = scheduledTask({ prompt: original, sessionMode: "continue", sessionId: "poller" });
+    const props = { onOpenChange: vi.fn(), editingTask: task };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+    const select = async (id: string, name: string) => {
+      fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Polly");
+    await select("task-worker-agent-trigger", "Claude Code");
+    await select("task-model-trigger", "Opus");
+    await select("task-effort-trigger", "High");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+      agentId: "ag_claude_native",
+      model: "opus",
+      effort: "high",
+    });
+    for (const key of [
+      "agentId",
+      "modelOverride",
+      "reasoningEffort",
+      "sessionId",
+      "permissionMode",
+    ])
+      expect(input).not.toHaveProperty(key);
+    expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Triage the ticket.");
+    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    rerender(
+      <CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt: input.prompt }} />,
+    );
+    expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Claude Code");
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+    await select("task-worker-agent-trigger", "Polly");
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(2));
+    expect(readTriggerWorkerSettings(updateMutateAsync.mock.calls[1][0].input.prompt)).toEqual({
+      agentId: "ag_1",
+      model: "",
+      effort: "",
+    });
+  });
+
+  it.each(["Your prompt", "System prompt"])(
+    "keeps polling settings unchanged while clearing and restoring %s",
+    async (field) => {
+      render(
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({
+            prompt: original,
+            sessionMode: "continue",
+            sessionId: "poller",
+          })}
+        />,
+      );
+      if (field === "System prompt") {
+        fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+        fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+      }
+      const editor = screen.getByRole("textbox", { name: field }) as HTMLTextAreaElement;
+      const saved = editor.value;
+      fireEvent.change(editor, { target: { value: "" } });
+      const pollerPicker = screen.queryByTestId("pick-harness-claude");
+      if (pollerPicker) fireEvent.click(pollerPicker);
+      fireEvent.change(editor, { target: { value: saved } });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(input.prompt).toBe(original);
+      for (const key of [
+        "agentId",
+        "sessionId",
+        "modelOverride",
+        "reasoningEffort",
+        "permissionMode",
+      ])
+        expect(input).not.toHaveProperty(key);
+      expect(pollerPicker).toBeNull();
+    },
+  );
+
+  it.each(
+    [true, false].flatMap((workerReady) =>
+      (
+        [
+          { change: "none", placement: "managed" },
+          { change: "host", placement: "managed" },
+          { change: "host", placement: "same_host" },
+          { change: "sandbox", placement: "same_host" },
+        ] as const
+      ).map((context) => ({ workerReady, ...context })),
+    ),
+  )(
+    "validates worker placement $placement after poller target change=$change (worker ready: $workerReady)",
+    async ({ workerReady, change, placement }) => {
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockImplementation(
+        (_provider, _harness, agentId) =>
+          ({
+            data: {
+              models: [],
+              configured: false,
+              status: agentId === "ag_claude_native" && workerReady ? "ready" : "unsupported",
+              error: "This harness is unavailable in the sandbox.",
+            },
+          }) as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>,
+      );
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            features: { automations_v2: true },
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            sandbox_provider_capabilities: { modal: { default_models: true } },
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              prompt: original.replace('placement "same_host"', `placement "${placement}"`),
+              executionTarget: change === "sandbox" ? "connected_host" : "managed_sandbox",
+              hostId: change === "sandbox" ? "host_1" : null,
+              sessionMode: "continue",
+              sessionId: "poller",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      if (change !== "sandbox")
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      if (change === "host") {
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+      }
+      fireEvent.keyDown(screen.getByTestId("task-worker-agent-trigger"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "Claude Code" }));
+      const submit = screen.getByTestId("create-scheduled-task-submit");
+      if (change === "sandbox") {
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByTestId("task-host-sandbox-option"));
+        expect(submit).toBeDisabled();
+        expect(screen.getByText(/Polling session cannot start:/)).toHaveTextContent(
+          "This harness is unavailable in the sandbox.",
+        );
+        fireEvent.click(submit);
+        expect(updateMutateAsync).not.toHaveBeenCalled();
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+        expect(screen.queryByText(/Polling session cannot start:/)).not.toBeInTheDocument();
+      }
+      if (workerReady || (change !== "none" && placement === "same_host")) {
+        expect(submit).toBeEnabled();
+        fireEvent.click(submit);
+        await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+        const input = updateMutateAsync.mock.calls[0][0].input;
+        expect(readTriggerWorkerSettings(input.prompt)?.agentId).toBe("ag_claude_native");
+        expect(input.prompt).toContain(`placement "${placement}"`);
+        expect(input).not.toHaveProperty("agentId");
+        expect(input).not.toHaveProperty("sessionId");
+      } else {
+        expect(submit).toBeDisabled();
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "This harness is unavailable in the sandbox.",
+        );
+        fireEvent.click(submit);
+        expect(updateMutateAsync).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("keeps a customized creation call in the separate system prompt editor", async () => {
+    const task = scheduledTask({
+      prompt: original,
+      agentId: "ag_claude_native",
+      sessionMode: "continue",
+      sessionId: "poller",
+    });
+    const props = { onOpenChange: vi.fn(), editingTask: task };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    const editor = screen.getByRole("textbox", { name: "System prompt" }) as HTMLTextAreaElement;
+    fireEvent.change(editor, {
+      target: {
+        value: editor.value.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
+      },
+    });
+    expect(screen.queryByTestId("task-worker-settings")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-agent-picker")).not.toBeInTheDocument();
+    expect(screen.getByText(/Worker controls are unavailable/)).toBeVisible();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(input.prompt).toBe(
+      original.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
+    );
+    expect(input).not.toHaveProperty("agentId");
+    expect(input).not.toHaveProperty("sessionId");
+    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    rerender(
+      <CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt: input.prompt }} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit worker instructions" }));
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveFocus();
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(
+      splitTriggerPrompt(input.prompt).systemPrompt,
+    );
+  });
 
   it("keeps a hand-written heading editable for unrelated changes", async () => {
     const prompt = "Write a training document.\n\nInstructions for each session:\n";

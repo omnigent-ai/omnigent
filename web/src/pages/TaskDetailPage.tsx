@@ -31,7 +31,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
-import { splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
+import { isTriggerPrompt, splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
@@ -276,6 +276,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
     );
   }
 
+  const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const paused = task.state === "paused";
   const { userPrompt, systemPrompt } = splitTriggerPrompt(task.prompt);
   const permissionOption = nativePermissionOptions(harness).find(
@@ -373,23 +374,25 @@ function TaskDetail({ taskId }: { taskId: string }) {
           >
             <Trash2Icon className="size-4" />
           </Button>
-          <Button
-            data-testid="task-detail-run-now"
-            disabled={busy || awaitingRunRow}
-            onClick={handleRunNow}
-          >
-            {runNowMutation.isPending || awaitingRunRow ? (
-              <>
-                <Loader2Icon className="size-4 animate-spin" />
-                In progress
-              </>
-            ) : (
-              <>
-                <PlayIcon className="size-4" />
-                Run now
-              </>
-            )}
-          </Button>
+          {!triggerMode && (
+            <Button
+              data-testid="task-detail-run-now"
+              disabled={busy || awaitingRunRow}
+              onClick={handleRunNow}
+            >
+              {runNowMutation.isPending || awaitingRunRow ? (
+                <>
+                  <Loader2Icon className="size-4 animate-spin" />
+                  In progress
+                </>
+              ) : (
+                <>
+                  <PlayIcon className="size-4" />
+                  Run now
+                </>
+              )}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -416,8 +419,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
           {paused ? "Paused" : "Active"}
         </span>
         <span className="text-muted-foreground" data-testid="task-detail-schedule">
-          {scheduleSummary}
-          {nextRun && ` · Next run ${nextRun}`}
+          {triggerMode ? "Runs when new items match" : scheduleSummary}
+          {!triggerMode && nextRun && ` · Next run ${nextRun}`}
         </span>
       </div>
 
@@ -667,12 +670,21 @@ function RunRow({
               Session cost {formatSessionCostUsd(run.sessionCostUsd)}
             </span>
           )}
-          {inFlightLabel && (
+          {inFlightLabel && !(run.conversationPendingApprovals ?? 0) && (
             <span className="text-xs text-muted-foreground" data-testid="run-status-label">
               {inFlightLabel}
             </span>
           )}
         </span>
+        {(run.conversationPendingApprovals ?? 0) > 0 && run.conversationId && (
+          <span
+            className="text-xs text-amber-600 dark:text-amber-400"
+            role="status"
+            data-testid="run-pending-approval"
+          >
+            Session needs approval · Open to review
+          </span>
+        )}
         {failure && (
           <span className="text-xs text-muted-foreground" data-testid="run-failure">
             {failure.stage && (

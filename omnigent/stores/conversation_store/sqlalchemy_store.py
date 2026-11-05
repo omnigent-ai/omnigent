@@ -1442,12 +1442,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id,
                     SqlConversationMetadata.live_status,
                     SqlConversationMetadata.session_usage,
+                    SqlConversationMetadata.pending_elicitation_count,
+                    SqlConversationMetadata.runner_id,
                 ).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id.in_([row.id for row in updated]),
                 )
             ).all()
         statuses = {row.id: row.live_status for row in meta_rows}
+        pending_counts = {row.id: row.pending_elicitation_count for row in meta_rows}
+        runner_ids = {row.id: row.runner_id for row in meta_rows}
         costs = {
             row.id: json.loads(row.session_usage).get("total_cost_usd")
             for row in meta_rows
@@ -1465,6 +1469,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 updated_at=row.updated_at,
                 live_status=live_status,
                 total_cost_usd=costs.get(row.id),
+                pending_elicitation_count=pending_counts.get(row.id),
+                runner_id=runner_ids.get(row.id),
             )
         return activity
 
