@@ -875,6 +875,7 @@ def create_scheduled_tasks_router(
         history and in the LIST endpoint's ``last_run_status``. Legacy timers
         return ``409`` when a fire for this task is already in flight. Both return
         ``503`` when the scheduler subsystem is not running.
+        The database scheduler also returns ``run_id`` to identify the queued run.
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
@@ -886,9 +887,10 @@ def create_scheduled_tasks_router(
                     "scheduled task scheduler is not running",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            if await scheduler.run_now(task) is None:
+            run = await scheduler.run_now(task)
+            if run is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
-            return {"triggered": True, "id": task.id}
+            return {"triggered": True, "id": task.id, "run_id": run.id}
         run_now = getattr(request.app.state, "scheduled_task_run_now", None)
         if run_now is None:
             raise OmnigentError(
