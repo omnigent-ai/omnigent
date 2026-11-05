@@ -83,6 +83,11 @@ the header menu), and each place is a separate entry point.
   Closing the dialog mid-clone keeps the clone running: a toast reports it
   (with **Open** on success), and reopening the dialog shows it again.
   Dismissing that toast stops tracking the clone, so a new one can start.
+- `fork-shareable-folder`: when restricted sharing blocks a home or root
+  workspace, the Share dialog (header or sidebar row) shows a banner with
+  **Fork into a different folder**. It opens the fork dialog with an empty
+  directory field that refuses home and root folders; the fork keeps the
+  history, and you then share it from its own Share dialog.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.

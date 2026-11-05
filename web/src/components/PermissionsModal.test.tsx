@@ -792,10 +792,11 @@ describe("PermissionsModal", () => {
           workspace="/home/alice/project"
           open
           onOpenChange={() => {}}
+          onForkIntoAnotherFolder={() => {}}
         />,
         { wrapper: createSharingWrapper("restricted_read_only") },
       );
-      expect(screen.queryByText(/This session's working directory/)).not.toBeInTheDocument();
+      expect(screen.queryByTestId("share-workspace-blocked")).not.toBeInTheDocument();
       fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
       fireEvent.click(screen.getByRole("button", { name: /grant/i }));
       await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob", 1));
@@ -896,24 +897,6 @@ describe("PermissionsModal", () => {
       await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
     });
 
-    it("shows no blocked-folder banner for a project folder", async () => {
-      listMock.mockResolvedValue([]);
-      render(
-        <PermissionsModal
-          sessionId="conv_abc"
-          workspace="/home/alice/project"
-          open
-          onOpenChange={() => {}}
-          onForkIntoAnotherFolder={() => {}}
-        />,
-        { wrapper: createSharingWrapper("restricted_read_only") },
-      );
-
-      expect(screen.queryByTestId("share-workspace-blocked")).not.toBeInTheDocument();
-      expect(screen.getByLabelText("User ID")).toBeEnabled();
-      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
-    });
-
     it("rejects a form submission once the workspace becomes unshareable", async () => {
       listMock.mockResolvedValue([]);
       const { rerender } = render(
@@ -964,7 +947,7 @@ describe("PermissionsModal", () => {
         fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
         fireEvent.click(screen.getByRole("button", { name: /grant/i }));
         await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob", 1));
-        expect(screen.queryByText(/This session's working directory/)).not.toBeInTheDocument();
+        expect(screen.queryByTestId("share-workspace-blocked")).not.toBeInTheDocument();
       },
     );
 

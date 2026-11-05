@@ -20,11 +20,18 @@ import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
-import { sessionActionRestrictions, type SessionActionSource } from "@/lib/sessionCapabilities";
+import {
+  SESSION_ACTIONS_LOADING,
+  sessionActionRestrictions,
+  type SessionActionSource,
+} from "@/lib/sessionCapabilities";
 
+const forkRestriction = vi.hoisted(() => ({ reason: undefined as string | undefined }));
 vi.mock("@/hooks/useSessionActionRestrictions", () => ({
-  useSessionActionRestrictions: (_id: string, source: SessionActionSource) =>
-    sessionActionRestrictions(source),
+  useSessionActionRestrictions: (_id: string, source: SessionActionSource) => ({
+    ...sessionActionRestrictions(source),
+    forkDisabledReason: forkRestriction.reason,
+  }),
 }));
 
 // Controllable rename mutation so the double-click test can assert the
@@ -137,11 +144,14 @@ vi.mock("@/components/PermissionsModal", () => ({
     workspace?: string | null;
     onOpenChange: (open: boolean) => void;
     onForkIntoAnotherFolder?: () => void;
+    forkDisabledReason?: string;
   }) =>
     props.open ? (
       <div data-testid="permissions-modal-stub" data-workspace={props.workspace ?? ""}>
         <button
           type="button"
+          disabled={props.forkDisabledReason !== undefined}
+          title={props.forkDisabledReason}
           onClick={() => {
             props.onOpenChange(false);
             props.onForkIntoAnotherFolder?.();
@@ -1609,6 +1619,24 @@ describe("sharing kill switch", () => {
 });
 
 describe("row Share for a home-directory session", () => {
+  afterEach(() => {
+    forkRestriction.reason = undefined;
+  });
+
+  it("disables the fork action with the row menu's fork restriction", () => {
+    forkRestriction.reason = SESSION_ACTIONS_LOADING;
+    mockConversations([{ ...CONV, workspace: "/home/alice", host_id: "host_a" }]);
+    renderSidebar(undefined, serverInfo({ sharing_mode: "restricted_read_only" }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByRole("menuitem", { name: "Fork" })).toHaveAttribute("aria-disabled");
+    fireEvent.click(screen.getByTestId("share-conversation"));
+
+    const forkAction = screen.getByRole("button", { name: "Fork into a different folder" });
+    expect(forkAction).toBeDisabled();
+    expect(forkAction).toHaveAttribute("title", SESSION_ACTIONS_LOADING);
+  });
+
   it("passes the workspace to Share and forks into a shareable folder from it", () => {
     mockConversations([{ ...CONV, workspace: "/home/alice", host_id: "host_a" }]);
     renderSidebar(undefined, serverInfo({ sharing_mode: "restricted_read_only" }));

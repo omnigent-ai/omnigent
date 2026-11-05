@@ -4947,6 +4947,29 @@ function SessionTooltipContent({
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
 
+/** A row's Share dialog; its fork action follows the same restriction as the row menu's Fork. */
+function RowShareDialog({
+  conversation,
+  onOpenChange,
+  onForkIntoAnotherFolder,
+}: {
+  conversation: Conversation;
+  onOpenChange: (open: boolean) => void;
+  onForkIntoAnotherFolder: () => void;
+}) {
+  const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
+  return (
+    <PermissionsModal
+      sessionId={conversation.id}
+      workspace={conversation.workspace}
+      open
+      onOpenChange={onOpenChange}
+      onForkIntoAnotherFolder={onForkIntoAnotherFolder}
+      forkDisabledReason={forkDisabledReason}
+    />
+  );
+}
+
 function ConversationRowImpl({
   conversation,
   isActive,
@@ -5852,10 +5875,8 @@ function ConversationRowImpl({
       {/* Mount only while open — one per row, its hook tree + JSX would
           otherwise run closed on every row re-render. */}
       {shareOpen && (
-        <PermissionsModal
-          sessionId={conversation.id}
-          workspace={conversation.workspace}
-          open={shareOpen}
+        <RowShareDialog
+          conversation={conversation}
           onOpenChange={setShareOpen}
           onForkIntoAnotherFolder={() => {
             setForkPickShareableDirectory(true);

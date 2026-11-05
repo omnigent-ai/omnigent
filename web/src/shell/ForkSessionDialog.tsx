@@ -2280,6 +2280,21 @@ export function ForkSessionDialog({
   }${
     sourceWorkspace ? ", then starts it on the host and directory you pick" : ""
   }. Comments aren't copied, and changes in the clone won't affect the original.`;
+  // Mode precedence: recovery, then shareable-folder, then a plain clone.
+  let title = truncated ? "Fork from this response" : "Clone session";
+  let description = cloneDescription;
+  let descriptionVisible = false;
+  if (workspaceRecovery) {
+    title = "Continue in another directory";
+    description =
+      "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.";
+    descriptionVisible = true;
+  } else if (pickShareableDirectory) {
+    title = "Fork into a different folder";
+    description =
+      "This server can't share a session that runs in a home or root directory. The fork keeps this conversation's history and starts in the folder you pick. Share the fork once it opens.";
+    descriptionVisible = true;
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -2289,13 +2304,7 @@ export function ForkSessionDialog({
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-1.5">
-            {workspaceRecovery
-              ? "Continue in another directory"
-              : pickShareableDirectory
-                ? "Fork into a different folder"
-                : truncated
-                  ? "Fork from this response"
-                  : "Clone session"}
+            {title}
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -2315,14 +2324,8 @@ export function ForkSessionDialog({
               <TooltipContent>{cloneDescription}</TooltipContent>
             </Tooltip>
           </DialogTitle>
-          <DialogDescription
-            className={workspaceRecovery || pickShareableDirectory ? undefined : "sr-only"}
-          >
-            {workspaceRecovery
-              ? "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored."
-              : pickShareableDirectory
-                ? "This server can't share a session that runs in a home or root directory. The fork keeps this conversation's history and starts in the folder you pick. Share the fork once it opens."
-                : cloneDescription}
+          <DialogDescription className={descriptionVisible ? undefined : "sr-only"}>
+            {description}
           </DialogDescription>
         </DialogHeader>
         <ForkSessionForm
