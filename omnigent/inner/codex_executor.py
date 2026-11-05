@@ -3240,7 +3240,7 @@ class _CodexAppServerSession:
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
-                except Exception:  # noqa: BLE001 - never block session startup
+                except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                     logger.warning(
                         "codex subagent-routing hook trust failed; "
                         "routing will not be enforced for this session",
@@ -3343,7 +3343,7 @@ class _CodexAppServerSession:
                         terminate_tree=_terminate_process_tree,
                         kill_tree=_kill_process_tree,
                     )
-                except Exception:  # noqa: BLE001 - cleanup must continue
+                except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                     logger.warning("Codex worker cleanup failed", exc_info=True)
                     reaped = False
                 if not reaped:
@@ -3410,7 +3410,13 @@ class _CodexAppServerSession:
                     self._worker_launch_close_task = None
                     try:
                         launch_close_task.result()
-                    except Exception:  # noqa: BLE001 - cleanup must continue
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        subprocess.SubprocessError,
+                    ):
                         logger.warning("Codex worker launch cleanup failed", exc_info=True)
                         cleanup_complete = False
                     else:
@@ -3518,7 +3524,7 @@ class _CodexAppServerSession:
             await signer.wait()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - any signer failure invalidates the worker
+        except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
             logger.debug("model signer watcher failed", exc_info=True)
         self._signer_exited = True
         if not self._closing and self._proc is not None:
@@ -3549,7 +3555,7 @@ class _CodexAppServerSession:
                 await signer.close()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - cleanup state records failure
+            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                 logger.warning("model signer close failed", exc_info=True)
             else:
                 if self._signer is signer:
