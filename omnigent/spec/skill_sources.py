@@ -443,15 +443,20 @@ def _plugin_asset_id(key: str, kind: str, source: str = "") -> str:
 
 
 def _plugin_install_paths(
-    ctx: SkillSourceContext, enabled: set[str] | None = None
+    ctx: SkillSourceContext, enabled: set[str] | None = None, *, listed: set[str] | None = None
 ) -> dict[str, Path]:
-    """Map installed plugin keys to trusted paths, optionally filtering by enablement."""
+    """Map installed plugin keys to trusted paths, optionally filtering by enablement.
+
+    :param listed: Collects every key the manifest lists, including skipped ones.
+    """
     data = _read_json(_claude_user_dir(ctx) / "plugins" / "installed_plugins.json")
     if data is None:
         return {}
     plugins = data.get("plugins")
     if not isinstance(plugins, dict):
         return {}
+    if listed is not None:
+        listed.update(plugins)
     # installPath values from installed_plugins.json are trusted only within
     # the Claude plugins cache root; anything pointing elsewhere is logged and
     # skipped so a tampered/odd manifest can't turn an arbitrary directory into
@@ -852,12 +857,19 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
     )
     enablement = _plugin_enablement(ctx)
-    enabled = {key for key, on in enablement.items() if on}
-    install_paths = _plugin_install_paths(ctx, enabled) if enabled else {}
-    for key, launch_path in _claude_launch_plugin_paths(ctx).items():
-        # The probe runs from home and misses workspace settings, so re-apply their disables.
-        if enablement.get(key, True):
-            install_paths.setdefault(key, launch_path)
+    # The probe runs from home and misses workspace settings, so re-apply their disables.
+    launch_paths = {
+        key: path
+        for key, path in _claude_launch_plugin_paths(ctx).items()
+        if enablement.get(key, True)
+    }
+    wanted = {key for key, on in enablement.items() if on} | set(launch_paths)
+    listed: set[str] = set()
+    install_paths = _plugin_install_paths(ctx, wanted, listed=listed) if wanted else {}
+    for key, launch_path in launch_paths.items():
+        # An installed plugin loads only from its trusted install path, even when launched.
+        if key not in listed:
+            install_paths[key] = launch_path
     out: list[SkillSpec] = []
     for key, install_path in install_paths.items():
         plugin = key.split("@", 1)[0]

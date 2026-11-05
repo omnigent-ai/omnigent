@@ -1055,13 +1055,33 @@ def test_claude_native_lists_plugins_the_configured_launch_loads(
 ) -> None:
     """A launcher's session-only plugin shows in the menu; settings disables and installs win.
 
-    A record without ``source`` cannot be matched to settings keys, so it is ignored.
+    An installed plugin loads only from its trusted install path, even one only the launch
+    enables. A record without ``source`` cannot be matched to settings keys, so it is ignored.
     """
     home = _claude_home_with_plugin(
         tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
     )
+    plugins_dir = home / ".claude" / "plugins"
+    lazy = plugins_dir / "cache" / "mkt" / "lazy" / "1.0.0"
+    _write_skill(lazy / "skills", "installed")
+    outside = tmp_path / "outside"
+    _write_skill(outside / "skills", "escaped")
+    manifest = json.loads((plugins_dir / "installed_plugins.json").read_text())
+    manifest["plugins"] |= {
+        "lazy@mkt": [{"installPath": str(lazy)}],
+        "ext@mkt": [{"installPath": str(outside)}],
+    }
+    (plugins_dir / "installed_plugins.json").write_text(json.dumps(manifest))
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"sp@mkt": True, "ext@mkt": True}})
+    )
     launch_dirs = tmp_path / "launch"
-    for plugin, skill in (("dev-productivity", "review"), ("sp", "stale"), ("off", "hidden")):
+    for plugin, skill in (
+        ("dev-productivity", "review"),
+        ("sp", "stale"),
+        ("off", "hidden"),
+        ("lazy", "stale"),
+    ):
         _write_skill(launch_dirs / plugin / "skills", skill)
     ws = tmp_path / "ws"
     (ws / ".claude").mkdir(parents=True)
@@ -1084,6 +1104,9 @@ def test_claude_native_lists_plugins_the_configured_launch_loads(
                 {"name": "sp", "path": str(launch_dirs / "sp"), "source": "sp@mkt"},
                 {"name": "off", "path": str(launch_dirs / "off"), "source": "off@mkt"},
                 {"name": "off", "path": str(launch_dirs / "off")},
+                {"name": "lazy", "path": str(launch_dirs / "lazy"), "source": "lazy@mkt"},
+                # The launch reports an installed plugin at its manifest path, outside the root.
+                {"name": "ext", "path": str(outside), "source": "ext@mkt"},
             ]
         ),
         args=("--", "--settings", configured_settings),
@@ -1094,8 +1117,8 @@ def test_claude_native_lists_plugins_the_configured_launch_loads(
 
     names = {s.name for s in resolve_harness_skills(ctx, "claude-native")}
 
-    assert {"dev-productivity:review", "sp:installed"} <= names
-    assert not names & {"sp:stale", "off:hidden"}
+    assert {"dev-productivity:review", "sp:installed", "lazy:installed"} <= names
+    assert not names & {"sp:stale", "off:hidden", "lazy:stale", "ext:escaped"}
     assert warnings == []
     [launch] = [json.loads(line) for line in launches.read_text().splitlines()]
     argv = launch["argv"]
