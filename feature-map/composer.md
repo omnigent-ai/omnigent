@@ -135,7 +135,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   A Claude native session started through a configured command, arguments or
   launcher also lists the plugins that launch loads, such as `--plugin-dir`.
   States: loading, error/retry, unavailable while disconnected, and an
-  incomplete catalog, including a launch that cannot report its plugins.
+  incomplete catalog, including a launch that has not reported its plugins yet
+  (the host asks it in the background) or cannot report them.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited

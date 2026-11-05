@@ -366,53 +366,62 @@ def test_incomplete_codex_catalog_reports_warnings_and_is_cached_only_briefly(
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize("shared_discovery", [True, False], ids=["shared", "separate"])
-def test_cold_claude_catalogs_share_one_stalled_launch_probe(
+def test_slow_claude_launch_probe_does_not_delay_catalogs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     shared_discovery: bool,
     _no_configured_claude_launch: Callable[[], bool],
 ) -> None:
-    """Concurrent catalogs fall back after one probe timeout, not one timeout each.
+    """Catalogs answer while one probe waits on the launch, then list its plugins once it reports.
 
-    Separate discoveries, like concurrent runner sessions, share no discovery lock.
+    The launch blocks until released, so a catalog returned before then did not wait for it.
+    Catalog expiry is frozen, so only the finished probe can make the cached entry stale.
     """
     for name in ("OMNIGENT_CLAUDE_LAUNCHER", "OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
         plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
     )
-    monkeypatch.setattr(plugin_discovery, "LAUNCH_PLUGINS_TIMEOUT_S", 3.0)
+    monkeypatch.setattr("omnigent.host.skills.time", SimpleNamespace(monotonic=lambda: 0.0))
     home = tmp_path / "home"
-    skill = home / ".claude" / "skills" / "local" / "SKILL.md"
-    skill.parent.mkdir(parents=True)
-    skill.write_text(_skill("local"))
+    for root, name in ((home / ".claude", "local"), (tmp_path / "launch" / "dev", "review")):
+        skill = root / "skills" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(_skill(name))
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    release = tmp_path / "release"
     launches = tmp_path / "launches.jsonl"
+    plugins = [{"name": "dev", "path": str(tmp_path / "launch" / "dev"), "source": "dev@inline"}]
+    init = json.dumps({"type": "system", "subtype": "init", "plugins": plugins})
     configure_claude_launch(
         isolate_provider_resolution(monkeypatch, tmp_path / "config"),
         launches,
-        "time.sleep(30)\n",
+        f"while not os.path.exists({str(release)!r}):\n    time.sleep(0.05)\nprint({init!r})\n",
     )
     shared = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
-
-    def catalog(workspace: Path) -> tuple[list[str], list[str]]:
+    discoveries = [
+        shared if shared_discovery else HostSkillDiscovery(lambda _: pytest.fail("No bundle"))
+        for _ in range(2)
+    ]
+    workspaces = [tmp_path / "first", tmp_path / "second"]
+    for workspace in workspaces:
         workspace.mkdir()
-        discovery = (
-            shared
-            if shared_discovery
-            else HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
-        )
+
+    def catalog(discovery: HostSkillDiscovery, workspace: Path) -> tuple[list[str], list[str]]:
         warnings: list[str] = []
         frame = HostSkillsFrame("request", "claude-native", str(workspace))
         skills = discovery.discover(frame, workspace, warnings=warnings)
         return [skill["name"] for skill in skills], warnings
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        catalogs = list(pool.map(catalog, (tmp_path / "first", tmp_path / "second")))
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            loading = list(pool.map(catalog, discoveries, workspaces))
+    finally:
+        release.touch()
+    plugin_discovery.claude_launch_plugin_dirs()
+    loaded = list(map(catalog, discoveries, workspaces))
 
+    note = "Claude plugins added by the configured launch are still loading; retry in a moment."
+    assert loading == [(["local"], [note])] * 2
+    assert loaded == [(["local", "dev:review"], [])] * 2
     assert len(launches.read_text().splitlines()) == 1
-    warning = (
-        "Claude plugins added by the configured launch are missing: the launch "
-        "timed out after 3s; see the host log for details."
-    )
-    assert catalogs == [(["local"], [warning]), (["local"], [warning])]

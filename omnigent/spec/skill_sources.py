@@ -109,6 +109,9 @@ class SkillSourceContext:
         for each source they could not read (for example a failed
         ``codex plugin list``), so callers can show an incomplete catalog as
         incomplete rather than empty.
+    :param wait_for_launch_plugins: Wait for a customized Claude launch to
+        report its plugins. A menu passes ``False`` to list the rest at once
+        while the launch is probed in the background.
     """
 
     roots: tuple[Path, ...]
@@ -119,6 +122,7 @@ class SkillSourceContext:
     codex_home: Path | None = None
     is_native: bool = False
     warnings: list[str] | None = None
+    wait_for_launch_plugins: bool = True
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -131,6 +135,7 @@ def skill_source_context_from_env(
     skills_filter: str | list[str] = "all",
     bundle_dir: Path | None = None,
     warnings: list[str] | None = None,
+    wait_for_launch_plugins: bool = True,
 ) -> SkillSourceContext:
     """Use the same ambient harness configuration for host and runner discovery."""
     configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -150,6 +155,7 @@ def skill_source_context_from_env(
         ),
         codex_home=codex_home,
         warnings=warnings,
+        wait_for_launch_plugins=wait_for_launch_plugins,
     )
 
 
@@ -284,6 +290,7 @@ def resolve_session_skills(
     bundle_dir: Path | None,
     *,
     warnings: list[str] | None = None,
+    wait_for_launch_plugins: bool = True,
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation."""
     from omnigent.harness_aliases import canonicalize_harness
@@ -298,6 +305,7 @@ def resolve_session_skills(
         skills_filter=spec.skills_filter,
         bundle_dir=bundle_dir,
         warnings=warnings,
+        wait_for_launch_plugins=wait_for_launch_plugins,
     )
     for skill in resolve_harness_skills(ctx, harness):
         if skill.name in seen:
@@ -773,6 +781,8 @@ def _claude_code_commands(ctx: SkillSourceContext) -> list[SkillSpec]:
 def _claude_launch_plugin_paths(ctx: SkillSourceContext) -> dict[str, Path]:
     """Plugins a customized native launch loads, such as a launcher's ``--plugin-dir``."""
     from omnigent.harnesses.claude_native.plugin_discovery import (
+        LaunchPluginsFailed,
+        LaunchPluginsPending,
         claude_launch_is_customized,
         claude_launch_plugin_dirs,
     )
@@ -792,20 +802,25 @@ def _claude_launch_plugin_paths(ctx: SkillSourceContext) -> dict[str, Path]:
     if not customized:
         return {}
     try:
-        return claude_launch_plugin_dirs()
-    except (OSError, subprocess.SubprocessError, TypeError, ValueError, yaml.YAMLError) as exc:
-        summary = (
-            f"timed out after {exc.timeout:g}s"
-            if isinstance(exc, subprocess.TimeoutExpired)
-            else "did not report its plugins"
+        return claude_launch_plugin_dirs(wait=ctx.wait_for_launch_plugins)
+    except LaunchPluginsPending:
+        note = (
+            "Claude plugins added by the configured launch are still loading; retry in a moment."
         )
-        _log.warning("The configured Claude launch %s: %s", summary, exc)
-        if ctx.warnings is not None:
-            ctx.warnings.append(
-                f"Claude plugins added by the configured launch are missing: the launch "
-                f"{summary}; see the host log for details."
-            )
-        return {}
+    except (LaunchPluginsFailed, OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        # The probe logged its own failure; anything else failed to resolve the launch.
+        if isinstance(exc, LaunchPluginsFailed):
+            summary = str(exc)
+        else:
+            _log.warning("Could not resolve the configured Claude launch: %s", exc)
+            summary = "did not report its plugins"
+        note = (
+            f"Claude plugins added by the configured launch are missing: the launch "
+            f"{summary}; see the host log for details."
+        )
+    if ctx.warnings is not None:
+        ctx.warnings.append(note)
+    return {}
 
 
 def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:

@@ -3,23 +3,53 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import threading
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
 
 from omnigent.inner import _proc
 
+_log = logging.getLogger(__name__)
+
 LAUNCH_PLUGINS_TIMEOUT_S = 10.0
-# One probe serves every workspace's catalog; a failure expires sooner so a retry probes again.
-LAUNCH_PLUGINS_TTL_S = 60.0
-FAILED_LAUNCH_PLUGINS_TTL_S = 5.0
+# The launch identity keys each answer, so this only bounds how long a missed change lasts.
+LAUNCH_PLUGINS_TTL_S = 3600.0
+# Each consecutive failure of one launch doubles the wait before it is spawned again.
+FAILED_LAUNCH_BACKOFF_S = 30.0
+MAX_FAILED_LAUNCH_BACKOFF_S = 600.0
 # Listing plugins must not run the user's session hooks.
 _PROBE_SETTINGS = json.dumps({"disableAllHooks": True})
-_launch_plugins_lock = threading.Lock()
-_launch_plugins: tuple[tuple[str, ...], float, dict[str, Path] | Exception] | None = None
+
+
+class LaunchPluginsPending(Exception):
+    """The launch has not reported its plugins yet; a background probe is asking it."""
+
+
+class LaunchPluginsFailed(Exception):
+    """The launch's last probe failed; the message summarizes why, e.g. ``timed out after 10s``."""
+
+
+@dataclass
+class _LaunchProbe:
+    """One launch identity's last answer and the probe refreshing it."""
+
+    plugins: dict[str, Path] | None = None
+    failure: str | None = None
+    backoff_s: float = 0.0
+    refresh_at: float = 0.0
+    running: threading.Event | None = None
+
+
+_probes_lock = threading.Lock()
+_probes: dict[tuple[object, ...], _LaunchProbe] = {}
+_generation = 0
 
 
 def claude_launch_is_customized() -> bool:
@@ -36,6 +66,23 @@ def claude_launch_is_customized() -> bool:
     cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
     return command != "claude" or bool(resolve_harness_args("claude-native", (), cfg=cfg))
+
+
+def launch_plugins_generation() -> int:
+    """Count finished launch probes; a change means catalogs built earlier may be stale."""
+    return _generation
+
+
+def prewarm_claude_launch_plugins() -> None:
+    """Start probing a customized launch, so the first skill menu can already list its plugins.
+
+    Failures are left for the menu to report.
+    """
+    with suppress(
+        LaunchPluginsPending, LaunchPluginsFailed, OSError, TypeError, ValueError, yaml.YAMLError
+    ):
+        if claude_launch_is_customized():
+            claude_launch_plugin_dirs(wait=False)
 
 
 def _plugin_dirs(plugins: object) -> dict[str, Path]:
@@ -56,35 +103,83 @@ def _plugin_dirs(plugins: object) -> dict[str, Path]:
     return out
 
 
-def claude_launch_plugin_dirs() -> dict[str, Path]:
+def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
     """Map each plugin the native launch loads to its directory, keyed ``<plugin>@<source>``.
 
     Claude's init event lists loaded plugins, including session-only ones a
-    launcher adds with ``--plugin-dir``, before it would contact a model.
+    launcher adds with ``--plugin-dir``, before it would contact a model. One
+    background probe at a time asks each launch; its answer is reused until the
+    command, arguments or executable change.
 
-    :raises OSError, subprocess.SubprocessError, ValueError: The launch did not report its plugins.
-    :raises yaml.YAMLError: The Omnigent config is malformed.
+    :param wait: Wait for a first answer rather than raise :class:`LaunchPluginsPending`.
+    :raises LaunchPluginsPending: The launch has not answered yet.
+    :raises LaunchPluginsFailed: The last probe failed and the next waits out a backoff.
+    :raises OSError, TypeError, ValueError, yaml.YAMLError: The Omnigent config could not be read.
     """
-    global _launch_plugins
     from omnigent.harnesses.claude_native.main import _claude_model_probe_invocation
+    from omnigent.models.model_catalog_store import binary_identity
 
     command, launch_args, env = _claude_model_probe_invocation(
         None, ("--settings", _PROBE_SETTINGS)
     )
-    key = (command, *launch_args)
-    # Concurrent callers wait for one probe rather than each spending the timeout.
-    with _launch_plugins_lock:
-        cached = _launch_plugins
-        if cached is None or cached[0] != key or cached[1] <= time.monotonic():
-            result: dict[str, Path] | Exception
+    key = (command, *launch_args, binary_identity(command))
+    with _probes_lock:
+        # Only the current launch's answer is reused, so idle earlier launches are dropped.
+        for idle in [k for k, probe in _probes.items() if k != key and probe.running is None]:
+            del _probes[idle]
+        probe = _probes.setdefault(key, _LaunchProbe())
+        if probe.running is None and probe.refresh_at <= time.monotonic():
+            probe.running = threading.Event()
             try:
-                result, ttl = _probe_plugin_dirs(command, launch_args, env), LAUNCH_PLUGINS_TTL_S
-            except (OSError, subprocess.SubprocessError, ValueError) as exc:
-                result, ttl = exc, FAILED_LAUNCH_PLUGINS_TTL_S
-            cached = _launch_plugins = (key, time.monotonic() + ttl, result)
-    if isinstance(cached[2], Exception):
-        raise cached[2]
-    return dict(cached[2])
+                # Not a daemon, so exiting still waits for a stalled launch to be killed.
+                threading.Thread(
+                    target=_refresh,
+                    args=(probe, command, launch_args, env),
+                    name="claude-launch-plugins",
+                ).start()
+            except RuntimeError:
+                probe.running = None
+                raise
+        running = probe.running
+    if wait and running is not None and probe.plugins is None:
+        running.wait(LAUNCH_PLUGINS_TIMEOUT_S + 5)
+    with _probes_lock:
+        if probe.plugins is not None:
+            return dict(probe.plugins)
+        if probe.running is not None:
+            raise LaunchPluginsPending
+        raise LaunchPluginsFailed(probe.failure)
+
+
+def _refresh(
+    probe: _LaunchProbe, command: str, launch_args: list[str], env: dict[str, str]
+) -> None:
+    global _generation
+    plugins: dict[str, Path] | None = None
+    failure = "did not report its plugins"
+    try:
+        plugins = _probe_plugin_dirs(command, launch_args, env)
+    except subprocess.TimeoutExpired as exc:
+        failure = f"timed out after {exc.timeout:g}s"
+        _log.warning("The configured Claude launch %s: %s", failure, exc)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        _log.warning("The configured Claude launch %s: %s", failure, exc)
+    finally:
+        with _probes_lock:
+            if plugins is None:
+                # A refresh that fails keeps serving the plugins this launch reported before.
+                probe.failure = failure
+                probe.backoff_s = min(
+                    2 * probe.backoff_s or FAILED_LAUNCH_BACKOFF_S, MAX_FAILED_LAUNCH_BACKOFF_S
+                )
+                probe.refresh_at = time.monotonic() + probe.backoff_s
+            else:
+                probe.plugins, probe.failure, probe.backoff_s = plugins, None, 0.0
+                probe.refresh_at = time.monotonic() + LAUNCH_PLUGINS_TTL_S
+            done, probe.running = probe.running, None
+            _generation += 1
+        if done is not None:
+            done.set()
 
 
 def _probe_plugin_dirs(

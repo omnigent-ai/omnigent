@@ -4942,6 +4942,12 @@ class HostProcess:
             # on a harness probe. This is independent of any one server tunnel:
             # reconnecting must not discard useful cold-start work.
             self._ensure_model_options_prewarm()
+            # The skill menu does not wait for a configured Claude launch, so ask it now.
+            from omnigent.harnesses.claude_native.plugin_discovery import (
+                prewarm_claude_launch_plugins,
+            )
+
+            asyncio.get_running_loop().run_in_executor(None, prewarm_claude_launch_plugins)
             self._start_capability_discovery()
             while True:
                 if self._lifecycle_lost.is_set():

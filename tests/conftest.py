@@ -478,7 +478,7 @@ def _no_configured_claude_launch(monkeypatch: pytest.MonkeyPatch) -> Callable[[]
 
     real = plugin_discovery.claude_launch_is_customized
     monkeypatch.setattr(plugin_discovery, "claude_launch_is_customized", lambda: False)
-    monkeypatch.setattr(plugin_discovery, "_launch_plugins", None)
+    monkeypatch.setattr(plugin_discovery, "_probes", {})
     return real
 
 

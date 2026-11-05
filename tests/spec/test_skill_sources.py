@@ -17,6 +17,7 @@ from omnigent.spec.skill_sources import (
     resolve_harness_skills,
 )
 from tests._helpers.claude_launch import configure_claude_launch, write_launch_recorder
+from tests._helpers.polling import poll_until
 from tests._helpers.providers import isolate_provider_resolution
 
 
@@ -1261,36 +1262,122 @@ def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
 
 
 @pytest.mark.posix_only
-@pytest.mark.parametrize(
-    ("script", "ttl_s"),
-    [
-        (_print_init([]), plugin_discovery.LAUNCH_PLUGINS_TTL_S),
-        ("sys.exit(3)\n", plugin_discovery.FAILED_LAUNCH_PLUGINS_TTL_S),
-    ],
-    ids=["reported", "failed"],
-)
-def test_claude_launch_probe_result_is_reused_until_it_expires(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str, ttl_s: float
+def test_unchanged_claude_launch_is_probed_once_until_it_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Repeated catalogs reuse one answer until the launcher changes or the safety TTL passes."""
     now = [0.0]
     monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
     launches = tmp_path / "launches.jsonl"
-    configure_claude_launch(
-        isolate_provider_resolution(monkeypatch, tmp_path / "config"), launches, script
-    )
+    configure_claude_launch(config_home, launches, _print_init([]))
 
     def launch_count(workspace: str) -> int:
         resolve_harness_skills(_ctx(tmp_path / workspace, home), "claude-native")
         return len(launches.read_text().splitlines())
 
-    assert launch_count("first") == 1
-    now[0] = ttl_s - 1
+    assert [launch_count(workspace) for workspace in ("first", "second", "first")] == [1, 1, 1]
+    now[0] = plugin_discovery.LAUNCH_PLUGINS_TTL_S - 1
     assert launch_count("second") == 1
-    now[0] = ttl_s + 1
+    configure_claude_launch(config_home, launches, _print_init([]) + "# upgraded\n")
     assert launch_count("second") == 2
+    # Past the TTL the last answer is served while one background probe refreshes it.
+    generation = plugin_discovery.launch_plugins_generation()
+    now[0] += plugin_discovery.LAUNCH_PLUGINS_TTL_S
+    launch_count("first")
+    poll_until(
+        lambda: plugin_discovery.launch_plugins_generation() > generation,
+        timeout_s=10,
+        interval_s=0.05,
+    )
+    assert launch_count("first") == 3
+
+
+@pytest.mark.posix_only
+def test_failing_claude_launch_backs_off_until_it_reports_its_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consecutive failures wait 30s, doubling up to 10 min, to respawn; success resets it."""
+    now = [0.0]
+    monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    failing = tmp_path / "failing"
+    failing.touch()
+    launches = tmp_path / "launches.jsonl"
+    configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
+        launches,
+        f"if os.path.exists({str(failing)!r}):\n    sys.exit(3)\n" + _print_init([]),
+    )
+    missing = [
+        "Claude plugins added by the configured launch are missing: the launch "
+        "did not report its plugins; see the host log for details."
+    ]
+
+    def catalog() -> tuple[int, list[str]]:
+        warnings: list[str] = []
+        ctx = replace(_ctx(tmp_path / "ws", home), warnings=warnings)
+        resolve_harness_skills(ctx, "claude-native")
+        return len(launches.read_text().splitlines()), warnings
+
+    def wait_for_background_probe(generation: int) -> None:
+        poll_until(
+            lambda: plugin_discovery.launch_plugins_generation() > generation,
+            timeout_s=10,
+            interval_s=0.05,
+        )
+
+    assert catalog() == (1, missing)
+    for count, backoff_s in enumerate((30, 60, 120, 240, 480, 600, 600), start=2):
+        now[0] += backoff_s - 1
+        assert catalog() == (count - 1, missing)
+        now[0] += 1
+        assert catalog() == (count, missing)
+    failing.unlink()
+    now[0] += 600
+    assert catalog() == (9, [])
+
+    failing.touch()
+    generation = plugin_discovery.launch_plugins_generation()
+    now[0] += plugin_discovery.LAUNCH_PLUGINS_TTL_S
+    catalog()
+    wait_for_background_probe(generation)
+    # A failed refresh keeps the last answer and backs off from 30s again.
+    now[0] += 29
+    assert catalog() == (10, [])
+    generation = plugin_discovery.launch_plugins_generation()
+    now[0] += 1
+    catalog()
+    wait_for_background_probe(generation)
+    assert catalog() == (11, [])
+
+
+@pytest.mark.posix_only
+def test_prewarm_asks_a_configured_launch_before_any_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    plugin = tmp_path / "launch" / "dev"
+    _write_skill(plugin / "skills", "review")
+    launches = tmp_path / "launches.jsonl"
+    configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
+        launches,
+        _print_init([{"name": "dev", "path": str(plugin), "source": "dev@inline"}]),
+    )
+
+    plugin_discovery.prewarm_claude_launch_plugins()
+    poll_until(launches.exists, timeout_s=10, interval_s=0.05)
+
+    assert plugin_discovery.claude_launch_plugin_dirs() == {"dev@inline": plugin}
+    assert len(launches.read_text().splitlines()) == 1
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(
