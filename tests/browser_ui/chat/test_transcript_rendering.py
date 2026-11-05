@@ -477,7 +477,8 @@ def test_streaming_mermaid_shows_its_source_until_the_diagram_draws(
     assert kinds == sorted(kinds), "the source showed again after the diagram"
     source = [frame["height"] for frame in shown if not frame["diagram"]]
     diagram = [frame["height"] for frame in shown if frame["diagram"]]
-    assert source and source == sorted(source), f"the source didn't grow as it streamed: {source}"
+    grew = len(set(source)) > 1 and source == sorted(source)
+    assert grew, f"the source didn't grow as it streamed: {source}"
     assert max(diagram) - min(diagram) <= 1, f"the diagram changed size once shown: {diagram}"
 
 

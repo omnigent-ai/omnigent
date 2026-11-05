@@ -2418,6 +2418,7 @@ describe("BlockRenderer dispatch", () => {
       expect(container.querySelector(".chat-mermaid")).toBeNull();
 
       act(() => vi.advanceTimersByTime(100));
+      expect(container).toHaveTextContent("Done.");
       expect(container.querySelector(".chat-mermaid")).not.toBeNull();
     });
   });
