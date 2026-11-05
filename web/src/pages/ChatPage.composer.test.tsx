@@ -1087,22 +1087,17 @@ describe("Composer slash-command menu", () => {
 
   // Which harness and server combinations offer /clear is unit-tested on
   // composerOffersClear (ChatPage.test.ts); these cover the composer's entry points.
+  const sdkClear = { session_event_types: ["message", "clear"], session_claude_sdk_clear: true };
   it.each([
-    ["claude-native", "the menu", { session_event_types: ["message", "clear"] }],
-    [
-      "claude-sdk",
-      "the menu",
-      { session_event_types: ["message", "clear"], session_claude_sdk_clear: true },
-    ],
-    [
-      "claude-sdk",
-      "a typed command",
-      { session_event_types: ["message", "clear"], session_claude_sdk_clear: true },
-    ],
+    ["claude-native", "the menu", { session_event_types: ["message", "clear"] }, null],
+    ["claude-sdk", "the menu", sdkClear, null],
+    ["claude-sdk", "a typed command", sdkClear, null],
+    ["claude-sdk", "a typed command", sdkClear, "Stop the current turn before running /clear."],
   ] as const)(
-    "%s /clear from %s runs the clear control when the server accepts it",
-    (harness, entry, advertised) => {
+    "%s /clear from %s runs the clear control when the server accepts it (refused: %s)",
+    async (harness, entry, advertised, refusal) => {
       const { clearContext, onSend } = renderClearComposer(harness, advertised);
+      if (refusal !== null) clearContext.mockRejectedValueOnce(new Error(refusal));
       if (entry === "the menu") {
         fireEvent.click(screen.getByTestId("slash-menu-item-clear"));
       } else {
@@ -1110,7 +1105,9 @@ describe("Composer slash-command menu", () => {
         fireEvent.keyDown(textarea(), { key: "Enter" });
       }
       expect(clearContext).toHaveBeenCalledOnce();
+      // Refused or not, /clear is never sent to the agent as text.
       expect(onSend).not.toHaveBeenCalled();
+      if (refusal !== null) expect(await screen.findByText(refusal)).toBeVisible();
     },
   );
 
