@@ -79,6 +79,8 @@ prompt, host and permission settings in that request. This also applies when
 the call inherits defaults. Direct changes you make in the UI or REST API keep
 their existing authorization rules.
 
+New automations default to the **Omnigent Automation** project, which is created or reused when you save. Choose another project or remove the selection to opt out. Run sessions and their workers inherit the project, keeping automated work together in the sidebar. Existing automations keep their selected project.
+
 ## Schedules are RRULEs, not cron
 
 Persisted RRULEs have a 512-character storage limit. The parser also applies a

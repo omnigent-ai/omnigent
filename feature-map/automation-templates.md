@@ -31,6 +31,9 @@ to customize.
   and preserves the separate prompts when saved and reopened.
   The detail page also keeps the system prompt collapsed by default, with a
   bounded read-only preview when expanded; use Edit automation to change it.
+- `default-project`: new automations select Omnigent Automation. Saving reuses or
+  creates that project; canceling creates nothing. The project picker can choose
+  another project or remove the default. Editing preserves the saved project.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
   browsing again; saved paths and sandbox setup are preserved. When the default

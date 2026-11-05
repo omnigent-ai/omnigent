@@ -1072,6 +1072,10 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == name)
     assert created["session_mode"] == "continue", created
+    projects = httpx.get(f"{live_server}/v1/projects", timeout=10).json()["data"]
+    automation_projects = [p for p in projects if p["name"] == "Omnigent Automation"]
+    assert len(automation_projects) == 1
+    assert created["project_id"] == automation_projects[0]["id"]
     assert created["rrule"].startswith("FREQ=HOURLY"), created
     # The prompt's details are covered by the dialog and renderer tests.
     assert '(project = "ES" AND labels = "omnigent")' in created["prompt"], created
