@@ -354,6 +354,17 @@ class _NewRunRecorder:
                 await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
 
 
+def _scheduled_session_title(task: ScheduledTask) -> str:
+    if task.session_mode == "continue" and task.prompt.startswith(
+        tuple(
+            f"This automation watches {source} and starts one Omnigent session"
+            for source in ("Jira", "Slack", "GitHub", "Linear")
+        )
+    ):
+        return f"[automation job] {task.name}"
+    return task.name
+
+
 # Follows the prompt in every message a fire sends. No one watches a run, so a
 # question or a permission request stalls it instead of reaching a person. Only
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
@@ -1511,7 +1522,7 @@ async def _create_session_resources(
         conv = await asyncio.to_thread(
             deps.conversation_store.create_conversation,
             agent_id=task.agent_id,
-            title=task.name,
+            title=_scheduled_session_title(task),
             host_id=task.host_id,
             workspace=workspace,
             git_branch=worktree.branch if worktree else None,

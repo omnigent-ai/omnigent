@@ -79,6 +79,7 @@ import {
 } from "@/lib/scheduledTasksApi";
 import { isValidSandboxRepoUrl, splitSandboxWorkspace } from "@/lib/sandboxRepositories";
 import { localTimezone } from "@/lib/timezones";
+import { describeSchedule } from "@/lib/scheduleText";
 
 const PROVIDER_DEFAULT = "provider-default";
 const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
@@ -110,6 +111,7 @@ export function CreateScheduledTaskDialog({
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
+  const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
   // gates on). "loading" → treat as disabled until /v1/info resolves.
@@ -298,6 +300,13 @@ export function CreateScheduledTaskDialog({
   );
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
+  const defaultTriggerSchedule = useMemo(
+    () =>
+      anchoredScheduling && (subhourSupported || triggerPollMinutes >= 60)
+        ? { ...TRIGGER_SCHEDULE_MODEL, interval: triggerPollMinutes }
+        : HOURLY_SCHEDULE_MODEL,
+    [anchoredScheduling, subhourSupported, triggerPollMinutes],
+  );
   const savedSchedule = useMemo(
     () => (editingTask ? parseRRuleToScheduleModel(editingTask.rrule) : null),
     [editingTask],
@@ -349,7 +358,7 @@ export function CreateScheduledTaskDialog({
         setStartNewSession(false);
         setTrigger(initialTrigger);
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
-        setSchedule(initialTrigger ? HOURLY_SCHEDULE_MODEL : DEFAULT_SCHEDULE_MODEL);
+        setSchedule(initialTrigger ? defaultTriggerSchedule : DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
         setWorkspace("");
@@ -366,6 +375,7 @@ export function CreateScheduledTaskDialog({
     initialName,
     initialPrompt,
     initialTrigger,
+    defaultTriggerSchedule,
     editingTask,
     savedSchedule,
     savedWorkspace,
@@ -523,12 +533,19 @@ export function CreateScheduledTaskDialog({
           // or each in its own sandbox.
           placement: sandboxMode ? "managed" : "same_host",
           sessionLink,
+          pollingIntervalMinutes:
+            schedule.preset === "custom" && schedule.customFreq === "minutely"
+              ? schedule.interval
+              : 60,
           model: supportsModel && pickedModel !== "" ? pickedModel : undefined,
           effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
         })
       : "";
   const effectivePrompt =
     trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
+  const triggerMode =
+    trigger !== null ||
+    (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
@@ -703,9 +720,11 @@ export function CreateScheduledTaskDialog({
         <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
           <DialogTitle>{isEdit ? "Edit automation" : "New automation"}</DialogTitle>
           <DialogDescription>
-            {isEdit
-              ? "Update this recurring agent session."
-              : "Runs an agent session on a recurring schedule."}
+            {triggerMode
+              ? "Starts an agent session for each matching item."
+              : isEdit
+                ? "Update this recurring agent session."
+                : "Runs an agent session on a recurring schedule."}
           </DialogDescription>
         </DialogHeader>
 
@@ -900,27 +919,54 @@ export function CreateScheduledTaskDialog({
             <p className="text-sm text-muted-foreground">{getHostHelpText()}</p>
           </div>
 
-          <ScheduleFields
-            timezone={timezone}
-            onTimezoneChange={setTimezone}
-            model={schedule}
-            anchoredScheduling={anchoredScheduling}
-            sessionMode={sessionMode}
-            executionTarget={executionTarget}
-            subhourSupported={subhourSupported}
-            recurrenceUnsupported={scheduleUnsupported}
-            allowPastEnd={allowPastEnd}
-            onChange={setSchedule}
-            onRecurrenceSelect={() => setScheduleUnsupported(false)}
-            onSelectOpenChange={handleSelectOpenChange}
-          />
-          {scheduleUnsupported && (
+          {!triggerMode && (
+            <ScheduleFields
+              timezone={timezone}
+              onTimezoneChange={setTimezone}
+              model={schedule}
+              anchoredScheduling={anchoredScheduling}
+              sessionMode={sessionMode}
+              executionTarget={executionTarget}
+              subhourSupported={subhourSupported}
+              recurrenceUnsupported={scheduleUnsupported}
+              allowPastEnd={allowPastEnd}
+              onChange={setSchedule}
+              onRecurrenceSelect={() => setScheduleUnsupported(false)}
+              onSelectOpenChange={handleSelectOpenChange}
+            />
+          )}
+          {triggerMode && !scheduleInvalid && (
+            <p className="text-sm text-muted-foreground" data-testid="task-trigger-cadence">
+              Checks for new matches: {describeSchedule(buildRRule(schedule))}. Matching items start
+              sessions automatically.
+            </p>
+          )}
+          {triggerMode && scheduleInvalid && (
+            <div className="space-y-2">
+              <p className="text-sm text-destructive" role="alert">
+                This polling configuration is no longer supported. Use the server default to save
+                your changes.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setSchedule(defaultTriggerSchedule);
+                  setScheduleUnsupported(false);
+                }}
+              >
+                Use server default ({describeSchedule(buildRRule(defaultTriggerSchedule))})
+              </Button>
+            </div>
+          )}
+          {!triggerMode && scheduleUnsupported && (
             <p className="text-sm text-destructive" role="alert">
               This schedule can&apos;t be edited in this form yet. Choose a frequency to replace it.
             </p>
           )}
 
-          {unsupportedByScheduler && (
+          {!triggerMode && unsupportedByScheduler && (
             <p className="text-sm text-destructive" role="alert">
               This server does not support custom schedules or occurrence limits. Choose a supported
               frequency and ending to replace this schedule.
@@ -1290,6 +1336,13 @@ async function projectChangeInput(
   if (pickedId !== null) return pickedId === savedProjectId ? {} : { projectId: pickedId };
   return { projectId: await resolveProjectId(choice) };
 }
+
+const TRIGGER_SCHEDULE_MODEL: ScheduleModel = {
+  ...DEFAULT_SCHEDULE_MODEL,
+  preset: "custom",
+  customFreq: "minutely",
+  interval: 10,
+};
 
 const HOURLY_SCHEDULE_MODEL: ScheduleModel = { ...DEFAULT_SCHEDULE_MODEL, preset: "hourly" };
 

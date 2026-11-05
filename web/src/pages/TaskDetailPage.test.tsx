@@ -13,6 +13,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { TaskDetailPage } from "./TaskDetailPage";
 import {
   emptyTriggerFields,
@@ -1201,3 +1203,36 @@ describe("auto-mark runs unread", () => {
     expect(seedRunUnreadBaseline).not.toHaveBeenCalled();
   });
 });
+
+it.each(["continue", "new"] as const)(
+  "keeps manual controls for new-session template prompts: %s",
+  (sessionMode) => {
+    setTask(
+      task({
+        prompt: "This automation watches Jira and starts one Omnigent session",
+        sessionMode,
+        nextRunAt: "2026-03-10T14:00:00Z",
+      }),
+    );
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+        }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+    if (sessionMode === "continue") {
+      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent(
+        "Runs when new items match",
+      );
+      expect(screen.getByTestId("task-detail-schedule")).not.toHaveTextContent("Next run");
+      expect(screen.queryByTestId("task-detail-run-now")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent("Next run");
+      expect(screen.getByTestId("task-detail-run-now")).toBeInTheDocument();
+    }
+  },
+);
