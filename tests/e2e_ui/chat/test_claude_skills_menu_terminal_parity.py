@@ -22,9 +22,11 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.spec.skill_sources import CLAUDE_LAUNCH_PLUGINS_LOADING
 from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
 from tests._helpers.native_session import create_native_session
+from tests._helpers.polling import poll_until
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.messages.test_message_render_parity import _select_view_mode
 from tests.e2e_ui.messages.test_native_claude_render_parity import (
@@ -305,10 +307,19 @@ def _fill_chat_composer(page: Page, text: str) -> None:
 
 def _expect_menu_lists(page: Page, client: httpx.Client, session_id: str, name: str) -> None:
     """Wait for ``/<plugin>:<name>`` in the chat menu, naming what ``/v1/skills`` lists if not."""
+    item = page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:{name}")
+    loading = page.get_by_role("status").filter(has_text=CLAUDE_LAUNCH_PLUGINS_LOADING)
+
+    def offered() -> bool:
+        if item.is_visible():
+            return True
+        if loading.is_visible():
+            # A catalog fetched before the launch answered says so; Retry fetches it again.
+            loading.get_by_role("button", name="Retry").click(timeout=5_000)
+        return False
+
     try:
-        expect(page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:{name}")).to_be_visible(
-            timeout=30_000
-        )
+        poll_until(offered, timeout_s=30, interval_s=1)
     except AssertionError:
         listed = client.get("/v1/skills", params={"session_id": session_id}).json()
         names = [skill["name"] for skill in listed.get("skills", [])]

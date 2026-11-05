@@ -1319,6 +1319,17 @@ def test_unchanged_claude_launch_is_probed_once_until_it_changes(
     """
     now = [0.0]
     monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    probes_may_run = threading.Event()
+    probes_may_run.set()
+
+    class HeldThread(threading.Thread):
+        def run(self) -> None:
+            probes_may_run.wait(10)
+            super().run()
+
+    monkeypatch.setattr(
+        plugin_discovery, "threading", SimpleNamespace(Event=threading.Event, Thread=HeldThread)
+    )
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
@@ -1373,11 +1384,13 @@ def test_unchanged_claude_launch_is_probed_once_until_it_changes(
     else:
         monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "renamed")
     assert catalog("second") == (2, ["two:review"])
-    # Past the TTL the last answer is served while one background probe refreshes it.
+    # Past the TTL the last answer is served while one background probe, held here, refreshes it.
     report("three")
     generation = plugin_discovery.launch_plugins_generation()
     now[0] += plugin_discovery.LAUNCH_PLUGINS_TTL_S
+    probes_may_run.clear()
     assert catalog("first")[1] == ["two:review"]
+    probes_may_run.set()
     poll_until(
         lambda: plugin_discovery.launch_plugins_generation() > generation,
         timeout_s=10,
