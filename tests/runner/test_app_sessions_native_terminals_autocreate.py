@@ -3366,8 +3366,11 @@ async def test_auto_create_claude_terminal_drops_stored_args_claude_cannot_start
     launch_dir = workspace / "sub" if env_chdir else workspace
     launch_dir.mkdir(parents=True)
     if env_chdir:
-        (workspace / ".omnigent").mkdir()
-        (workspace / ".omnigent" / "config.yaml").write_text(
+        # Harness command and args are user-owned, so only the global config
+        # (not a project's .omnigent/config.yaml) can set the wrapper.
+        config_home = tmp_path / "config-home"
+        config_home.mkdir()
+        (config_home / "config.yaml").write_text(
             "harness:\n  claude-native:\n    command: env\n    args: ['--chdir=sub', 'claude']\n"
         )
     (launch_dir / "servers.json").write_text('{"mcpServers": {}}', encoding="utf-8")

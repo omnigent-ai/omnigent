@@ -9760,10 +9760,7 @@ async def _auto_create_claude_terminal(
 
     _harness_cfg = load_effective_config(workspace=workspace)
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
-    claude_terminal_env = build_native_claude_terminal_env(
-        claude_config,
-        client_surface=resource_registry.client_surface(session_id),
-    )
+    claude_terminal_env = build_native_claude_terminal_env(claude_config)
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
     # Inherit the agent's sandbox (and pass ``parent_os_env`` below): otherwise
     # launch_terminal falls back to _default_sandbox_for_platform, overriding
@@ -9908,7 +9905,10 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=claude_terminal_env,
+        env=build_native_claude_terminal_env(
+            claude_config,
+            client_surface=resource_registry.client_surface(session_id),
+        ),
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning
