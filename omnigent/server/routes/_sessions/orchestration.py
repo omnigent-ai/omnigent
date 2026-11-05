@@ -4410,11 +4410,14 @@ async def _wait_for_host_bound_runner_client(
             await asyncio.sleep(_HOST_RUNNER_STARTUP_POLL_S)
         if not retain_startup:
             return await _query_host_runner_status(host_conn, host_registry, runner_id)
+        query_connection = host_registry.get(host_conn.host_id)
+        if query_connection is None:
+            return None
         query_started = time.monotonic()
 
         def observe_launch_age(age: float) -> None:
             nonlocal startup_deadline, retention_declined
-            if retention_declined:
+            if retention_declined or host_registry.get(host_conn.host_id) is not query_connection:
                 return
             cutoff = min(
                 wait_ceiling,
@@ -4428,9 +4431,10 @@ async def _wait_for_host_bound_runner_client(
             else:
                 startup_deadline = max(ordinary_deadline, min(startup_deadline, cutoff))
 
-        return await _query_host_runner_status(
-            host_conn, host_registry, runner_id, on_launch_age=observe_launch_age
+        status = await _query_host_runner_status(
+            query_connection, host_registry, runner_id, on_launch_age=observe_launch_age
         )
+        return status if host_registry.get(host_conn.host_id) is query_connection else None
 
     async def check_pending_owner() -> None:
         wait_reason = "runner startup" if retain_startup else "host sign-in"
@@ -4467,8 +4471,6 @@ async def _wait_for_host_bound_runner_client(
             if sign_in_deadline is not None or retain_startup:
                 await check_pending_owner()
             check_startup_deadline()
-            if retaining_startup and host_registry.get(host_conn.host_id) is not host_conn:
-                return None
             if connect_task in done:
                 client = connect_task.result()
                 if client is not None:
@@ -4488,7 +4490,10 @@ async def _wait_for_host_bound_runner_client(
                     check_startup_deadline()
                     connect_task = wait_for_connection(startup_deadline - time.monotonic())
                     continue
-                if host_registry.get(host_conn.host_id) is not host_conn:
+                if (
+                    startup_deadline is None
+                    and host_registry.get(host_conn.host_id) is not host_conn
+                ):
                     return None
                 if status_task not in done:
                     # A responsive host may have entered sign-in between polls.
@@ -4499,7 +4504,10 @@ async def _wait_for_host_bound_runner_client(
                     if retain_startup:
                         await check_pending_owner()
                     check_startup_deadline()
-                    if host_registry.get(host_conn.host_id) is not host_conn:
+                    if (
+                        startup_deadline is None
+                        and host_registry.get(host_conn.host_id) is not host_conn
+                    ):
                         return None
                 if status_task.result() != "sign_in_pending":
                     remaining = (
@@ -4553,6 +4561,7 @@ async def _wait_for_host_bound_runner_client(
                 waiting_for_sign_in = False
             if (
                 sign_in_deadline is not None
+                and startup_deadline is None
                 and host_registry.get(host_conn.host_id) is not host_conn
             ):
                 return None

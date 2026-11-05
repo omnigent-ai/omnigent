@@ -580,6 +580,8 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
         "rebound",
         "host_rebound",
         "host_lost",
+        "host_reconnected",
+        "retired_host_verdict",
         "dead",
         "unknown",
         "no_reply",
@@ -635,6 +637,7 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
     connection_results: asyncio.Queue[object] = asyncio.Queue()
     waits: list[float] = []
     status_calls = 0
+    queried_connections = []
     active: list[asyncio.Task] = []
     client = object()
     reports = RunnerExitReports()
@@ -653,6 +656,7 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
 
     async def status(*_args, on_launch_age=None):
         nonlocal status_calls
+        queried_connections.append(_args[0])
         status_calls += 1
         initial_status.set()
         if status_calls == 1:
@@ -765,7 +769,24 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
             elif outcome == "host_lost":
                 registered = None
                 next_status.put_nowait((None, None))
-                assert await task is None
+                clock.now = allowance
+                connection_results.put_nowait(None)
+                with pytest.raises(OmnigentError, match="startup deadline"):
+                    await task
+            elif outcome in {"host_reconnected", "retired_host_verdict"}:
+                registered = SimpleNamespace(host_id="host-owned")
+                clock.now = 120.0
+                verdict = "dead" if outcome == "retired_host_verdict" else "alive"
+                next_status.put_nowait((verdict, 0.0))
+                await poll_until_async(
+                    lambda: len(queried_connections) >= 3 or task.done(), timeout_s=budget(5)
+                )
+                assert not task.done()
+                assert queried_connections[-1] is registered
+                next_status.put_nowait(("alive", 0.0))
+                connection_results.put_nowait(client)
+                assert await task is client
+                assert waits == [timeout, allowance], "reconnecting renewed the startup allowance"
             elif outcome in {"dead", "unknown"}:
                 next_status.put_nowait((outcome, None))
                 assert await task is None

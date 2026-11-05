@@ -809,7 +809,16 @@ def _stub_launch(
 
 
 @pytest.mark.parametrize(
-    "outcome", ["connected", "worker_restart", "stop", "expired", "old_input"]
+    "outcome",
+    [
+        "connected",
+        "worker_restart",
+        "stop",
+        "expired",
+        "old_input",
+        "host_reconnected",
+        "host_reconnected_expired",
+    ],
 )
 async def test_saved_input_retains_the_slow_starting_runner(
     startup_env: _Env, monkeypatch: pytest.MonkeyPatch, outcome: str
@@ -821,7 +830,11 @@ async def test_saved_input_retains_the_slow_starting_runner(
     env = startup_env
     session_id = await _create(
         env,
-        name=CODEX_NATIVE_CODING_AGENT.agent_name if outcome == "expired" else "startup-probe",
+        name=(
+            CODEX_NATIVE_CODING_AGENT.agent_name
+            if outcome in {"expired", "host_reconnected_expired"}
+            else "startup-probe"
+        ),
     )
     saved = _bind(env, session_id)
     if outcome == "old_input":
@@ -840,9 +853,12 @@ async def test_saved_input_retains_the_slow_starting_runner(
     grace = 0.03
     monkeypatch.setattr(facade, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", grace)
     monkeypatch.setattr(facade, "_get_runner_client", resolve)
-    launch_started = orchestration.time.monotonic() - (599.7 if outcome == "expired" else 0)
+    expires = outcome in {"expired", "host_reconnected_expired"}
+    launch_started = orchestration.time.monotonic() - (599.7 if expires else 0)
+    queried_connections: list[Any] = []
 
-    async def status(*_args: Any, on_launch_age: Any = None) -> str:
+    async def status(connection: Any, *_args: Any, on_launch_age: Any = None) -> str:
+        queried_connections.append(connection)
         if on_launch_age is not None:
             on_launch_age(orchestration.time.monotonic() - launch_started)
         return "alive"
@@ -885,6 +901,18 @@ async def test_saved_input_retains_the_slow_starting_runner(
         assert len(env.conv_store.list_pending_inputs(session_id)) == 1
         assert launch.await_count == 0
 
+        if outcome.startswith("host_reconnected"):
+            replacement = _connect_host(env, conv.host_id)
+            await poll_until_async(
+                lambda: (
+                    any(connection is replacement for connection in queried_connections)
+                    or delivery.done()
+                ),
+                timeout_s=budget(5),
+            )
+            assert launch.await_count == 0, "a same-host reconnect replaced the admitted runner"
+            assert any(connection is replacement for connection in queried_connections)
+            assert env.conv_store.get_conversation(session_id).runner_id == runner_id
         if outcome == "worker_restart":
             delivery.cancel()
             await asyncio.gather(delivery, return_exceptions=True)
@@ -904,7 +932,7 @@ async def test_saved_input_retains_the_slow_starting_runner(
             assert env.conv_store.list_pending_inputs(session_id) == []
             assert env.conv_store.list_items(session_id).data == []
             return
-        elif outcome == "expired":
+        elif expires:
             await asyncio.wait_for(delivery, budget(5))
             await startup._deliver(env.app, session_id, saved)
             [pending] = env.conv_store.list_pending_inputs(session_id)
