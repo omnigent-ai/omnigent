@@ -195,6 +195,18 @@ export interface Conversation {
   harness?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
+  /**
+   * Work outlives the session's ended turn, such as a background shell or a
+   * Codex goal. The sidebar shows the session as working; `status` stays as
+   * reported.
+   */
+  background_work_running?: boolean;
+  /**
+   * Why a running session's agent is parked on a terminal prompt, e.g.
+   * `"permission prompt"`. The sidebar shows the session as needing input even
+   * when no web card exists for the prompt.
+   */
+  blocked_on?: string | null;
   status?: "idle" | "running" | "failed";
   /**
    * Whether the session's runner is reachable, matching `GET /health`.
@@ -466,8 +478,10 @@ function withRecentlyCreated(
   queryClient: QueryClient,
   visibility?: "mine" | "shared" | "archived",
 ): ConversationsPage {
-  // Recently-created sessions are always owned (active, not archived), so skip
-  // injection for "shared" and "archived" filters where they would not belong.
+  // Kept-alive rows are active (never archived): your own creates/forks and
+  // sessions newly shared with you. Shared fetches skip injection so a share
+  // that has since ended can't be restored over the server's answer, and the
+  // "mine" tab takes only the viewer's own rows.
   if (
     after !== undefined ||
     searchQuery ||
@@ -478,6 +492,7 @@ function withRecentlyCreated(
   ) {
     return page;
   }
+  const viewerId = visibility ? getCurrentUserId() : null;
   const present = new Set(page.data.map((c) => c.id));
   const inject: Conversation[] = [];
   for (const [id, snapshot] of recentlyCreatedSessions) {
@@ -490,6 +505,7 @@ function withRecentlyCreated(
     // isn't reverted by re-injecting stale data.
     const row = findCachedConversationRow(queryClient, id) ?? snapshot;
     if (row.archived && !includeArchived) continue;
+    if (visibility === "mine" && sessionVisibility(row, viewerId) !== "mine") continue;
     inject.push(row);
   }
   if (inject.length === 0) return page;
@@ -1320,6 +1336,9 @@ export function useLeaveSession() {
     mutationFn: ({ id, viewerId }: { id: string; viewerId: string }) =>
       revokePermission(id, viewerId),
     onSuccess: (_data, { id }) => {
+      // The left session may still be readable by link, so no removed frame is
+      // guaranteed; stop the keep-alive from re-injecting it.
+      unmarkRecentlyCreated(id);
       const ids = new Set([id]);
       for (const queryKey of [["conversations"], ["project-sessions"]]) {
         for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({

@@ -1550,16 +1550,13 @@ def build_native_controls(
         # Claude Code's statusLine names a 1M model without its ``[1m]`` marker,
         # so once the marker reached the pane, the unmarked name confirms it.
         unmarked_expected: set[str] = set()
-        long_context_requested = any(
-            value.lower().endswith("[1m]")
-            for value in (selected_model, resolved_model or "", model_arg)
-        )
-        if bound_model:
-            if long_context_requested and model_arg.lower().endswith("[1m]"):
-                unmarked_expected = {normalized_model_id(value) for value in expected}
         if not bound_model:
             # A repeated alias pick keeps the same model; its launch pin proves
             # the exact generation even when the options cache is cold.
+            long_context_requested = any(
+                value.lower().endswith("[1m]")
+                for value in (selected_model, resolved_model or "", model_arg)
+            )
             pinned = alias_pins(env or {}).get(model_arg.lower().removesuffix("[1m]"))
             # A translation that dropped the marker leaves the pane on the plain
             # model, which must not confirm a 1M pick.
@@ -1577,6 +1574,10 @@ def build_native_controls(
             expected.update(
                 canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
             )
+        elif model_arg.lower().endswith("[1m]"):
+            # A bound 1M pick is typed with its marker too, and the statusLine
+            # names the model without it; the unmarked name confirms the pick.
+            unmarked_expected = {normalized_model_id(value) for value in expected}
 
         def _switched(current: str | None) -> bool:
             comparable = current if bound_model or not current else canonical_claude_id(current)
@@ -1639,6 +1640,13 @@ def build_native_controls(
             if model_switch_boundary is not None and await asyncio.to_thread(
                 model_switch_acknowledged, model_switch_boundary, model_arg
             ):
+                _logger.info(
+                    "claude-native model change for session=%s confirmed by Claude Code's "
+                    "fresh acknowledgement; statusLine still reports %r",
+                    conv_id,
+                    current,
+                    extra={"session_id": conv_id},
+                )
                 return Response(status_code=204)
             if baseline is None and current is None:
                 # No statusLine snapshot on either side of the injection: a

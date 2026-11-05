@@ -8403,15 +8403,16 @@ def _tool_relay_handler_factory(
             if len(detail) > _POLICY_PROXY_ERROR_DETAIL_MAX:
                 detail = detail[: _POLICY_PROXY_ERROR_DETAIL_MAX - 3] + "..."
             message = f"omnigent policy-eval proxy could not reach the Omnigent server: {detail}"
-            # Keep the full exception (with traceback) in the runner log; the
-            # user-facing body is capped and can drop a diagnostically useful tail.
-            _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
             body = message.encode("utf-8", "replace")
-            self.send_response(HTTPStatus.BAD_GATEWAY)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(HTTPStatus.BAD_GATEWAY)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            finally:
+                # Slow traceback rendering must not delay the fail-closed response.
+                _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
 
         def _read_json_body(self) -> _JsonObject | None:
             """
@@ -8952,7 +8953,30 @@ def _call_mcp_tool(
         conversation_id=read_active_session_id(bridge_dir),
     )
     result = tools[name].invoke(json.dumps(arguments), ctx)
-    return {"content": [{"type": "text", "text": result}]}
+    response: _JsonObject = {"content": [{"type": "text", "text": result}]}
+    if _local_result_is_error(result):
+        response["isError"] = True
+    return response
+
+
+def _local_result_is_error(result: object) -> bool:
+    """Whether a bridge-local tool's JSON result reports an error.
+
+    Relay-routed calls get ``isError`` from
+    :func:`omnigent.runtime.mcp_tool_result.mcp_response_from_tool_result`;
+    the local ``sys_os_*`` tools served outside an active turn return the same
+    ``{"error": ...}`` / ``{"blocked": true}`` shapes and must flag them the
+    same way, or the model reads a failure as a result.
+    """
+    if not isinstance(result, str):
+        return False
+    try:
+        payload = json.loads(result)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("blocked") is True or bool(payload.get("error"))
 
 
 def _read_relay_tool_names(bridge_dir: Path) -> set[str]:
