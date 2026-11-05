@@ -13,6 +13,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { TaskDetailPage } from "./TaskDetailPage";
 import {
   emptyTriggerFields,
@@ -1062,4 +1064,20 @@ describe("auto-mark runs unread", () => {
 
     expect(seedRunUnreadBaseline).not.toHaveBeenCalled();
   });
+});
+
+it("presents a trigger without a Run now action or next-run timestamp", () => {
+  setTask(task({ prompt: "This automation watches Jira and starts one Omnigent session" }));
+  render(
+    <CapabilitiesProvider
+      info={{
+        ...SERVER_INFO_OFFLINE_FALLBACK,
+        features: { automations_v2: true, automation_trigger_ui: true },
+      }}
+    >
+      {pageTree()}
+    </CapabilitiesProvider>,
+  );
+  expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent("Runs when new items match");
+  expect(screen.queryByTestId("task-detail-run-now")).not.toBeInTheDocument();
 });

@@ -31,7 +31,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
-import { splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
+import { isTriggerPrompt, splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
@@ -61,7 +61,7 @@ import {
   formatRunTimestamp,
 } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
 import { cn } from "@/lib/utils";
@@ -253,6 +253,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
     );
   }
 
+  const triggerMode =
+    isFeatureEnabled(info, "automation_trigger_ui") && isTriggerPrompt(task.prompt);
   const paused = task.state === "paused";
   const { userPrompt, systemPrompt } = splitTriggerPrompt(task.prompt);
   const permissionOption = nativePermissionOptions(harness).find(
@@ -344,23 +346,25 @@ function TaskDetail({ taskId }: { taskId: string }) {
           >
             <Trash2Icon className="size-4" />
           </Button>
-          <Button
-            data-testid="task-detail-run-now"
-            disabled={busy || awaitingRunRow}
-            onClick={handleRunNow}
-          >
-            {runNowMutation.isPending || awaitingRunRow ? (
-              <>
-                <Loader2Icon className="size-4 animate-spin" />
-                In progress
-              </>
-            ) : (
-              <>
-                <PlayIcon className="size-4" />
-                Run now
-              </>
-            )}
-          </Button>
+          {!triggerMode && (
+            <Button
+              data-testid="task-detail-run-now"
+              disabled={busy || awaitingRunRow}
+              onClick={handleRunNow}
+            >
+              {runNowMutation.isPending || awaitingRunRow ? (
+                <>
+                  <Loader2Icon className="size-4 animate-spin" />
+                  In progress
+                </>
+              ) : (
+                <>
+                  <PlayIcon className="size-4" />
+                  Run now
+                </>
+              )}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -387,8 +391,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
           {paused ? "Paused" : "Active"}
         </span>
         <span className="text-muted-foreground" data-testid="task-detail-schedule">
-          {scheduleSummary}
-          {nextRun && ` · Next run ${nextRun}`}
+          {triggerMode ? "Runs when new items match" : scheduleSummary}
+          {!triggerMode && nextRun && ` · Next run ${nextRun}`}
         </span>
       </div>
 

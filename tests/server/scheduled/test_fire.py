@@ -34,6 +34,7 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.routes._host_worktree import (
     WORKTREE_ROOT_LABEL_KEY,
     worktree_root_fingerprint,
@@ -498,6 +499,7 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         sandbox_config=overrides.get("sandbox_config"),
         managed_launches=overrides.get("managed_launches"),
         startup_inputs=overrides.get("startup_inputs"),
+        app_state=overrides.get("app_state"),
         project_store=overrides.get("project_store"),
         single_user_owner=overrides.get("single_user_owner", RESERVED_USER_LOCAL),
     )
@@ -610,17 +612,34 @@ async def test_delete_between_on_fire_and_run_fire_is_noop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_active_creates_session_grant_and_run() -> None:
+@pytest.mark.parametrize("trigger_ui", [False, True])
+@pytest.mark.parametrize("trigger", [False, True])
+async def test_active_creates_session_grant_and_run(trigger_ui: bool, trigger: bool) -> None:
     perm = FakePermissionStore()
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    task = _task(
+        prompt="This automation watches Jira and starts one Omnigent session"
+        if trigger
+        else "Do the work.",
+        session_mode="continue" if trigger else "new",
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": task})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append((conv, task))
 
     on_fire = build_on_fire(
-        _deps(store, permission_store=perm, conversation_store=conv_store),
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+            app_state=SimpleNamespace(
+                feature_flags=resolve_feature_flags(
+                    {"OMNIGENT_FEATURES": "automation_trigger_ui" if trigger_ui else ""}
+                )
+            ),
+        ),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -629,6 +648,9 @@ async def test_active_creates_session_grant_and_run() -> None:
     # A conversation was created bound to the task's agent.
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["agent_id"] == "ag_1"
+    assert conv_store.created[0]["title"] == (
+        "[automation job] nightly" if trigger and trigger_ui else "nightly"
+    )
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
     assert perm.ensured == [RESERVED_USER_LOCAL]
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL

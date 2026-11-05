@@ -1001,6 +1001,11 @@ def test_scheduled_task_create_persists_continuing_one_session(
 
 @pytest.mark.usefixtures("automations_v2_host")
 @pytest.mark.parametrize("entry", ["preview", "templates"])
+@pytest.mark.parametrize(
+    "automations_v2_server",
+    ["automations_v2", "automations_v2,automation_trigger_ui"],
+    indirect=True,
+)
 def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page: Page,
     automations_v2_server: str,
@@ -1068,7 +1073,17 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == name)
     assert created["session_mode"] == "continue", created
-    assert created["rrule"].startswith("FREQ=HOURLY"), created
+    trigger_ui = (
+        httpx.get(f"{live_server}/v1/info", timeout=10)
+        .json()["features"]
+        .get("automation_trigger_ui", False)
+    )
+    assert created["rrule"].startswith(
+        "FREQ=MINUTELY;INTERVAL=10" if trigger_ui else "FREQ=HOURLY"
+    ), created
+    if trigger_ui:
+        expect(_row_by_name(page, name)).to_contain_text("Runs when new items match")
+        expect(_row_by_name(page, name).get_by_test_id("task-next-run")).to_have_count(0)
     # The prompt's details are covered by the dialog and renderer tests.
     assert '(project = "ES" AND labels = "omnigent")' in created["prompt"], created
     expect(page.get_by_role("region", name="Suggested Automations")).to_be_visible()
@@ -1127,6 +1142,9 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page.goto(f"{live_server}/tasks")
     page.get_by_test_id("suggestion-trigger-slack").click()
     expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
+    if trigger_ui:
+        expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
+        expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
 
 
 def test_ten_minute_host_schedule_round_trip(

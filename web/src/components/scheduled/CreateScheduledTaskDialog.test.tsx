@@ -2444,6 +2444,21 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     return mutateAsync.mock.calls[0][0].prompt;
   }
 
+  it("uses ten-minute polling without schedule controls when trigger UI is enabled", async () => {
+    renderTrigger("jira", {
+      features: { automations_v2: true, automation_trigger_ui: true },
+      scheduled_task_subhour: true,
+    });
+    fillJira();
+    expect(screen.queryByLabelText("Frequency")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
+    await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+      rrule: "FREQ=MINUTELY;INTERVAL=10",
+      sessionMode: "continue",
+    });
+  });
+
   it("replaces the prompt with a trigger builder, runs hourly and keeps one session", async () => {
     const user = userEvent.setup();
     const { onOpenChange } = renderTrigger("jira");

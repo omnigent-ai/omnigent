@@ -79,6 +79,7 @@ import {
 } from "@/lib/scheduledTasksApi";
 import { isValidSandboxRepoUrl, splitSandboxWorkspace } from "@/lib/sandboxRepositories";
 import { localTimezone } from "@/lib/timezones";
+import { describeSchedule } from "@/lib/scheduleText";
 
 const PROVIDER_DEFAULT = "provider-default";
 
@@ -107,6 +108,7 @@ export function CreateScheduledTaskDialog({
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
+  const triggerUiEnabled = isFeatureEnabled(info, "automation_trigger_ui");
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
   // Gates the "new sandbox each run" option: only servers that can actually
@@ -346,7 +348,13 @@ export function CreateScheduledTaskDialog({
         setStartNewSession(false);
         setTrigger(initialTrigger);
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
-        setSchedule(initialTrigger ? HOURLY_SCHEDULE_MODEL : DEFAULT_SCHEDULE_MODEL);
+        setSchedule(
+          initialTrigger
+            ? triggerUiEnabled && anchoredScheduling && subhourSupported
+              ? TRIGGER_SCHEDULE_MODEL
+              : HOURLY_SCHEDULE_MODEL
+            : DEFAULT_SCHEDULE_MODEL,
+        );
         setScheduleUnsupported(false);
         setHostId("");
         setWorkspace("");
@@ -363,6 +371,9 @@ export function CreateScheduledTaskDialog({
     initialName,
     initialPrompt,
     initialTrigger,
+    triggerUiEnabled,
+    anchoredScheduling,
+    subhourSupported,
     editingTask,
     savedSchedule,
     savedWorkspace,
@@ -524,6 +535,7 @@ export function CreateScheduledTaskDialog({
       : "";
   const effectivePrompt =
     trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
+  const triggerMode = triggerUiEnabled && (trigger !== null || isTriggerPrompt(effectivePrompt));
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
@@ -697,9 +709,11 @@ export function CreateScheduledTaskDialog({
         <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
           <DialogTitle>{isEdit ? "Edit automation" : "New automation"}</DialogTitle>
           <DialogDescription>
-            {isEdit
-              ? "Update this recurring agent session."
-              : "Runs an agent session on a recurring schedule."}
+            {triggerMode
+              ? "Starts an agent session for each matching item."
+              : isEdit
+                ? "Update this recurring agent session."
+                : "Runs an agent session on a recurring schedule."}
           </DialogDescription>
         </DialogHeader>
 
@@ -893,20 +907,28 @@ export function CreateScheduledTaskDialog({
             <p className="text-sm text-muted-foreground">{getHostHelpText()}</p>
           </div>
 
-          <ScheduleFields
-            timezone={timezone}
-            onTimezoneChange={setTimezone}
-            model={schedule}
-            anchoredScheduling={anchoredScheduling}
-            sessionMode={sessionMode}
-            executionTarget={executionTarget}
-            subhourSupported={subhourSupported}
-            recurrenceUnsupported={scheduleUnsupported}
-            allowPastEnd={allowPastEnd}
-            onChange={setSchedule}
-            onRecurrenceSelect={() => setScheduleUnsupported(false)}
-            onSelectOpenChange={handleSelectOpenChange}
-          />
+          {(!triggerMode || scheduleUnsupported || unsupportedByScheduler) && (
+            <ScheduleFields
+              timezone={timezone}
+              onTimezoneChange={setTimezone}
+              model={schedule}
+              anchoredScheduling={anchoredScheduling}
+              sessionMode={sessionMode}
+              executionTarget={executionTarget}
+              subhourSupported={subhourSupported}
+              recurrenceUnsupported={scheduleUnsupported}
+              allowPastEnd={allowPastEnd}
+              onChange={setSchedule}
+              onRecurrenceSelect={() => setScheduleUnsupported(false)}
+              onSelectOpenChange={handleSelectOpenChange}
+            />
+          )}
+          {triggerMode && (
+            <p className="text-sm text-muted-foreground" data-testid="task-trigger-cadence">
+              Checks for new matches: {describeSchedule(buildRRule(schedule))}. Matching items start
+              sessions automatically.
+            </p>
+          )}
           {scheduleUnsupported && (
             <p className="text-sm text-destructive" role="alert">
               This schedule can&apos;t be edited in this form yet. Choose a frequency to replace it.
@@ -1251,6 +1273,13 @@ async function projectChangeInput(
   if (pickedId !== null) return pickedId === savedProjectId ? {} : { projectId: pickedId };
   return { projectId: await resolveProjectId(choice) };
 }
+
+const TRIGGER_SCHEDULE_MODEL: ScheduleModel = {
+  ...DEFAULT_SCHEDULE_MODEL,
+  preset: "custom",
+  customFreq: "minutely",
+  interval: 10,
+};
 
 const HOURLY_SCHEDULE_MODEL: ScheduleModel = { ...DEFAULT_SCHEDULE_MODEL, preset: "hourly" };
 

@@ -202,3 +202,5 @@ All scheduler backends must support `scheduled_task_harness_settings` before usi
 
 - [Agent YAML spec](AGENT_YAML_SPEC.md) -- defining the agent an automation binds to.
 - [Policies](POLICIES.md) -- gates and spend caps that apply to sessions an automation creates.
+
+With the default-off `automation_trigger_ui` feature enabled, trigger templates show automatic matching instead of next-run times or Run now. New templates poll every 10 minutes when the server supports sub-hour schedules and automations v2; otherwise they retain hourly polling. Existing saved schedules are preserved. New polling sessions are named `[automation job] <automation name>`. These are polling triggers, not webhooks.

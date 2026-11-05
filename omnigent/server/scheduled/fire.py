@@ -82,6 +82,7 @@ from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
+from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.managed_hosts import (
     is_repo_workspace,
@@ -352,6 +353,23 @@ class _NewRunRecorder:
             await _fail_running_run(self._deps, conv.id, reason, "launch_failed")
             if self._deps.startup_inputs is not None:
                 await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
+
+
+def _scheduled_session_title(deps: FireDeps, task: ScheduledTask) -> str:
+    flags = getattr(deps.app_state, "feature_flags", None)
+    if (
+        flags is not None
+        and flags.enabled(Feature.AUTOMATION_TRIGGER_UI)
+        and task.session_mode == "continue"
+        and task.prompt.startswith(
+            tuple(
+                f"This automation watches {source} and starts one Omnigent session"
+                for source in ("Jira", "Slack", "GitHub", "Linear")
+            )
+        )
+    ):
+        return f"[automation job] {task.name}"
+    return task.name
 
 
 # Follows the prompt in every message a fire sends. No one watches a run, so a
@@ -1496,7 +1514,7 @@ async def _create_session_resources(
         conv = await asyncio.to_thread(
             deps.conversation_store.create_conversation,
             agent_id=task.agent_id,
-            title=task.name,
+            title=_scheduled_session_title(deps, task),
             host_id=task.host_id,
             workspace=workspace,
             git_branch=worktree.branch if worktree else None,
