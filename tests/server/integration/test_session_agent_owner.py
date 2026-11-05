@@ -567,18 +567,22 @@ async def test_native_approval_changes_require_owner_authority(
     assert (await auth_client.get(path, headers=owner)).json()["terminal_launch_args"] == args
 
 
+def _queued_texts(session_id: str) -> list[str]:
+    return [
+        block["text"]
+        for entry in pending_inputs.snapshot_for(session_id)
+        for block in entry["content"]
+    ]
+
+
 @pytest.mark.parametrize("level", [LEVEL_EDIT, LEVEL_MANAGE])
 async def test_native_queue_operations_require_owner_authority(
     auth_client: httpx.AsyncClient, level: int
 ) -> None:
     agent = await create_test_agent(auth_client, name="native-queue", user=ALICE)
     session_id = agent["_session_id"]
-    path = f"/v1/sessions/{session_id}"
-    owner = {"X-Forwarded-Email": ALICE}
-    response = await auth_client.put(
-        f"{path}/permissions", json={"user_id": BOB, "level": level}, headers=owner
-    )
-    assert response.status_code in (200, 204), response.text
+    path = f"/v1/sessions/{session_id}/events"
+    await _share_editor(auth_client, session_id, ALICE, BOB, level)
     pending_inputs.record(session_id, [{"type": "input_text", "text": "Then summarize"}])
     event = {
         "type": "external_queue_operations",
@@ -590,18 +594,51 @@ async def test_native_queue_operations_require_owner_authority(
         },
     }
 
-    def queued_texts() -> list[str]:
-        return [
-            block["text"]
-            for entry in pending_inputs.snapshot_for(session_id)
-            for block in entry["content"]
-        ]
-
-    response = await auth_client.post(
-        f"{path}/events", json=event, headers={"X-Forwarded-Email": BOB}
-    )
+    response = await auth_client.post(path, json=event, headers={"X-Forwarded-Email": BOB})
     assert response.status_code == 403, response.text
-    assert queued_texts() == ["Then summarize"]
-    response = await auth_client.post(f"{path}/events", json=event, headers=owner)
+    assert _queued_texts(session_id) == ["Then summarize"]
+    response = await auth_client.post(path, json=event, headers={"X-Forwarded-Email": ALICE})
     assert response.status_code == 202, response.text
-    assert queued_texts() == ["Then summarize briefly"]
+    assert _queued_texts(session_id) == ["Then summarize briefly"]
+
+
+@pytest.mark.parametrize("level", [LEVEL_EDIT, LEVEL_MANAGE], ids=["edit", "manage"])
+async def test_only_the_sender_can_edit_a_queued_native_message(
+    auth_client: httpx.AsyncClient, level: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+    from omnigent.server.routes.sessions import routes_events
+
+    forwarded: list[dict[str, object]] = []
+
+    async def forward(session_id: str, router: object, event: dict[str, object], **kwargs: object):
+        forwarded.append(event)
+        return _RunnerForwardResult(200, "")
+
+    # Isolate the pane; keep authorization and the queued message real.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner", forward
+    )
+    monkeypatch.setattr(
+        routes_events, "_native_pane_harness", lambda *_args, **_kw: "claude-native"
+    )
+    agent = await create_test_agent(auth_client, name="native-queue-edit", user=ALICE)
+    session_id = agent["_session_id"]
+    path = f"/v1/sessions/{session_id}/events"
+    await _share_editor(auth_client, session_id, ALICE, BOB, level)
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "Then summarize"}], created_by=ALICE
+    )
+    event = {
+        "type": "queued_message_edit",
+        "data": {"pending_id": pending_id, "content": "Then delete the logs"},
+    }
+
+    response = await auth_client.post(path, json=event, headers={"X-Forwarded-Email": BOB})
+    assert response.status_code == 403, response.text
+    assert forwarded == []
+    assert _queued_texts(session_id) == ["Then summarize"]
+    response = await auth_client.post(path, json=event, headers={"X-Forwarded-Email": ALICE})
+    assert response.status_code == 202, response.text
+    assert len(forwarded) == 1
+    assert _queued_texts(session_id) == ["Then delete the logs"]

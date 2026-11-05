@@ -518,6 +518,13 @@ _EDIT = {"original": "Then summarize", "replacement": "Then list"}
         (
             "claude-native",
             _EDIT,
+            claude_native_bridge.ClaudeQueuedMessageAmbiguous("queued twice"),
+            409,
+            {"error": "queued_message_ambiguous"},
+        ),
+        (
+            "claude-native",
+            _EDIT,
             claude_native_bridge.ClaudeUserPromptPending("Answer it first.", nothing_typed=True),
             503,
             {"error": "claude_native_queued_message_edit_failed", "detail": "Answer it first."},
@@ -542,6 +549,7 @@ _EDIT = {"original": "Then summarize", "replacement": "Then list"}
     ids=[
         "edited",
         "no-longer-queued",
+        "queued-twice",
         "prompt-pending",
         "prompts-unqueued",
         "pane-failed",

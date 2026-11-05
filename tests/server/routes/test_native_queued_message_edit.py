@@ -51,6 +51,7 @@ async def _edit(pending_id: str, content: object) -> None:
         _SESSION_ID,
         SimpleNamespace(),  # type: ignore[arg-type]
         {"pending_id": pending_id, "content": content},
+        author=None,
         runner_router=None,
         agent_store=SimpleNamespace(),  # type: ignore[arg-type]
         agent_cache=None,
@@ -112,12 +113,24 @@ async def test_confirmed_web_edit_updates_the_queued_message_and_publishes_it(
         ),
         (
             409,
+            {"error": "queued_message_ambiguous"},
+            ErrorCode.CONFLICT,
+            "Another queued message has the same text",
+        ),
+        (
+            409,
             {
                 "error": "no_live_harness",
                 "detail": "no harness subprocess is running for this conversation",
             },
-            ErrorCode.RUNNER_UNAVAILABLE,
-            "Couldn't edit the queued message in the terminal.",
+            ErrorCode.RUNNER_CAPABILITY_MISMATCH,
+            "This session's runner can't edit queued messages.",
+        ),
+        (
+            422,
+            {"detail": "Input should be 'message', 'interrupt' or 'approval'"},
+            ErrorCode.RUNNER_CAPABILITY_MISMATCH,
+            "This session's runner can't edit queued messages.",
         ),
         (
             400,
@@ -126,7 +139,14 @@ async def test_confirmed_web_edit_updates_the_queued_message_and_publishes_it(
             "Couldn't edit the queued message in the terminal.",
         ),
     ],
-    ids=["no-longer-queued", "pane-refused", "no-live-harness", "runner-rejected"],
+    ids=[
+        "no-longer-queued",
+        "pane-refused",
+        "same-text-in-pane",
+        "old-runner-without-harness",
+        "old-runner-harness-rejected",
+        "runner-rejected",
+    ],
 )
 async def test_refused_web_edit_keeps_the_queued_message(
     monkeypatch: pytest.MonkeyPatch,
@@ -155,6 +175,7 @@ async def test_refused_web_edit_keeps_the_queued_message(
     assert message in raised.value.message
     assert "subprocess" not in raised.value.message
     assert "must be a string" not in raised.value.message
+    assert "Input should be" not in raised.value.message
     # A refusal settles the edit, so retrying reaches the runner again.
     assert retried.value.code == error_code
     assert len(forwarded) == 2
@@ -257,6 +278,24 @@ async def test_web_edit_is_refused_before_reaching_the_runner(
 
     assert raised.value.code == error_code
     assert forwarded == []
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_web_edit_is_refused_while_another_queued_message_has_the_same_text(
+    monkeypatch: pytest.MonkeyPatch, published: list[dict[str, Any]]
+) -> None:
+    forwarded = _route_to_runner(monkeypatch, harness="claude-native", runner_status=200)
+    pending_inputs.record(_SESSION_ID, [{"type": "input_text", "text": "Then summarize"}])
+    later = pending_inputs.record(_SESSION_ID, [{"type": "input_text", "text": "Then summarize"}])
+
+    with pytest.raises(OmnigentError) as raised:
+        await _edit(later, "Then summarize the logs")
+
+    assert raised.value.code == ErrorCode.CONFLICT
+    assert "same text" in raised.value.message
+    assert forwarded == []
+    assert _pending_texts() == ["Then summarize", "Then summarize"]
     assert published == []
 
 

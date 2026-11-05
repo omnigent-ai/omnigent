@@ -762,6 +762,10 @@ class ClaudeQueuedMessageMissing(RuntimeError):
     """The message to edit is no longer in Claude Code's prompt queue."""
 
 
+class ClaudeQueuedMessageAmbiguous(RuntimeError):
+    """More than one prompt in Claude Code's queue has the text to edit."""
+
+
 class ClaudeQueuedEditIncomplete(RuntimeError):
     """
     An edit emptied Claude Code's prompt queue but could not queue every prompt again.
@@ -4660,6 +4664,8 @@ def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: st
     :param replacement: The edited text, e.g. ``"Then summarize the logs"``.
     :raises ClaudeQueuedMessageMissing: If no queued prompt matches
         ``original``; any prompts Up popped were submitted again unchanged.
+    :raises ClaudeQueuedMessageAmbiguous: If several queued prompts match
+        ``original``; they were all submitted again unchanged.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending; nothing was typed.
     :raises ClaudeInputBoxOccupied: If the input box stays in shell mode or
@@ -4705,14 +4711,14 @@ def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: st
         if not popped:
             # With nothing queued, Up recalled a history prompt into the composer instead.
             _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-            raise ClaudeQueuedMessageMissing("Claude Code has no queued message to edit.")
+            # Pop records written late mean the clear discarded queued prompts.
+            popped = _popped_queue_prompts(transcript, offset)
+            if not popped:
+                raise ClaudeQueuedMessageMissing("Claude Code has no queued message to edit.")
         target = " ".join(original.split())
-        index = next(
-            (index for index, text in enumerate(popped) if " ".join(text.split()) == target),
-            None,
-        )
-        if index is not None:
-            popped[index] = replacement
+        matches = [index for index, text in enumerate(popped) if " ".join(text.split()) == target]
+        if len(matches) == 1:
+            popped[matches[0]] = replacement
         unsent = _resubmit_popped_prompts(bridge_dir, socket_path, tmux_target, popped)
     finally:
         _INJECTION_CANCEL_EVENT.reset(cancel_token)
@@ -4725,8 +4731,12 @@ def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: st
             "Resend them.",
             unsent=unsent,
         )
-    if index is None:
+    if not matches:
         raise ClaudeQueuedMessageMissing("The message is no longer queued in Claude Code.")
+    if len(matches) > 1:
+        raise ClaudeQueuedMessageAmbiguous(
+            "Claude Code has several queued messages with this text."
+        )
 
 
 def _resubmit_popped_prompts(
@@ -4793,10 +4803,8 @@ def _popped_queue_prompts(transcript: Path, byte_offset: int) -> list[str]:
             if operation is not None and operation.operation in {"popAll", "popOne"}:
                 operations.append(operation)
         if operations:
-            batch = operations[0].timestamp
-            popped = [
-                operation.content for operation in operations if operation.timestamp == batch
-            ]
+            # Claude stamps each pop record as it writes it, so one press can span timestamps.
+            popped = [operation.content for operation in operations]
             settle_until = settle_until or time.monotonic() + _QUEUE_POP_SETTLE_S
         now = time.monotonic()
         if (settle_until is not None and now >= settle_until) or (

@@ -1231,12 +1231,14 @@ def build_native_controls(
         Replace a message waiting in a claude-native pane's queue with edited text.
 
         :returns: 200 once the pane queued the edit, 409 when the message is no
-            longer queued, or 503 when the pane could not be driven. A 503
+            longer queued or several queued messages have its text, or 503 when
+            the pane could not be driven. A 503
             ``claude_native_queued_message_edit_incomplete`` means Up emptied the
             queue and some prompts did not go back; any other 503 left it untouched.
         """
         from omnigent.harnesses.claude_native.bridge import (
             ClaudeQueuedEditIncomplete,
+            ClaudeQueuedMessageAmbiguous,
             ClaudeQueuedMessageMissing,
             bridge_dir_for_bridge_id,
             edit_queued_user_message,
@@ -1258,6 +1260,8 @@ def build_native_controls(
             )
         except ClaudeQueuedMessageMissing:
             return JSONResponse(status_code=409, content={"error": "queued_message_missing"})
+        except ClaudeQueuedMessageAmbiguous:
+            return JSONResponse(status_code=409, content={"error": "queued_message_ambiguous"})
         except ClaudeQueuedEditIncomplete as exc:
             _logger.warning("claude-native queued message edit left prompts unqueued: %s", exc)
             return JSONResponse(

@@ -750,6 +750,12 @@ def _queue_operations_from_event(data: Mapping[str, Any]) -> list[pending_inputs
 _PANE_EDIT_ERRORS = frozenset(
     {"claude_native_queued_message_edit_failed", "claude_native_queued_message_edit_incomplete"}
 )
+# Runners built before queued edits hand the event to the harness, which refuses it.
+_PRE_EDIT_RUNNER_ERRORS = frozenset({"no_live_harness", "no_harness"})
+_AMBIGUOUS_EDIT_MESSAGE = (
+    "Another queued message has the same text, so this one can't be edited here. "
+    "Edit it in the terminal."
+)
 
 
 async def _edit_queued_native_message(
@@ -757,6 +763,7 @@ async def _edit_queued_native_message(
     conv: Conversation,
     data: Mapping[str, Any],
     *,
+    author: str | None,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore,
     agent_cache: AgentCache | None,
@@ -772,13 +779,18 @@ async def _edit_queued_native_message(
     :param conv: The session's conversation.
     :param data: Event data, e.g. ``{"pending_id": "pending_a1b2c3",
         "content": "Then summarize the logs"}``.
+    :param author: Attributed identity of the editor, e.g.
+        ``"alice@example.com"``; only the message's sender may edit it.
     :param runner_router: The session's runner router.
     :param agent_store: Agent store used to resolve the harness.
     :param agent_cache: Agent cache used to resolve the harness.
     :raises OmnigentError: ``INVALID_INPUT`` for a malformed payload or a
-        non-claude-native session, ``CONFLICT`` when the message is no longer
-        queued, and ``RUNNER_UNAVAILABLE`` when an earlier edit of it is
-        unsettled or the pane edit failed or went unconfirmed.
+        non-claude-native session, ``FORBIDDEN`` for someone else's message,
+        ``CONFLICT`` when the message is no longer queued or shares its text
+        with another queued message, ``RUNNER_CAPABILITY_MISMATCH`` when the
+        runner predates queued edits, and ``RUNNER_UNAVAILABLE`` when an
+        earlier edit of it is unsettled or the pane edit failed or went
+        unconfirmed.
     """
     from omnigent.server.routes.sessions.routes_core import _runner_reply_field
 
@@ -798,9 +810,15 @@ async def _edit_queued_native_message(
             code=ErrorCode.INVALID_INPUT,
         )
     try:
-        original = pending_inputs.plan_queued_edit(session_id, pending_id, content)
+        original = pending_inputs.plan_queued_edit(session_id, pending_id, content, author=author)
+    except pending_inputs.QueuedEditForbidden:
+        raise OmnigentError(
+            "You can only edit queued messages you sent.", code=ErrorCode.FORBIDDEN
+        ) from None
+    except pending_inputs.QueuedEditAmbiguous:
+        raise OmnigentError(_AMBIGUOUS_EDIT_MESSAGE, code=ErrorCode.CONFLICT) from None
     except pending_inputs.QueuedEditInProgress:
-        # Not CONFLICT, which tells the client the message has left the queue.
+        # Not CONFLICT, which tells the client not to retry the edit.
         raise OmnigentError(
             "An earlier edit of this message is still being applied. Try again shortly.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -825,10 +843,23 @@ async def _edit_queued_native_message(
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
     error = _runner_reply_field(result.body, "error")
-    if 400 <= result.status_code < 500 or error == "claude_native_queued_message_edit_failed":
+    old_runner = result.status_code == 422 or error in _PRE_EDIT_RUNNER_ERRORS
+    if (
+        old_runner
+        or 400 <= result.status_code < 500
+        or error == "claude_native_queued_message_edit_failed"
+    ):
         pending_inputs.cancel_queued_edit(session_id, pending_id)
+    if old_runner:
+        raise OmnigentError(
+            "This session's runner can't edit queued messages. Update omnigent on its host, "
+            "or edit the message in the terminal.",
+            code=ErrorCode.RUNNER_CAPABILITY_MISMATCH,
+        )
     if error == "queued_message_missing":
         raise OmnigentError("This message is no longer queued.", code=ErrorCode.CONFLICT)
+    if error == "queued_message_ambiguous":
+        raise OmnigentError(_AMBIGUOUS_EDIT_MESSAGE, code=ErrorCode.CONFLICT)
     message = "Couldn't edit the queued message in the terminal."
     # Only the pane edit's own errors carry a detail written for the person.
     detail = _runner_reply_field(result.body, "detail") if error in _PANE_EDIT_ERRORS else None
@@ -2464,6 +2495,7 @@ def register_events_routes(
                 session_id,
                 conv,
                 body.data,
+                author=created_by,
                 runner_router=runner_router,
                 agent_store=agent_store,
                 agent_cache=agent_cache,

@@ -79,6 +79,22 @@ def _queue_gui_follow_up(
     )
 
 
+def _expect_claude_answers_only_the_edit(
+    page: Page, mock_llm_server_url: str, tokens: dict[str, str]
+) -> None:
+    reply = page.get_by_text(f"reply {tokens['edited']}")
+
+    def answered() -> bool:
+        # Releasing the held first turn lets Claude take the queued follow-up.
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)
+        return reply.count() > 0
+
+    poll_until(answered, timeout_s=90)
+    expect(page.get_by_text(f"reply {tokens['original']}")).to_have_count(0)
+    expect(page.locator(_USER, has_text=tokens["edited"])).to_have_count(1)
+    expect(page.locator(_USER, has_text=tokens["original"])).to_have_count(0)
+
+
 def _tmux_keys(base_url: str, session_id: str, *keys: str, literal: bool = False) -> None:
     advert = _tmux_advert(base_url, session_id)
     assert advert is not None
@@ -113,6 +129,7 @@ def test_tui_edit_of_queued_follow_up_updates_the_gui_bubble(
 
     expect(page.locator(_USER, has_text=tokens["edited"])).to_have_count(1, timeout=20_000)
     expect(page.locator(_USER, has_text=tokens["original"])).to_have_count(0)
+    _expect_claude_answers_only_the_edit(page, mock_llm_server_url, tokens)
 
 
 @pytest.mark.nightly
@@ -140,3 +157,4 @@ def test_gui_arrow_up_edit_of_queued_follow_up_replaces_it_in_the_tui(
     expect(page.locator(_USER, has_text="Then summarize")).to_have_count(1, timeout=20_000)
     expect(page.locator(_USER, has_text=tokens["edited"])).to_have_count(1)
     assert tokens["original"] not in _squashed(_pane_text(base_url, session_id))
+    _expect_claude_answers_only_the_edit(page, mock_llm_server_url, tokens)

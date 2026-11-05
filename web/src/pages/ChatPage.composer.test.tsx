@@ -6879,22 +6879,62 @@ describe("Composer — editing Claude Code's queued messages", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("sends the edit as a new message once Claude Code has taken the original", async () => {
+  it("keeps a draft typed while an edit was failing and does not claim to restore the edit", async () => {
+    const toastError = vi.spyOn(toast, "error");
+    const { editQueuedMessage } = renderComposer();
+    let fail: (error: unknown) => void = () => {};
+    editQueuedMessage.mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        fail = reject;
+      }),
+    );
+
+    recallAndSubmit(EDITED_TEXT);
+    fireEvent.change(textarea(), { target: { value: "A new draft" } });
+    await act(async () => fail(new TypeError("Failed to fetch")));
+
+    expect(toastError).toHaveBeenCalledExactlyOnceWith("Couldn't edit the queued message.");
+    expect(textarea()).toHaveValue("A new draft");
+  });
+
+  it.each([
+    new ApiError("This message is no longer queued.", 409, "conflict"),
+    new ApiError("You can only edit queued messages you sent.", 403, "forbidden"),
+  ])("sends the edit as a new message after the server refuses it: %s", async (refusal) => {
     const toastError = vi.spyOn(toast, "error");
     const { editQueuedMessage, onSend } = renderComposer();
-    editQueuedMessage.mockRejectedValueOnce(
-      new ApiError("This message is no longer queued.", 409, "conflict"),
-    );
+    editQueuedMessage.mockRejectedValueOnce(refusal);
 
     recallAndSubmit(EDITED_TEXT);
 
     await waitFor(() => expect(textarea()).toHaveValue(EDITED_TEXT));
     expect(toastError).toHaveBeenCalledExactlyOnceWith(
-      "This message is no longer queued. Your edit is back in the composer.",
+      `${refusal.message} Your edit is back in the composer.`,
     );
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(editQueuedMessage).toHaveBeenCalledOnce();
     expect(onSend).toHaveBeenCalledExactlyOnceWith(EDITED_TEXT, undefined);
+  });
+
+  it("stops recalling queued messages once the runner reports it can't edit them", async () => {
+    const { editQueuedMessage, onSend } = renderComposer();
+    editQueuedMessage.mockRejectedValueOnce(
+      new ApiError(
+        "This session's runner can't edit queued messages.",
+        503,
+        "runner_capability_mismatch",
+      ),
+    );
+
+    recallAndSubmit(EDITED_TEXT);
+
+    await waitFor(() => expect(textarea()).toHaveValue(EDITED_TEXT));
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).toHaveBeenCalledExactlyOnceWith(EDITED_TEXT, undefined);
+    fireEvent.change(textarea(), { target: { value: "" } });
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).not.toHaveValue(QUEUED_TEXT);
+    expect(editQueuedMessage).toHaveBeenCalledOnce();
   });
 
   it("sends a recalled message as new when Claude Code takes it before Enter", () => {

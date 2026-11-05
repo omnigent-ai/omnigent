@@ -3575,6 +3575,8 @@ function ComposerImpl(
   const recallingRef = useRef(false);
   // Pending id of the queued Claude Code message ArrowUp recalled for editing.
   const editingQueuedIdRef = useRef<string | null>(null);
+  // Sessions whose runner predates queued edits, so Up browses history there.
+  const queuedEditUnsupportedRef = useRef(new Set<string>());
   useEffect(() => {
     editingQueuedIdRef.current = null;
   }, [conversationId]);
@@ -3700,16 +3702,19 @@ function ComposerImpl(
       setCommandError(null);
       void editQueuedMessage(queuedEditId, edited).catch((error: unknown) => {
         const refusal = error instanceof ApiError && error.code !== null;
-        toast.error(
-          `${refusal ? error.message : "Couldn't edit the queued message."} Your edit is back in the composer.`,
-        );
         // Restore the edit to resend it, unless the user has moved on.
-        if (useChatStore.getState().conversationId !== editedIn || tailTextareaRef.current?.value) {
-          return;
-        }
+        const restored =
+          useChatStore.getState().conversationId === editedIn && !tailTextareaRef.current?.value;
+        const unsupported = refusal && error.code === "runner_capability_mismatch";
+        if (unsupported && editedIn) queuedEditUnsupportedRef.current.add(editedIn);
+        const reason = refusal ? error.message : "Couldn't edit the queued message.";
+        toast.error(restored ? `${reason} Your edit is back in the composer.` : reason);
+        if (!restored) return;
         replaceText(edited);
-        // Enter retries the edit unless the message has left the queue.
-        if (!(refusal && error.status === 409)) editingQueuedIdRef.current = queuedEditId;
+        // Enter retries the edit only after a failure that may pass.
+        if (!refusal || (error.status >= 500 && !unsupported)) {
+          editingQueuedIdRef.current = queuedEditId;
+        }
       });
       return;
     }
@@ -3965,9 +3970,15 @@ function ComposerImpl(
             return;
           }
           // Like Claude Code's own Up, recall a message it has queued for editing.
-          const queued = canEditQueuedInput
-            ? editableQueuedInput(useChatStore.getState().pendingUserMessages)
-            : null;
+          const queued =
+            canEditQueuedInput &&
+            conversationId &&
+            !queuedEditUnsupportedRef.current.has(conversationId)
+              ? editableQueuedInput(
+                  useChatStore.getState().pendingUserMessages,
+                  getCurrentAuthorId(),
+                )
+              : null;
           if (queued !== null) {
             e.preventDefault();
             resetCursor();
@@ -4538,22 +4549,44 @@ export function hasSentNativeInputPending(
 
 /**
  * The latest queued native message, when the composer can edit it in place: the
- * server has accepted it (so it holds a pending id) and its content is plain text.
+ * viewer sent it, the server has accepted it (so it holds a pending id), its
+ * content is plain text, and no other queued message has the same text.
  *
  * @param pendingUserMessages - The conversation's optimistic and replayed bubbles.
+ * @param viewer - The viewer's author id from `getCurrentAuthorId()`, e.g.
+ *   `"alice@example.com"`, or `null` when unattributed.
  * @returns Its server pending id and text, or `null` when it is not editable.
  */
 export function editableQueuedInput(
   pendingUserMessages: PendingUserMessage[],
+  viewer: string | null,
 ): { pendingId: string; text: string } | null {
   const message = pendingUserMessages.at(-1);
   if (message === undefined || message.initialDraft !== undefined) return null;
+  if ((message.author ?? null) !== viewer) return null;
   const pendingId =
     message.pendingId ?? (message.tempId.startsWith("pending_") ? message.tempId : null);
   if (pendingId === null || message.content.length === 0) return null;
   if (!message.content.every((block) => block.type === "input_text")) return null;
   const text = message.content.map((block) => block.text).join("\n");
-  return text.trim() && !text.startsWith("!") ? { pendingId, text } : null;
+  if (!text.trim() || text.startsWith("!")) return null;
+  // Claude Code's queue holds only text, so it can't tell identical messages apart.
+  const collapsed = collapseWhitespace(text);
+  const duplicated = pendingUserMessages.some(
+    (other) =>
+      other !== message &&
+      other.initialDraft === undefined &&
+      collapseWhitespace(
+        other.content
+          .flatMap((block) => (block.type === "input_text" ? [block.text] : []))
+          .join("\n"),
+      ) === collapsed,
+  );
+  return duplicated ? null : { pendingId, text };
+}
+
+function collapseWhitespace(text: string): string {
+  return text.trim().split(/\s+/).join(" ");
 }
 
 /**

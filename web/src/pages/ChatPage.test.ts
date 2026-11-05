@@ -596,20 +596,27 @@ const bubbleIds = (bubbles: Bubble[]): string[] =>
 describe("editableQueuedInput", () => {
   const text = (value: string) => [{ type: "input_text" as const, text: value }];
 
-  it("offers the latest accepted message under its server pending id", () => {
-    const pending = [
-      { tempId: "tmp_1", pendingId: "pending_1", content: text("first") },
-      { tempId: "tmp_2", pendingId: "pending_2", content: text("Then summarize") },
-    ];
-    expect(editableQueuedInput(pending)).toEqual({
-      pendingId: "pending_2",
-      text: "Then summarize",
-    });
-  });
+  it.each([null, "alice@example.com"])(
+    "offers the latest accepted message %s sent under its server pending id",
+    (viewer) => {
+      const author = viewer === null ? {} : { author: viewer };
+      const pending = [
+        { tempId: "tmp_1", pendingId: "pending_1", content: text("first") },
+        { tempId: "tmp_2", pendingId: "pending_2", content: text("Then summarize"), ...author },
+      ];
+      expect(editableQueuedInput(pending, viewer)).toEqual({
+        pendingId: "pending_2",
+        text: "Then summarize",
+      });
+    },
+  );
 
   it("reads the pending id of a snapshot-replayed bubble from its temp id", () => {
     const pending = [{ tempId: "pending_abc", content: text("replayed") }];
-    expect(editableQueuedInput(pending)).toEqual({ pendingId: "pending_abc", text: "replayed" });
+    expect(editableQueuedInput(pending, null)).toEqual({
+      pendingId: "pending_abc",
+      text: "replayed",
+    });
   });
 
   it.each([
@@ -639,8 +646,19 @@ describe("editableQueuedInput", () => {
     ],
     ["it is a shell command", [{ tempId: "pending_1", content: text("!ls") }]],
     ["it is blank", [{ tempId: "pending_1", content: text("  ") }]],
+    [
+      "someone else sent it",
+      [{ tempId: "pending_1", content: text("Then summarize"), author: "bob@example.com" }],
+    ],
+    [
+      "another queued message has the same text",
+      [
+        { tempId: "pending_1", content: text("Then  summarize") },
+        { tempId: "pending_2", content: text("Then summarize") },
+      ],
+    ],
   ])("returns null when %s", (_case, pending) => {
-    expect(editableQueuedInput(pending)).toBeNull();
+    expect(editableQueuedInput(pending, null)).toBeNull();
   });
 });
 

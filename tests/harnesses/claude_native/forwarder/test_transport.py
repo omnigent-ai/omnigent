@@ -460,31 +460,41 @@ def _session_not_bound_rows(caplog: pytest.LogCaptureFixture) -> list[dict[str, 
     ]
 
 
-def _assistant_items_state(path: Path, *uuids: str) -> forwarder.TranscriptForwardState:
-    """Write one assistant record per uuid; return a cursor positioned before them."""
-    path.write_text(
-        "\n".join(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "uuid": uuid,
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": f"private reply {uuid}"}],
-                    },
-                }
-            )
-            for uuid in uuids
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+def _transcript_state(path: Path, *records: dict[str, Any]) -> forwarder.TranscriptForwardState:
+    """Write the records as a transcript; return a cursor positioned before them."""
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
     return forwarder.TranscriptForwardState(
         transcript_path=path,
         line_cursor=0,
         byte_offset=0,
         cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(path, 0),
     )
+
+
+def _assistant_items_state(path: Path, *uuids: str) -> forwarder.TranscriptForwardState:
+    """Write one assistant record per uuid; return a cursor positioned before them."""
+    return _transcript_state(
+        path,
+        *(
+            {
+                "type": "assistant",
+                "uuid": uuid,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": f"private reply {uuid}"}],
+                },
+            }
+            for uuid in uuids
+        ),
+    )
+
+
+_ENQUEUE_RECORD = {
+    "type": "queue-operation",
+    "operation": "enqueue",
+    "content": "Then summarize the logs",
+    "timestamp": "2026-11-05T09:45:21.000Z",
+}
 
 
 @pytest.mark.asyncio
@@ -867,34 +877,14 @@ async def test_forwarder_posts_queue_operations_before_the_items_after_them(
     gets through.
     """
     transcript_path = tmp_path / "session.jsonl"
-    transcript_path.write_text(
-        "\n".join(
-            [
-                json.dumps(
-                    {
-                        "type": "queue-operation",
-                        "operation": "enqueue",
-                        "content": "Then summarize the logs",
-                        "timestamp": "2026-11-05T09:45:21.000Z",
-                    }
-                ),
-                json.dumps(
-                    {
-                        "type": "user",
-                        "uuid": "user-msg-3",
-                        "message": {"role": "user", "content": "Then summarize the logs"},
-                    }
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    state = forwarder.TranscriptForwardState(
-        transcript_path=transcript_path,
-        line_cursor=0,
-        byte_offset=0,
-        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    state = _transcript_state(
+        transcript_path,
+        _ENQUEUE_RECORD,
+        {
+            "type": "user",
+            "uuid": "user-msg-3",
+            "message": {"role": "user", "content": "Then summarize the logs"},
+        },
     )
     requests: list[dict[str, Any]] = []
 
@@ -946,25 +936,7 @@ async def test_forwarder_waits_out_the_backoff_before_reposting_queue_operations
     tmp_path: Path,
 ) -> None:
     """A failed queue post is not retried on every poll while its backoff runs."""
-    transcript_path = tmp_path / "session.jsonl"
-    transcript_path.write_text(
-        json.dumps(
-            {
-                "type": "queue-operation",
-                "operation": "enqueue",
-                "content": "Then summarize the logs",
-                "timestamp": "2026-11-05T09:45:21.000Z",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    state = forwarder.TranscriptForwardState(
-        transcript_path=transcript_path,
-        line_cursor=0,
-        byte_offset=0,
-        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
-    )
+    state = _transcript_state(tmp_path / "session.jsonl", _ENQUEUE_RECORD)
     queue_posts = 0
 
     def _handle_request(request: httpx.Request) -> httpx.Response:

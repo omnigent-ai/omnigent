@@ -7092,6 +7092,32 @@ describe("chatStore — queued native message edits", () => {
 
     expect(useChatStore.getState().pendingUserMessages[0]?.content).toEqual(text("Then summarize"));
   });
+
+  it("editQueuedMessage keeps the text an edit event delivered while the request was failing", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        handleSessionEvent({
+          type: "session_input_edited",
+          pendingId: "pending_1",
+          content: [{ type: "input_text", text: "Then summarize the logs" }],
+          mergedPendingIds: [],
+        });
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: "It may still apply." } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await expect(
+      useChatStore.getState().editQueuedMessage("pending_1", "Then summarize the logs"),
+    ).rejects.toMatchObject({ status: 503 });
+
+    expect(useChatStore.getState().pendingUserMessages[0]?.content).toEqual(
+      text("Then summarize the logs"),
+    );
+  });
 });
 
 describe("chatStore — handleSessionEvent (session.* events)", () => {

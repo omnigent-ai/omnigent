@@ -3609,9 +3609,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         data: { pending_id: pendingId, content: text },
       });
     } catch (error) {
-      setterFor(conversationId)((s) => ({
-        pendingUserMessages: withPendingContent(s.pendingUserMessages, pendingId, original),
-      }));
+      setterFor(conversationId)((s) => {
+        // Keep newer text that a session.input.edited event wrote meanwhile.
+        const current = s.pendingUserMessages.find((p) => isPendingInput(p, pendingId));
+        if (current?.content !== edited) return {};
+        return {
+          pendingUserMessages: withPendingContent(s.pendingUserMessages, pendingId, original),
+        };
+      });
       throw error;
     }
   },

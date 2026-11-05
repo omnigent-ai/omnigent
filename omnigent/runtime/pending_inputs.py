@@ -390,13 +390,22 @@ class QueuedEditInProgress(RuntimeError):
     """An earlier web edit of the same queued message is still waiting on the pane."""
 
 
+class QueuedEditForbidden(RuntimeError):
+    """Someone other than the queued message's sender asked to edit it."""
+
+
+class QueuedEditAmbiguous(RuntimeError):
+    """Another queued message has the same text, so the pane edit could change either."""
+
+
 @dataclass
 class _QueueMirror:
     """Per-conversation view of the prompts Up moved out of Claude's queue."""
 
     # (whitespace-collapsed text, pending id or None for a prompt typed in the TUI)
     popped: list[tuple[str, str | None]] = field(default_factory=list)
-    pop_batch: str | None = None
+    # Whether the last applied record was a popAll, i.e. one Up press is still popping
+    popping: bool = False
     applied: deque[tuple[str, str, str, int]] = field(default_factory=deque)
     # pending id -> latest web edit text, kept while the entry is queued to attribute late records
     planned_edits: dict[str, str] = field(default_factory=dict)
@@ -1074,7 +1083,9 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
         ]
 
 
-def plan_queued_edit(conversation_id: str, pending_id: str, replacement: str) -> str | None:
+def plan_queued_edit(
+    conversation_id: str, pending_id: str, replacement: str, *, author: str | None
+) -> str | None:
     """
     Register a web edit of a queued message and return the text to replace.
 
@@ -1085,20 +1096,36 @@ def plan_queued_edit(conversation_id: str, pending_id: str, replacement: str) ->
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param pending_id: The queued entry to edit, e.g. ``"pending_a1b2c3"``.
     :param replacement: The edited message text.
+    :param author: Attributed identity of the editor, e.g.
+        ``"alice@example.com"``, or ``None`` for an unattributed local user.
     :returns: The entry's current text, or ``None`` when it is no longer a
         live text-only queued message.
+    :raises QueuedEditForbidden: If ``author`` did not send the entry.
+    :raises QueuedEditAmbiguous: If another live entry has the same text.
     :raises QueuedEditInProgress: If an earlier edit of this entry is still
         unsettled and younger than :data:`_PLANNED_EDIT_TTL_S`.
     """
     with _lock:
         now = _now()
         _evict_stale_locked(conversation_id, now)
-        entry = _pending.get(conversation_id, {}).get(pending_id)
+        entries = _pending.get(conversation_id, {})
+        entry = entries.get(pending_id)
         if entry is None or entry.held or entry.interrupted or _attachment_count(entry.content):
             return None
         text = _content_text(entry.content)
         if not text.strip():
             return None
+        if entry.created_by != author:
+            raise QueuedEditForbidden(pending_id)
+        collapsed = _collapse_whitespace(text)
+        if any(
+            other is not entry
+            and not other.held
+            and not other.interrupted
+            and _collapse_whitespace(_content_text(other.content)) == collapsed
+            for other in entries.values()
+        ):
+            raise QueuedEditAmbiguous(pending_id)
         mirror = _queue_mirrors.get(conversation_id)
         if mirror is None:
             mirror = _QueueMirror()
@@ -1155,13 +1182,13 @@ def apply_queue_operations(
     """
     Mirror Claude Code's queued-prompt edits onto the pending entries.
 
-    Up logs one ``popAll`` per queued prompt it moves into the composer, and
-    submitting the draft logs one ``enqueue`` of the combined text. An
-    ``enqueue`` equal to a popped prompt puts it back unchanged; any other
-    ``enqueue`` after a pop is the edited draft, so the oldest popped entry
-    takes its text and the other popped entries are merged into it. A
-    planned web edit (:func:`plan_queued_edit`) instead edits only its own
-    entry. Records already applied are skipped.
+    Up logs one ``popAll`` per queued prompt it moves into the composer, each
+    with its own timestamp, and submitting the draft logs one ``enqueue`` of
+    the combined text. An ``enqueue`` equal to a popped prompt puts it back
+    unchanged; any other ``enqueue`` after a pop is the edited draft, so the
+    oldest popped entry takes its text and the other popped entries are
+    merged into it. A planned web edit (:func:`plan_queued_edit`) instead
+    edits only its own entry. Records already applied are skipped.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param operations: Queue records in transcript order.
@@ -1196,10 +1223,10 @@ def apply_queue_operations(
             mirror.applied.append(key)
             if len(mirror.applied) > _MAX_APPLIED_QUEUE_OPERATIONS:
                 mirror.applied.popleft()
-            if operation.operation == "popAll" and mirror.pop_batch != operation.timestamp:
+            if operation.operation == "popAll" and not mirror.popping:
                 # Up pops everything queued, so prompts left over from an earlier pop are gone.
                 mirror.popped.clear()
-                mirror.pop_batch = operation.timestamp
+            mirror.popping = operation.operation == "popAll"
             popped_ids = {pid for _text, pid in mirror.popped if pid is not None}
             live = [
                 entry

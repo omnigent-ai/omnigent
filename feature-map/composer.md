@@ -204,9 +204,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `prompt-history`: Up starts history recall only from empty text in an existing
   session. Up/Down at the text boundaries browse recalled messages; editing one
   returns to normal caret navigation. Whitespace and queued messages recalled
-  for editing remain drafts. In a Claude Code session, Up recalls a message
-  Claude Code has queued, and Enter edits it in the chat and the terminal;
-  Up in the terminal updates the chat's queued messages too.
+  for editing remain drafts. In a Claude Code session, Up recalls the latest
+  queued message when you sent it and no other queued message has its text, and
+  Enter edits it in the chat and the terminal; Up in the terminal updates the
+  chat's queued messages too.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain. The "Something went wrong" card from the

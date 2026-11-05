@@ -1180,7 +1180,10 @@ def test_terminal_edit_of_a_queued_message_replaces_its_text() -> None:
     assert pending_inputs.resolve_matching_text("conv", "Then summarize logs").matched is not None
 
 
-def test_terminal_edit_of_two_queued_messages_merges_them_into_the_first() -> None:
+@pytest.mark.parametrize("second_pop_at", ["t1", "t1.001"], ids=["same-ms", "next-ms"])
+def test_terminal_edit_of_two_queued_messages_merges_them_into_the_first(
+    second_pop_at: str,
+) -> None:
     first = pending_inputs.record("conv", [_text_block("first")])
     second = pending_inputs.record("conv", [_text_block("second")])
 
@@ -1188,7 +1191,7 @@ def test_terminal_edit_of_two_queued_messages_merges_them_into_the_first() -> No
         "conv",
         _queue_ops(
             ("popAll", "first", "t1"),
-            ("popAll", "second", "t1"),
+            ("popAll", "second", second_pop_at),
             ("enqueue", "first\nsecond!", "t2"),
         ),
     )
@@ -1196,6 +1199,23 @@ def test_terminal_edit_of_two_queued_messages_merges_them_into_the_first() -> No
     assert edit.pending_id == first
     assert edit.merged_pending_ids == [second]
     assert pending_inputs.pending_ids("conv") == [first]
+
+
+def test_a_later_up_press_forgets_prompts_left_from_an_earlier_one() -> None:
+    pending_inputs.record("conv", [_text_block("first")])
+    second = pending_inputs.record("conv", [_text_block("second")])
+    pending_inputs.apply_queue_operations(
+        "conv",
+        _queue_ops(
+            ("popAll", "first", "t1"), ("popAll", "second", "t1"), ("enqueue", "second", "t2")
+        ),
+    )
+
+    [edit] = pending_inputs.apply_queue_operations(
+        "conv", _queue_ops(("popAll", "second", "t3"), ("enqueue", "second!", "t4"))
+    )
+
+    assert edit == pending_inputs.QueueEdit(second, [_text_block("second!")])
 
 
 def test_terminal_edit_keeps_the_queued_messages_attachments() -> None:
@@ -1246,7 +1266,9 @@ def test_web_edit_resubmitted_one_by_one_edits_only_its_message(
     first = pending_inputs.record("conv", [_text_block("first")])
     second = pending_inputs.record("conv", [_text_block("second")])
     third = pending_inputs.record("conv", [_text_block("third")])
-    assert pending_inputs.plan_queued_edit("conv", second, "second edited") == "second"
+    assert (
+        pending_inputs.plan_queued_edit("conv", second, "second edited", author=None) == "second"
+    )
     if plan_state == "refused":
         pending_inputs.cancel_queued_edit("conv", second)
     elif plan_state == "expired":
@@ -1271,18 +1293,21 @@ def test_web_edit_resubmitted_one_by_one_edits_only_its_message(
 
 def test_a_settled_web_edit_can_be_planned_again() -> None:
     queued = pending_inputs.record("conv", [_text_block("first")])
-    pending_inputs.plan_queued_edit("conv", queued, "first edited")
+    pending_inputs.plan_queued_edit("conv", queued, "first edited", author=None)
 
     with pytest.raises(pending_inputs.QueuedEditInProgress):
-        pending_inputs.plan_queued_edit("conv", queued, "first edited again")
+        pending_inputs.plan_queued_edit("conv", queued, "first edited again", author=None)
     pending_inputs.cancel_queued_edit("conv", queued)
 
-    assert pending_inputs.plan_queued_edit("conv", queued, "first edited again") == "first"
+    assert (
+        pending_inputs.plan_queued_edit("conv", queued, "first edited again", author=None)
+        == "first"
+    )
 
 
 def test_confirmed_web_edit_applies_before_its_queue_records_arrive_and_only_once() -> None:
     queued = pending_inputs.record("conv", [_text_block("first")])
-    pending_inputs.plan_queued_edit("conv", queued, "first edited")
+    pending_inputs.plan_queued_edit("conv", queued, "first edited", author=None)
 
     edit = pending_inputs.confirm_queued_edit("conv", queued)
 
@@ -1297,8 +1322,35 @@ def test_web_edit_is_refused_for_a_missing_or_attachment_message_and_cancellable
     with_image = pending_inputs.record("conv", [image, _text_block("describe")])
     plain = pending_inputs.record("conv", [_text_block("plain")])
 
-    assert pending_inputs.plan_queued_edit("conv", "pending_missing", "x") is None
-    assert pending_inputs.plan_queued_edit("conv", with_image, "x") is None
-    assert pending_inputs.plan_queued_edit("conv", plain, "plain edited") == "plain"
+    assert pending_inputs.plan_queued_edit("conv", "pending_missing", "x", author=None) is None
+    assert pending_inputs.plan_queued_edit("conv", with_image, "x", author=None) is None
+    assert pending_inputs.plan_queued_edit("conv", plain, "plain edited", author=None) == "plain"
     pending_inputs.cancel_queued_edit("conv", plain)
     assert pending_inputs.confirm_queued_edit("conv", plain) is None
+
+
+def test_web_edit_is_refused_for_someone_elses_message() -> None:
+    owners = pending_inputs.record("conv", [_text_block("first")], created_by="alice@example.com")
+
+    for editor in ("bob@example.com", None):
+        with pytest.raises(pending_inputs.QueuedEditForbidden):
+            pending_inputs.plan_queued_edit("conv", owners, "first edited", author=editor)
+
+    assert (
+        pending_inputs.plan_queued_edit("conv", owners, "first edited", author="alice@example.com")
+        == "first"
+    )
+
+
+def test_web_edit_is_refused_while_another_queued_message_has_the_same_text() -> None:
+    earlier = pending_inputs.record("conv", [_text_block("Then  summarize")])
+    later = pending_inputs.record("conv", [_text_block("Then summarize")])
+
+    with pytest.raises(pending_inputs.QueuedEditAmbiguous):
+        pending_inputs.plan_queued_edit("conv", later, "Then summarize the logs", author=None)
+    pending_inputs.resolve("conv", earlier)
+
+    assert (
+        pending_inputs.plan_queued_edit("conv", later, "Then summarize the logs", author=None)
+        == "Then summarize"
+    )
