@@ -115,6 +115,10 @@ the header menu), and each place is a separate entry point.
   directory…**. Choose an existing host directory, optionally with a new git
   worktree of it, to fork the conversation into a new session; the original
   remains available and missing files are not restored.
+- `output-limit-recovery`: a Claude response capped by the output-token limit
+  keeps its partial answer and offers **Continue**. This sends a follow-up in
+  the same conversation without replaying the original prompt or restarting
+  the runner. An older failure or a busy session cannot be continued.
 - `compaction-model-recovery`: a Codex turn that failed while compacting on the
   previous model shows the provider's error and why on a gray error card, with
   **Fork session…**. A spent-budget card is gray for every harness, since it
@@ -430,6 +434,11 @@ from the session header menu. The action also appears on such a card inside a
 Canvas conversation or side chat, and forks that displayed conversation rather
 than the main session.
 
+**Claude output limit:** choose **Continue** on the latest failed response's
+error card in a conversation, Canvas conversation, or side chat. The partial
+answer remains visible while a follow-up asks the agent to continue from
+where it left off. The action is also available on mobile.
+
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
@@ -715,6 +724,14 @@ plain `uv run pytest`, which starts a private server for the test.
   its failed rebuild. The card's hint and **Fork session…** action have
   component coverage in `web/src/components/blocks/StatusBlocks.test.tsx`.
   No browser test drives the card into the fork dialog.
+- **`output-limit-recovery`, desktop/mobile conversation, Canvas, and side chat:**
+  `tests/browser_ui/chat/test_output_limit_continuation.py::test_continue_output_limited_response`
+  runs with the existing built-SPA contract and records the exact follow-up
+  request while retaining partial output. Component tests in
+  `web/src/components/chat/chatBubbleParts.test.tsx` cover duplicate clicks,
+  stale failures and busy sessions. Native failure classification and reload
+  persistence use the existing server native-failure scenario; the browser
+  contract does not simulate native provider output-limit recovery.
 - **`fork`, whole session and resources:**
   `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`.
   This uses the header menu and checks that the fork's image URL loads.

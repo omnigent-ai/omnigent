@@ -6209,6 +6209,16 @@ _CODEX_PROVIDER_DISK_FULL_CARD = {
     ("detail", "expected_code", "card", "wrapper", "reauth_required", "status_extra"),
     [
         (
+            "API Error: Claude's response exceeded the 64000 output token maximum. "
+            "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS "
+            "environment variable.",
+            "max_output_tokens",
+            {},
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (
             "Request timed out",
             "transient_upstream_error",
             {},

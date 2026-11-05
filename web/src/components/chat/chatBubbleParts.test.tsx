@@ -289,6 +289,54 @@ describe("UserBubble literal text", () => {
 });
 
 describe("AssistantBubble error retry", () => {
+  it("continues an output-limited response once while preserving its partial output and draft", async () => {
+    let finish: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const bubble = errorBubble("max_output_tokens");
+    bubble.items.unshift({
+      kind: "text",
+      itemId: "partial_answer",
+      text: "The completed first part of the answer.",
+      final: true,
+    });
+    const draft = { conversationId: "conv_retry", text: "Keep my draft", files: [] };
+    useChatStore.setState({ failedSendDraft: draft });
+    render(<BubbleView bubble={bubble} isLastAssistant />);
+
+    const action = screen.getByRole("button", { name: "Continue" });
+    fireEvent.click(action);
+    fireEvent.click(action);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(screen.getByText("The completed first part of the answer.")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Continuing");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_retry/events");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+    });
+    await act(async () => finish?.(jsonResponse({ queued: true })));
+    expect(screen.getByText("The completed first part of the answer.")).toBeInTheDocument();
+    expect(useChatStore.getState().failedSendDraft).toBe(draft);
+  });
+
+  it.each([false, true])("keeps output-limit recovery guarded (busy=%s)", async (busy) => {
+    if (busy) useChatStore.setState({ sessionStatus: "running" });
+    render(<BubbleView bubble={errorBubble("max_output_tokens")} isLastAssistant={busy} />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        busy ? "Wait for the current turn to finish" : "Only the latest failed turn can be retried",
+      ),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("submits one continuation for a rate limit without replaying the original input", async () => {
     let finishRetry: ((response: Response) => void) | undefined;
     fetchMock.mockImplementationOnce(

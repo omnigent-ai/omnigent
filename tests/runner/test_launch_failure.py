@@ -290,6 +290,36 @@ def test_classifies_native_429_and_rate_limit_errors(code: str, message: str) ->
     assert classify_native_turn_error(code, message) == "rate_limit_exceeded"
 
 
+_CLAUDE_OUTPUT_LIMIT = (
+    "API Error: Claude's response exceeded the 64000 output token maximum. "
+    "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
+)
+
+
+@pytest.mark.parametrize("message", [_CLAUDE_OUTPUT_LIMIT, f"\n{_CLAUDE_OUTPUT_LIMIT}\n"])
+def test_classifies_claude_output_limit_for_manual_continuation(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "max_output_tokens"
+
+
+@pytest.mark.parametrize("code", ["codex_turn_error", "workspace_missing", "invalid_input"])
+def test_claude_output_limit_preserves_other_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _CLAUDE_OUTPUT_LIMIT) == code
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        f"The tool printed: {_CLAUDE_OUTPUT_LIMIT}",
+        f"{_CLAUDE_OUTPUT_LIMIT}\nAnother failure followed.",
+        _CLAUDE_OUTPUT_LIMIT.replace("64000", "0"),
+        "max_output_tokens",
+        "The model reached its context limit.",
+    ],
+)
+def test_output_limit_continuation_requires_the_exact_native_diagnostic(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
 @pytest.mark.parametrize(
     "message",
     [
