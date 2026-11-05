@@ -251,6 +251,7 @@ def _run_to_response(
     viewer_last_seen: int | None = None,
     viewer_unread: bool | None = None,
     session_cost_usd: float | None = None,
+    conversation_pending_approvals: int = 0,
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
 
@@ -273,6 +274,7 @@ def _run_to_response(
         so the frontend never needs a separate session fetch.
     :param session_cost_usd: Current cumulative session cost, or ``None`` when
         unreported. Runs continuing the same session share this total.
+    :param conversation_pending_approvals: Current session approval/question count.
     """
     return {
         "id": run.id,
@@ -288,6 +290,7 @@ def _run_to_response(
         "viewer_last_seen": viewer_last_seen,
         "viewer_unread": viewer_unread,
         "session_cost_usd": session_cost_usd,
+        "conversation_pending_approvals": conversation_pending_approvals,
     }
 
 
@@ -837,6 +840,7 @@ def create_scheduled_tasks_router(
                         viewer_last_seen=last_seen,
                         viewer_unread=explicit_unread,
                         session_cost_usd=session.total_cost_usd,
+                        conversation_pending_approvals=session.pending_elicitation_count or 0,
                     )
                 )
             else:

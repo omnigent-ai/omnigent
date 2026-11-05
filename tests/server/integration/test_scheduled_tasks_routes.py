@@ -1817,6 +1817,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     # A known session the viewer saw but never flagged, waiting on its harness.
     waiting = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
     conv_store.set_session_live_status(waiting.id, "waiting")
+    conv_store.set_pending_elicitation_count(waiting.id, 2)
     _set_read_state("alice@example.com", waiting.id, 1_700_000_100, False)
 
     succeeded_id = uuid.uuid4().hex
@@ -1859,6 +1860,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert succ["viewer_last_seen"] == conv.updated_at - 1
     assert succ["viewer_unread"] is True
     assert succ["session_cost_usd"] == 1.234
+    assert succ["conversation_pending_approvals"] == 0
 
     # Status reads as the sessions list reports it ("waiting" is "running"), and
     # an unflagged session is explicitly not unread rather than unknown.
@@ -1867,6 +1869,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert running["viewer_last_seen"] == 1_700_000_100
     assert running["viewer_unread"] is False
     assert running["session_cost_usd"] is None
+    assert running["conversation_pending_approvals"] == 2
 
     # The skipped run (no conversation_id) gets null for all three fields.
     skip = runs[skipped_id]
@@ -1875,6 +1878,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert skip["viewer_last_seen"] is None
     assert skip["viewer_unread"] is None
     assert skip["session_cost_usd"] is None
+    assert skip["conversation_pending_approvals"] == 0
 
     # Continuing the same session reports its current total on every run.
     _seed_run(

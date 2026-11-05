@@ -176,6 +176,8 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 
 A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `session_mode`, `session_id`, `workspace`, `host_id`, `execution_target`, `project_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
 
+Run history shows **Session needs approval · Open to review** when the linked session has a pending permission request or question. Open the run to review it. This is current session state, including when several runs reuse that session; it is not a historical per-run outcome. Permission enforcement and approval timeouts are unchanged.
+
 ## Current limits
 
 The scheduler is the timing engine only, and its behavior is deliberately simple:

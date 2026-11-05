@@ -140,6 +140,7 @@ describe("listScheduledTaskRuns", () => {
       viewerLastSeen: null,
       viewerUnread: null,
       sessionCostUsd: null,
+      conversationPendingApprovals: 0,
     });
   });
 
@@ -161,6 +162,7 @@ describe("listScheduledTaskRuns", () => {
             viewer_last_seen: 1_700_000_055,
             viewer_unread: false,
             session_cost_usd: 0,
+            conversation_pending_approvals: 2,
           },
         ],
       }),
@@ -172,6 +174,7 @@ describe("listScheduledTaskRuns", () => {
       viewerLastSeen: 1_700_000_055,
       viewerUnread: false,
       sessionCostUsd: 0,
+      conversationPendingApprovals: 2,
     });
   });
 });
