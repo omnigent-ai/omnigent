@@ -991,3 +991,52 @@ async def test_smart_routing_overrides_orchestrator_model_for_child_session(
         f"Smart routing should have set the harness to {routed_harness!r}; "
         f"runner body had {captured['body'].get('harness_override')!r}."
     )
+
+
+async def test_bundled_child_create_survives_a_failed_notify_read(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed child-row read for the runner notify does not fail the create.
+
+    The child is already persisted when the route notifies the runner, so the
+    read that feeds the session-init envelope is best-effort: the create still
+    returns the child and the runner gets the id-only body.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes._sessions import helpers
+
+    parent = await _post_bundle_create(client, {})
+    assert parent.status_code == 201, parent.text
+    parent_id = parent.json()["session_id"]
+    store = get_conversation_store()
+    store.set_runner_id(parent_id, "runner_test")
+    captured: dict[str, Any] = {}
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureClient:
+        return _CaptureClient(captured)
+
+    store_type = type(store)
+    real_get = store_type.get_conversation
+
+    def _get(self: Any, session_id: str, *args: Any, **kwargs: Any) -> Any:
+        # Fail only reads of the new child before the runner is notified.
+        if session_id != parent_id and "body" not in captured:
+            raise RuntimeError("database unavailable")
+        return real_get(self, session_id, *args, **kwargs)
+
+    monkeypatch.setattr(helpers, "_get_runner_client", _stub)
+    monkeypatch.setattr(store_type, "get_conversation", _get)
+    resp = await _post_bundle_create(client, {"parent_session_id": parent_id})
+
+    assert resp.status_code == 201, resp.text
+    created = resp.json()
+    assert captured["body"] == {
+        "session_id": created["session_id"],
+        "agent_id": created["agent_id"],
+        "sub_agent_name": None,
+    }
+    monkeypatch.undo()
+    child = await client.get(f"/v1/sessions/{created['session_id']}")
+    assert child.status_code == 200, child.text
+    assert child.json()["parent_session_id"] == parent_id

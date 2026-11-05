@@ -1587,9 +1587,7 @@ def register_core_routes(
                 result.session_id,
                 result.agent_id,
                 runner_router,
-                conversation=await asyncio.to_thread(
-                    conversation_store.get_conversation, result.session_id
-                ),
+                conversation_store=conversation_store,
             )
         # Grant the creator ownership BEFORE scheduling the managed
         # launch, mirroring the JSON path: a managed-guard failure

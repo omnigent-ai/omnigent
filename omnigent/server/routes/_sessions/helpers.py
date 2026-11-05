@@ -11273,6 +11273,8 @@ async def _notify_runner_of_bundled_child(
     agent_id: str,
     runner_router: RunnerRouter | None,
     conversation: Conversation | None = None,
+    *,
+    conversation_store: ConversationStore | None = None,
 ) -> None:
     """
     Notify the inherited runner that a bundled child session exists.
@@ -11290,6 +11292,10 @@ async def _notify_runner_of_bundled_child(
     :param conversation: The created child row. When given, the runner gets
         the full session-init envelope, so it seeds the requested model and
         effort instead of fetching them back; ``None`` sends the id-only body.
+    :param conversation_store: Store to read the child row from when
+        *conversation* is not given. The read is best-effort like the envelope
+        build: the session is already persisted, so a failed read sends the
+        id-only body instead of failing the create.
     :returns: None.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
@@ -11300,15 +11306,20 @@ async def _notify_runner_of_bundled_child(
         "agent_id": agent_id,
         "sub_agent_name": None,
     }
-    if conversation is not None:
+    if conversation is not None or conversation_store is not None:
         try:
-            # The route forwards any initial input itself right after this
-            # notify, so a recovery turn would run it twice.
-            body = build_runner_session_init_payload(
-                conversation,
-                server_version=VERSION,
-                suppress_recovery_turn=True,
-            )
+            if conversation is None and conversation_store is not None:
+                conversation = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+            if conversation is not None:
+                # The route forwards any initial input itself right after
+                # this notify, so a recovery turn would run it twice.
+                body = build_runner_session_init_payload(
+                    conversation,
+                    server_version=VERSION,
+                    suppress_recovery_turn=True,
+                )
         except Exception:  # noqa: BLE001 — must not fail the create, as on the JSON path.
             # The runner falls back to fetching the row.
             _logger.warning(
