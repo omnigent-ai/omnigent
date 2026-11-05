@@ -45,7 +45,6 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.scheduled.test_fire import (
     FakeAgentStore,
-    FakeConversationStore,
     FakeHostStore,
     FakePermissionStore,
     FakeProjectStore,
@@ -66,7 +65,7 @@ _HOST_ID = uuid.uuid5(uuid.NAMESPACE_DNS, "host").hex
 _CONV_ID = uuid.uuid5(uuid.NAMESPACE_DNS, "conversation").hex
 
 
-class _ConversationStore(FakeConversationStore):
+class _ConversationStore(_ExistingConversationStore):
     """Mints UUID session ids and remembers host bindings a managed launch writes."""
 
     def __init__(self) -> None:
@@ -77,10 +76,15 @@ class _ConversationStore(FakeConversationStore):
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         conv = super().create_conversation(**kwargs)
         conv.id = kwargs.get("conversation_id") or uuid.uuid4().hex
+        conv.root_conversation_id = conv.id
         self.ids.append(conv.id)
+        self.existing[conv.id] = conv
         return conv
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+        if conversation_id in self.existing:
+            conv = self.existing[conversation_id]
+            return replace(conv, host_id=self.hosts.get(conversation_id, conv.host_id))
         return _FakeConversation(
             id=conversation_id, agent_id=_AGENT_ID, host_id=self.hosts.get(conversation_id)
         )
@@ -508,22 +512,51 @@ async def test_a_second_run_sends_into_a_session_another_run_is_using(store) -> 
     assert outcomes == [("succeeded", _CONV_ID)] * 2
 
 
-async def test_two_first_runs_start_one_session(store) -> None:
-    claimed = _claim(store, session_mode="continue")
+@pytest.mark.parametrize("target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_two_first_runs_send_both_prompts_into_one_session(store, target, overlap) -> None:
+    claimed = _claim(
+        store,
+        session_mode="continue",
+        execution_target=target,
+        host_id=_HOST_ID if target == "connected_host" else None,
+        workspace="/repo" if target == "connected_host" else None,
+    )
     second = _second_claim(store, claimed)
     conversations = _ConversationStore()
+
+    async def send_second() -> None:
+        store.update(claimed.task.id, prompt="edited after the runs were claimed")
+        await executor.fire(replace(claimed.task, prompt="second prompt"), second)
+
+    async def during_dispatch(conv: Any, task: ScheduledTask) -> None:
+        if overlap and dispatch.await_count == 1:
+            await send_second()
+
+    dispatch = AsyncMock(side_effect=during_dispatch)
     executor = ClaimedRunExecutor(
-        _deps(store, conversation_store=conversations), launch_dispatch=AsyncMock()
+        _deps(
+            store,
+            conversation_store=conversations,
+            sandbox_config=_managed_sandbox_config() if target == "managed_sandbox" else None,
+        ),
+        launch_dispatch=dispatch,
     )
 
     await executor.fire(claimed.task, claimed.lease)
-    await executor.fire(claimed.task, second)
+    if not overlap:
+        await send_second()
 
     kept, discarded = conversations.ids
     assert conversations.deleted == [discarded]
     assert store.get(claimed.task.id).session_id == kept
     outcomes = sorted((run.status, run.error_code) for run in _runs(store, claimed.task))
-    assert outcomes == [("running", None), ("skipped", "continued_session_busy")]
+    assert outcomes == [("running", None), ("succeeded", None)]
+    assert {run.conversation_id for run in _runs(store, claimed.task)} == {kept}
+    assert [(call.args[0].id, call.args[1].prompt) for call in dispatch.await_args_list] == [
+        (kept, claimed.task.prompt),
+        (kept, "second prompt"),
+    ]
 
 
 class _HeldConversationStore(_ConversationStore):
@@ -558,9 +591,7 @@ class _HeldPermissionStore(FakePermissionStore):
 
 @pytest.mark.parametrize("held", ["creating the session", "granting its owner"])
 async def test_a_run_never_finds_a_recorded_first_session_it_cannot_continue(store, held) -> None:
-    """A first session is recorded once it exists and its owner can use it, so a
-    run that fires meanwhile starts its own; the run that records second deletes
-    its session and is skipped."""
+    """Overlapping first runs both send to the session recorded after its owner grant."""
     claimed = _claim(store, session_mode="continue")
     second = _second_claim(store, claimed)
     conversations = (
@@ -568,9 +599,10 @@ async def test_a_run_never_finds_a_recorded_first_session_it_cannot_continue(sto
     )
     permissions = _HeldPermissionStore() if held == "granting its owner" else FakePermissionStore()
     gate = conversations if held == "creating the session" else permissions
+    dispatch = AsyncMock()
     executor = ClaimedRunExecutor(
         _deps(store, conversation_store=conversations, permission_store=permissions),
-        launch_dispatch=AsyncMock(),
+        launch_dispatch=dispatch,
     )
 
     first = asyncio.create_task(executor.fire(claimed.task, claimed.lease))
@@ -584,7 +616,9 @@ async def test_a_run_never_finds_a_recorded_first_session_it_cannot_continue(sto
     [discarded] = conversations.deleted
     assert sorted(conversations.ids) == sorted([kept, discarded]) and kept != discarded
     outcomes = sorted((run.status, run.error_code) for run in _runs(store, claimed.task))
-    assert outcomes == [("running", None), ("skipped", "continued_session_busy")]
+    assert outcomes == [("running", None), ("succeeded", None)]
+    assert [call.args[0].id for call in dispatch.await_args_list] == [kept, kept]
+    assert {run.conversation_id for run in _runs(store, claimed.task)} == {kept}
 
 
 async def test_a_first_run_whose_owner_grant_fails_leaves_the_next_run_a_new_session(
