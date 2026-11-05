@@ -1923,12 +1923,6 @@ async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBl
   return block;
 }
 
-/**
- * Download a rewound prompt's attachments from the new session as composer
- * files. Each is remembered as already uploaded there, so sending reuses the
- * session's copy. An attachment that fails to download is left out, and a
- * warning names it.
- */
 /** Build a file from a base64 `data:` URI, e.g. an image a prompt carried inline. */
 function fileFromDataUri(dataUri: string, filename: string): File {
   const match = dataUri.match(/^data:([^;,]+);base64,(.*)$/s);
@@ -1938,6 +1932,7 @@ function fileFromDataUri(dataUri: string, filename: string): File {
   return new File([bytes], filename, { type: match[1] });
 }
 
+/** Downloads rewind attachments, reuses copied file IDs, and warns about failed downloads. */
 async function rewindAttachmentFiles(
   sessionId: string,
   attachments: readonly RewindAttachment[],
