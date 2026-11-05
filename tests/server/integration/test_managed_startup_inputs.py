@@ -1136,7 +1136,12 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     for cursor in ("-1", "x", "A" * 32, "0" * 31):
         response = await auth_client.get(url, params={"after": cursor})
         assert response.status_code == 422, response.text
+    for limit in (0, 101):
+        response = await auth_client.get(url, params={"limit": limit})
+        assert response.status_code == 422, response.text
     response = await send("alice", "first", replaces=["pending_first"])
+    assert response.status_code == 422, response.text
+    response = await send("alice", "first", replaces=[pending_ids["first"]] * 1001)
     assert response.status_code == 422, response.text
     # A refused resend leaves the inputs it names, so they aren't lost with it.
     response = await send("alice", "first", replaces=[pending_ids["first"]])
