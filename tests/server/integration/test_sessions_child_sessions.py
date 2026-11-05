@@ -2887,3 +2887,51 @@ async def test_child_sessions_descendants_cursor_fails_once_the_tree_outgrows_on
 
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "stale_cursor"
+
+
+async def test_child_sessions_descendants_exact_breadth_first_order(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The exact sequence: level by level, each level grouped by its parents'
+    order, each parent's children newest first with ties broken by id
+    (descending), as the MySQL, PostgreSQL and managed stores order a level."""
+    from sqlalchemy import update
+
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlConversation
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    ids: dict[str, str] = {"root": session["id"]}
+    created = {"a": 100, "b": 100, "a1": 200, "a2": 200, "b1": 150, "b2": 300}
+    for name, parent in [
+        ("a", "root"),
+        ("b", "root"),
+        ("a1", "a"),
+        ("a2", "a"),
+        ("b1", "b"),
+        ("b2", "b"),
+    ]:
+        ids[name] = _seed_child(
+            conv_store=conv_store, parent_id=ids[parent], title=f"worker:{name}"
+        ).id
+    with conv_store._conv_engine.begin() as conn:
+        for name, ts in created.items():
+            conn.execute(
+                update(SqlConversation)
+                .where(SqlConversation.id == ids[name])
+                .values(created_at=ts)
+            )
+
+    def newest_first(*names: str) -> list[str]:
+        return sorted(names, key=lambda n: (created[n], ids[n]), reverse=True)
+
+    level1 = newest_first("a", "b")
+    children = {"a": newest_first("a1", "a2"), "b": newest_first("b1", "b2")}
+    expected = [ids[n] for n in level1] + [ids[c] for p in level1 for c in children[p]]
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/child_sessions", params={"descendants": "true"}
+    )
+
+    assert [row["id"] for row in resp.json()["data"]] == expected

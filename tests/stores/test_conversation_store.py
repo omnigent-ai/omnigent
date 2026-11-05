@@ -9345,6 +9345,8 @@ def test_spawn_tree_read_examines_rows_through_the_root_index(
     examined even when the tree holds many archived sub-agents."""
     from sqlalchemy import event
 
+    if conversation_store._conv_engine.dialect.name != "sqlite":
+        pytest.skip("SQLite EXPLAIN QUERY PLAN only; other dialects keep the behavioural coverage")
     root = conversation_store.create_conversation()
     for i in range(30):
         child = conversation_store.create_conversation(
