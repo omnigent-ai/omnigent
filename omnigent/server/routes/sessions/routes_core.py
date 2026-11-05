@@ -54,6 +54,7 @@ from omnigent.harnesses.codex_native.timeouts import (
 )
 from omnigent.models.model_override import validate_model_override
 from omnigent.native._native_supersession import supersession_notice_text
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -4224,14 +4225,20 @@ def register_core_routes(
                 )
 
         # A continuation keeps running the source's effective harness, which a
-        # per-session override can make native while the agent declares SDK.
-        continuation_harness = (
-            await asyncio.to_thread(
-                _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+        # per-session override or a native wrapper label can make native while
+        # the agent declares otherwise.
+        continuation_harness: str | None = None
+        if continue_source:
+            wrapped = native_coding_agent_for_wrapper_label(
+                source.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
             )
-            if continue_source
-            else None
-        )
+            continuation_harness = (
+                wrapped.harness
+                if wrapped is not None
+                else await asyncio.to_thread(
+                    _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+                )
+            )
         # A fork that keeps no history has no attachments to replay.
         if copy_history:
             await asyncio.to_thread(

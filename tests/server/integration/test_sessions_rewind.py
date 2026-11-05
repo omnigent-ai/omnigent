@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS, MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, managed_repo_labels
@@ -56,6 +57,8 @@ def item_ids(store: SqlAlchemyConversationStore, session_id: str) -> list[str]:
         ("claude-native", 2, "Q2", ["Q1", "A1"], "placed"),
         # The session's override, not the agent's declared harness, runs it.
         ("override:claude-native", 2, "Q2", ["Q1", "A1"], "placed"),
+        # Only the wrapper label marks it native; its agent's harness doesn't.
+        ("wrapper:claude-native", 2, "Q2", ["Q1", "A1"], "placed"),
         # Nothing precedes the first prompt, so the fork starts like a /clear.
         ("claude-sdk", 0, "Q1", [], "placed"),
         # A fork's stored "Fork of <title>" can run past the limit a caller's
@@ -77,13 +80,18 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     """Rewinding to a prompt forks just before it, on the source's runner and host.
 
     A rewound Claude Code native session rebuilds its transcript from the
-    kept items, whether the agent declares that harness or the session
-    overrides it. The rewound chat keeps the source's stored title.
+    kept items, whether the agent declares that harness, the session
+    overrides it, or only its wrapper label names it. The rewound chat keeps
+    the source's stored title.
     """
     store = SqlAlchemyConversationStore(db_uri)
+    wrapper_labels: dict[str, str] = {}
     if harness.startswith("override:"):
         source_id = await create_placed_session(client, store)
         store.update_conversation(source_id, harness_override=harness.removeprefix("override:"))
+    elif harness.startswith("wrapper:"):
+        source_id = await create_placed_session(client, store)
+        wrapper_labels = {WRAPPER_LABEL_KEY: "claude-code-native-ui"}
     else:
         resolve_harness_as(monkeypatch, harness)
         source_id = await create_placed_session(client, store)
@@ -102,7 +110,7 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     items = item_ids(store, source_id)
     repos = ["https://github.com/acme/api"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
-    store.set_labels(source_id, sandbox_labels)
+    store.set_labels(source_id, {**sandbox_labels, **wrapper_labels})
     store.update_conversation(
         source_id, cost_control_mode_override="on", subagent_routing_override="on"
     )
