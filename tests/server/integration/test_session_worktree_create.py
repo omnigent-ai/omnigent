@@ -89,7 +89,9 @@ async def register_worktree_host(
     :returns: Async iterator yielding a ``register`` factory. Its
         kwargs: ``create_status`` (``"ok"`` returns a worktree path,
         ``"failed"`` simulates a host git failure such as a bad base
-        ref) and ``create_error`` (the failure message). Returns a
+        ref), ``create_error`` (the failure message), and ``create_gate``
+        (when set, the host holds its worktree reply until the event
+        fires, like a slow ``git worktree add``). Returns a
         ``_HostCapture`` whose ``.create`` / ``.remove`` lists accumulate
         the create- and remove-worktree frames the host received.
     """
@@ -101,6 +103,7 @@ async def register_worktree_host(
         create_error: str | None = None,
         workspace: str | None = None,
         capabilities: list[str] | None = None,
+        create_gate: asyncio.Event | None = None,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
@@ -137,6 +140,8 @@ async def register_worktree_host(
                         )
                 elif isinstance(frame, HostCreateWorktreeFrame):
                     cap.create.append(frame)
+                    if create_gate is not None:
+                        await create_gate.wait()
                     fut = conn.pending_create_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         if create_status == "ok":
@@ -264,6 +269,49 @@ async def test_create_without_base_branch_sends_none(
     assert len(cap.create) == 1
     assert cap.create[0].branch_name == "wip"
     assert cap.create[0].base_branch is None
+
+
+async def test_create_finishes_after_client_disconnects(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """A create whose client leaves mid-worktree still produces the session.
+
+    The web UI shows a new session before its create returns, and a host
+    worktree can take a minute on a large repo, so a page refresh can drop
+    the connection while the host is still running git. The host finishes
+    the worktree regardless; if the server abandoned the create, the user
+    would be left with a worktree (and branch) but no session.
+    """
+    release_worktree = asyncio.Event()
+    cap = register_worktree_host(create_gate=release_worktree)
+    agent = await create_test_agent(client, name="wt-disconnect-agent")
+
+    create = asyncio.create_task(
+        _create_git_session(client, agent["id"], {"branch_name": "feature/refresh"})
+    )
+    async with asyncio.timeout(5):
+        while not cap.create:
+            await asyncio.sleep(0.01)
+    # The client disconnects while the host is still creating the worktree.
+    create.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await create
+    release_worktree.set()
+
+    async with asyncio.timeout(5):
+        while True:
+            listed = await client.get("/v1/sessions")
+            assert listed.status_code == 200, listed.text
+            created = [
+                s for s in listed.json()["data"] if s.get("git_branch") == "feature/refresh"
+            ]
+            if created:
+                break
+            await asyncio.sleep(0.01)
+    assert len(created) == 1
+    assert created[0]["workspace"] == f"{_SOURCE_REPO}-worktrees/feature-refresh"
+    assert cap.remove == []
 
 
 async def test_create_with_invalid_base_branch_fails_400(
