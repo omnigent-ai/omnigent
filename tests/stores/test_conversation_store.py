@@ -9911,8 +9911,9 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_failed", [False, True])
 async def test_family_limit_counts_archived_members_and_cleans_up_rejected_creation(
-    conversation_store,
+    conversation_store, monkeypatch, cleanup_failed, caplog
 ):
     from omnigent.errors import OmnigentError
     from omnigent.server.session_families import complete_sibling_creation
@@ -9927,9 +9928,20 @@ async def test_family_limit_counts_archived_members_and_cleans_up_rejected_creat
     retained = {member.id for member in store.get_session_family(source.id)}
     assert len(retained) == MAX_SESSION_FAMILY_MEMBERS
     rejected = store.create_conversation()
+    if cleanup_failed:
+
+        async def fail_cleanup(session_id):
+            assert session_id == rejected.id
+            raise RuntimeError("cleanup database unavailable")
+
+        monkeypatch.setattr(store, "delete_conversation", fail_cleanup)
     with pytest.raises(OmnigentError, match=f"up to {MAX_SESSION_FAMILY_MEMBERS}"):
         await complete_sibling_creation(store, source.id, rejected.id, user_id="alice")
-    assert store.get_conversation(rejected.id) is None
+    if cleanup_failed:
+        assert "Failed to discard rejected sibling" in caplog.text
+        assert store.get_conversation(rejected.id).family_id is None
+    else:
+        assert store.get_conversation(rejected.id) is None
     assert {member.id for member in store.get_session_family(source.id)} == retained
 
 

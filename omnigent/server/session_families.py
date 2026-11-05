@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from itertools import batched
 
 from fastapi import Request
@@ -21,6 +22,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.permission_store import PermissionStore
 
 _FAMILY_GRANT_BATCH_SIZE = 1000
+_logger = logging.getLogger(__name__)
 
 
 def authorize_sibling_source(
@@ -68,7 +70,10 @@ async def complete_sibling_creation(
         )
     except Exception:
         # No runner or fresh sandbox has been launched yet.
-        await conversations.delete_conversation(session_id)
+        try:
+            await conversations.delete_conversation(session_id)
+        except Exception:
+            _logger.exception("Failed to discard rejected sibling %s", session_id)
         raise
 
 
