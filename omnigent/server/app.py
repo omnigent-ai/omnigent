@@ -3998,6 +3998,7 @@ def create_app(
     # sleep-wake reconnects) that re-register within the grace never
     # flap their sessions to failed.
     _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
+    _disconnect_held_sessions: dict[asyncio.Task[Any], frozenset[str]] = {}
 
     def _cancel_disconnect_grace(runner_id: str) -> None:
         """Cancel and forget the pending disconnect-grace timer, if any."""
@@ -4303,6 +4304,9 @@ def create_app(
                     hold_s=HOST_OFFLINE_HOLD_S,
                 ),
             )
+        hold_task = asyncio.current_task()
+        if hold_task is not None:
+            _disconnect_held_sessions[hold_task] = frozenset(conv.id for conv in held)
         try:
             while True:
                 now = loop.time()
@@ -4335,6 +4339,8 @@ def create_app(
                     # A brief host return cannot end a sleeping host's absolute hold.
                     host_back_deadline = None
         finally:
+            if hold_task is not None:
+                _disconnect_held_sessions.pop(hold_task, None)
             for conv in held:
                 _logger.info(
                     "Runner %s: host-offline hold ended (%s) for session=%s",
@@ -4356,6 +4362,9 @@ def create_app(
         task = _disconnect_grace_tasks.get(runner_id)
         if task is None or task.done():
             return False
+        # The hold also owns its grace after host return and unreadable host rows.
+        if session_id in _disconnect_held_sessions.get(task, ()):
+            return True
         try:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         except Exception:  # noqa: BLE001 — unreadable: the relay fails the turn as before

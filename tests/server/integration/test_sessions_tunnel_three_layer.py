@@ -2451,6 +2451,7 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
     "scenario",
     [
         "reconnect",
+        "host_back_runner_within_grace",
         "expired",
         "host_back_without_runner",
         "host_back_relaunched",
@@ -2489,6 +2490,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     from omnigent.runner.identity import token_bound_runner_id
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
     from tests._helpers.polling import poll_until_async
 
     ap_app = tunnel_three_layer_stack.ap_app
@@ -2500,7 +2502,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         "host_back_stopped_before_relaunch",
         "host_back_rebound_before_relaunch",
     }
-    grace = 0.2
+    grace = 1.0 if scenario == "host_back_runner_within_grace" else 0.2
     hold = {"expired": 1.0, "host_flaps_expired": 1.5}.get(scenario, 30.0)
     monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", grace)
     monkeypatch.setattr(sessions_module, "HOST_OFFLINE_HOLD_S", hold)
@@ -2645,6 +2647,27 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             host_row[0] = None
             await asyncio.wait_for(_host_checked(10), timeout=budget(5.0))
             assert sessions_module._session_status_cache.get(session_id) == "running"
+        if scenario == "host_back_runner_within_grace":
+            host_row[0] = False
+            await asyncio.wait_for(_host_checked(1), timeout=budget(5.0))
+        if scenario in ("host_back_runner_within_grace", "unreadable"):
+            # The relay's grace can end while the host hold still awaits its runner.
+            with monkeypatch.context() as relay_patch:
+                relay_patch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
+                async with httpx.AsyncClient(
+                    base_url="http://runner",
+                    transport=httpx.MockTransport(lambda _request: httpx.Response(503)),
+                ) as relay_client:
+                    await orchestration._relay_runner_stream(
+                        session_id, relay_client, store, runner_id=runner_id
+                    )
+            assert sessions_module._session_status_cache[session_id] == "running"
+            assert (
+                sessions_module._last_task_error_from_labels(
+                    store.get_conversation(session_id).labels
+                )
+                is None
+            )
         if local_host_return or scenario in (
             "host_back_without_runner",
             "host_flaps_back_without_runner",
@@ -2709,7 +2732,13 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 host_task = asyncio.create_task(serve_host())
             await asyncio.sleep(grace / 2)
             assert sessions_module._session_status_cache.get(session_id) == "running"
-        if scenario in ("reconnect", "unreadable", "host_flaps_reconnect", "host_back_unreadable"):
+        if scenario in (
+            "reconnect",
+            "host_back_runner_within_grace",
+            "unreadable",
+            "host_flaps_reconnect",
+            "host_back_unreadable",
+        ):
             reconnect = await _connect_runner_tunnel(ap_app, runner_id)
             await _send_hello_and_wait(
                 reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
