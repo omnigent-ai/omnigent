@@ -21,6 +21,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.automations_availability import AUTOMATIONS_HEADER
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from omnigent.runner.identity import (
@@ -384,11 +385,20 @@ async def test_automations_gate_is_checked_per_request(
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
 
+    session_id = _owned_session(db_uri)
+
     async with _serve(app, mock_llm, tmp_path) as client:
 
         async def enabled_in_info() -> bool:
             info = (await client.get("/v1/info", headers=_headers())).json()
             assert info["scheduled_task_inbox"] == info["automations_enabled"]
+            # The runner reads the same gate off its bundle download to hide the tools.
+            bundle = await client.get(
+                f"/v1/sessions/{session_id}/agent/contents", headers=_headers()
+            )
+            assert bundle.status_code == 200, bundle.text
+            expected = "1" if info["automations_enabled"] else "0"
+            assert bundle.headers[AUTOMATIONS_HEADER] == expected
             return info["automations_enabled"]
 
         created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
