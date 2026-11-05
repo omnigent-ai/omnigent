@@ -4903,6 +4903,48 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(failedInputReads).toHaveLength(0);
   });
 
+  it("keeps managed startup ended when an earlier failure's pending snapshot answers last", async () => {
+    seedSession("conv_real");
+    sessionLabels.set("conv_real", { "omnigent.startup": "pending" });
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    let snapshotReads = 0;
+    let answerOlderRead: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      if (!String(input).startsWith("/v1/sessions/conv_real?") || ++snapshotReads > 1)
+        return defaultFetchHandler(input, init);
+      const pending = defaultFetchHandler(input, init);
+      return new Promise<Response>((resolve) => {
+        answerOlderRead = () => resolve(pending);
+      });
+    });
+
+    // A failed delivery reads a pending snapshot, and the launch fails before that read answers.
+    handleSessionEvent(
+      { type: "session_status", conversationId: "conv_real", status: "failed" },
+      "conv_real",
+    );
+    await vi.waitFor(() => expect(answerOlderRead).toBeDefined());
+    failManagedLaunch("conv_real", "saved on server");
+    handleSessionEvent(
+      { type: "session_status", conversationId: "conv_real", status: "failed" },
+      "conv_real",
+    );
+    await vi.waitFor(() => expect(useChatStore.getState().failedSendDraft).not.toBeNull());
+    answerOlderRead!();
+    await settle();
+
+    expect(snapshotReads).toBe(2);
+    expect(useChatStore.getState().startupPending).toBe(false);
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_real",
+      text: "saved on server",
+      files: [],
+      startupInputIds: ["pending_first"],
+      recovered: true,
+    });
+  });
+
   it("offers a startup input its launch failed only after the session was opened", async () => {
     seedSession("conv_real");
     // Opened after the label changed but before the inputs were failed, the read finds none.

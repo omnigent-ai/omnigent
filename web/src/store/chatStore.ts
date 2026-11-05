@@ -8369,6 +8369,9 @@ async function listFailedStartupInputs(
 /** Entries that saw their managed launch fail; its later failure report is read again. */
 const failedLaunchEntries = new WeakSet<ConversationEntry>();
 
+/** Per entry, how many startup settlements began, so only the latest applies its snapshot. */
+const startupSettlements = new WeakMap<ConversationEntry, number>();
+
 /** Startup inputs disposed entries had handed back, so a session reopened in this tab doesn't offer them again. */
 const disposedReturnedStartupInputs = new Map<string, string[]>();
 conversationRegistry.subscribeDisposed((id, state) => {
@@ -8506,10 +8509,13 @@ async function lookUpFailedStartupInputs(
 async function settleFailedStartup(conversationId: string): Promise<void> {
   const entry = conversationRegistry.peek(conversationId);
   if (entry === undefined) return;
+  const settlement = (startupSettlements.get(entry) ?? 0) + 1;
+  startupSettlements.set(entry, settlement);
   const session = await readWithinReconcileTimeout((signal) =>
     getSessionSlim(conversationId, { signal }),
   );
-  if (entry.disposed) return;
+  // A settlement begun later read a newer snapshot, which may already have ended startup.
+  if (entry.disposed || startupSettlements.get(entry) !== settlement) return;
   entrySetter(entry)({ startupPending: session !== null && startupPendingIn(session) });
   if (session === null || startupFailedIn(session)) {
     await restoreFailedStartupInputs(conversationId);
