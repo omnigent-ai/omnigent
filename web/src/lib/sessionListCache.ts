@@ -614,18 +614,20 @@ export function overlayArchivedIntoCaches(
 }
 
 /**
- * Settle server-known fields on the open session's fetched sidebar row, keeping
- * its owner. A detail request in flight may have been served before they
- * changed, so it is cancelled and restarted rather than left to land.
+ * Settle server-known fields on the open session's fetched sidebar row, merged
+ * as the lists merge a streamed row but keeping the fetched owner and access
+ * level, which a streamed shared row may not carry. A detail request in flight
+ * may have been served before they changed, so it is cancelled and restarted
+ * rather than left to land.
  *
  * @param queryClient - The app QueryClient.
  * @param id - The session whose fields are known.
- * @param fields - The server's archive flag, title and update time; omitted ones are kept.
+ * @param fields - Fields from the server, as a wire item; omitted ones are kept.
  */
 export function settleOpenSessionRow(
   queryClient: QueryClient,
   id: string,
-  fields: Pick<SessionListWireItem, "archived" | "title" | "updated_at">,
+  fields: Omit<SessionListWireItem, "id">,
 ): void {
   const queryKey = ["conversation-backfill", id];
   if (queryClient.getQueryState(queryKey) === undefined) return;
@@ -634,17 +636,12 @@ export function settleOpenSessionRow(
   if (fetching) void queryClient.cancelQueries({ queryKey, exact: true });
   const row = queryClient.getQueryData<Conversation | null>(queryKey);
   if (row) {
-    const settledRow: Conversation = {
-      ...row,
-      archived: fields.archived ?? row.archived,
-      title: fields.title === undefined ? row.title : fields.title,
-      updated_at: fields.updated_at ?? row.updated_at,
-    };
-    if (
-      (settledRow.archived ?? false) !== (row.archived ?? false) ||
-      settledRow.title !== row.title ||
-      settledRow.updated_at !== row.updated_at
-    ) {
+    const wire: SessionListWireItem = { ...fields, id };
+    delete wire.owner;
+    delete wire.permission_level;
+    // A fetched row keeps the detail response's nulls, which wire items carry as undefined.
+    if (changedWireFields(nullsToUndefined(row) as Conversation, wire).size > 0) {
+      const settledRow: Conversation = { ...row, ...wire };
       queryClient.setQueryData<Conversation | null>(queryKey, settledRow);
     }
   }

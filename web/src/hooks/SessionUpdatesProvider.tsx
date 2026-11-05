@@ -175,10 +175,8 @@ function applyItemsToCache(
     return changed ? { ...previous, conversations } : previous;
   });
   // The open session's fetched sidebar row sits outside every list, so a remote
-  // archive, unarchive or rename reaches it only here.
-  for (const { id, archived, title, updated_at } of itemsById.values()) {
-    settleOpenSessionRow(queryClient, id, { archived, title, updated_at });
-  }
+  // change (archive, rename, an approval) reaches it only here.
+  for (const item of itemsById.values()) settleOpenSessionRow(queryClient, item.id, item);
   return {
     // Sub-agent children are watched for their tree views, but no session list
     // ever holds them, so their absence is not a sign of a new session.

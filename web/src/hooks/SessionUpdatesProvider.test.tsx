@@ -718,6 +718,46 @@ describe("SessionUpdatesProvider open-session row", () => {
     });
   });
 
+  it.each([
+    [0, 1],
+    [1, 0],
+  ])(
+    "applies a remote approval count change (%i → %i) to a fetched shared row",
+    (before, after) => {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      const key = ["conversation-backfill", "conv_old"];
+      const row: Conversation = {
+        ...conv("conv_old"),
+        owner: "teammate",
+        permission_level: 1,
+        pending_elicitations_count: before,
+      };
+      client.setQueryData<Conversation>(key, row);
+      renderProvider(client, ["/c/conv_old"]);
+
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [
+            {
+              ...conv("conv_old"),
+              owner: null,
+              permission_level: null,
+              pending_elicitations_count: after,
+            },
+          ],
+        }),
+      );
+
+      expect(client.getQueryData<Conversation>(key)).toMatchObject({
+        owner: "teammate",
+        permission_level: 1,
+        pending_elicitations_count: after,
+      });
+    },
+  );
+
   it("leaves an unchanged fetched row as it is", () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_a"]);
