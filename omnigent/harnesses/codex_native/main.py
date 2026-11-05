@@ -2762,27 +2762,33 @@ def _bound_codex_replay_argument_bytes(
     calls: Counter[str] = Counter()
     outputs: Counter[str] = Counter()
     output_positions: dict[str, int] = {}
-    ambiguous: set[str] = set()
-    # Count the replayed source window, since conversion can drop duplicate outputs as orphans.
-    source_counts: Counter[tuple[object, str]] = Counter()
+    # Conversion can drop orphan outputs or merge carried calls, so check source evidence too.
+    source_counts: dict[str, Counter[str]] = {}
     for source_item in source_items:
         compacted_messages = source_item.get("compacted_messages")
         is_snapshot = source_item.get("type") == "compaction" and isinstance(
             compacted_messages, list
         )
-        if is_snapshot and compacted_messages:
-            source_counts.clear()
+        item_counts: dict[str, Counter[str]] = {}
         for item in compacted_messages if is_snapshot else [source_item]:
             if not isinstance(item, dict) or not isinstance(call_id := item.get("call_id"), str):
                 continue
+            counts = item_counts.setdefault(call_id, Counter())
             if "status" in item and item["status"] != "completed":
-                ambiguous.add(call_id)
-            source_counts[item.get("type"), call_id] += 1
-    ambiguous.update(
+                counts["pending"] += 1
+            if (item_type := item.get("type")) in ("function_call", "function_call_output"):
+                counts[item_type] += 1
+        if is_snapshot:
+            # A snapshot replaces only the calls it contains; conversion carries other open calls.
+            source_counts.update(item_counts)
+        else:
+            for call_id, counts in item_counts.items():
+                source_counts.setdefault(call_id, Counter()).update(counts)
+    ambiguous = {
         call_id
-        for (item_type, call_id), count in source_counts.items()
-        if count > 1 and item_type in ("function_call", "function_call_output")
-    )
+        for call_id, counts in source_counts.items()
+        if counts["pending"] or counts["function_call"] > 1 or counts["function_call_output"] > 1
+    }
     for index, item in enumerate(history):
         if not isinstance(item, dict):
             continue

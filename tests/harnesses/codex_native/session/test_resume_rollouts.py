@@ -1345,7 +1345,9 @@ def test_rollout_records_bound_aggregate_completed_arguments(compacted: bool) ->
         )
     ]
     if compacted:
+        superseded = [{"type": [], "call_id": "call_superseded"}]
         items = [
+            {"type": "compaction", "compacted_messages": superseded},
             *items[:40],
             {"type": "compaction", "compacted_messages": items[:40]},
             *items[40:],
@@ -1419,8 +1421,17 @@ def test_rollout_byte_measurement_preserves_surrogate_content(text: str) -> None
     assert len(json.loads(json.dumps(records))) == len(records)
 
 
-@pytest.mark.parametrize("compacted", [False, True])
-@pytest.mark.parametrize("ambiguity", ["pending_call", "pending_output", "earlier_output"])
+@pytest.mark.parametrize(
+    ("ambiguity", "compacted"),
+    [
+        *(
+            (ambiguity, compacted)
+            for ambiguity in ("pending_call", "pending_output", "earlier_output")
+            for compacted in (False, True)
+        ),
+        ("carried_duplicate_call", False),
+    ],
+)
 def test_rollout_byte_budget_preserves_source_ambiguity(
     monkeypatch: pytest.MonkeyPatch, compacted: bool, ambiguity: str
 ) -> None:
@@ -1434,7 +1445,11 @@ def test_rollout_byte_budget_preserves_source_ambiguity(
             _tool_output(f"call_{index}"),
         )
     ]
-    if ambiguity == "earlier_output":
+    if ambiguity == "carried_duplicate_call":
+        # The summary-only snapshot omits both copies; conversion carries the last one.
+        summary = {"type": "compaction", "compacted_messages": [_user_message("Earlier work")]}
+        history[1:1] = [deepcopy(history[0]), summary]
+    elif ambiguity == "earlier_output":
         history.insert(0, _tool_output("call_0"))
     else:
         history[0 if ambiguity == "pending_call" else 1]["status"] = "in_progress"
@@ -1448,17 +1463,16 @@ def test_rollout_byte_budget_preserves_source_ambiguity(
         model_provider="omnigent_databricks",
         cli_version="0.154.0",
     )
-    payloads = (
-        records[1]["payload"]["replacement_history"]
-        if compacted
-        else [record["payload"] for record in records if record["type"] == "response_item"]
-    )
-    assert payloads[0]["arguments"] == arguments
-    assert any(
-        item.get("arguments") != arguments
-        for item in payloads[2:]
-        if item["type"] == "function_call"
-    )
+    payloads: list[dict[str, Any]] = []
+    for record in records:
+        if record["type"] == "compacted":
+            payloads = list(record["payload"]["replacement_history"])
+        elif record["type"] == "response_item":
+            payloads.append(record["payload"])
+    calls = [item for item in payloads if item["type"] == "function_call"]
+    assert [call["call_id"] for call in calls] == [f"call_{index}" for index in range(4)]
+    assert calls[0]["arguments"] == arguments
+    assert any(call["arguments"] != arguments for call in calls[1:])
     assert history == original
 
 
