@@ -62,7 +62,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 from urllib import request
 
@@ -2778,8 +2778,18 @@ def build_hook_settings(
     settings: _JsonObject = {"hooks": hooks}
     if launch_model:
         settings["model"] = launch_model
+    permissions: _JsonObject = {}
     if launch_permission_mode:
-        settings["permissions"] = {"defaultMode": launch_permission_mode}
+        permissions["defaultMode"] = launch_permission_mode
+    from omnigent.inner.native_attachments import attachment_cache_dir
+
+    # Pasted attachments are cached outside the workspace, so Claude would ask
+    # before reading them. Deny/ask rules and Omnigent policy hooks still apply.
+    attachment_read_rule = _claude_read_rule(attachment_cache_dir(bridge_dir))
+    if attachment_read_rule is not None:
+        permissions["allow"] = [attachment_read_rule]
+    if permissions:
+        settings["permissions"] = permissions
     if launch_bypass_permissions:
         # Bypass mode shows a one-time "Bypass Permissions mode" acceptance
         # dialog. Like the trust/onboarding gates it fires no
@@ -2818,6 +2828,31 @@ def build_hook_settings(
         status_command += f"; printf '%s' \"$p\" | ( {chain_command} )"
     settings["statusLine"] = {"type": "command", "command": status_command}
     return settings
+
+
+def _claude_read_rule(directory: PurePath) -> str | None:
+    """
+    Return a Claude Code ``Read`` allow rule for files under *directory*.
+
+    Claude writes absolute paths as ``//path`` and normalizes Windows drives,
+    so ``C:\\Users\\a`` becomes ``//c/Users/a``.
+
+    :param directory: Absolute directory, e.g. ``Path("/home/a/.omnigent/attachments/k")``.
+    :returns: A rule such as ``"Read(//home/a/.omnigent/attachments/k/**)"``, or
+        ``None`` when the path cannot be expressed exactly as a rule pattern.
+    """
+    if not directory.is_absolute():
+        return None
+    if isinstance(directory, PureWindowsPath):
+        drive = directory.drive
+        if len(drive) != 2 or drive[1] != ":":
+            return None
+        posix_path = "/".join(("", drive[0].lower(), *directory.parts[1:]))
+    else:
+        posix_path = directory.as_posix()
+    if any(char in posix_path for char in "*?[]{}\\"):
+        return None
+    return f"Read(/{posix_path.rstrip('/')}/**)"
 
 
 def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
@@ -6311,7 +6346,8 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
 
     The dialogs :func:`_terminal_dialog_headline` names (a settings error, an
     exit confirmation, an MCP approval) have no web card; the person answers
-    them in the embedded terminal.
+    them in the embedded terminal. A launcher's unanswered installation
+    confirmation, printed before Claude Code runs, is answered there too.
 
     :param bridge_dir: The session's native bridge directory.
     :returns: ``True`` while such a dialog is on screen; ``False`` once it
@@ -6323,7 +6359,41 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
     socket_path, target = info.get("socket_path"), info.get("tmux_target")
     if not isinstance(socket_path, str) or not isinstance(target, str):
         return False
-    return _terminal_dialog_headline(_capture_pane(socket_path, target)) is not None
+    pane = _capture_pane(socket_path, target)
+    return _terminal_dialog_headline(pane) is not None or launcher_install_prompt(pane)
+
+
+# Claude Code echoes a ``/model`` command, then prints this acknowledgement
+# under it ("Set model to Opus 5.5 and saved as your default for new sessions").
+_MODEL_SWITCH_ACKNOWLEDGEMENT = "Set model to "
+
+
+def model_switch_acknowledged(bridge_dir: Path, *, command: str) -> bool:
+    """
+    Check whether Claude Code acknowledged a ``/model`` command on the pane.
+
+    A second confirmation source next to the statusLine snapshot: the
+    acknowledgement Claude Code prints under the echoed command says the
+    switch took effect even when the snapshot spells the model differently
+    or has not been rewritten yet.
+
+    :param bridge_dir: The session's native bridge directory.
+    :param command: The injected command, e.g. ``"/model opus[1m]"``.
+    :returns: ``True`` when the acknowledgement follows the command's last
+        echo on the pane; ``False`` when it does not, the echo is not on
+        screen, or the pane cannot be read.
+    """
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    lines = _capture_pane(socket_path, target).splitlines()
+    echoes = [index for index, line in enumerate(lines) if command in line]
+    if not echoes:
+        return False
+    return any(_MODEL_SWITCH_ACKNOWLEDGEMENT in line for line in lines[echoes[-1] + 1 :])
 
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:
@@ -7241,8 +7311,9 @@ def _wait_for_claude_prompt_ready(
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
-        A launcher password or installation prompt on two consecutive polls
-        is reported the same way.
+        A launcher password prompt on two consecutive polls is reported the
+        same way; an installation prompt is reported as awaiting an answer,
+        so the delivery holds the message for it.
     :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
@@ -7349,11 +7420,15 @@ def _wait_for_claude_prompt_ready(
         waited_on_password = at_password_prompt
         at_install_prompt = launcher_install_prompt(pane)
         if at_install_prompt and waited_on_install:
+            # Nothing was typed, and the question is answered in this terminal,
+            # so the delivery can hold the message until it is (see
+            # :func:`terminal_dialog_pending`) instead of failing it.
             raise ClaudeTerminalDialog(
                 "Claude Code's launch command is waiting for installation confirmation "
                 "in its terminal, so the message was not delivered. Open the terminal, "
                 "answer the install prompt, then resend your message."
-                + _format_terminal_failure_tail(pane)
+                + _format_terminal_failure_tail(pane),
+                awaits_answer=True,
             )
         waited_on_install = at_install_prompt
         # A launcher sign-in prompt printed before Claude Code runs: an address
@@ -8349,15 +8424,16 @@ def _tool_relay_handler_factory(
             if len(detail) > _POLICY_PROXY_ERROR_DETAIL_MAX:
                 detail = detail[: _POLICY_PROXY_ERROR_DETAIL_MAX - 3] + "..."
             message = f"omnigent policy-eval proxy could not reach the Omnigent server: {detail}"
-            # Keep the full exception (with traceback) in the runner log; the
-            # user-facing body is capped and can drop a diagnostically useful tail.
-            _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
             body = message.encode("utf-8", "replace")
-            self.send_response(HTTPStatus.BAD_GATEWAY)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(HTTPStatus.BAD_GATEWAY)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            finally:
+                # Slow traceback rendering must not delay the fail-closed response.
+                _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
 
         def _read_json_body(self) -> _JsonObject | None:
             """
@@ -8898,7 +8974,30 @@ def _call_mcp_tool(
         conversation_id=read_active_session_id(bridge_dir),
     )
     result = tools[name].invoke(json.dumps(arguments), ctx)
-    return {"content": [{"type": "text", "text": result}]}
+    response: _JsonObject = {"content": [{"type": "text", "text": result}]}
+    if _local_result_is_error(result):
+        response["isError"] = True
+    return response
+
+
+def _local_result_is_error(result: object) -> bool:
+    """Whether a bridge-local tool's JSON result reports an error.
+
+    Relay-routed calls get ``isError`` from
+    :func:`omnigent.runtime.mcp_tool_result.mcp_response_from_tool_result`;
+    the local ``sys_os_*`` tools served outside an active turn return the same
+    ``{"error": ...}`` / ``{"blocked": true}`` shapes and must flag them the
+    same way, or the model reads a failure as a result.
+    """
+    if not isinstance(result, str):
+        return False
+    try:
+        payload = json.loads(result)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("blocked") is True or bool(payload.get("error"))
 
 
 def _read_relay_tool_names(bridge_dir: Path) -> set[str]:
@@ -10987,6 +11086,27 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
         return f"{text.rstrip()}\n\n{_login_guidance()}"
     return text
+
+
+def program_status_turn_error(text: str) -> tuple[str, str]:
+    """
+    Name the error code and display text for an error Claude reported itself.
+
+    Claude Code refuses a turn whose context is already full before calling
+    the model: it ends the turn with "Prompt is too long" in its terminal
+    status and fires no ``StopFailure`` hook, so that status is the only
+    record of the cause. The text gets the same rewrite as a ``StopFailure``
+    message, and an overflow gets its own code so the failure card describes
+    it instead of a generic turn error.
+
+    :param text: Claude's error text, e.g. ``"Prompt is too long"``.
+    :returns: ``(code, message)``, e.g. ``("context_length_exceeded",
+        "Context limit reached — ...")``; other errors keep
+        ``"native_turn_error"``.
+    """
+    if _CONTEXT_OVERFLOW_RE.match(text.strip()):
+        return "context_length_exceeded", _CONTEXT_OVERFLOW_REPLACEMENT
+    return "native_turn_error", _display_text(text, is_api_error=True)
 
 
 def _stripped_image_placeholder(source: _JsonObject) -> str:
