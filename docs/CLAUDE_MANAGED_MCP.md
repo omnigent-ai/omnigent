@@ -51,6 +51,11 @@ Merge this into the file's `mcpServers` and keep the organization's other server
 - If managed settings define `allowedMcpServers`, also list
   `{"serverName": "omnigent"}` there. Claude Code applies that allowlist to any
   managed entry that uses `${VAR}`, and drops the entry silently when it isn't listed.
+- Don't name `omnigent` in `deniedMcpServers`. The denylist wins over the allowlist,
+  and Claude Code drops a denied entry just as silently. Omnigent reads only
+  `managed-mcp.json`, not this policy, so with the entry denied or left off the
+  allowlist, sessions start without Omnigent's tools and without the missing-entry
+  warning, and claude-sdk still tells the model the tools exist.
 
 > **Security note.** This entry hands its executable (`${OMNIGENT_MCP_RELAY_PYTHON}`)
 > and its tool surface (the bridge directory) to whatever environment launches Claude
@@ -72,3 +77,18 @@ Merge this into the file's `mcpServers` and keep the organization's other server
 file exists, because those are the only ones Claude Code loads. The `omnigent` entry
 itself is never listed. To report sign-in state for the managed servers, see
 [MCP_AUTH_STATUS.md](MCP_AUTH_STATUS.md).
+
+## Tool call time limit
+
+Through this entry, each Omnigent tool call runs in the relay with a budget of 300
+seconds of active work. Time spent waiting for an approval doesn't count. When a
+call runs past it, Omnigent asks the tool to stop and returns an error: "Omnigent
+tool dispatch timed out after 300s of active work (approval waiting excluded).
+Cancellation requested; completion is unknown." The work may have finished in
+part, so check its effects before retrying. This applies even to a tool given a
+longer timeout of its own, such as a `sys_os_shell` command. No setting changes
+the budget. Claude Code's own MCP tool timeout (`MCP_TOOL_TIMEOUT`, or a
+per-server timeout) also applies, so whichever is shorter ends the call.
+
+Without a managed file, claude-sdk runs Omnigent's tools in-process, where this
+relay budget doesn't apply.
