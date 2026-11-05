@@ -3,7 +3,13 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
-import { isNativeFindShortcut, type TranscriptGeometry, VirtualBubbleList } from "./Transcript";
+import { useChatStore } from "@/store/chatStore";
+import {
+  isNativeFindShortcut,
+  type TranscriptGeometry,
+  VirtualBubbleList,
+  visibleTranscriptBubbles,
+} from "./Transcript";
 
 afterEach(cleanup);
 
@@ -21,6 +27,43 @@ const assistantBubble: Extract<Bubble, { kind: "assistant" }> = {
   error: null,
   items: [{ kind: "text", itemId: "assistant-1", text: "hello back", final: true }],
 };
+
+it("omits hidden sub-agent wakes from visible row geometry", () => {
+  const wake: Bubble = {
+    kind: "user",
+    itemId: "wake",
+    content: [
+      {
+        type: "input_text",
+        text: "[System: sub-agent Dewey finished (completed) \u2014 1 result waiting in inbox. Call sys_read_inbox to collect.]",
+      },
+    ],
+  };
+  const timer: Bubble = {
+    kind: "user",
+    itemId: "timer",
+    content: [{ type: "input_text", text: "[System: timer reminder fired]" }],
+  };
+  const bubbles = [assistantBubble, wake, timer, bubble];
+  const visible = visibleTranscriptBubbles(bubbles);
+
+  expect(visible).toEqual([assistantBubble, timer, bubble]);
+  const malformed: Bubble = {
+    kind: "user",
+    itemId: "malformed",
+    content: [{ type: "input_text", text: null as unknown as string }],
+  };
+  expect(visibleTranscriptBubbles([malformed, wake])).toEqual([malformed]);
+  const wakeWithBody: Bubble = {
+    ...wake,
+    itemId: "wake-with-body",
+    content: [...wake.content, { type: "input_text", text: "\nOther context" }],
+  };
+  expect(visibleTranscriptBubbles([wakeWithBody])).toEqual([wakeWithBody]);
+  expect(visibleTranscriptBubbles(visible)).toBe(visible);
+  render(list(false, document.createElement("div"), vi.fn(), false, visible));
+  expect(vi.mocked(useVirtualizer).mock.lastCall?.[0].count).toBe(3);
+});
 
 function list(
   hasTasks: boolean,
@@ -208,6 +251,37 @@ it("keeps actions visible only on a final assistant message while idle", () => {
     "md:opacity-0",
   );
 });
+
+it("keeps the final reply's actions hover-only while a follow-up is queued", () => {
+  useChatStore.setState({
+    queuedMessages: [{ queueId: "q_1", text: "and the tests?", conversationId: "conv-1" }],
+  });
+  try {
+    render(messageList([bubble, assistantBubble], false, true));
+    const replyCopy = screen.getAllByRole("button", { name: "Copy" }).at(-1)!;
+    expect(actionFooter(replyCopy)).toHaveClass("md:opacity-0");
+  } finally {
+    useChatStore.setState({ queuedMessages: [] });
+  }
+});
+
+it.each([{ requiresRetry: true }, { waitingForHost: true }])(
+  "keeps the final reply's actions visible while a queued follow-up cannot send (%o)",
+  (blocked) => {
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_1", text: "and the tests?", conversationId: "conv-1", ...blocked },
+      ],
+    });
+    try {
+      render(messageList([bubble, assistantBubble], false, true));
+      const replyCopy = screen.getAllByRole("button", { name: "Copy" }).at(-1)!;
+      expect(actionFooter(replyCopy)).toHaveClass("opacity-100");
+    } finally {
+      useChatStore.setState({ queuedMessages: [] });
+    }
+  },
+);
 
 it("keeps every action row hover-only when the final message is from the user", () => {
   render(messageList([assistantBubble, bubble], false, true));

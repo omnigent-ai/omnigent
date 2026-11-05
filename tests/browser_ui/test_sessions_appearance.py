@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Iterator
+from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.conftest import BrowserContract
 
@@ -14,7 +16,15 @@ _COMPOSER = "Send a message…"
 
 
 @pytest.fixture
-def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
+def appearance_features() -> dict[str, bool]:
+    """Feature flags served by ``/v1/info``; a test may change them before reloading."""
+    return {}
+
+
+@pytest.fixture
+def appearance_url(
+    browser_contract: BrowserContract, appearance_features: dict[str, bool]
+) -> Iterator[str]:
     empty_list = {
         "object": "list",
         "data": [],
@@ -40,7 +50,7 @@ def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
             "server_version": "browser-contract",
             "smart_routing_enabled": False,
             "smart_routing_sources": {"external": False, "oss": False},
-            "features": {},
+            "features": appearance_features,
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "dictation_available": False,
@@ -67,6 +77,116 @@ def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
         "**/v1/sessions/updates*", lambda ws: ws.on_message(lambda _message: None)
     )
     yield browser_contract.base_url
+
+
+def test_custom_order_keeps_the_list_and_commits_on_drop(
+    page: Page,
+    appearance_url: str,
+    appearance_features: dict[str, bool],
+    browser_contract: BrowserContract,
+) -> None:
+    """Custom keeps the Updated list, moves a row only on drop, and adds new sessions above."""
+    appearance_features["sidebar_grouping_ui"] = True
+    sessions = [
+        {
+            "id": f"{index + 1:032x}",
+            "object": "conversation",
+            "title": title,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "status": "idle",
+            "labels": {},
+            "permission_level": None,
+        }
+        for index, (title, created_at, updated_at) in enumerate(
+            (("Busy session", 10, 300), ("Quiet session", 20, 100), ("Recent session", 30, 200))
+        )
+    ]
+
+    def session_list(request: Request) -> dict:
+        params = parse_qs(urlparse(request.url).query)
+        sort_by = params.get("sort_by", ["updated_at"])[0]
+        rows = [] if "pinned" in params else sorted(sessions, key=lambda row: -row[sort_by])
+        return {
+            "object": "list",
+            "data": rows,
+            "has_more": False,
+            "first_id": rows[0]["id"] if rows else None,
+            "last_id": rows[-1]["id"] if rows else None,
+        }
+
+    def choose(menu: str, option: str) -> None:
+        page.get_by_test_id("session-filter").press("ArrowDown")
+        page.get_by_test_id(menu).click()
+        page.get_by_role("menuitemradio", name=option, exact=True).click()
+
+    browser_contract.json("/v1/sessions", session_list)
+    browser_contract.json(
+        re.compile(r"/v1/sessions/[0-9a-f]{32}/items(?:\?.*)?$"), {"data": [], "has_more": False}
+    )
+    page.goto(appearance_url)
+    rows = page.locator("li[data-sidebar-session-id]").get_by_role("link")
+
+    def titles(*names: str) -> list[re.Pattern[str]]:
+        # A bumped session also reads "(unread)" to screen readers.
+        return [re.compile(rf"^{name}") for name in names]
+
+    updated = titles("Busy session", "Recent session", "Quiet session")
+    expect(rows).to_have_text(updated)
+    choose("session-ordering-menu", "Custom")
+    expect(rows).to_have_text(updated)
+    sessions[1]["updated_at"] = 999
+    page.reload()
+    expect(rows).to_have_text(updated)
+
+    # Updated would now be Quiet, Busy, Recent, so this drop leaves a distinct Custom order.
+    source = rows.filter(has_text="Recent session").bounding_box()
+    target = rows.filter(has_text="Busy session").bounding_box()
+    assert source and target
+    page.mouse.move(source["x"] + 30, source["y"] + source["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
+    # Like pins, a line marks the slot: above Busy, since Recent moves up.
+    busy_row = page.locator("li[data-sidebar-session-id]", has_text="Busy session")
+    line = busy_row.get_by_test_id("session-order-insertion")
+    expect(line).to_have_css("top", "0px")
+    expect(line).to_have_css("height", "2px")
+    expect(rows).to_have_text(updated)
+    page.mouse.up()
+    custom = titles("Recent session", "Busy session", "Quiet session")
+    expect(rows).to_have_text(custom)
+
+    sessions.append(
+        {
+            **sessions[0],
+            "id": f"{4:032x}",
+            "title": "New session",
+            "created_at": int(time.time()),
+            "updated_at": int(time.time()),
+        }
+    )
+    page.reload()
+    expect(rows).to_have_text([*titles("New session"), *custom])
+
+    # Each tab keeps its own selection until reload; this tab's next write wins.
+    with page.expect_popup() as popup:
+        page.evaluate("window.open('about:blank')")
+    popup.value.evaluate("""() => {
+        const key = 'omnigent:sidebar-view';
+        const view = JSON.parse(localStorage.getItem(key));
+        localStorage.setItem(key, JSON.stringify({ ...view, ordering: 'updated' }));
+    }""")
+    popup.value.close()
+    choose("session-grouping-menu", "Status")
+    choose("session-grouping-menu", "Default")
+    page.reload()
+    expect(rows).to_have_text([*titles("New session"), *custom])
+
+    appearance_features["sidebar_grouping_ui"] = False
+    page.reload()
+    expect(rows).to_have_text(
+        titles("New session", "Quiet session", "Busy session", "Recent session")
+    )
 
 
 @pytest.fixture
@@ -225,13 +345,13 @@ def test_appearance_reset_restores_defaults(page: Page, appearance_url: str) -> 
     terminal_dark = page.get_by_test_id("terminal-theme-dark")
 
     # Fresh context: the defaults are applied and nothing is persisted yet.
-    expect(font_size_input).to_have_value("13")
+    expect(font_size_input).to_have_value("14")
     expect(page.get_by_test_id("terminal-theme-auto")).to_have_attribute("aria-checked", "true")
     stored_font_size = page.evaluate("() => window.localStorage.getItem('omnigent:ui-font-size')")
     assert stored_font_size is None, "expected no persisted font size on a fresh load"
 
     # Change two unrelated appearance preferences away from their defaults.
-    for _ in range(5):
+    for _ in range(4):
         font_size_inc.click()
     expect(font_size_input).to_have_value("18")
     terminal_dark.click()
@@ -247,7 +367,7 @@ def test_appearance_reset_restores_defaults(page: Page, appearance_url: str) -> 
     page.get_by_test_id("reset-appearance-confirm").click()
 
     # Both choices are back to the product defaults.
-    expect(font_size_input).to_have_value("13")
+    expect(font_size_input).to_have_value("14")
     expect(page.get_by_test_id("terminal-theme-auto")).to_have_attribute("aria-checked", "true")
     assert page.evaluate("() => window.localStorage.getItem('omnigent:ui-font-size')") is None
     assert page.evaluate("() => window.localStorage.getItem('omnigent:terminal-theme')") is None
@@ -315,7 +435,7 @@ def test_ui_font_family_reset_restores_system_default(page: Page, appearance_url
 def test_ui_font_size_scales_and_persists(page: Page, appearance_url: str) -> None:
     """Stepping the size updates the token + value live and survives a reload.
 
-    A fresh context has no stored preference → default 13px. Increasing the
+    A fresh context has no stored preference and uses the 14px default. Increasing the
     size updates ``--desktop-ui-font-size`` and persists the px value; a page
     reload restores it (no reset, no flash back to the default).
     """
@@ -325,13 +445,13 @@ def test_ui_font_size_scales_and_persists(page: Page, appearance_url: str) -> No
     value = page.get_by_test_id("ui-font-size-input")
     increase = page.get_by_test_id("ui-font-size-inc")
 
-    # Fresh context → default 13px token, nothing stored.
-    expect(value).to_have_value("13")
+    # Fresh context uses the 14px token, with nothing stored.
+    expect(value).to_have_value("14")
     assert _stored_size(page) is None, "expected no persisted size on a fresh load"
-    assert _desktop_ui_font_size(page) == "13px", "fresh load should apply the default size"
+    assert _desktop_ui_font_size(page) == "14px", "fresh load should apply the default size"
 
-    # → 18px: five steps up. The value, applied token, and storage all move.
-    for _ in range(5):
+    # Four steps reach 18px. The value, applied token, and storage all move.
+    for _ in range(4):
         increase.click()
     expect(value).to_have_value("18")
     assert _stored_size(page) == "18"
@@ -394,8 +514,7 @@ def test_ui_font_size_input_allows_free_editing(page: Page, appearance_url: str)
 
     # Backspace to "1": the box holds the partial value; nothing clamps or
     # re-persists while the draft is out of range.
-    value.click()
-    value.press("End")
+    value.fill("13")
     value.press("Backspace")
     expect(value).to_have_value("1")
     assert _stored_size(page) == "13", "a mid-edit below-min draft must not persist"

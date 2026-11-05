@@ -1,11 +1,13 @@
+import { startTransition, Suspense } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { setOmnigentHostConfig, type HtmlPreviewFrameProps } from "@/lib/host";
 import type { Comment } from "@/hooks/useComments";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
-import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
+import { connectHtmlPreviewBridge, requestedScrollRestore } from "@/test/htmlPreviewBridge";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
+import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({
@@ -22,10 +24,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function renderViewer(content: string, truncated = false, embedded = false) {
+function renderViewer(
+  content: string,
+  truncated = false,
+  embedded = false,
+  scrollKey: string | null = null,
+) {
   const viewer = (
     <HtmlCommentViewer
       conversationId="conv_1"
+      scrollKey={scrollKey}
       content={content}
       truncated={truncated}
       comments={[]}
@@ -102,6 +110,7 @@ describe("HtmlCommentViewer", () => {
       <EmbeddedProvider>
         <HtmlCommentViewer
           conversationId="conv_1"
+          scrollKey={null}
           content="<p>Updated artifact</p>"
           truncated={false}
           comments={[]}
@@ -179,6 +188,7 @@ describe("HtmlCommentViewer", () => {
     rerender(
       <HtmlCommentViewer
         conversationId="conv_1"
+        scrollKey={null}
         content="<body>x</body>"
         truncated={true}
         comments={[]}
@@ -192,6 +202,99 @@ describe("HtmlCommentViewer", () => {
   it("does not show the floating Add-comment button before any selection", () => {
     renderViewer("<body><p>doc</p></body>");
     expect(document.querySelector("[data-add-comment-btn]")).toBeNull();
+  });
+});
+
+describe("HtmlCommentViewer scroll position", () => {
+  it("saves the frame's reported offset and restores it when the preview remounts", async () => {
+    const key = "html-preview:conv_1:plan.html";
+    const first = renderViewer("<body><p>plan</p></body>", false, false, key);
+    expect(requestedScrollRestore()).toBeNull();
+    const { port, send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.scroll, top: 760 });
+    await waitFor(() => expect(getSavedScrollTop(key)).toBe(760));
+    port.close();
+    first.unmount();
+
+    // Switching back to the tab or session mounts a fresh preview for the file.
+    renderViewer("<body><p>plan</p></body>", false, false, key);
+    expect(requestedScrollRestore()).toMatchObject({ top: 760 });
+  });
+
+  it("returns to the saved offset when the agent rewrites the file", async () => {
+    const key = "html-preview:conv_1:live.html";
+    saveScrollTop(key, 300);
+    const { rerender } = renderViewer("<body><p>v1</p></body>", false, false, key);
+    const rewrite = (content: string) =>
+      rerender(
+        <HtmlCommentViewer
+          conversationId="conv_1"
+          scrollKey={key}
+          content={content}
+          truncated={false}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+        />,
+      );
+    saveScrollTop(key, 512);
+    rewrite("<body><p>v2</p></body>");
+    expect(requestedScrollRestore()).toMatchObject({ top: 512 });
+
+    // The rewritten frame reports its own offset, which the next rewrite restores.
+    const { send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.scroll, top: 140 });
+    await waitFor(() => expect(getSavedScrollTop(key)).toBe(140));
+    rewrite("<body><p>v3</p></body>");
+    expect(requestedScrollRestore()).toMatchObject({ top: 140 });
+  });
+
+  it("saves a frame's offset under its own file while navigation to another file suspends", async () => {
+    const key = "html-preview:conv_1:suspended.html";
+    const nextKey = "html-preview:conv_1:next.html";
+    const pending = new Promise<void>(() => {});
+    const attempted = vi.fn();
+    function Suspend({ blocked }: { blocked: boolean }) {
+      if (blocked) {
+        attempted();
+        throw pending;
+      }
+      return null;
+    }
+    const tree = (scrollKey: string, blocked: boolean) => (
+      <Suspense fallback={<div>Loading navigation</div>}>
+        <HtmlCommentViewer
+          conversationId="conv_1"
+          scrollKey={scrollKey}
+          content="<body><p>plan</p></body>"
+          truncated={false}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+        />
+        <Suspend blocked={blocked} />
+      </Suspense>
+    );
+    const view = render(tree(key, false));
+    const { send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+
+    // The viewer renders for the next file, but the navigation never commits.
+    act(() => {
+      startTransition(() => {
+        view.rerender(tree(nextKey, true));
+      });
+    });
+    expect(attempted).toHaveBeenCalled();
+    send({ type: BRIDGE_MSG.scroll, top: 420 });
+    await waitFor(() => expect(getSavedScrollTop(key)).toBe(420));
+    expect(getSavedScrollTop(nextKey)).toBeUndefined();
+    view.rerender(tree(key, false));
   });
 });
 
@@ -255,6 +358,7 @@ describe("HtmlCommentViewer zoom", () => {
     rerender(
       <HtmlCommentViewer
         conversationId="conv_1"
+        scrollKey={null}
         content="<body><p>rewritten</p></body>"
         truncated={false}
         comments={[]}
@@ -336,6 +440,7 @@ describe("HtmlCommentViewer zoom", () => {
     render(
       <HtmlCommentViewer
         conversationId="conv_1"
+        scrollKey={null}
         content={content}
         truncated={false}
         comments={[draft]}

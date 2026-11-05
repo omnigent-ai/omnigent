@@ -16,6 +16,7 @@ import type {
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
+  FileEditRequest,
   ModelUsage,
   RememberScope,
   Response,
@@ -234,6 +235,8 @@ export interface ElicitationRequest {
    * Optional/null for any other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Producer-supplied extra (codex-native command approvals only):
    * structured command details that let the UI render the approval
@@ -657,6 +660,18 @@ export interface SessionCodexApprovalModeEvent {
 }
 
 /**
+ * `session.background_tasks` — background tasks that changed between turns,
+ * e.g. a codex-native session's background terminals. The count is
+ * authoritative, like the one on a `session.status` edge.
+ */
+export interface SessionBackgroundTasksEvent {
+  type: "session_background_tasks";
+  conversationId: string;
+  backgroundTaskCount: number;
+  backgroundTasks: BackgroundTaskInfo[];
+}
+
+/**
  * `session.agent_changed`: the session's bound agent changed (e.g. its
  * MCP servers were edited).
  *
@@ -1034,6 +1049,7 @@ export type StreamEvent =
   | SessionCollaborationModeEvent
   | SessionPermissionModeEvent
   | SessionCodexApprovalModeEvent
+  | SessionBackgroundTasksEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent
