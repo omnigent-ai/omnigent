@@ -489,20 +489,26 @@ describe("HeaderConversationMenu", () => {
     // The mobile chat header shows no title of its own (the native shells hide
     // the breadcrumb), so the menu itself has to name the session.
     mocks.isMobile = true;
-    renderMenu();
+    renderMenu({ workingDirectory: "/Users/ajay/projects/omni" });
     openMenu();
     const label = screen.getByText("Quarterly planning");
     expect(label.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
+    const directory = screen.getByLabelText("Working directory: /Users/ajay/projects/omni");
+    expect(directory).toHaveTextContent("omni");
+    expect(directory.querySelector("svg")).toHaveClass("lucide-folder");
+    expect(directory.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("header-move-to-project"));
     expect(screen.queryByText("Quarterly planning")).toBeNull();
+    expect(screen.queryByText("omni")).toBeNull();
   });
 
   it("omits the title header on desktop, where the breadcrumb already shows it", () => {
-    renderMenu();
+    renderMenu({ workingDirectory: "/Users/ajay/projects/omni" });
     openMenu();
 
     expect(screen.queryByText("Quarterly planning")).toBeNull();
+    expect(screen.queryByText("omni")).toBeNull();
   });
 
   it("sizes the trigger and rows for touch on mobile only", () => {

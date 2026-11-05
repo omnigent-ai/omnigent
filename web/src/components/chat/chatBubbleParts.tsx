@@ -11,6 +11,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 import {
   ArrowUpIcon,
@@ -738,7 +739,32 @@ function useCopyMessageLink(messageId: string | null): {
   return { isLinkCopied, handleCopyLink };
 }
 
+function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesktop = false) {
+  const isMobile = useIsMobileViewport();
+  const [actionsRevealed, setActionsRevealed] = useState<boolean | null>(null);
+  const actionsVisible = isMobile ? (actionsRevealed ?? persistentOnMobile) : persistentOnDesktop;
+
+  return {
+    toggleActions: isMobile
+      ? (event: ReactMouseEvent<HTMLDivElement>) => {
+          if (
+            event.target instanceof Element &&
+            event.target.closest("a, button, input, textarea, select, [role=button]")
+          )
+            return;
+          setActionsRevealed((visible) => !(visible ?? persistentOnMobile));
+        }
+      : undefined,
+    visibilityClassName: actionsVisible
+      ? "opacity-100"
+      : isMobile
+        ? "invisible opacity-0"
+        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
+  };
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
+  const { toggleActions, visibilityClassName } = useMessageActionVisibility();
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
   const sessionId = useScopedConversationId();
@@ -788,6 +814,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-user-message-id={bubble.itemId}
       data-message-id={bubble.itemId}
       className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
+      onClick={toggleActions}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
@@ -950,8 +977,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             The agent will read this after its current step
           </div>
         )}
-        {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40">
+        <div
+          className={cn(
+            "flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0",
+            visibilityClassName,
+          )}
+        >
           {ts && (
             <span
               className="select-none text-[11px] leading-4 text-foreground/56"
@@ -1000,6 +1031,10 @@ function AssistantBubble({
   actionsPersistent?: boolean;
   recoveryDisabled?: boolean;
 }) {
+  const { toggleActions, visibilityClassName } = useMessageActionVisibility(
+    isLastAssistant,
+    actionsPersistent,
+  );
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
   // is rendered at the page level, not inside this component.
@@ -1124,6 +1159,7 @@ function AssistantBubble({
         data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
+        onClick={toggleActions}
         className={cn(
           "mobile-app:gap-0",
           spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]",
@@ -1167,9 +1203,7 @@ function AssistantBubble({
           <div
             className={cn(
               "flex mobile-app:flex-wrap items-center gap-3 py-1 mobile-app:py-0",
-              actionsPersistent
-                ? "opacity-100"
-                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
+              visibilityClassName,
             )}
           >
             <MessageActions>

@@ -880,6 +880,23 @@ aside[aria-label="Workspace"][data-maximized] {
   backdrop-filter: var(--menu-surface-backdrop-filter);
 }
 
+@media (width < 48rem) {
+  .mobile-menu-glass,
+  .mobile-menu-glass-layer,
+  .dark [data-radix-popper-content-wrapper] > :is(.mobile-menu-glass, .mobile-menu-glass-layer) {
+    isolation: isolate;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+  }
+
+  .mobile-menu-glass [data-slot="command"] {
+    background: transparent;
+  }
+}
+
 /* Native clearance uses window pixels, independent of rem and page zoom.
  * The preload supplies zoom; older shells fall back to 100%.
  * The embed build maps html selectors onto the .omnigent-app scope root. */

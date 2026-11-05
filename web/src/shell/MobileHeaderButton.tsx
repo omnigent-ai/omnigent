@@ -1,15 +1,41 @@
-import { forwardRef, type ComponentPropsWithoutRef } from "react";
+import { createContext, forwardRef, useContext, type ComponentPropsWithoutRef } from "react";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { Button } from "@/components/ui/button";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 
+const MobileHeaderButtonGroupContext = createContext(false);
+
+export function MobileHeaderButtonGroup({
+  children,
+  className,
+  ...props
+}: ComponentPropsWithoutRef<"div">) {
+  const isMobile = useIsMobileViewport();
+  return (
+    <MobileHeaderButtonGroupContext.Provider value={isMobile}>
+      <div
+        {...props}
+        data-mobile-header-group=""
+        className={cn(
+          className,
+          isMobile && "relative isolate h-11 rounded-[20px] [&:not(:has(button))]:hidden",
+        )}
+      >
+        {isMobile && <OmniGlassSurface borderRadius={20} className="-z-10" />}
+        {children}
+      </div>
+    </MobileHeaderButtonGroupContext.Provider>
+  );
+}
+
 /** Keep the native button as the Radix trigger and layer glass behind its icon. */
 export const MobileHeaderButton = forwardRef<
   HTMLButtonElement,
-  Omit<ComponentPropsWithoutRef<typeof Button>, "asChild">
->(function MobileHeaderButton({ children, className, size, variant, ...props }, ref) {
+  Omit<ComponentPropsWithoutRef<typeof Button>, "asChild"> & { glass?: boolean }
+>(function MobileHeaderButton({ children, className, size, variant, glass = true, ...props }, ref) {
   const isMobile = useIsMobileViewport();
+  const grouped = useContext(MobileHeaderButtonGroupContext);
   return (
     <Button
       {...props}
@@ -25,7 +51,7 @@ export const MobileHeaderButton = forwardRef<
       {isMobile ? (
         <>
           <span className="relative z-10 flex items-center justify-center">{children}</span>
-          <OmniGlassSurface width={44} height={44} borderRadius={22} />
+          {glass && !grouped && <OmniGlassSurface width={44} height={44} borderRadius={22} />}
         </>
       ) : (
         children

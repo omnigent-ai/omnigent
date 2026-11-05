@@ -74,6 +74,7 @@ function renderHeader(props: {
   isChildSession?: boolean;
   subAgentName?: string | null;
   conversationId?: string;
+  workingDirectory?: string;
   createdBySessionId?: string;
   queryClient?: QueryClient;
   actionConversation?: Conversation | null;
@@ -114,6 +115,7 @@ function renderHeader(props: {
             // right-panel toggle / rail entries all gate on conversationId and
             // stay unmounted, isolating the left-slot affordances under test.
             conversationId={props.conversationId}
+            workingDirectory={props.workingDirectory}
             createdBySessionId={props.createdBySessionId}
             actionConversation={props.actionConversation}
             conversationTitle={props.conversationTitle ?? null}
@@ -709,7 +711,7 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
 });
 
 describe("ChatHeader — floating mobile controls", () => {
-  it("adds glass to the mobile sidebar and fallback menu buttons without covering the title", () => {
+  it("adds glass to the mobile sidebar and shared action container", () => {
     isMobileMock.mockReturnValue(true);
     const onOpenSidebar = vi.fn();
     renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true, onOpenSidebar });
@@ -718,7 +720,10 @@ describe("ChatHeader — floating mobile controls", () => {
     const menu = screen.getByRole("button", { name: "Session actions" });
     const cluster = screen.getByRole("button", { name: "Share session" }).parentElement;
     for (const button of [toggle, menu]) {
-      const surface = button.querySelector<HTMLElement>(".glass-surface")!;
+      const surface = (button.querySelector<HTMLElement>(".glass-surface") ??
+        button
+          .closest("[data-mobile-header-group]")
+          ?.querySelector<HTMLElement>(".glass-surface"))!;
       expect(surface.parentElement).toHaveAttribute("aria-hidden", "true");
       expect(surface).toHaveClass("glass-surface--fallback");
       expect(surface).toHaveClass("[&>.glass-surface\\_\\_sheen]:opacity-0");
@@ -738,7 +743,7 @@ describe("ChatHeader — floating mobile controls", () => {
         "stdDeviation",
         "4.4",
       );
-      expect(surface).toHaveStyle({ borderRadius: "22px" });
+      expect(surface).toHaveStyle({ borderRadius: button === toggle ? "22px" : "20px" });
       expect(button).toHaveClass(
         "size-11",
         "rounded-full",
@@ -756,7 +761,7 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(onOpenSidebar).toHaveBeenCalledWith(false);
   });
 
-  it("gives the sidebar and owner-managed actions matching glass surfaces and touch targets", () => {
+  it("shares the glass material across the sidebar and grouped session actions", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: false,
@@ -786,15 +791,15 @@ describe("ChatHeader — floating mobile controls", () => {
         "aria-expanded:bg-transparent",
         "active:transform-none!",
       );
-      expect(button.querySelector(".glass-surface")).not.toBeNull();
     }
     const sidebarSurface = toggle.querySelector<HTMLElement>(".glass-surface")!;
-    const menuSurface = trigger.querySelector<HTMLElement>(".glass-surface")!;
+    expect(trigger.querySelector(".glass-surface")).toBeNull();
+    const group = trigger.closest("[data-mobile-header-group]")!;
+    const menuSurface = group.querySelector<HTMLElement>(".glass-surface")!;
+    expect(group).toHaveClass("rounded-[20px]");
+    expect(group.querySelectorAll(".glass-surface")).toHaveLength(1);
     expect(menuSurface.className).toBe(sidebarSurface.className);
     for (const property of [
-      "width",
-      "height",
-      "border-radius",
       "box-shadow",
       "backdrop-filter",
       "--glass-frost",
@@ -850,6 +855,7 @@ describe("ChatHeader — floating mobile controls", () => {
     renderHeader({
       sidebarOpen: true,
       conversationId: "conv-1",
+      workingDirectory: "/Users/ajay/projects/omni",
       canShare: true,
       hasHeaderMenu: true,
     });
@@ -858,6 +864,9 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(screen.getByRole("menu")).toHaveClass(
       "max-md:bg-background/70",
       "max-md:backdrop-blur-xl",
+    );
+    expect(screen.getByLabelText("Working directory: /Users/ajay/projects/omni")).toHaveTextContent(
+      "omni",
     );
   });
 

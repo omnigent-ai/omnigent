@@ -28,7 +28,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -51,7 +50,9 @@ import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
-import { MobileHeaderButton } from "./MobileHeaderButton";
+import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
+import { MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
+import { SessionMenuHeader } from "./SessionMenuHeader";
 
 const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
@@ -144,6 +145,7 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  workingDirectory?: string | null;
   createdBySessionId?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
@@ -337,6 +339,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  workingDirectory,
   createdBySessionId,
   permissionLevel,
   actionConversation = null,
@@ -499,6 +502,7 @@ export function ChatHeader({
     !pending && actionConversation ? (
       <HeaderConversationMenu
         conversation={actionConversation}
+        workingDirectory={workingDirectory}
         currentProject={projectName}
         canShare={canShare}
         canFork={canFork}
@@ -627,7 +631,8 @@ export function ChatHeader({
         )}
       </div>
 
-      <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
+      <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
+        {isMobile && conversationId && <MobileHeaderControlsSlot sessionId={conversationId} />}
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
@@ -707,18 +712,18 @@ export function ChatHeader({
               </DropdownMenuTrigger>
               <DropdownMenuContent
                 align="end"
-                className={cn("min-w-44 max-w-[min(20rem,calc(100vw-1rem))]", MOBILE_GLASS_SURFACE)}
+                collisionPadding={isMobile ? 16 : undefined}
+                className={cn(
+                  "min-w-44 max-w-[min(20rem,calc(100vw-1rem))]",
+                  MOBILE_GLASS_SURFACE,
+                  isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
+                )}
               >
                 {isMobile && conversationId && (
-                  <>
-                    <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
-                      <span className="min-w-0 flex-1 truncate">
-                        {conversationTitle || UNTITLED_CONVERSATION_LABEL}
-                      </span>
-                      <PresenceAvatars />
-                    </DropdownMenuLabel>
-                    <DropdownMenuSeparator />
-                  </>
+                  <SessionMenuHeader
+                    title={conversationTitle || UNTITLED_CONVERSATION_LABEL}
+                    workingDirectory={workingDirectory}
+                  />
                 )}
                 {/* Chat/Terminal switch (terminal-first sessions) — self-gates to
                   null otherwise, and renders its own trailing separator. */}
@@ -871,7 +876,7 @@ export function ChatHeader({
             </Button>
           </>
         )}
-      </div>
+      </MobileHeaderButtonGroup>
     </header>
   );
 }

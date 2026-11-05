@@ -17,6 +17,7 @@ import {
   MonitorCloudIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -181,15 +182,26 @@ export const ComposerHostTrigger = forwardRef<
     label: string;
     status?: HostStatusDotStatus;
     cloud?: boolean;
+    appearance?: "composer" | "header";
     testIdPrefix?: string;
   }
 >(function ComposerHostTrigger(
-  { label, status, cloud = false, testIdPrefix = "composer", className, ...props },
+  {
+    label,
+    status,
+    cloud = false,
+    appearance = "composer",
+    testIdPrefix = "composer",
+    className,
+    ...props
+  },
   ref,
 ) {
   const Icon = cloud ? MonitorCloudIcon : LaptopIcon;
+  const Trigger = appearance === "header" ? MobileHeaderButton : "button";
   return (
-    <button
+    <Trigger
+      {...(appearance === "header" ? { glass: false } : {})}
       ref={ref}
       type="button"
       aria-label={label}
@@ -205,9 +217,12 @@ export const ComposerHostTrigger = forwardRef<
             <HostStatusDot status={status} testId={`${testIdPrefix}-host-status`} />
           </span>
         )}
-        <Icon className="size-4 shrink-0" data-testid={`${testIdPrefix}-host-icon`} />
+        <Icon
+          className={cn("size-4 shrink-0", appearance === "header" && "size-5")}
+          data-testid={`${testIdPrefix}-host-icon`}
+        />
       </span>
-    </button>
+    </Trigger>
   );
 });
 
@@ -388,6 +403,7 @@ export const ComposerHarnessTrigger = forwardRef<
     icon?: ReactNode;
     testIdPrefix?: string;
     labelClassName?: string;
+    appearance?: "composer" | "header";
   }
 >(function ComposerHarnessTrigger(
   {
@@ -399,13 +415,16 @@ export const ComposerHarnessTrigger = forwardRef<
     pending = false,
     testIdPrefix = "composer",
     labelClassName,
+    appearance = "composer",
     className,
     ...props
   },
   ref,
 ) {
+  const Trigger = appearance === "header" ? MobileHeaderButton : Button;
   return (
-    <Button
+    <Trigger
+      {...(appearance === "header" ? { glass: false } : {})}
       ref={ref}
       type="button"
       variant="ghost"
@@ -441,6 +460,7 @@ export const ComposerHarnessTrigger = forwardRef<
           "inline-flex min-w-0 flex-nowrap items-baseline gap-1",
           icon != null && COMPOSER_COLLAPSED_LABEL_CLASS,
           labelClassName,
+          appearance === "header" && "sr-only",
         )}
         data-testid={`${testIdPrefix}-agent-config-value`}
       >
@@ -462,7 +482,7 @@ export const ComposerHarnessTrigger = forwardRef<
           </span>
         )}
       </span>
-      <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
-    </Button>
+      {appearance !== "header" && <ChevronDownIcon className="size-4 shrink-0 opacity-60" />}
+    </Trigger>
   );
 });

@@ -2,22 +2,34 @@ import GlassSurface from "@/components/ui/glass-surface/GlassSurface";
 import { cn } from "@/lib/utils";
 
 interface OmniGlassSurfaceProps {
+  variant?: "default" | "menu";
   width?: number | string;
   height?: number | string;
   borderRadius?: number;
   className?: string;
 }
 
-const GLASS_BLUR = 6;
-const GLASS_BACKDROP_FILTER = `blur(${GLASS_BLUR}px) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(1.04)`;
+const GLASS_VARIANTS = {
+  default: {
+    blur: 6,
+    background: "hsl(0 0% 100% / 0%)",
+  },
+  menu: {
+    blur: 20,
+    background: "color-mix(in oklch, var(--popover) 65%, transparent)",
+  },
+};
 
 /** Decorative glass background for a positioned container; content stays in its own layout. */
 export function OmniGlassSurface({
+  variant = "default",
   width = "100%",
   height = "100%",
   borderRadius = 16,
   className,
 }: OmniGlassSurfaceProps) {
+  const surface = GLASS_VARIANTS[variant];
+  const backdropFilter = `blur(${surface.blur}px) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(1.04)`;
   return (
     <span
       aria-hidden="true"
@@ -31,16 +43,16 @@ export function OmniGlassSurface({
         height={height}
         borderRadius={borderRadius}
         borderWidth={0.06}
-        blur={GLASS_BLUR}
+        blur={surface.blur}
         displace={4.4}
         distortionScale={-270}
         refraction={false}
         opacity={0.45}
         className="[&>.glass-surface\_\_sheen]:opacity-0 dark:[&>.glass-surface\_\_rim]:opacity-25 dark:[&>.glass-surface\_\_rim]:p-px!"
         style={{
-          background: "hsl(0 0% 100% / 0%)",
-          WebkitBackdropFilter: GLASS_BACKDROP_FILTER,
-          backdropFilter: GLASS_BACKDROP_FILTER,
+          background: surface.background,
+          WebkitBackdropFilter: backdropFilter,
+          backdropFilter,
           boxShadow: [
             "inset 0 1px 0 0 light-dark(hsl(0 0% 100% / 0.85), hsl(0 0% 100% / 0.15))",
             "inset 0 -1px 0 0 light-dark(hsl(0 0% 100% / 0.35), hsl(0 0% 100% / 0.04))",
