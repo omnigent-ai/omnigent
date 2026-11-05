@@ -41,7 +41,9 @@ the header menu), and each place is a separate entry point.
   closing one stops only that chat. Starting one from a stopped generic hosted
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
-  message or Resume.
+  message or Resume. Only the session's owner can start side chats. A side
+  chat started on one device appears as an existing side-chat tab on the
+  owner's other devices. Selection and closing tabs stay local.
 - `side-chat-settings`: choose a supported model or effort in the side-chat composer;
   selections apply to that chat's next turn independently of its parent, in the
   desktop panel and mobile drawer. Generic side chats allow selection before or
@@ -161,18 +163,22 @@ the header menu), and each place is a separate entry point.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
-  (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
+  (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
   (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
   clears the cached rows and shows loading while session timestamps refresh,
   including project folders, pins, and Archived. With the flag off,
-  sessions always use Updated regardless of the saved preference. Shared sessions
-  get their own section above Sessions. Status groups are Needs attention, Unread,
+  sessions always use Updated regardless of the saved preference. Sessions shared
+  with the viewer get their own "Shared with me" section above Sessions, without a
+  per-row people icon. Status groups are Needs attention, Unread,
   Working, Draft, and Done. Working stays visible with muted “No sessions” text
   when empty. Starting or running sessions enter Working immediately; idle must
   last 10 seconds before they leave it. Errors and approvals bypass that delay.
+  Background work of a native Claude or Codex session keeps it in Working, and
+  a prompt its turn waits on in the terminal puts it in Needs attention; see the
+  `working-status` rules in [Native harnesses](./native-harnesses.md).
   This only affects grouping, and existing hover/rename holds still apply.
   Harness groups sessions under alphabetically ordered harness names (such as
   Claude Code, Codex, and Pi), including custom agents using the same harness.
@@ -203,7 +209,9 @@ menu → **Open in grid** and choose the pane and direction. Each pane has its o
 transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
-screen; drafts and terminal connections survive view changes.
+screen; drafts and terminal connections survive view changes. A managed session
+whose sandbox never started shows its saved first message as **Not delivered**
+in its cell too, with **Copy message to new session**.
 Render failures in one chat or terminal show **Try again** in that view while
 cell controls, the other view and neighboring sessions stay usable. Clear the
 fault and retry to recover.
@@ -241,7 +249,9 @@ Failed sends restore text and supported attachments unless the cell has a newer 
 Quoted replies recover as serialized text.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
-sessions** on the empty landing. Choose a machine, harness, and recent count
+sessions** on the empty landing. The X beside the landing button dismisses the
+suggestion and keeps it hidden after reload in this browser; Settings → Import
+sessions remains available. Choose a machine, harness, and recent count
 or session ID. After starting, go Back to the session list; its heading shows
 progress and links back to Settings. Imported sessions appear in the normal list,
 except Codex threads archived in Codex, which land in Archived, so the list can
@@ -283,7 +293,15 @@ actions (mark as read or unread, archive, unarchive, delete).
 pin, fork, export, rename, mark as unread, add to project, archive or
 unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
-actions.
+actions. On phones, the sidebar toggle has a circular glass surface; host,
+harness/model, background tasks, and session actions share the top-right glass
+group. Buttons are 44px tall with 20px icons. These surfaces use the shared
+React Bits glass treatment with a transparent fill, diffused backdrop, subtle
+rim, and soft shadow. Menus and the sidebar use the more strongly blurred menu
+variant. Browsers without backdrop filtering receive a solid theme surface.
+The header controls sit 16px from the top and sides.
+The mobile header omits the session title and fading backdrop,
+retaining a Back link for child sessions.
 
 **Rename shortcut:** in an owner-managed top-level session on desktop, press
 Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
@@ -325,7 +343,9 @@ Projects header holds Grouping, Display, Ordering and Show. In
 Status, Harness, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
 project, Shared and Sessions rows together; the Sessions header keeps only New
-session. Hovering a row opens
+session. On Display → Shared with me, Projects is hidden (folders hold only the
+viewer's own sessions) and the Shared with me header carries the funnel, New
+session and Select sessions. Hovering a row opens
 its tooltip; the repo and PR rows load from the session's GitHub info only once
 the tooltip opens, and fall back to the PR the server stored for the session
 when the live lookup has none, with its age once that state is over five
@@ -469,10 +489,11 @@ choose Stop session while a side chat or sub-agent is working. On mobile, open
 the sidebar drawer and long-press the row. The current-turn interrupt control is
 a separate action that leaves the session connected.
 
-**Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
-parent composer, or choose **Start a new side chat** from the composer's add
-tray. Selecting assistant text also offers **Ask in side chat** unless the
-composer is read-only. On mobile,
+**Side-chat lifecycle:** as the session's owner, use **Workspace → + → Side
+chat**, type `/side` in the parent composer, or choose **Start a new side chat**
+from the composer's add tray. Selecting assistant text also offers **Ask in side
+chat** unless the composer is read-only. Viewers and editors of a shared session
+see none of these. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
 chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Sending to
@@ -480,6 +501,11 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
+On another device, open the same parent: saved side chats appear in the existing
+Workspace tab strip or mobile Side chats drawer. Discovery fetches up to 20 chats
+without changing the active panel or tab. Tabs closed on this device stay closed
+after reload; other devices keep their tabs. Side chats created before server
+discovery was added remain local to their original browser.
 In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
 in a visible workspace rail. With no closable visible tab it returns to the
 new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are
@@ -494,9 +520,11 @@ keeps running. Covered by `tests/e2e_ui/agents/test_subagent_side_panel.py`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
-Closing the side chat discards its queued follow-ups. A
-chat-only side chat can also send messages from its direct `/c/<child_id>` URL
-without choosing a workspace. The side-chat composer opens the same `/` menu
+Closing the side chat discards the follow-ups queued on that device. Other
+devices keep their tabs and queued work. Closing still stops the chat's running
+turn, as before; a sealed Codex side chat refuses further input. A chat-only
+side chat can also send messages from its direct URL without choosing a
+workspace. The side-chat composer opens the same `/` menu
 affordance as the main composer but with a narrower set — `/help` and the
 session's skills: `/help` is answered locally and a recognised skill runs
 in-process through `slash_command`; a native terminal side chat shows no menu
@@ -776,11 +804,12 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
   seeds an error item directly into the spawned server's database.
 - **`reconnect`, offline-host cause (own environment):**
-  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_preserves_failed_turn_and_retry`
+  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_refuses_input_and_keeps_reconnect_action`
   creates Claude/Codex native-wrapper sessions on a real disposable host, stops
-  the host and its runners, and checks the API failure and browser details.
-  It covers missing and stale runner bindings, reload persistence, and retry
-  without duplicate transcript input. Repeat with `--device='iPhone 13'` for
+  the host and its runners, and checks that both client retry contracts refuse
+  without transcript input, failed status, or pending work. It covers missing
+  and stale runner bindings, reload, the host menu's Reconnect action, and a
+  refused retry with no extra items. Repeat with `--device='iPhone 13'` for
   the mobile entry point; keep browser evidence outside the checkout.
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
@@ -882,6 +911,11 @@ plain `uv run pytest`, which starts a private server for the test.
   eligibility; `web/src/pages/ChatPage.composer.test.tsx` checks target routing
   and parent isolation. In an embedded app, repeat text selection in both the
   parent and side chat and check the popup's theme and button styling.
+- **`side-chat-lifecycle`, another device:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_follows_the_user_to_another_device`
+  starts a side chat in the desktop rail, opens it from a phone-sized browser
+  context with its own storage using the automatically restored tab, sends a follow-up,
+  closes it there, and checks that only the phone tab stays closed after reload.
 - **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
   opens a runnerless child directly and sends a message without a directory
@@ -889,7 +923,8 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`side-chat-lifecycle`, `side-chat-settings`, native Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   drives a real Codex CLI and app-server with scripted model replies. It checks
-  inherited context in the model request, isolated follow-ups, and a parent
+  inherited context in the model request, discovery and a follow-up from an
+  independent browser context, isolated follow-ups, and a parent
   that stays usable after closing its side chat. Desktop/mobile variants create
   a side chat through the Workspace menu or `/side`, then change its model and
   effort before a follow-up. Scripted provider requests verify the actual model
@@ -958,7 +993,9 @@ plain `uv run pytest`, which starts a private server for the test.
   exact-ID imports through a real host when a transcript exceeds the tunnel's
   message cap; the batch summary links to all three sessions in the sidebar.
   Component coverage checks compact large batches, failure expansion, retry
-  after navigation, and collapsed headings.
+  after navigation, and collapsed headings. `web/src/shell/NewChatDialog.test.tsx`
+  covers the landing import link and dismissal, including persistence after
+  remount and unavailable storage.
 
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`

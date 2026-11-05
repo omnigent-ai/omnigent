@@ -108,6 +108,10 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
             timeout=60,
         )
         assert snapshot["pending_inputs"] == []
+        # B can still show the message the launch never delivered.
+        assert [entry["content"] for entry in snapshot["failed_inputs"]] == [
+            [{"type": "input_text", "text": _PROMPT}]
+        ]
         errors = [item for item in snapshot["items"] if item["type"] == "error"]
         # The provider's own text stays server-side; the launch failure is named.
         assert any(
