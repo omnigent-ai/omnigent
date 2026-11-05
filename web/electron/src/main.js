@@ -73,6 +73,7 @@ const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
 const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
 const { createReturnBanner } = require("./return_banner");
+const { createSecurityKeyPrompt } = require("./security_key_prompt");
 const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
@@ -1718,6 +1719,16 @@ const returnBanner = createReturnBanner({
   onGoBack: (win) => awayWatches.get(win)?.reset(),
 });
 
+// Shell-owned "Use your security key" prompt while a window's page waits on
+// WebAuthn, which Electron otherwise runs with nothing on screen.
+const securityKeyPrompt = createSecurityKeyPrompt({
+  BrowserWindow,
+  ipcMain,
+  promptPage: path.join(__dirname, "..", "security-key-prompt", "index.html"),
+  preloadPath: path.join(__dirname, "security_key_prompt_preload.js"),
+  isShellWindow: (win) => windows.has(win),
+});
+
 // Shell-owned "Reconnecting to Databricks…" overlay over the window's page while
 // silent reconnects run; Cancel ends them on the setup page.
 const reconnectOverlay = createReconnectOverlay({
@@ -2698,6 +2709,7 @@ function createWindow(targetUrl, opts = {}) {
       onReturn: () => returnBanner.hide(win),
     }),
   );
+  securityKeyPrompt.attach(win);
   if (destination) {
     // All server entry points share auth preparation and resolved-origin manifest lookup.
     void loadServerUrl(win, serverUrl, undefined, { loadUrl: destination })
@@ -4971,6 +4983,7 @@ function registerIpc() {
   browserPermissionPrompt.registerIpc();
   updateOverlay.registerIpc();
   returnBanner.registerIpc();
+  securityKeyPrompt.registerIpc();
   reconnectOverlay.registerIpc();
 
   // Mirror the web app's in-app theme onto the native side so the update
