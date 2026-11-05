@@ -272,6 +272,10 @@ _CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
 # Claude Code waits 10 minutes by default for response headers, so a request
 # whose connection died silently (e.g. across host sleep) stalls the turn.
 _CLAUDE_CODE_API_TIMEOUT_ENV = "API_TIMEOUT_MS"
+# Claude Code caps replies at 32000 output tokens by default, which cuts long answers off.
+# 64000 is the highest value its CLI accepts for this variable.
+_CLAUDE_CODE_MAX_OUTPUT_TOKENS_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
+_CLAUDE_CODE_MAX_OUTPUT_TOKENS_VALUE = "64000"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -1726,6 +1730,10 @@ def build_native_claude_terminal_env(
 
         retry_env = RetryPolicy().claude_cli.env()
         terminal_env[_CLAUDE_CODE_API_TIMEOUT_ENV] = retry_env[_CLAUDE_CODE_API_TIMEOUT_ENV]
+    if _CLAUDE_CODE_MAX_OUTPUT_TOKENS_ENV not in terminal_env and not os.environ.get(
+        _CLAUDE_CODE_MAX_OUTPUT_TOKENS_ENV
+    ):
+        terminal_env[_CLAUDE_CODE_MAX_OUTPUT_TOKENS_ENV] = _CLAUDE_CODE_MAX_OUTPUT_TOKENS_VALUE
     # A raw credential can override the helper or open Claude's API-key menu.
     for name in native_claude_auth_env_unset(claude_config):
         if name in terminal_env:
