@@ -1,10 +1,17 @@
 import userEvent from "@testing-library/user-event";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
 import { MermaidPreview } from "@/shell/MermaidPreview";
 import { Reasoning, ReasoningContent } from "./reasoning";
-import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
+import {
+  hasOpenCodeFence,
+  Message,
+  MessageAction,
+  MessageActions,
+  MessageContent,
+  MessageResponse,
+} from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -281,6 +288,84 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
     },
     15_000,
   );
+});
+
+describe("a streaming Mermaid fence", () => {
+  const open = "Flow:\n\n```mermaid\nflowchart LR\n  Alpha --> Beta\n";
+  const closed = `${open}\`\`\`\n\nDone.`;
+  const originalGetBBox = Object.getOwnPropertyDescriptor(SVGElement.prototype, "getBBox");
+
+  beforeEach(() => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    // jsdom has no SVG layout; keep the real Mermaid renderer and supply its measurements.
+    Object.defineProperty(SVGElement.prototype, "getBBox", {
+      configurable: true,
+      value: () => ({ x: 0, y: 0, width: 100, height: 40 }),
+    });
+  });
+
+  afterEach(() => {
+    if (originalGetBBox) Object.defineProperty(SVGElement.prototype, "getBBox", originalGetBBox);
+    else delete (SVGElement.prototype as { getBBox?: unknown }).getBBox;
+  });
+
+  it("shows its source until the fence closes and the diagram has drawn", async () => {
+    const { container, rerender } = render(<MessageResponse isStreaming>{open}</MessageResponse>);
+    const source = () => container.querySelector('[data-streamdown="code-block"]');
+    expect(source()).toHaveTextContent("Alpha --> Beta");
+    expect(container.querySelector(".chat-mermaid")).toBeNull();
+
+    rerender(<MessageResponse isStreaming>{closed}</MessageResponse>);
+    expect(source()).toHaveTextContent("Alpha --> Beta");
+    expect(container.querySelector(".chat-mermaid")).toHaveClass("invisible");
+
+    await waitFor(() => expect(source()).toBeNull(), { timeout: 10_000 });
+    expect(container.querySelector('svg[id^="mermaid-"]')).toHaveTextContent("Alpha");
+    expect(container.querySelector(".chat-mermaid")).not.toHaveClass("invisible");
+  }, 15_000);
+
+  it("shows its source when the fence's language arrives after the fence opens", () => {
+    const { container, rerender } = render(
+      <MessageResponse isStreaming>{"Flow:\n\n```mer"}</MessageResponse>,
+    );
+    rerender(<MessageResponse isStreaming>{open}</MessageResponse>);
+
+    expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent(
+      "Alpha --> Beta",
+    );
+    expect(container.querySelector(".chat-mermaid")).toBeNull();
+  });
+
+  it("shows the source of a fence that arrives closed until the diagram has drawn", async () => {
+    const { container } = render(<MessageResponse isStreaming>{closed}</MessageResponse>);
+    const source = () => container.querySelector('[data-streamdown="code-block"]');
+    expect(source()).toHaveTextContent("Alpha --> Beta");
+    expect(container.querySelector(".chat-mermaid")).toHaveClass("invisible");
+
+    await waitFor(() => expect(source()).toBeNull(), { timeout: 10_000 });
+    expect(container.querySelector('svg[id^="mermaid-"]')).toHaveTextContent("Alpha");
+  }, 15_000);
+
+  it("draws a fence that never streamed without showing its source", () => {
+    const { container } = render(<MessageResponse>{closed}</MessageResponse>);
+
+    expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull();
+    expect(container.querySelector(".chat-mermaid")).not.toHaveClass("invisible");
+  });
+
+  it.each([
+    ["an open fence", "```mermaid\nA", true],
+    ["a closed fence", "```mermaid\nA\n```", false],
+    ["a shorter closer", "````\nA\n```", true],
+    ["a longer closer", "```\nA\n````", false],
+    ["a closer of the other character", "~~~\nA\n```", true],
+    ["a fence-like line with text after it", "```mermaid\nA\n```not-a-closer", true],
+    ["a closer with trailing spaces", "```\nA\n```  \r", false],
+    ["a fence indented four spaces", "    ```\nA", false],
+    ["prose", "No code here.", false],
+  ])("hasOpenCodeFence: %s", (_case, text, isOpen) => {
+    expect(hasOpenCodeFence(text)).toBe(isOpen);
+  });
 });
 
 it("preserves ordinary code fences in reasoning", () => {
