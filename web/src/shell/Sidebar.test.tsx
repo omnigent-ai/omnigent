@@ -3340,9 +3340,13 @@ describe("Sidebar active-row auto-scroll", () => {
     );
   }
 
-  it("scrolls the active session's row to center with a smooth animation", () => {
+  it("scrolls an offscreen active session's row to center with a smooth animation", () => {
     const scrollIntoView = vi.fn();
     vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+    // jsdom has no layout: place every element below the viewport so the active row is offscreen.
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 2000, 300, 40),
+    );
 
     mockConversations([conv("conv_top", "Claude Code"), conv("conv_active", "Claude Code")]);
     renderAtRoute("/c/conv_active");
@@ -3350,6 +3354,21 @@ describe("Sidebar active-row auto-scroll", () => {
     // The active row owns the only scrollIntoView call, centered + smooth.
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
+
+    vi.restoreAllMocks();
+  });
+
+  it("leaves the list alone when the active session's row is already fully visible", () => {
+    const scrollIntoView = vi.fn();
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 100, 300, 40),
+    );
+
+    mockConversations([conv("conv_top", "Claude Code"), conv("conv_active", "Claude Code")]);
+    renderAtRoute("/c/conv_active");
+
+    expect(scrollIntoView).not.toHaveBeenCalled();
 
     vi.restoreAllMocks();
   });
