@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import re
 import secrets
@@ -81,7 +82,7 @@ from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
-from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
+from omnigent.host.frames import HARNESS_NOT_CONFIGURED_ERROR_CODE, RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import (
@@ -6515,15 +6516,23 @@ async def _launch_runner_on_host_locked(
                 mapped = category_for_code(refusal_code)
                 if mapped is not ErrorCategory.UNKNOWN:
                     refusal_category = mapped.value
-            _logger.error(
+            harness_refusal = refusal_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+            _logger.log(
+                logging.WARNING if harness_refusal else logging.ERROR,
                 "Host refused runner launch",
                 extra=debug_event(
                     "runner_launch_failed",
                     stage="runner_launch",
                     error_code=refusal_code,
                     error_category=refusal_category,
-                    error_impact=ErrorImpact.BLOCKING.value,
-                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+                    error_impact=(
+                        ErrorImpact.BENIGN.value if harness_refusal else ErrorImpact.BLOCKING.value
+                    ),
+                    error_phase=(
+                        ErrorPhase.HARNESS_SETUP.value
+                        if harness_refusal
+                        else ErrorPhase.RUNNER_LAUNCH.value
+                    ),
                 ),
             )
             return _HostLaunchAttempt(

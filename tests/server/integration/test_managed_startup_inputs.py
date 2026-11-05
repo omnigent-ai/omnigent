@@ -680,7 +680,7 @@ async def test_pending_input_retains_request_options_on_service_restart(startup_
 
 
 @pytest.mark.parametrize("detail", [None, "harness is not configured on this host"])
-async def test_host_refusal_keeps_startup_input_without_repeated_launches(
+async def test_host_refusal_keeps_startup_input_without_failing_session(
     startup_env: _Env, monkeypatch: pytest.MonkeyPatch, detail: str | None
 ) -> None:
     env = startup_env
@@ -709,9 +709,10 @@ async def test_host_refusal_keeps_startup_input_without_repeated_launches(
     assert launch.await_count == 1
     [pending] = env.conv_store.list_pending_inputs(session_id)
     assert pending.id == saved.id and pending.status == "failed"
-    [error] = env.conv_store.list_items(session_id).data
-    assert error.data.code == "startup_input_failed"
-    assert (detail or "The host refused to launch the session") in error.data.message
+    assert env.conv_store.list_items(session_id).data == []
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["status"] != "failed"
+    assert snapshot["last_task_error"] is None
 
 
 async def test_saved_sdk_skill_resolves_after_launch_and_replaces_pending_bubble(

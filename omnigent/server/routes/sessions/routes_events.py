@@ -2873,16 +2873,10 @@ def register_events_routes(
                     raise_host_refusal=True,
                 )
             except OmnigentError as exc:
-                if exc.code not in (
-                    ErrorCode.HARNESS_NOT_CONFIGURED,
-                    ErrorCode.WORKSPACE_MISSING,
-                ):
+                if exc.code == ErrorCode.HARNESS_NOT_CONFIGURED:
                     raise
-                refusal_code = (
-                    _HARNESS_NOT_CONFIGURED_ERROR_CODE
-                    if exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
-                    else _WORKSPACE_MISSING_ERROR_CODE
-                )
+                if exc.code != ErrorCode.WORKSPACE_MISSING:
+                    raise
                 item_id = await _persist_host_launch_failure_turn(
                     session_id,
                     conv,
@@ -2891,7 +2885,7 @@ def register_events_routes(
                     str(exc),
                     runner_router,
                     created_by=created_by,
-                    host_error_code=refusal_code,
+                    host_error_code=_WORKSPACE_MISSING_ERROR_CODE,
                 )
                 return {"queued": True, "item_id": item_id}
             if runner_client is not None:
@@ -3030,6 +3024,13 @@ def register_events_routes(
                         # Rebuild from the authorized session row instead
                         # of reflecting arbitrary host-provided text.
                         host_error = _workspace_missing_message(conv.workspace)
+                    if host_error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+                        raise OmnigentError(
+                            host_error
+                            or "the agent's harness is not configured on the selected host — "
+                            f"run `{cli_invocation()} setup`",
+                            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+                        )
                     if host_error_code is not None:
                         if isinstance(request, StartupInputContext):
                             raise OmnigentError(

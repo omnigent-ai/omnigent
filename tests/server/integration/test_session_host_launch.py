@@ -939,7 +939,7 @@ async def test_inline_create_harness_not_configured_stays_lenient(
         ),
     ],
 )
-async def test_message_relaunch_deterministic_failure_persists_error_turn(
+async def test_message_relaunch_deterministic_failure_matches_refusal_contract(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
@@ -951,15 +951,13 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     wrapper_command: str | None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A deterministic host relaunch refusal persists user msg + error.
+    """A deterministic host relaunch refusal preserves the input's retry contract.
 
-    The first message is the real runner-start attempt. When the host
-    refuses the relaunch with a definite failure, the server
-    consumes the user message and records a sibling ``type="error"`` item
-    carrying the host's actionable message (the web renders it as an
-    error banner) instead of timing out into a generic
-    ``RUNNER_UNAVAILABLE``. The binding is left intact so a later message
-    can relaunch after the underlying host problem is fixed.
+    Harness setup refusals return a typed 412 before persistence, matching
+    Retry. A missing workspace remains a consumed message with an actionable
+    item, and an unknown launch failure remains a generic 503 without host
+    text. The binding is left intact so a later message can relaunch after
+    the underlying host problem is fixed.
 
     Mutation check: drop the deterministic-failure branch in
     post_event's relaunch and the message instead 503s with
@@ -1033,12 +1031,33 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
         WORKSPACE_MISSING_ERROR_CODE: "user",
     }.get(launch_error_code or "")
     assert refusal.attributes.get("error_category") == expected_category
-    assert refusal.attributes["error_impact"] == "blocking"
+    expected_impact = (
+        "benign" if launch_error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE else "blocking"
+    )
+    assert refusal.attributes["error_impact"] == expected_impact
+    if launch_error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
+        assert refusal.levelno == logging.WARNING
+        assert refusal.attributes["error_phase"] == "harness_setup"
 
     if expected_error_code is None:
         # Unknown host categories may contain arbitrary runner output and
         # must not be persisted into the transcript.
         assert msg_resp.status_code == 503
+        items = await client.get(f"/v1/sessions/{session_id}/items")
+        assert items.status_code == 200, items.text
+        assert items.json()["data"] == []
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert conv is not None
+        assert conv.host_id == _HOST_ID
+        assert conv.runner_id is not None
+        assert conv.runner_id != initial_runner_id
+        return
+
+    if expected_error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
+        assert msg_resp.status_code == 412, msg_resp.text
+        assert msg_resp.json()["error"]["code"] == HARNESS_NOT_CONFIGURED_ERROR_CODE
+        for fragment in expected_fragments:
+            assert fragment in msg_resp.json()["error"]["message"]
         items = await client.get(f"/v1/sessions/{session_id}/items")
         assert items.status_code == 200, items.text
         assert items.json()["data"] == []
@@ -4461,8 +4480,8 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
     Single-flight makes the second caller ride the first flight's rotated
     binding; without the last-attempt memo it would lose the structured
     ``harness_not_configured`` refusal and dead-end in a connect wait.
-    Both messages must return promptly, and every error turn they leave
-    behind must carry the actionable refusal.
+    Both messages must return the actionable refusal promptly without
+    creating failed turns.
     """
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
@@ -4544,22 +4563,12 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
     with contextlib.suppress(asyncio.CancelledError):
         await responder
 
-    assert first.status_code in (200, 202), first.text
-    assert second.status_code in (200, 202), second.text
-    # Reaching here at all is the guard: a rider that loses the refusal falls
-    # into the 30s connect wait and the wait_for above fires. What the
-    # transcript must show is that every banner carries the actionable
-    # refusal. A count would instead pin how many messages opened a turn,
-    # which turn scheduling decides, not the rider path.
+    assert first.status_code == 412, first.text
+    assert second.status_code == 412, second.text
+    assert first.json()["error"]["code"] == "harness_not_configured"
+    assert second.json()["error"]["code"] == "harness_not_configured"
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-    error_items = [i for i in items if i.get("type") == "error"]
-    assert error_items, "the refused relaunch must persist an actionable banner"
-    for item in error_items:
-        assert item["code"] == "harness_not_configured", (
-            f"a racing caller surfaced a non-actionable error instead of the "
-            f"host refusal: {item!r}"
-        )
-        assert "omnigent setup" in item["message"], item
+    assert items == []
 
 
 # ── Sub-agent children riding the parent's shared runner ─────────────────────
@@ -5063,7 +5072,7 @@ async def test_side_chat_retry_relaunches_exited_source_runner(
     ],
     ids=["harness-not-configured", "workspace-missing"],
 )
-async def test_side_chat_message_source_refusal_persists_error_turn(
+async def test_side_chat_message_source_refusal_matches_refusal_contract(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
@@ -5072,13 +5081,11 @@ async def test_side_chat_message_source_refusal_persists_error_turn(
     host_error: str,
     expected_message: str,
 ) -> None:
-    """A refused source relaunch consumes the side chat's message with the reason.
+    """A refused source relaunch preserves the side chat's retry contract.
 
-    The refusal comes from the source's host, but the side chat is the session
-    being messaged: its transcript must carry the same actionable error item
-    the source's own send produces, instead of the generic unavailable error
-    keyed to the side chat's old runner binding. A workspace refusal is rebuilt
-    from the source row, so the host's own text never reaches the transcript.
+    Harness setup refusals return a typed 412 without persistence. A workspace
+    refusal remains a consumed message whose item is rebuilt from the source
+    row, so the host's own text never reaches the transcript.
     """
     comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
         client, app, db_uri, monkeypatch, "claude-native"
@@ -5098,24 +5105,29 @@ async def test_side_chat_message_source_refusal_persists_error_turn(
         responder.cancel()
         await runners.client.aclose()
 
-    assert response.status_code == 202, (
-        f"expected the message to be consumed, got {response.status_code}: {response.text}"
-    )
     items = await client.get(f"/v1/sessions/{side_chat_id}/items")
     assert items.status_code == 200, items.text
     data = items.json()["data"]
+    if error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
+        assert response.status_code == 412, response.text
+        assert response.json()["error"]["code"] == error_code
+        assert response.json()["error"]["message"] == expected_message
+        assert data == []
+    else:
+        assert response.status_code == 202, response.text
     user_texts = [
         part.get("text", "")
         for item in data
         if item.get("type") == "message"
         for part in item.get("content", [])
     ]
-    assert "hello" in user_texts, f"user message should be persisted, got {user_texts!r}"
     error_items = [item for item in data if item.get("type") == "error"]
-    assert len(error_items) == 1, f"expected one refusal error item, got {error_items!r}"
-    assert error_items[0]["code"] == error_code, error_items[0]
-    assert error_items[0]["message"] == expected_message, error_items[0]
-    assert "SECRET_TOKEN" not in error_items[0]["message"]
+    if error_code == WORKSPACE_MISSING_ERROR_CODE:
+        assert "hello" in user_texts, f"user message should be persisted, got {user_texts!r}"
+        assert len(error_items) == 1, f"expected one refusal error item, got {error_items!r}"
+        assert error_items[0]["code"] == error_code, error_items[0]
+        assert error_items[0]["message"] == expected_message, error_items[0]
+        assert "SECRET_TOKEN" not in error_items[0]["message"]
     # The refusal binds the attempted runner to the source (the same
     # remediation-friendly rebinding the source's own refused relaunch does);
     # the side chat keeps its old binding to follow the source's next relaunch.
