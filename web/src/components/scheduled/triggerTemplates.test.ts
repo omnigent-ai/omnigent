@@ -371,6 +371,27 @@ describe("renderTriggerPrompt", () => {
     expect(sorted).not.toContain("ORDER BY created DESC");
   });
 
+  it.each([true, false])("puts Slack links in the worker result with linkBack=%s", (linkBack) => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      fields({ event: "posted", scope: "#support", linkBack }),
+      CTX,
+    );
+    const [manager, worker] = prompt.split("Instructions for each session:\n");
+    expect(manager).not.toContain("Link-back pending:");
+    expect(manager).not.toContain('Reply "Omnigent session:');
+    expect(worker).toContain(
+      "Reply in the source thread when you have a useful result or a blocker",
+    );
+    expect(worker).toContain("Do not send an acknowledgement or a separate session-link message");
+    expect(worker).toContain(
+      linkBack ? "Include your own session link at the bottom" : "Do not add a session link",
+    );
+    const parts = splitTriggerPrompt(prompt);
+    expect(parts.userPrompt).toBe(fields().instructions);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+  });
+
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
 
@@ -539,7 +560,7 @@ describe("renderTriggerPrompt", () => {
     );
     expect(filtered).toContain("Only messages that are about bug reports count.");
     expect(filtered).toContain('title "Slack <channel> <message ts>"');
-    expect(filtered).toContain("in the thread of each message");
+    expect(filtered).toContain("Reply in the source thread when you have a useful result");
 
     const unfiltered = renderTriggerPrompt(
       "slack",

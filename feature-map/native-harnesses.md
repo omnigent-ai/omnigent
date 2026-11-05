@@ -23,8 +23,9 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings > Appearance apply to the curated list too. A remembered pick the curation drops falls back to the
   configured default carrying that agent's own brain harness, never the
   rejected agent's, and a project's configured agent outside the curation is
-  reported unavailable until the user picks an offered one. Display only,
-  and New Chat only: the scheduled-task and project-settings pickers are untouched.
+  reported unavailable until the user picks an offered one. Display only;
+  [automations](automation-templates.md) share this curation while preserving
+  saved selections on edit. Project-settings pickers are unchanged.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
