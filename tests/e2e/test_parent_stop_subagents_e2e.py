@@ -68,6 +68,46 @@ def _send_message(client: httpx.Client, session_id: str, text: str) -> None:
     assert response.status_code == 202, response.text
 
 
+def _record_child_delivery_failure(
+    client: httpx.Client, session_id: str, snapshot: dict, log_dir: Path
+) -> None:
+    """Keep this synthetic session's pane before server cleanup destroys it."""
+    evidence = {"status": snapshot["status"], "error": snapshot["last_task_error"]}
+    terminals = []
+    try:
+        for resource in _get(client, f"/v1/sessions/{session_id}/resources")["data"]:
+            if resource["type"] != "terminal":
+                continue
+            metadata = resource["metadata"]
+            captured = subprocess.run(
+                [
+                    "tmux",
+                    "-S",
+                    metadata["tmux_socket"],
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    metadata["tmux_target"],
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            terminals.append(
+                {
+                    "returncode": captured.returncode,
+                    "pane": captured.stdout[-16000:],
+                    "stderr": captured.stderr[-2000:],
+                }
+            )
+    except (httpx.HTTPError, OSError, subprocess.SubprocessError, KeyError) as exc:
+        evidence["capture_error"] = type(exc).__name__
+    evidence["terminals"] = terminals
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "native-child-delivery-failure.log").write_text(json.dumps(evidence, indent=2))
+
+
 def _wait_for_native_tools(
     client: httpx.Client, session_id: str, mock_url: str, tool_name: str
 ) -> None:
@@ -331,13 +371,30 @@ def test_native_parent_teardown_preserves_child_outcome(
 
         child = _wait(dispatched_child, "native parent to dispatch its sub-agent")
         child_id = child["id"]
-        _wait(
-            lambda: (
+
+        def child_model_blocked():
+            snapshot = _get(client, f"/v1/sessions/{child_id}")
+            if snapshot.get("last_task_error"):
+                _record_child_delivery_failure(
+                    client,
+                    child_id,
+                    snapshot,
+                    stack.runner_home / ".omnigent" / "logs" / "runner",
+                )
+                pytest.fail(
+                    f"Native child failed before its model request: {snapshot['last_task_error']}"
+                )
+            return (
                 any(child_prompt in json.dumps(req) for req in get_mock_requests(mock_url))
-                and httpx.get(f"{mock_url}/gate/pending", timeout=5, trust_env=False).json()[
-                    "pending"
-                ]
-            ),
+                and (
+                    httpx.get(f"{mock_url}/gate/pending", timeout=5, trust_env=False).json()[
+                        "pending"
+                    ]
+                )
+            )
+
+        _wait(
+            child_model_blocked,
             "native child's real model request to block",
         )
 

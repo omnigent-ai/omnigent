@@ -1,4 +1,4 @@
-"""Exercise injection into a real tmux pane the reader left scrolled back in copy mode."""
+"""Exercise native input through real tmux scrollback and clipped composer redraws."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -28,52 +29,87 @@ pytestmark = [
 _TERMINAL = r"""
 import json
 import os
+import re
+import signal
 import sys
 import tty
 from pathlib import Path
 
+sys.path.insert(0, sys.argv[4])
+from tests.harnesses.claude_native.test_claude_native_shell_mode_draft import _InputBox
+
 received, delivered = map(Path, sys.argv[1:3])
-panel_open = len(sys.argv) > 3 and sys.argv[3] == "btw"
+panel_open = sys.argv[3] in {"btw", "background"}
+quick_answer = sys.argv[3] == "btw"
+box = _InputBox("prompt", "")
 tty.setraw(sys.stdin.fileno())
 sys.stdout.write("\x1b[?2004h")
 
 
-def render(draft=""):
+def render(*_args):
     rule = "─" * min(80, os.get_terminal_size().columns)
-    sys.stdout.write("\x1b[H\x1b[2J" + rule + "\r\n❯ " + draft + "\r\n" + rule + "\r\n")
+    screen = box.pane().replace("─" * 30, rule)
+    sys.stdout.write("\x1b[H\x1b[2J" + screen.replace("\n", "\r\n")
+        + "  mode hints\r\n  status line\r\n  agent status\r\n")
+    cursor_row = 1 + box.draft[:box.cursor].count("\n")
+    cursor_column = len(box.draft[:box.cursor].rsplit("\n", 1)[-1]) + 2
+    sys.stdout.write(f"\x1b[{cursor_row + 1};{cursor_column + 1}H")
     sys.stdout.flush()
 
 
-if panel_open:
+signal.signal(signal.SIGWINCH, render)
+if quick_answer:
     sys.stdout.write("\x1b[H\x1b[2J" + "▔" * os.get_terminal_size().columns + "\r\n"
         "    /btw do the checks pass?\r\n      Yes, the checks pass.\r\n"
         "    ↑/↓ to scroll · c to copy · f to fork · Esc to close\r\n")
     sys.stdout.flush()
+elif panel_open:
+    sys.stdout.write("\x1b[H\x1b[2J" + "─" * 50 + "\r\n"
+        "  Background\r\n  1 active shell\r\n  ❯ ● make test   running\r\n"
+        "  ↑/↓ to select · Enter to view · x to stop · Esc to close\r\n")
+    sys.stdout.flush()
 else:
     render()
-buffer = b""
-draft = None
-messages = []
+pending = b""
 while True:
-    chunk = os.read(sys.stdin.fileno(), 65536)
+    incoming = os.read(sys.stdin.fileno(), 65536)
     with received.open("ab") as log:
-        log.write(chunk)
-    buffer += chunk
+        log.write(incoming)
+    pending += incoming
     if panel_open:
-        if b"\x1b" in buffer:
+        if pending == b"\x1b":
             panel_open = False
-            buffer = b""
+            pending = b""
             render()
         continue
-    if b"\x1b[200~" in buffer and b"\x1b[201~" in buffer:
-        pasted, buffer = buffer.split(b"\x1b[200~", 1)[1].split(b"\x1b[201~", 1)
-        draft = pasted.decode().strip()
-        render(draft)
-    if draft is not None and b"\r" in buffer:
-        messages.append(draft)
-        delivered.write_text(json.dumps(messages))
-        draft = None
-        buffer = b""
+    while pending:
+        if pending.startswith(b"\x1b[200~"):
+            if b"\x1b[201~" not in pending:
+                break
+            pasted, pending = pending[6:].split(b"\x1b[201~", 1)
+            text = pasted.decode().replace("\r", "\n")
+            box.draft = box.draft[:box.cursor] + text + box.draft[box.cursor:]
+            box.cursor += len(text)
+        else:
+            match = re.match(rb"\x1b\[\d+;5u", pending)
+            if match:
+                token = match[0].decode()
+                pending = pending[len(match[0]):]
+            elif pending.startswith(b"\x1b["):
+                break
+            else:
+                token = chr(pending[0])
+                pending = pending[1:]
+            if token == "\r":
+                box.key("Enter")
+                delivered.write_text(json.dumps([text for _, text in box.submitted]))
+            elif token in {"\x7f", "\b"}:
+                box.key("BSpace")
+            elif token == "\x15" or token.startswith("\x1b["):
+                box.key("C-u" if token == "\x15" else token)
+            elif token.isprintable():
+                box.draft = box.draft[:box.cursor] + token + box.draft[box.cursor:]
+                box.cursor += len(token)
         render()
 """
 
@@ -106,9 +142,17 @@ class _Pane:
         assert self.in_mode(), "Expected the pane to be in copy mode after scrolling back."
 
 
+@pytest.fixture
+def initial_surface() -> str:
+    return "composer"
+
+
 @pytest.fixture(params=["emacs", "vi"])
 def pane(
-    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_surface: str,
 ) -> Iterator[_Pane]:
     """Start the stand-in composer in tmux with the parametrized copy-mode key table."""
     mode_keys, panel = request.param if isinstance(request.param, tuple) else (request.param, "")
@@ -122,7 +166,17 @@ def pane(
     with tempfile.TemporaryDirectory(prefix="claude-copy-", dir="/tmp") as socket_dir:
         socket_path = Path(socket_dir) / "tmux.sock"
         tmux = ["tmux", "-S", str(socket_path)]
-        command = shlex.join([sys.executable, str(terminal), str(received), str(delivered), panel])
+        surface = initial_surface if initial_surface == "background" else panel
+        command = shlex.join(
+            [
+                sys.executable,
+                str(terminal),
+                str(received),
+                str(delivered),
+                surface,
+                str(Path(__file__).resolve().parents[3]),
+            ]
+        )
         try:
             subprocess.run(
                 [
@@ -134,7 +188,7 @@ def pane(
                     "-s",
                     "main",
                     "-x",
-                    "48" if panel else "120",
+                    "50" if surface == "background" else "48" if surface == "btw" else "120",
                     "-y",
                     "24",
                     command,
@@ -186,6 +240,23 @@ def test_message_from_web_ui_reaches_scrolled_back_pane(pane: _Pane) -> None:
     assert not pane.in_mode(), "Delivery should return the pane to the live view."
 
 
+@pytest.mark.parametrize("pane", ["emacs"], indirect=True)
+@pytest.mark.parametrize("initial_surface", ["background"])
+def test_web_message_dismisses_wrapped_background_panel(
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real terminal wraps the close hint before delivery reclaims the composer."""
+    monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 2.0)
+    captured = bridge._capture_pane(pane.tmux[-1], "main")
+    assert "Esc to close" not in captured
+    assert "Esc\nto close" in captured
+
+    bridge.inject_user_message(pane.bridge_dir, content="AFTER_BACKGROUND_PANEL", timeout_s=2.0)
+
+    assert json.loads(pane.delivered.read_text()) == ["AFTER_BACKGROUND_PANEL"]
+    assert pane.received.read_bytes().startswith(b"\x1b ")
+
+
 @pytest.mark.parametrize("pane", [("emacs", "btw")], indirect=True, ids=["narrow-quick-answer"])
 def test_quick_answer_can_be_read_and_closed_in_a_narrow_pane(pane: _Pane) -> None:
     """A terminal-wrapped footer still relays the answer and lets the next message through."""
@@ -220,3 +291,81 @@ def test_watchers_leave_scrollback_alone_when_nothing_is_on_screen(pane: _Pane) 
 
     assert pane.in_mode(), "A watcher with nothing to confirm must not leave copy mode."
     assert not pane.received.exists(), "A watcher with nothing to confirm must not send keys."
+
+
+@pytest.mark.parametrize("pane", ["emacs"], indirect=True)
+@pytest.mark.parametrize("blocked_by", [None, "approval", "cancellation"])
+def test_five_row_delivery_restores_geometry_and_preserves_input_guards(
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch, blocked_by: str | None
+) -> None:
+    """A clipped input row needs room before readiness can recognize the composer."""
+    monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(bridge, "_OCCUPIED_INPUT_DISMISS_TIMEOUT_S", 0.1)
+    subprocess.run(
+        [*pane.tmux, "resize-window", "-t", "main", "-y", "5"],
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    deadline = time.monotonic() + 5.0
+    while bridge._claude_prompt_rendered(bridge._capture_pane(pane.tmux[2], "main")):
+        assert time.monotonic() < deadline, "The five-row redraw never clipped the input row."
+        time.sleep(0.05)
+    geometry = [
+        *pane.tmux,
+        "display-message",
+        "-p",
+        "-t",
+        "main",
+        "#{window_width} #{window_height} #{window-size}",
+    ]
+    original = subprocess.run(
+        geometry,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    ).stdout
+    assert original.startswith("120 5 ")
+
+    cancelled = threading.Event()
+    if blocked_by == "approval":
+        monkeypatch.setattr(bridge, "has_pending_user_prompt", lambda _: True)
+    elif blocked_by == "cancellation":
+        capture = bridge._capture_pane
+
+        def cancel_after_redraw(*args: str, **kwargs: bool) -> str:
+            screen = capture(*args, **kwargs)
+            if bridge._claude_prompt_rendered(screen):
+                cancelled.set()
+            return screen
+
+        monkeypatch.setattr(bridge, "_capture_pane", cancel_after_redraw)
+    with bridge.cancellable_injection(cancelled):
+        if blocked_by is None:
+            bridge.inject_user_message(
+                pane.bridge_dir, content="SENT_FROM_FIVE_ROWS", timeout_s=0.3
+            )
+            assert json.loads(pane.delivered.read_text()) == ["SENT_FROM_FIVE_ROWS"]
+        else:
+            error = (
+                bridge.ClaudeUserPromptPending
+                if blocked_by == "approval"
+                else bridge.ClaudeInjectionCancelled
+            )
+            with pytest.raises(error):
+                bridge.inject_user_message(
+                    pane.bridge_dir, content="SENT_FROM_FIVE_ROWS", timeout_s=0.3
+                )
+            assert not pane.received.exists(), "A blocked delivery must send no input bytes."
+            assert not pane.delivered.exists()
+    assert (
+        subprocess.run(
+            geometry,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        == original
+    )

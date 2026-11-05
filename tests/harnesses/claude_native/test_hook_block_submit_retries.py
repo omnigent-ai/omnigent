@@ -12,7 +12,7 @@ import pytest
 from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
 from omnigent.native.input_diagnostics import input_delivery_scope
 from omnigent.util.json_types import JsonObject
-from tests.harnesses.claude_native.test_claude_native_bridge import _composer_pane
+from tests.harnesses.claude_native.test_claude_native_bridge import _composer_pane, _fake_tmux
 from tests.harnesses.claude_native.test_claude_native_bridge import (
     _trust_tmp_bridge_parent as _trust_tmp_bridge_parent,
 )
@@ -139,7 +139,7 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
         SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep, time=lambda: elapsed),
     )
     monkeypatch.setattr(delivery_diagnostics, "time", bridge.time)
-    monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
+    _fake_tmux(monkeypatch, [_composer_pane()], on_send=run_tmux)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_args: pane)
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", lambda *_args, **_kw: None)
     monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_args, **_kw: None)
