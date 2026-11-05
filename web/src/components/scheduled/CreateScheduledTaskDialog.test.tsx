@@ -323,11 +323,15 @@ describe("prompt-first automation setup", () => {
     );
     expect(screen.getByLabelText("Name")).toBeVisible();
     expect(screen.queryByLabelText("Schedule ends")).not.toBeInTheDocument();
+    fireEvent.change(instructions, { target: { value: "Review pull requests" } });
+    expect(screen.queryByTestId("task-execution-summary")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Name")).toHaveValue("");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
     fireEvent.change(instructions, {
       target: { value: "  Review pull requests\n and report CI failures.  " },
     });
-    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
+    expect(screen.getByLabelText("Name")).toHaveValue("Morning review");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
@@ -336,22 +340,6 @@ describe("prompt-first automation setup", () => {
       prompt: "Review pull requests\n and report CI failures.",
       hostId: "host_1",
     });
-  });
-
-  it("preserves a manually chosen name when instructions change", async () => {
-    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
-    fireEvent.change(screen.getByLabelText("Instructions"), {
-      target: { value: "Review pull requests" },
-    });
-    expect(screen.queryByTestId("task-execution-summary")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Name")).toHaveValue("");
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
-    fireEvent.change(screen.getByLabelText("Instructions"), {
-      target: { value: "Review pull requests and CI" },
-    });
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-    expect(mutateAsync.mock.calls[0][0].name).toBe("Morning review");
   });
 
   it("keeps saved names and overrides when editing instructions with Advanced collapsed", async () => {
@@ -433,6 +421,10 @@ describe("prompt-first automation setup", () => {
   it("edits time directly and opens only the timezone dropdown", async () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
     const timeField = screen.getByLabelText("Time", { exact: true });
+    expect(screen.getByLabelText("Frequency")).toBeVisible();
+    expect(timeField).toBeVisible();
+    expect(timeField).toHaveValue("09:00 AM");
+    expect(screen.getByLabelText("Timezone", { exact: true })).toBeVisible();
     expect(timeField.tagName).toBe("INPUT");
     expect(timeField).toHaveAttribute("placeholder", "5:00 PM");
     expect(timeField).toHaveClass("text-ui");
@@ -1298,13 +1290,6 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(arg).not.toHaveProperty("reasoningEffort");
   });
 
-  it("groups Repeat and Time in separate schedule rows", () => {
-    renderDialog();
-    expect(screen.getByTestId("schedule-frequency-time-row")).toHaveTextContent("RepeatEvery day");
-    expect(screen.getByLabelText("Time", { exact: true })).toHaveValue("09:00 AM");
-    expect(screen.getByLabelText("Timezone", { exact: true })).toBeVisible();
-  });
-
   it("waits for a host pick when no host is online", async () => {
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
@@ -1589,7 +1574,13 @@ describe("CreateScheduledTaskDialog submit", () => {
       expect(interval).toHaveAttribute("min", String(minimum));
       fireEvent.change(interval, { target: { value: String(minimum - 1) } });
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      expect(interval).toHaveAttribute("aria-invalid", "true");
+      expect(interval).toHaveAccessibleDescription(
+        screen.getByTestId("schedule-error").textContent!,
+      );
       fireEvent.change(interval, { target: { value: String(minimum + 5) } });
+      expect(interval).not.toHaveAttribute("aria-invalid");
+      expect(interval).not.toHaveAttribute("aria-describedby");
       expect(screen.getByLabelText("Frequency")).toHaveTextContent("Interval");
       expect(screen.getByLabelText("Repeat every")).toHaveValue(minimum + 5);
       fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
@@ -2620,10 +2611,15 @@ describe("CreateScheduledTaskDialog session mode", () => {
   });
 
   it("sends sessionMode only when continue is chosen on create", async () => {
-    renderWithSessionModes();
+    renderWithSessionModes(undefined, { managed_sandboxes_enabled: true });
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
     chooseContinue();
+    fireEvent.keyDown(screen.getByLabelText("Run on"), { key: "Enter" });
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+    expect(
+      screen.getByText("Later runs continue in the same session, keeping its context."),
+    ).toBeVisible();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
@@ -2638,29 +2634,6 @@ describe("CreateScheduledTaskDialog session mode", () => {
 
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
-  });
-
-  it("explains context retention for a continuing sandbox automation", () => {
-    render(
-      <CapabilitiesProvider
-        info={{
-          ...SERVER_INFO_OFFLINE_FALLBACK,
-          scheduled_task_session_modes: true,
-          managed_sandboxes_enabled: true,
-        }}
-      >
-        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
-      </CapabilitiesProvider>,
-    );
-    chooseContinue();
-    const host = screen.getByTestId("task-host-trigger");
-    fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
-    fireEvent.click(host);
-    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
-
-    expect(
-      screen.getByText("Later runs continue in the same session, keeping its context."),
-    ).toBeVisible();
   });
 
   it("clears the continued session when asked to start a new one on the next run", async () => {
@@ -3670,6 +3643,43 @@ describe("editing template prompts", () => {
 });
 
 describe("scheduler capabilities", () => {
+  it("keeps trigger polling errors visible without opening unrelated Advanced fields", async () => {
+    const prompt = renderTriggerPrompt(
+      "jira",
+      { ...emptyTriggerFields("jira"), scope: "ES", instructions: "Triage it." },
+      { placement: "same_host", sessionLink: "https://omni.example.com/c/CONVERSATION_ID" },
+    );
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({
+            prompt,
+            sessionMode: "continue",
+            rrule: "FREQ=HOURLY;BYMINUTE=0;COUNT=3",
+          })}
+        />
+      </CapabilitiesProvider>,
+      { expandAdvanced: false },
+    );
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("polling configuration");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /Use server default/ }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Schedule ends")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=HOURLY;BYMINUTE=0");
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("sessionMode");
+  });
+
   it.each([false, undefined, "loading"] as const)(
     "hides anchored recurrence controls when automations_v2 is %s",
     async (enabled) => {

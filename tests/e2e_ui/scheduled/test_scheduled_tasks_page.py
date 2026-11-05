@@ -417,7 +417,6 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     time_input.fill("9:45 AM")
     page.get_by_label("Name", exact=True).click()
     expect(time_input).to_have_value("09:45 AM")
-    page.get_by_label("Name", exact=True).click()
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     created_row = _row_by_name(page, typed_name)
@@ -460,7 +459,6 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
     page.get_by_label("Name", exact=True).click()
     expect(time_input).to_have_value("10:37 AM")
-    page.get_by_label("Name", exact=True).click()
     submit.click()
 
     expect(edit_row.get_by_test_id("task-schedule-line")).to_contain_text(
@@ -1200,6 +1198,10 @@ def test_ten_minute_host_schedule_round_trip(
     expect(page.get_by_label("Repeat every", exact=True)).to_have_value("10")
     page.get_by_role("switch", name="Start each run in a new session").uncheck()
     expect(page.get_by_label("Repeat every", exact=True)).to_have_value("10")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_text("Interval")
+    expect(
+        page.get_by_test_id("create-scheduled-task-dialog").get_by_text("minutes", exact=True)
+    ).to_be_visible()
     expect(page.get_by_test_id("create-scheduled-task-submit")).to_be_enabled()
     page.get_by_test_id("create-scheduled-task-submit").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()

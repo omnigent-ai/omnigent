@@ -226,10 +226,6 @@ export function CreateScheduledTaskDialog({
   const selectOpenCountRef = useRef(0);
   const selectClosedAtRef = useRef(0);
   const [workspaceBrowserOpen, setWorkspaceBrowserOpen] = useState(false);
-  useScheduleEscape(open && workspaceBrowserOpen, () => {
-    setWorkspaceBrowserOpen(false);
-    return true;
-  });
   function handleSelectOpenChange(isOpen: boolean) {
     if (isOpen) {
       selectOpenCountRef.current += 1;
@@ -539,6 +535,12 @@ export function CreateScheduledTaskDialog({
   }
 
   const workspaceHostOffline = !sandboxMode && selectedHost?.status === "offline";
+  const workspacePickerVisible =
+    open && workspaceBrowserOpen && !workspaceHostOffline && !sandboxMode && hostId !== "";
+  useScheduleEscape(workspacePickerVisible, () => {
+    setWorkspaceBrowserOpen(false);
+    return true;
+  });
   const { data: worktrees, isFetching: worktreesChecking } = useHostWorktrees(
     open && worktreesSupported && !sandboxMode && !workspaceHostOffline && hostId !== ""
       ? hostId
@@ -601,7 +603,7 @@ export function CreateScheduledTaskDialog({
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
   const pollingBlockedReason =
     editingWorkerSettings && reusesExistingSession ? null : harnessSettings.blockedReason;
-  // Expand Advanced when a collapsed field has an error.
+  // Collapsed fields must not hide an error that blocks submit.
   const endingInvalid =
     validateSchedule({ ...DEFAULT_SCHEDULE_MODEL, end: schedule.end }, { allowPastEnd }) !== null ||
     (!anchoredScheduling && schedule.end?.type === "count");
@@ -609,7 +611,7 @@ export function CreateScheduledTaskDialog({
     workspaceWithoutHost ||
     Boolean(pollingBlockedReason) ||
     (workerSettings !== null && Boolean(workerHarnessSettings.blockedReason)) ||
-    endingInvalid;
+    (!triggerMode && endingInvalid);
   useEffect(() => {
     if (open && advancedError) setAdvancedOpen(true);
   }, [open, advancedError]);
@@ -1142,7 +1144,7 @@ export function CreateScheduledTaskDialog({
                             </p>
                           )}
                           <WorkspacePickerDialog
-                            open={workspaceBrowserOpen && !workspaceHostOffline}
+                            open={workspacePickerVisible}
                             onOpenChange={setWorkspaceBrowserOpen}
                             hostId={hostId}
                             initialPath={workspace}

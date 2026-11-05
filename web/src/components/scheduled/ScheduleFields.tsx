@@ -231,6 +231,8 @@ export function ScheduleFields({
       max={minutely ? MAX_MINUTE_INTERVAL : 366}
       step={1}
       disabled={!anchoredScheduling}
+      aria-invalid={error ? true : undefined}
+      aria-describedby={error ? errorId : undefined}
       value={Number.isFinite(model.interval) ? model.interval : ""}
       className="h-8 w-16 px-2 text-ui focus-visible:ring-0"
       onChange={(event) =>
