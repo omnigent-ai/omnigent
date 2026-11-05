@@ -479,6 +479,8 @@ def _no_configured_claude_launch(monkeypatch: pytest.MonkeyPatch) -> Callable[[]
     real = plugin_discovery.claude_launch_is_customized
     monkeypatch.setattr(plugin_discovery, "claude_launch_is_customized", lambda: False)
     monkeypatch.setattr(plugin_discovery, "_probes", {})
+    # A runner lifespan's shutdown would otherwise stop probes for later tests.
+    monkeypatch.setattr(plugin_discovery, "_exiting", False)
     return real
 
 

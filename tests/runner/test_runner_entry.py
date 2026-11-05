@@ -25,6 +25,8 @@ import httpx
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.harnesses.claude_native import plugin_discovery
+from omnigent.inner import _proc
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.native import native_terminal
 from omnigent.runner._entry import (
@@ -77,6 +79,9 @@ from omnigent.runner.transports.ws_tunnel.serve import (
 )
 from omnigent.terminals.pane_reaper import PaneRef
 from omnigent.util import event_loop_watchdog as watchdog
+from tests._helpers.claude_launch import configure_claude_launch
+from tests._helpers.polling import poll_until
+from tests._helpers.providers import isolate_provider_resolution
 from tests._helpers.session import bundle_files
 from tests.budgets import budget
 
@@ -2960,6 +2965,7 @@ async def test_runner_shutdown_closes_terminal_registry(
     tmp_path: Path,
     host_owns_global_cleanup: bool,
     expected_sweep_orphans: bool,
+    _no_configured_claude_launch: Callable[[], bool],
 ) -> None:
     """The --server local runner shuts down terminal-owned resources.
 
@@ -2967,7 +2973,9 @@ async def test_runner_shutdown_closes_terminal_registry(
     and in ``omnigent run --server`` mode those terminals are owned
     by the local tunnel runner. This test drives the runner app
     startup/shutdown hooks directly and verifies shutdown includes the
-    TerminalRegistry, not just harness subprocesses and MCPs.
+    TerminalRegistry, not just harness subprocesses and MCPs. Shutdown
+    also kills a running Claude launch probe, which ``atexit`` misses in
+    a zygote-forked runner.
     """
     import omnigent.runner._entry as entry_mod
 
@@ -3074,7 +3082,22 @@ async def test_runner_shutdown_closes_terminal_registry(
     )
     monkeypatch.setattr(entry_mod, "monitor_event_loop", monitor, raising=False)
 
+    for env_name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH", "OMNIGENT_CLAUDE_LAUNCHER"):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(
+        plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
+    )
+    monkeypatch.setattr(plugin_discovery, "LAUNCH_PLUGINS_TIMEOUT_S", 60)
+    launch_pid = tmp_path / "launch.pid"
+    configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
+        tmp_path / "launches.jsonl",
+        f"open({str(launch_pid)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n",
+    )
+
     app = entry_mod.create_app()
+    plugin_discovery.prewarm_claude_launch_plugins()
+    poll_until(launch_pid.exists, timeout_s=10, interval_s=0.05)
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan instead.
     handler = Capture()
     watchdog._logger.addHandler(handler)
@@ -3097,6 +3120,8 @@ async def test_runner_shutdown_closes_terminal_registry(
     assert bridge_sweeps == ([] if host_owns_global_cleanup else [1])
     assert terminal_registries and terminal_registries[0].shutdown_called
     assert terminal_registries[0].conversation_link_base_url == "http://runner.test"
+    pid = int(launch_pid.read_text())
+    poll_until(lambda: not _proc.process_alive(pid), timeout_s=10, interval_s=0.05)
     # In Omnigent mode (P1) the entry point passes mcp_manager=None; MCP calls are
     # routed per-session through ProxyMcpManager (runner/proxy_mcp_manager.py)
     # instead of a shared RunnerMcpManager. No RunnerMcpManager is created on

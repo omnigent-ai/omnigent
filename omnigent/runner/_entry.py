@@ -1792,6 +1792,11 @@ def create_app(
             await teardown_all_codex_native_app_servers()
         with contextlib.suppress(Exception):
             await teardown_all_opencode_native_servers()
+        # Zygote-forked runners leave through os._exit, which skips the probes' atexit hook.
+        from omnigent.harnesses.claude_native.plugin_discovery import stop_claude_launch_probes
+
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(stop_claude_launch_probes)
         await pm.shutdown()
         await _terminal_registry.shutdown()
         if mcp_manager is not None:

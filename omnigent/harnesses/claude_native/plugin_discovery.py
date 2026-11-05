@@ -77,7 +77,8 @@ _running_launches: set[subprocess.Popen[str]] = set()
 _exiting = False
 
 
-def _kill_running_launches() -> None:
+def stop_claude_launch_probes() -> None:
+    """Kill the launches probes still wait on, and start no more; call when exiting."""
     global _exiting
     # Probe threads are daemons, so exit kills the launches they still wait on.
     with _launches_lock:
@@ -87,7 +88,7 @@ def _kill_running_launches() -> None:
         _proc.kill_tree(process)
 
 
-atexit.register(_kill_running_launches)
+atexit.register(stop_claude_launch_probes)
 
 
 def claude_launch_is_customized() -> bool:

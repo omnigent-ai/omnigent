@@ -667,7 +667,7 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
     _no_configured_claude_launch: Callable[[], bool],
 ) -> None:
     """A listed skill resolves while the configured launch is pending; its plugin skill waits."""
-    for env_name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
+    for env_name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH", "OMNIGENT_CLAUDE_LAUNCHER"):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(
         plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
