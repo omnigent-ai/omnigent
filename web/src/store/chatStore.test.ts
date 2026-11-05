@@ -8770,6 +8770,45 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.background_tasks", () => {
+    it("sets and clears the composer's background tasks between turns", () => {
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        backgroundTaskCount: 0,
+        backgroundTasks: [],
+      });
+      const tasks = [{ id: "proc_0", command: "npm run dev" }];
+      handleSessionEvent({
+        type: "session_background_tasks",
+        conversationId: "conv_abc",
+        backgroundTaskCount: 1,
+        backgroundTasks: tasks,
+      });
+      expect(useChatStore.getState().backgroundTaskCount).toBe(1);
+      expect(useChatStore.getState().backgroundTasks).toEqual(tasks);
+
+      handleSessionEvent({
+        type: "session_background_tasks",
+        conversationId: "conv_abc",
+        backgroundTaskCount: 0,
+        backgroundTasks: [],
+      });
+      expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+      expect(useChatStore.getState().backgroundTasks).toEqual([]);
+    });
+
+    it("ignores background tasks of a different session", () => {
+      useChatStore.setState({ conversationId: "conv_open", backgroundTaskCount: 0 });
+      handleSessionEvent({
+        type: "session_background_tasks",
+        conversationId: "conv_other",
+        backgroundTaskCount: 2,
+        backgroundTasks: [],
+      });
+      expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+    });
+  });
+
   describe("session.input.consumed", () => {
     it.each([false, true])(
       "does not consume an unsent model-switch draft (already mirrored=%s)",
