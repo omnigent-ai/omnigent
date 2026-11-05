@@ -2,7 +2,7 @@
 
 These need a real logged-in ``claude`` CLI (the SDK harness drives it) but none
 of claude-native's terminal prerequisites, so they have their own opt-in.
-Shared host and session helpers live in ``test_host_claude_native_fork_e2e``::
+Shared host and session helpers live in ``_claude_host_support``::
 
     OMNIGENT_E2E_CLAUDE_SDK=1 \\
     .venv/bin/python -m pytest tests/e2e/test_host_claude_sdk_e2e.py \\
@@ -19,12 +19,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.e2e.test_host_claude_native_e2e import (
-    _assistant_text,
-    _online_host_id,
-    _poll_for_assistant_marker,
-)
-from tests.e2e.test_host_claude_native_fork_e2e import (
+from tests.e2e._claude_host_support import (
     _builtin_agent_id,
     _host_daemon,
     _placement,
@@ -34,6 +29,11 @@ from tests.e2e.test_host_claude_native_fork_e2e import (
     _rewind,
     _send_user_message,
     _wait_until_idle,
+)
+from tests.e2e.test_host_claude_native_e2e import (
+    _assistant_text,
+    _online_host_id,
+    _poll_for_assistant_marker,
 )
 
 pytestmark = pytest.mark.skipif(

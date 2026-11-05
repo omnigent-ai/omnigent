@@ -16,15 +16,15 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui._claude_sdk_session import create_claude_sdk_session
-from tests.e2e_ui.chat._claude_sdk_continuation import ClaudeSdkRun
 from tests.e2e_ui.chat._claude_sdk_continuation import (
-    claude_sdk_run as claude_sdk_run,
-)
-from tests.e2e_ui.chat.test_claude_sdk_clear import (
     COMPOSER,
     USER,
+    ClaudeSdkRun,
     send_and_wait,
     session_mentions,
+)
+from tests.e2e_ui.chat._claude_sdk_continuation import (
+    claude_sdk_run as claude_sdk_run,
 )
 from tests.e2e_ui.conftest import configure_mock_llm
 
