@@ -134,8 +134,8 @@ _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
 )
 
 
-# Work that outlives the ended turn, such as a background shell. Sidebar-only:
-# it publishes no status edge.
+# Work that outlives the ended turn (a background shell, a Codex goal running
+# between turns). Sidebar-only: it publishes no status edge.
 _EXTERNAL_BACKGROUND_WORK_TYPE: str = "external_background_work"
 
 
