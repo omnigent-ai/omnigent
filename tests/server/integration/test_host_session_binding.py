@@ -1682,10 +1682,14 @@ async def test_managed_wake_waits_for_runner_or_reports_timeout(
         assert stages[-1] == ("failed", "managed runner did not connect after launch")
 
 
-@pytest.mark.parametrize("credential_recovers", [False, True])
+@pytest.mark.parametrize(
+    "credential_recovers,host_reconnect",
+    [(False, None), (True, None), (True, "replaced"), (True, "absent")],
+)
 async def test_managed_launch_waits_for_runner_or_reports_timeout(
     monkeypatch: pytest.MonkeyPatch,
     credential_recovers: bool,
+    host_reconnect: str | None,
 ) -> None:
     """Initial managed launch settlement also depends on the runner tunnel.
 
@@ -1698,7 +1702,7 @@ async def test_managed_launch_waits_for_runner_or_reports_timeout(
 
     session_id = "1a41e11887aca4570e42c0be40f24833"
     host_id = "3c8cdcdb61903904849174c864620a5c"
-    conv = SimpleNamespace(id=session_id, runner_id="runner_never_connects")
+    conv = SimpleNamespace(id=session_id, runner_id="runner_never_connects", host_id=host_id)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     launch = tracker.get(session_id)
@@ -1708,8 +1712,12 @@ async def test_managed_launch_waits_for_runner_or_reports_timeout(
     sentinel_host = object()
     waits: list[float] = []
     connection = SimpleNamespace(host_id=host_id, pending_runner_status={})
+    replacement = SimpleNamespace(host_id=host_id, pending_runner_status={})
+    current_connection = [connection]
+    queried_connections: list[object] = []
     host_registry = Mock(
-        get=Mock(return_value=connection), send_text=Mock(side_effect=ConnectionError)
+        get=Mock(side_effect=lambda _host_id: current_connection[0]),
+        send_text=Mock(side_effect=ConnectionError),
     )
 
     async def _launch_runner(*_args: object, **_kwargs: object) -> object:
@@ -1733,9 +1741,20 @@ async def test_managed_launch_waits_for_runner_or_reports_timeout(
             return sentinel_host
 
     if credential_recovers:
-        monkeypatch.setattr(
-            orchestration, "_query_host_runner_status", AsyncMock(return_value="sign_in_pending")
-        )
+        monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0)
+
+        async def _status(queried: object, *_args: object) -> str:
+            queried_connections.append(queried)
+            if host_reconnect is not None and queried is connection:
+                current_connection[0] = replacement if host_reconnect == "replaced" else None
+                if host_reconnect == "absent":
+                    asyncio.get_running_loop().call_soon(
+                        current_connection.__setitem__, 0, replacement
+                    )
+                return "dead"
+            return "sign_in_pending"
+
+        monkeypatch.setattr(orchestration, "_query_host_runner_status", _status)
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
     monkeypatch.setattr(
         sessions_module,
@@ -1773,6 +1792,9 @@ async def test_managed_launch_waits_for_runner_or_reports_timeout(
         assert stages[-1] == ("ready", None)
         assert len(waits) == 2 and waits[1] > waits[0]
         assert terminated == []
+        if host_reconnect is not None:
+            assert queried_connections[0] is connection
+            assert queried_connections[-1] is replacement
     else:
         assert launch.error == "managed runner did not connect after launch"
         assert stages[-1] == ("failed", "managed runner did not connect after launch")
@@ -1867,7 +1889,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
 
     session_id = "d3a6e13f0dbf4b6ea4b6e37f4a76f2a9"
     host_id = "9e6cf6f52ebb4a2c9c9a1a5f8e8f5f42"
-    conv = SimpleNamespace(id=session_id)
+    conv = SimpleNamespace(id=session_id, runner_id="runner_never_connects", host_id=host_id)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     terminated: list[object] = []
@@ -1909,6 +1931,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            get_conversation=lambda _sid: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=host_registry,

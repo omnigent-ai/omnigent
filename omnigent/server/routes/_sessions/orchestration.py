@@ -4440,14 +4440,18 @@ async def _wait_for_host_bound_runner[Connection](
     authentication finishes; old hosts retain the ordinary startup budget.
     Stop, rebind, cancellation and process exit still end the wait promptly.
 
-    :param conversation_store: Optional binding check while sign-in is pending.
+    :param conversation_store: Optional exact runner and host binding check.
     """
     from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
 
     async def query_status(*, pause: bool = False) -> str | None:
         if pause:
             await asyncio.sleep(_HOST_RUNNER_STARTUP_POLL_S)
-        return await _query_host_runner_status(host_conn, host_registry, runner_id)
+        query_connection = host_registry.get(host_conn.host_id)
+        if query_connection is None:
+            return None
+        status = await _query_host_runner_status(query_connection, host_registry, runner_id)
+        return status if host_registry.get(host_conn.host_id) is query_connection else None
 
     async def check_pending_owner() -> None:
         if _intentional_stop_sessions.get(session_id) == runner_id:
@@ -4457,7 +4461,11 @@ async def _wait_for_host_bound_runner[Connection](
             )
         if conversation_store is not None:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if current is None or current.runner_id != runner_id:
+            if (
+                current is None
+                or current.runner_id != runner_id
+                or current.host_id != host_conn.host_id
+            ):
                 raise OmnigentError(
                     "session runner binding changed while waiting for host sign-in; retry",
                     code=ErrorCode.WRONG_REPLICA,
@@ -4472,7 +4480,7 @@ async def _wait_for_host_bound_runner[Connection](
             done, _pending = await asyncio.wait(
                 {connect_task, status_task}, return_when=asyncio.FIRST_COMPLETED
             )
-            if sign_in_deadline is not None:
+            if sign_in_deadline is not None or conversation_store is not None:
                 await check_pending_owner()
             if connect_task in done:
                 client = connect_task.result()
@@ -4485,7 +4493,10 @@ async def _wait_for_host_bound_runner[Connection](
                     and runner_exit_reports.get(runner_id) is not None
                 ):
                     return None
-                if host_registry.get(host_conn.host_id) is not host_conn:
+                if (
+                    sign_in_deadline is None
+                    and host_registry.get(host_conn.host_id) is not host_conn
+                ):
                     return None
                 if status_task not in done:
                     # A responsive host may have entered sign-in between polls.
@@ -4498,7 +4509,11 @@ async def _wait_for_host_bound_runner[Connection](
             status = status_task.result()
             if status in ("dead", "unknown"):
                 return None
-            if sign_in_deadline is None and status not in {"alive", "sign_in_pending"}:
+            if (
+                sign_in_deadline is None
+                and status not in {"alive", "sign_in_pending"}
+                and host_registry.get(host_conn.host_id) is host_conn
+            ):
                 return await connect_task
             if status == "sign_in_pending" and not waiting_for_sign_in:
                 if sign_in_deadline is None:
@@ -4519,11 +4534,6 @@ async def _wait_for_host_bound_runner[Connection](
                 await asyncio.gather(connect_task, return_exceptions=True)
                 connect_task = asyncio.ensure_future(wait_for_connection(budget_s))
                 waiting_for_sign_in = False
-            if (
-                sign_in_deadline is not None
-                and host_registry.get(host_conn.host_id) is not host_conn
-            ):
-                return None
             status_task = asyncio.create_task(query_status(pause=True))
     finally:
         outstanding = [task for task in (connect_task, status_task) if not task.done()]

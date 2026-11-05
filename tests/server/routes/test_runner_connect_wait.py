@@ -442,6 +442,8 @@ async def test_wait_for_runner_client_never_connected_makes_no_lookup(
         "cancelled",
         "dead",
         "expired",
+        "host_reconnected",
+        "host_changed",
     ],
 )
 async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, wait_kind) -> None:
@@ -462,7 +464,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, 
     clock_tick = object()
     connection_results: asyncio.Queue[object] = asyncio.Queue()
     next_status: asyncio.Queue[str] = asyncio.Queue()
-    current = SimpleNamespace(runner_id="runner-owned")
+    current = SimpleNamespace(runner_id="runner-owned", host_id="host-owned")
     connection = SimpleNamespace(host_id="host-owned")
     registry = SimpleNamespace(get=lambda _host_id: connection)
     store = SimpleNamespace(get_conversation=lambda _session_id: current)
@@ -470,6 +472,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, 
     waits: list[float] = []
     active: list[asyncio.Task] = []
     status_calls = 0
+    queried_connections: list[object] = []
 
     async def wait(*_args, timeout_s, **_kwargs):
         waits.append(timeout_s)
@@ -497,6 +500,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, 
     async def status(*_args):
         nonlocal status_calls
         status_calls += 1
+        queried_connections.append(_args[0])
         if outcome == "late_pending" and status_calls == 1:
             return "alive"
         # Late pending follows alive, a cancelled poll, then a fresh deadline query.
@@ -542,12 +546,25 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, 
                 ordinary_expired.set()
             await pending_wait_started.wait()
             assert waits == [30.0, 150.0]
+            if outcome == "host_reconnected":
+                await status_poll_started.wait()
+                connection = SimpleNamespace(host_id="host-owned")
+                next_status.put_nowait("dead")
+                await pending_rechecked.wait()
+                assert queried_connections[-1] is connection
+                next_status.put_nowait("sign_in_pending")
+                assert waits == [30.0, 150.0], "a host reconnect renewed the credential wait"
             if outcome in {"connected", "deadline_tie", "late_pending", "expired"}:
                 clock.now += 31.0
                 next_status.put_nowait("sign_in_pending")
                 await pending_rechecked.wait()
                 assert waits == [30.0, 150.0], "a repeated status renewed the sign-in wait"
-            if outcome in {"connected", "deadline_tie", "late_pending"}:
+            if outcome in {
+                "connected",
+                "deadline_tie",
+                "late_pending",
+                "host_reconnected",
+            }:
                 assert not task.done(), "ordinary startup grace discarded pending sign-in"
                 connection_results.put_nowait(client)
                 assert await task is (True if wait_kind == "managed" else client)
@@ -560,6 +577,11 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, 
                     await task
             elif outcome == "rebound":
                 current.runner_id = "runner-replacement"
+                next_status.put_nowait("sign_in_pending")
+                with pytest.raises(OmnigentError, match="binding changed"):
+                    await task
+            elif outcome == "host_changed":
+                current.host_id = "host-other"
                 next_status.put_nowait("sign_in_pending")
                 with pytest.raises(OmnigentError, match="binding changed"):
                     await task

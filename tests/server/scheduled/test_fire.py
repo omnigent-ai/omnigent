@@ -1288,7 +1288,9 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
     captured: dict[str, Any] = {}
     waits: list[float] = []
     connection = SimpleNamespace(host_id="host_1")
-    conversation = _FakeConversation(id="conv_1", agent_id="ag_1", runner_id="runner_1")
+    conversation = _FakeConversation(
+        id="conv_1", agent_id="ag_1", runner_id="runner_1", host_id="host_1"
+    )
     conversation_store = FakeConversationStore()
     host_registry = FakeHostRegistry(online={"host_1"})
     monkeypatch.setattr(conversation_store, "get_conversation", lambda _sid: conversation)
