@@ -15,7 +15,7 @@ parameterization produces additional collected cases.
 | [test_local_sessions.py](test_local_sessions.py) | Local sessions | 11 |
 | [test_plan_implementation.py](test_plan_implementation.py) | Plan implementation | 4 |
 | [test_resume_permissions.py](test_resume_permissions.py) | Resume permissions | 13 |
-| [test_resume_rollouts.py](test_resume_rollouts.py) | Resume rollouts | 18 |
+| [test_resume_rollouts.py](test_resume_rollouts.py) | Resume rollouts | 33 |
 | [test_session_rotation.py](test_session_rotation.py) | Session rotation | 4 |
 | [test_subagents.py](test_subagents.py) | Subagents | 10 |
 | [test_subscription.py](test_subscription.py) | Subscription | 17 |
@@ -34,3 +34,9 @@ module stay beside their tests. Search a retained test name to find an old failu
 rg 'def test_name' tests/harnesses/codex_native/session
 uv run --no-sync pytest tests/harnesses/codex_native/session --reruns 0 -n 4 --dist loadfile
 ```
+
+Native-clone argument cases extend the existing rollout setup. They cover completed
+call/output pairs, compaction-context resets, ambiguous and open calls, character
+boundaries and UTF-8, source appends, canonical/local-fallback preservation, and
+owned temporary-file cleanup. These file-conversion boundaries do not require a
+vendor process or browser fixture.

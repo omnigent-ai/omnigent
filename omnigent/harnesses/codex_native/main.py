@@ -302,7 +302,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
             or native_codex_launch_base_url(launch) is not None
         )
         defers_to_codex_config = not native_codex_launch_pins_model_provider(launch)
-    except Exception:
+    except Exception:  # noqa: BLE001 - readiness can fall back to local auth.
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
         routes_through_provider = False
     if routes_through_provider and not defers_to_codex_config:
@@ -321,7 +321,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         if not _codex_auth_json_has_available_credential(source.auth_path):
             return HARNESS_NEEDS_AUTH
         return None
-    except Exception:
+    except Exception:  # noqa: BLE001 - a failed readiness probe reports needs-auth.
         _logger.debug("codex readiness: local auth check failed", exc_info=True)
         return HARNESS_NEEDS_AUTH
 
@@ -663,7 +663,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional spec lookup must not block launch.
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -1757,11 +1757,125 @@ def _find_codex_rollout(codex_home: Path, thread_id: str) -> Path | None:
     return matches[0]
 
 
+def _completed_codex_clone_call_positions(clone: Path) -> set[tuple[int, int]]:
+    """Find oversized calls with one later terminal output in their effective context."""
+    calls: dict[str, tuple[int, int]] = {}
+    outputs: dict[str, tuple[int, int]] = {}
+    ambiguous: set[str] = set()
+    oversized: set[tuple[int, int]] = set()
+    completed: set[tuple[int, int]] = set()
+
+    def finish_context() -> None:
+        for call_id, position in calls.items():
+            output_position = outputs.get(call_id)
+            if (
+                position in oversized
+                and call_id not in ambiguous
+                and output_position is not None
+                and position < output_position
+            ):
+                completed.add(position)
+        calls.clear()
+        outputs.clear()
+        ambiguous.clear()
+        oversized.clear()
+
+    def observe(payload: object, position: tuple[int, int]) -> None:
+        if not isinstance(payload, dict):
+            return
+        call_id = payload.get("call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            return
+        if "status" in payload and payload["status"] != "completed":
+            ambiguous.add(call_id)
+        if payload.get("type") == "function_call":
+            if call_id in calls:
+                ambiguous.add(call_id)
+            calls[call_id] = position
+            arguments = payload.get("arguments")
+            name = payload.get("name")
+            if (
+                not isinstance(arguments, str)
+                or not isinstance(name, str)
+                or not name
+                or ("namespace" in payload and not isinstance(payload["namespace"], str))
+            ):
+                ambiguous.add(call_id)
+            elif len(arguments) > _MAX_REPLAYED_ARGUMENTS_CHARS:
+                oversized.add(position)
+        elif payload.get("type") == "function_call_output":
+            if call_id in outputs:
+                ambiguous.add(call_id)
+            outputs[call_id] = position
+            if not isinstance(payload.get("output"), (str, list)):
+                ambiguous.add(call_id)
+        else:
+            ambiguous.add(call_id)
+
+    with clone.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                continue
+            payload = record.get("payload")
+            if record.get("type") in ("session_meta", "compacted"):
+                finish_context()
+                if record.get("type") == "compacted" and isinstance(payload, dict):
+                    history = payload.get("replacement_history")
+                    if isinstance(history, list):
+                        for index, item in enumerate(history):
+                            observe(item, (line_number, index))
+            elif record.get("type") == "response_item":
+                observe(payload, (line_number, -1))
+    finish_context()
+    return completed
+
+
+def _guard_completed_codex_clone_arguments(clone: Path) -> None:
+    """Bound completed replay arguments only in the already-owned clone snapshot."""
+    completed = _completed_codex_clone_call_positions(clone)
+    if not completed:
+        return
+    changed_lines = {line_number for line_number, _index in completed}
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=clone.parent,
+            prefix=f".{clone.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as destination:
+            temporary = Path(destination.name)
+            with clone.open("r", encoding="utf-8") as source:
+                for line_number, line in enumerate(source, start=1):
+                    if line_number not in changed_lines:
+                        destination.write(line)
+                        continue
+                    record = json.loads(line)
+                    payload = record["payload"]
+                    if record["type"] == "response_item":
+                        payload["arguments"] = _codex_replayed_arguments(payload["arguments"])
+                    else:
+                        for index, item in enumerate(payload["replacement_history"]):
+                            if (line_number, index) in completed:
+                                item["arguments"] = _codex_replayed_arguments(item["arguments"])
+                    destination.write(json.dumps(record, separators=(",", ":")) + "\n")
+        os.replace(temporary, clone)
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+
 def _copy_rollout_with_cwd(
     *, source: Path, target: Path, clone_workspace: Path, new_thread_id: str
 ) -> None:
     """
-    Copy a Codex rollout JSONL, rewriting only the structural id/cwd.
+    Copy a Codex rollout into a derived clone with its own structural id/cwd.
 
     A rollout interleaves *structural* fields (the live thread settings
     Codex reads on resume) with *historical* content (recorded shell
@@ -1769,9 +1883,10 @@ def _copy_rollout_with_cwd(
     Only two structural fields carry the working directory —
     ``session_meta.payload.cwd`` and each ``turn_context.payload.cwd`` —
     plus the thread id at ``session_meta.payload.id``. Those are rewritten
-    to the clone's id / workspace; every other line (and every other
-    ``cwd`` mention, which lives inside message/tool bodies) is copied
-    verbatim, so the clone's history stays truthful about the source run.
+    to the clone's id / workspace. Historical records stay verbatim except
+    oversized arguments in unambiguous completed call/output pairs, which use
+    the replay marker only in the derived copy. Open or ambiguous calls keep
+    their full arguments. The canonical source is never rewritten.
 
     :param source: Existing source rollout JSONL.
     :param target: Temporary output path (atomically renamed by the
@@ -1800,9 +1915,8 @@ def _copy_rollout_with_cwd(
                 ) from exc
             record_type = record.get("type") if isinstance(record, dict) else None
             if record_type not in ("session_meta", "turn_context"):
-                # Historical record — write the original bytes back unchanged
-                # so message/tool bodies (and their incidental cwd mentions)
-                # are preserved exactly, including whitespace and key order.
+                # Capture history verbatim before pairing; the guard reads only
+                # this owned snapshot, never the growing canonical source.
                 dst.write(line)
                 continue
             payload = record.get("payload")
@@ -1815,6 +1929,7 @@ def _copy_rollout_with_cwd(
                 elif isinstance(payload.get("cwd"), str):  # turn_context
                     payload["cwd"] = workspace_text
             dst.write(json.dumps(record, separators=(",", ":")) + "\n")
+    _guard_completed_codex_clone_arguments(target)
 
 
 class _CodexForkModelMismatchError(Exception):
@@ -1839,8 +1954,9 @@ def _clone_codex_rollout(
     source rollout must be copied into the *clone's* ``CODEX_HOME`` under a
     thread id we assign. We rewrite ``session_meta.payload.id`` →
     *target_thread_id* and the two structural ``cwd`` fields →
-    *clone_workspace* (see :func:`_copy_rollout_with_cwd`), preserving the
-    record order and all historical content. The clone then launches
+    *clone_workspace* (see :func:`_copy_rollout_with_cwd`), preserving record
+    order and bounding only completed historical arguments in the derived copy.
+    The canonical source remains byte-identical. The clone then launches
     ``codex resume <target_thread_id>``. Writing the file ourselves before
     launch (rather than pointing resume at the source's home) is what makes
     the worktree case work and keeps the clone's history isolated from the

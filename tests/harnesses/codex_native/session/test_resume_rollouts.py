@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +168,461 @@ def test_clone_codex_rollout_leaves_source_untouched(
     assert source_rollout.read_bytes() == before, (
         "source rollout must be byte-identical after clone"
     )
+
+
+def _clone_history_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    records: list[dict[str, Any]],
+) -> tuple[Path, bytes, Path | None]:
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    source_home = codex_native.codex_home_for_bridge_dir(
+        codex_native.bridge_dir_for_bridge_id("conv_source")
+    )
+    source = _write_source_rollout(
+        codex_home=source_home, thread_id=source_thread, source_cwd="/source/worktree"
+    )
+    with source.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    before = source.read_bytes()
+    clone_home = codex_native.codex_home_for_bridge_dir(
+        codex_native.bridge_dir_for_bridge_id("conv_clone")
+    )
+    clone = codex_native._clone_codex_rollout(
+        source_session_id="conv_source",
+        source_thread_id=source_thread,
+        target_thread_id="019eaa11-1111-7222-8333-444455556666",
+        clone_codex_home=clone_home,
+        clone_workspace=tmp_path / "clone-worktree",
+    )
+    return source, before, clone
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+@pytest.mark.parametrize("character", ["a", "😀"], ids=["ascii", "utf8"])
+@pytest.mark.parametrize("length", [899_999, 900_000, 900_001, 1_823_011])
+def test_clone_codex_rollout_bounds_completed_historical_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compacted: bool,
+    character: str,
+    length: int,
+) -> None:
+    prefix, suffix = '{"patch":"', '"}'
+    arguments = prefix + character * (length - len(prefix) - len(suffix)) + suffix
+    call: dict[str, Any] = {
+        "type": "function_call",
+        "id": "fc_historical",
+        "call_id": "call_historical",
+        "name": "apply_patch",
+        "namespace": "functions",
+        "arguments": arguments,
+        "status": "completed",
+    }
+    output = {
+        "type": "function_call_output",
+        "call_id": call["call_id"],
+        "output": "/source/worktree/result",
+        "status": "completed",
+    }
+    records = (
+        [
+            {
+                "type": "compacted",
+                "payload": {
+                    "message": "summary",
+                    "replacement_history": [call, output],
+                    "window_id": "window-kept",
+                },
+            }
+        ]
+        if compacted
+        else [{"type": "response_item", "payload": item} for item in [call, output]]
+    )
+    source, before, clone = _clone_history_records(tmp_path, monkeypatch, records)
+
+    assert clone is not None
+    copied = [json.loads(line) for line in clone.read_text().splitlines()]
+    if compacted:
+        copied_call, copied_output = copied[-1]["payload"]["replacement_history"]
+        assert copied[-1]["payload"]["window_id"] == "window-kept"
+        assert copied[-1]["payload"]["message"] == "summary"
+    else:
+        copied_call, copied_output = [record["payload"] for record in copied[-2:]]
+    assert {key: value for key, value in copied_call.items() if key != "arguments"} == {
+        key: value for key, value in call.items() if key != "arguments"
+    }
+    assert copied_output == output
+    if length > codex_native._MAX_REPLAYED_ARGUMENTS_CHARS:
+        expected = {"omitted": f"{length} characters of arguments, too large to replay"}
+        assert len(copied_call["arguments"]) == len(json.dumps(expected))
+        assert json.loads(copied_call["arguments"]) == expected
+    else:
+        assert copied_call["arguments"] == arguments
+        assert clone.read_bytes().splitlines()[4:] == before.splitlines()[4:]
+    assert source.read_bytes() == before
+    assert call["arguments"] == arguments
+    assert copied[0]["payload"] == {
+        "id": "019eaa11-1111-7222-8333-444455556666",
+        "cwd": str(tmp_path / "clone-worktree"),
+        "originator": "test",
+    }
+    assert copied[1]["payload"] == {
+        "turn_id": "turn_1",
+        "cwd": str(tmp_path / "clone-worktree"),
+        "approval_policy": "on-request",
+    }
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "open",
+        "duplicate_call",
+        "duplicate_output",
+        "missing_call_id",
+        "missing_output_id",
+        "output_before_call",
+        "missing_output",
+        "in_progress_call",
+        "in_progress_output",
+        "invalid_namespace",
+        "other_call_type",
+    ],
+)
+def test_clone_codex_rollout_preserves_unproven_argument_pairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compacted: bool, case: str
+) -> None:
+    call: dict[str, Any] = {
+        "type": "function_call",
+        "call_id": "call_unproven",
+        "name": "apply_patch",
+        "namespace": "functions",
+        "arguments": json.dumps({"patch": "x" * 900_001}),
+    }
+    output = {"type": "function_call_output", "call_id": "call_unproven", "output": "done"}
+    history = [call, output]
+    if case == "open":
+        history = [call]
+    elif case == "duplicate_call":
+        history = [call, dict(call), output]
+    elif case == "duplicate_output":
+        history = [call, output, dict(output)]
+    elif case == "missing_call_id":
+        del call["call_id"]
+    elif case == "missing_output_id":
+        del output["call_id"]
+    elif case == "output_before_call":
+        history = [output, call]
+    elif case == "missing_output":
+        del output["output"]
+    elif case == "in_progress_call":
+        call["status"] = "in_progress"
+    elif case == "in_progress_output":
+        output["status"] = "in_progress"
+    elif case == "invalid_namespace":
+        call["namespace"] = 42
+    elif case == "other_call_type":
+        history = [
+            call,
+            {"type": "custom_tool_call", "call_id": "call_unproven", "input": "other"},
+            output,
+        ]
+    records = (
+        [{"type": "compacted", "payload": {"message": "summary", "replacement_history": history}}]
+        if compacted
+        else [{"type": "response_item", "payload": item} for item in history]
+    )
+    source, before, clone = _clone_history_records(tmp_path, monkeypatch, records)
+
+    assert clone is not None
+    assert clone.read_bytes().splitlines()[4:] == before.splitlines()[4:]
+    assert source.read_bytes() == before
+
+
+@pytest.mark.parametrize("old_pair", [False, True])
+@pytest.mark.parametrize("new_output", [False, True])
+def test_clone_codex_rollout_pairs_only_within_compaction_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_pair: bool, new_output: bool
+) -> None:
+    call = {
+        "type": "function_call",
+        "call_id": "call_reused",
+        "name": "apply_patch",
+        "arguments": json.dumps({"patch": "x" * 900_001}),
+    }
+    output = {"type": "function_call_output", "call_id": "call_reused", "output": "done"}
+    records = [
+        *([{"type": "response_item", "payload": call}] if old_pair else []),
+        {"type": "response_item", "payload": output},
+        {
+            "type": "compacted",
+            "payload": {"message": "new context", "replacement_history": [call]},
+        },
+        *([{"type": "response_item", "payload": output}] if new_output else []),
+    ]
+    source, before, clone = _clone_history_records(tmp_path, monkeypatch, records)
+
+    assert clone is not None
+    copied = [json.loads(line) for line in clone.read_text().splitlines()]
+    replacement = next(
+        record["payload"]["replacement_history"]
+        for record in copied
+        if record["type"] == "compacted"
+    )
+    replacement_arguments = replacement[0]["arguments"]
+    if new_output:
+        assert len(replacement_arguments) < codex_native._MAX_REPLAYED_ARGUMENTS_CHARS
+        assert "omitted" in json.loads(replacement_arguments)
+    else:
+        assert replacement_arguments == call["arguments"]
+        source_lines = before.splitlines()
+        cloned_lines = clone.read_bytes().splitlines()
+        compacted_index = next(
+            index
+            for index, line in enumerate(source_lines)
+            if json.loads(line)["type"] == "compacted"
+        )
+        assert cloned_lines[compacted_index] == source_lines[compacted_index]
+    if old_pair:
+        assert len(copied[4]["payload"]["arguments"]) < codex_native._MAX_REPLAYED_ARGUMENTS_CHARS
+    assert source.read_bytes() == before
+
+
+def test_clone_codex_rollout_bounds_completed_snapshot_call_without_changing_open_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    arguments = json.dumps({"patch": "x" * 900_001})
+    closed = {
+        "type": "function_call",
+        "call_id": "closed",
+        "name": "apply_patch",
+        "arguments": arguments,
+    }
+    output = {"type": "function_call_output", "call_id": "closed", "output": "done"}
+    opened = {**closed, "call_id": "open", "namespace": "functions"}
+    source, before, clone = _clone_history_records(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "type": "compacted",
+                "payload": {"message": "summary", "replacement_history": [closed, output, opened]},
+            }
+        ],
+    )
+
+    assert clone is not None
+    history = json.loads(clone.read_text().splitlines()[-1])["payload"]["replacement_history"]
+    assert len(history[0]["arguments"]) < codex_native._MAX_REPLAYED_ARGUMENTS_CHARS
+    assert history[1:] == [output, opened]
+    assert source.read_bytes() == before
+
+
+def test_clone_codex_rollout_preserves_snapshot_pair_with_duplicate_later_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call = {
+        "type": "function_call",
+        "call_id": "duplicated",
+        "name": "apply_patch",
+        "arguments": json.dumps({"patch": "x" * 900_001}),
+    }
+    output = {"type": "function_call_output", "call_id": "duplicated", "output": "done"}
+    source, before, clone = _clone_history_records(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "type": "compacted",
+                "payload": {"message": "summary", "replacement_history": [call, output]},
+            },
+            {"type": "response_item", "payload": output},
+        ],
+    )
+
+    assert clone is not None
+    assert clone.read_bytes().splitlines()[4:] == before.splitlines()[4:]
+    assert source.read_bytes() == before
+
+
+def test_copy_codex_rollout_pairs_the_prefix_copied_while_source_appends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_source_rollout(
+        codex_home=tmp_path / "source",
+        thread_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        source_cwd="/source",
+    )
+    call = {
+        "type": "response_item",
+        "payload": {
+            "type": "function_call",
+            "call_id": "growing",
+            "name": "apply_patch",
+            "arguments": json.dumps({"patch": "x" * 900_001}),
+        },
+    }
+    call_line = json.dumps(call) + "\n"
+    output_line = (
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "growing",
+                    "output": "finished",
+                },
+            }
+        )
+        + "\n"
+    )
+    with source.open("a") as handle:
+        handle.write(call_line)
+    before = source.read_bytes()
+    real_open = Path.open
+
+    @contextmanager
+    def opening(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Iterator[Any]:
+        with real_open(path, mode, *args, **kwargs) as handle:
+            if path != source or mode != "r":
+                yield handle
+                return
+
+            def growing_lines() -> Iterator[str]:
+                for line in handle:
+                    yield line
+                    if line == call_line:
+                        with real_open(source, "a") as writer:
+                            writer.write(output_line)
+
+            yield growing_lines()
+
+    monkeypatch.setattr(Path, "open", opening)
+    target = tmp_path / "derived.jsonl.tmp"
+    codex_native._copy_rollout_with_cwd(
+        source=source,
+        target=target,
+        clone_workspace=tmp_path / "clone",
+        new_thread_id="synthetic-clone",
+    )
+
+    records = [json.loads(line) for line in target.read_text().splitlines()]
+    assert len(records[-2]["payload"]["arguments"]) < codex_native._MAX_REPLAYED_ARGUMENTS_CHARS
+    assert records[-1]["payload"] == json.loads(output_line)["payload"]
+    assert source.read_bytes() == before + output_line.encode()
+
+
+def test_copy_codex_rollout_guards_owned_snapshot_when_source_appends_after_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_source_rollout(
+        codex_home=tmp_path / "source",
+        thread_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        source_cwd="/source",
+    )
+    call = {
+        "type": "response_item",
+        "payload": {
+            "type": "function_call",
+            "call_id": "completed",
+            "name": "apply_patch",
+            "arguments": json.dumps({"patch": "x" * 900_001}),
+        },
+    }
+    output = {
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "completed", "output": "done"},
+    }
+    with source.open("a") as handle:
+        handle.write(json.dumps(call) + "\n" + json.dumps(output) + "\n")
+    before = source.read_bytes()
+    duplicate_line = json.dumps(call) + "\n"
+    real_scan = codex_native._completed_codex_clone_call_positions
+    target = tmp_path / "derived.jsonl.tmp"
+
+    def append_after_copy(snapshot: Path) -> set[tuple[int, int]]:
+        assert snapshot == target
+        with source.open("a") as writer:
+            writer.write(duplicate_line)
+        return real_scan(snapshot)
+
+    monkeypatch.setattr(codex_native, "_completed_codex_clone_call_positions", append_after_copy)
+    codex_native._copy_rollout_with_cwd(
+        source=source,
+        target=target,
+        clone_workspace=tmp_path / "clone",
+        new_thread_id="synthetic-clone",
+    )
+
+    records = [json.loads(line) for line in target.read_text().splitlines()]
+    assert len(records[-2]["payload"]["arguments"]) < codex_native._MAX_REPLAYED_ARGUMENTS_CHARS
+    assert records[-1] == output
+    assert source.read_bytes() == before + duplicate_line.encode()
+
+
+def test_clone_codex_rollout_cleans_owned_temps_if_argument_guard_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_replace = os.replace
+
+    def fail_guard_replace(source: Any, destination: Any) -> None:
+        if str(destination).endswith(".jsonl.tmp"):
+            raise OSError("synthetic guard write failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(codex_native.os, "replace", fail_guard_replace)
+    call = {
+        "type": "function_call",
+        "call_id": "closed",
+        "name": "apply_patch",
+        "arguments": json.dumps({"patch": "x" * 900_001}),
+    }
+    output = {"type": "function_call_output", "call_id": "closed", "output": "done"}
+    with pytest.raises(OSError, match="synthetic guard write failure"):
+        _clone_history_records(
+            tmp_path,
+            monkeypatch,
+            [{"type": "response_item", "payload": item} for item in [call, output]],
+        )
+
+    clone_home = codex_native.codex_home_for_bridge_dir(
+        codex_native.bridge_dir_for_bridge_id("conv_clone")
+    )
+    assert not [path for path in clone_home.rglob("*") if path.is_file()]
+    source_home = codex_native.codex_home_for_bridge_dir(
+        codex_native.bridge_dir_for_bridge_id("conv_source")
+    )
+    source = next(source_home.rglob("rollout-*.jsonl"))
+    assert json.loads(source.read_text().splitlines()[-2])["payload"] == call
+
+
+def test_clone_codex_rollout_retains_malformed_refusal_and_previous_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, before, clone = _clone_history_records(tmp_path, monkeypatch, [])
+    assert clone is not None
+    existing_clone = clone.read_bytes()
+    clone_home = codex_native.codex_home_for_bridge_dir(
+        codex_native.bridge_dir_for_bridge_id("conv_clone")
+    )
+    source.write_bytes(before + b"{not valid JSON\n")
+    with pytest.raises(click.ClickException, match="Cannot clone malformed Codex rollout"):
+        codex_native._clone_codex_rollout(
+            source_session_id="conv_source",
+            source_thread_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+            target_thread_id="019eaa11-1111-7222-8333-444455556666",
+            clone_codex_home=clone_home,
+            clone_workspace=tmp_path / "clone-worktree",
+        )
+    assert clone.read_bytes() == existing_clone
+    assert source.read_bytes() == before + b"{not valid JSON\n"
+    assert not list(clone_home.rglob("*.tmp"))
 
 
 def test_clone_codex_rollout_returns_none_when_source_missing(
@@ -852,9 +1309,11 @@ async def test_ensure_local_codex_resume_rollout_uses_unique_atomic_temp_files(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["server", "transport"])
+@pytest.mark.parametrize("large_completed_call", [False, True])
 async def test_ensure_local_codex_resume_rollout_falls_back_when_server_unavailable(
     tmp_path: Path,
     failure: str,
+    large_completed_call: bool,
 ) -> None:
     """A transient server failure falls back to a valid local rollout."""
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
@@ -864,6 +1323,17 @@ async def test_ensure_local_codex_resume_rollout_falls_back_when_server_unavaila
         thread_id=thread_id,
         source_cwd="/local/fallback",
     )
+    if large_completed_call:
+        call = {
+            "type": "function_call",
+            "call_id": "resident",
+            "name": "apply_patch",
+            "arguments": json.dumps({"patch": "x" * 900_001}),
+        }
+        output = {"type": "function_call_output", "call_id": "resident", "output": "done"}
+        with existing.open("a") as handle:
+            for item in [call, output]:
+                handle.write(json.dumps({"type": "response_item", "payload": item}) + "\n")
     before = existing.read_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
