@@ -25,7 +25,12 @@ def test_sibling_composer_placement_and_survivor(
     managed_replicas: ManagedReplicas,  # noqa: F811
     mock_llm_server_url: str,
 ):
-    for prompt in ("Research the API", "Implement the client", "Still here after deletion"):
+    for prompt in (
+        "Research the API",
+        "Implement the client",
+        "Still here after deletion",
+        "Still here after fork deletion",
+    ):
         configure_mock_llm(mock_llm_server_url, [{"text": f"Done: {prompt}"}], match=prompt)
     run_in_fresh_loop(_drive(managed_replicas))
 
@@ -348,15 +353,42 @@ async def _drive(rig: ManagedReplicas) -> None:
                     await page.get_by_test_id("fork-conversation").click()
                     await expect(page.get_by_test_id("fork-session-dialog")).to_be_visible()
                     await page.get_by_test_id("fork-session-host-select").click()
-                    await page.get_by_test_id(f"fork-session-host-option-{source_host}").click()
+                    await expect(
+                        page.get_by_role("option", name="Same sandbox online")
+                    ).to_be_visible()
+                    await page.screenshot(path=str(evidence / "fork-same-sandbox.png"))
+                    await page.get_by_role("option", name="Same sandbox online").click()
                     await page.get_by_test_id("fork-session-submit").click()
                     await expect(page).not_to_have_url(
                         re.compile(f"/c/{sibling_id}$"), timeout=30000
                     )
                     fork_id = page.url.rsplit("/c/", 1)[-1]
-                    fork = (await client.get(f"{rig.a}/v1/sessions/{fork_id}")).json()
+                    fork = await _poll(
+                        client,
+                        f"{rig.a}/v1/sessions/{fork_id}",
+                        lambda row: bool(row.get("runner_online")),
+                    )
                     assert not fork.get("family")
                     assert fork["host_id"] == source_host
+                    await menu(fork_id)
+                    await page.get_by_role("menuitem", name="Delete", exact=True).click()
+                    await (
+                        page.get_by_role("dialog")
+                        .get_by_role("button", name="Delete", exact=True)
+                        .click()
+                    )
+                    await expect(
+                        page.locator(f'li[data-sidebar-session-id="{fork_id}"]')
+                    ).to_have_count(0)
+                    assert (Path(source["workspace"]) / "keep.txt").is_file()
+                    await page.goto(f"{rig.ui}/c/{sibling_id}")
+                    await page.get_by_label("Message the agent").fill(
+                        "Still here after fork deletion"
+                    )
+                    await page.get_by_label("Message the agent").press("Enter")
+                    await expect(
+                        page.get_by_text("Done: Still here after fork deletion", exact=True)
+                    ).to_be_visible(timeout=60000)
                     # Desktop header and mobile header/sidebar use the same composer.
                     await page.goto(f"{rig.ui}/c/{sibling_id}")
                     await page.locator(f'li[data-sidebar-session-id="{sibling_id}"]').first.click(

@@ -6235,7 +6235,14 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
     assert fake.host_starts == []
 
 
-async def test_siblings_share_one_recovery_across_host_stores(db_uri, monkeypatch) -> None:
+@pytest.mark.parametrize("waiter_timeout", [False, True])
+async def test_siblings_share_one_recovery_across_host_stores(
+    db_uri, monkeypatch, waiter_timeout
+) -> None:
+    if waiter_timeout:
+        monkeypatch.setattr(
+            "omnigent.server.managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", 0.05
+        )
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 1)
     store = HostStore(db_uri)
     host = store.register_managed_host(
@@ -6271,7 +6278,12 @@ async def test_siblings_share_one_recovery_across_host_stores(db_uri, monkeypatc
             tunnel_registry=None,
             relaunch_host=host,
         )
-        assert tracker.get(sessions[index].id) is None
+        if index == 1 and waiter_timeout:
+            state = tracker.get(sessions[index].id)
+            assert state is not None and state.error is not None
+            assert "Timed out waiting for shared sandbox recovery" in state.error
+        else:
+            assert tracker.get(sessions[index].id) is None
 
     gate = threading.Event()
     fake = FakeSandboxLauncher(
@@ -6302,8 +6314,12 @@ async def test_siblings_share_one_recovery_across_host_stores(db_uri, monkeypatc
                 await asyncio.sleep(0.01)
             second = asyncio.create_task(recover(1, second_store))
             await joined.wait()
-            await asyncio.sleep(1.1)
-            assert not second.done()
+            if waiter_timeout:
+                await second
+                assert not first.done()
+            else:
+                await asyncio.sleep(1.1)
+                assert not second.done()
             gate.set()
             await asyncio.gather(first, second)
         restored = [conversations.get_conversation(session.id) for session in sessions]

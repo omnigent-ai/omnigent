@@ -493,8 +493,10 @@ chat, otherwise it springs back. Settings and desktop widths don't use it.
 sidebar menus, and message actions, and offers the same destinations as any
 other session: connected hosts and each offered sandbox provider. Sessions
 labelled `omnigent.host_type: managed` fork the same way. The source's own
-sandbox host is offered when `sibling_sessions` is advertised; older servers
-keep the fresh-sandbox choices. A fork
+sandbox is offered as **Same sandbox** when shared-sandbox support is available;
+it keeps the working directory and creates a standalone fork with copied history.
+Other sessions' ephemeral sandboxes are omitted, and an offline source cannot
+be selected. Older servers keep the fresh-sandbox choices. A fork
 of any sandbox session defaults to a fresh sandbox from the source's provider
 when the server offers it, and otherwise to a connected host.
 **Continue in another directory…** on these sessions continues on a connected
@@ -750,6 +752,8 @@ plain `uv run pytest`, which starts a private server for the test.
   runs without a repro instance using `uv run pytest <test>
 --browser-ui-skip-build --video=on --output=<evidence-directory>`.
   Each entry checks current-branch prefilling and the unpushed-branch fallback.
+  Each also selects **Same sandbox**, checks directory reuse and exclusion of
+  unrelated sandboxes, then switches back to a fresh sandbox.
   Desktop and phone header variants remove a repo, search for another, choose
   independent branches, and check the fork request and navigation. The message
   variant submits the inherited selection and checks the history cutoff; sidebar

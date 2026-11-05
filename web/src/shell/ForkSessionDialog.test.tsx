@@ -349,7 +349,11 @@ describe("ForkSessionDialog", () => {
       isLoading: false,
       error: null,
     } as ReturnType<typeof useSession>);
-    setHosts([host({ sandbox_provider: provider }), host({ host_id: "host_2", name: "laptop" })]);
+    setHosts([
+      host({ sandbox_provider: provider }),
+      host({ host_id: "host_2", name: "laptop" }),
+      host({ host_id: "unrelated", sandbox_provider: "arclet" }),
+    ]);
     renderDialog({
       sourceHostId: "host_1",
       sourceWorkspace: "/Users/a/repo",
@@ -368,6 +372,12 @@ describe("ForkSessionDialog", () => {
     expect(screen.queryByTestId("fork-session-host-option-host_1") !== null).toBe(
       reuse || provider === null,
     );
+    expect(screen.queryByTestId("fork-session-host-option-unrelated")).not.toBeInTheDocument();
+    if (reuse && provider) {
+      expect(screen.getByTestId("fork-session-host-option-host_1")).toHaveTextContent(
+        "Same sandbox",
+      );
+    }
     expect(screen.getByTestId("fork-session-sandbox-option")).toBeInTheDocument();
     expect(screen.getByTestId("fork-session-sandbox-option-arclet")).toBeInTheDocument();
   });
@@ -2115,9 +2125,11 @@ describe("ForkSessionDialog", () => {
       // The first provider row keeps the bare test id; later rows add the provider.
       ["a fresh Arclet", "arclet", "fork-session-sandbox-option-arclet"],
       ["another sandbox provider", "lakebox", "fork-session-sandbox-option"],
+      ["the same sandbox", null, "fork-session-host-option-host_1"],
     ])(
       "forks an Arclet source onto %s beside the connected hosts",
       async (_name, provider, row) => {
+        launchRunnerMock.mockResolvedValue({ runnerId: "fork-runner" });
         useSessionMock.mockReturnValue({
           session: {
             hostId: "host_1",
@@ -2152,7 +2164,12 @@ describe("ForkSessionDialog", () => {
         expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
         expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
         fireEvent.click(screen.getByTestId(row));
-        expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
+        if (provider) {
+          expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
+        } else {
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Same sandbox");
+          expect(screen.queryByTestId("fork-session-sandbox-repo-row")).not.toBeInTheDocument();
+        }
 
         // Picking the sandbox starts a repository-branch lookup that disables Clone until it settles.
         await waitFor(() => expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled());
@@ -2165,10 +2182,22 @@ describe("ForkSessionDialog", () => {
           agentId: undefined,
           upToResponseId: undefined,
           config: {},
-          sandbox: { provider, workspaces: ["https://github.com/databricks-eng/universe"] },
+          sandbox: provider
+            ? { provider, workspaces: ["https://github.com/databricks-eng/universe"] }
+            : undefined,
         });
-        expect(launchRunnerMock).not.toHaveBeenCalled();
-        expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+        if (provider) {
+          expect(launchRunnerMock).not.toHaveBeenCalled();
+          expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+        } else {
+          expect(launchRunnerMock).toHaveBeenCalledWith(
+            "host_1",
+            "conv_fork",
+            CODING.sourceWorkspace,
+            undefined,
+          );
+          expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", CODING.sourceWorkspace);
+        }
         await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
       },
     );
@@ -2220,9 +2249,9 @@ describe("ForkSessionDialog", () => {
         "Arclet Sandbox",
       ],
       [
-        "falls back to a connected host when the server doesn't offer that provider",
+        "reuses the source sandbox when the server no longer offers that provider",
         "modal",
-        "laptop",
+        "Same sandbox",
       ],
     ])("%s", async (_name, sourceProvider, expected) => {
       useSessionMock.mockReturnValue({

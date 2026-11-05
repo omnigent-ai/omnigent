@@ -3980,19 +3980,28 @@ async def relaunch_managed_host(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not claimed:
-        while True:
-            try:
-                result = await asyncio.to_thread(host_store.managed_recovery_result, host.host_id)
-            except ValueError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            if result is not None:
-                return ManagedHostLaunch(
-                    host_id=host.host_id,
-                    workspace=result[0],
-                    sandbox_id=result[1],
-                    sandbox_provider=host.sandbox_provider,
-                )
-            await asyncio.sleep(0.5)
+        try:
+            async with asyncio.timeout(MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S):
+                while True:
+                    try:
+                        result = await asyncio.to_thread(
+                            host_store.managed_recovery_result, host.host_id
+                        )
+                    except ValueError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    if result is not None:
+                        return ManagedHostLaunch(
+                            host_id=host.host_id,
+                            workspace=result[0],
+                            sandbox_id=result[1],
+                            sandbox_provider=host.sandbox_provider,
+                        )
+                    await asyncio.sleep(0.5)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Timed out waiting for shared sandbox recovery; retry once it is ready",
+            ) from exc
 
     async def renew() -> None:
         while True:
