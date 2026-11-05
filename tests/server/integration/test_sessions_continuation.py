@@ -34,6 +34,7 @@ from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SO
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests._helpers.polling import poll_until_async
 from tests.server.integration._session_continuation import (
     _COMPACT_INPUT,
     _HOST_ID,
@@ -50,6 +51,7 @@ from tests.server.integration._session_continuation import (
     install_managed_sandbox,
     message_texts,
     resolve_harness_as,
+    save_inference_snapshot,
 )
 from tests.server.integration._session_continuation import (
     auth_live_runner as auth_live_runner,
@@ -305,33 +307,48 @@ async def test_refuses_input_sent_while_it_moves_the_session(
     assert not orchestration._session_is_starting(source_id)
 
 
+@pytest.mark.parametrize("failure", ["after_setup", "unconfirmed_initialization"])
 @pytest.mark.parametrize("command", COMMANDS)
-async def test_a_continuation_that_fails_after_runner_setup_leaves_nothing_behind(
+async def test_a_continuation_that_fails_once_sent_to_the_runner_leaves_nothing_behind(
     client: httpx.AsyncClient,
     db_uri: str,
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
     command: str,
+    failure: str,
 ) -> None:
-    """A step failing after the runner set the new session up leaves nothing behind.
+    """A continuation failing once sent to the runner leaves nothing behind.
 
-    Detaching the original from the runner fails here: the new session is
-    deleted and dropped from the runner, was never listed in the owner's tabs,
-    and the original keeps its history with no notice or redirect.
+    Either detaching the original fails after the runner set the new session
+    up, or the runner never confirms the saved inference configuration it must
+    accept, though it may have set the session up. The new session is deleted
+    and dropped from the runner, was never listed in the owner's tabs, and the
+    original keeps its history with no notice or redirect.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     source_id = await create_placed_session(client, store)
-    monkeypatch.setattr(
-        SqlAlchemyConversationStore,
-        "clear_runner_id",
-        Mock(side_effect=OmnigentError("detach failed", code=ErrorCode.INTERNAL_ERROR)),
-    )
+    if failure == "after_setup":
+        monkeypatch.setattr(
+            SqlAlchemyConversationStore,
+            "clear_runner_id",
+            Mock(side_effect=OmnigentError("detach failed", code=ErrorCode.INTERNAL_ERROR)),
+        )
+    else:
+        save_inference_snapshot(
+            db_uri,
+            source_id,
+            {"runtime_config": {}, "harness": "claude-sdk", "owner_id": "local"},
+        )
     before = len((await client.get("/v1/sessions")).json()["data"])
 
     resp = await continue_session(client, store, source_id, command)
 
-    assert resp.status_code == 500, resp.text
+    if failure == "after_setup":
+        assert resp.status_code == 500, resp.text
+    else:
+        assert resp.status_code == 503, resp.text
+        assert "did not accept this session's saved inference configuration" in resp.text
     initialized = [
         body["session_id"] for path, body in live_runner.posts if path == "/v1/sessions"
     ]
@@ -342,6 +359,69 @@ async def test_a_continuation_that_fails_after_runner_setup_leaves_nothing_behin
     assert len((await client.get("/v1/sessions")).json()["data"]) == before
     assert message_texts(store, source_id) == ["Q1", "A1", "Q2", "A2"]
     assert live_runner.superseded == []
+
+
+@pytest.mark.parametrize("cancelled_during", ["fork", "runner_binding"])
+@pytest.mark.parametrize("command", COMMANDS)
+async def test_a_cancelled_request_still_finishes_the_move(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    cancelled_during: str,
+) -> None:
+    """Cancelling the request (e.g. a client disconnect) mid-move leaves no half-made session.
+
+    Once allowed, the move runs to its end on its own: exactly one new session
+    is placed and announced, a retry is refused while it runs, and the original
+    is superseded but can still be resumed.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    before = len((await client.get("/v1/sessions")).json()["data"])
+    loop = asyncio.get_running_loop()
+    paused, resume = asyncio.Event(), threading.Event()
+    if cancelled_during == "fork":
+        fork = SqlAlchemyConversationStore.fork_conversation
+
+        def fork_after_cancel(self: Any, *args: Any, **kwargs: Any) -> Any:
+            loop.call_soon_threadsafe(paused.set)
+            assert resume.wait(timeout=10)
+            return fork(self, *args, **kwargs)
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "fork_conversation", fork_after_cancel)
+    else:
+        resolve_runner = sessions_module._get_runner_client
+
+        async def bind_after_cancel(session_id: str, *args: Any, **kwargs: Any) -> Any:
+            if session_id != source_id and not paused.is_set():
+                paused.set()
+                await asyncio.to_thread(resume.wait, 10)
+            return await resolve_runner(session_id, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", bind_after_cancel)
+    moving = asyncio.create_task(continue_session(client, store, source_id, command))
+    await asyncio.wait_for(paused.wait(), timeout=10)
+
+    moving.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await moving
+    retried = await continue_session(client, store, source_id, command)
+    resume.set()
+    await poll_until_async(lambda: bool(live_runner.superseded), timeout_s=10)
+
+    assert retried.status_code == 409, retried.text
+    [(_, new_id, _)] = live_runner.superseded
+    continuation = store.get_conversation(new_id)
+    assert continuation is not None
+    assert (continuation.runner_id, continuation.host_id) == (_RUNNER_ID, _HOST_ID)
+    assert new_id in live_runner.announced
+    assert len((await client.get("/v1/sessions")).json()["data"]) == before + 1
+    assert not orchestration._session_is_moving(source_id)
+    resumed = await client.post(f"/v1/sessions/{source_id}/events", json=_MESSAGE_INPUT)
+    assert resumed.status_code < 300, resumed.text
 
 
 @pytest.mark.parametrize("host_live", [False, True], ids=["offline", "on-another-replica"])

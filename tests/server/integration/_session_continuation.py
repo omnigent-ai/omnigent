@@ -143,6 +143,19 @@ def set_runner_workspace(db_uri: str, session_id: str, workspace: str, git_branc
         )
 
 
+def save_inference_snapshot(db_uri: str, session_id: str, snapshot: dict[str, Any]) -> None:
+    """Save *snapshot* as *session_id*'s inference configuration, which a runner must accept."""
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            update(SqlConversationMetadata)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == session_id,
+            )
+            .values(inference_snapshot=json.dumps(snapshot))
+        )
+
+
 def bind_to_host(
     store: SqlAlchemyConversationStore,
     session_id: str,
