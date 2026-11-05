@@ -109,13 +109,22 @@ async def test_reconnected_client_streams_live_events() -> None:
 
 
 @pytest.mark.parametrize("stop", [False, True])
-async def test_output_limit_continuation_over_loopback_rpc(tmp_path: Path, stop: bool) -> None:
+@pytest.mark.parametrize("failure", ["output_limit", "stream_disconnect"])
+async def test_recoverable_turn_continuation_over_loopback_rpc(
+    tmp_path: Path, stop: bool, failure: str
+) -> None:
     """Real client transport proves delivery and keeps Stop distinct from completion."""
     requests: list[dict] = []
     receipt: dict = {}
-    error = {"message": "Incomplete response returned, reason: max_output_tokens"}
+    error = {
+        "message": (
+            "Incomplete response returned, reason: max_output_tokens"
+            if failure == "output_limit"
+            else "stream disconnected before completion: stream closed before response.completed"
+        )
+    }
     source = {
-        "method": "turn/completed",
+        "method": "turn/failed" if failure == "stream_disconnect" else "turn/completed",
         "params": {
             "threadId": "thread",
             "turn": {"id": "source", "status": "failed", "error": error},
@@ -245,6 +254,10 @@ async def test_output_limit_continuation_over_loopback_rpc(tmp_path: Path, stop:
             await forward_next()
             await native.notify("probe/source")
             await forward_next()
+            if failure == "stream_disconnect":
+                continuation = requests[0]["params"]["input"][0]["text"]
+                assert "stream disconnected" in continuation
+                assert "Do not repeat completed tool calls" in continuation
             assert [request["method"] for request in requests] == (
                 ["turn/start", "thread/read", "turn/interrupt"]
                 if stop

@@ -1584,6 +1584,189 @@ async def test_output_limit_exact_receipt_continues_once_and_preserves_partial_o
     assert client.posts[-1][1]["data"]["status"] == "failed"
 
 
+_STREAM_DISCONNECT_ERROR = (
+    "stream disconnected before completion: stream closed before response.completed"
+)
+
+
+@pytest.mark.parametrize("method", ["turn/completed", "turn/failed"])
+@pytest.mark.parametrize("standalone", [False, True])
+async def test_stream_disconnect_continues_once_with_exact_receipt(
+    tmp_path: Path,
+    method: str,
+    standalone: bool,
+) -> None:
+    client, codex, state = _RecordingClient(), _ContinuingCodexClient(), fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "item/completed",
+        {
+            "threadId": "thread_123",
+            "turnId": "turn_a",
+            "item": {"type": "agentMessage", "id": "partial", "text": "First half."},
+        },
+    )
+    if standalone:
+        await _forward_output_limit_event(
+            client,
+            codex,
+            state,
+            tmp_path,
+            "error",
+            {
+                "threadId": "thread_123",
+                "turnId": "turn_a",
+                "willRetry": False,
+                "error": {"message": _STREAM_DISCONNECT_ERROR},
+            },
+        )
+        assert codex.requests == []
+    params = _output_limit_completion(error={"message": _STREAM_DISCONNECT_ERROR})
+    for _ in range(2):
+        await _forward_output_limit_event(client, codex, state, tmp_path, method, params)
+
+    owner = read_bridge_state(tmp_path)
+    assert owner is not None and owner.active_turn_id == "turn_auto"
+    assert owner.automatic_input_outcome == "accepted"
+    assert [method for method, _ in codex.requests] == ["turn/start", "thread/read"]
+    continuation = codex.requests[0][1]["input"][0]["text"]
+    assert "stream disconnected" in continuation
+    assert "Do not repeat completed tool calls" in continuation
+    assert [
+        body["data"]["status"]
+        for _, body in client.posts
+        if body["type"] == "external_session_status"
+    ] == ["running"]
+
+    await _forward_output_limit_event(
+        client,
+        codex,
+        fwd._CodexForwarderState(),
+        tmp_path,
+        method,
+        _output_limit_completion("turn_auto", error={"message": _STREAM_DISCONNECT_ERROR}),
+    )
+    assert len([method for method, _ in codex.requests if method == "turn/start"]) == 1
+    assert read_bridge_state(tmp_path).automatic_input_outcome == "completed"
+    assert read_bridge_state(tmp_path).active_turn_id is None
+    assert client.posts[-1][1]["data"]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "stream disconnected before completion: "
+        "Incomplete response returned, reason: content_filter",
+        "stream disconnected before completion: "
+        "Incomplete response returned, reason: max_output_tokens",
+        "stream disconnected before completion: Incomplete response returned, reason: other",
+        "stream disconnected before completion: 401 Unauthorized",
+        "stream disconnected before completion: ",
+        "Stream disconnected before completion: stream closed before response.completed",
+        "prefix stream disconnected before completion: stream closed before response.completed",
+    ],
+)
+async def test_stream_disconnect_lookalikes_do_not_continue(tmp_path: Path, message: str) -> None:
+    client, codex, state = _RecordingClient(), _ContinuingCodexClient(), fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "turn/completed",
+        _output_limit_completion(error={"message": message}),
+    )
+    assert codex.requests == []
+    assert client.posts[-1][1]["data"]["status"] == "failed"
+
+
+@pytest.mark.parametrize("items", [[None], ["future"], "malformed", None])
+async def test_stream_disconnect_malformed_items_do_not_continue(
+    tmp_path: Path, items: object
+) -> None:
+    client, codex, state = _RecordingClient(), _ContinuingCodexClient(), fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "turn/completed",
+        _output_limit_completion(error={"message": _STREAM_DISCONNECT_ERROR}, items=items),
+    )
+    assert codex.requests == []
+    assert client.posts[-1][1]["data"]["status"] == "failed"
+
+
+async def test_stream_disconnect_malformed_terminal_does_not_continue(tmp_path: Path) -> None:
+    client, codex, state = _RecordingClient(), _ContinuingCodexClient(), fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "error",
+        {
+            "threadId": "thread_123",
+            "turnId": "turn_a",
+            "willRetry": False,
+            "error": {"message": _STREAM_DISCONNECT_ERROR},
+        },
+    )
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "turn/failed",
+        {"threadId": "thread_123", "turnId": "turn_a", "turn": "malformed"},
+    )
+    assert codex.requests == []
+
+
+@pytest.mark.parametrize(
+    ("item_type", "status", "continues"),
+    [
+        ("commandExecution", "inProgress", False),
+        ("commandExecution", "completed", True),
+        ("mcpToolCall", "inProgress", False),
+        ("dynamicToolCall", "failed", True),
+        ("collabAgentToolCall", "cancelled", True),
+        ("futureSideEffect", "inProgress", False),
+        ("futureSideEffect", None, False),
+        ("futureSideEffect", "completed", True),
+        ("agentMessage", None, True),
+        ("userMessage", None, True),
+    ],
+)
+async def test_stream_disconnect_tool_status_gates_recovery(
+    tmp_path: Path,
+    item_type: str,
+    status: str | None,
+    continues: bool,
+) -> None:
+    client, codex, state = _RecordingClient(), _ContinuingCodexClient(), fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    item = {"type": item_type, "id": "item_a", "status": status}
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "turn/completed",
+        _output_limit_completion(error={"message": _STREAM_DISCONNECT_ERROR}, items=[item]),
+    )
+    assert bool(codex.requests) is continues
+    if not continues:
+        assert client.posts[-1][1]["data"]["status"] == "failed"
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -1931,13 +2114,18 @@ async def test_output_limit_late_receipt_cancels_exact_input_once_and_waits_for_
     assert client.posts[-1][1]["data"]["status"] == "idle"
 
 
-async def test_output_limit_deferred_error_preserves_native_lifecycle(
+@pytest.mark.parametrize("failure", ["output_limit", "stream_disconnect"])
+async def test_recoverable_deferred_error_preserves_native_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
     monkeypatch.setattr(fwd, "_OUTPUT_LIMIT_TERMINAL_WAIT_SECONDS", 0.001, raising=False)
     client, codex, state = _RecordingClient(), _ContinuingCodexClient(), fwd._CodexForwarderState()
     _seed_active_turn(tmp_path, "turn_a")
+    message = (
+        _OUTPUT_LIMIT_ERROR["message"] if failure == "output_limit" else _STREAM_DISCONNECT_ERROR
+    )
     await _forward_output_limit_event(
         client,
         codex,
@@ -1948,7 +2136,7 @@ async def test_output_limit_deferred_error_preserves_native_lifecycle(
             "threadId": "thread_123",
             "turnId": "turn_a",
             "willRetry": False,
-            "error": _OUTPUT_LIMIT_ERROR,
+            "error": {"message": message},
         },
     )
     assert read_bridge_state(tmp_path).active_turn_id == "turn_a"
@@ -1956,11 +2144,25 @@ async def test_output_limit_deferred_error_preserves_native_lifecycle(
     assert read_bridge_state(tmp_path).active_turn_id == "turn_a"
     assert not any(body["type"] == "external_session_status" for _, body in client.posts)
     await _forward_output_limit_event(
-        client, codex, state, tmp_path, "turn/completed", _output_limit_completion()
+        client,
+        codex,
+        state,
+        tmp_path,
+        "turn/completed",
+        _output_limit_completion(error={"message": message}),
     )
     assert codex.requests == []
     assert read_bridge_state(tmp_path).active_turn_id is None
     assert client.posts[-1][1]["data"]["status"] == "idle"
+    source_error = next(
+        body
+        for _, body in client.posts
+        if body["type"] == "external_conversation_item" and body["data"]["item_type"] == "error"
+    )
+    assert message in source_error["data"]["item_data"]["message"]
+    if failure == "stream_disconnect":
+        assert "response stream disconnected" in source_error["data"]["item_data"]["message"]
+        assert "response length limit" not in source_error["data"]["item_data"]["message"]
 
 
 @pytest.mark.parametrize("native_status", ["inProgress", "completed", "failed"])

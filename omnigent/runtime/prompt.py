@@ -28,6 +28,13 @@ OUTPUT_LIMIT_CONTINUATION_INSTRUCTION = (
     "tool calls. If an operation's outcome is unknown, stop and explain instead of retrying it."
 )
 
+STREAM_DISCONNECT_CONTINUATION_INSTRUCTION = (
+    "The previous response stream disconnected before completion. Continue from where it "
+    "stopped, using the existing conversation and completed tool results. Do not repeat "
+    "completed tool calls. If an operation's outcome is unknown, stop and explain instead "
+    "of retrying it."
+)
+
 # Shape of the wake notice the runner posts into a parent session when a
 # dispatched sub-agent finishes (``omnigent.runner.subagent_work._format_subagent_wake_notice``).
 # Quoted verbatim wherever the model is told what to expect, so the notice

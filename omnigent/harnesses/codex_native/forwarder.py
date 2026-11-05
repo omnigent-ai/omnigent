@@ -95,6 +95,9 @@ from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.prompt import (
     OUTPUT_LIMIT_CONTINUATION_INSTRUCTION as _OUTPUT_LIMIT_CONTINUE_TEXT,
 )
+from omnigent.runtime.prompt import (
+    STREAM_DISCONNECT_CONTINUATION_INSTRUCTION as _STREAM_DISCONNECT_CONTINUE_TEXT,
+)
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -316,6 +319,21 @@ _CODEX_OUTPUT_LIMIT_HINT = (
     "The model reached its response length limit. Ask it to continue or split "
     "the request into smaller parts."
 )
+_CODEX_STREAM_DISCONNECT_PREFIX = "stream disconnected before completion: "
+_CODEX_STREAM_DISCONNECT_HINT = (
+    "The response stream disconnected. Inspect the terminal before retrying so "
+    "completed work is not repeated."
+)
+
+
+def _is_stream_disconnect_message(message: str) -> bool:
+    """Codex transport failures exclude incomplete responses with their own policy."""
+    if not message.startswith(_CODEX_STREAM_DISCONNECT_PREFIX):
+        return False
+    detail = message.removeprefix(_CODEX_STREAM_DISCONNECT_PREFIX)
+    return bool(detail) and not detail.startswith("Incomplete response returned, reason:")
+
+
 # Budget/quota exhaustion from the AI gateway: the gateway returns HTTP 403 +
 # PERMISSION_DENIED for these, which looks like auth to the generic checks —
 # it isn't. Re-authenticating cannot resolve a spending limit.
@@ -1407,6 +1425,10 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
 
 
+def _is_recoverable_stream_error(error: _CodexTerminalError) -> bool:
+    return error.kind != _CODEX_ERROR_KIND_AUTH and _is_stream_disconnect_message(error.message)
+
+
 @dataclass(frozen=True)
 class _CodexTurnStatusEdge:
     """
@@ -1891,7 +1913,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     started=chunk.reasoning_started,
                 )
-            except Exception:  # preserve the long-lived forwarder.
+            except Exception:  # noqa: BLE001 - keep the forwarder alive.
                 _logger.warning("Codex forwarder reasoning delta flush failed", exc_info=True)
             return
         if chunk.tool_call_id is not None:
@@ -1902,7 +1924,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     call_id=chunk.tool_call_id,
                 )
-            except Exception:  # preserve the long-lived forwarder.
+            except Exception:  # noqa: BLE001 - keep the forwarder alive.
                 _logger.warning("Codex forwarder tool-output delta flush failed", exc_info=True)
             return
         index: int | None = None
@@ -1920,7 +1942,7 @@ class _OutputTextDeltaCoalescer:
                 index=index,
                 final=final,
             )
-        except Exception:  # preserve the long-lived forwarder.
+        except Exception:  # noqa: BLE001 - keep the forwarder alive.
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
@@ -2257,7 +2279,7 @@ class _CodexElicitationTaskTracker:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # keep the long-lived forwarder alive.
+        except Exception:  # noqa: BLE001 - keep the forwarder alive.
             _logger.warning(
                 "Codex forwarder elicitation hook task failed: method=%s",
                 event.get("method"),
@@ -2527,7 +2549,7 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
-                except Exception:  # keep the long-lived mirror alive.
+                except Exception:  # noqa: BLE001 - keep the mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         except BaseException as exc:
             stream_error = exc
@@ -2615,7 +2637,7 @@ async def _drive_side_chat_requests(
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")
-                    except Exception:  # one bad request must not drop the rest.
+                    except Exception:  # noqa: BLE001 - isolate each request failure.
                         _logger.warning(
                             "Codex /side fork failed for %s", request.path, exc_info=True
                         )
@@ -2626,7 +2648,7 @@ async def _drive_side_chat_requests(
                     # done, and a failed one has surfaced a notice — keeping it
                     # would retry the same failure forever.
                     side_chat.discard_side_chat_request(request.path)
-        except Exception:  # keep the drain loop alive.
+        except Exception:  # noqa: BLE001 - keep the drain loop alive.
             _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)
 
@@ -2665,7 +2687,7 @@ async def _post_side_chat_failed_notice(
             response_id=marker,
             source_id=marker,
         )
-    except Exception:  # the notice is best-effort.
+    except Exception:  # noqa: BLE001 - the notice is best-effort.
         _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
 
 
@@ -2967,7 +2989,7 @@ async def _subscribe_until_ready(
                 except asyncio.CancelledError:
                     raise
                 # App-server error envelopes are surfaced as RuntimeError.
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - surface the original error.
                     if not _is_thread_not_ready_error(exc):
                         _logger.warning(
                             "failed to subscribe to Codex thread %s", thread_id, exc_info=True
@@ -4172,7 +4194,7 @@ async def _maybe_fail_turn_on_certificate_failure(
             await codex_client.request(
                 "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
             )
-        except Exception:  # the failure is surfaced either way.
+        except Exception:  # noqa: BLE001 - surface the failure either way.
             _logger.warning(
                 "Codex turn interrupt after a certificate failure failed", exc_info=True
             )
@@ -4277,11 +4299,17 @@ async def _present_output_limit_error(
     automatic_input_uncertain: bool = False,
 ) -> None:
     """Persist the source's error without changing another native turn's lifecycle."""
-    hint = (
-        "Automatic continuation is unconfirmed. Inspect the terminal before sending more input."
-        if automatic_input_uncertain
-        else _CODEX_OUTPUT_LIMIT_HINT
-    )
+    stream_disconnect = _is_stream_disconnect_message(error.message)
+    if automatic_input_uncertain:
+        hint = (
+            "Automatic continuation is unconfirmed. "
+            "Inspect the terminal before sending more input."
+        )
+    elif stream_disconnect:
+        hint = _CODEX_STREAM_DISCONNECT_HINT
+    else:
+        hint = _CODEX_OUTPUT_LIMIT_HINT
+    source_kind = "stream-disconnect" if stream_disconnect else "output-limit"
     await _post_external_item(
         client,
         session_id,
@@ -4292,7 +4320,7 @@ async def _present_output_limit_error(
             "message": f"{error.message}\n\n{hint}",
         },
         response_id=_response_id(_params_with_turn_id({}, turn_id)),
-        source_id=f"codex-output-limit:{turn_id}",
+        source_id=f"codex-{source_kind}:{turn_id}",
     )
 
 
@@ -4474,14 +4502,18 @@ async def _auto_continue_after_output_limit(
 ) -> bool:
     """Submit once and certify delivery only by the native clientId receipt."""
     turn_id = completed.active_turn_id
+    stream_disconnect = _is_recoverable_stream_error(error)
     if (
         turn_id is None
         or getattr(codex_client, "supports_user_message_ids", False) is not True
-        or error.message != _CODEX_OUTPUT_LIMIT_ERROR
+        or (error.message != _CODEX_OUTPUT_LIMIT_ERROR and not stream_disconnect)
         or forwarder_state.open_tool_items_by_turn.get(turn_id)
         or forwarder_state.open_tool_items_by_turn.get(None)
     ):
         return False
+    continuation_text = (
+        _STREAM_DISCONNECT_CONTINUE_TEXT if stream_disconnect else _OUTPUT_LIMIT_CONTINUE_TEXT
+    )
     client_message_id = uuid4().hex
     deadline = time.time() + _OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS
     try:
@@ -4521,7 +4553,7 @@ async def _auto_continue_after_output_limit(
                     {
                         "threadId": completed.thread_id,
                         "clientUserMessageId": client_message_id,
-                        "input": [{"type": "text", "text": _OUTPUT_LIMIT_CONTINUE_TEXT}],
+                        "input": [{"type": "text", "text": continuation_text}],
                     },
                 )
             except (OSError, ConnectionClosed):
@@ -4621,7 +4653,10 @@ async def _auto_continue_after_output_limit(
                 "message": "The automatic continuation failed. Inspect the terminal for details.",
             },
             response_id=_response_id(_params_with_turn_id({}, continued_turn_id)),
-            source_id=f"codex-output-limit-failed:{continued_turn_id}",
+            source_id=(
+                f"codex-{'stream-disconnect' if stream_disconnect else 'output-limit'}-"
+                f"failed:{continued_turn_id}"
+            ),
         )
     if native_status not in {"inProgress", "unknown"}:
         try:
@@ -4794,7 +4829,10 @@ async def _maybe_handle_turn_event(
                     and codex_client is not None
                     and getattr(codex_client, "supports_user_message_ids", False) is True
                     and turn_id is not None
-                    and error.message == _CODEX_OUTPUT_LIMIT_ERROR
+                    and (
+                        error.message == _CODEX_OUTPUT_LIMIT_ERROR
+                        or _is_recoverable_stream_error(error)
+                    )
                 ):
                     active = read_bridge_state(bridge_dir)
                     if (
@@ -4850,7 +4888,7 @@ async def _maybe_handle_turn_event(
                     compaction_model = await asyncio.to_thread(
                         _failed_compaction_model, bridge_dir, selected_model
                     )
-                except Exception:  # the failure still posts, undiagnosed.
+                except Exception:  # noqa: BLE001 - post the failure undiagnosed.
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
             await _post_turn_status_edge(
                 client,
@@ -4955,7 +4993,7 @@ async def _maybe_handle_turn_event(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - compaction is best-effort.
                 _logger.warning(
                     "Failed to persist codex compaction item for %s: %s",
                     session_id,
@@ -5194,26 +5232,45 @@ async def _handle_terminal_turn_boundary_inner(
     if forwarder_state is not None and terminal_turn_id is not None:
         turn = params.get("turn")
         items = turn.get("items") if isinstance(turn, dict) else None
+        recoverable_stream = candidate_error is not None and _is_recoverable_stream_error(
+            candidate_error
+        )
         if isinstance(items, list):
             for item in items:
+                if not isinstance(item, dict):
+                    if recoverable_stream:
+                        forwarder_state.open_tool_items_by_turn.setdefault(
+                            terminal_turn_id, set()
+                        ).add("malformed-item")
+                    continue
+                item_type = item.get("type")
+                potentially_open_tool = item_type in _OUTPUT_LIMIT_TOOL_ITEM_TYPES or (
+                    recoverable_stream and item_type not in _STREAM_RECOVERY_NON_TOOL_ITEM_TYPES
+                )
                 if (
-                    isinstance(item, dict)
-                    and item.get("type") in _OUTPUT_LIMIT_TOOL_ITEM_TYPES
-                    and item.get("status")
-                    not in {
-                        "completed",
-                        "failed",
-                        "interrupted",
-                        "cancelled",
-                        "canceled",
-                        "declined",
-                    }
+                    potentially_open_tool
+                    and item.get("status") not in _TERMINAL_TOOL_ITEM_STATUSES
                 ):
                     forwarder_state.open_tool_items_by_turn.setdefault(
                         terminal_turn_id, set()
                     ).add(str(item.get("id", "unknown-tool")))
+        elif recoverable_stream and isinstance(turn, dict) and "items" in turn:
+            forwarder_state.open_tool_items_by_turn.setdefault(terminal_turn_id, set()).add(
+                "malformed-items"
+            )
+        if recoverable_stream and not isinstance(turn, dict):
+            forwarder_state.open_tool_items_by_turn.setdefault(terminal_turn_id, set()).add(
+                "malformed-turn"
+            )
     continued = bool(
-        method == "turn/completed"
+        (
+            method == "turn/completed"
+            or (
+                method == "turn/failed"
+                and candidate_error is not None
+                and _is_recoverable_stream_error(candidate_error)
+            )
+        )
         and not retired_source
         and not interrupted
         and bridge_dir is not None
@@ -6550,7 +6607,7 @@ async def _handle_completed_item_inner(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - compaction is best-effort.
                 _logger.warning(
                     "Failed to persist codex compaction item for %s: %s",
                     session_id,
@@ -7483,7 +7540,7 @@ async def _ensure_user_message_posted(
         response = await codex_client.request("thread/resume", {"threadId": thread_id})
     except asyncio.CancelledError:
         raise
-    except Exception:  # degrade to current behavior on resume failure.
+    except Exception:  # noqa: BLE001 - degrade to the existing resume behavior.
         _logger.warning(
             "Codex forwarder could not resume to recover user message: thread=%s turn=%s",
             thread_id,
@@ -8213,6 +8270,24 @@ _OUTPUT_LIMIT_TOOL_ITEM_TYPES = _TOOL_ITEM_TYPES | {
     "dynamicToolCall",
     _CODEX_COLLAB_AGENT_ITEM_TYPE,
 }
+_TERMINAL_TOOL_ITEM_STATUSES = frozenset(
+    {"completed", "failed", "interrupted", "cancelled", "canceled", "declined"}
+)
+# These items cannot still perform side effects when the response stream ends.
+_STREAM_RECOVERY_NON_TOOL_ITEM_TYPES = frozenset(
+    {
+        "userMessage",
+        "agentMessage",
+        "reasoning",
+        "plan",
+        "proposedPlan",
+        "contextCompaction",
+        "turnDiff",
+        "enteredReviewMode",
+        "exitedReviewMode",
+        _CODEX_ERROR_ITEM_TYPE,
+    }
+)
 
 # Codex ``/review`` enter/exit thread items. The web UI has no dedicated
 # review-mode affordance, so these are mirrored as a visible assistant-message
@@ -8615,7 +8690,7 @@ async def _persist_codex_compaction_item(
             rollout = _latest_thread_rollout(state) if state is not None else None
             if rollout is not None:
                 compacted = _read_compacted_history(rollout)
-        except Exception:
+        except Exception:  # noqa: BLE001 - diagnostics are best-effort.
             _logger.debug(
                 "Failed to read codex rollout for compaction persist",
                 exc_info=True,
@@ -9215,7 +9290,7 @@ async def _replay_dead_letters_before_resume(
             max_records=_REPLAY_MAX_RECORDS,
             deadline_seconds=_REPLAY_DEADLINE_SECONDS,
         )
-    except Exception:  # replay must never block resume.
+    except Exception:  # noqa: BLE001 - replay must not block resume.
         _logger.warning("Codex dead-letter replay before resume failed", exc_info=True)
 
 
