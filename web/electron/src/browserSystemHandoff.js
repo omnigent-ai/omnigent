@@ -1,7 +1,6 @@
-// Hand an embedded-browser page off to the user's system browser. Google
-// Workspace context-aware access only admits browsers that report device
-// signals (Chrome with Endpoint Verification), which an Electron view cannot,
-// so a blocked sign-in has to continue in the user's own browser.
+// Hand an embedded-browser page off to the system browser. Google Workspace
+// context-aware access only admits browsers with device signals, which an
+// Electron view can't report, so a blocked sign-in continues there instead.
 
 "use strict";
 

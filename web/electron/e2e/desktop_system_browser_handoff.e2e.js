@@ -1,16 +1,6 @@
-// Desktop journeys for handing an embedded-browser page to the system browser.
-//
-// Google Workspace context-aware access blocks sign-in from Electron, so the
-// pane offers "Continue in browser" on Google's block page and an "Open in
-// browser" toolbar button everywhere. The real shell, SPA, IPC and navigation
-// policy run unchanged; two stand-ins replace what CI cannot reach:
-//   - Google's hosts are served by an in-process https handler that mimics the
-//     docs → sign-in → access-blocked redirect chain;
-//   - shell.openExternal opens a small "default browser" window that shows the
-//     URL it was asked to open.
-//
-// Run from web/electron after building the SPA:
-//   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_system_browser_handoff.e2e.js
+// Desktop journeys for handing a browser-pane page to the system browser. Stand-ins:
+// an in-process https handler serves Google's sign-in redirect chain, and
+// shell.openExternal opens a window showing the URL. Run: see e2e/README.md.
 
 "use strict";
 
