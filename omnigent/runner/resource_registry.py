@@ -150,6 +150,16 @@ _CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS = 0.2
 # at 1s, so this throttle is a no-op for them (their own poll spacing
 # already exceeds the threshold).
 _TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS = 1.0
+
+# ``blocked_on`` reason for a running Claude turn whose input box has been
+# replaced by a surface Claude does not report as waiting, e.g. a dialog
+# opened while a reply streams. Chat points the user at the terminal.
+NATIVE_TERMINAL_PROMPT_BLOCKED_ON = "terminal prompt"
+
+# How long Claude's input box must stay hidden during a running turn before
+# that reason is published. Claude reports its known dialogs within a poll,
+# so this delay only matters for surfaces it does not report.
+_HIDDEN_INPUT_BOX_ALERT_SECONDS = 15.0
 _TERMINAL_EXIT_OUTPUT_MAX_LINES = 40
 _TERMINAL_EXIT_OUTPUT_MAX_CHARS = 4000
 
@@ -364,6 +374,35 @@ def _terminal_exit_diagnostics(
                 exit_status = raw_exit_status
 
     return command, args_count, cwd, last_output, exit_status
+
+
+class _HiddenInputBoxWatch:
+    """Time how long a native agent's input box has been hidden during a turn."""
+
+    def __init__(self, threshold_s: float) -> None:
+        """
+        :param threshold_s: Seconds the input box must stay hidden, e.g. ``15.0``.
+        """
+        self._threshold_s = threshold_s
+        self._hidden_since: float | None = None
+
+    def observe(self, *, input_box_visible: bool, turn_running: bool) -> bool:
+        """
+        Record one pane read and report whether the alert threshold has passed.
+
+        :param input_box_visible: Whether the agent's input box is on screen.
+        :param turn_running: Whether the session reads as working with no
+            reported blocking reason, or with this watch's own reason.
+        :returns: ``True`` once the input box has stayed hidden for the
+            whole threshold while the turn was running.
+        """
+        if input_box_visible or not turn_running:
+            self._hidden_since = None
+            return False
+        now = _monotonic()
+        if self._hidden_since is None:
+            self._hidden_since = now
+        return now - self._hidden_since >= self._threshold_s
 
 
 def _monotonic() -> float:
@@ -716,6 +755,11 @@ class SessionResourceRegistry:
             if not explicit_activity:
                 self._set_session_status_memo_locked(session_id, status, False)
             return True
+
+    def _published_status_edge(self, session_id: str) -> tuple[str, str | None] | None:
+        """Return the last ``(status, blocked_on)`` edge published for a session."""
+        with self._lock:
+            return self._published_session_status.get(session_id)
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
         """Adopt an external status and let native state reconcile a missing edge."""
@@ -1672,6 +1716,42 @@ class SessionResourceRegistry:
 
         input_ready_probe = _native_input_ready_probe(resource_role)
         native_input_ready = False
+        # Claude stays "busy" when a dialog opens while a reply streams, so only
+        # its hidden input box shows that the terminal now needs the person.
+        hidden_input_box_watch = (
+            _HiddenInputBoxWatch(_HIDDEN_INPUT_BOX_ALERT_SECONDS)
+            if status_poller is not None
+            else None
+        )
+
+        def _check_hidden_input_box(
+            probe: Callable[[str, TerminalInstance], bool],
+            watch: _HiddenInputBoxWatch,
+        ) -> None:
+            edge = self._published_status_edge(session_id)
+            alerting = edge == ("running", NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
+            turn_running = (
+                (edge == ("running", None) or alerting)
+                and _structured_status_active()
+                and self.session_turn_is_active(session_id)
+            )
+            input_box_visible = probe(session_id, instance)
+            hidden_too_long = watch.observe(
+                input_box_visible=input_box_visible, turn_running=turn_running
+            )
+            if hidden_too_long and not alerting:
+                _logger.info(
+                    "Native input box hidden during a running turn",
+                    extra=debug_event(
+                        "native_input_box_hidden",
+                        session_id=session_id,
+                        harness=resource_role,
+                        terminal_instance_id=instance.diagnostic_id,
+                    ),
+                )
+                _publish_status("running", NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
+            elif alerting and input_box_visible:
+                _publish_status("running")
 
         def _on_tick() -> None:
             nonlocal native_input_ready
@@ -1721,6 +1801,10 @@ class SessionResourceRegistry:
                                 stage="native_input",
                             ),
                         )
+            if hidden_input_box_watch is not None and input_ready_probe is not None:
+                # The alert is advisory; a probe failure must not stop the watcher.
+                with contextlib.suppress(Exception):
+                    _check_hidden_input_box(input_ready_probe, hidden_input_box_watch)
 
         def _on_activity() -> None:
             if not _owns_terminal():

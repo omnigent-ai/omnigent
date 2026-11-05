@@ -1003,8 +1003,14 @@ async def _observe_native_with_real_poller(
     session_id: str,
     *,
     program_status_path: Path | None = None,
+    instance: TerminalInstance | None = None,
+    published: list[tuple[str, str | None]] | None = None,
 ) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
-    """Observe a Claude terminal with a real poller and caller-written status file."""
+    """Observe a Claude terminal with a real poller and caller-written status file.
+
+    :param instance: Terminal to observe; a fresh test terminal when ``None``.
+    :param published: Collects each published ``(status, blocked_on)`` edge.
+    """
     config_dir = tmp_path / "claude"
     status_file = config_dir / "sessions" / "123.json"
     status_file.parent.mkdir(parents=True)
@@ -1014,7 +1020,8 @@ async def _observe_native_with_real_poller(
     )
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    if instance is None:
+        instance = make_test_terminal_instance("claude", "main", tmp_path)
     if program_status_path is not None:
         from omnigent.terminals.program_status import ProgramStatusReader
 
@@ -1024,9 +1031,13 @@ async def _observe_native_with_real_poller(
     monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
     monkeypatch.setattr(instance, "pane_pid_sync", lambda: 123)
     statuses: list[str] = []
-    registry.set_session_status_publisher(
-        lambda _sid, status, _reason=None: statuses.append(status)
-    )
+
+    def _publish(_sid: str, status: str, reason: str | None = None) -> None:
+        statuses.append(status)
+        if published is not None:
+            published.append((status, reason))
+
+    registry.set_session_status_publisher(_publish)
     await registry.observe_required_terminal(
         session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
     )
@@ -1346,6 +1357,103 @@ async def test_queued_turn_republishes_running_after_stop(
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
     assert not registry.session_turn_is_active(session_id)
+
+
+_CLAUDE_WORKING_PANE = """\
+❯ summarize the repository
+● Reading the files
+✻ Recombobulating… (16s · ↓ 27 tokens)
+──────────────────────────────────────────
+❯\u00a0
+──────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+"""
+_CLAUDE_NOTICE_PANE = """\
+❯ summarize the repository
+●
+✻ Recombobulating… (31s · ↓ 27 tokens)
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What's new in Claude Code
+   Press Enter to continue
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("claude_status", "waiting_for", "expected_reason"),
+    [
+        ("busy", None, "terminal prompt"),
+        # Claude's own reason already tells the person where to look.
+        ("waiting", "dialog open", "dialog open"),
+    ],
+)
+async def test_running_turn_with_hidden_input_box_points_chat_at_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_status: str,
+    waiting_for: str | None,
+    expected_reason: str,
+) -> None:
+    """A surface Claude does not report must not leave chat on a bare spinner."""
+    session_id = "conv_hidden_input_box"
+    clock = {"now": 100.0}
+    monkeypatch.setattr("omnigent.runner.resource_registry._monotonic", lambda: clock["now"])
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    published: list[tuple[str, str | None]] = []
+    on_tick, _statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id, instance=instance, published=published
+    )
+    record = {"pid": 123, "sessionId": "claude-hidden", "kind": "interactive"}
+    record |= {"status": claude_status, "statusUpdatedAt": 1000}
+    if waiting_for is not None:
+        record["waitingFor"] = waiting_for
+    status_file.write_text(json.dumps(record), encoding="utf-8")
+
+    async def tick_at(now: float, pane: str) -> None:
+        clock["now"] = now
+        instance._remember_pane_snapshot(pane)
+        on_tick()
+        await asyncio.sleep(0)
+
+    await tick_at(100.0, _CLAUDE_WORKING_PANE)
+    await tick_at(130.0, _CLAUDE_WORKING_PANE)
+    assert published == [("running", waiting_for)]
+
+    await tick_at(131.0, _CLAUDE_NOTICE_PANE)
+    await tick_at(145.0, _CLAUDE_NOTICE_PANE)
+    assert published == [("running", waiting_for)]
+
+    await tick_at(146.0, _CLAUDE_NOTICE_PANE)
+    await tick_at(150.0, _CLAUDE_NOTICE_PANE)
+    assert published[-1] == ("running", expected_reason)
+    assert len(published) == (2 if expected_reason == "terminal prompt" else 1)
+
+    # Answering the prompt restores the input box, and chat drops the alert.
+    await tick_at(151.0, _CLAUDE_WORKING_PANE)
+    assert published[-1] == ("running", waiting_for)
+    assert registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+async def test_hidden_input_box_after_the_turn_ends_publishes_no_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished turn has nothing to wait on, even if a notice hides the box."""
+    clock = {"now": 100.0}
+    monkeypatch.setattr("omnigent.runner.resource_registry._monotonic", lambda: clock["now"])
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    published: list[tuple[str, str | None]] = []
+    on_tick, _statuses, _registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, "conv_hidden_idle", instance=instance, published=published
+    )
+    record = {"pid": 123, "sessionId": "claude-idle", "kind": "interactive"}
+    status_file.write_text(json.dumps(record | {"status": "idle"}), encoding="utf-8")
+    instance._remember_pane_snapshot(_CLAUDE_NOTICE_PANE)
+    for now in (100.0, 120.0, 140.0):
+        clock["now"] = now
+        on_tick()
+        await asyncio.sleep(0)
+    assert published == [("idle", None)]
 
 
 @pytest.mark.asyncio

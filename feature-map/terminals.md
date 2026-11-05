@@ -29,7 +29,10 @@ reattach when the session moves to another host.
 - `hidden-terminal`: in chat view, the background terminal never draws over the
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
-  says so and routes the user to the terminal.
+  says so and routes the user to the terminal. When Claude Code still reports a
+  running turn but its input box has been hidden for 15 seconds (for example a
+  dialog opened while a reply streams), chat says something in the terminal may
+  need input until the input box returns.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 
@@ -171,7 +174,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
-  injects the blocked event; it does not run a vendor CLI. For Claude's OSC
+  injects the blocked event; it does not run a vendor CLI. The hidden-input-box
+  hint is produced by
+  `tests/e2e/test_claude_native_hidden_prompt_e2e.py::test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal`
+  (real Claude Code and tmux against a slow local Messages API; needs `claude`
+  on `PATH`), with timing cases in `tests/runner/test_resource_registry.py`
+  (`-k hidden_input_box`) and the label in `web/src/pages/ChatPage.test.ts`.
+  For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
 

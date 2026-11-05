@@ -421,6 +421,12 @@ function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
 }
 
 /**
+ * Runner's `blockedOn` reason when the agent still reads as working but its
+ * terminal shows something it did not report, e.g. a dialog opened mid-reply.
+ */
+export const TERMINAL_PROMPT_BLOCKED_ON = "terminal prompt";
+
+/**
  * The label shown next to the working shimmer. When the agent is parked on a
  * dialog (`blockedOn`) it says so; otherwise it rotates through
  * `WORKING_MESSAGES` by wall-clock `tick`.
@@ -438,6 +444,11 @@ export function workingIndicatorLabel(
     // there to respond rather than leaving the session looking hung.
     if (blockedOn === "dialog open") {
       return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
+    }
+    if (blockedOn === TERMINAL_PROMPT_BLOCKED_ON) {
+      // Inferred from the terminal's screen, so the hint stays tentative.
+      const hint = "Something in the agent's terminal may need your input.";
+      return terminalView ? `${hint} Open the Terminal view to check.` : hint;
     }
     if (answerableInChat) return `Blocked on: ${blockedOn}`;
     const waiting =
