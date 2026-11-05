@@ -57,6 +57,6 @@ def test_codex_resolves_the_injected_skill(tmp_path: Path) -> None:
     """
     _ensure_orchestrator_skills_in_bundle(tmp_path, None)
 
-    sources = codex_skill_sources(tmp_path, tmp_path / "fake-home")
+    sources = codex_skill_sources(tmp_path, tmp_path / "fake-home").linked
     assert sources == [tmp_path / "skills"]
     assert SKILL_NAME in select_codex_skill_dirs("all", sources)

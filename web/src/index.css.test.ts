@@ -921,31 +921,24 @@ describe("index.css desktop typography ramp", () => {
   });
 });
 
-/* Contract for the two body text steps.
- *
- * text-sm used to be derived from --ui-ramp-anchor, which put it at 14.4px
- * against a 13px body — a caption tier LARGER than the text it captions. It
- * must come off the body step so it stays proportional at every size the
- * Appearance setting allows.
- */
+/* Captions derive from the raw body preference so they stay 1px smaller
+ * at every size the Appearance setting allows. */
 describe("index.css body text tokens", () => {
   const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
   const mobileMap = cssSource.match(
     /@media \(width < 48rem\) \{\s*(?:\/\*[\s\S]*?\*\/\s*)?:root \{[^}]*\}/,
   )?.[0];
-  const CAPTION_RATIO = 0.9;
-  const LINE_HEIGHT_RATIO = 1.6;
+  const BODY_LINE_HEIGHT_RATIO = 1.8;
+  const CAPTION_LINE_HEIGHT_RATIO = 1.4;
 
   it("derives the caption step from the body step on desktop", () => {
-    expect(desktopMap).toContain(`--text-sm: calc(var(--desktop-ui-font-size) * ${CAPTION_RATIO})`);
-    // The anchor is the 16px-equivalent grid for TITLE ratios only. Routing the
-    // caption factor through it is the inverted-hierarchy bug.
-    expect(desktopMap).not.toContain(`--text-sm: calc(var(--ui-ramp-anchor) * ${CAPTION_RATIO})`);
+    expect(desktopMap).toContain("--text-sm: calc(var(--desktop-ui-font-size) - 1px)");
+    expect(cssSource).toContain("--text-sm: calc(var(--text-ui) - 1px)");
   });
 
   it("derives the caption step from the body step on mobile too", () => {
     expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
-    expect(mobileMap).toContain(`--text-sm: calc(var(--mobile-ui-font-size) * ${CAPTION_RATIO})`);
+    expect(mobileMap).toContain("--text-sm: calc(var(--mobile-ui-font-size) - 1px)");
     expect(mobileMap).toContain("--text-ui: var(--mobile-ui-font-size)");
     expect(mobileMap).toContain("--text-base: var(--mobile-ui-font-size)");
   });
@@ -962,7 +955,7 @@ describe("index.css body text tokens", () => {
 
     it("keeps the desktop and mobile defaults distinct", () => {
       expect(UI_FONT_SIZE_DEFAULT).toBe(13);
-      expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(14);
+      expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(15);
     });
 
     it("routes inherited body text through the same effective token", () => {
@@ -978,10 +971,26 @@ describe("index.css body text tokens", () => {
     });
   });
 
-  it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX])(
-    "keeps the caption step smaller than the body step at %ipx",
+  it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MOBILE_DEFAULT, UI_FONT_SIZE_MAX])(
+    "keeps the caption step 1px below the body step at %ipx",
     (px) => {
-      expect(px * CAPTION_RATIO).toBeLessThan(px);
+      for (const [mapping, preference] of [
+        [desktopMap, "--desktop-ui-font-size"],
+        [mobileMap, "--mobile-ui-font-size"],
+      ]) {
+        const captionSize = mapping?.match(/--text-sm:\s*([^;]+);/)?.[1];
+        expect(captionSize).toBeDefined();
+        const resolvedSize = captionSize!.replace(`var(${preference})`, `${px}px`);
+        const minified = new TextDecoder().decode(
+          transform({
+            filename: "caption.css",
+            code: new TextEncoder().encode(`.caption { font-size: ${resolvedSize}; }`),
+            minify: true,
+            targets: TARGETS,
+          }).code,
+        );
+        expect(minified).toContain(`font-size:${px - 1}px`);
+      }
     },
   );
 
@@ -996,12 +1005,17 @@ describe("index.css body text tokens", () => {
     expect(mobileMap).not.toContain("--text-xs:");
   });
 
-  it("gives both steps a unitless line height so the rhythm scales", () => {
-    // Unitless, not px: a fixed pair would re-freeze the line box at the
-    // larger settings. 1.6 puts the 13px default on ~21px.
+  it("shares the interface body size with messages across all viewports and input types", () => {
+    expect(cssSource.match(/--text-message:\s*[^;]+;/g)).toEqual([
+      "--text-message: var(--text-ui);",
+    ]);
+  });
+
+  it("gives body and caption text their shared unitless line heights", () => {
+    // Unitless line heights scale with the selected font size.
     const themeBlock = cssSource.match(/@theme \{[^}]*--text-ui:[^}]*\}/)?.[0];
-    expect(themeBlock).toContain(`--text-ui--line-height: ${LINE_HEIGHT_RATIO}`);
-    expect(themeBlock).toContain(`--text-sm--line-height: ${LINE_HEIGHT_RATIO}`);
+    expect(themeBlock).toContain(`--text-ui--line-height: ${BODY_LINE_HEIGHT_RATIO}`);
+    expect(themeBlock).toContain(`--text-sm--line-height: ${CAPTION_LINE_HEIGHT_RATIO}`);
   });
 
   it("retires the duplicate 13px and caption tokens", () => {
@@ -1253,6 +1267,31 @@ describe("index.css electron-mac window drag region", () => {
     expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
     unmarkMacShell();
     expect(strip.matches(dragSelector)).toBe(false);
+  });
+});
+
+describe("index.css shared UI font smoothing", () => {
+  const SMOOTHING_DECL = /-webkit-font-smoothing\s*:\s*antialiased/;
+  const smoothingRules = cssBlocks
+    .map(([block]) => block)
+    .filter((block) => /-webkit-font-smoothing\s*:/.test(block));
+
+  it("antialiases text across browsers and native shells", () => {
+    expect(smoothingRules.map(selectorOf)).toEqual(["html"]);
+    expect(smoothingRules[0]).toMatch(SMOOTHING_DECL);
+  });
+
+  it("keeps the declaration through build minification", () => {
+    const minified = new TextDecoder().decode(
+      transform({
+        filename: "index.css",
+        code: new TextEncoder().encode(indexCssSource),
+        minify: true,
+        targets: TARGETS,
+      }).code,
+    );
+    const rootRules = [...minified.matchAll(/(?:^|\})html\{([^}]*)\}/g)].map(([, body]) => body);
+    expect(rootRules.some((body) => /-webkit-font-smoothing:antialiased/.test(body))).toBe(true);
   });
 });
 

@@ -839,6 +839,38 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(ev.allowAllEdits).toBe(false);
   });
 
+  it.each([
+    {
+      label: "a well-formed hint",
+      hint: { tool_name: "Edit", tool_input: { file_path: "/a.py" } },
+      expected: { toolName: "Edit", toolInput: { file_path: "/a.py" } },
+    },
+    { label: "a hint without a tool name", hint: { tool_input: {} }, expected: null },
+    {
+      label: "a hint whose input is not an object",
+      hint: { tool_name: "Edit", tool_input: [] },
+      expected: null,
+    },
+    { label: "no hint", hint: undefined, expected: null },
+  ])("parses file_edit from $label", ({ hint, expected }) => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_file_edit",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **Edit**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: "Edit({})",
+        requestedSchema: {},
+        file_edit: hint,
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    expect((out[0] as ElicitationRequest).fileEdit).toEqual(expected);
+  });
+
   it("lifts the remember_scope hint with a host for WebFetch prompts", () => {
     // The server stamps ``remember_scope`` on non-edit tool
     // PermissionRequests so the card can offer "Approve & don't ask

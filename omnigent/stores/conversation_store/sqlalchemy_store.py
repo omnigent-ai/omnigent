@@ -3045,8 +3045,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``. Powers ``GET /v1/sessions`` — sessions
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"``
-            or ``"updated_at"``.
+        :param sort_by: Column to sort on, ``"created_at"``,
+            ``"updated_at"``, or ``"id"``.
         :param search_query: Case-insensitive substring filter on
             the session title OR conversation item content.
             ``None`` or empty string disables the filter;
@@ -3090,6 +3090,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises ValueError: If ``search_scope`` is not a known scope.
+        :raises StaleCursorError: If a cursor names a vanished conversation,
+            or one that ``accessible_by``/``owned_by`` has no grant on.
         """
         from omnigent.server.auth import LEVEL_OWNER
 
@@ -3169,6 +3171,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     qualifying_ids = list(
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
+
+        # A permission-scoped page only lists sessions the viewer has a grant
+        # on, so a cursor without one didn't come from a page. Resolving it
+        # anyway would reveal where that session sorts.
+        cursor_viewer = accessible_by if accessible_by is not None else owned_by
+        if cursor_viewer is not None:
+            for cursor_id in (after, before):
+                if cursor_id:
+                    self._require_cursor_grant(cursor_id, cursor_viewer)
 
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
@@ -3481,13 +3492,75 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more=has_more,
         )
 
+    def _require_cursor_grant(self, cursor_id: str, viewer: str) -> None:
+        """
+        Reject a list cursor naming a session the viewer has no grant on.
+
+        Fails the same way as a deleted cursor, so it doesn't reveal whether
+        the session exists.
+
+        :param cursor_id: The ``after`` or ``before`` session ID.
+        :param viewer: The user whose listing the cursor pages.
+        :raises StaleCursorError: If the viewer has no grant on the session.
+        """
+        with self._session("authorize_session_list_cursor") as meta_sess:
+            granted = meta_sess.execute(
+                select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == cursor_id,
+                    SqlSessionPermission.user_id == viewer,
+                )
+            ).first()
+        if granted is None:
+            raise StaleCursorError(cursor_id)
+
+    def list_spawn_tree(self, root_conversation_id: str, *, limit: int) -> PagedList[Conversation]:
+        """Read one spawn tree, breaking timestamp ties by this store's tiebreaker.
+
+        The one-level listing orders siblings by ``(created_at,
+        _tiebreaker_col)`` (insertion order on SQLite, id elsewhere), so the
+        tree is ordered the same way. Both reads walk the
+        ``(workspace_id, root_conversation_id, id)`` index in id order, so
+        *limit* bounds the rows each examines.
+
+        :param root_conversation_id: Root of the spawn tree.
+        :param limit: Maximum conversations to return.
+        :returns: The tree's conversations in listing order.
+        """
+        page = super().list_spawn_tree(root_conversation_id, limit=limit)
+        if self._conv_engine.dialect.name != "sqlite":
+            return page
+        with self._conv_session("list_spawn_tree") as session:
+            tiebreakers: dict[str, Any] = {
+                str(row[0]): row[1]
+                for row in session.execute(
+                    select(SqlConversation.id, self._tiebreaker_col)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.root_conversation_id == root_conversation_id,
+                    )
+                    .order_by(SqlConversation.id)
+                    .limit(limit)
+                ).all()
+            }
+        rows = sorted(
+            page.data, key=lambda c: (c.created_at, tiebreakers.get(c.id, 0)), reverse=True
+        )
+        return PagedList(
+            data=rows,
+            first_id=rows[0].id if rows else None,
+            last_id=rows[-1].id if rows else None,
+            has_more=page.has_more,
+        )
+
     @staticmethod
-    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
+    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[Any]:
         """
         Map a ``sort_by`` string to the corresponding
         :class:`SqlConversation` column.
 
-        :param sort_by: ``"created_at"`` or ``"updated_at"``.
+        :param sort_by: ``"created_at"``, ``"updated_at"``, or ``"id"``
+            (index order, for bounded reads of one spawn tree).
         :returns: The mapped column attribute.
         :raises ValueError: If ``sort_by`` is not a valid column
             name.
@@ -3495,6 +3568,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         allowed = {
             "created_at": SqlConversation.created_at,
             "updated_at": SqlConversation.updated_at,
+            "id": SqlConversation.id,
         }
         col = allowed.get(sort_by)
         if col is None:
@@ -3506,7 +3580,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         session: Session,
         stmt: Select[tuple[SqlConversation]],
         cursor_id: str,
-        sort_col: QueryableAttribute[int],
+        sort_col: QueryableAttribute[Any],
         is_desc: bool,
         tiebreaker_col: ColumnElement[Any],
         forward: bool,

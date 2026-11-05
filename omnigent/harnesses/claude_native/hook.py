@@ -437,9 +437,13 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     from omnigent.cli_auth import databricks_request_headers
 
     headers.update(databricks_request_headers(ap_server_url))
+    from omnigent.native.native_policy_hook import is_loopback_url
+
     try:
         with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
+            headers=headers,
+            timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S),
+            trust_env=not is_loopback_url(ap_server_url),
         ) as client:
             new_session_id = _create_clear_replacement_session(
                 client,
@@ -495,9 +499,13 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     from omnigent.cli_auth import databricks_request_headers
 
     headers.update(databricks_request_headers(ap_server_url))
+    from omnigent.native.native_policy_hook import is_loopback_url
+
     try:
         with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
+            headers=headers,
+            timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S),
+            trust_env=not is_loopback_url(ap_server_url),
         ) as client:
             new_session_id = _create_fork_replacement_session(
                 client,
@@ -551,13 +559,15 @@ def _create_clear_replacement_session(
     )
     labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
 
-    create_resp = client.post(
-        f"{ap_server_url}/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "labels": labels,
-        },
+    from omnigent.native._native_supersession import (
+        clear_replacement_create_body,
+        unfiled_clear_replacement_body,
     )
+
+    create_body = clear_replacement_create_body(old, agent_id=agent_id, labels=labels)
+    create_resp = client.post(f"{ap_server_url}/v1/sessions", json=create_body)
+    if (unfiled_body := unfiled_clear_replacement_body(create_body, create_resp)) is not None:
+        create_resp = client.post(f"{ap_server_url}/v1/sessions", json=unfiled_body)
     create_resp.raise_for_status()
     created = create_resp.json()
     if not isinstance(created, dict):
@@ -811,7 +821,10 @@ def _post_hook_with_reattach(
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     import httpx
 
-    from omnigent.native.native_policy_hook import _is_login_redirect_or_unauthorized
+    from omnigent.native.native_policy_hook import (
+        _is_login_redirect_or_unauthorized,
+        is_loopback_url,
+    )
 
     timeout = httpx.Timeout(
         _PERMISSION_TIMEOUT_S,
@@ -833,11 +846,16 @@ def _post_hook_with_reattach(
         else contextlib.nullcontext()
     )
     with marker_scope:
+        trust_env = not is_loopback_url(url)
         while True:
             attempt_started = time.monotonic()
             never_connected = False
             try:
-                with httpx.Client(headers=headers, timeout=timeout) as client:
+                with httpx.Client(
+                    headers=headers,
+                    timeout=timeout,
+                    trust_env=trust_env,
+                ) as client:
                     resp = client.post(url, json=body)
                     if (
                         reauth is not None
