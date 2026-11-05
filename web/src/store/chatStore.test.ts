@@ -3844,6 +3844,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
         { pending_id: "pending_first", content: [{ type: "input_text", text: "saved on server" }] },
         { pending_id: "pending_image", content: [chart] },
       ],
+      inDraft: false,
     },
     {
       attached: "with the text the draft holds",
@@ -3853,8 +3854,10 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
           content: [{ type: "input_text", text: "saved on server" }, chart],
         },
       ],
+      inDraft: true,
     },
-  ])("names a failed startup input's file $attached again after a reload", async ({ inputs }) => {
+  ])("names a failed startup input's file $attached again after a reload", async (row) => {
+    const { inputs, inDraft } = row;
     onTestFinished(clearSessionDrafts);
     seedSession("conv_real");
     seedSession("conv_other");
@@ -3888,14 +3891,42 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     await retryFailedStartupLookup("conv_real");
     expect(notices()).toEqual([reminder]);
 
-    // So does the session evicted and reopened in the same tab.
+    // A file attached after a reload's read failed doesn't stand in for the input's own on Retry.
+    let readFails = true;
+    fetchMock.mockImplementation((input, init) =>
+      readFails && String(input) === "/v1/sessions/conv_real/failed-inputs"
+        ? mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 })
+        : defaultFetchHandler(input, init),
+    );
     await useChatStore.getState().switchTo("conv_other");
-    await settle();
-    expect(conversationRegistry.evictLruEvictable()).toBe("conv_real");
+    initChatStore(client);
     await useChatStore.getState().switchTo("conv_real");
     await settle();
+    expect(notices()).toEqual([]);
+    const notes = new File(["notes"], "notes.txt", { type: "text/plain" });
+    setSessionDraft("conv_real", { ...getSessionDraft("conv_real")!, files: [notes] });
+    readFails = false;
+    await retryFailedStartupLookup("conv_real");
     expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(getSessionDraft("conv_real")?.text).toBe(taken!.text);
     expect(notices()).toEqual([reminder]);
+
+    // So does the session evicted and reopened in the same tab.
+    const reopen = async (files: File[]) => {
+      setSessionDraft("conv_real", { ...getSessionDraft("conv_real")!, files });
+      await useChatStore.getState().switchTo("conv_other");
+      await settle();
+      expect(conversationRegistry.evictLruEvictable()).toBe("conv_real");
+      await useChatStore.getState().switchTo("conv_real");
+      await settle();
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(getSessionDraft("conv_real")?.text).toBe(taken!.text);
+    };
+    await reopen([notes]);
+    expect(notices()).toEqual([reminder]);
+    // A draft holding the file itself drops it, though not for an input the draft doesn't hold.
+    await reopen([new File([new Uint8Array(10)], "chart.png", { type: "image/png" })]);
+    expect(notices()).toEqual(inDraft ? [] : [reminder]);
   });
 
   it("reopening a session whose managed launch failed offers its first input for resending", async () => {

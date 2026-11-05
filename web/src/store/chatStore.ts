@@ -153,7 +153,7 @@ import type {
   SessionStatus,
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
-import { attachmentKey } from "@/lib/attachments";
+import { attachmentFilename, attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
@@ -8065,13 +8065,13 @@ function returnFailedStartupInputs(
   const withoutFiles = new Set([
     ...(state.failedSendDraft?.files.length ? [] : inWaitingDraft),
     ...(state.restoredSendDraft?.files.length ? [] : inComposer),
-    ...(saved?.files.length ? [] : inSavedDraft),
-    ...(sideChat?.files.length ? [] : inSideChat),
+    ...missingFilesIn(failedInputs, inSavedDraft, saved?.files),
+    ...missingFilesIn(failedInputs, inSideChat, sideChat?.files),
   ]);
   // An adopted input's notice didn't survive, so name the files no draft holds alongside it.
   const adoptedWithoutFiles = new Set([
-    ...(saved?.files.length ? [] : (saved?.startupInputIds ?? [])),
-    ...(sideChat?.files.length ? [] : (sideChat?.startupInputIds ?? [])),
+    ...missingFilesIn(failedInputs, saved?.startupInputIds ?? [], saved?.files),
+    ...missingFilesIn(failedInputs, sideChat?.startupInputIds ?? [], sideChat?.files),
   ]);
   const lacksFiles = (input: FailedInput) =>
     unreturned.includes(input)
@@ -8234,6 +8234,26 @@ function startupInputText(input: PendingInput): string {
   return input.content
     .flatMap((block) => (block.type === "input_text" ? [block.text] : []))
     .join("\n");
+}
+
+/** Those of `ids` whose input has an attachment no file in `files` shares a name with. */
+function missingFilesIn(
+  inputs: readonly PendingInput[],
+  ids: readonly string[],
+  files: readonly File[] = [],
+): string[] {
+  const names = new Set(files.map(attachmentFilename));
+  return ids.filter((id) =>
+    inputs.some(
+      (input) =>
+        input.pendingId === id &&
+        input.content.some(
+          (block) =>
+            (block.type === "input_image" || block.type === "input_file") &&
+            (block.filename === undefined || !names.has(block.filename)),
+        ),
+    ),
+  );
 }
 
 /** A notice naming the failed startup inputs' attachments, or `null` without any. */
