@@ -442,9 +442,21 @@ def test_a_managed_config_lists_only_the_servers_claude_code_loads(
     ]
     assert _SECRET not in json.dumps(servers)
 
-    # An unreadable file still keeps exclusive control, so Claude Code loads nothing.
+    # A file that can't be parsed or read still keeps exclusive control, so Claude Code
+    # loads nothing.
     managed = tmp_path / "managed" / "managed-mcp.json"
     managed.write_text("not json")
+    assert discover_mcp_servers() == []
+
+    managed.write_text(json.dumps({"mcpServers": {"linear": _stdio()}}))
+    read_text = Path.read_text
+
+    def deny_managed(path: Path, *args: object, **kwargs: object) -> str:
+        if path == managed:
+            raise PermissionError(13, "Permission denied", str(path))
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_managed)
     assert discover_mcp_servers() == []
 
 
