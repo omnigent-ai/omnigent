@@ -1537,7 +1537,7 @@ def create_runner_app(
     # subprocess. The release closes the httpx client an in-flight
     # ``proxy_stream`` is reading, which surfaces there as a transport error;
     # the stream's failure handler consumes the record to report the exit.
-    _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
+    _required_terminal_exit_errors: dict[str, dict[str, Any]] = {}
     app.state.required_terminal_exit_errors = _required_terminal_exit_errors
     _clean_terminal_exit_responses: dict[str, str | None] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
@@ -1937,13 +1937,14 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
-    def _build_delivery_timeout_error(event: TerminalExitEvent) -> dict[str, str]:
+    def _build_delivery_timeout_error(event: TerminalExitEvent) -> dict[str, Any]:
         """Build the failure for a pane the delivery timeout closed.
 
         Stands in for the turn's own readiness error when releasing the harness
         severs its stream first. The executor reports that error as a
-        ``RuntimeError``; the same code keeps both readings of one failure
-        together.
+        ``RuntimeError`` with ``undelivered`` set, since nothing reached the
+        pane; the same shape keeps both readings of one failure together and
+        lets the server keep the queued message.
 
         :param event: The exit of the pane Omnigent closed.
         """
@@ -1955,11 +1956,11 @@ def create_runner_app(
         )
         if event.last_output:
             message = f"{message}\n\nLast captured terminal output:\n{event.last_output}"
-        return {"code": "RuntimeError", "message": message}
+        return {"code": "RuntimeError", "message": message, "undelivered": True}
 
     def _build_required_terminal_error(
         event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Build the structured ``session.status`` error for a required-terminal exit.
 
         Always carries ``code`` + a fully-composed ``message`` (back-compat: the
@@ -1971,7 +1972,7 @@ def create_runner_app(
         :param diagnosis: The exit's :func:`classify_terminal_failure` result.
         """
         message = _format_required_terminal_exit_output(event, diagnosis)
-        error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
+        error: dict[str, Any] = {"code": "required_terminal_exited", "message": message}
         if diagnosis is not None:
             error["title"] = diagnosis.title
             error["cause"] = diagnosis.cause
