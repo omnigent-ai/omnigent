@@ -1598,6 +1598,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    scheduled_task_interactive_origin: Callable[[Request], bool | None] | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1644,6 +1645,11 @@ def create_app(
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
+    :param scheduled_task_interactive_origin: Classifies the credential of an
+        automation create or update that carries no agent source header: ``True``
+        for a person's interactive client, ``False`` for a token code can hold
+        (refused), ``None`` when unknown (accepted). ``None`` for the hook keeps
+        accepting every authenticated caller.
     :param scheduled_task_scheduler_config: Overrides the server config's
         scheduled_task_scheduler section. With automations_v2 off, only
         startup_retry_seconds applies. Changes require restarting the app.
@@ -3970,6 +3976,7 @@ def create_app(
                 project_store=project_store,
                 automations=app.state.automations,
                 liveness_lookup=_bulk_session_liveness,
+                interactive_origin=scheduled_task_interactive_origin,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],

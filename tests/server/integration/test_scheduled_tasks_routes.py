@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from omnigent.automations_availability import AUTOMATIONS_HEADER
 from omnigent.db.utils import builtin_agent_id
@@ -96,6 +96,7 @@ def _build_app(
     local_single_user: bool = False,
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
+    interactive_origin: Callable[[Request], bool | None] | None = None,
 ) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.host_store import HostStore
@@ -120,6 +121,7 @@ def _build_app(
             {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
         ),
         server_config={"scheduled_task_scheduler": {"startup_retry_seconds": 0.01}},
+        scheduled_task_interactive_origin=interactive_origin,
         scheduled_task_dispatch=(
             ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock(return_value=None))
             if persistent
@@ -296,7 +298,6 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     ("mode", "expected_status"),
     [
         ("bound-token", 200),
-        ("legacy-token-only", 200),
         ("allow-listed", 200),
         ("loopback", 200),
         ("wrong-token", 403),
@@ -333,9 +334,7 @@ async def test_agent_mutations_validate_origin_at_http_boundary(
         ORCHESTRATION_SOURCE_HEADER: source.id,
         RUNNER_TUNNEL_TOKEN_HEADER: token,
     }
-    if mode == "legacy-token-only":
-        headers.pop(ORCHESTRATION_SOURCE_HEADER)
-    elif mode == "empty-source":
+    if mode == "empty-source":
         headers[ORCHESTRATION_SOURCE_HEADER] = ""
     elif mode == "missing-source":
         headers[ORCHESTRATION_SOURCE_HEADER] = uuid.uuid4().hex
@@ -366,6 +365,92 @@ async def test_agent_mutations_validate_origin_at_http_boundary(
         assert updated.status_code == expected_status, updated.text
         stored = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
         assert stored.json()["state"] == ("paused" if expected_status == 200 else "active")
+
+
+async def test_runner_token_without_source_cannot_create_or_edit(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient
+) -> None:
+    """A runner credential that skips the source header skipped the approval card."""
+    headers = {**_headers(), RUNNER_TUNNEL_TOKEN_HEADER: "scheduled-approval-token"}
+
+    created = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+    assert created.status_code == 403, created.text
+    assert "approved tool call" in created.text
+
+    task_id = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()["id"]
+    edited = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"prompt": "something else"}, headers=headers
+    )
+    assert edited.status_code == 403, edited.text
+    # Pausing only reduces what the task does, so the runner may still do it.
+    paused = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"state": "paused"}, headers=headers
+    )
+    assert paused.status_code == 200, paused.text
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected_status"),
+    [(True, 200), (None, 200), (False, 403), ("raise", 403)],
+)
+async def test_interactive_origin_hook_gates_unmarked_changes(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+    verdict: bool | str | None,
+    expected_status: int,
+) -> None:
+    """The deployment's credential classifier refuses unmarked changes from API tokens."""
+    seen: list[str | None] = []
+
+    def interactive_origin(request: Request) -> bool | None:
+        seen.append(request.headers.get("X-Client"))
+        if verdict == "raise":
+            raise RuntimeError("classifier unavailable")
+        return verdict  # type: ignore[return-value]
+
+    app = _build_app(db_uri, tmp_path, interactive_origin=interactive_origin)
+    _make_user(db_uri)
+    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+    headers = {**_headers(), "X-Client": "api"}
+    async with _serve(app, mock_llm, tmp_path) as client:
+        created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+        assert created.status_code == expected_status, created.text
+        assert seen == ["api"]
+        if expected_status == 403:
+            assert "approved tool call" in created.text
+            return
+        task_id = created.json()["id"]
+        edited = await client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json={"prompt": "p2"}, headers=headers
+        )
+        assert edited.status_code == 200, edited.text
+
+
+async def test_interactive_origin_hook_allows_pausing(
+    runtime_init: None, db_uri: str, tmp_path: Path, mock_llm: ControllableMockClient
+) -> None:
+    """Owners can pause from any client, even one the classifier refuses."""
+    verdict = {"interactive": True}
+    app = _build_app(db_uri, tmp_path, interactive_origin=lambda _req: verdict["interactive"])
+    _make_user(db_uri)
+    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+    async with _serve(app, mock_llm, tmp_path) as client:
+        task_id = (
+            await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+        ).json()["id"]
+        verdict["interactive"] = False
+        paused = await client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json={"state": "paused"}, headers=_headers()
+        )
+        assert paused.status_code == 200, paused.text
+        resumed = await client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json={"state": "active"}, headers=_headers()
+        )
+        assert resumed.status_code == 403, resumed.text
 
 
 async def test_automations_gate_is_checked_per_request(
