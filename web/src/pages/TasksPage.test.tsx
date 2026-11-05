@@ -12,6 +12,9 @@ import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { showToast } from "@/components/ui/toast";
+
+vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
 
@@ -117,6 +120,7 @@ beforeEach(() => {
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
+  vi.mocked(showToast).mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate,
     isPending: false,
@@ -572,6 +576,21 @@ describe("template prefill", () => {
 });
 
 describe("row actions", () => {
+  it("confirms Run now with a run history hint only after the request succeeds", () => {
+    setTasks([task()]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Run now" }));
+
+    expect(runNowMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
+    expect(showToast).not.toHaveBeenCalled();
+
+    runNowMutate.mock.calls[0][1].onSuccess();
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      "Run triggered, it will start shortly. Open automation details to check run history.",
+    );
+  });
+
   it("opens edit mode for a task from the row menu", () => {
     setTasks([task({ id: "st_edit", name: "Morning brief" })]);
     renderPage();

@@ -16,6 +16,7 @@ import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { showToast } from "@/components/ui/toast";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
@@ -171,7 +172,13 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function handleRunNow(task: ScheduledTask) {
-    runNowMutation.mutate(task.id);
+    runNowMutation.mutate(task.id, {
+      onSuccess: () => {
+        showToast(
+          "Run triggered, it will start shortly. Open automation details to check run history.",
+        );
+      },
+    });
   }
 
   function handleEdit(task: ScheduledTask) {
