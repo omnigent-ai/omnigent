@@ -159,9 +159,12 @@ describe("mutations invalidate the list", () => {
     queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [RUN]);
     const runs = renderHook(() => useScheduledTaskRuns("st_1"), { wrapper });
     expect(runs.result.current.isFetchedAfterMount).toBe(false);
+    expect(api.listScheduledTaskRuns).not.toHaveBeenCalled();
     const spy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
     expect(await result.current.mutateAsync("st_1")).toBe("run_1");
+    await waitFor(() => expect(runs.result.current.isFetchedAfterMount).toBe(true));
+    expect(api.listScheduledTaskRuns).toHaveBeenCalledTimes(1);
     expect(api.runScheduledTaskNow).toHaveBeenCalledWith("st_1");
     // Refreshes the list (so the completion badge updates)…
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });

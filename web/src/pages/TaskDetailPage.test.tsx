@@ -650,6 +650,11 @@ describe("header actions", () => {
           setRuns([run({ id: "other_task_run" })]);
           rerender(pageTree());
           expect(highlighted()).toHaveLength(0);
+          routeParams = { taskId: "st_1" };
+          setTask(task());
+          setRuns([newRun]);
+          rerender(pageTree());
+          expect(highlighted()).toHaveLength(0);
         }
       } finally {
         vi.useRealTimers();
