@@ -15364,6 +15364,41 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await pump.stop();
   });
 
+  it("keeps a reconnect backfill's failure owed when an older retry succeeds after it", async () => {
+    const id = "conv_retry_outrun_by_failure";
+    let itemsDown: () => boolean | Promise<boolean> = () => true;
+    const { pump, reply, newestSink } = await settleMissedEndWhileItemsDown(id, () => itemsDown());
+    let releaseItems!: (down: boolean) => void;
+    const itemsHeld = new Promise<boolean>((resolve) => {
+      releaseItems = resolve;
+    });
+    itemsDown = () => itemsHeld;
+    await advanceUntilRetryStarts(pump, newestSink);
+
+    itemsDown = () => true;
+    newestSink().error();
+    await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS);
+    await drainAsync();
+    expect(pump.sinks).toHaveLength(3);
+    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id]);
+    itemsDown = () => false;
+    releaseItems(false);
+    await drainAsync();
+    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
+
+    const fetchesBeforeRetry = pump.itemFetches();
+    await advanceWithHeartbeats(newestSink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(pump.itemFetches()).toBeGreaterThan(fetchesBeforeRetry);
+    const fetchesAfterRetry = pump.itemFetches();
+    await advanceWithHeartbeats(newestSink, 2 * ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(pump.itemFetches()).toBe(fetchesAfterRetry);
+    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
+
+    await pump.stop();
+  });
+
   /**
    * Pump a conversation whose "Compacting…" spinner is owned by `owner`, and
    * whose status snapshot is `snapshot` (the idle seed when omitted).
