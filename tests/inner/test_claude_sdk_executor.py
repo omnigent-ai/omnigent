@@ -5,6 +5,8 @@ import base64
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -546,7 +548,7 @@ class TestConstructor(unittest.TestCase):
         self.assertIn(expected, captured["sandbox"].read_roots)
 
     def test_default_process_sandbox_wraps_cli_without_enabling_native_tools(self):
-        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
 
         with (
             patch(
@@ -554,8 +556,10 @@ class TestConstructor(unittest.TestCase):
                 return_value="/usr/bin/claude",
             ),
             patch(
-                "omnigent.inner.claude_sdk_executor.prepare_tight_cli_process_path",
-                return_value="/tmp/omnigent-claude-tight-wrapper",
+                "omnigent.inner.claude_sdk_executor.prepare_tight_cli_process",
+                return_value=PreparedClaudeCli(
+                    cli_path="/tmp/omnigent-claude-tight-wrapper", enable_native_tools=False
+                ),
             ),
         ):
             executor = ClaudeSDKExecutor()
@@ -4002,7 +4006,7 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
         messages.clear()
         bare = await turn("q2")
         assert bare.options.mcp_servers == {}
-        assert bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV not in bare.options.env
+        assert bare.options.env[bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV] == ""
         assert "mcp__omnigent__" not in (bare.options.system_prompt or "")
         assert warnings == [bridge.MANAGED_MCP_RELAY_MISSING_WARNING]
         await executor.close_session("managed")
@@ -4147,6 +4151,169 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         assert not allocated[0].exists()
 
 
+_RELAY_ENV_NAMES = (
+    "OMNIGENT_MCP_RELAY_PYTHON",
+    "OMNIGENT_MCP_RELAY_BRIDGE_DIR",
+    "OMNIGENT_MCP_RELAY_TMPDIR",
+)  # Spelled out, so a renamed variable fails here.
+
+
+async def _managed_turn(executor, session_key: str, tools: list[dict]) -> object:
+    """Run one turn for ``session_key`` and return its live client."""
+    messages = [{"role": "user", "content": f"hi {session_key}", "session_id": session_key}]
+    events = [event async for event in executor.run_turn(messages, tools, "")]
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    return executor._clients[session_key].client
+
+
+@pytest.mark.asyncio
+async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Under bwrap the CLI gets a private /tmp and a fixed /etc, so each CLI needs its own
+    launcher exposing the managed config and its own bridge, never another session's."""
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    _deploy_managed_mcp(tmp_path, monkeypatch, {"omnigent": bridge.managed_mcp_relay_entry()})
+    managed_dir = (tmp_path / "etc-claude-code").resolve()
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    launchers: dict[str, SandboxPolicy] = {}
+
+    def record_launcher(target: str, policy: SandboxPolicy) -> str:
+        path = tmp_path / f"launcher-{len(launchers)}.sh"
+        path.write_text("")
+        launchers[str(path)] = policy
+        return str(path)
+
+    base = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=None,
+        write_roots=[],
+        write_files=[],
+        allow_network=True,
+    )
+    prefix = "omnigent.inner.claude_sdk_executor"
+    monkeypatch.setattr(f"{prefix}._find_system_claude", lambda: "/usr/bin/claude")
+    monkeypatch.setattr(f"{prefix}.resolve_sandbox", lambda spec, cwd: base)
+    monkeypatch.setattr(f"{prefix}._claude_internal_write_roots", list)
+    monkeypatch.setattr(f"{prefix}._claude_internal_write_files", list)
+    monkeypatch.setattr(f"{prefix}.create_exec_launcher", record_launcher)
+    executor = ClaudeSDKExecutor(
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", allow_network=True),
+        )
+    )
+    base_launcher = executor._cli_path
+
+    async def tool_executor(name: str, arguments: dict) -> dict:
+        return {}
+
+    executor._tool_executor = tool_executor
+    tools = [{"name": "sys_ping", "parameters": {"type": "object", "properties": {}}}]
+    with patch(f"{prefix}._ensure_sdk", return_value=_make_recovery_fake_sdk()):
+        clients = {key: await _managed_turn(executor, key, tools) for key in ("one", "two")}
+        for key, client in clients.items():
+            other = clients["two" if key == "one" else "one"]
+            assert client.options.cli_path != base_launcher
+            own_dir = Path(client.options.env[bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV]).resolve()
+            other_dir = Path(other.options.env[bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV]).resolve()
+            argv = BwrapSandboxBackend().wrap_launcher_argv(
+                [sys.executable, "-c", "pass"],
+                launchers[client.options.cli_path],
+                workspace,
+                target="/usr/bin/claude",
+            )
+            mounts = list(zip(argv, argv[1:], argv[2:], strict=False))
+            assert ("--bind-try", str(own_dir), str(own_dir)) in mounts
+            assert ("--ro-bind-try", str(managed_dir), str(managed_dir)) in mounts
+            # Other sessions' relay tokens stay out of reach, as does the relay root.
+            assert str(other_dir) not in argv
+            assert str(own_dir.parent) not in argv
+        launcher = Path(clients["one"].options.cli_path)
+        await executor.close_session("one")
+        assert not launcher.exists()
+        await executor.close_session("two")
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not shutil.which("bwrap"), reason="needs bubblewrap on Linux"
+)
+def test_bwrap_cli_reaches_its_own_relay_bridge_but_not_another_sessions(tmp_path: Path) -> None:
+    from omnigent.harnesses.claude_native.bridge import prepare_acp_mcp_bridge_dir
+    from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
+    from omnigent.inner.claude_sdk_executor import _client_cli_sandbox
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    own, other = prepare_acp_mcp_bridge_dir(), prepare_acp_mcp_bridge_dir()
+    try:
+        base = SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        )
+        probe = (
+            'cat "$1/bridge.json" >/dev/null && echo own-readable; '
+            'touch "$1/server.json" && echo own-writable; '
+            'cat "$2/bridge.json" >/dev/null 2>&1 && echo other-readable || echo other-hidden'
+        )
+        argv = BwrapSandboxBackend().wrap_launcher_argv(
+            ["/bin/sh", "-c", probe, "probe", str(own), str(other)],
+            _client_cli_sandbox(base, managed_config_dirs=[], bridge_dir=own),
+            tmp_path,
+        )
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+        assert completed.stdout.split() == ["own-readable", "own-writable", "other-hidden"], (
+            completed.stderr
+        )
+    finally:
+        shutil.rmtree(own, ignore_errors=True)
+        shutil.rmtree(other, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["tools", "tool-executor"])
+async def test_a_cli_without_its_own_relay_cannot_reach_an_inherited_bridge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, missing: str
+) -> None:
+    """The SDK merges the parent environment into the CLI's, so relay variables inherited
+    from an enclosing session must be blanked, or the managed entry would reach its bridge."""
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    _deploy_managed_mcp(tmp_path, monkeypatch, {"omnigent": bridge.managed_mcp_relay_entry()})
+    for name in _RELAY_ENV_NAMES:
+        monkeypatch.setenv(name, f"/parent-session/{name}")
+    executor = ClaudeSDKExecutor()
+
+    async def tool_executor(name: str, arguments: dict) -> dict:
+        return {}
+
+    if missing != "tool-executor":
+        executor._tool_executor = tool_executor
+    tools = [] if missing == "tools" else [{"name": "sys_ping", "parameters": {}}]
+    with patch(
+        "omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_make_recovery_fake_sdk()
+    ):
+        client = await _managed_turn(executor, "child", tools)
+        # The child environment the SDK builds: the parent's, overlaid with options.env.
+        effective = {**os.environ, **client.options.env}
+        assert {name: effective[name] for name in _RELAY_ENV_NAMES} == dict.fromkeys(
+            _RELAY_ENV_NAMES, ""
+        )
+        await executor.close_session("child")
+
+
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
     """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
     against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd
@@ -4221,9 +4388,9 @@ def test_prepare_claude_cli_path_bypasses_wrapper_when_env_set(
     ]
 
 
-def test_prepare_tight_cli_process_path_bypasses_wrapper_when_env_set(monkeypatch) -> None:
-    """``prepare_tight_cli_process_path`` must also honor the bypass env."""
-    from omnigent.inner.claude_sdk_executor import prepare_tight_cli_process_path
+def test_prepare_tight_cli_process_bypasses_wrapper_when_env_set(monkeypatch) -> None:
+    """``prepare_tight_cli_process`` must also honor the bypass env."""
+    from omnigent.inner.claude_sdk_executor import prepare_tight_cli_process
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", "1")
 
@@ -4235,7 +4402,8 @@ def test_prepare_tight_cli_process_path_bypasses_wrapper_when_env_set(monkeypatc
         _fail_if_called,
     )
 
-    assert prepare_tight_cli_process_path("/usr/bin/claude") == "/usr/bin/claude"
+    prepared = prepare_tight_cli_process("/usr/bin/claude")
+    assert (prepared.cli_path, prepared.sandbox) == ("/usr/bin/claude", None)
 
 
 def _wrap_probe_spec():

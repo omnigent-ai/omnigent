@@ -94,6 +94,7 @@ from .executor import (
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
+    SandboxPolicy,
     create_exec_launcher,
     get_backend,
     resolve_sandbox,
@@ -929,6 +930,11 @@ class _ManagedMcpRelay:
             raise
         self.env = managed_mcp_relay_env(self._bridge_dir)
 
+    @property
+    def bridge_dir(self) -> pathlib.Path:
+        """The private directory this relay's ``serve-mcp`` reads and writes."""
+        return self._bridge_dir
+
     def close(self) -> None:
         """Stop the relay and remove its bridge directory."""
         try:
@@ -948,13 +954,25 @@ class _ClaudeClientState:
     mcp_auth: dict[str, str] = field(default_factory=dict)
     # Serves Omnigent's tools to this client's CLI under an enterprise MCP config.
     mcp_relay: _ManagedMcpRelay | None = None
+    # This client's own sandbox launcher, which exposes the managed config and its relay.
+    cli_launcher: str | None = None
 
 
 async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
-    """Stop the relay of a client whose CLI has gone; its shutdown blocks briefly."""
-    if state.mcp_relay is not None:
-        relay, state.mcp_relay = state.mcp_relay, None
-        await asyncio.to_thread(relay.close)
+    """Release a gone CLI's relay and launcher; the relay's shutdown blocks briefly."""
+    relay, launcher = state.mcp_relay, state.cli_launcher
+    state.mcp_relay = state.cli_launcher = None
+    await asyncio.to_thread(_release_client_cli, relay, launcher)
+
+
+def _release_client_cli(relay: _ManagedMcpRelay | None, launcher: str | None) -> None:
+    try:
+        if relay is not None:
+            relay.close()
+    finally:
+        if launcher is not None:
+            with suppress(OSError):
+                os.unlink(launcher)
 
 
 def _claude_mcp_auth_statuses() -> dict[str, str]:
@@ -1042,6 +1060,8 @@ class PreparedClaudeCli:
 
     cli_path: str | None
     enable_native_tools: bool
+    # Policy the wrapper applies; a CLI needing extra grants gets its own launcher from it.
+    sandbox: SandboxPolicy | None = None
 
 
 def _ensure_sdk() -> ModuleType:
@@ -1679,21 +1699,20 @@ def prepare_claude_cli_path(
     return PreparedClaudeCli(
         cli_path=create_exec_launcher(real_cli_path, sandbox),
         enable_native_tools=True,
+        sandbox=sandbox,
     )
 
 
-def prepare_tight_cli_process_path(
+def prepare_tight_cli_process(
     real_cli_path: str | None,
     *,
     cwd: str | None = None,
-) -> str | None:
+) -> PreparedClaudeCli:
     """Wrap the Claude CLI in a tight default sandbox without enabling tools."""
 
-    if real_cli_path is None:
-        return None
-
-    if _sandbox_disabled_by_env():
-        return real_cli_path
+    unwrapped = PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
+    if real_cli_path is None or _sandbox_disabled_by_env():
+        return unwrapped
 
     # Skip silently on non-Linux: the implicit default sandbox here is
     # ``linux_bwrap`` and ``resolve_sandbox`` would raise
@@ -1704,7 +1723,7 @@ def prepare_tight_cli_process_path(
     # logging a warning every run is just noise (and breaks
     # tests that assert ``stderr_is_clean``).
     if sys.platform != "linux":
-        return real_cli_path
+        return unwrapped
 
     spec = OSEnvSpec(
         type="caller_process",
@@ -1723,13 +1742,46 @@ def prepare_tight_cli_process_path(
             "Could not apply default local CLI sandbox; continuing without it: %s",
             exc,
         )
-        return real_cli_path
+        return unwrapped
     else:
         if not sandbox.active:
-            return real_cli_path
+            return unwrapped
         sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
         sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-        return create_exec_launcher(real_cli_path, sandbox)
+        return PreparedClaudeCli(
+            cli_path=create_exec_launcher(real_cli_path, sandbox),
+            enable_native_tools=False,
+            sandbox=sandbox,
+        )
+
+
+def _claude_managed_config_dirs() -> list[pathlib.Path]:
+    """Directories holding the enterprise ``managed-mcp.json`` Claude Code reads.
+
+    Claude Code reads its managed settings, drop-ins and MCP config from that one
+    directory, so a sandboxed CLI needs all of it to honour the relay entry's policy.
+    """
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_paths
+
+    return [path.parent for path in claude_code_managed_mcp_paths() if os.path.exists(path)]
+
+
+def _client_cli_sandbox(
+    base: SandboxPolicy,
+    *,
+    managed_config_dirs: Sequence[pathlib.Path],
+    bridge_dir: pathlib.Path | None,
+) -> SandboxPolicy:
+    """The CLI sandbox for one client under an enterprise MCP config.
+
+    Bubblewrap gives the CLI a private ``/tmp`` and a fixed set of ``/etc`` paths, so
+    the managed config is granted read-only and this client's relay bridge read-write.
+    The relay root is never granted: it holds every other session's relay token.
+    """
+    policy = with_additional_read_roots(base, managed_config_dirs)
+    if bridge_dir is not None:
+        policy = with_additional_write_roots(policy, [bridge_dir])
+    return policy
 
 
 @dataclass(frozen=True)
@@ -1992,6 +2044,9 @@ class ClaudeSDKExecutor(Executor):
         # Databricks gateway doesn't support.
         self._cli_wrapper_path: str | None = None
         self._cli_path: str | None = _find_system_claude()
+        # The unwrapped CLI and the sandbox its wrapper applies, for per-client launchers.
+        self._real_cli_path = self._cli_path
+        self._cli_sandbox: SandboxPolicy | None = None
         if self._cli_path:
             if self._os_env_spec is not None:
                 prepared = prepare_claude_cli_path(
@@ -1999,17 +2054,12 @@ class ClaudeSDKExecutor(Executor):
                     self._os_env_spec,
                 )
                 self._os_env = prepared.enable_native_tools
-                if prepared.cli_path != self._cli_path:
-                    self._cli_wrapper_path = prepared.cli_path
-                    self._cli_path = prepared.cli_path
             else:
-                wrapped_cli = prepare_tight_cli_process_path(
-                    self._cli_path,
-                    cwd=self._cwd,
-                )
-                if wrapped_cli != self._cli_path:
-                    self._cli_wrapper_path = wrapped_cli
-                    self._cli_path = wrapped_cli
+                prepared = prepare_tight_cli_process(self._cli_path, cwd=self._cwd)
+            if prepared.cli_path != self._cli_path:
+                self._cli_wrapper_path = prepared.cli_path
+                self._cli_path = prepared.cli_path
+                self._cli_sandbox = prepared.sandbox
             if self._os_env_spec is not None and self._cwd is None:
                 self._cwd = self._os_env_spec.cwd
             logger.info("Using system claude CLI: %s", self._cli_path)
@@ -2222,6 +2272,44 @@ class ClaudeSDKExecutor(Executor):
             await state.client.set_model(model)
             state.model = model
         return state.client
+
+    def _prepare_managed_cli(
+        self, options: SdkOptions, relay_tools: list[ToolSpec] | None
+    ) -> tuple[_ManagedMcpRelay | None, str | None]:
+        """Point a new CLI's managed relay entry at its own relay, or at nothing.
+
+        The SDK merges this process's environment into the CLI's, so relay variables
+        inherited from an enclosing session are blanked rather than left out. Under a
+        sandbox the CLI also gets its own launcher, which exposes the managed config
+        and only this client's bridge.
+
+        :returns: The started relay and launcher, each ``None`` when not needed.
+        """
+        from omnigent.harnesses.claude_native.bridge import MANAGED_MCP_RELAY_ENV_NAMES
+
+        relay = None
+        if relay_tools is not None and self._tool_executor is not None:
+            relay = _ManagedMcpRelay(relay_tools, self._tool_executor, asyncio.get_running_loop())
+            options.env.update(relay.env)
+        else:
+            # Empty values make the entry's command fail instead of reaching a bridge.
+            options.env.update(dict.fromkeys(MANAGED_MCP_RELAY_ENV_NAMES, ""))
+        if self._cli_sandbox is None or self._real_cli_path is None:
+            return relay, None
+        try:
+            launcher = create_exec_launcher(
+                self._real_cli_path,
+                _client_cli_sandbox(
+                    self._cli_sandbox,
+                    managed_config_dirs=_claude_managed_config_dirs(),
+                    bridge_dir=relay.bridge_dir if relay is not None else None,
+                ),
+            )
+        except BaseException:
+            _release_client_cli(relay, None)
+            raise
+        options.cli_path = launcher
+        return relay, launcher
 
     async def _reconnect_signed_in_mcp_servers(self, state: _ClaudeClientState) -> bool:
         """Reconnect servers the host reports signed in since this client last checked.
@@ -2998,7 +3086,8 @@ class ClaudeSDKExecutor(Executor):
         # Tools a new client's CLI reaches through the managed relay entry instead.
         managed_relay_tools: list[ToolSpec] | None = None
         omnigent_tools_reachable = bool(tools)
-        if tools and claude_code_managed_mcp_present():
+        managed_mcp = claude_code_managed_mcp_present()
+        if tools and managed_mcp:
             # Claude Code refuses --mcp-config while an enterprise MCP config exists.
             if not managed_mcp_relay_configured():
                 if session_key not in self._clients:
@@ -3384,16 +3473,10 @@ class ClaudeSDKExecutor(Executor):
             )
 
         mcp_relay = None
-        if (
-            managed_relay_tools is not None
-            and self._tool_executor is not None
-            and session_key not in self._clients
-        ):
-            # Only a new CLI reads the relay environment; a live one keeps its relay.
-            mcp_relay = _ManagedMcpRelay(
-                managed_relay_tools, self._tool_executor, asyncio.get_running_loop()
-            )
-            options.env.update(mcp_relay.env)
+        cli_launcher = None
+        # Only a new CLI reads the relay environment; a live one keeps its relay.
+        if managed_mcp and session_key not in self._clients:
+            mcp_relay, cli_launcher = self._prepare_managed_cli(options, managed_relay_tools)
         try:
             client = await self._get_or_create_client(
                 sdk,
@@ -3402,11 +3485,11 @@ class ClaudeSDKExecutor(Executor):
                 model=model,
             )
         except BaseException:
-            if mcp_relay is not None:
-                await asyncio.to_thread(mcp_relay.close)
+            await asyncio.to_thread(_release_client_cli, mcp_relay, cli_launcher)
             raise
-        if mcp_relay is not None:
-            self._clients[session_key].mcp_relay = mcp_relay
+        if mcp_relay is not None or cli_launcher is not None:
+            state = self._clients[session_key]
+            state.mcp_relay, state.cli_launcher = mcp_relay, cli_launcher
 
         # ── LLM_REQUEST policy evaluation ────────────────────────
         # If the executor adapter installed a ``_policy_evaluator``
