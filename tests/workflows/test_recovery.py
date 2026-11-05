@@ -42,6 +42,8 @@ async def test_uncertain_turn_waits_for_reconciliation_without_resubmission(
         execute,
         store=store,
         binding=ExecutionBinding(mode="server", server="http://test"),
+        workflow_id="saved-workflow",
+        root_session_id="planning-session",
     )
     task = asyncio.create_task(runner.run())
     await started.wait()
@@ -81,12 +83,16 @@ async def test_uncertain_turn_waits_for_reconciliation_without_resubmission(
     assert runner.nodes["root"].summary == "Recovered result"
     assert runner.nodes["root"].members["lead"].session_id == "session-known"
     assert runner.events["resolved"].status == "applied"
+    assert runner.snapshot()["workflow_id"] == "saved-workflow"
+    assert runner.snapshot()["root_session_id"] == "planning-session"
     assert calls == ["root.1.work.lead"]
 
 
+@pytest.mark.parametrize("legacy_checkpoint", [False, True])
 async def test_saved_completed_turn_is_reused_before_candidate_commit(
     owner_workflow: Workflow,
     tmp_path: Path,
+    legacy_checkpoint: bool,
 ) -> None:
     snapshots = []
 
@@ -113,7 +119,12 @@ async def test_saved_completed_turn_is_reused_before_candidate_commit(
     async def must_not_execute(request: MemberRequest) -> str:
         pytest.fail("A completed turn was replayed")
 
+    if legacy_checkpoint:
+        saved.pop("workflow_id")
+        saved.pop("root_session_id")
     restored = WorkflowRunner.restore(saved, must_not_execute)
+    assert restored.workflow_id is None
+    assert restored.root_session_id is None
     await restored.run()
     assert restored.status == "succeeded"
     assert restored.nodes["root"].summary == "done"

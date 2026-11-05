@@ -237,3 +237,17 @@ that the server removes the managed hosts after session deletion; actual cloud
 resource termination remains the provider's responsibility and is not independently
 verified. It allocates compute and calls models, so it is excluded from normal CI.
 A passing mocked test does not establish compatibility with a live deployment.
+
+## Root-session references in integrations
+
+An embedding application can pass `workflow_id` and `root_session_id` to
+`WorkflowRunner(workflow, executor, ...)`. The engine retains these identifiers
+in checkpoints across repair, cancellation and restart, and passes them to each
+member request. The generic session executor adds `omnigent.workflow.id` and
+`omnigent.workflow.root_session` labels to the sessions it creates.
+
+The application owns root-session creation, permissions and the saved design.
+These references do not change a member's session parent, sandbox, runner or
+credentials. Older checkpoints restore with both fields unset; standalone CLI
+runs continue to work without a root session. The saved-workflow API and designer
+provide the application integration separately.
