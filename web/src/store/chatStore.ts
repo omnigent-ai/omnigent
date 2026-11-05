@@ -4919,8 +4919,15 @@ function pendingBubbleFromSnapshot(input: PendingInput): PendingUserMessage {
   };
 }
 
-// The newest startup re-read per conversation; an older one that lands later is dropped.
-const startupReads = new Map<string, number>();
+// The newest startup re-read per conversation, and the inputs delivered while it
+// was out. Read numbers are never reused, so an older read can't pass for it.
+let startupReadCount = 0;
+const startupReads = new Map<string, { read: number; delivered: Set<string> }>();
+
+/** Note a delivered startup input, so a re-read still in flight doesn't bring it back. */
+function noteStartupInputDelivered(id: string, pendingId: string): void {
+  startupReads.get(id)?.delivered.add(pendingId);
+}
 
 /**
  * Re-read a session's saved startup messages after its launch failed or was retried.
@@ -4934,29 +4941,38 @@ const startupReads = new Map<string, number>();
  * @param showQueued - Also show the messages the server queued again as sending.
  */
 async function refreshStartupInputs(id: string, showQueued = false): Promise<void> {
-  const read = (startupReads.get(id) ?? 0) + 1;
-  startupReads.set(id, read);
+  startupReadCount += 1;
+  const read = startupReadCount;
+  // Deliveries seen by a read this one replaces still postdate its snapshot.
+  const delivered = startupReads.get(id)?.delivered ?? new Set<string>();
+  startupReads.set(id, { read, delivered });
   let session: Session | null = null;
   try {
     session = await getSessionSlim(id);
   } catch {
     // The next bind reads the snapshot again.
   }
-  if (startupReads.get(id) !== read) return;
+  if (startupReads.get(id)?.read !== read) return;
   startupReads.delete(id);
   if (session === null) return;
   const fresh = session;
   queryClient?.setQueryData(["session", id], fresh);
+  const undelivered = (inputs: PendingInput[] | undefined) =>
+    (inputs ?? []).filter((input) => !delivered.has(input.pendingId));
   setterFor(id)((s) => {
-    const pending = withoutFailedInputs(s.pendingUserMessages, fresh.failedInputs ?? []);
+    const failedInputs = undelivered(fresh.failedInputs);
+    const pending = withoutFailedInputs(s.pendingUserMessages, failedInputs);
     const shown = new Set(pending.flatMap((message) => [message.tempId, message.pendingId]));
     const queued = showQueued
-      ? (fresh.pendingInputs ?? []).filter((input) => !shown.has(input.pendingId))
+      ? undelivered(fresh.pendingInputs).filter((input) => !shown.has(input.pendingId))
       : [];
     // Only the startup fields: live events stay newer than this read for the
-    // rest, e.g. a "failed" launch stage a replica without the launch doesn't know.
+    // rest, e.g. a "failed" launch stage a replica without the launch doesn't know,
+    // or a delivery that ended the startup the snapshot still shows.
+    const { startupPending } = startupInputsPatch(fresh);
     return {
-      ...startupInputsPatch(fresh),
+      ...(delivered.size === 0 ? { startupPending } : {}),
+      failedInputs,
       pendingUserMessages: [...pending, ...queued.map(pendingBubbleFromSnapshot)],
     };
   });
@@ -8257,6 +8273,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             },
       );
       if (event.stage === "failed") void refreshStartupInputs(event.conversationId);
+      // A relaunch, maybe from another tab: its undelivered messages are sending again.
+      if (
+        event.stage === "provisioning" &&
+        (setterForState(event.conversationId)?.failedInputs.length ?? 0) > 0
+      ) {
+        void refreshStartupInputs(event.conversationId, true);
+      }
       // The sandbox host is bound before its runner starts; refetch the binding and a
       // host list cached before that host registered, so the composer can name it.
       if (event.stage === "connecting" || event.stage === "ready") {
@@ -8768,8 +8791,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // without a fresh transition, would strand the queue forever.
       return;
     }
-    case "session_input_consumed":
+    case "session_input_consumed": {
       applyToConversation({ startupPending: false });
+      const deliveredId = event.clearedPendingId;
+      if (deliveredId) {
+        // Delivered, maybe by another tab's retry, so it is no longer undelivered here.
+        if (sourceConversationId) noteStartupInputDelivered(sourceConversationId, deliveredId);
+        applyToConversation((s) =>
+          s.failedInputs.some((input) => input.pendingId === deliveredId)
+            ? { failedInputs: s.failedInputs.filter((input) => input.pendingId !== deliveredId) }
+            : {},
+        );
+      }
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt,
@@ -8950,6 +8983,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         };
       });
       return;
+    }
     case "slash_command":
       // Claude-native: a `/skill-name` or surfaced CLI command typed
       // in the web composer round-trips through tmux → Claude TUI →

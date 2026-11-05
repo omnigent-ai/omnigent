@@ -7874,6 +7874,126 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
     });
 
+    describe("startup re-reads", () => {
+      const lost = { type: "input_text" as const, text: "Summarize the open PRs" };
+      const failedEntry = { pending_id: "pending_first", content: [lost] };
+      const snapshot = (startup: string, queued: unknown[], failed: unknown[]) =>
+        mockResponse({
+          id: "conv_abc",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.startup": startup },
+          pending_elicitations: [],
+          pending_inputs: queued,
+          failed_inputs: failed,
+        });
+      const deferred = () => {
+        let answer!: (response: Response) => void;
+        const response = new Promise<Response>((resolve) => {
+          answer = resolve;
+        });
+        return { response, answer };
+      };
+      const failLaunch = () =>
+        handleSessionEvent({
+          type: "session_sandbox_status",
+          conversationId: "conv_abc",
+          stage: "failed",
+          error: "managed host did not come online",
+        });
+
+      it("drops a failure read that lands after the retry's read", async () => {
+        const early = deferred();
+        const retried = deferred();
+        fetchMock
+          .mockImplementationOnce(() => early.response)
+          .mockResolvedValueOnce(snapshot("failed", [], [failedEntry]))
+          .mockResolvedValueOnce(mockResponse({ queued: true, recovery: "sandbox_relaunched" }))
+          .mockImplementationOnce(() => retried.response);
+        useChatStore.setState({ failedInputs: [], pendingUserMessages: [] });
+
+        failLaunch();
+        failLaunch();
+        await vi.waitFor(() => expect(useChatStore.getState().failedInputs).toHaveLength(1));
+        const retry = retryFailedStartup("conv_abc");
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+        early.answer(snapshot("failed", [], [failedEntry]));
+        retried.answer(snapshot("pending", [failedEntry], []));
+        await retry;
+
+        expect(useChatStore.getState()).toMatchObject({
+          failedInputs: [],
+          pendingUserMessages: [{ tempId: "pending_first", content: [lost] }],
+        });
+      });
+
+      it("doesn't bring back a retried message delivered while the re-read was out", async () => {
+        const retried = deferred();
+        fetchMock
+          .mockResolvedValueOnce(mockResponse({ queued: true, recovery: "sandbox_relaunched" }))
+          .mockImplementationOnce(() => retried.response);
+        useChatStore.setState({
+          isNativeTerminalSession: true,
+          startupPending: false,
+          failedInputs: [{ pendingId: "pending_first", content: [lost] }],
+          pendingUserMessages: [],
+        });
+
+        const retry = retryFailedStartup("conv_abc");
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "item_first",
+          itemType: "message",
+          data: { role: "user", content: [lost] },
+          clearedPendingId: "pending_first",
+        });
+        retried.answer(snapshot("pending", [failedEntry], []));
+        await retry;
+
+        const state = useChatStore.getState();
+        expect(state.pendingUserMessages).toEqual([]);
+        expect(state.failedInputs).toEqual([]);
+        expect(state.startupPending).toBe(false);
+        expect(state.blocks.filter((block) => block.type === "user_message")).toHaveLength(1);
+      });
+
+      it("follows another tab's relaunch and delivery", async () => {
+        fetchMock.mockResolvedValueOnce(snapshot("pending", [failedEntry], []));
+        useChatStore.setState({
+          failedInputs: [{ pendingId: "pending_first", content: [lost] }],
+          pendingUserMessages: [],
+        });
+
+        handleSessionEvent({
+          type: "session_sandbox_status",
+          conversationId: "conv_abc",
+          stage: "provisioning",
+          error: null,
+        });
+        await vi.waitFor(() => expect(useChatStore.getState().failedInputs).toEqual([]));
+        expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+          { tempId: "pending_first" },
+        ]);
+
+        // A receipt alone also clears it, e.g. when that relaunch's stage went unseen.
+        useChatStore.setState({
+          failedInputs: [{ pendingId: "pending_first", content: [lost] }],
+          pendingUserMessages: [],
+        });
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "item_first",
+          itemType: "message",
+          data: { role: "user", content: [lost] },
+          clearedPendingId: "pending_first",
+        });
+        expect(useChatStore.getState().failedInputs).toEqual([]);
+      });
+    });
+
     it("learns the provisioned host without a browser message POST", async () => {
       fetchMock.mockResolvedValueOnce(
         mockResponse({

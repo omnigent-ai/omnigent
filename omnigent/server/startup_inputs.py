@@ -38,6 +38,7 @@ from omnigent.server.scheduled.telemetry import (
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
 from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     ConversationNotFoundError,
     ConversationStore,
 )
@@ -132,6 +133,33 @@ def wake_startup_worker(host_id: str) -> None:
             entry[2].set()
 
 
+def _relaunch_host_id(labels: dict[str, str]) -> str | None:
+    """
+    The host id a retried first launch asks for, or ``None`` to mint one.
+
+    A continue automation's sandbox keeps its task-derived id, which every later
+    run checks; the scheduler re-requests that id the same way. Any other create
+    that chose its host's id (to route by it) gets a fresh one, since the failed
+    host's id stays reserved until its sandbox is cleaned up.
+
+    :param labels: The session's labels.
+    :returns: The host id to request.
+    """
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+
+    requested = labels.get(REQUESTED_HOST_ID_LABEL_KEY)
+    if requested is None:
+        return None
+    task_id = labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
+    with contextlib.suppress(ValueError):
+        if task_id is not None and requested == continued_sandbox_host_id(
+            task_id, current_workspace_id()
+        ):
+            return requested
+    return uuid4().hex
+
+
 class ManagedStartupInputs:
     """Recover pending conversation items on the replica connected to their host."""
 
@@ -142,7 +170,6 @@ class ManagedStartupInputs:
         self.dispatch: StartupDispatch | None = None
         # The create's managed-launch scheduler, used to retry a failed first launch.
         self.schedule_launch: Callable[..., Coroutine[Any, Any, None]] | None = None
-        self._relaunching: set[tuple[int, str]] = set()
         self._workers: dict[
             tuple[int, str], tuple[HostConnection, asyncio.Task[None], asyncio.Event]
         ] = {}
@@ -571,48 +598,62 @@ class ManagedStartupInputs:
         :param request: The ``retry_session`` request (for ``app.state``).
         :param conv: The session being retried.
         :param user_id: The caller, used when the session has no owner grant.
-        :returns: ``True`` when a launch for the session is now under way,
-            ``False`` when the session has a host or its startup didn't fail.
+        :returns: ``True`` when a launch for the session is now under way, by
+            this request or a concurrent one; ``False`` when the session has a
+            host, its startup didn't fail, or it holds no undelivered input.
         """
         from omnigent.server.managed_hosts import (
             MANAGED_PROVIDER_LABEL_KEY,
-            REQUESTED_HOST_ID_LABEL_KEY,
             read_managed_repo_workspaces,
         )
 
         if self.schedule_launch is None or conv.host_id is not None:
             return False
-        key = (current_workspace_id(), conv.id)
         launch = request.app.state.managed_launches.get(conv.id)
-        if key in self._relaunching or (launch is not None and not launch.settled.is_set()):
+        if launch is not None and not launch.settled.is_set():
             return True
         if conv.labels.get(STARTUP_LABEL) != "failed":
             return False
-        self._relaunching.add(key)
+        failed = [
+            item
+            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
+            if item.status == "failed"
+        ]
+        if not failed:
+            return False
+        # Moving the first input back is the claim: of concurrent retries on any
+        # replica, only the one whose transition lands provisions a sandbox.
+        if not await self._requeue(conv.id, failed[0].id):
+            return True
+        for item in failed[1:]:
+            await self._requeue(conv.id, item.id)
+        owner = await asyncio.to_thread(
+            self.conversations.get_session_owner, conv.id, owner_only=True
+        )
         try:
-            await self.retry(conv.id)
-            owner = await asyncio.to_thread(
-                self.conversations.get_session_owner, conv.id, owner_only=True
+            await self.schedule_launch(
+                request,
+                session_id=conv.id,
+                agent_id=conv.agent_id,
+                user_id=owner or user_id,
+                sandbox_provider=conv.labels.get(MANAGED_PROVIDER_LABEL_KEY),
+                workspaces=read_managed_repo_workspaces(conv.labels),
+                requested_host_id=_relaunch_host_id(conv.labels),
             )
-            # The failed host's id stays reserved until its sandbox is cleaned up, so a
-            # create that chose its host's id (to route by it) chooses a fresh one.
-            requested_host_id = uuid4().hex if REQUESTED_HOST_ID_LABEL_KEY in conv.labels else None
-            try:
-                await self.schedule_launch(
-                    request,
-                    session_id=conv.id,
-                    agent_id=conv.agent_id,
-                    user_id=owner or user_id,
-                    sandbox_provider=conv.labels.get(MANAGED_PROVIDER_LABEL_KEY),
-                    workspaces=read_managed_repo_workspaces(conv.labels),
-                    requested_host_id=requested_host_id,
-                )
-            except Exception as exc:
-                await self.record_launch_failure(conv.id, str(exc))
-                raise
-        finally:
-            self._relaunching.discard(key)
+        except Exception as exc:
+            await self.record_launch_failure(conv.id, str(exc))
+            raise
         return True
+
+    async def _requeue(self, session_id: str, item_id: str) -> bool:
+        """Queue a failed input for delivery again; ``False`` if another request did."""
+        return await asyncio.to_thread(
+            self.conversations.transition_pending_input,
+            session_id,
+            item_id,
+            expected="failed",
+            status="in_progress",
+        )
 
     async def cancel(self, session_id: str) -> None:
         items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
