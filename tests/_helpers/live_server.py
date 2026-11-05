@@ -117,6 +117,10 @@ def serve_app_in_thread(app: ASGIApp) -> Iterator[str]:
             # Stop the daemon thread too, or it outlives the failed caller.
             server.should_exit = True
             thread.join(timeout=10)
+            if thread.is_alive():
+                raise RuntimeError(
+                    "app did not start, and uvicorn did not exit within the join timeout"
+                )
             raise RuntimeError("app did not start")
         time.sleep(0.05)
     port = server.servers[0].sockets[0].getsockname()[1]
