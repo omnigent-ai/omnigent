@@ -363,7 +363,8 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # silently truncated at the 256-char label-value cap, losing repos on relaunch.
 # Per-session state: a fork never inherits them (the store drops the whole
 # ``<base>.`` family, and the fork's own launch re-stamps whatever it resolves),
-# while an in-place agent switch keeps them — the sandbox is unchanged.
+# while an in-place agent switch or a continuation in the same sandbox (claude-sdk
+# ``/clear``) keeps them — the sandbox is unchanged.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 
 # Server-owned routing id from a managed create's or fork's ``host_id``:
@@ -4640,6 +4641,34 @@ async def terminate_managed_host(
                     tombstone.host_id,
                     sandbox_id=sandbox_id,
                 )
+
+
+async def release_session_managed_host(
+    host_id: str,
+    host_store: HostStore,
+    config: ManagedSandboxDeployment | None,
+    *,
+    capture_logs: bool = False,
+) -> None:
+    """
+    Tear down a gone session's managed sandbox unless another session uses it.
+
+    For a session row that was just deleted: a host with no sandbox provider
+    (e.g. a laptop) is never touched, and a managed host another session is
+    still bound to (e.g. a ``/clear`` continuation) is kept.
+
+    :param host_id: The deleted session's host.
+    :param host_store: Store holding the host row.
+    :param config: The deployment's sandbox config, or ``None`` (the row is
+        still deleted and its token revoked).
+    :param capture_logs: Log the sandbox's log tails before terminating.
+    """
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or host.sandbox_provider is None:
+        return
+    await terminate_managed_host(
+        host, host_store, config, keep_if_bound=True, capture_logs=capture_logs
+    )
 
 
 async def _log_sandbox_logs_best_effort(
