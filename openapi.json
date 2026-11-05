@@ -16,6 +16,16 @@
             "description": "Plain-text snapshot of the selected range, used to re-anchor the comment after file edits. `None` if not provided.",
             "title": "Anchor Content"
           },
+          "anchor_metadata": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PullRequestCommentAnchor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "body": {
             "description": "The comment text.",
             "title": "Body",
@@ -5187,6 +5197,54 @@
           "ordered_project_ids"
         ],
         "title": "ProjectOrderResponse",
+        "type": "object"
+      },
+      "PullRequestCommentAnchor": {
+        "description": "Immutable PR coordinates for a session-only review comment.",
+        "properties": {
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "line": {
+            "format": "int64",
+            "title": "Line",
+            "type": "integer"
+          },
+          "pr_url": {
+            "title": "Pr Url",
+            "type": "string"
+          },
+          "side": {
+            "title": "Side",
+            "type": "string"
+          },
+          "start_line": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Line"
+          }
+        },
+        "required": [
+          "pr_url",
+          "side",
+          "line",
+          "start_line",
+          "head_sha",
+          "base_sha"
+        ],
+        "title": "PullRequestCommentAnchor",
         "type": "object"
       },
       "QueuedEvent": {

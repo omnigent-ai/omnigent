@@ -469,6 +469,11 @@ export function PullRequestChangesTab({
     if (
       !selected ||
       !navigationTarget ||
+      changes.isLoading ||
+      changes.isFetching ||
+      prDiff.isLoading ||
+      prDiff.isFetching ||
+      sessionComments.isFetching ||
       navigationTarget.anchor_metadata?.pr_url !== selectedPrUrl
     )
       return;
@@ -486,7 +491,7 @@ export function PullRequestChangesTab({
     reveal(navigationTarget.path);
     const container = scrollRef.current;
     if (!container) return;
-    // Wait through query loading and lazy diff rendering, within this panel only.
+    // Wait for the final placement; loading fallbacks are replaced by inline annotations.
     let frame = 0;
     const focusComment = () => {
       const element = container.querySelector<HTMLElement>(
@@ -509,6 +514,10 @@ export function PullRequestChangesTab({
       cancelAnimationFrame(frame);
     };
   }, [
+    changes.isLoading,
+    changes.isFetching,
+    prDiff.isLoading,
+    prDiff.isFetching,
     conversationId,
     navigationTarget,
     reveal,
