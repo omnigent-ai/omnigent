@@ -1260,11 +1260,19 @@ def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
 
 
 @pytest.mark.posix_only
-@pytest.mark.parametrize("launched_by", ["command", "launcher-plugin"])
+@pytest.mark.parametrize(
+    ("launched_by", "change"),
+    [
+        ("command", "executable"),
+        ("launcher-plugin", "executable"),
+        ("launcher-plugin", "args"),
+        ("launcher-plugin", "launcher-name"),
+    ],
+)
 def test_unchanged_claude_launch_is_probed_once_until_it_changes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launched_by: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launched_by: str, change: str
 ) -> None:
-    """Repeated catalogs reuse one answer until the launcher changes or the safety TTL passes.
+    """Repeated catalogs reuse one answer until the launch changes or the safety TTL passes.
 
     A launcher plugin picks its executable itself, so that executable is checked too.
     """
@@ -1301,7 +1309,14 @@ def test_unchanged_claude_launch_is_probed_once_until_it_changes(
     assert [launch_count(workspace) for workspace in ("first", "second", "first")] == [1, 1, 1]
     now[0] = plugin_discovery.LAUNCH_PLUGINS_TTL_S - 1
     assert launch_count("second") == 1
-    install(_print_init([]) + "# upgraded\n")
+    if change == "executable":
+        install(_print_init([]) + "# upgraded\n")
+    elif change == "args":
+        (config_home / "config.yaml").write_text(
+            json.dumps({"harness": {"claude-native": {"args": ["--debug"]}}})
+        )
+    else:
+        monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "renamed")
     assert launch_count("second") == 2
     # Past the TTL the last answer is served while one background probe refreshes it.
     generation = plugin_discovery.launch_plugins_generation()
