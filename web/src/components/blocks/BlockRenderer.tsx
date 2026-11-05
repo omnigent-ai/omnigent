@@ -1019,11 +1019,12 @@ function renderItem(
   }
 }
 
-// Any indent: a list item's continuation lines carry its content indent.
-const REFERENCE_DEFINITION = /^\s*\[(?!\^)(?:[^[\]\\]|\\.)+\]:/;
+// Any indent: a list item's continuation lines carry its content indent. A caret
+// followed by more label text is a footnote; a bare `[^]` is an ordinary label.
+const REFERENCE_DEFINITION = /^\s*\[(?!\^[^\]])(?:[^[\]\\]|\\.)+\]:/;
 // A label opened on this line and still open at its end (where a backslash may end
 // it), then the rest of one.
-const LABEL_OPEN = /^\s*\[(?!\^)((?:[^[\]\\]|\\.)*\\?)$/;
+const LABEL_OPEN = /^\s*\[(?!\^[^\]])((?:[^[\]\\]|\\.)*\\?)$/;
 const LABEL_REST = /^((?:[^[\]\\]|\\.)*\\?)(\]:)?/;
 const LINE_ENDING = /\r\n?|\n/;
 const MAX_LABEL_LENGTH = 999;

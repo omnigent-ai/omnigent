@@ -411,11 +411,18 @@ describe("BlockRenderer dispatch", () => {
   });
 
   it.each([
-    ["at the top level", "[docs]: https://example.com/docs"],
-    ["in a blockquote", "> [docs]: https://example.com/docs"],
-    ["in a blockquote inside a list item", "10. q\n\n    > [docs]: https://example.com/docs"],
-    ["after CR line endings", "Notes.\r\r[docs]: https://example.com/docs"],
-  ])("resolves a settled streamed reply's reference link defined %s", (_where, definition) => {
+    ["at the top level", "See [the docs][docs].\n\n[docs]: https://example.com/docs"],
+    ["in a blockquote", "See [the docs][docs].\n\n> [docs]: https://example.com/docs"],
+    [
+      "in a blockquote inside a list item",
+      "See [the docs][docs].\n\n10. q\n\n    > [docs]: https://example.com/docs",
+    ],
+    [
+      "after CR line endings",
+      "See [the docs][docs].\n\nNotes.\r\r[docs]: https://example.com/docs",
+    ],
+    ["with a caret-only label", "See [the docs][^].\n\n[^]: https://example.com/docs"],
+  ])("resolves a settled streamed reply's reference link defined %s", (_where, text) => {
     // Streamed text stays in streaming mode, which renders each block alone, so a
     // reply with a link definition in another block settles into static mode.
     render(
@@ -425,7 +432,7 @@ describe("BlockRenderer dispatch", () => {
             {
               kind: "text",
               itemId: "t1",
-              text: `See [the docs][docs].\n\n${definition}`,
+              text,
               final: true,
               streamKey: "text#0",
             },
@@ -480,6 +487,7 @@ describe("BlockRenderer dispatch", () => {
     ["an unescaped bracket in the label", "[foo[bar]: text", false],
     ["a split label broken by a blank line", "[foo\n\nbar]: /url", false],
     ["a footnote definition", "[^1]: A note.", false],
+    ["a caret-only label", "See [docs][^].\n\n[^]: https://example.com/docs", true],
     ["plain prose", "Done. There are two names in the file.", false],
   ])("mayDefineReferenceLink: %s", (_case, text, expected) => {
     expect(mayDefineReferenceLink(text)).toBe(expected);
