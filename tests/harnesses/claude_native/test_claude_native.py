@@ -224,6 +224,17 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
     assert captured_warnings == []
 
 
+def test_documented_managed_relay_entry_matches_the_one_omnigent_reads() -> None:
+    """Operators copy the entry from the docs, so it must be the shape the relay expands."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    doc = (Path(__file__).parents[3] / "docs" / "CLAUDE_MANAGED_MCP.md").read_text()
+    documented = json.loads(doc.split("```json\n", 1)[1].split("```", 1)[0])
+    assert documented == {
+        "mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}
+    }
+
+
 def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
