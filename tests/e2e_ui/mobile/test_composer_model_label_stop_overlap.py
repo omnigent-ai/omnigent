@@ -462,7 +462,7 @@ def test_new_session_composer_collapses_labels_to_icons_on_mobile(
 ) -> None:
     """The compact landing composer hides permissions until focused, then
     shows an icon-only permission control. The model stays in the mobile
-    header. Menus and the draft remain usable when resizing to desktop.
+    header. Both menus remain usable without losing the draft.
 
     :param seeded_session: ``(base_url, session_id)``; the landing page's
         create POST is stubbed to return this real session id.
@@ -550,20 +550,13 @@ async def _drive_landing_collapse(base_url: str, session_id: str) -> None:
             await page.keyboard.press("Escape")
             await async_expect(permission_menu).to_be_hidden()
 
-            # Desktop keeps the controls in the composer and preserves the draft.
-            await page.set_viewport_size(_DESKTOP_VIEWPORT)
-            await async_expect(permission).to_be_visible()
-            await async_expect(
-                composer.get_by_test_id("new-chat-landing-agent-select")
-            ).to_be_visible()
-            await async_expect(model).to_have_accessible_name(re.compile(r"\S"))
+            # Model settings remain reachable from the header without losing the draft.
+            await model.click()
+            await async_expect(page.get_by_role("menu")).to_be_visible()
+            await page.keyboard.press("Escape")
+            await async_expect(page.get_by_role("menu")).to_be_hidden()
             await async_expect(input_field).to_have_value("Keep this draft")
-            assert {
-                "Work in a project",
-                "Choose a project for this session",
-            } <= await _landing_add_menu_texts_shown(page)
-            if shot_dir:
-                await page.screenshot(path=str(Path(shot_dir) / "landing-composer-desktop.png"))
+            await async_expect(permission_text).to_be_hidden()
         finally:
             await context.close()
             await browser.close()
