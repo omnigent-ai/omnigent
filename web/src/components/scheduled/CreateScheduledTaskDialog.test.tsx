@@ -357,7 +357,7 @@ describe("prompt-first automation setup", () => {
     );
     const advanced = screen.getByRole("button", { name: "Advanced" });
     expect(advanced).toHaveAttribute("aria-expanded", "false");
-    expect(advanced).toHaveTextContent("opus · high");
+    expect(advanced).toHaveTextContent("Opus · High");
     fireEvent.change(screen.getByLabelText("Instructions"), {
       target: { value: "Also summarize CI failures" },
     });
@@ -416,6 +416,12 @@ describe("prompt-first automation setup", () => {
     );
     expect(screen.getByLabelText("End date")).toBeVisible();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    expect(screen.queryByLabelText("End date")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Expand Advanced to fix settings");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    expect(screen.getByLabelText("End date")).toBeVisible();
   });
 
   it("edits time directly and opens only the timezone dropdown", async () => {
@@ -1140,6 +1146,9 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
         expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
         expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
         expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
+        expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
+          "Sonnet · Medium · Accept edits",
+        );
       }
       if (pick !== null) {
         fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
@@ -1523,11 +1532,7 @@ describe("CreateScheduledTaskDialog submit", () => {
       }
       expect(screen.getByLabelText("Minute of the hour")).toHaveValue(0);
       expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
-      if (preset === "Custom schedule") {
-        expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
-      } else {
-        expect(screen.getByLabelText("Minute of the hour")).toHaveValue(0);
-      }
+      expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
     },
   );
 
@@ -2048,6 +2053,9 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
         expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
         expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Plan");
+        expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
+          "Sonnet · Medium · Plan",
+        );
         for (const field of ["model", "effort", "permission"]) {
           expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
         }

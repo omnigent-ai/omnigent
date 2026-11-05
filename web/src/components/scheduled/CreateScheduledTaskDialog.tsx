@@ -615,11 +615,25 @@ export function CreateScheduledTaskDialog({
   useEffect(() => {
     if (open && advancedError) setAdvancedOpen(true);
   }, [open, advancedError]);
+  const displayedModel = reusesExistingSession ? (editingTask?.modelOverride ?? "") : pickedModel;
+  const displayedEffort = reusesExistingSession
+    ? (editingTask?.reasoningEffort ?? "")
+    : pickedEffort;
+  const displayedPermission = reusesExistingSession
+    ? (editingTask?.permissionMode ?? "")
+    : effectivePermission;
+  const summarySettings = editingWorkerSettings ? workerHarnessSettings : harnessSettings;
+  const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
+  const summaryEffort = editingWorkerSettings ? (workerSettings?.effort ?? "") : displayedEffort;
+  const summaryPermission = editingWorkerSettings ? "" : displayedPermission;
   const overrideSummary = [
-    pickedModel || null,
-    pickedEffort || null,
-    pickedPermission || null,
-    schedule.end ? "End limit" : null,
+    summarySettings.models.find((option) => option.id === summaryModel)?.displayName ??
+      summaryModel,
+    summarySettings.efforts.find((option) => option.value === summaryEffort)?.label ??
+      summaryEffort,
+    summarySettings.permissions.find((option) => option.value === summaryPermission)?.label ??
+      summaryPermission,
+    !triggerMode && schedule.end ? "End limit" : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -1068,6 +1082,11 @@ export function CreateScheduledTaskDialog({
                   </p>
                 )}
 
+                {!advancedOpen && advancedError && (
+                  <p role="alert" className="text-sm text-destructive">
+                    Expand Advanced to fix settings before saving.
+                  </p>
+                )}
                 <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
                   <CollapsibleTrigger className="group/advanced flex w-full cursor-pointer items-center gap-2 rounded-sm py-1 text-ui text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
                     <span>Advanced</span>
@@ -1368,21 +1387,9 @@ export function CreateScheduledTaskDialog({
                           {showAdvanced && (
                             <div data-testid="task-model-effort-field">
                               <ModelEffortFields
-                                model={
-                                  reusesExistingSession
-                                    ? (editingTask?.modelOverride ?? "")
-                                    : pickedModel
-                                }
-                                effort={
-                                  reusesExistingSession
-                                    ? (editingTask?.reasoningEffort ?? "")
-                                    : pickedEffort
-                                }
-                                permissionMode={
-                                  reusesExistingSession
-                                    ? (editingTask?.permissionMode ?? "")
-                                    : effectivePermission
-                                }
+                                model={displayedModel}
+                                effort={displayedEffort}
+                                permissionMode={displayedPermission}
                                 settings={harnessSettings}
                                 disabled={curationPending || reusesExistingSession}
                                 onModelChange={handleModelChange}

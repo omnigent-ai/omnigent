@@ -85,6 +85,10 @@ const readyHost: Host = {
 
 function renderPicker(props: {
   open?: boolean;
+  openNonce?: number;
+  autoHarnessAvailable?: boolean;
+  onSelectAutoHarness?: () => void;
+  selectedConfigContent?: React.ReactNode;
   onOpenChange?: (open: boolean) => void;
   harnessEntries: AvailableAgent[];
   agentEntries?: AvailableAgent[];
@@ -99,12 +103,16 @@ function renderPicker(props: {
   host?: Host;
   onPrefetchEntries?: (ids: string[]) => void;
 }) {
-  const picker = (open = props.open) => (
+  const picker = (open = props.open, openNonce = props.openNonce) => (
     <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
       <StoryQueryRouter>
         <TooltipProvider>
           <AgentHarnessPicker
             open={open}
+            openNonce={openNonce}
+            autoHarnessAvailable={props.autoHarnessAvailable}
+            onSelectAutoHarness={props.onSelectAutoHarness}
+            selectedConfigContent={props.selectedConfigContent}
             onOpenChange={props.onOpenChange}
             agentEntries={props.agentEntries ?? []}
             harnessEntries={props.harnessEntries}
@@ -128,7 +136,11 @@ function renderPicker(props: {
     </CapabilitiesProvider>
   );
   const view = render(picker());
-  return { ...view, rerenderOpen: (open: boolean) => view.rerender(picker(open)) };
+  return {
+    ...view,
+    rerenderOpen: (open: boolean) => view.rerender(picker(open)),
+    rerenderNonce: (nonce: number) => view.rerender(picker(props.open, nonce)),
+  };
 }
 
 async function openPicker(): Promise<void> {
@@ -151,7 +163,14 @@ afterEach(() => {
 describe("AgentHarnessPicker inline harness list", () => {
   it("lets a parent control visibility while reporting close requests", async () => {
     const onOpenChange = vi.fn();
-    const view = renderPicker({ harnessEntries: [claude], open: true, onOpenChange });
+    const onPrefetchEntries = vi.fn();
+    const view = renderPicker({
+      harnessEntries: [claude],
+      open: true,
+      onOpenChange,
+      onPrefetchEntries,
+    });
+    expect(onPrefetchEntries).toHaveBeenCalledWith([claude.id]);
     expect(screen.getByRole("menu")).toBeVisible();
     await userEvent.click(screen.getByTestId(`new-chat-landing-agent-${claude.id}`));
     expect(onOpenChange).toHaveBeenCalledWith(false);
@@ -160,6 +179,34 @@ describe("AgentHarnessPicker inline harness list", () => {
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
     view.rerenderOpen(true);
     expect(screen.getByRole("menu")).toBeVisible();
+    expect(onPrefetchEntries).toHaveBeenCalledTimes(2);
+  });
+
+  it("requests controlled hotkey opens and resets configuration before Smart Routing selection", async () => {
+    const onOpenChange = vi.fn();
+    const onSelectAutoHarness = vi.fn();
+    const view = renderPicker({
+      harnessEntries: [claude],
+      effectiveAgentId: claude.id,
+      open: false,
+      openNonce: 0,
+      onOpenChange,
+      autoHarnessAvailable: true,
+      onSelectAutoHarness,
+      selectedConfigContent: <button type="button">Configured model</button>,
+    });
+    view.rerenderNonce(1);
+    expect(onOpenChange).toHaveBeenCalledWith(true);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    view.rerenderOpen(true);
+    expect(await screen.findByRole("button", { name: "Configured model" })).toBeVisible();
+    view.rerenderOpen(false);
+    view.rerenderOpen(true);
+    expect(screen.queryByRole("button", { name: "Configured model" })).not.toBeInTheDocument();
+    onOpenChange.mockClear();
+    await userEvent.click(screen.getByTestId("new-chat-landing-harness-smart-routing"));
+    expect(onSelectAutoHarness).toHaveBeenCalledOnce();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it("keeps the preferred harnesses inline when they are seeded", async () => {
