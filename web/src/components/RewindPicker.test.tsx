@@ -13,7 +13,7 @@ function renderPicker(open = true) {
     view.rerender(
       <RewindPicker sessionId="conv_abc" open={next} onOpenChange={onOpenChange} onPick={onPick} />,
     );
-  return { onPick, reopen };
+  return { onPick, onOpenChange, reopen };
 }
 
 const rowTexts = (picker: HTMLElement) =>
@@ -68,6 +68,48 @@ describe("RewindPicker", () => {
       itemId: "msg_oldest",
       text: "Set up the repo",
     });
+  });
+
+  it("moves, loads older prompts and picks one from the keyboard alone", async () => {
+    vi.spyOn(sessionsApi, "fetchRewindPrompts")
+      .mockResolvedValueOnce({
+        prompts: [
+          { itemId: "msg_recent", text: "Add parser tests" },
+          { itemId: "msg_middle", text: "Fix the lexer" },
+        ],
+        olderCursor: "msg_cursor",
+      })
+      .mockResolvedValueOnce({
+        prompts: [{ itemId: "msg_oldest", text: "Set up the repo" }],
+        olderCursor: null,
+      });
+    const { onPick, onOpenChange } = renderPicker();
+    const picker = await screen.findByTestId("rewind-picker");
+    await within(picker).findAllByTestId("rewind-prompt");
+    const search = within(picker).getByRole("combobox");
+    expect(search).toHaveFocus();
+    const highlighted = () => within(picker).getByRole("option", { selected: true }).textContent;
+
+    expect(highlighted()).toBe("Add parser tests");
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(highlighted()).toBe("Load older prompts");
+    fireEvent.keyDown(search, { key: "Enter" });
+    await within(picker).findByText("Set up the repo");
+    expect(onPick).not.toHaveBeenCalled();
+
+    // The list loops, so ArrowUp from the newest prompt reaches the oldest.
+    fireEvent.keyDown(search, { key: "Home" });
+    fireEvent.keyDown(search, { key: "ArrowUp" });
+    expect(highlighted()).toBe("Set up the repo");
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onPick).toHaveBeenCalledExactlyOnceWith({
+      itemId: "msg_oldest",
+      text: "Set up the repo",
+    });
+
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it("ignores prompts that arrive after it was closed", async () => {
