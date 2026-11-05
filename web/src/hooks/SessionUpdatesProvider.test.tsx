@@ -741,19 +741,20 @@ describe("SessionUpdatesProvider open-session row", () => {
     expect(client.getQueryData(key)).toBeNull();
   });
 
-  it.each([true, false])(
-    "keeps a streamed archive change (archived: %s) and the owner over a late refetch",
-    async (archived) => {
+  it.each([true, false].flatMap((archived) => [true, false].map((changed) => [archived, changed])))(
+    "keeps a streamed archive flag (archived: %s, changed: %s) and the owner over a late refetch",
+    async (archived, changed) => {
       const client = new QueryClient();
       seedConversations(client, ["conv_a"]);
       const key = ["conversation-backfill", "conv_old"];
       client.setQueryData<Conversation>(key, {
         ...conv("conv_old"),
         owner: "teammate",
-        archived: !archived,
+        archived: changed ? !archived : archived,
       });
       let answer: (row: Conversation) => void = () => undefined;
-      // Served before the change: it still carries the old flag.
+      // Served before the frame: it carries the opposite flag, even when the
+      // frame matches the row (an archive and its undo between two rescans).
       const refetching = client.fetchQuery<Conversation | null>({
         queryKey: key,
         queryFn: () =>

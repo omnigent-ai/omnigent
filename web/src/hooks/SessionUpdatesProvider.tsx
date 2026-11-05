@@ -195,8 +195,8 @@ const settlingFirstFetches = new Set<string>();
 /**
  * Apply a streamed archive flag to the open session's fetched sidebar row. Only
  * `archived` is taken, keeping the row's owner. A detail request in flight may
- * have been served before the change, so, as the local archive path does, it is
- * replaced by a fresh one instead of landing the older flag.
+ * have been served before the frame, even one whose flag matches the row, so, as
+ * the local archive path does, it is replaced by a fresh one instead of landing.
  *
  * @param queryClient - The app QueryClient.
  * @param id - The streamed session.
@@ -207,10 +207,11 @@ function settleStreamedArchive(queryClient: QueryClient, id: string, archived: b
   const row = queryClient.getQueryData<Conversation | null>(key);
   const fetching = queryClient.isFetching({ queryKey: key, exact: true }) > 0;
   if (row) {
-    if ((row.archived ?? false) === archived) return;
     if (fetching) void queryClient.cancelQueries({ queryKey: key, exact: true });
-    const patchedRow: Conversation = { ...row, archived };
-    queryClient.setQueryData<Conversation | null>(key, patchedRow);
+    if ((row.archived ?? false) !== archived) {
+      const patchedRow: Conversation = { ...row, archived };
+      queryClient.setQueryData<Conversation | null>(key, patchedRow);
+    }
     if (fetching) void queryClient.invalidateQueries({ queryKey: key, exact: true });
     return;
   }
