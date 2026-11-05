@@ -340,6 +340,20 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-project")).toHaveTextContent("missing-project");
   });
 
+  it.each(["running", "succeeded"] as const)(
+    "shows current session approvals for a %s run",
+    (status) => {
+      setTask(task());
+      setRuns([run({ status, conversationId: "conv_approval", conversationPendingApprovals: 2 })]);
+      renderPage();
+      expect(screen.getByTestId("run-pending-approval")).toHaveTextContent(
+        "Session needs approval",
+      );
+      expect(screen.getByTestId("run-open")).toHaveAttribute("href", "/c/conv_approval");
+      expect(screen.queryByTestId("run-status-label")).not.toBeInTheDocument();
+    },
+  );
+
   it.each([
     ["codex-native", "default", "Agent default"],
     ["cursor-native", "default", "Agent default"],

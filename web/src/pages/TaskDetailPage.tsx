@@ -667,12 +667,21 @@ function RunRow({
               Session cost {formatSessionCostUsd(run.sessionCostUsd)}
             </span>
           )}
-          {inFlightLabel && (
+          {inFlightLabel && !(run.conversationPendingApprovals ?? 0) && (
             <span className="text-xs text-muted-foreground" data-testid="run-status-label">
               {inFlightLabel}
             </span>
           )}
         </span>
+        {(run.conversationPendingApprovals ?? 0) > 0 && run.conversationId && (
+          <span
+            className="text-xs text-amber-600 dark:text-amber-400"
+            role="status"
+            data-testid="run-pending-approval"
+          >
+            Session needs approval · Open to review
+          </span>
+        )}
         {failure && (
           <span className="text-xs text-muted-foreground" data-testid="run-failure">
             {failure.stage && (

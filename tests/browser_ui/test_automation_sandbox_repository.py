@@ -226,3 +226,59 @@ def test_reused_automation_explains_locked_settings(
             expect(
                 page.get_by_role("button", name="Edit worker instructions", exact=True)
             ).to_have_count(0)
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_automation_pending_approval_links_to_session(
+    page: Page, browser_contract: BrowserContract, width: int
+) -> None:
+    page.set_viewport_size({"width": width, "height": 900})
+    with contextmanager(chat_session_handle)(page, browser_contract) as chat:
+        contract = browser_contract
+        contract.json(
+            "/v1/info",
+            {
+                "single_user": True,
+                "automations_enabled": True,
+                "features": {"automations_v2": True},
+            },
+        )
+        task = {
+            "id": "approval-task",
+            "name": "Repository maintenance",
+            "prompt": "Review stale documentation.",
+            "agent_id": chat.agent_id,
+            "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+            "timezone": "UTC",
+            "owner_user_id": "local",
+            "created_at": 1,
+            "updated_at": 1,
+            "state": "active",
+            "session_mode": "continue",
+            "session_id": chat.session_id,
+            "execution_target": "connected_host",
+            "next_run_at": None,
+        }
+        run = {
+            "id": "approval-run",
+            "scheduled_task_id": task["id"],
+            "status": "succeeded",
+            "scheduled_at": 1,
+            "fired_at": 1,
+            "finished_at": 2,
+            "conversation_id": chat.session_id,
+            "conversation_pending_approvals": 1,
+        }
+        contract.json("/v1/scheduled-tasks/approval-task", task)
+        contract.json(
+            "/v1/scheduled-tasks/approval-task/runs", {"runs": [run], "next_cursor": None}
+        )
+        page.goto(f"{contract.base_url}/tasks/approval-task")
+        notice = page.get_by_test_id("run-pending-approval")
+        expect(notice).to_have_text("Session needs approval · Open to review")
+        page.get_by_test_id("run-open").click()
+        expect(page).to_have_url(chat.url)
+        page.go_back()
+        expect(notice).to_have_text("Session needs approval · Open to review")
+        page.get_by_test_id("run-open").hover()
+        expect(notice).to_be_visible()
