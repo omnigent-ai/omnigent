@@ -30,6 +30,7 @@ import {
   useRef,
   useState,
   type ReactNode,
+  type RefObject,
 } from "react";
 import {
   AlertTriangleIcon,
@@ -349,8 +350,9 @@ interface FileViewerProps {
   mobileOverlay?: boolean;
   /** Only the active viewport mounts the diff editor and synchronizes the URL. */
   viewport?: "desktop" | "mobile";
-  /** Called when the user presses Escape to close the active file tab. */
+  /** Called after confirming unsaved edits when closing the active file tab. */
   onCloseTab?: () => void;
+  closeTabRef?: RefObject<(() => void) | null>;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
   /**
@@ -392,6 +394,7 @@ function FileViewerBody({
   path,
   onClose,
   onCloseTab,
+  closeTabRef,
   onNavigateTo,
   permissionLevel,
   frameless,
@@ -467,6 +470,7 @@ function FileViewerBody({
       ? navigableFiles[currentNavIdx + 1]
       : null;
   const commentsQuery = useComments(conversationId, path);
+  const sessionCommentsQuery = useComments(conversationId);
   const addComment = useAddComment(conversationId);
   const updateComment = useUpdateComment(conversationId);
   const deleteComment = useDeleteComment(conversationId);
@@ -664,6 +668,20 @@ function FileViewerBody({
     () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
     [allComments, fileContent, remapFormatted],
   );
+  // Address All sends drafts from every file; this file's own query supplies its drafts.
+  // Until both lists load, a send would silently skip the unloaded list's drafts.
+  const { ids: addressableCommentIds, fileCount: addressableFileCount } = useMemo(() => {
+    if (!commentsQuery.data || !sessionCommentsQuery.data) return { ids: [], fileCount: 0 };
+    const ids = new Set(openComments.map((c) => c.id));
+    const paths = new Set(openComments.length > 0 ? [path] : []);
+    for (const c of sessionCommentsQuery.data) {
+      if (c.status === "draft" && c.path !== path) {
+        ids.add(c.id);
+        paths.add(c.path);
+      }
+    }
+    return { ids: [...ids], fileCount: paths.size };
+  }, [openComments, commentsQuery.data, sessionCommentsQuery.data, path]);
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
     // Comment navigation supersedes a citation, including clicks outside the editor.
@@ -742,6 +760,15 @@ function FileViewerBody({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
+
+  useLayoutEffect(() => {
+    if (!open || !onCloseTab || !closeTabRef) return;
+    const close = () => guardDirty(onCloseTab);
+    closeTabRef.current = close;
+    return () => {
+      if (closeTabRef.current === close) closeTabRef.current = null;
+    };
+  }, [open, onCloseTab, closeTabRef, guardDirty]);
 
   // Escape closes the active file tab (when search is not open).
   useEffect(() => {
@@ -1895,10 +1922,11 @@ function FileViewerBody({
               );
             }}
             canAddress={canEdit && sender !== null}
+            addressCount={addressableCommentIds.length}
+            addressFileCount={addressableFileCount}
             onAddressAll={() => {
-              if (!sender) return;
-              const ids = openComments.map((c) => c.id);
-              sender.mutate({ comment_ids: ids });
+              if (!sender || addressableCommentIds.length === 0) return;
+              sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {
               handleSetActiveSelection({

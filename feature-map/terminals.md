@@ -66,6 +66,9 @@ with their own terminal retain the switcher.
   is inert while the host is offline, the session is stranded, or a shell is
   still being created, and it yields to a focused terminal or editor.
 - Select an open shell from the rail's shell list; close it from its tab.
+  In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
+  workspace tab, using the same terminal confirmation. A read-only viewer's
+  terminal stays open. Cmd/Ctrl+Shift+W closes the window.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
@@ -171,6 +174,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   injects the blocked event; it does not run a vendor CLI. For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
+
+For the desktop Close Tab shortcut, open a shell tab in an ordinary session,
+focus its terminal, and press Cmd/Ctrl+W. Confirm any terminal-close prompt;
+only that tab should close. Cancel the prompt to keep the tab and session.
+Repeat as a read-only viewer: the shortcut should leave the terminal open.
+Cmd/Ctrl+Shift+W should close the window. Native accelerator delivery requires
+an Electron run; component tests cover the selection and confirmation paths.
 
 ## Gotchas
 

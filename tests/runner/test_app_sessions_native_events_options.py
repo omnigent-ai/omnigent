@@ -19,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
 )
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
@@ -840,6 +841,108 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
     assert body.get("error") == "codex_native_compact_failed", (
         f"503 body must carry the codex bridge-failure error code; got {body!r}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_turn_id", ["turn_running", None], ids=["busy", "idle"])
+async def test_events_codex_native_approval_mode_change_types_only_when_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    active_turn_id: str | None,
+) -> None:
+    """
+    An approval-mode switch while Codex runs a turn is refused, not keyed in.
+
+    Codex disables /permissions during a turn, and the Escape that opens it
+    interrupts the turn and drops the message it carries. The 409 detail tells
+    the person why the mode did not change. Once the session is idle the same
+    request drives the /permissions popup and reports the confirmed mode.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    popup = (
+        "  Update Model Permissions\n\n"
+        "› 1. Ask for approval  Read and edit workspace files and run commands\n"
+        "  2. Full Access       Use with caution: Codex can edit files outside\n\n"
+        "  enter select · esc back\n"
+    )
+    tmux_calls: list[tuple[str, ...]] = []
+
+    def _recording_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        tmux_calls.append(args)
+
+    def _fake_capture_pane(socket_path: str, target: str, **kwargs: Any) -> str:
+        del socket_path, target, kwargs
+        # The popup stays up until its Full Access row is picked; Codex then
+        # prints the confirmation line.
+        if any(call[-1] == "2" for call in tmux_calls):
+            return "• Permissions updated to Full Access\n"
+        return popup
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        # Session creation would otherwise rewrite the bridge state below.
+        del args, kwargs
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _recording_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture_pane)
+    monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    conv_id = "3c1f6be0b1f04e45a8d9e2f7c6b5a4d3"
+    codex_native_bridge.write_bridge_state(
+        codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=active_turn_id,
+        ),
+    )
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=terminal_registry
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_approval_mode_change", "approval_mode": "full-access"},
+        )
+
+    if active_turn_id is None:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"approval_mode": "full-access"}
+        target = instance.tmux_target
+        assert tmux_calls == [
+            ("send-keys", "-t", target, "Escape"),
+            ("send-keys", "-t", target, "C-u"),
+            ("send-keys", "-l", "-t", target, "/permissions"),
+            ("send-keys", "-t", target, "Enter"),
+            ("send-keys", "-l", "-t", target, "2"),
+            ("send-keys", "-l", "-t", target, "1"),
+        ]
+        return
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["error"] == "codex_native_approval_mode_busy"
+    assert body["detail"] == (
+        "Codex is working on a turn. Change the approval mode after it finishes, "
+        "or stop the turn first."
+    )
+    assert tmux_calls == []
 
 
 @pytest.mark.asyncio
@@ -1793,6 +1896,7 @@ async def _post_model_change_with_status_sequence(
     pane_idle_after_polls: int | None = None,
     model_env: dict[str, str] | None = None,
     expected_command: str | None = None,
+    acknowledged_after_polls: int | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -1858,6 +1962,20 @@ async def _post_model_change_with_status_sequence(
         return script.pop(0) if len(script) > 1 else script[0]
 
     monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", _scripted_status)
+    acknowledgement_polls = 0
+
+    def _acknowledged(_bridge_dir: Any, *, command: str) -> bool:
+        nonlocal acknowledgement_polls
+        del command
+        acknowledgement_polls += 1
+        return (
+            acknowledged_after_polls is not None
+            and acknowledgement_polls >= acknowledged_after_polls
+        )
+
+    monkeypatch.setattr(
+        claude_native_bridge, "model_switch_acknowledged", _acknowledged, raising=False
+    )
     # No tmux behind these tests: the in-loop dialog check must not spend a
     # real 1 s tmux-info wait per poll.
     monkeypatch.setattr(
@@ -1947,9 +2065,11 @@ async def test_events_model_change_confirms_against_the_status_file(
         ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7[1m]", 204),
         ("opus[1m]", "system.ai.claude-opus-4-7[1M]", "claude-opus-4-7[1m]", 204),
         ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-6[1m]", 503),
-        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7", 503),
-        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
-        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-6", 503),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7", 204),
+        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 204),
+        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 204),
+        ("opus", "system.ai.claude-opus-4-7", "system.ai.claude-opus-4-7[1m]", 503),
         ("opus", None, "claude-opus-4-7", 503),
     ],
     ids=[
@@ -1959,9 +2079,11 @@ async def test_events_model_change_confirms_against_the_status_file(
         "uppercase-bracket-alias",
         "uppercase-pin-marker",
         "different-generation",
-        "different-context",
-        "bracket-alias-different-context",
-        "uppercase-bracket-alias-different-context",
+        "unmarked-different-generation",
+        "unmarked-status-for-1m-pin",
+        "unmarked-status-for-bracket-alias",
+        "unmarked-status-for-uppercase-bracket-alias",
+        "marked-status-for-plain-pin",
         "unpinned-alias",
     ],
 )
@@ -1972,7 +2094,12 @@ async def test_events_model_change_confirms_unchanged_model_against_launch_pin(
     status_model: str,
     status_code: int,
 ) -> None:
-    """An unchanged model confirms only the pin's exact generation and context."""
+    """An unchanged model confirms only the pin's exact generation and context.
+
+    Claude Code's statusLine names a 1M model without its ``[1m]`` marker, so
+    an unmarked status confirms a pick whose marker reached the pane; a marked
+    status still has to match the pick's context.
+    """
 
     async def _skip_terminal_creation(**_kwargs: Any) -> None:
         pass
@@ -1989,6 +2116,35 @@ async def test_events_model_change_confirms_unchanged_model_against_launch_pin(
         model_env={"ANTHROPIC_DEFAULT_OPUS_MODEL": pin_model} if pin_model else {},
     )
     assert resp.status_code == status_code, resp.text
+
+
+@pytest.mark.parametrize(
+    "status_values",
+    [
+        ["system.ai.claude-sonnet-5-5"],
+        [None, "system.ai.claude-sonnet-5-5"],
+        ["system.ai.claude-haiku-5-5", "system.ai.claude-sonnet-5-5"],
+    ],
+    ids=["already-on-the-model", "status-not-written-yet", "switched-from-another-model"],
+)
+async def test_events_model_change_confirms_a_typed_1m_pick_by_its_unmarked_name(
+    monkeypatch: pytest.MonkeyPatch,
+    status_values: list[str | None],
+) -> None:
+    """A typed 1M pick confirms once the status names its model without the marker.
+
+    After ``/model system.ai.claude-sonnet-5-5[1m]`` Claude Code's statusLine
+    reads ``system.ai.claude-sonnet-5-5``, so a pane already on that model, or
+    one whose status was not written before the switch, still confirms it.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        status_values,
+        model="system.ai.claude-sonnet-5-5[1m]",
+        picker_values=("system.ai.claude-sonnet-5-5[1m]",),
+        model_env={},
+    )
+    assert resp.status_code == 204, resp.text
 
 
 @pytest.mark.parametrize("translation", ["alias", "custom-slot", "picker"])
@@ -2054,6 +2210,42 @@ async def test_bound_claude_switch_preserves_private_model_id(
             monkeypatch,
             ["private/model-a", selected],
             model=selected,
+        )
+    assert response.status_code == 204, response.text
+
+
+async def test_bound_claude_1m_pick_is_confirmed_by_the_unmarked_status_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound 1M pick is confirmed by the statusLine's unmarked model name.
+
+    Claude Code's statusLine never carries ``[1m]``, so a bound session that
+    already runs the model and picks its 1M variant reads the same name before
+    and after. The unmarked name confirms the pick, as it does for a session
+    whose model is not bound.
+    """
+    from omnigent.inference_config import inference_config_scope
+
+    plain = "system.ai.claude-fable-5-1"
+    selected = f"{plain}[1m]"
+    config = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": plain,
+                    "model_allowlist": [plain, selected],
+                }
+            }
+        },
+    }
+    with inference_config_scope(config):
+        response = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            [plain],
+            model=selected,
+            expected_command=f"/model {selected}",
         )
     assert response.status_code == 204, response.text
 
@@ -2179,6 +2371,24 @@ async def test_events_model_change_unconfirmed_switch_answers_503(
     body = resp.json()
     assert body["error"] == "claude_native_model_unconfirmed"
     assert "did not confirm" in body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_confirmed_by_claudes_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude Code's own "Set model to" line confirms a switch the statusLine never does.
+
+    In production the statusLine snapshot kept its old reading for the whole
+    budget on an idle pane while the pane itself showed the acknowledgement, so
+    an applied switch was reported as "did not confirm the switch".
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        acknowledged_after_polls=2,
+    )
+    assert resp.status_code == 204, resp.text
 
 
 @pytest.mark.asyncio
