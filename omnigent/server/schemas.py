@@ -356,6 +356,10 @@ class AgentObject(BaseModel):
         built-in template and native agents are read-only.
     :param mcp_registry_editable: Whether this caller owns the session and can
         select managed MCP services independently of agent ownership.
+    :param loads_user_settings: Whether a claude-sdk session for this agent loads
+        the user's Claude settings and user-scope MCP servers. ``False`` when the
+        spec's ``skills: none`` runs the CLI with no setting sources; ``True``
+        when the bundle cannot be loaded.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -397,6 +401,7 @@ class AgentObject(BaseModel):
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
+    loads_user_settings: bool = True
     mcp_registry_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
@@ -923,6 +928,9 @@ class ChildSessionSummary(BaseModel):
         ``RoutingDecisionData.decision_id``. Read from the child's
         ``omnigent.routing.decision_id`` label, stamped when routing pins
         the model. ``None`` when the child was not routed.
+    :param depth: Levels below the queried session, ``1`` for a direct
+        child. Set only by ``?descendants=true``, so a client can tell the
+        server returned the whole subtree; ``None`` otherwise.
     """
 
     id: str
@@ -946,6 +954,7 @@ class ChildSessionSummary(BaseModel):
     pending_elicitations_count: int = 0
     routed_model: str | None = None
     routing_decision_id: str | None = None
+    depth: int | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
