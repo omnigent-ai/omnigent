@@ -1390,9 +1390,15 @@ describe("side-chat scroll position", () => {
       },
     );
     try {
-      conversationRegistry.acquire(childId).setState({ blocks: earlierAnswer });
+      const conversation = conversationRegistry.acquire(childId);
+      conversation.setState({ sessionStatus: "idle" });
       const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
       const { unmount } = renderPane(<SideChatPane childId={childId} />);
+      // An empty side chat has no list; the observer attaches when the first reply mounts it.
+      expect(
+        screen.getByText("Ask a question here without affecting the main conversation."),
+      ).toBeInTheDocument();
+      act(() => conversation.setState({ blocks: earlierAnswer }));
       const answer = screen.getByText("Earlier side-chat answer");
       const list = observers.find((observer) => observer.targets.some((t) => t.contains(answer)))!;
 
