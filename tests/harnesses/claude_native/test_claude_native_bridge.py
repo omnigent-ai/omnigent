@@ -17907,3 +17907,24 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
         }
     else:
         assert settings_path.read_bytes() == original
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_bridge_temp_parent_follows_a_pinned_tmpdir_it_cannot_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relay helpers run with ``TMPDIR`` pinned to the runner's, but a sandbox may let
+    them only read it. Python's tempdir then falls back elsewhere, and the bridge tree
+    the runner made would no longer sit under the helper's trusted root."""
+    from omnigent.harnesses.claude_native.bridge import _runner_temp_parent
+
+    pinned = tmp_path / "runner-tmp"
+    pinned.mkdir()
+    pinned.chmod(0o500)
+    try:
+        monkeypatch.setenv("TMPDIR", f"{pinned}/")
+        assert _runner_temp_parent() == pinned
+        monkeypatch.setenv("TMPDIR", "relative/tmp")
+        assert _runner_temp_parent() == Path(tempfile.gettempdir())
+    finally:
+        pinned.chmod(0o700)
