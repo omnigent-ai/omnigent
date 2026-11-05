@@ -5045,6 +5045,7 @@ function ConversationRowImpl({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
+  const [forkPickShareableDirectory, setForkPickShareableDirectory] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
@@ -5853,8 +5854,13 @@ function ConversationRowImpl({
       {shareOpen && (
         <PermissionsModal
           sessionId={conversation.id}
+          workspace={conversation.workspace}
           open={shareOpen}
           onOpenChange={setShareOpen}
+          onForkIntoAnotherFolder={() => {
+            setForkPickShareableDirectory(true);
+            setForkOpen(true);
+          }}
         />
       )}
       {forkOpen && (
@@ -5864,8 +5870,12 @@ function ConversationRowImpl({
           sourceWorkspace={conversation.workspace}
           sourceHostId={conversation.host_id}
           sourceGitBranch={conversation.git_branch}
+          pickShareableDirectory={forkPickShareableDirectory}
           open
-          onOpenChange={setForkOpen}
+          onOpenChange={(open) => {
+            setForkOpen(open);
+            if (!open) setForkPickShareableDirectory(false);
+          }}
         />
       )}
       <Dialog

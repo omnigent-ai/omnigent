@@ -16,8 +16,18 @@ import {
   useState,
 } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import {
+  CheckIcon,
+  FolderLockIcon,
+  GitForkIcon,
+  LinkIcon,
+  QrCodeIcon,
+  Trash2Icon,
+  UserPlusIcon,
+} from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -69,6 +79,13 @@ interface PermissionsModalProps {
   workspace?: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /**
+   * Opens the fork dialog to move this session into a shareable folder. The
+   * blocked-workspace banner offers the action only when this is provided.
+   */
+  onForkIntoAnotherFolder?: () => void;
+  /** Visible-but-disabled reason for the fork action, e.g. while it loads. */
+  forkDisabledReason?: string;
 }
 
 export function PermissionsModal({
@@ -76,6 +93,8 @@ export function PermissionsModal({
   workspace,
   open,
   onOpenChange,
+  onForkIntoAnotherFolder,
+  forkDisabledReason,
 }: PermissionsModalProps) {
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
@@ -214,6 +233,23 @@ export function PermissionsModal({
           </DialogDescription>
         </DialogHeader>
 
+        {/* Leads the body so the reason the controls below are inert, and the
+            way out, are the first thing the owner reads. */}
+        {workspaceBlocked && (
+          <WorkspaceBlockedNotice
+            descriptionId={blockedNoticeId}
+            workspace={workspace ?? ""}
+            onForkIntoAnotherFolder={
+              onForkIntoAnotherFolder &&
+              (() => {
+                onOpenChange(false);
+                onForkIntoAnotherFolder();
+              })
+            }
+            forkDisabledReason={forkDisabledReason}
+          />
+        )}
+
         {(publicSharingEnabled || publicGrant) && (
           <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2">
             <div className="min-w-0">
@@ -318,15 +354,6 @@ export function PermissionsModal({
           )}
         </div>
 
-        {/* Shown above the disabled add-grant form so it reads as the reason the
-            controls are inert, before the user tries them. */}
-        {workspaceBlocked && (
-          <p id={blockedNoticeId} className="text-sm text-destructive">
-            This session&apos;s working directory (a home or root directory) cannot be shared on
-            this Omnigent server.
-          </p>
-        )}
-
         {/* Add grant form */}
         <form onSubmit={handleGrant} className="flex items-end gap-2">
           <div className="flex-1">
@@ -394,6 +421,63 @@ export function PermissionsModal({
       {/* Separate modal for the QR code so the share dialog stays compact. */}
       <QrCodeDialog sessionId={sessionId} open={showQr} onOpenChange={setShowQr} />
     </Dialog>
+  );
+}
+
+/**
+ * Banner for a session whose working directory is a home or root directory,
+ * which a restricted server refuses to share. Names the directory and points
+ * at the fix: fork into a project folder (keeping the history) and share that.
+ */
+function WorkspaceBlockedNotice({
+  descriptionId,
+  workspace,
+  onForkIntoAnotherFolder,
+  forkDisabledReason,
+}: {
+  descriptionId: string;
+  workspace: string;
+  onForkIntoAnotherFolder?: () => void;
+  forkDisabledReason?: string;
+}) {
+  return (
+    <Alert
+      variant="destructive"
+      className="min-w-0 border-destructive/30 bg-destructive/5"
+      data-testid="share-workspace-blocked"
+    >
+      <FolderLockIcon />
+      <AlertTitle>Sharing is blocked for this folder</AlertTitle>
+      <AlertDescription className="flex min-w-0 flex-col gap-2 [&_p:not(:last-child)]:mb-0">
+        <p id={descriptionId}>
+          This session runs in <code className="break-all font-mono">{workspace}</code>, a home or
+          root directory, which this Omnigent server doesn&apos;t allow sharing. To share it, fork
+          the session into a project folder (not <code className="font-mono">~</code> or{" "}
+          <code className="font-mono">/</code>), then share the fork. The fork keeps the
+          conversation history.
+        </p>
+        {onForkIntoAnotherFolder && (
+          <DisabledActionTooltip
+            reason={forkDisabledReason}
+            label="Fork into a different folder"
+            className="self-start"
+          >
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="self-start"
+              onClick={onForkIntoAnotherFolder}
+              disabled={!!forkDisabledReason}
+              componentId="diagnostics.permissions.fork_into_another_folder"
+            >
+              <GitForkIcon className="size-3.5" />
+              Fork into a different folder
+            </Button>
+          </DisabledActionTooltip>
+        )}
+      </AlertDescription>
+    </Alert>
   );
 }
 

@@ -817,8 +817,12 @@ describe("PermissionsModal", () => {
           },
         );
 
-        const warning = screen.getByText(/This session's working directory/);
-        expect(warning).toHaveClass("text-destructive");
+        const banner = screen.getByRole("alert");
+        expect(banner).toHaveTextContent("Sharing is blocked for this folder");
+        // The first code span names the blocked directory itself.
+        expect(banner.querySelector("code")?.textContent).toBe(workspace);
+        const warning = within(banner).getByText(/fork the session into a project folder/);
+        expect(warning).toHaveTextContent("The fork keeps the conversation history.");
         const grantButton = screen.getByRole("button", { name: /grant/i });
         expect(screen.getByLabelText("User ID")).toBeDisabled();
         expect(screen.getByRole("combobox", { name: "New user permission" })).toBeDisabled();
@@ -833,6 +837,82 @@ describe("PermissionsModal", () => {
         expect(grantMock).not.toHaveBeenCalled();
       },
     );
+
+    it("offers a fork into another folder that closes the share dialog first", async () => {
+      listMock.mockResolvedValue([]);
+      const calls: string[] = [];
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice"
+          open
+          onOpenChange={(open) => calls.push(`share-open:${open}`)}
+          onForkIntoAnotherFolder={() => calls.push("fork")}
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+
+      fireEvent.click(
+        within(screen.getByRole("alert")).getByRole("button", {
+          name: "Fork into a different folder",
+        }),
+      );
+      expect(calls).toEqual(["share-open:false", "fork"]);
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+    });
+
+    it("disables the fork action while it is unavailable", async () => {
+      listMock.mockResolvedValue([]);
+      const onFork = vi.fn();
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice"
+          open
+          onOpenChange={() => {}}
+          onForkIntoAnotherFolder={onFork}
+          forkDisabledReason="Loading session actions…"
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+
+      const forkButton = screen.getByRole("button", { name: "Fork into a different folder" });
+      expect(forkButton).toBeDisabled();
+      fireEvent.click(forkButton);
+      expect(onFork).not.toHaveBeenCalled();
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+    });
+
+    it("keeps the instructions without a fork action when none is wired", async () => {
+      listMock.mockResolvedValue([]);
+      render(<PermissionsModal sessionId="conv_abc" workspace="/" open onOpenChange={() => {}} />, {
+        wrapper: createSharingWrapper("restricted_read_only"),
+      });
+
+      expect(screen.getByRole("alert")).toHaveTextContent("then share the fork");
+      expect(
+        screen.queryByRole("button", { name: "Fork into a different folder" }),
+      ).not.toBeInTheDocument();
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+    });
+
+    it("shows no blocked-folder banner for a project folder", async () => {
+      listMock.mockResolvedValue([]);
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice/project"
+          open
+          onOpenChange={() => {}}
+          onForkIntoAnotherFolder={() => {}}
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+
+      expect(screen.queryByTestId("share-workspace-blocked")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("User ID")).toBeEnabled();
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+    });
 
     it("rejects a form submission once the workspace becomes unshareable", async () => {
       listMock.mockResolvedValue([]);

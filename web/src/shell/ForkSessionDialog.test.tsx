@@ -159,6 +159,7 @@ function renderDialog(
     sourceGitBranch?: string | null;
     upToResponseId?: string | null;
     workspaceRecovery?: boolean;
+    pickShareableDirectory?: boolean;
     // Server capabilities the dialog reads. Omitted leaves the context on
     // "loading", which fails the sandbox gate closed — the world every
     // pre-sandbox case here was written against.
@@ -193,6 +194,7 @@ function renderDialog(
       sourceGitBranch={props.sourceGitBranch}
       upToResponseId={props.upToResponseId}
       workspaceRecovery={props.workspaceRecovery}
+      pickShareableDirectory={props.pickShareableDirectory}
       open
       onOpenChange={vi.fn()}
     />
@@ -1195,6 +1197,88 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-disabled", "true");
       expect(screen.getByTestId("connect-host-command")).toBeVisible();
       expect(screen.queryByTestId("fork-session-sandbox-hint")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("fork into a shareable folder", () => {
+    const SHAREABLE = {
+      sourceTitle: "My session",
+      sourceWorkspace: "/Users/a",
+      sourceHostId: "host_1",
+      pickShareableDirectory: true,
+    };
+
+    it("asks for a new folder instead of prefilling the home directory", () => {
+      renderDialog(SHAREABLE);
+
+      expect(screen.getByRole("heading", { name: "Fork into a different folder" })).toBeVisible();
+      expect(
+        screen.getByText(/can't share a session that runs in a home or root directory/),
+      ).toBeVisible();
+      expect(screen.getByTestId("workspace-path-input")).toBeVisible();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+      expect(screen.getByTestId("fork-session-shareable-dir-hint")).toHaveTextContent(
+        "Pick a project folder, not your home folder or /.",
+      );
+      expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-disabled", "true");
+    });
+
+    it.each(["/Users/a", "/", "/root"])("refuses to fork into %s", (blocked) => {
+      renderDialog(SHAREABLE);
+
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: blocked },
+      });
+      expect(screen.getByTestId("fork-session-shareable-dir-hint")).toHaveTextContent(
+        "Home and root directories can't be shared on this server. Pick a project folder.",
+      );
+      // The folder can't stay the source's, so the "reuses the original" hint is wrong here.
+      expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+        "Home and root directories can't be shared",
+      );
+      expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+      expect(forkSessionMock).not.toHaveBeenCalled();
+    });
+
+    it("forks the full history into the picked project folder", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog(SHAREABLE);
+
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/Users/a/project" },
+      });
+      expect(screen.getByTestId("fork-session-shareable-dir-hint")).toHaveTextContent(
+        "Pick a project folder",
+      );
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock).toHaveBeenCalledWith(
+        "conv_src",
+        expect.objectContaining({ upToResponseId: undefined }),
+      );
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/project",
+        undefined,
+      );
+      expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork");
+    });
+
+    it("leaves an ordinary clone of a home-directory session unchanged", () => {
+      renderDialog({ ...SHAREABLE, pickShareableDirectory: false });
+
+      expect(screen.getByRole("heading", { name: "Clone session" })).toBeVisible();
+      expect(screen.queryByTestId("fork-session-shareable-dir-hint")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a");
     });
   });
 
