@@ -1,9 +1,9 @@
 import { useState } from "react";
+import { PencilIcon, Trash2Icon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { requestLocalReviewContext } from "@/lib/localReviewContext";
 import { useDeleteComment, useUpdateComment, type Comment } from "@/hooks/useComments";
 
 export function LocalReviewComment({
@@ -29,12 +29,45 @@ export function LocalReviewComment({
       aria-label="Local review comment"
       className="pull-request-comment-surface my-2 rounded-md border p-3 text-ui text-foreground font-sans [white-space:normal]"
     >
-      <p className="mb-2 text-xs text-muted-foreground">
-        Local comment · {anchor.side === "LEFT" ? "Old" : "New"} lines{" "}
-        {anchor.start_line ?? anchor.line}–{anchor.line}
-        {outdated && " · Earlier revision"}
-        {comment.status === "addressed" && " · Addressed"}
-      </p>
+      <div className="mb-2 flex items-start justify-between gap-2">
+        <p className="min-w-0 text-xs text-muted-foreground">
+          Local comment · {anchor.side === "LEFT" ? "Old" : "New"} lines{" "}
+          {anchor.start_line ?? anchor.line}–{anchor.line}
+          {outdated && " · Earlier revision"}
+          {comment.status === "addressed" && " · Addressed"}
+        </p>
+        {own && (
+          <div className="flex shrink-0 gap-1">
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-6"
+              aria-label="Edit local comment"
+              title="Edit comment"
+              disabled={pending || editing}
+              onClick={() => {
+                setBody(comment.body);
+                setEditing(true);
+              }}
+            >
+              <PencilIcon className="size-3.5" />
+            </Button>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-6"
+              aria-label="Delete local comment"
+              title="Delete comment"
+              disabled={pending}
+              onClick={() => remove.mutate(comment.id)}
+            >
+              <Trash2Icon className="size-3.5" />
+            </Button>
+          </div>
+        )}
+      </div>
       {editing ? (
         <Textarea
           aria-label="Edit local comment"
@@ -44,76 +77,20 @@ export function LocalReviewComment({
       ) : (
         <MessageResponse>{comment.body}</MessageResponse>
       )}
-      {own && (
+      {own && editing && (
         <div className="mt-2 flex flex-wrap gap-2">
-          {editing ? (
-            <>
-              <Button
-                size="sm"
-                disabled={pending || !body.trim()}
-                onClick={() =>
-                  update.mutate(
-                    { commentId: comment.id, body },
-                    { onSuccess: () => setEditing(false) },
-                  )
-                }
-              >
-                Save
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={pending}
-                onClick={() => setEditing(false)}
-              >
-                Cancel
-              </Button>
-            </>
-          ) : (
-            <>
-              {comment.status === "draft" && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => requestLocalReviewContext(comment)}
-                >
-                  Attach to agent
-                </Button>
-              )}
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={pending}
-                onClick={() => {
-                  setBody(comment.body);
-                  setEditing(true);
-                }}
-              >
-                Edit
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={pending}
-                onClick={() =>
-                  update.mutate({
-                    commentId: comment.id,
-                    status: comment.status === "draft" ? "addressed" : "draft",
-                  })
-                }
-              >
-                {comment.status === "draft" ? "Mark addressed" : "Reopen"}
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={pending}
-                onClick={() => remove.mutate(comment.id)}
-              >
-                Delete
-              </Button>
-            </>
-          )}
+          <Button
+            size="sm"
+            disabled={pending || !body.trim()}
+            onClick={() =>
+              update.mutate({ commentId: comment.id, body }, { onSuccess: () => setEditing(false) })
+            }
+          >
+            Save
+          </Button>
+          <Button size="sm" variant="ghost" disabled={pending} onClick={() => setEditing(false)}>
+            Cancel
+          </Button>
         </div>
       )}
       {(update.error || remove.error) && (

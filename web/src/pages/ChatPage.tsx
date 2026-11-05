@@ -1,8 +1,4 @@
-import {
-  clearLocalReviewContexts,
-  removeLocalReviewContext,
-  usePendingLocalReviewContexts,
-} from "@/lib/localReviewContext";
+import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
@@ -4660,10 +4656,7 @@ function ComposerImpl(
               {attachmentError !== null && (
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
-              <ComposerLocalReviewChips
-                comments={localReviewComments}
-                onRemove={(id) => conversationId && removeLocalReviewContext(conversationId, id)}
-              />
+              <ComposerLocalReviewChips comments={localReviewComments} />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>
