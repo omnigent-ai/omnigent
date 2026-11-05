@@ -117,6 +117,7 @@ export function ComposerAddMenu({
           className="size-8 mobile-touch-target rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
           disabled={disabled}
           aria-label="Add"
+          data-composer-action="add"
           title="Add"
           data-testid={`${testIdPrefix}-attach`}
           componentId={`${testIdPrefix}.add_menu`}

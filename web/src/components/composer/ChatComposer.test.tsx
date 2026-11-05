@@ -1,6 +1,7 @@
 import { createRef, useState, type FormEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ChatComposer,
   ComposerTextarea,
@@ -158,6 +159,7 @@ describe("ChatComposer", () => {
       </form>,
     );
     expect(screen.getByTestId("shared-composer")).toHaveAttribute("data-composer-card");
+    expect(screen.getByTestId("shared-composer")).not.toHaveAttribute("data-mobile-composer");
     expect(inputRef.current).toBe(screen.getByRole("textbox"));
     expect(inputRef.current?.parentElement).toHaveClass("relative", "overflow-hidden");
     expect(screen.getByText("Context controls").parentElement?.parentElement).toHaveClass(
@@ -365,6 +367,112 @@ describe("ChatComposer", () => {
     fireEvent.compositionStart(input);
     expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(true);
     expect(input).toHaveValue("draft");
+  });
+
+  describe("mobile expansion", () => {
+    beforeEach(() => {
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: query === "(max-width: 767.98px)",
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }));
+    });
+
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("expands on focus and collapses after leaving an empty composer", () => {
+      const { input } = renderEditor("");
+      const card = input.closest("[data-composer-card]")!;
+      expect(card).toHaveAttribute("data-mobile-composer", "collapsed");
+      fireEvent.focus(input);
+      expect(card).toHaveAttribute("data-mobile-composer", "expanded");
+      fireEvent.blur(input, { relatedTarget: document.body });
+      expect(card).toHaveAttribute("data-mobile-composer", "collapsed");
+      expect(screen.getByRole("textbox")).toBe(input);
+    });
+
+    it("keeps a draft and its caret when focus leaves, then collapses after clearing it", () => {
+      const { input } = renderEditor("");
+      const card = input.closest("[data-composer-card]")!;
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "Keep this draft" } });
+      input.setSelectionRange(4, 4);
+      fireEvent.blur(input, { relatedTarget: document.body });
+      expect(card).toHaveAttribute("data-mobile-composer", "expanded");
+      expect(screen.getByRole("textbox")).toBe(input);
+      expect(input.selectionStart).toBe(4);
+      fireEvent.change(input, { target: { value: "" } });
+      expect(card).toHaveAttribute("data-mobile-composer", "collapsed");
+    });
+
+    it("retains expansion between local controls and ignores focus in portaled header controls", () => {
+      const onFocus = vi.fn();
+      const onBlur = vi.fn();
+      render(
+        <ChatComposer
+          keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+          input={{ "aria-label": "Draft", onFocus, onBlur }}
+          actions={{
+            leading: createPortal(<button type="button">Header model</button>, document.body),
+            trailing: <ComposerSendButton label="Send" />,
+          }}
+        />,
+      );
+      const input = screen.getByRole("textbox");
+      const card = input.closest("[data-composer-card]")!;
+      const send = screen.getByRole("button", { name: "Send" });
+      fireEvent.focus(input);
+      fireEvent.blur(input, { relatedTarget: send });
+      fireEvent.focus(send, { relatedTarget: input });
+      expect(card).toHaveAttribute("data-mobile-composer", "expanded");
+      fireEvent.blur(send, { relatedTarget: document.body });
+      fireEvent.focus(screen.getByRole("button", { name: "Header model" }));
+      expect(card).toHaveAttribute("data-mobile-composer", "collapsed");
+      expect(onFocus).toHaveBeenCalledOnce();
+      expect(onBlur).toHaveBeenCalledOnce();
+    });
+
+    it.each(["attachment", "quote"])("keeps a %s expanded until removed", (content) => {
+      const composer = (hasContent: boolean) => (
+        <ChatComposer
+          hasContent={content === "attachment" && hasContent}
+          keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+          input={{ "aria-label": "Draft", value: "", readOnly: true }}
+          slots={{
+            inputPrefix: content === "quote" && hasContent ? <span>Quoted reply</span> : undefined,
+            attachments: (
+              <>
+                <input type="file" hidden />
+                {content === "attachment" && hasContent && <span>File</span>}
+              </>
+            ),
+          }}
+          actions={{ leading: null, trailing: null }}
+        />
+      );
+      const { rerender } = render(composer(true));
+      const card = screen.getByRole("textbox").closest("[data-composer-card]")!;
+      expect(card).toHaveAttribute("data-mobile-composer", "expanded");
+      rerender(composer(false));
+      expect(card).toHaveAttribute("data-mobile-composer", "collapsed");
+    });
+
+    it("also retains an uncontrolled draft after blur", () => {
+      render(
+        <ChatComposer
+          keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+          input={{ "aria-label": "Draft" }}
+          actions={{ leading: null, trailing: null }}
+        />,
+      );
+      const input = screen.getByRole("textbox");
+      fireEvent.change(input, { target: { value: "Uncontrolled draft" } });
+      fireEvent.blur(input, { relatedTarget: document.body });
+      expect(input.closest("[data-composer-card]")).toHaveAttribute(
+        "data-mobile-composer",
+        "expanded",
+      );
+    });
   });
 });
 

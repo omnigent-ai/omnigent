@@ -11,12 +11,12 @@ interface OmniGlassSurfaceProps {
 
 const GLASS_VARIANTS = {
   default: {
-    blur: 6,
+    blur: 8,
     background: "hsl(0 0% 100% / 0%)",
   },
   menu: {
-    blur: 20,
-    background: "color-mix(in oklch, var(--popover) 65%, transparent)",
+    blur: 32,
+    background: "hsl(0 0% 100% / 0%)",
   },
 };
 

@@ -112,7 +112,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
       content={tooltip}
       // The wrapper is the bar's flex item, so it carries the width cap.
       className="max-w-[calc(50%-0.25rem)]"
-      contentClassName="max-w-[min(36rem,calc(100vw-2rem))] break-all"
+      contentClassName="max-w-[min(36rem,calc(100vw-2rem))] break-all max-md:hidden"
     >
       <button
         ref={ref}
@@ -207,6 +207,8 @@ export const ComposerHostTrigger = forwardRef<
       aria-label={label}
       className={cn(
         "flex h-8 mobile-touch-target w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
+        appearance === "header" &&
+          "max-md:data-[state=open]:bg-transparent max-md:focus:bg-transparent max-md:focus-visible:ring-0",
         className,
       )}
       {...props}
@@ -280,11 +282,14 @@ export function ComposerPermissionPicker({
           aria-label={`${label}: ${value}`}
           title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
+          data-composer-action="permission"
+          data-mobile-icon-button
           data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
           <HandIcon className="size-3 shrink-0" />
           {!iconOnly && (
             <span
+              data-composer-permission-label
               className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
             >
               {value}

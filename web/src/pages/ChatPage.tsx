@@ -4058,6 +4058,13 @@ function ComposerImpl(
       </div>
       <ChatComposer
         appearance={isMobile ? "glass" : "default"}
+        hasContent={
+          files.length > 0 ||
+          mentionedItems.length > 0 ||
+          attachmentError !== null ||
+          commandError !== null ||
+          Boolean(btwSidechat)
+        }
         keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
         ref={bindComposerCard}
         className={cn(
@@ -4230,7 +4237,7 @@ function ComposerImpl(
               ref={backdropRef}
               aria-hidden
               data-testid="composer-highlight-overlay"
-              className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground"
+              className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground max-md:px-4 max-md:pt-4 max-md:pb-2"
             >
               {(() => {
                 const split = splitSlashCommand(value, slashCommandNames);

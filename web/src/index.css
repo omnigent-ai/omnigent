@@ -524,6 +524,157 @@
   background-color: var(--composer-surface-bg);
 }
 
+@media (width < 48rem) {
+  [data-mobile-composer] {
+    --composer-compact-start: 8px;
+    --composer-compact-end: 8px;
+
+    > .px-3 {
+      padding-inline: 8px;
+    }
+
+    > .mx-3 {
+      margin-inline: 8px;
+    }
+
+    svg:not(.glass-surface *) {
+      width: 20px !important;
+      height: 20px !important;
+      padding: 0;
+    }
+
+    [data-composer-action="microphone"] > span[aria-hidden="true"] {
+      width: 20px;
+      height: 20px;
+    }
+
+    &:has([data-composer-action="add"]) {
+      --composer-compact-start: 56px;
+    }
+
+    &:has([data-composer-action="send"], [data-composer-action="microphone"]) {
+      --composer-compact-end: 56px;
+    }
+
+    &:has([data-composer-action="send"]):has([data-composer-action="microphone"]) {
+      --composer-compact-end: 104px;
+    }
+
+    > [data-composer-input-area] {
+      min-height: 0;
+      padding: 16px 16px 8px;
+      transition:
+        margin-bottom 180ms ease,
+        padding 180ms ease,
+        min-height 180ms ease;
+    }
+
+    > [data-composer-input-area] > textarea {
+      display: block;
+      min-height: 1lh;
+    }
+
+    > [data-composer-actions] {
+      min-height: 60px;
+      flex-wrap: wrap;
+      padding-block: 8px;
+    }
+
+    [data-composer-action-group="left"] {
+      flex: 1 1 0;
+      flex-wrap: wrap;
+    }
+
+    [data-composer-action]:is(
+      [data-composer-action="add"],
+      [data-composer-action="microphone"],
+      [data-composer-action="send"],
+      [data-composer-action="permission"]
+    ) {
+      width: 44px;
+      min-width: 44px;
+      height: 44px;
+      min-height: 44px;
+      border-radius: 100%;
+    }
+
+    [data-composer-action="permission"] {
+      gap: 0;
+      padding: 0;
+    }
+
+    [data-composer-permission-label],
+    [data-composer-action="permission"] > svg:last-child {
+      display: none;
+    }
+
+    &[data-composer-hint-placeholder] > [data-composer-input-area] > textarea::placeholder {
+      color: transparent;
+    }
+
+    /* Keep menu anchors in place while their portaled menu owns focus. */
+    &[data-mobile-composer="collapsed"]:not(:has([data-state="open"])) {
+      border-radius: 9999px;
+
+      > [aria-hidden="true"] > .glass-surface {
+        border-radius: 9999px !important;
+      }
+
+      > [data-composer-input-area] {
+        z-index: 1;
+        display: flex;
+        min-height: 60px;
+        height: 60px;
+        margin-bottom: -60px;
+        align-items: center;
+        padding-block: 0;
+        padding-inline: var(--composer-compact-start) var(--composer-compact-end);
+        pointer-events: none;
+      }
+
+      > [data-composer-input-area] > textarea {
+        min-height: 1lh;
+        height: 1lh !important;
+        overflow: hidden;
+        white-space: nowrap;
+        pointer-events: auto;
+      }
+
+      > [data-composer-input-area] > :not(textarea) {
+        visibility: hidden;
+      }
+
+      > [data-composer-input-area] > textarea::placeholder {
+        color: var(--muted-foreground);
+      }
+
+      [data-composer-action-group="left"] {
+        flex: none;
+      }
+
+      [data-composer-action-group="left"]
+        > :not([data-composer-action="add"], :has([data-composer-action="add"])) {
+        display: none;
+      }
+
+      [data-composer-action-group="right"]
+        > :not(
+          [data-composer-action="microphone"],
+          [data-composer-action="send"],
+          :has([data-composer-action="microphone"], [data-composer-action="send"])
+        ) {
+        display: none;
+      }
+    }
+  }
+}
+
+@media (width < 48rem) and (prefers-reduced-motion: reduce) {
+  [data-mobile-composer] > [data-composer-input-area] {
+    transition: none;
+  }
+}
+
 .composer-context-bar {
   position: relative;
   z-index: 20;
@@ -541,6 +692,42 @@
   border-top-width: 0;
   border-top-left-radius: 0;
   border-top-right-radius: 0;
+}
+
+@media (width < 48rem) {
+  .new-chat-workspace-controls .composer-context-bar {
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    min-height: 44px;
+    margin: 0;
+    padding: 0 0.5rem;
+    flex-wrap: wrap;
+    background: transparent;
+    border: 0;
+    border-radius: 20px;
+  }
+
+  .new-chat-workspace-controls .composer-context-bar > * {
+    max-width: 100%;
+  }
+
+  .new-chat-workspace-controls .composer-context-bar button {
+    min-height: 44px;
+    height: auto;
+    max-width: 100%;
+    justify-content: flex-start;
+    gap: 0.5rem;
+    padding: 0.5rem 0.25rem;
+    font-size: var(--text-ui);
+    line-height: var(--text-ui--line-height);
+    color: var(--muted-foreground);
+  }
+
+  .new-chat-workspace-controls .composer-context-bar button:hover {
+    background-color: transparent;
+    color: var(--foreground);
+  }
 }
 
 /* Queued rows and workspace metadata form one continuous composer surface. */
@@ -604,6 +791,76 @@
   width: 24px;
   height: 24px;
   padding: 0;
+}
+
+/* Mobile icon controls change the glyph's opacity while the surface stays still. */
+@media (width < 48rem) {
+  [data-slot="button"][data-size^="icon"],
+  [data-mobile-icon-button] {
+    --mobile-icon-button-background: transparent;
+    --mobile-icon-button-foreground: var(--foreground);
+    --mobile-icon-button-border: transparent;
+    background-color: var(--mobile-icon-button-background) !important;
+    color: var(--mobile-icon-button-foreground) !important;
+    border-color: var(--mobile-icon-button-border) !important;
+    outline: none !important;
+    box-shadow: none !important;
+
+    &[data-variant="default"] {
+      --mobile-icon-button-background: var(--primary-cta);
+      --mobile-icon-button-foreground: var(--primary-cta-foreground);
+    }
+
+    &[data-variant="default"]:disabled {
+      --mobile-icon-button-background: var(--muted);
+      --mobile-icon-button-foreground: var(--muted-foreground);
+    }
+
+    &[data-variant="secondary"] {
+      --mobile-icon-button-background: var(--secondary);
+      --mobile-icon-button-foreground: var(--secondary-foreground);
+    }
+
+    &[data-variant="outline"] {
+      --mobile-icon-button-background: var(--background);
+      --mobile-icon-button-border: var(--border);
+
+      .dark & {
+        --mobile-icon-button-background: var(--input);
+        --mobile-icon-button-border: var(--input);
+      }
+    }
+
+    &[data-variant="destructive"] {
+      --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 10%, transparent);
+      --mobile-icon-button-foreground: var(--destructive);
+
+      .dark & {
+        --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 20%, transparent);
+      }
+    }
+
+    &:not(:disabled, [aria-disabled="true"]):is(:hover, :focus, :active) {
+      opacity: 1 !important;
+    }
+
+    :is(svg, img):not(.glass-surface *) {
+      opacity: 0.7;
+      transition: opacity 150ms ease;
+    }
+
+    &:not(:disabled, [aria-disabled="true"]):is(
+        :hover,
+        :focus,
+        :active,
+        [aria-expanded="true"],
+        [aria-pressed="true"],
+        [data-state="open"]
+      )
+      :is(svg, img):not(.glass-surface *) {
+      opacity: 1;
+    }
+  }
 }
 
 /* The desktop workspace rail stays mounted through its exit so its content
@@ -733,12 +990,17 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   border-color: var(--workspace-panel-border);
 }
 
-/* Below md the sidebar is a full-screen overlay on top of the chat, so every
- * palette and mode needs an opaque base. */
+/* Mobile drawers use the shared glass layer behind their content. */
 @media (width < 48rem) {
-  :root:not([data-theme]) .conversations-sidebar,
-  :root[data-theme] .conversations-sidebar {
-    background-color: var(--card-solid);
+  .conversations-sidebar {
+    margin-top: -1px;
+    margin-bottom: -1px;
+    isolation: isolate;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
   }
 }
 

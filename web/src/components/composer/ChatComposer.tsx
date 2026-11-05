@@ -2,6 +2,7 @@ import {
   forwardRef,
   useLayoutEffect,
   useRef,
+  useState,
   type ComponentPropsWithRef,
   type ComponentPropsWithoutRef,
   type KeyboardEvent,
@@ -14,6 +15,7 @@ import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { cn } from "@/lib/utils";
 import { insertComposerText } from "@/lib/composerText";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   isComposerAltNewlineKey,
   isComposerSendKey,
@@ -71,6 +73,8 @@ export interface ComposerKeyIntent {
 
 interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
   appearance?: "default" | "glass";
+  /** Attachments, mentions, or feedback that need the expanded mobile layout. */
+  hasContent?: boolean;
   keyboard: {
     submitWithModEnter: boolean;
     preventsKeyboardSubmit: boolean;
@@ -98,9 +102,29 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
 }
 
 export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
-  { appearance = "default", className, input, keyboard, slots, actions, ...props },
+  {
+    appearance = "default",
+    hasContent = false,
+    className,
+    input,
+    keyboard,
+    slots,
+    actions,
+    onFocusCapture,
+    onBlurCapture,
+    ...props
+  },
   ref,
 ) {
+  const isMobile = useIsMobileViewport();
+  const [focusWithin, setFocusWithin] = useState(false);
+  const [uncontrolledValue, setUncontrolledValue] = useState(input.defaultValue ?? "");
+  const expanded =
+    focusWithin ||
+    hasContent ||
+    Boolean(slots?.inputPrefix) ||
+    String(input.value ?? uncontrolledValue).length > 0;
+  const needsHintPlaceholder = input.placeholder === "" && Boolean(slots?.inputHint);
   const actionRowRef = useRef<HTMLDivElement>(null);
   const actionWidthRef = useRef<HTMLDivElement>(null);
   const leadingRef = useRef<HTMLDivElement>(null);
@@ -110,6 +134,8 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
     <div
       ref={ref}
       data-composer-card
+      data-mobile-composer={isMobile ? (expanded ? "expanded" : "collapsed") : undefined}
+      data-composer-hint-placeholder={needsHintPlaceholder || undefined}
       className={cn(
         "relative flex w-full flex-col rounded-2xl md:min-h-[105px]",
         appearance === "glass"
@@ -118,19 +144,42 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
         className,
       )}
       {...props}
+      onFocusCapture={(event) => {
+        // Header controls bubble through React portals outside this card.
+        if (event.currentTarget.contains(event.target)) setFocusWithin(true);
+        onFocusCapture?.(event);
+      }}
+      onBlurCapture={(event) => {
+        if (event.currentTarget.contains(event.target)) {
+          setFocusWithin(event.currentTarget.contains(event.relatedTarget));
+        }
+        onBlurCapture?.(event);
+      }}
     >
       {appearance === "glass" && <OmniGlassSurface borderRadius={20} className="-z-10" />}
       {slots?.beforeInput}
       <ComposerInputArea
+        data-composer-input-area
         className={slots?.inputPrefix ? "max-h-[320px] overflow-y-auto" : undefined}
       >
         {slots?.inputPrefix}
         {slots?.inputBackdrop}
-        <ComposerTextInput input={input} keyboard={keyboard} />
+        <ComposerTextInput
+          input={{
+            ...input,
+            rows: input.rows ?? (isMobile ? 1 : undefined),
+            placeholder: isMobile && needsHintPlaceholder ? input["aria-label"] : input.placeholder,
+            onChange: (event) => {
+              if (input.value === undefined) setUncontrolledValue(event.currentTarget.value);
+              input.onChange?.(event);
+            },
+          }}
+          keyboard={keyboard}
+        />
         {slots?.inputHint}
       </ComposerInputArea>
       {slots?.attachments}
-      <ComposerActionRow ref={actionRowRef} data-testid={actions.testId}>
+      <ComposerActionRow ref={actionRowRef} data-composer-actions data-testid={actions.testId}>
         {/* Zero-height width probe: resize-observed instead of the row itself,
             whose height the collapse verdict can change. */}
         <div ref={actionWidthRef} className="absolute inset-x-0 top-0 h-0" />
@@ -438,6 +487,7 @@ export const ComposerActionGroup = forwardRef<
   return (
     <div
       ref={ref}
+      data-composer-action-group={side}
       className={cn(
         "flex min-w-0 items-center gap-1 mobile-app:max-w-full",
         side === "left"
@@ -475,6 +525,7 @@ export const ComposerSendButton = forwardRef<
       )}
       aria-label={label}
       aria-busy={busy}
+      data-composer-action="send"
       {...props}
     >
       {busy ? (

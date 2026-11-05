@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useMemo, useState, type ReactNo
 import { createPortal } from "react-dom";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
-type HeaderControlsTarget = { element: HTMLDivElement; sessionId: string } | null;
+type HeaderControlsTarget = { element: HTMLDivElement; sessionId: string | null } | null;
 
 const MobileHeaderControlsContext = createContext<{
   target: HeaderControlsTarget;
@@ -19,7 +19,7 @@ export function MobileHeaderControlsProvider({ children }: { children: ReactNode
   );
 }
 
-export function MobileHeaderControlsSlot({ sessionId }: { sessionId: string }) {
+export function MobileHeaderControlsSlot({ sessionId }: { sessionId: string | null }) {
   const context = useContext(MobileHeaderControlsContext);
   const setTarget = context?.setTarget;
   const registerTarget = useCallback(
@@ -31,7 +31,7 @@ export function MobileHeaderControlsSlot({ sessionId }: { sessionId: string }) {
       ref={registerTarget}
       data-session-id={sessionId}
       data-testid="mobile-header-controls-slot"
-      className="flex items-center empty:hidden"
+      className="flex items-center empty:hidden max-md:gap-2"
     />
   );
 }

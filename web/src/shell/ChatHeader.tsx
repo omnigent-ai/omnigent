@@ -631,8 +631,10 @@ export function ChatHeader({
         )}
       </div>
 
-      <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
-        {isMobile && conversationId && <MobileHeaderControlsSlot sessionId={conversationId} />}
+      <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:empty:hidden">
+        {isMobile && !settingsMode && (
+          <MobileHeaderControlsSlot sessionId={conversationId ?? null} />
+        )}
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}

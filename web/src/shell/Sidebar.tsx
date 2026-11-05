@@ -117,6 +117,7 @@ import {
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
+import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import {
   Dialog,
   DialogContent,
@@ -1084,22 +1085,16 @@ function SidebarImpl({
           peekCloseTimer.current = setTimeout(tryClose, 200);
         }}
         className={cn(
-          // Base: bg + flex column. No transition — expand/collapse snaps
+          // Base: flex column. No transition — expand/collapse snaps
           // instantly (animating the width also lagged drag-to-resize).
           // conversations-sidebar only matters under the macOS Electron
           // shell, where it pushes the card below the traffic lights
           // (see the [data-electron-mac] rules in index.css).
-          "conversations-sidebar flex flex-col bg-card md:select-none",
+          "conversations-sidebar flex flex-col md:bg-card md:select-none",
           nativeSidebarSurface ? "omnigent-native-sidebar-surface" : "omnigent-sidebar-panel",
           // Mobile (default): a fixed drawer that slides in via translate-x
           // and stops short of the right edge, leaving a tappable strip of the
           // chat behind it. The floating-card treatment below is desktop-only.
-          // bg-card-solid (opaque): the overlay sits on top of the chat, and
-          // WebKit drops the glass rule's backdrop-filter once a Radix popper
-          // opens (and never repaints it), letting the chat bleed through the
-          // 60%-alpha glass --card. Desktop keeps the translucent bg-card —
-          // there the sidebar pushes content aside, so nothing sits behind it.
-          "max-md:bg-card-solid",
           // `max-md:right-14` is the ChatGPT-style peek strip: the drawer covers
           // most of the phone but stops short of the right edge so the chat stays
           // visible (and tappable through the scrim) behind it.
@@ -1154,6 +1149,9 @@ function SidebarImpl({
         data-collapsed={!effectiveOpen || undefined}
         data-floating={peek ? "true" : "false"}
       >
+        {mobileLayout && effectiveOpen && (
+          <OmniGlassSurface variant="menu" borderRadius={0} className="-z-10" />
+        )}
         {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
           full-screen overlay with no resize affordance; the parent's ``inert``
