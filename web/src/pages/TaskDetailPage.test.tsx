@@ -442,42 +442,37 @@ describe("loading / not-found states", () => {
 
 describe("header actions", () => {
   it.each([{ isLoading: true }, { cached: true }, { isError: true }])(
-    "waits for a fresh history baseline before Run now: %j",
+    "can trigger before history is ready without highlighting old history: %j",
     (state) => {
       setTask(task());
       setRuns([], state);
-      runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
-        opts?.onSuccess?.(),
+      runNowMutate.mockImplementation(
+        (_id: string, opts?: { onSuccess?: (runId: string) => void }) => opts?.onSuccess?.("new"),
       );
       const { rerender, container } = renderPage();
       const button = screen.getByTestId("task-detail-run-now");
-      expect(button).toBeDisabled();
+      expect(button).not.toBeDisabled();
       fireEvent.click(button);
-      expect(runNowMutate).not.toHaveBeenCalled();
+      expect(runNowMutate).toHaveBeenCalledOnce();
 
       const oldRun = run({ id: "old" });
       setRuns([oldRun]);
       rerender(pageTree());
-      expect(button).not.toBeDisabled();
       expect(container.querySelector(".animate-message-highlight")).toBeNull();
-      fireEvent.click(button);
-      setRuns([run({ id: "new" }), oldRun]);
-      rerender(pageTree());
-      expect(screen.getAllByTestId("task-detail-run")[0]).toHaveClass("animate-message-highlight");
-      expect(screen.getAllByTestId("task-detail-run")[1]).not.toHaveClass(
-        "animate-message-highlight",
-      );
     },
   );
 
-  it("Run now confirms the run was triggered and will start shortly on success", () => {
-    runNowMutate.mockImplementation(
-      (_id: string, opts?: { onSuccess?: () => void; onError?: () => void }) => opts?.onSuccess?.(),
+  it("confirms Run now on an older server without highlighting a guessed row", () => {
+    runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: (runId: null) => void }) =>
+      opts?.onSuccess?.(null),
     );
     setTask(task());
-    renderPage();
+    const { rerender, container } = renderPage();
     fireEvent.click(screen.getByTestId("task-detail-run-now"));
     expect(showToast).toHaveBeenCalledWith("Run triggered, it will start shortly");
+    setRuns([run({ id: "unknown" })]);
+    rerender(pageTree());
+    expect(container.querySelector(".animate-message-highlight")).toBeNull();
   });
 
   it("Run now shows error toast on a generic (non-409) failure", () => {
@@ -611,8 +606,9 @@ describe("header actions", () => {
         const oldRun = run({ id: "run_old", conversationId: null });
         setTask(task());
         setRuns([oldRun]);
-        runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
-          opts?.onSuccess?.(),
+        runNowMutate.mockImplementation(
+          (_id: string, opts?: { onSuccess?: (runId: string) => void }) =>
+            opts?.onSuccess?.("run_new"),
         );
         const { rerender, container } = renderPage();
         const highlighted = () =>
@@ -623,10 +619,14 @@ describe("header actions", () => {
         expect(highlighted()).toHaveLength(0);
 
         const newRun = run({ id: "run_new", status: "running", conversationId });
-        setRuns([newRun, oldRun]);
+        const unrelatedRun = run({ id: "scheduled_elsewhere" });
+        setRuns([unrelatedRun, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(0);
+        setRuns([unrelatedRun, newRun, oldRun]);
         rerender(pageTree());
         expect(highlighted()).toHaveLength(1);
-        expect(screen.getAllByTestId("task-detail-run")[0]).toContainElement(highlighted()[0]);
+        expect(screen.getAllByTestId("task-detail-run")[1]).toBe(highlighted()[0]);
         expect(highlighted()[0]).toHaveStyle({ animationDuration: "3000ms" });
         const highlightedRow = highlighted()[0];
 
@@ -643,12 +643,14 @@ describe("header actions", () => {
         expect(highlighted()).toHaveLength(0);
 
         // Opening a different task must not carry over the pending highlight.
-        fireEvent.click(screen.getByTestId("task-detail-run-now"));
-        routeParams = { taskId: "st_2" };
-        setTask(task({ id: "st_2" }));
-        setRuns([run({ id: "other_task_run" })]);
-        rerender(pageTree());
-        expect(highlighted()).toHaveLength(0);
+        if (delay === 0) {
+          fireEvent.click(screen.getByTestId("task-detail-run-now"));
+          routeParams = { taskId: "st_2" };
+          setTask(task({ id: "st_2" }));
+          setRuns([run({ id: "other_task_run" })]);
+          rerender(pageTree());
+          expect(highlighted()).toHaveLength(0);
+        }
       } finally {
         vi.useRealTimers();
       }
@@ -656,14 +658,15 @@ describe("header actions", () => {
   );
 
   it.each(["expired", "failed retry"])(
-    "does not highlight unrelated runs after %s tracking",
+    "does not highlight even a matching run after %s tracking",
     (reason) => {
       vi.useFakeTimers();
       try {
         setTask(task());
         setRuns([]);
-        runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
-          opts?.onSuccess?.(),
+        runNowMutate.mockImplementation(
+          (_id: string, opts?: { onSuccess?: (runId: string) => void }) =>
+            opts?.onSuccess?.("run_new"),
         );
         const { rerender, container } = renderPage();
         const button = screen.getByTestId("task-detail-run-now");
@@ -675,8 +678,10 @@ describe("header actions", () => {
               opts?.onError?.(new Error("failed")),
           );
           fireEvent.click(button);
+          expect(runNowMutate).toHaveBeenCalledTimes(2);
+          expect(showToast).toHaveBeenCalledWith("Couldn't start the run");
         }
-        setRuns([run({ id: "unrelated" })]);
+        setRuns([run({ id: "run_new" })]);
         rerender(pageTree());
         expect(container.querySelector(".animate-message-highlight")).toBeNull();
       } finally {

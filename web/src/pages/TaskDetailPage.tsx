@@ -89,7 +89,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const [awaitingRunRow, setAwaitingRunRow] = useState(false);
   const preFireNewestIdRef = useRef<string | null>(null);
   const awaitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingRunHighlightUntilRef = useRef<number | null>(null);
+  const pendingRunHighlightRef = useRef<{ runId: string; until: number } | null>(null);
   const [highlightedRunId, setHighlightedRunId] = useState<string | null>(null);
 
   const { data: task, isLoading, isError, error, refetch } = useScheduledTask(taskId);
@@ -100,7 +100,6 @@ function TaskDetail({ taskId }: { taskId: string }) {
     isError: runsError,
     isFetchedAfterMount: runsFetchedAfterMount,
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
-  const runHistoryReady = runs != null && runsFetchedAfterMount && !runsLoading && !runsError;
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -120,17 +119,21 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
   // Clear the flag when a new run row appears (newestId changed from snapshot).
   useEffect(() => {
-    const highlightUntil = pendingRunHighlightUntilRef.current;
-    if (highlightUntil != null && Date.now() >= highlightUntil) {
-      pendingRunHighlightUntilRef.current = null;
+    const pendingHighlight = pendingRunHighlightRef.current;
+    if (pendingHighlight != null) {
+      if (Date.now() >= pendingHighlight.until) {
+        pendingRunHighlightRef.current = null;
+      } else if (runs?.some((run) => run.id === pendingHighlight.runId)) {
+        pendingRunHighlightRef.current = null;
+        setHighlightedRunId(pendingHighlight.runId);
+        clearAwaitingRunRow();
+        return;
+      }
     }
-    if (!awaitingRunRow && pendingRunHighlightUntilRef.current == null) return;
+    // Older servers omit the run ID; only use the newest row to settle loading.
+    if (!awaitingRunRow || pendingRunHighlightRef.current != null) return;
     const newestId = runs?.[0]?.id ?? null;
     if (newestId != null && newestId !== preFireNewestIdRef.current) {
-      if (pendingRunHighlightUntilRef.current != null) {
-        pendingRunHighlightUntilRef.current = null;
-        setHighlightedRunId(newestId);
-      }
       clearAwaitingRunRow();
     }
   }, [runs, awaitingRunRow]);
@@ -297,16 +300,17 @@ function TaskDetail({ taskId }: { taskId: string }) {
   }
 
   function handleRunNow() {
-    if (!runHistoryReady) return;
-    pendingRunHighlightUntilRef.current = null;
+    pendingRunHighlightRef.current = null;
     // Snapshot the pre-fire newest run id so the awaiting effect knows what
     // "a new row appeared" means.
     preFireNewestIdRef.current = runs?.[0]?.id ?? null;
     runNowMutation.mutate(task!.id, {
-      onSuccess: () => {
+      onSuccess: (runId) => {
         showToast("Run triggered, it will start shortly");
         // Keep tracking the new row even after the button's loading timeout.
-        pendingRunHighlightUntilRef.current = Date.now() + RUN_HIGHLIGHT_WAIT_MS;
+        pendingRunHighlightRef.current = runId
+          ? { runId, until: Date.now() + RUN_HIGHLIGHT_WAIT_MS }
+          : null;
         // Keep the button in loading state until the new run row appears, and —
         // because the row is written a few seconds AFTER this 202 — keep the run
         // history polling across that gap so the row is picked up at all.
@@ -318,7 +322,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
         awaitingTimerRef.current = setTimeout(clearAwaitingRunRow, 20_000);
       },
       onError: (err) => {
-        pendingRunHighlightUntilRef.current = null;
+        pendingRunHighlightRef.current = null;
         clearAwaitingRunRow();
         // A 409 (CONFLICT) means a run for this task is already in flight — the
         // run is fine. Show a truthful, non-alarming message.
@@ -371,7 +375,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
           </Button>
           <Button
             data-testid="task-detail-run-now"
-            disabled={busy || awaitingRunRow || !runHistoryReady}
+            disabled={busy || awaitingRunRow}
             onClick={handleRunNow}
           >
             {runNowMutation.isPending || awaitingRunRow ? (
