@@ -14380,6 +14380,95 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("keeps one failure when its status lands while the first history load is pending", async () => {
+    const failure = { code: "startup_input_failed", message: "The message could not be delivered" };
+    const persisted: ConversationItem = {
+      id: "err_cold",
+      response_id: "startup_launch_failed",
+      type: "error",
+      status: "completed",
+      source: "execution",
+      ...failure,
+    };
+    seedSession("conv_cold_status", [persisted]);
+    let releaseItems: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_cold_status\/items/.test(url) && releaseItems === null) {
+        return new Promise<Response>((resolve) => {
+          releaseItems = () => resolve(defaultFetchHandler(input, init));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const switching = useChatStore.getState().switchTo("conv_cold_status");
+    await drainAsync();
+    expect(releaseItems).not.toBeNull();
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_cold_status",
+      status: "failed",
+      responseId: "startup_launch_failed",
+      error: failure,
+    });
+    releaseItems!();
+    await drainAsync();
+    await switching;
+
+    const errors = useChatStore.getState().blocks.filter((b) => b.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ ...failure, ctx: { itemId: persisted.id } });
+  });
+
+  it("replaces a status-only failure card with its persisted error on reconnect", async () => {
+    // The failed status reaches the client before the transcript item that
+    // records the same failure; later content separates the two by the time
+    // a reconnect backfills that item.
+    const failure = { code: "startup_input_failed", message: "The message could not be delivered" };
+    const persisted: ConversationItem = {
+      id: "err_startup",
+      response_id: "startup_launch_failed",
+      type: "error",
+      status: "completed",
+      source: "execution",
+      ...failure,
+    };
+    const resend = userMessage("resp_resend", "try again");
+    seedSession("conv_status_error", []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_status_error", abortController: controller });
+
+    const loop = startStreamPump("conv_status_error", controller, setState, getState);
+    await drainAsync();
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_status_error",
+      status: "failed",
+      responseId: "startup_launch_failed",
+      error: failure,
+    });
+    useChatStore.setState((s) => ({ blocks: [...s.blocks, ...itemsToBlocks([resend])] }));
+    expect(useChatStore.getState().blocks.map((b) => b.type)).toEqual(["error", "user_message"]);
+
+    seedSessionItems("conv_status_error", [persisted, resend]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const errors = useChatStore.getState().blocks.filter((b) => b.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ ...failure, ctx: { itemId: persisted.id } });
+    expect(errors[0]).not.toHaveProperty("fromSessionStatus");
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   /** The card a send leaves when its POST gets no answer. */
   function unansweredSendCard(send: NonNullable<ErrorBlock["unansweredSend"]>): ErrorBlock {
     return {
@@ -15845,10 +15934,23 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       source: "",
       code: "task_failed",
     };
+    // A status-only card whose transcript item the gap persisted: the merge
+    // must keep the persisted copy and drop this one.
+    const startupFailure = {
+      code: "startup_input_failed",
+      message: "The message could not be delivered",
+    };
+    const statusError: ErrorBlock = {
+      type: "error",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "startup_x", itemId: null },
+      source: "",
+      ...startupFailure,
+      fromSessionStatus: true,
+    };
     useChatStore.setState({
       conversationId: "conv_keep",
       abortController: controller,
-      blocks: [...itemsToBlocks(windowItems), approvalCard, syntheticError],
+      blocks: [...itemsToBlocks(windowItems), approvalCard, syntheticError, statusError],
       hasMoreHistory: true,
       oldestItemId: windowItems[0]!.id,
     });
@@ -15862,7 +15964,16 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     gap.forEach((item, i) => {
       item.created_at = 9_000 + i * 10;
     });
-    seedSessionItems("conv_keep", [...preGap, ...gap]);
+    const persistedError: ConversationItem = {
+      id: "err_startup_x",
+      response_id: "startup_x",
+      type: "error",
+      status: "completed",
+      source: "execution",
+      created_at: 10_000,
+      ...startupFailure,
+    };
+    seedSessionItems("conv_keep", [...preGap, ...gap, persistedError]);
     sinks[0]!.error();
     await drainAsync();
     expect(sinks).toHaveLength(2);
@@ -15878,8 +15989,72 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const card = state.blocks.find((b): b is ElicitationBlock => b.type === "elicitation");
     expect(card?.elicitationId).toBe("elic_keep");
     expect(card?.status).toBe("pending");
-    const err = state.blocks.find((b): b is ErrorBlock => b.type === "error");
-    expect(err?.message).toBe("boom");
+    const errors = state.blocks.filter((b): b is ErrorBlock => b.type === "error");
+    expect(errors.map((b) => [b.message, b.ctx.itemId, b.fromSessionStatus])).toEqual([
+      ["boom", null, undefined],
+      [startupFailure.message, persistedError.id, undefined],
+    ]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("drops a status-only failure card when scroll-up loads its persisted error", async () => {
+    const preGap = Array.from({ length: 30 }, (_, i) => gapUser("spre", i));
+    const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+    seedSession("conv_scroll_err", preGap);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    const failure = { code: "startup_input_failed", message: "The message could not be delivered" };
+    const statusError: ErrorBlock = {
+      type: "error",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "startup_y", itemId: null },
+      source: "",
+      ...failure,
+      fromSessionStatus: true,
+    };
+    useChatStore.setState({
+      conversationId: "conv_scroll_err",
+      abortController: controller,
+      blocks: [...itemsToBlocks(windowItems), statusError],
+      hasMoreHistory: true,
+      oldestItemId: windowItems[0]!.id,
+    });
+
+    const loop = startStreamPump("conv_scroll_err", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // The persisted error is older than the newest window the re-hydrate keeps.
+    const persistedError: ConversationItem = {
+      id: "err_startup_y",
+      response_id: "startup_y",
+      type: "error",
+      status: "completed",
+      source: "execution",
+      ...failure,
+    };
+    const gap = Array.from({ length: 100 }, (_, i) => gapUser("sgap", i));
+    seedSessionItems("conv_scroll_err", [...preGap, persistedError, ...gap]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    const errorsOf = () =>
+      useChatStore.getState().blocks.filter((b): b is ErrorBlock => b.type === "error");
+    expect(errorsOf().map((b) => b.fromSessionStatus)).toEqual([true]);
+
+    /* oxlint-disable no-await-in-loop */
+    while (useChatStore.getState().hasMoreHistory) {
+      await useChatStore.getState().loadMoreHistory();
+      await drainAsync(2);
+    }
+    /* oxlint-enable no-await-in-loop */
+    const errors = errorsOf();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ ...failure, ctx: { itemId: persistedError.id } });
 
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");

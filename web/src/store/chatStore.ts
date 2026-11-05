@@ -3863,7 +3863,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         );
         const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
         return {
-          blocks: [...unique, ...state.blocks],
+          blocks: [...unique, ...withoutPersistedStatusErrors(state.blocks, unique)],
           hasMoreHistory: hasMore,
           oldestItemId: items[0]?.id ?? state.oldestItemId,
           loadingMoreHistory: false,
@@ -5037,7 +5037,10 @@ async function bindStream(
       // re-binds.)
       const allBlocks = [
         ...unique,
-        ...withoutRebuiltUserInputCards(currentBlocks, unique),
+        ...withoutPersistedStatusErrors(
+          withoutRebuiltUserInputCards(currentBlocks, unique),
+          unique,
+        ),
         ...uniquePendingElicitations,
       ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
@@ -5688,6 +5691,29 @@ function withoutRebuiltUserInputCards(
   });
 }
 
+/** What identifies one failure across its status card and its persisted error item. */
+function failureKey(block: ErrorBlock): string {
+  return JSON.stringify([block.ctx.responseId, block.code, block.message]);
+}
+
+/**
+ * Status cards lack item ids, so history merges cannot deduplicate them by id.
+ * Prefer persisted errors matching response id, code, and message.
+ */
+function withoutPersistedStatusErrors(
+  liveBlocks: AnyBlock[],
+  historyBlocks: AnyBlock[],
+): AnyBlock[] {
+  const persisted = new Set<string>();
+  for (const b of historyBlocks) {
+    if (b.type === "error" && b.ctx.itemId) persisted.add(failureKey(b));
+  }
+  if (persisted.size === 0) return liveBlocks;
+  return liveBlocks.filter(
+    (b) => !(b.type === "error" && b.fromSessionStatus && persisted.has(failureKey(b))),
+  );
+}
+
 /**
  * Snapshot the ids of currently rendered elicitation cards, split by
  * answerable state, BEFORE a snapshot fetch. `pending` cards are
@@ -5815,7 +5841,7 @@ async function rehydrateWindowOnReconnect(
     const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
     const merged = mergeReconnectWindow(
       windowBlocks,
-      withoutRebuiltUserInputCards(tail, windowBlocks),
+      withoutPersistedStatusErrors(withoutRebuiltUserInputCards(tail, windowBlocks), windowBlocks),
     );
     const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
     const blocks =
@@ -5999,7 +6025,10 @@ async function reconcileOnReconnect(
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
       // A card answered before the gap whose call the gap persisted comes
       // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(reconciledBlocks, unseen);
+      const kept = withoutPersistedStatusErrors(
+        withoutRebuiltUserInputCards(reconciledBlocks, unseen),
+        unseen,
+      );
       let at = -1;
       if (rid) {
         at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
