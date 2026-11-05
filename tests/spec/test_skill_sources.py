@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -1068,6 +1069,7 @@ def test_claude_native_lists_plugins_the_configured_launch_loads(
         json.dumps({"enabledPlugins": {"off@mkt": False}})
     )
     launches = tmp_path / "launches.jsonl"
+    configured_settings = json.dumps({"disableAllHooks": False})
     configure_claude_launch(
         isolate_provider_resolution(monkeypatch, tmp_path / "config"),
         launches,
@@ -1084,6 +1086,7 @@ def test_claude_native_lists_plugins_the_configured_launch_loads(
                 {"name": "off", "path": str(launch_dirs / "off")},
             ]
         ),
+        args=("--", "--settings", configured_settings),
     )
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     warnings: list[str] = []
@@ -1096,8 +1099,13 @@ def test_claude_native_lists_plugins_the_configured_launch_loads(
     assert warnings == []
     [launch] = [json.loads(line) for line in launches.read_text().splitlines()]
     argv = launch["argv"]
-    assert argv[:3] == ["--", "-p", "/model"]
-    assert json.loads(argv[argv.index("--settings") + 1]) == {"disableAllHooks": True}
+    assert argv[:5] == ["--", "--settings", configured_settings, "-p", "/model"]
+    # Like the terminal's own settings, the probe's follow configured ones, so they take effect.
+    settings = [value for flag, value in itertools.pairwise(argv) if flag == "--settings"]
+    assert [json.loads(value) for value in settings] == [
+        {"disableAllHooks": False},
+        {"disableAllHooks": True},
+    ]
     assert Path(launch["cwd"]).resolve() == home.resolve()
 
 

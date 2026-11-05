@@ -2961,6 +2961,7 @@ def test_install_crash_logging_is_idempotent() -> None:
     [(True, False), (False, True)],
 )
 async def test_runner_shutdown_closes_terminal_registry(
+    request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     host_owns_global_cleanup: bool,
@@ -3098,6 +3099,7 @@ async def test_runner_shutdown_closes_terminal_registry(
 
     app = entry_mod.create_app()
     plugin_discovery.prewarm_claude_launch_plugins()
+    request.addfinalizer(plugin_discovery.stop_claude_launch_probes)
     poll_until(launch_pid.exists, timeout_s=10, interval_s=0.05)
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan instead.
     handler = Capture()

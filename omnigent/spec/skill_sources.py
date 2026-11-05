@@ -778,6 +778,11 @@ def _claude_code_commands(ctx: SkillSourceContext) -> list[SkillSpec]:
     return out
 
 
+CLAUDE_LAUNCH_PLUGINS_LOADING = (
+    "Claude plugins added by the configured launch are still loading; retry in a moment."
+)
+
+
 def _claude_launch_plugin_paths(ctx: SkillSourceContext) -> dict[str, Path]:
     """Plugins a customized native launch loads, such as a launcher's ``--plugin-dir``."""
     from omnigent.harnesses.claude_native.plugin_discovery import (
@@ -809,9 +814,7 @@ def _claude_launch_plugin_paths(ctx: SkillSourceContext) -> dict[str, Path]:
     try:
         return claude_launch_plugin_dirs(wait=ctx.wait_for_launch_plugins)
     except LaunchPluginsPending:
-        note = (
-            "Claude plugins added by the configured launch are still loading; retry in a moment."
-        )
+        note = CLAUDE_LAUNCH_PLUGINS_LOADING
     except (LaunchPluginsFailed, *CONFIG_READ_ERRORS) as exc:
         # The probe logged its own failure; anything else failed to resolve the launch.
         if isinstance(exc, LaunchPluginsFailed):

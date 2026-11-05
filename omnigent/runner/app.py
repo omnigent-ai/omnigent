@@ -215,7 +215,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
-from omnigent.spec.skill_sources import resolve_session_skills
+from omnigent.spec.skill_sources import CLAUDE_LAUNCH_PLUGINS_LOADING, resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.util.dedicated_executor import DedicatedExecutor
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -8011,8 +8011,8 @@ def create_runner_app(
         _session_skills_cache[session_id] = (
             time.monotonic() + ttl,
             skills,
-            # Waiting changes only a list that a still-loading source left incomplete.
-            wait_for_launch_plugins or not problems,
+            # Waiting changes only a list that a still-loading launch left incomplete.
+            wait_for_launch_plugins or CLAUDE_LAUNCH_PLUGINS_LOADING not in problems,
             generation,
         )
         return skills

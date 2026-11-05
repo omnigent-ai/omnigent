@@ -455,13 +455,18 @@ async def test_resolve_session_skill_non_string_arguments_returns_400(tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_warning",
+    [None, "Codex plugin skills unavailable: `codex plugin list` timed out after 5s."],
+    ids=["complete", "failed-source"],
+)
 async def test_session_skills_cached_per_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_warning: str | None
 ) -> None:
     """
     The merged skills are cached per session: a second ``POST /skills/resolve``
     reuses the cache and does not re-run spec resolution / the host-skill
-    filesystem walk. A missing name reuses it too when no source was still loading.
+    filesystem walk. A missing name reuses it too unless a launch was still loading.
     """
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -474,6 +479,8 @@ async def test_session_skills_cached_per_session(
         spec: Any, roots: tuple[Path, ...], *args: Any, **kwargs: Any
     ) -> list[SkillSpec]:
         walks.append(roots)
+        if source_warning is not None:
+            kwargs["warnings"].append(source_warning)
         return resolve_session_skills(spec, roots, *args, **kwargs)
 
     monkeypatch.setattr("omnigent.runner.app.resolve_session_skills", counted_walk)
