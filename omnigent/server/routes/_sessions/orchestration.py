@@ -12352,7 +12352,9 @@ async def _create_session_from_existing_agent(
                     conv.id,
                     user_id=user_id,
                 )
-                conv = conversation_store.get_conversation(conv.id) or conv
+                conv = (
+                    await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+                ) or conv
             await record_profile(request, conv.id, sandbox_profile, conversation_store)
     except NameAlreadyExistsError as exc:
         if (
