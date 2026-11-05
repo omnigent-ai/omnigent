@@ -4,7 +4,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
@@ -25,6 +25,7 @@ import {
   undoArchiveConversations,
   retryListFetch,
   useConversations,
+  useLeaveSession,
   useSessionSearch,
   useDeleteProject,
   useProjects,
@@ -1172,6 +1173,97 @@ describe("recently-created keep-alive", () => {
     // row doesn't flash out of the sidebar.
     await waitFor(() => expect(result.current.data).toBeDefined());
     expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it.each([
+    ["mine", ["mine_new", "conv_old"]],
+    ["shared", ["conv_old"]],
+  ] as const)(
+    "keeps the viewer's own rows alive in My sessions and none in Shared (%s)",
+    async (visibility, expected) => {
+      const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("me");
+      onTestFinished(() => viewer.mockRestore());
+      for (const [id, owner] of [
+        ["mine_new", undefined],
+        ["shared_new", "alice"],
+      ] as const) {
+        markRecentlyCreated({
+          id,
+          object: "conversation",
+          title: null,
+          created_at: 0,
+          updated_at: 9,
+          labels: {},
+          permission_level: null,
+          ...(owner ? { owner } : {}),
+        });
+      }
+      fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useConversations("", false, {}, undefined, visibility), {
+        wrapper,
+      });
+
+      await waitFor(() => expect(result.current.data).toBeDefined());
+      expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(expected);
+    },
+  );
+
+  it("keeps an owner-permission row in My sessions while the viewer is unresolved", async () => {
+    // A transient /v1/me failure leaves the viewer unknown; the row's owner
+    // permission still marks it as the viewer's own.
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue(null);
+    onTestFinished(() => viewer.mockRestore());
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: null,
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      owner: "alice",
+      permission_level: 4,
+    });
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useConversations("", false, {}, undefined, "mine"), {
+      wrapper,
+    });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it("stops keeping a session alive once the viewer leaves it", async () => {
+    // The session stays readable by link, so no removed frame follows the leave.
+    markRecentlyCreated({
+      id: "conv_left",
+      object: "conversation",
+      title: null,
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      owner: "alice",
+      permission_level: 2,
+    });
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const leave = renderHook(() => useLeaveSession(), { wrapper });
+    await act(() => leave.result.current.mutateAsync({ id: "conv_left", viewerId: "bob" }));
+    const { result } = renderHook(() => useConversations("", false, {}), { wrapper });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_old"]);
   });
 
   it("drops the keep-alive (no duplicate) once the fetch returns the row", async () => {

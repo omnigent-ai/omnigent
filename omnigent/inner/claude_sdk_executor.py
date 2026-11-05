@@ -36,9 +36,9 @@ import pathlib
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
@@ -320,6 +320,8 @@ class _ClaudeClient(Protocol):
     ) -> None: ...
     async def set_model(self, model: str | None) -> None: ...
     async def interrupt(self) -> None: ...
+    async def get_mcp_status(self) -> Mapping[str, object]: ...
+    async def reconnect_mcp_server(self, server_name: str) -> None: ...
 
     # receive_response yields heterogeneous SDK message objects — kept
     # as ``Any`` so the caller can ``isinstance``-narrow onto the SDK's
@@ -420,6 +422,8 @@ class _ClaudeSDK(Protocol):
 
 _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
+_MCP_STATUS_TIMEOUT_SECONDS = 10.0
+_MCP_RECONNECT_TIMEOUT_SECONDS = 30.0
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -902,6 +906,76 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    # Host-reported account state of each Claude MCP server when last checked.
+    mcp_auth: dict[str, str] = field(default_factory=dict)
+
+
+def _claude_mcp_auth_statuses() -> dict[str, str]:
+    """The host sign-in manager's account state for each Claude MCP server, by name."""
+    try:
+        from omnigent.host.mcp_inventory import read_auth_status_overlay
+
+        overlay = read_auth_status_overlay(pathlib.Path.home())
+    except Exception:
+        logger.warning("Reading MCP auth status failed", exc_info=True)
+        return {}
+    return {
+        name: fields["auth_status"]
+        for (harness, name), fields in overlay.items()
+        if harness == "claude"
+    }
+
+
+def _inventory_mcp_server_name(live_name: str) -> str:
+    """The host inventory's name for a server; the CLI adds ``plugin:<plugin>:`` to plugin ones."""
+    prefix, plugin_sep, rest = live_name.partition(":")
+    if prefix == "plugin" and plugin_sep:
+        _plugin, server_sep, server = rest.partition(":")
+        if server_sep and server:
+            return server
+    return live_name
+
+
+async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) -> set[str]:
+    """Reconnect the named servers the CLI reports failed; return those to check again.
+
+    :raises TimeoutError: The CLI did not answer in time and is still busy with the request.
+    """
+    try:
+        response = await asyncio.wait_for(
+            client.get_mcp_status(), timeout=_MCP_STATUS_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        raise
+    except Exception:
+        logger.warning("Reading MCP status before reconnect failed", exc_info=True)
+        return names
+    retry: set[str] = set()
+    # (live CLI name, host inventory name) of each server to reconnect.
+    failed: list[tuple[str, str]] = []
+    servers = response.get("mcpServers")
+    for server in servers if isinstance(servers, list) else []:
+        live_name = server.get("name") if isinstance(server, Mapping) else None
+        if not isinstance(live_name, str):
+            continue
+        name = _inventory_mcp_server_name(live_name)
+        if name not in names:
+            continue
+        status = server.get("status")
+        if status == "pending":
+            retry.add(name)
+        elif status in ("failed", "needs-auth"):
+            failed.append((live_name, name))
+
+    # The CLI handles control requests one at a time, so the reconnects share one budget.
+    async with asyncio.timeout(_MCP_RECONNECT_TIMEOUT_SECONDS):
+        for live_name, name in failed:
+            try:
+                await client.reconnect_mcp_server(live_name)
+            except Exception:
+                logger.warning("Reconnecting MCP server %r failed", live_name, exc_info=True)
+                retry.add(name)
+    return retry
 
 
 @dataclass(frozen=True)
@@ -1982,6 +2056,7 @@ class ClaudeSDKExecutor(Executor):
     ) -> _ClaudeClient:
         state = self._clients.get(session_key)
         if state is None:
+            mcp_auth = _claude_mcp_auth_statuses()
             await self._route_options_through_gateway_shim(options)
             # Tee CLI stderr so the connect timeout error carries the
             # tail; ``_on_stderr`` alone only logs at DEBUG.
@@ -2074,6 +2149,7 @@ class ClaudeSDKExecutor(Executor):
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
+                mcp_auth=mcp_auth,
             )
             self._clients[session_key] = state
             return client
@@ -2082,6 +2158,37 @@ class ClaudeSDKExecutor(Executor):
             await state.client.set_model(model)
             state.model = model
         return state.client
+
+    async def _reconnect_signed_in_mcp_servers(self, state: _ClaudeClientState) -> bool:
+        """Reconnect servers the host reports signed in since this client last checked.
+
+        The CLI connects MCP servers only at startup, so one that failed while its
+        sign-in was pending stays failed for the life of the client.
+
+        :returns: ``False`` when the CLI is still busy with a timed-out request and
+            would hold the next prompt, so the client must be replaced.
+        """
+        current = _claude_mcp_auth_statuses()
+        signed_in = {
+            name
+            for name, status in current.items()
+            if status == "connected" and state.mcp_auth.get(name) != "connected"
+        }
+        try:
+            retry = (
+                await _reconnect_failed_mcp_servers(state.client, signed_in)
+                if signed_in
+                else set()
+            )
+        except TimeoutError:
+            logger.warning(
+                "Reconnecting MCP servers timed out; restarting the Claude CLI, "
+                "which connects them as it starts"
+            )
+            return False
+        # A server left out of the snapshot is checked again next turn.
+        state.mcp_auth = {name: status for name, status in current.items() if name not in retry}
+        return True
 
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
@@ -2786,12 +2893,21 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
-            # Effort is a launch option. Rebuild with history for conversational
-            # turns, but let /compact operate on the existing client's context.
-            await self._close_live_client(session_key)
-            resume_session = False
-            prompt = self._build_prompt(messages, resume_session=False)
+        if state is not None and prompt != "/compact":
+            # Effort is a launch option, and a CLI busy with a timed-out MCP reconnect
+            # holds the prompt. Rebuild with history for conversational turns, but let
+            # /compact operate on the existing client's context.
+            rebuild = state.effort != reasoning_effort
+            if not rebuild:
+                try:
+                    rebuild = not await self._reconnect_signed_in_mcp_servers(state)
+                except asyncio.CancelledError:
+                    self._evict_client_on_cancel(session_key)
+                    raise
+            if rebuild:
+                await self._close_live_client(session_key)
+                resume_session = False
+                prompt = self._build_prompt(messages, resume_session=False)
 
         # Build MCP tools from Omnigent tool schemas
         mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []

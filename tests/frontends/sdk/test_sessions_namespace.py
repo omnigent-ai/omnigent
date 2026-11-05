@@ -249,6 +249,44 @@ async def test_get_returns_typed_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_sends_only_the_parts_turned_off() -> None:
+    """Each disabled part becomes ``include_<part>=false``; enabled parts send nothing,
+    so a default call is unchanged and older servers, which ignore the flags, still work."""
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        return httpx.Response(200, json=_session_response_body(items=[]))
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.get("conv_abc")
+        await ns.get("conv_abc", include_items=False)
+        await ns.get("conv_abc", include_items=False, include_usage=False)
+        await ns.get(
+            "conv_abc",
+            include_items=False,
+            include_liveness=False,
+            include_live_status=False,
+            include_usage=False,
+        )
+    finally:
+        await client.aclose()
+
+    assert seen == [
+        {},
+        {"include_items": "false"},
+        {"include_items": "false", "include_usage": "false"},
+        {
+            "include_items": "false",
+            "include_liveness": "false",
+            "include_live_status": "false",
+            "include_usage": "false",
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_get_updated_at_defaults_to_none_when_omitted() -> None:
     """Older session responses without ``updated_at`` remain parseable."""
 
