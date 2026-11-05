@@ -876,7 +876,7 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
         assert reason in (run.error or "")
 
 
-@pytest.mark.parametrize("hint_outcome", ["absent", "hint", "empty", "raises", "blocked"])
+@pytest.mark.parametrize("hint_outcome", ["absent", "hint", "none", "empty", "raises", "blocked"])
 async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(
     store, monkeypatch, hint_outcome
 ) -> None:
@@ -900,6 +900,8 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(
             raise RuntimeError("provider unavailable")
         if hint_outcome == "blocked":
             release_hint.wait()
+        if hint_outcome == "empty":
+            return ""
         return "Check provider sign-in and retry." if hint_outcome == "hint" else None
 
     async def launch(**kwargs: Any) -> None:
