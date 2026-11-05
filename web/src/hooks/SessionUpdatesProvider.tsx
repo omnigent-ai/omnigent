@@ -1,5 +1,9 @@
 import { SidebarDataContext } from "./useSidebarData";
-import { PINNED_CONVERSATIONS_KEY, type PinnedConversationsResult } from "./useConversations";
+import {
+  type Conversation,
+  PINNED_CONVERSATIONS_KEY,
+  type PinnedConversationsResult,
+} from "./useConversations";
 // App-level wiring for the `WS /v1/sessions/updates` push stream.
 //
 // Mounted once near the app root. It:
@@ -169,6 +173,19 @@ function applyItemsToCache(
       .filter((row) => !row.archived);
     return changed ? { ...previous, conversations } : previous;
   });
+  // The open session's fetched sidebar row sits outside every list, so a remote
+  // archive or unarchive reaches it only here. Only `archived` is taken, keeping its owner.
+  for (const item of itemsById.values()) {
+    if (typeof item.archived !== "boolean") continue;
+    const backfillKey = ["conversation-backfill", item.id];
+    const row = queryClient.getQueryData<Conversation | null>(backfillKey);
+    if (row && (row.archived ?? false) !== item.archived) {
+      queryClient.setQueryData<Conversation | null>(backfillKey, {
+        ...row,
+        archived: item.archived,
+      });
+    }
+  }
   return {
     // Sub-agent children are watched for their tree views, but no session list
     // ever holds them, so their absence is not a sign of a new session.

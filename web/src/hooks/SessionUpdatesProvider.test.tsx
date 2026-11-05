@@ -665,6 +665,50 @@ describe("SessionUpdatesProvider archive tombstone", () => {
   });
 });
 
+describe("SessionUpdatesProvider open-session row", () => {
+  it.each([true, false])(
+    "applies a remote archive change (archived: %s) to the fetched row, keeping its owner",
+    (archived) => {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      const key = ["conversation-backfill", "conv_old"];
+      client.setQueryData<Conversation>(key, {
+        ...conv("conv_old"),
+        owner: "teammate",
+        archived: !archived,
+      });
+      renderProvider(client, ["/c/conv_old"]);
+
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [{ ...conv("conv_old"), owner: null, archived }],
+        }),
+      );
+
+      expect(client.getQueryData<Conversation>(key)).toMatchObject({ archived, owner: "teammate" });
+    },
+  );
+
+  it("leaves an unchanged fetched row as it is", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    const row: Conversation = { ...conv("conv_old"), archived: true };
+    client.setQueryData<Conversation>(key, row);
+    renderProvider(client, ["/c/conv_old"]);
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("conv_old"), archived: true, title: "Renamed" }],
+      }),
+    );
+
+    expect(client.getQueryData<Conversation>(key)).toBe(row);
+  });
+});
+
 describe("SessionUpdatesProvider list invalidation", () => {
   it("invalidates the archived-project-names scan on a remote removal", () => {
     // Another client archiving/relabeling/deleting must refresh the Archived
