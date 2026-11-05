@@ -866,7 +866,8 @@ describe("AppShell header", () => {
       expect(
         screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive" }),
       ).toBeInTheDocument();
-      if (sibling) expect(screen.queryByRole("menuitem", { name: /Move to project/ })).toBeNull();
+      if (sibling) expect(screen.queryByTestId("header-move-to-project")).toBeNull();
+      else expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     },
   );
 

@@ -905,13 +905,10 @@ function SidebarImpl({
   const { data: pinnedData, isSuccess: pinnedLoaded } = sidebarData.pinned;
   // Stable empty fallback so downstream memos don't re-fire on every render
   // while the query is still loading (`pinnedData` undefined).
+  const pinnedFamilyRows = pinnedData?.conversations ?? EMPTY_CONVERSATIONS;
   const pinnedConversations = useMemo(
-    () => pinnedData?.conversations ?? EMPTY_CONVERSATIONS,
-    [pinnedData],
-  );
-  const pinnedFamilyRows = useMemo(
-    () => [...pinnedConversations, ...(pinnedData?.familyMembers ?? [])],
-    [pinnedConversations, pinnedData],
+    () => pinnedFamilyRows.filter(isPinOrderUnit),
+    [pinnedFamilyRows],
   );
   const pinnedFilterHonored = pinnedData?.filterHonored ?? false;
   // Membership is the union of the server's pinned rows and any pins still in
@@ -4156,11 +4153,10 @@ function ConversationSection({
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
   const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
-  const familyRows = orderSessionFamilies(conversations);
   const familyRepresentatives = new Set(
-    familyRows.filter((row) => row.family?.representative_id === row.id).map((row) => row.id),
+    conversations.filter((row) => row.family?.representative_id === row.id).map((row) => row.id),
   );
-  const visibleFamilyRows = familyRows.filter(
+  const visibleFamilyRows = conversations.filter(
     (row) => !isIndentedSibling(row) || !row.family || !collapsedFamilies.has(row.family.id),
   );
 
@@ -4285,7 +4281,7 @@ function ConversationSection({
                   }
                   familyExpanded={
                     conv.family?.representative_id === conv.id &&
-                    familyRows.some(
+                    conversations.some(
                       (row) => row.id !== conv.id && row.family?.id === conv.family?.id,
                     )
                       ? !collapsedFamilies.has(conv.family.id)

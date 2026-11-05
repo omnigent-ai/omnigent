@@ -237,6 +237,8 @@ async def test_editor_beyond_first_grant_page_blocks_controls(auth_client, peers
         permissions.ensure_user(f"viewer-{index:03d}")
         permissions.grant(f"viewer-{index:03d}", source["id"], LEVEL_READ)
     assert (await _send(auth_client, source, target)).get("queued") is True
+    metadata = {"agent_id": source["agent_id"], "sibling_source_id": source["id"]}
+    assert (await auth_client.post("/v1/sessions", json=metadata)).status_code == 201
     permissions.ensure_user("zed")
     permissions.grant("zed", source["id"], LEVEL_EDIT)
     _, cursor = permissions.list_for_session(source["id"])
@@ -244,6 +246,7 @@ async def test_editor_beyond_first_grant_page_blocks_controls(auth_client, peers
     captured.clear()
     assert "shared with edit access cannot" in (await _send(auth_client, source, target))["detail"]
     assert not captured.get("posts")
+    assert (await auth_client.post("/v1/sessions", json=metadata)).status_code == 403
 
 
 async def test_sharing_during_receiver_startup_blocks_delivery(
@@ -1409,21 +1412,6 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
         "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
     )
     assert response.status_code == 403, response.text
-
-
-async def test_read_only_shared_source_can_orchestrate_after_many_readers(
-    auth_client, peers, db_uri
-):
-    source, target, _ = peers
-    permissions = SqlAlchemyPermissionStore(db_uri)
-    for index in range(105):
-        reader = f"reader-{index:03}"
-        permissions.ensure_user(reader)
-        permissions.grant(reader, source["id"], LEVEL_READ)
-    assert (await _send(auth_client, source, target)).get("queued") is True
-    permissions.ensure_user("z-editor")
-    permissions.grant("z-editor", source["id"], LEVEL_EDIT)
-    assert "shared with edit access cannot" in (await _send(auth_client, source, target))["detail"]
 
 
 async def test_family_project_removal_precedes_archive(auth_client, peers, db_uri):

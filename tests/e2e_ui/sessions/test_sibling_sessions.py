@@ -165,26 +165,38 @@ async def _drive(rig: ManagedReplicas) -> None:
                     await expect(menu).not_to_contain_text(names[source_host])
                     await page.keyboard.press("Escape")
                     await page.goto(f"{rig.ui}/c/{sibling_id}")
-                    # Archive promotes a survivor; Undo restores the original representative.
                     row = page.locator(f'li[data-sidebar-session-id="{source_id}"]')
                     await row.hover()
-                    await row.get_by_test_id("conversation-actions").click()
-                    await page.get_by_test_id("archive-conversation").click()
+                    await row.get_by_test_id("quick-pin-conversation").click()
                     await _poll(
                         client,
                         f"{rig.a}/v1/sessions/{sibling_id}",
-                        lambda row: row.get("family", {}).get("representative_id") == sibling_id,
+                        lambda row: row.get("family", {}).get("pinned") is True,
                     )
-                    await (
-                        page.get_by_test_id("archive-undo-toast-item")
-                        .get_by_role("button", name="Undo")
-                        .click()
-                    )
-                    await _poll(
-                        client,
-                        f"{rig.a}/v1/sessions/{sibling_id}",
-                        lambda row: row.get("family", {}).get("representative_id") == source_id,
-                    )
+                    # Pinned peers disappear immediately; Undo restores their family position.
+                    for archived_id in (fresh_id, source_id):
+                        row = page.locator(f'li[data-sidebar-session-id="{archived_id}"]')
+                        await row.hover()
+                        await row.get_by_test_id("conversation-actions").click()
+                        await page.get_by_test_id("archive-conversation").click()
+                        await expect(row).to_have_count(0)
+                        representative_id = sibling_id if archived_id == source_id else source_id
+                        await expect(
+                            page.locator(
+                                f'li[data-sidebar-session-id="{representative_id}"]'
+                            ).get_by_role("button", name="Collapse session family")
+                        ).to_be_visible()
+                        await (
+                            page.get_by_test_id("archive-undo-toast-item")
+                            .get_by_role("button", name="Undo")
+                            .click()
+                        )
+                        await expect(row).to_have_count(1)
+                        await expect(
+                            page.locator(f'li[data-sidebar-session-id="{source_id}"]').get_by_role(
+                                "button", name="Collapse session family"
+                            )
+                        ).to_be_visible()
                     # Delete through the UI and prove the same-host sibling can still work.
                     row = page.locator(f'li[data-sidebar-session-id="{source_id}"]')
                     await row.hover()
@@ -203,6 +215,11 @@ async def _drive(rig: ManagedReplicas) -> None:
                         f"{rig.a}/v1/sessions/{sibling_id}",
                         lambda row: row.get("family", {}).get("representative_id") == sibling_id,
                     )
+                    await expect(
+                        page.locator(f'li[data-sidebar-session-id="{sibling_id}"]').get_by_role(
+                            "button", name="Collapse session family"
+                        )
+                    ).to_be_visible()
                     assert promoted["host_id"] == source_host
                     assert (
                         Path(source["workspace"]) / "keep.txt"
@@ -213,6 +230,14 @@ async def _drive(rig: ManagedReplicas) -> None:
                         page.get_by_text("Done: Still here after deletion", exact=True)
                     ).to_be_visible(timeout=60000)
                     await page.screenshot(path=str(evidence / "survivor.png"))
+                    row = page.locator(f'li[data-sidebar-session-id="{sibling_id}"]')
+                    await row.hover()
+                    await row.get_by_test_id("quick-pin-conversation").click()
+                    await _poll(
+                        client,
+                        f"{rig.a}/v1/sessions/{sibling_id}",
+                        lambda row: row.get("family", {}).get("pinned") is False,
+                    )
 
                     async def menu(session_id: str) -> None:
                         row = page.locator(f'li[data-sidebar-session-id="{session_id}"]').first

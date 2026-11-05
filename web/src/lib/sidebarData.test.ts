@@ -19,6 +19,18 @@ const row = (id: string, updated_at: number): Conversation => ({
 });
 
 describe("scope merge", () => {
+  it("retains family context below the raw cursor without admitting unrelated older rows", () => {
+    const family = { id: "family", representative_id: "old", pinned: false };
+    const mine = [
+      { ...row("recent", 100), family },
+      row("cursor", 80),
+      { ...row("old", 10), family },
+      row("unrelated", 5),
+    ];
+    const merged = mergeScopeRows(mine, [row("shared", 90)], true, false, "cursor");
+    expect(merged.watermark?.id).toBe("cursor");
+    expect(merged.rows.map((item) => item.id)).toEqual(["recent", "shared", "cursor", "old"]);
+  });
   it("buffers rows below the shallower tail until both scopes advance", () => {
     const mine = [row("m1", 100), row("m2", 80), row("m3", 20)];
     const shared = [row("s1", 90), row("s2", 70)];
@@ -120,6 +132,27 @@ describe("scope merge", () => {
 });
 
 describe("scope refresh", () => {
+  it("retains loaded history beyond the raw cursor when expansion appends older context", () => {
+    const family = { id: "family", representative_id: "old", pinned: false };
+    const current = {
+      pages: [sessionRowsPage([row("cursor", 30), row("history", 20)], true)],
+      pageParams: [undefined],
+      windowSize: 240,
+    };
+    const incoming = {
+      ...sessionRowsPage(
+        [
+          { ...row("cursor", 30), family },
+          { ...row("old", 10), family },
+        ],
+        true,
+      ),
+      last_id: "cursor",
+    };
+    expect(refreshScopeWindow(current, incoming, 100).pages[0].data.map((item) => item.id)).toEqual(
+      ["cursor", "history", "old"],
+    );
+  });
   it("replaces a loaded window instead of retaining removed rows", () => {
     const current = {
       pages: [sessionRowsPage([row("removed", 40), row("a", 30)], true)],

@@ -51,7 +51,7 @@ export function refreshScopeWindow(
     };
   }
   const previous = current?.pages.flatMap((page) => page.data) ?? [];
-  const incomingTail = incoming.data.at(-1);
+  const incomingTail = scopeBoundaryRow(incoming.data, incoming.last_id);
   const older = incomingTail ? previous.filter((row) => compare(row, incomingTail) > 0) : previous;
   const rows = dedupeSessionRows([...older, ...incoming.data]).sort(compare);
   const overlaps = incomingTail && previous.some((row) => row.id === incomingTail.id);
@@ -135,8 +135,16 @@ export function mergeScopeRows(
     .sort(compare);
   const watermark = tails[0];
   const rows = dedupeSessionRows([...mine, ...shared]).sort(compare);
+  const visibleFamilies = new Set(
+    rows.filter((row) => !watermark || compare(row, watermark) <= 0).map((row) => row.family?.id),
+  );
   return {
-    rows: watermark ? rows.filter((row) => compare(row, watermark) <= 0) : rows,
+    rows: watermark
+      ? rows.filter(
+          (row) =>
+            compare(row, watermark) <= 0 || (row.family && visibleFamilies.has(row.family.id)),
+        )
+      : rows,
     watermark,
   };
 }
