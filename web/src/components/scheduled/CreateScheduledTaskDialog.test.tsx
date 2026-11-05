@@ -2864,6 +2864,193 @@ describe("CreateScheduledTaskDialog session mode", () => {
   });
 });
 
+describe("automation trigger type", () => {
+  function dialog(props: Partial<React.ComponentProps<typeof CreateScheduledTaskDialog>> = {}) {
+    return (
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_subhour: true,
+          automation_trigger_poll_minutes: 30,
+          features: { automations_v2: true, session_orchestration: true },
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} {...props} />
+      </CapabilitiesProvider>
+    );
+  }
+
+  async function choose(label: string, testId = "task-trigger-type") {
+    fireEvent.keyDown(screen.getByTestId(testId), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: label }));
+  }
+
+  function type(testId: string, value: string) {
+    fireEvent.change(screen.getByTestId(testId), { target: { value } });
+  }
+
+  it.each([
+    ["Jira", "jira", "ES"],
+    ["Slack", "slack", "support"],
+    ["GitHub", "github", "acme/app"],
+    ["Linear", "linear", "ENG"],
+  ])(
+    "defaults to Schedule and creates a %s trigger from the selector",
+    async (label, source, scope) => {
+      render(dialog());
+      expect(screen.getByLabelText("Trigger type")).toHaveTextContent("Schedule");
+      expect(screen.getByTestId("schedule-preset-trigger")).toBeVisible();
+      await choose(label);
+      expect(screen.getByLabelText("Trigger type")).toHaveTextContent(label);
+      expect(screen.queryByTestId("schedule-preset-trigger")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-session-mode-field")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 30 minutes");
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      type("task-trigger-scope", scope);
+      type("task-trigger-instructions", "Investigate the item.");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+      expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+        templateId: source,
+        sessionMode: "continue",
+        rrule: "FREQ=MINUTELY;INTERVAL=30",
+        prompt: expect.stringContaining(scope),
+      });
+    },
+  );
+
+  it("restores schedule and source drafts without carrying conditions between integrations", async () => {
+    async function chooseTimezone(zone: string) {
+      await userEvent.click(screen.getByLabelText("Timezone", { exact: true }));
+      fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: zone } });
+      await userEvent.click(await screen.findByRole("option", { name: zone.replaceAll("_", " ") }));
+    }
+
+    render(dialog());
+    type("task-name-input", "Team work");
+    type("task-prompt-input", "Prepare the weekly report.");
+    await choose("Every week", "schedule-preset-trigger");
+    await chooseTimezone("America/New_York");
+    await choose("Jira");
+    expect(screen.getByTestId("task-name-input")).toHaveValue("Team work");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(
+      "Prepare the weekly report.",
+    );
+    type("task-trigger-scope", "ES");
+    type("task-trigger-instructions", "Triage the ticket.");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    type("task-trigger-condition-0-value", "bug");
+    await choose("Slack");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Triage the ticket.");
+    expect(screen.queryByTestId("task-trigger-condition-0-value")).not.toBeInTheDocument();
+    type("task-trigger-scope", "support");
+    type("task-trigger-instructions", "Summarize the message.");
+    await choose("Jira");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("ES");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Triage the ticket.");
+    expect(screen.getByTestId("task-trigger-condition-0-value")).toHaveValue("bug");
+    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
+    fireEvent.click(screen.getByTestId("task-session-mode-trigger"));
+    await choose("Every day", "schedule-preset-trigger");
+    await chooseTimezone("Europe/London");
+    await choose("Schedule");
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue("Prepare the weekly report.");
+    expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every week");
+    expect(screen.getByLabelText("Timezone", { exact: true })).toHaveTextContent(
+      "America/New York",
+    );
+    expect(screen.getByTestId("task-session-mode-trigger")).toBeChecked();
+    await choose("Jira");
+    expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every day");
+    expect(screen.getByLabelText("Timezone", { exact: true })).toHaveTextContent("Europe/London");
+    await choose("Schedule");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].rrule).toContain("FREQ=WEEKLY");
+    expect(mutateAsync.mock.calls[0][0].timezone).toBe("America/New_York");
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("templateId");
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
+  });
+
+  it("keeps custom prompt edits and attributes a switched gallery template to the selected source", async () => {
+    render(dialog({ initialTrigger: "jira", initialTemplateId: "jira" }));
+    expect(screen.getByLabelText("Trigger type")).toHaveTextContent("Jira");
+    await choose("GitHub");
+    expect(screen.getByTestId("task-name-input")).toHaveValue("GitHub");
+    type("task-trigger-scope", "acme/app");
+    type("task-trigger-instructions", "Investigate it.");
+    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
+    type("task-prompt-input", "Investigate it and add a regression test.");
+    await choose("Slack");
+    await choose("GitHub");
+    expect(screen.queryByTestId("task-trigger-fields")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue(
+      "Investigate it and add a regression test.",
+    );
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+      templateId: "github",
+      prompt: expect.stringContaining("repo:acme/app"),
+    });
+    expect(mutateAsync.mock.calls[0][0].prompt).toContain(
+      "Investigate it and add a regression test.",
+    );
+  });
+
+  it("clears canceled drafts and selects the next entry point's default", async () => {
+    const { rerender } = render(dialog());
+    await choose("Slack");
+    type("task-trigger-scope", "support");
+    rerender(dialog({ open: false }));
+    rerender(dialog({ initialTrigger: "linear" }));
+    expect(screen.getByLabelText("Trigger type")).toHaveTextContent("Linear");
+    await choose("Slack");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+    rerender(dialog({ open: false }));
+    rerender(dialog());
+    expect(screen.getByLabelText("Trigger type")).toHaveTextContent("Schedule");
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue("");
+  });
+
+  it.each(["continuity", "orchestration"])(
+    "disables integration types without %s",
+    async (missing) => {
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            scheduled_task_session_modes: missing !== "continuity",
+            features: { session_orchestration: missing !== "orchestration" },
+          }}
+        >
+          <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.keyDown(screen.getByLabelText("Trigger type"), { key: "Enter" });
+      await screen.findByRole("listbox");
+      for (const label of ["Jira", "Slack", "GitHub", "Linear"]) {
+        expect(screen.getByRole("option", { name: label })).toHaveAttribute(
+          "aria-disabled",
+          "true",
+        );
+      }
+      expect(screen.getByRole("option", { name: "Schedule" })).not.toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+    },
+  );
+
+  it("preserves the existing editor for saved automations", () => {
+    render(dialog({ editingTask: scheduledTask() }));
+    expect(screen.queryByLabelText("Trigger type")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue("Summarize overnight activity");
+  });
+});
+
 describe("CreateScheduledTaskDialog trigger template", () => {
   function renderTrigger(
     source: "jira" | "slack" | "github" | "linear",
