@@ -539,21 +539,11 @@ def register_core_routes(
             if after is None:
                 return levels
 
-    async def _mirror_session_grants(source_id: str, target_id: str) -> None:
-        """Make *target_id*'s grants exactly *source_id*'s.
-
-        Nothing is granted that the source lacks, so the target is never
-        more widely readable than the source, even briefly.
-        """
+    async def _copy_session_grants(source_id: str, target_id: str) -> None:
+        """Give *target_id*, a session created with no grants, exactly *source_id*'s."""
         if permission_store is None:
             return
-        wanted = await _list_session_grants(source_id)
-        for user_id, level in (await _list_session_grants(target_id)).items():
-            if user_id not in wanted:
-                await asyncio.to_thread(permission_store.revoke, user_id, target_id)
-            elif level == wanted[user_id]:
-                del wanted[user_id]
-        for user_id, level in wanted.items():
+        for user_id, level in (await _list_session_grants(source_id)).items():
             await asyncio.to_thread(permission_store.grant, user_id, target_id, level)
 
     async def _release_unreturned_runner_session(session_id: str, routing: Conversation) -> None:
@@ -4813,11 +4803,12 @@ def register_core_routes(
                     "copy_history": copy_history,
                     "continue_source": True,
                 }
-                # Refuse before the source's live client is freed, so a clear
-                # that can't continue leaves it untouched.
-                await _fork_session(
-                    request, source.id, fork_request, validate_only=True, **fork_options
-                )
+                if prepare is not None:
+                    # Refuse before the source's live client is freed, so a clear
+                    # that can't continue leaves it untouched.
+                    await _fork_session(
+                        request, source.id, fork_request, validate_only=True, **fork_options
+                    )
                 profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
                 if host_bound and profile_catalog is not None:
                     await asyncio.to_thread(
@@ -4845,7 +4836,7 @@ def register_core_routes(
                     # The same conversation continues there, and every live viewer
                     # of the source is redirected to it, so it shares exactly as
                     # the source does (no creation default was applied).
-                    await _mirror_session_grants(source.id, fork.id)
+                    await _copy_session_grants(source.id, fork.id)
                     if host_bound:
                         assert source.host_id is not None
                         # The fork was born on the host under its row lock, so a
