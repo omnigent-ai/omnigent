@@ -323,6 +323,10 @@ network_policies:
 > # OMNIGENT_RUNNER_ENV_PASSTHROUGH=https_proxy,http_proxy,HTTPS_PROXY,HTTP_PROXY,NO_PROXY,no_proxy
 > ```
 
+The host and runner open their WebSocket tunnels through that proxy with HTTP
+`CONNECT`. Only `http://` proxy URLs are supported; for a SOCKS or `https://`
+proxy URL they log a warning and dial the server directly, which the sandbox blocks.
+
 > [!TIP]
 > For LLM traffic specifically, OpenShell recommends its **inference routing**
 > over allow-listing the provider host directly, so a stolen key can't be used to

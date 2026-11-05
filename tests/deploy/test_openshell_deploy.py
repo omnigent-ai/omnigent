@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -139,6 +141,48 @@ def test_openshell_overlay_gateway_secret_projects_gateway_metadata() -> None:
     }
     # Plaintext gateways have no mTLS keys; optional lets the pod start without them.
     assert secret["optional"] is True
+
+
+def test_server_sdk_resolves_the_projected_gateway(tmp_path, monkeypatch) -> None:
+    """The SDK finds the selected gateway and its mTLS files where the Secret lands."""
+    openshell = pytest.importorskip("openshell")
+    pod = _server_pod()
+    container = pod["containers"][0]
+    (volume,) = [
+        volume
+        for volume in pod["volumes"]
+        if volume.get("secret", {}).get("secretName") == _GATEWAY_SECRET
+    ]
+    (mount,) = [mount for mount in container["volumeMounts"] if mount["name"] == volume["name"]]
+    secret_data = {
+        "metadata.json": json.dumps({"gateway_endpoint": "https://gateway.openshell.svc:8080"}),
+        "ca.crt": "test CA",
+        "tls.crt": "test client certificate",
+        "tls.key": "test client key",
+    }
+    # Without items, the kubelet writes each key as a file named after it.
+    items = volume["secret"].get("items") or [{"key": key, "path": key} for key in secret_data]
+    mount_dir = tmp_path / mount["mountPath"].lstrip("/")
+    for item in items:
+        projected = mount_dir / item["path"]
+        projected.parent.mkdir(parents=True, exist_ok=True)
+        projected.write_text(secret_data[item["key"]])
+    config_home = tmp_path / _server_sdk_config_home(container).lstrip("/")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("OPENSHELL_GATEWAY", raising=False)
+    resolved = {}
+
+    class _ResolvedGateway(openshell.SandboxClient):
+        def __init__(self, endpoint, *, tls=None, **_kwargs):
+            resolved.update(endpoint=endpoint, tls=tls)
+
+    _ResolvedGateway.from_active_cluster(cluster=_openshell_config().get("cluster"))
+
+    assert resolved["endpoint"] == "gateway.openshell.svc:8080"
+    tls_files = (resolved["tls"].ca_path, resolved["tls"].cert_path, resolved["tls"].key_path)
+    assert [Path(path).read_text() for path in tls_files] == [
+        secret_data[key] for key in ("ca.crt", "tls.crt", "tls.key")
+    ]
 
 
 def test_openshell_overlay_allows_server_egress_to_in_cluster_gateway() -> None:

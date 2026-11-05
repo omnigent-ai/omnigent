@@ -41,9 +41,8 @@ _DEFAULT_PORT_BY_HTTP_SCHEME = {"http": 80, "https": 443}
 # confused intermediary, not a proxy.
 _MAX_CONNECT_RESPONSE_BYTES = 65536
 
-# Proxy schemes the CONNECT dialer speaks. SOCKS / TLS-to-proxy URLs are
-# warned about once per variable and ignored (direct dial preserves prior
-# behavior), as are values that do not parse.
+# Proxy schemes the CONNECT dialer speaks. SOCKS, TLS-to-proxy and unparsable
+# values are warned about once per variable, and the tunnel dials directly.
 _SUPPORTED_PROXY_SCHEMES = frozenset({"http"})
 _warned_proxy_env: set[tuple[str, str]] = set()
 
