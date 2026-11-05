@@ -21,6 +21,7 @@ from omnigent.harnesses.codex_native.bridge import (
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import InjectionDeliveryAmbiguous
 from omnigent.native.input_diagnostics import input_delivery_scope
+from omnigent.native.input_receipt import build_native_input_receipt
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.runtime.harnesses._scaffold import TurnContext
 from omnigent.server.schemas import CreateResponseRequest
@@ -46,7 +47,8 @@ from omnigent.server.schemas import CreateResponseRequest
         "read-failure",
         "read-timeout",
         "cancel-read",
-        "no-server-id",
+        "no-flat-attempt",
+        "legacy-no-context",
         "explicit-rejection",
     ],
 )
@@ -65,7 +67,8 @@ async def test_native_receipt_requires_exact_delivery_identity(
     confirmed = (
         receipt_kind in {"exact", "native-failed"}
         or (receipt_kind == "different-turn" and method == "turn/start")
-        or (oversized and receipt_kind == "no-server-id")
+        or (oversized and receipt_kind == "no-flat-attempt")
+        or (not oversized and receipt_kind == "legacy-no-context")
     )
     if receipt_kind == "read-timeout":
         monkeypatch.setattr(native_executor, "_DELIVERY_RECEIPT_TIMEOUT_SECONDS", 0.05)
@@ -171,16 +174,42 @@ async def test_native_receipt_requires_exact_delivery_identity(
         )
         executor = CodexNativeExecutor(bridge_dir=tmp_path)
         adapter = ExecutorAdapter(executor_factory=lambda: executor)
+        content = [{"type": "input_text", "text": "same text" * (120_000 if oversized else 1)}]
+        identity = {
+            "input_stable_id": "a" * 32,
+            "pending_id": "pending_" + "b" * 32,
+            "delivery_attempt_id": "c" * 32,
+        }
+        # Receipt ownership stays complete when only flat diagnostics are absent.
+        flat_identity = {
+            **identity,
+            "delivery_attempt_id": None if receipt_kind == "no-flat-attempt" else "c" * 32,
+        }
         request = CreateResponseRequest(
             model="test-agent",
-            input="same text" * (120_000 if oversized else 1),
-            input_stable_id="a" * 32,
-            pending_id="pending_" + "b" * 32,
-            delivery_attempt_id=None if receipt_kind == "no-server-id" else "c" * 32,
+            input=content,
+            **flat_identity,
+            native_input_receipt=None
+            if receipt_kind == "legacy-no-context"
+            else build_native_input_receipt(content, identity),
         )
         ctx = TurnContext(
             response_id="resp_receipt", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
         )
+        if oversized and receipt_kind == "legacy-no-context":
+            with pytest.raises(
+                RuntimeError, match="cannot preserve a large native input"
+            ) as caught:
+                await asyncio.wait_for(adapter.run_turn(request, ctx), timeout=5)
+            error = adapter._build_error_detail(caught.value)
+            assert error.code == "input_too_large" and error.undelivered is True
+            assert method not in requests and "thread/read" not in requests
+            assert not receipt_file.exists()
+            state = read_bridge_state(tmp_path)
+            assert state is not None
+            assert state.active_turn_id == ("turn_accepted" if method == "turn/steer" else None)
+            assert request.input == content
+            return
         if receipt_kind == "cancel-read":
             task = asyncio.create_task(adapter.run_turn(request, ctx))
             await asyncio.wait_for(read_waiting.wait(), timeout=5)
@@ -202,7 +231,7 @@ async def test_native_receipt_requires_exact_delivery_identity(
 
     assert requests.count(method) == 1
     should_probe = receipt_kind not in {"session-before-read", "explicit-rejection"} and (
-        oversized or receipt_kind != "no-server-id"
+        oversized or receipt_kind != "no-flat-attempt"
     )
     assert requests.count("thread/read") == int(should_probe)
     if receipt_kind not in {"explicit-rejection", "cancel-read"}:
