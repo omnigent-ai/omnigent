@@ -109,8 +109,11 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   // A template is picked from the gallery view; show the new automation in the
-  // list so it is obvious it was created.
+  // list so it is obvious it was created. A filter or search left over from
+  // earlier could still hide the new row, so clear them.
   function handleCreated() {
+    setFilter("all");
+    setSearch("");
     if (view !== "yours") {
       requestedView.current = "yours";
       setSearchParams((current) => {
