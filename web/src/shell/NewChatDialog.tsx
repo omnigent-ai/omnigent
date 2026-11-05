@@ -389,6 +389,11 @@ import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
+import {
+  NEW_SESSION_HANDOFF_PARAM,
+  forgetNewSessionHandoff,
+  peekNewSessionHandoff,
+} from "@/lib/newSessionHandoff";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -2090,6 +2095,10 @@ export function NewChatLandingScreen() {
   const location = useLocation();
   const [searchParams] = useSearchParams();
   const linkedPrompt = searchParams.get("prompt");
+  const handoffToken = searchParams.get(NEW_SESSION_HANDOFF_PARAM);
+  // A copied message replaces the whole draft, even with no text or files. Read
+  // once: the link effect below releases the token.
+  const [handoff] = useState(() => peekNewSessionHandoff(handoffToken));
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -2296,20 +2305,31 @@ export function NewChatLandingScreen() {
           autoSeededBranch: "",
         };
 
-  const [message, setMessage] = useState<string>(() =>
-    linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? ""),
-  );
+  const [message, setMessage] = useState<string>(() => {
+    if (handoff !== null) return handoff.text;
+    return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
+  });
   useEffect(() => {
-    if (!searchParams.has("prompt")) return;
+    if (!searchParams.has("prompt") && handoffToken === null) return;
     if (linkedPrompt?.trim()) setMessage(linkedPrompt);
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
+    remaining.delete(NEW_SESSION_HANDOFF_PARAM);
+    forgetNewSessionHandoff(handoffToken);
     navigate(
       { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [linkedPrompt, searchParams, location.pathname, location.hash, location.state, navigate]);
+  }, [
+    linkedPrompt,
+    handoffToken,
+    searchParams,
+    location.pathname,
+    location.hash,
+    location.state,
+    navigate,
+  ]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2342,7 +2362,9 @@ export function NewChatLandingScreen() {
     restoreFiles,
     onPaste,
     clearError,
-  } = useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
+  } = useComposerAttachments({
+    initialFiles: handoff?.files ?? restoredDraft?.files ?? [],
+  });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on

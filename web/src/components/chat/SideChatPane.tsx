@@ -25,13 +25,12 @@ import {
   BubbleView,
   WorkingIndicator,
   bubbleKey,
-  buildPendingBubbles,
   computeIsWorking,
   computeIsTurnActive,
-  mergePendingBubbles,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
+  withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
 import {
   ChatComposer,
@@ -200,6 +199,7 @@ export function SideChatPane({
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedInputs,
     subagentRoutingOverride,
     sessionStatus,
     sessionHarness,
@@ -277,16 +277,19 @@ export function SideChatPane({
       ),
       subagentRoutingOverride,
     );
-    if (pendingUserMessages.length === 0) return committed;
-    return mergePendingBubbles(
+    // A session opened in a grid shows its undelivered startup messages too.
+    return withUncommittedUserBubbles(
       committed,
-      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
+      pendingUserMessages,
+      failedInputs,
+      getCurrentAuthorId(),
     );
   }, [
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedInputs,
     subagentRoutingOverride,
     sessionStatus,
   ]);

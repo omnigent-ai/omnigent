@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { StrictMode } from "react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
 import { toast } from "sonner";
@@ -112,6 +113,27 @@ afterEach(() => {
   conversationRegistry.clear();
   useChatStore.setState(initialStoreState);
   localStorage.clear();
+});
+
+describe("undelivered startup messages", () => {
+  it("shows a failed session's first message and its recovery action in a grid", () => {
+    const lost = "Summarize the open PRs";
+    conversationRegistry.acquire(childId).setState({
+      failedInputs: [{ pendingId: "pending_first", content: [{ type: "input_text", text: lost }] }],
+    });
+    renderPane(
+      <MemoryRouter>
+        <SideChatPane childId={childId} fullSession />
+      </MemoryRouter>,
+    );
+
+    const notice = screen.getByTestId("message-undelivered");
+    expect(notice).toHaveTextContent("Not delivered");
+    expect(screen.getByText(lost)).toBeTruthy();
+    expect(
+      within(notice).getByRole("button", { name: "Copy message to new session" }),
+    ).toBeEnabled();
+  });
 });
 
 describe("side-chat working indicator", () => {
