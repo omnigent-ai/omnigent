@@ -747,6 +747,11 @@ def _queue_operations_from_event(data: Mapping[str, Any]) -> list[pending_inputs
     return operations
 
 
+_PANE_EDIT_ERRORS = frozenset(
+    {"claude_native_queued_message_edit_failed", "claude_native_queued_message_edit_incomplete"}
+)
+
+
 async def _edit_queued_native_message(
     session_id: str,
     conv: Conversation,
@@ -772,8 +777,11 @@ async def _edit_queued_native_message(
     :param agent_cache: Agent cache used to resolve the harness.
     :raises OmnigentError: ``INVALID_INPUT`` for a malformed payload or a
         non-claude-native session, ``CONFLICT`` when the message is no longer
-        queued, and ``RUNNER_UNAVAILABLE`` when the pane edit failed.
+        queued, and ``RUNNER_UNAVAILABLE`` when an earlier edit of it is
+        unsettled or the pane edit failed or went unconfirmed.
     """
+    from omnigent.server.routes.sessions.routes_core import _runner_reply_field
+
     pending_id = data.get("pending_id")
     content = data.get("content")
     if not isinstance(pending_id, str) or not isinstance(content, str) or not content.strip():
@@ -789,7 +797,14 @@ async def _edit_queued_native_message(
             "Queued messages can only be edited in Claude Code sessions.",
             code=ErrorCode.INVALID_INPUT,
         )
-    original = pending_inputs.plan_queued_edit(session_id, pending_id, content)
+    try:
+        original = pending_inputs.plan_queued_edit(session_id, pending_id, content)
+    except pending_inputs.QueuedEditInProgress:
+        # Not CONFLICT, which tells the client the message has left the queue.
+        raise OmnigentError(
+            "An earlier edit of this message is still being applied. Try again shortly.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from None
     if original is None:
         raise OmnigentError("This message is no longer queued.", code=ErrorCode.CONFLICT)
     result = await _forward_session_change_to_runner(
@@ -803,13 +818,23 @@ async def _edit_queued_native_message(
         if edit is not None:
             _publish_input_edited(session_id, edit)
         return
-    pending_inputs.cancel_queued_edit(session_id, pending_id)
-    if result is not None and result.status_code == 409:
+    if result is None:
+        # The pane may still take the edit, so the plan stays to attribute its late queue records.
+        raise OmnigentError(
+            "Couldn't confirm the edit with the terminal. It may still apply.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    error = _runner_reply_field(result.body, "error")
+    if 400 <= result.status_code < 500 or error == "claude_native_queued_message_edit_failed":
+        pending_inputs.cancel_queued_edit(session_id, pending_id)
+    if error == "queued_message_missing":
         raise OmnigentError("This message is no longer queued.", code=ErrorCode.CONFLICT)
-    raise OmnigentError(
-        "Couldn't edit the queued message in the terminal.",
-        code=ErrorCode.RUNNER_UNAVAILABLE,
-    )
+    message = "Couldn't edit the queued message in the terminal."
+    # Only the pane edit's own errors carry a detail written for the person.
+    detail = _runner_reply_field(result.body, "detail") if error in _PANE_EDIT_ERRORS else None
+    if isinstance(detail, str) and detail.strip():
+        message = f"{message} {detail.strip()}"
+    raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE)
 
 
 async def _recover_retry_session(

@@ -152,7 +152,7 @@ _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
 # region the forwarder re-reads after a failed post is not applied twice.
 _MAX_APPLIED_QUEUE_OPERATIONS = 256
 
-# How long a web edit waits for the pane's queue records to confirm it.
+# How long an unsettled web edit blocks another edit of the same message.
 _PLANNED_EDIT_TTL_S = 60.0
 
 # Words Claude Code's composer treats as /exit when sent on their own.
@@ -386,6 +386,10 @@ class QueueEdit:
     merged_pending_ids: list[str] = field(default_factory=list)
 
 
+class QueuedEditInProgress(RuntimeError):
+    """An earlier web edit of the same queued message is still waiting on the pane."""
+
+
 @dataclass
 class _QueueMirror:
     """Per-conversation view of the prompts Up moved out of Claude's queue."""
@@ -394,8 +398,10 @@ class _QueueMirror:
     popped: list[tuple[str, str | None]] = field(default_factory=list)
     pop_batch: str | None = None
     applied: deque[tuple[str, str, str, int]] = field(default_factory=deque)
-    # pending id -> (replacement text, created at)
-    planned_edits: dict[str, tuple[str, float]] = field(default_factory=dict)
+    # pending id -> latest web edit text, kept while the entry is queued to attribute late records
+    planned_edits: dict[str, str] = field(default_factory=dict)
+    # pending id -> when its web edit was sent to the pane, until confirmed or refused
+    edits_in_flight: dict[str, float] = field(default_factory=dict)
 
 
 _queue_mirrors: WorkspaceScopedCache[str, _QueueMirror] = WorkspaceScopedCache(
@@ -1081,9 +1087,12 @@ def plan_queued_edit(conversation_id: str, pending_id: str, replacement: str) ->
     :param replacement: The edited message text.
     :returns: The entry's current text, or ``None`` when it is no longer a
         live text-only queued message.
+    :raises QueuedEditInProgress: If an earlier edit of this entry is still
+        unsettled and younger than :data:`_PLANNED_EDIT_TTL_S`.
     """
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
         entry = _pending.get(conversation_id, {}).get(pending_id)
         if entry is None or entry.held or entry.interrupted or _attachment_count(entry.content):
             return None
@@ -1094,16 +1103,25 @@ def plan_queued_edit(conversation_id: str, pending_id: str, replacement: str) ->
         if mirror is None:
             mirror = _QueueMirror()
             _queue_mirrors[conversation_id] = mirror
-        mirror.planned_edits[pending_id] = (replacement, _now())
+        started = mirror.edits_in_flight.get(pending_id)
+        if started is not None and now - started <= _PLANNED_EDIT_TTL_S:
+            raise QueuedEditInProgress(pending_id)
+        mirror.planned_edits[pending_id] = replacement
+        mirror.edits_in_flight[pending_id] = now
         return text
 
 
 def cancel_queued_edit(conversation_id: str, pending_id: str) -> None:
-    """Forget a planned web edit whose pane edit failed."""
+    """
+    Settle a web edit the pane refused, so the message can be edited again.
+
+    Its text stays planned while the entry is queued: should the pane have
+    queued it after all, its records still edit this entry alone.
+    """
     with _lock:
         mirror = _queue_mirrors.get(conversation_id)
         if mirror is not None:
-            mirror.planned_edits.pop(pending_id, None)
+            mirror.edits_in_flight.pop(pending_id, None)
 
 
 def confirm_queued_edit(conversation_id: str, pending_id: str) -> QueueEdit | None:
@@ -1116,16 +1134,18 @@ def confirm_queued_edit(conversation_id: str, pending_id: str) -> QueueEdit | No
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param pending_id: The edited entry, e.g. ``"pending_a1b2c3"``.
     :returns: The edit to publish, or ``None`` when it was already applied
-        or the entry is gone.
+        or refused, or the entry is gone.
     """
     with _lock:
         mirror = _queue_mirrors.get(conversation_id)
-        plan = mirror.planned_edits.pop(pending_id, None) if mirror is not None else None
+        if mirror is None or mirror.edits_in_flight.pop(pending_id, None) is None:
+            return None
+        replacement = mirror.planned_edits.pop(pending_id, None)
         entry = _pending.get(conversation_id, {}).get(pending_id)
-        if mirror is None or plan is None or entry is None:
+        if replacement is None or entry is None:
             return None
         mirror.popped = [item for item in mirror.popped if item[1] != pending_id]
-        entry.content = _with_text(entry.content, plan[0])
+        entry.content = _with_text(entry.content, replacement)
         return QueueEdit(pending_id=pending_id, content=copy.deepcopy(entry.content))
 
 
@@ -1160,9 +1180,10 @@ def apply_queue_operations(
             mirror = _QueueMirror()
             _queue_mirrors[conversation_id] = mirror
         mirror.planned_edits = {
-            pid: plan
-            for pid, plan in mirror.planned_edits.items()
-            if now - plan[1] <= _PLANNED_EDIT_TTL_S
+            pid: replacement for pid, replacement in mirror.planned_edits.items() if pid in entries
+        }
+        mirror.edits_in_flight = {
+            pid: started for pid, started in mirror.edits_in_flight.items() if pid in entries
         }
         occurrences: dict[tuple[str, str, str], int] = {}
         for operation in operations:
@@ -1208,13 +1229,14 @@ def apply_queue_operations(
                 (
                     pid
                     for pid in popped_entries
-                    if _collapse_whitespace(mirror.planned_edits.get(pid, ("", 0.0))[0]) == text
+                    if _collapse_whitespace(mirror.planned_edits.get(pid, "")) == text
                 ),
                 None,
             )
             if planned is not None:
                 target, merged = planned, []
                 mirror.planned_edits.pop(planned, None)
+                mirror.edits_in_flight.pop(planned, None)
                 mirror.popped = [item for item in mirror.popped if item[1] != planned]
             else:
                 target, merged = popped_entries[0], popped_entries[1:]

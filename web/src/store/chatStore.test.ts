@@ -7059,7 +7059,7 @@ describe("chatStore — queued native message edits", () => {
   it("editQueuedMessage posts the edit and shows the new text", async () => {
     await expect(
       useChatStore.getState().editQueuedMessage("pending_2", "and list the errors"),
-    ).resolves.toBe(true);
+    ).resolves.toBeUndefined();
 
     const events = fetchMock.mock.calls.filter(([url]) =>
       String(url).endsWith("/v1/sessions/conv_abc/events"),
@@ -7078,14 +7078,17 @@ describe("chatStore — queued native message edits", () => {
   it("editQueuedMessage restores the original text when the edit is refused", async () => {
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
-        return mockResponse({ error: "conflict" }, { ok: false, status: 409 });
+        return mockResponse(
+          { error: { code: "conflict", message: "This message is no longer queued." } },
+          { ok: false, status: 409 },
+        );
       }
       return defaultFetchHandler(input, init);
     });
 
     await expect(
       useChatStore.getState().editQueuedMessage("pending_1", "Then summarize the logs"),
-    ).resolves.toBe(false);
+    ).rejects.toMatchObject({ status: 409, message: "This message is no longer queued." });
 
     expect(useChatStore.getState().pendingUserMessages[0]?.content).toEqual(text("Then summarize"));
   });

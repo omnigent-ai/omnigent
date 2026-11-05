@@ -1231,9 +1231,12 @@ def build_native_controls(
         Replace a message waiting in a claude-native pane's queue with edited text.
 
         :returns: 200 once the pane queued the edit, 409 when the message is no
-            longer queued, or 503 when the pane could not be driven.
+            longer queued, or 503 when the pane could not be driven. A 503
+            ``claude_native_queued_message_edit_incomplete`` means Up emptied the
+            queue and some prompts did not go back; any other 503 left it untouched.
         """
         from omnigent.harnesses.claude_native.bridge import (
+            ClaudeQueuedEditIncomplete,
             ClaudeQueuedMessageMissing,
             bridge_dir_for_bridge_id,
             edit_queued_user_message,
@@ -1255,15 +1258,24 @@ def build_native_controls(
             )
         except ClaudeQueuedMessageMissing:
             return JSONResponse(status_code=409, content={"error": "queued_message_missing"})
-        except (RuntimeError, ValueError, OSError) as exc:
+        except ClaudeQueuedEditIncomplete as exc:
+            _logger.warning("claude-native queued message edit left prompts unqueued: %s", exc)
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "claude_native_queued_message_edit_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="claude-native queued message edit"
-                    ),
+                    "error": "claude_native_queued_message_edit_incomplete",
+                    "detail": str(exc),
                 },
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            detail = (
+                str(exc)
+                if _claude_waits_on_person(exc)
+                else _client_safe_error_detail(exc, context="claude-native queued message edit")
+            )
+            return JSONResponse(
+                status_code=503,
+                content={"error": "claude_native_queued_message_edit_failed", "detail": detail},
             )
         return Response(status_code=200)
 

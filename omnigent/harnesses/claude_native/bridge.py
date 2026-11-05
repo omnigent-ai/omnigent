@@ -374,6 +374,9 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # How long Up gets to log its ``popAll`` records, then to finish the batch.
 _QUEUE_POP_TIMEOUT_S = 3.0
 _QUEUE_POP_SETTLE_S = 0.3
+# How long popped prompts wait out a question or an uncleared draft before an
+# edit gives up queueing them again; sized to fit the runner's control budget.
+_QUEUE_RESUBMIT_HOLD_S = 8.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud. Sized to out-wait a transiently unresponsive
@@ -757,6 +760,19 @@ class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
 
 class ClaudeQueuedMessageMissing(RuntimeError):
     """The message to edit is no longer in Claude Code's prompt queue."""
+
+
+class ClaudeQueuedEditIncomplete(RuntimeError):
+    """
+    An edit emptied Claude Code's prompt queue but could not queue every prompt again.
+
+    :param message: Human-readable failure naming the prompts to resend.
+    :param unsent: The prompts left out of the queue, in queue order.
+    """
+
+    def __init__(self, message: str, *, unsent: list[str]) -> None:
+        super().__init__(message)
+        self.unsent = unsent
 
 
 @contextlib.contextmanager
@@ -4635,13 +4651,23 @@ def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: st
     submitted again in order, with ``replacement`` in place of ``original``,
     so the queue keeps its order and Claude logs the edit as ``enqueue``.
 
+    A refusal before Up leaves the queue untouched. Once Up has emptied it,
+    the resubmission ignores the caller's cancellation, since stopping would
+    drop the popped prompts.
+
     :param bridge_dir: Bridge directory path.
     :param original: The queued text to replace, e.g. ``"Then summarize"``.
     :param replacement: The edited text, e.g. ``"Then summarize the logs"``.
     :raises ClaudeQueuedMessageMissing: If no queued prompt matches
         ``original``; any prompts Up popped were submitted again unchanged.
-    :raises RuntimeError: If a ``tmux`` invocation fails or a resubmission
-        is not accepted.
+    :raises ClaudeUserPromptPending: If a question or permission prompt is
+        pending; nothing was typed.
+    :raises ClaudeInputBoxOccupied: If the input box stays in shell mode or
+        the prompt-history search; nothing was typed.
+    :raises ClaudeQueuedEditIncomplete: If Up emptied the queue but some
+        popped prompts could not be submitted again.
+    :raises RuntimeError: If the pane is not ready or a ``tmux`` invocation
+        fails before Up.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
     socket_path = info["socket_path"]
@@ -4649,6 +4675,22 @@ def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: st
     transcript = read_transcript_path(bridge_dir)
     if transcript is None:
         raise ClaudeQueuedMessageMissing("Claude Code has no transcript to edit a message in.")
+    # A dialog would take the keys below as its answer.
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Answer the pending Claude question or permission request before editing a message.",
+            nothing_typed=True,
+        )
+    surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    if surface is not None and surface != _OVERLAY_SURFACE:
+        raise ClaudeInputBoxOccupied(
+            f"Claude Code's input box is occupied by {surface}, so the message was not "
+            "edited. Open the terminal, dismiss it, then edit the message again.",
+            surface=surface,
+        )
+    _wait_for_claude_prompt_ready(
+        socket_path, tmux_target, timeout_s=_TMUX_READY_TIMEOUT_S, bridge_dir=bridge_dir
+    )
     # Up pops the queue only from an empty composer. Claude may drop its "Press up to
     # edit queued messages" placeholder once cleared, so only the popAll records tell.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
@@ -4657,32 +4699,73 @@ def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: st
     except OSError as exc:
         raise ClaudeQueuedMessageMissing("Claude Code's transcript is unreadable.") from exc
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Up")
-    popped = _popped_queue_prompts(transcript, offset)
-    if not popped:
-        # With nothing queued, Up recalled a history prompt into the composer instead.
-        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-        raise ClaudeQueuedMessageMissing("Claude Code has no queued message to edit.")
-    target = " ".join(original.split())
-    index = next(
-        (index for index, text in enumerate(popped) if " ".join(text.split()) == target),
-        None,
-    )
-    if index is not None:
-        popped[index] = replacement
+    cancel_token = _INJECTION_CANCEL_EVENT.set(None)
     try:
-        for text in popped:
-            _paste_and_submit(
-                bridge_dir,
-                socket_path,
-                tmux_target,
-                text=_escape_unsupported_slash_command(text),
-                needle=_submit_needle(text),
-            )
-    except ClaudeComposerNotCleared as exc:
-        # Up already emptied the queue, so retrying the whole edit would press it again.
-        raise RuntimeError(str(exc)) from exc
+        popped = _popped_queue_prompts(transcript, offset)
+        if not popped:
+            # With nothing queued, Up recalled a history prompt into the composer instead.
+            _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+            raise ClaudeQueuedMessageMissing("Claude Code has no queued message to edit.")
+        target = " ".join(original.split())
+        index = next(
+            (index for index, text in enumerate(popped) if " ".join(text.split()) == target),
+            None,
+        )
+        if index is not None:
+            popped[index] = replacement
+        unsent = _resubmit_popped_prompts(bridge_dir, socket_path, tmux_target, popped)
+    finally:
+        _INJECTION_CANCEL_EVENT.reset(cancel_token)
+    if unsent:
+        from textwrap import shorten
+
+        previews = "; ".join(f'"{shorten(text, width=60, placeholder="…")}"' for text in unsent)
+        raise ClaudeQueuedEditIncomplete(
+            f"Claude Code could not queue {len(unsent)} message(s) again: {previews}. "
+            "Resend them.",
+            unsent=unsent,
+        )
     if index is None:
         raise ClaudeQueuedMessageMissing("The message is no longer queued in Claude Code.")
+
+
+def _resubmit_popped_prompts(
+    bridge_dir: Path, socket_path: str, tmux_target: str, prompts: list[str]
+) -> list[str]:
+    """
+    Queue the prompts Up moved into the composer again, in order.
+
+    A question or an uncleared draft only delays a prompt, so those refusals
+    are retried for :data:`_QUEUE_RESUBMIT_HOLD_S`; any other failure stops.
+
+    :param bridge_dir: Bridge directory path.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param prompts: The prompts to submit, e.g. ``["First", "Then summarize the logs"]``.
+    :returns: The prompts that were not queued again, in order; empty on success.
+    """
+    hold_until = time.monotonic() + _QUEUE_RESUBMIT_HOLD_S
+    for index, text in enumerate(prompts):
+        while True:
+            try:
+                _paste_and_submit(
+                    bridge_dir,
+                    socket_path,
+                    tmux_target,
+                    text=_escape_unsupported_slash_command(text),
+                    needle=_submit_needle(text),
+                )
+                break
+            except (ClaudeUserPromptPending, ClaudeComposerNotCleared) as exc:
+                held = not isinstance(exc, ClaudeUserPromptPending) or exc.nothing_typed
+                if not held or time.monotonic() >= hold_until:
+                    _logger.warning("claude-native: could not requeue a popped prompt: %s", exc)
+                    return prompts[index:]
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            except RuntimeError as exc:
+                _logger.warning("claude-native: could not requeue a popped prompt: %s", exc)
+                return prompts[index:]
+    return []
 
 
 def _popped_queue_prompts(transcript: Path, byte_offset: int) -> list[str]:

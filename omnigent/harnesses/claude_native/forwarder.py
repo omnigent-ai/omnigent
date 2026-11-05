@@ -189,6 +189,9 @@ _SUBAGENT_FORWARD_CONCURRENCY = 8
 # source-keyed individual posts. Individual transient failures stay pending
 # at the durable cursor so a temporary outage cannot lose child history.
 _SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS = 12
+# Queue records only keep queued bubbles in sync, so an outage drops them
+# after a few backed-off attempts instead of holding up the transcript.
+_QUEUE_OPERATIONS_MAX_TRANSIENT_ATTEMPTS = 6
 _CURSOR_FINGERPRINT_BYTES = 256
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
@@ -5216,7 +5219,11 @@ async def _forward_available_items(
     )
     # Before items, so an edited queued prompt updates its entry before Claude takes it.
     if result.queue_operations and not await _post_external_queue_operations(
-        client, session_id=session_id, operations=result.queue_operations
+        client,
+        session_id=session_id,
+        operations=result.queue_operations,
+        retry_tracker=retry_tracker,
+        retry_key=f"queue:{state.byte_offset or 0}:{result.queue_operations[0].timestamp}",
     ):
         return state
     items = result.items
@@ -6403,6 +6410,8 @@ async def _post_external_queue_operations(
     *,
     session_id: str,
     operations: tuple[ClaudeQueueOperation, ...],
+    retry_tracker: _PostRetryTracker,
+    retry_key: str,
 ) -> bool:
     """
     Report Claude's prompt-queue records so edited queued bubbles follow the pane.
@@ -6413,9 +6422,13 @@ async def _post_external_queue_operations(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
     :param operations: Queue records in transcript order.
-    :returns: ``False`` when a transient failure should retry this region on
-        the next poll; ``True`` once posted or permanently rejected.
+    :param retry_tracker: Backoff tracker shared with the transcript item posts.
+    :param retry_key: Key for this transcript region, e.g. ``"queue:1024:2026-…Z"``.
+    :returns: ``False`` while this region should be retried on a later poll;
+        ``True`` once posted or given up on.
     """
+    if retry_tracker.retry_delay_s(retry_key) is not None:
+        return False
     try:
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
@@ -6435,15 +6448,24 @@ async def _post_external_queue_operations(
         )
         resp.raise_for_status()
     except httpx.HTTPError as exc:
-        permanent = _is_permanent_http_error(exc)
+        decision = retry_tracker.record_failure(
+            retry_key,
+            exc,
+            session_id=session_id,
+            max_transient_attempts=_QUEUE_OPERATIONS_MAX_TRANSIENT_ATTEMPTS,
+        )
         _logger.warning(
-            "Failed to forward Claude queue operations; session=%s http_status=%s permanent=%s",
+            "Failed to forward Claude queue operations; session=%s http_status=%s "
+            "attempt=%s permanent=%s dropped=%s",
             session_id,
             _http_status_for_log(exc),
-            permanent,
+            decision.attempts,
+            decision.permanent,
+            decision.exhausted,
             extra={"session_id": session_id},
         )
-        return permanent
+        return decision.exhausted
+    retry_tracker.clear(retry_key)
     return True
 
 

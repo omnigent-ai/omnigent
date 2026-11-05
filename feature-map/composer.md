@@ -204,7 +204,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `prompt-history`: Up starts history recall only from empty text in an existing
   session. Up/Down at the text boundaries browse recalled messages; editing one
   returns to normal caret navigation. Whitespace and queued messages recalled
-  for editing remain drafts.
+  for editing remain drafts. In a Claude Code session, Up recalls a message
+  Claude Code has queued, and Enter edits it in the chat and the terminal;
+  Up in the terminal updates the chat's queued messages too.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain. The "Something went wrong" card from the
@@ -278,6 +280,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Send while the agent is working to queue a message, then steer it.
 - With the in-session message box empty, press Up to recall a previous prompt
   (or the last queued message). While writing a draft, Up stops at the top.
+- In a Claude Code session, queue a follow-up while a turn runs, press Up, edit
+  it and press Enter; the chat bubble and the terminal both show the edit.
 - With a native session's host offline, send a message; it waits in the queue
   as "Waiting for host" until the host reconnects.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
@@ -761,6 +765,10 @@ Other connection providers alone do not enable the managed MCP picker.
   Multiline, whitespace, quotes, and queued drafts have component coverage in
   `web/src/pages/ChatPage.composer.test.tsx`. The new-session and side-chat
   composers have no prompt recall; the vendor terminal owns its own history.
+- **`prompt-history`, Claude Code queued follow-ups (chat and terminal):**
+  `tests/e2e_ui/messages/test_native_claude_queued_follow_up_edit.py`
+  edits a queued follow-up from each side in the real Claude Code CLI with a
+  mock model.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport

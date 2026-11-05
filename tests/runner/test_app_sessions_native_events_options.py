@@ -500,27 +500,54 @@ async def test_events_compact_on_native_session_types_slash_command(
     assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
 
 
+_EDIT = {"original": "Then summarize", "replacement": "Then list"}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("harness", "body", "pane_error", "expected_status"),
+    ("harness", "body", "pane_error", "expected_status", "expected_reply"),
     [
-        ("claude-native", {"original": "Then summarize", "replacement": "Then list"}, None, 200),
+        ("claude-native", _EDIT, None, 200, None),
         (
             "claude-native",
-            {"original": "Then summarize", "replacement": "Then list"},
+            _EDIT,
             claude_native_bridge.ClaudeQueuedMessageMissing("no longer queued"),
             409,
+            {"error": "queued_message_missing"},
         ),
         (
             "claude-native",
-            {"original": "Then summarize", "replacement": "Then list"},
-            RuntimeError("tmux send-keys failed"),
+            _EDIT,
+            claude_native_bridge.ClaudeUserPromptPending("Answer it first.", nothing_typed=True),
             503,
+            {"error": "claude_native_queued_message_edit_failed", "detail": "Answer it first."},
         ),
-        ("claude-native", {"original": "Then summarize"}, None, 400),
-        ("codex-native", {"original": "Then summarize", "replacement": "Then list"}, None, 204),
+        (
+            "claude-native",
+            _EDIT,
+            claude_native_bridge.ClaudeQueuedEditIncomplete('Resend "Last".', unsent=["Last"]),
+            503,
+            {"error": "claude_native_queued_message_edit_incomplete", "detail": 'Resend "Last".'},
+        ),
+        (
+            "claude-native",
+            _EDIT,
+            RuntimeError("tmux send-keys failed on /tmp/socket"),
+            503,
+            {"error": "claude_native_queued_message_edit_failed"},
+        ),
+        ("claude-native", {"original": "Then summarize"}, None, 400, None),
+        ("codex-native", _EDIT, None, 204, None),
     ],
-    ids=["edited", "no-longer-queued", "pane-failed", "missing-replacement", "other-harness"],
+    ids=[
+        "edited",
+        "no-longer-queued",
+        "prompt-pending",
+        "prompts-unqueued",
+        "pane-failed",
+        "missing-replacement",
+        "other-harness",
+    ],
 )
 async def test_events_queued_message_edit_drives_the_claude_native_pane(
     monkeypatch: pytest.MonkeyPatch,
@@ -528,6 +555,7 @@ async def test_events_queued_message_edit_drives_the_claude_native_pane(
     body: dict[str, str],
     pane_error: Exception | None,
     expected_status: int,
+    expected_reply: dict[str, str] | None,
 ) -> None:
     """The runner edits a queued Claude Code prompt and reports why an edit failed."""
     edits: list[tuple[Path, str, str]] = []
@@ -553,6 +581,10 @@ async def test_events_queued_message_edit_drives_the_claude_native_pane(
         )
 
     assert resp.status_code == expected_status, resp.text
+    if expected_reply is not None:
+        reply = resp.json()
+        assert {key: reply.get(key) for key in expected_reply} == expected_reply
+        assert "/tmp/socket" not in resp.text
     expected_edits = (
         [(bridge_dir_for_conversation_id(session_id), "Then summarize", "Then list")]
         if expected_status in {200, 409, 503}

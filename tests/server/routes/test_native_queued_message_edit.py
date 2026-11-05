@@ -1,5 +1,6 @@
 """Editing a claude-native queued message from the web, and from the pane."""
 
+import json
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -24,7 +25,11 @@ def published(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]]]
 
 
 def _route_to_runner(
-    monkeypatch: pytest.MonkeyPatch, *, harness: str, runner_status: int | None
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    harness: str,
+    runner_status: int | None,
+    runner_reply: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     forwarded: list[dict[str, Any]] = []
 
@@ -32,7 +37,9 @@ def _route_to_runner(
         _session_id: str, _runner_router: object, event: dict[str, Any], **_kwargs: Any
     ) -> SimpleNamespace | None:
         forwarded.append(event)
-        return None if runner_status is None else SimpleNamespace(status_code=runner_status)
+        if runner_status is None:
+            return None
+        return SimpleNamespace(status_code=runner_status, body=json.dumps(runner_reply or {}))
 
     monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", forward)
     monkeypatch.setattr(routes_events, "_native_pane_harness", lambda *_args, **_kwargs: harness)
@@ -91,32 +98,69 @@ async def test_confirmed_web_edit_updates_the_queued_message_and_publishes_it(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("runner_status", "error_code"),
+    ("runner_status", "runner_reply", "error_code", "message"),
     [
-        (409, ErrorCode.CONFLICT),
-        (503, ErrorCode.RUNNER_UNAVAILABLE),
-        (None, ErrorCode.RUNNER_UNAVAILABLE),
+        (409, {"error": "queued_message_missing"}, ErrorCode.CONFLICT, "no longer queued"),
+        (
+            503,
+            {
+                "error": "claude_native_queued_message_edit_failed",
+                "detail": "Answer the pending Claude question first.",
+            },
+            ErrorCode.RUNNER_UNAVAILABLE,
+            "Answer the pending Claude question first.",
+        ),
+        (
+            409,
+            {
+                "error": "no_live_harness",
+                "detail": "no harness subprocess is running for this conversation",
+            },
+            ErrorCode.RUNNER_UNAVAILABLE,
+            "Couldn't edit the queued message in the terminal.",
+        ),
+        (
+            400,
+            {"error": "invalid_input", "detail": "Body 'original' must be a string"},
+            ErrorCode.RUNNER_UNAVAILABLE,
+            "Couldn't edit the queued message in the terminal.",
+        ),
     ],
-    ids=["no-longer-queued", "pane-failed", "runner-unreachable"],
+    ids=["no-longer-queued", "pane-refused", "no-live-harness", "runner-rejected"],
 )
-async def test_failed_web_edit_keeps_the_queued_message(
+async def test_refused_web_edit_keeps_the_queued_message(
     monkeypatch: pytest.MonkeyPatch,
     published: list[dict[str, Any]],
-    runner_status: int | None,
+    runner_status: int,
+    runner_reply: dict[str, str],
     error_code: ErrorCode,
+    message: str,
 ) -> None:
-    _route_to_runner(monkeypatch, harness="claude-native", runner_status=runner_status)
+    forwarded = _route_to_runner(
+        monkeypatch,
+        harness="claude-native",
+        runner_status=runner_status,
+        runner_reply=runner_reply,
+    )
     pending_id = pending_inputs.record(
         _SESSION_ID, [{"type": "input_text", "text": "Then summarize"}]
     )
 
     with pytest.raises(OmnigentError) as raised:
         await _edit(pending_id, "Then summarize the logs")
+    with pytest.raises(OmnigentError) as retried:
+        await _edit(pending_id, "Then summarize the logs")
 
     assert raised.value.code == error_code
+    assert message in raised.value.message
+    assert "subprocess" not in raised.value.message
+    assert "must be a string" not in raised.value.message
+    # A refusal settles the edit, so retrying reaches the runner again.
+    assert retried.value.code == error_code
+    assert len(forwarded) == 2
     assert _pending_texts() == ["Then summarize"]
     assert published == []
-    # The cancelled plan no longer redirects the pane's own edit of this message.
+    # The refused edit leaves the message editable from the terminal.
     edits = pending_inputs.apply_queue_operations(
         _SESSION_ID,
         [
@@ -125,6 +169,63 @@ async def test_failed_web_edit_keeps_the_queued_message(
         ],
     )
     assert [edit.content[0]["text"] for edit in edits] == ["Then summarize in the TUI"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner_status", "runner_reply", "message"),
+    [
+        (None, None, "may still apply"),
+        (
+            503,
+            {
+                "error": "claude_native_queued_message_edit_incomplete",
+                "detail": 'Claude Code could not queue 1 message(s) again: "Last". Resend them.',
+            },
+            'Claude Code could not queue 1 message(s) again: "Last". Resend them.',
+        ),
+    ],
+    ids=["unconfirmed", "prompts-unqueued"],
+)
+async def test_unconfirmed_web_edit_still_applies_to_its_own_message(
+    monkeypatch: pytest.MonkeyPatch,
+    published: list[dict[str, Any]],
+    runner_status: int | None,
+    runner_reply: dict[str, str] | None,
+    message: str,
+) -> None:
+    forwarded = _route_to_runner(
+        monkeypatch,
+        harness="claude-native",
+        runner_status=runner_status,
+        runner_reply=runner_reply,
+    )
+    pending_inputs.record(_SESSION_ID, [{"type": "input_text", "text": "First"}])
+    pending_id = pending_inputs.record(
+        _SESSION_ID, [{"type": "input_text", "text": "Then summarize"}]
+    )
+
+    with pytest.raises(OmnigentError) as raised:
+        await _edit(pending_id, "Then summarize the logs")
+    with pytest.raises(OmnigentError) as overlapping:
+        await _edit(pending_id, "Then summarize everything")
+
+    assert raised.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert message in raised.value.message
+    assert overlapping.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert len(forwarded) == 1
+    # The pane's late records still give the edit to this message, not the oldest popped one.
+    edits = pending_inputs.apply_queue_operations(
+        _SESSION_ID,
+        [
+            pending_inputs.QueueOperation("popAll", "First", "t1"),
+            pending_inputs.QueueOperation("popAll", "Then summarize", "t1"),
+            pending_inputs.QueueOperation("enqueue", "First", "t2"),
+            pending_inputs.QueueOperation("enqueue", "Then summarize the logs", "t3"),
+        ],
+    )
+    assert [(edit.pending_id, edit.merged_pending_ids) for edit in edits] == [(pending_id, [])]
+    assert _pending_texts() == ["First", "Then summarize the logs"]
 
 
 @pytest.mark.asyncio

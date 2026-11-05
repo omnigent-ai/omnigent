@@ -1236,24 +1236,48 @@ def test_queue_records_reported_twice_apply_once() -> None:
     assert pending_inputs.snapshot_for("conv")[0]["content"] == [_text_block("two")]
 
 
-def test_web_edit_resubmitted_one_by_one_edits_only_its_message() -> None:
+@pytest.mark.parametrize("plan_state", ["unsettled", "refused", "expired"])
+def test_web_edit_resubmitted_one_by_one_edits_only_its_message(
+    monkeypatch: pytest.MonkeyPatch, plan_state: str
+) -> None:
+    """Late records still edit only the planned message once its edit is settled or stale."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
     first = pending_inputs.record("conv", [_text_block("first")])
     second = pending_inputs.record("conv", [_text_block("second")])
+    third = pending_inputs.record("conv", [_text_block("third")])
     assert pending_inputs.plan_queued_edit("conv", second, "second edited") == "second"
+    if plan_state == "refused":
+        pending_inputs.cancel_queued_edit("conv", second)
+    elif plan_state == "expired":
+        clock["t"] += pending_inputs._PLANNED_EDIT_TTL_S + 1
 
     [edit] = pending_inputs.apply_queue_operations(
         "conv",
         _queue_ops(
             ("popAll", "first", "t1"),
             ("popAll", "second", "t1"),
+            ("popAll", "third", "t1"),
             ("enqueue", "first", "t2"),
             ("enqueue", "second edited", "t3"),
+            ("enqueue", "third", "t4"),
         ),
     )
 
     assert edit == pending_inputs.QueueEdit(second, [_text_block("second edited")])
-    assert pending_inputs.pending_ids("conv") == [first, second]
+    assert pending_inputs.pending_ids("conv") == [first, second, third]
     assert pending_inputs.confirm_queued_edit("conv", second) is None
+
+
+def test_a_settled_web_edit_can_be_planned_again() -> None:
+    queued = pending_inputs.record("conv", [_text_block("first")])
+    pending_inputs.plan_queued_edit("conv", queued, "first edited")
+
+    with pytest.raises(pending_inputs.QueuedEditInProgress):
+        pending_inputs.plan_queued_edit("conv", queued, "first edited again")
+    pending_inputs.cancel_queued_edit("conv", queued)
+
+    assert pending_inputs.plan_queued_edit("conv", queued, "first edited again") == "first"
 
 
 def test_confirmed_web_edit_applies_before_its_queue_records_arrive_and_only_once() -> None:

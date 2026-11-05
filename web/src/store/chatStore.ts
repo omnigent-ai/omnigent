@@ -1431,10 +1431,10 @@ export interface ChatActions {
   clearContext: () => Promise<void>;
   /**
    * Replace the text of a queued claude-native message, as Up does in the
-   * terminal. Resolves `false` when the message is no longer queued or the
-   * terminal edit failed; the bubble then keeps its original text.
+   * terminal. Rejects, with the bubble keeping its original text, when the
+   * message is no longer queued or the terminal edit failed.
    */
-  editQueuedMessage: (pendingId: string, text: string) => Promise<boolean>;
+  editQueuedMessage: (pendingId: string, text: string) => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -3596,7 +3596,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   editQueuedMessage: async (pendingId, text) => {
     const { conversationId, pendingUserMessages } = get();
     const original = pendingUserMessages.find((p) => isPendingInput(p, pendingId))?.content;
-    if (!conversationId || original === undefined) return false;
+    if (!conversationId || original === undefined) {
+      throw new ApiError("This message is no longer queued.", 409, "conflict");
+    }
     const edited: MessageContentBlock[] = [{ type: "input_text", text }];
     setterFor(conversationId)((s) => ({
       pendingUserMessages: withPendingContent(s.pendingUserMessages, pendingId, edited),
@@ -3606,12 +3608,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         type: "queued_message_edit",
         data: { pending_id: pendingId, content: text },
       });
-      return true;
-    } catch {
+    } catch (error) {
       setterFor(conversationId)((s) => ({
         pendingUserMessages: withPendingContent(s.pendingUserMessages, pendingId, original),
       }));
-      return false;
+      throw error;
     }
   },
 
@@ -7456,7 +7457,7 @@ function userInputBlocksOf(raw: unknown[]): MessageContentBlock[] {
 }
 
 /** Whether a bubble is the server pending input `pendingId` (replayed bubbles use it as `tempId`). */
-function isPendingInput(message: PendingUserMessage, pendingId: string): boolean {
+export function isPendingInput(message: PendingUserMessage, pendingId: string): boolean {
   return message.pendingId === pendingId || message.tempId === pendingId;
 }
 

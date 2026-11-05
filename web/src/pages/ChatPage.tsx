@@ -96,6 +96,7 @@ import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
   holdsInitialDraft,
+  isPendingInput,
   isStaleTempConvId,
   isTempConvId,
   type ChatState,
@@ -2932,6 +2933,11 @@ function ComposerImpl(
     (sessionHarness === "claude-native" || sessionHarness === "codex-native") &&
     composerServerInfo !== "loading" &&
     !!composerServerInfo.session_event_types?.includes("clear");
+  // Older servers reject queued_message_edit, so Up keeps browsing history there.
+  const canEditQueuedInput =
+    sessionHarness === "claude-native" &&
+    composerServerInfo !== "loading" &&
+    !!composerServerInfo.session_event_types?.includes("queued_message_edit");
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -3659,35 +3665,51 @@ function ComposerImpl(
     )
       return;
 
+    // Commands run as usual, and text for a message Claude has taken sends anew.
+    const editingQueuedId = editingQueuedIdRef.current;
+    editingQueuedIdRef.current = null;
+    const queuedEditId =
+      editingQueuedId !== null &&
+      trimmed &&
+      !trimmed.startsWith("!") &&
+      !isSlashCommandText(trimmed) &&
+      useChatStore.getState().pendingUserMessages.some((m) => isPendingInput(m, editingQueuedId))
+        ? editingQueuedId
+        : null;
+    if (
+      queuedEditId !== null &&
+      (files.length > 0 || mentionedItems.length > 0 || draft.quotes.length > 0)
+    ) {
+      editingQueuedIdRef.current = queuedEditId;
+      setCommandError(
+        "A queued message can only be edited as text. Remove the attachments, mentions and quotes, or clear the composer to send a new message.",
+      );
+      return;
+    }
+
     // A send is actually happening: report it for both pointer clicks (which
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
 
-    const editingQueuedId = editingQueuedIdRef.current;
-    editingQueuedIdRef.current = null;
-    if (
-      editingQueuedId !== null &&
-      trimmed &&
-      files.length === 0 &&
-      mentionedItems.length === 0 &&
-      draft.quotes.length === 0
-    ) {
+    if (queuedEditId !== null) {
       const edited = fullText.trimEnd();
       const editedIn = conversationId;
       dirtyRef.current = true;
       setValue("");
       setCommandError(null);
-      void editQueuedMessage(editingQueuedId, edited).then((ok) => {
-        if (ok) return;
-        toast.error("Couldn't edit the queued message. Your edit is back in the composer.");
+      void editQueuedMessage(queuedEditId, edited).catch((error: unknown) => {
+        const refusal = error instanceof ApiError && error.code !== null;
+        toast.error(
+          `${refusal ? error.message : "Couldn't edit the queued message."} Your edit is back in the composer.`,
+        );
         // Restore the edit to resend it, unless the user has moved on.
-        if (
-          useChatStore.getState().conversationId === editedIn &&
-          !tailTextareaRef.current?.value
-        ) {
-          replaceText(edited);
+        if (useChatStore.getState().conversationId !== editedIn || tailTextareaRef.current?.value) {
+          return;
         }
+        replaceText(edited);
+        // Enter retries the edit unless the message has left the queue.
+        if (!(refusal && error.status === 409)) editingQueuedIdRef.current = queuedEditId;
       });
       return;
     }
@@ -3943,10 +3965,9 @@ function ComposerImpl(
             return;
           }
           // Like Claude Code's own Up, recall a message it has queued for editing.
-          const queued =
-            sessionHarness === "claude-native"
-              ? editableQueuedInput(useChatStore.getState().pendingUserMessages)
-              : null;
+          const queued = canEditQueuedInput
+            ? editableQueuedInput(useChatStore.getState().pendingUserMessages)
+            : null;
           if (queued !== null) {
             e.preventDefault();
             resetCursor();

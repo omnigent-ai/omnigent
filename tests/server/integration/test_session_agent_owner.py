@@ -17,6 +17,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ
@@ -564,3 +565,43 @@ async def test_native_approval_changes_require_owner_authority(
     response = await auth_client.post(f"{path}/events", json=event, headers=owner)
     assert response.status_code == 202, response.text
     assert (await auth_client.get(path, headers=owner)).json()["terminal_launch_args"] == args
+
+
+@pytest.mark.parametrize("level", [LEVEL_EDIT, LEVEL_MANAGE])
+async def test_native_queue_operations_require_owner_authority(
+    auth_client: httpx.AsyncClient, level: int
+) -> None:
+    agent = await create_test_agent(auth_client, name="native-queue", user=ALICE)
+    session_id = agent["_session_id"]
+    path = f"/v1/sessions/{session_id}"
+    owner = {"X-Forwarded-Email": ALICE}
+    response = await auth_client.put(
+        f"{path}/permissions", json={"user_id": BOB, "level": level}, headers=owner
+    )
+    assert response.status_code in (200, 204), response.text
+    pending_inputs.record(session_id, [{"type": "input_text", "text": "Then summarize"}])
+    event = {
+        "type": "external_queue_operations",
+        "data": {
+            "operations": [
+                {"operation": "popAll", "content": "Then summarize", "timestamp": "t1"},
+                {"operation": "enqueue", "content": "Then summarize briefly", "timestamp": "t2"},
+            ]
+        },
+    }
+
+    def queued_texts() -> list[str]:
+        return [
+            block["text"]
+            for entry in pending_inputs.snapshot_for(session_id)
+            for block in entry["content"]
+        ]
+
+    response = await auth_client.post(
+        f"{path}/events", json=event, headers={"X-Forwarded-Email": BOB}
+    )
+    assert response.status_code == 403, response.text
+    assert queued_texts() == ["Then summarize"]
+    response = await auth_client.post(f"{path}/events", json=event, headers=owner)
+    assert response.status_code == 202, response.text
+    assert queued_texts() == ["Then summarize briefly"]
