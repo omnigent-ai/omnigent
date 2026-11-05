@@ -4012,9 +4012,10 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
 async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A relay outlives no CLI: a turn cancelled mid-reconnect evicts its client; one whose
-    CLI fails, hangs past the connect timeout or is cancelled while connecting never keeps
-    it; and one that fails to start leaves nothing."""
+    """A relay outlives no CLI: a turn cancelled mid-reconnect evicts its client and the
+    next turn recovers on a fresh relay; one whose CLI fails, hangs past the connect
+    timeout or is cancelled while connecting never keeps it; and one that fails to start
+    leaves nothing."""
     from omnigent.harnesses.claude_native import bridge
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
@@ -4049,8 +4050,11 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
     fake_sdk.ClaudeSDKClient = _Client
     executor = ClaudeSDKExecutor()
 
+    dispatched: list[str] = []
+
     async def tool_executor(name: str, arguments: dict) -> dict:
-        return {}
+        dispatched.append(name)
+        return {"result": "pong"}
 
     executor._tool_executor = tool_executor
     tools = [{"name": "sys_ping", "parameters": {"type": "object", "properties": {}}}]
@@ -4075,6 +4079,20 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         await asyncio.gather(*executor._cancel_close_tasks)
         assert "managed" not in executor._clients
         assert not relay_dir(first).exists()
+
+        # The next turn recovers on a new CLI whose own relay serves the tools.
+        [event async for event in executor.run_turn(messages, tools, "")]
+        recovered = executor._clients["managed"].client
+        assert recovered is not first
+        assert relay_dir(recovered).is_dir() and relay_dir(recovered) != relay_dir(first)
+        relay_env = {k: v for k, v in recovered.options.env.items() if k.startswith("OMNIGENT_")}
+        replies = await asyncio.to_thread(
+            _serve_mcp_round_trip, bridge.managed_mcp_relay_entry(), relay_env, "sys_ping"
+        )
+        assert "pong" in json.dumps(next(r for r in replies if r.get("id") == 3)["result"])
+        assert dispatched == ["sys_ping"]
+        await executor.close_session("managed")
+        assert not relay_dir(recovered).exists()
 
         connect_outcome = "fails"
         with pytest.raises(RuntimeError, match="claude exited"):
