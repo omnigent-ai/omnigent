@@ -244,8 +244,10 @@ class FakeStartupInputs:
             {"session_id": session_id, "event": event, "user_id": user_id, "headers": headers}
         )
 
-    async def record_launch_failure(self, session_id: str, reason: str) -> None:
+    async def record_launch_failure(self, session_id: str, reason: Any) -> str:
+        reason = await reason() if callable(reason) else reason
         self.launch_failures.append((session_id, reason))
+        return reason
 
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):

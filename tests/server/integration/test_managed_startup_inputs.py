@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -959,6 +960,105 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     assert (
         await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
     )
+
+
+async def test_registration_timeout_fences_prompt_before_provider_hint(
+    startup_env: _Env, db_uri: str
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.scheduled.fire import _ClaimedRunRecorder
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+    from tests.server.helpers import FakeSandboxLauncher
+    from tests.server.scheduled.test_claimed_fire import _claim, _deps, _runs
+    from tests.server.test_managed_hosts import _injected_config
+
+    env = startup_env
+    session_id = await _create(env)
+    [saved] = env.conv_store.list_pending_inputs(session_id)
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    store.configure_dispatch(True)
+    claimed = _claim(store, execution_target="managed_sandbox", host_id=None, workspace=None)
+    host_id = claimed.lease.run.host_id
+    fake = FakeSandboxLauncher()
+    env.host_store.register_managed_host(
+        host_id=host_id,
+        name="late-host",
+        user_id="local",
+        token="launch-token",
+        token_expires_at=2**31,
+        provider=fake.provider,
+        sandbox_id="late-sandbox",
+    )
+    startup = env.app.state.startup_inputs
+    startup.dispatch = AsyncMock(return_value={})
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    state = tracker.get(session_id)
+    assert state is not None
+    hint_started = asyncio.Event()
+    release_hint = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def hint() -> str:
+        loop.call_soon_threadsafe(hint_started.set)
+        release_hint.wait()
+        return "Inspect provider logs."
+
+    state.host_online_failure_hint = hint
+
+    async def launching() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            state.host_online_failure_hint = None
+
+    launch = asyncio.create_task(launching())
+    recorder = _ClaimedRunRecorder(
+        _deps(
+            store,
+            conversation_store=env.conv_store,
+            host_store=env.host_store,
+            startup_inputs=startup,
+            managed_launches=tracker,
+            sandbox_config=_injected_config(fake),
+        ),
+        claimed.task,
+        claimed.lease,
+        registration_timeout_s=0.01,
+    )
+    await recorder.session_created(session_id)
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    failure = asyncio.create_task(recorder.hand_off_managed(conv, claimed.task, lambda *_: launch))
+    try:
+        await asyncio.wait_for(hint_started.wait(), 5)
+        env.conv_store.set_host_id(session_id, host_id, "/tmp/workspace")
+        env.conv_store.set_runner_id(session_id, uuid4().hex)
+        connection = _connect_host(env, host_id)
+        # A new worker and a delivery that already read the pending item both lose the claim.
+        assert not await startup._recover_session(env.app, session_id, connection)
+        context = StartupInputContext(env.app, Headers(), saved.created_by, saved.id)
+        assert not await context.claim(env.conv_store, session_id)
+        await startup._deliver(env.app, session_id, saved)
+        startup.dispatch.assert_not_awaited()
+        release_hint.set()
+        await asyncio.wait_for(failure, 5)
+    finally:
+        release_hint.set()
+        for task in (failure, launch):
+            task.cancel()
+        await asyncio.gather(failure, launch, return_exceptions=True)
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "sandbox_registration_timeout")
+    assert run.error == (
+        "the sandbox did not register within 0.01 seconds — Inspect provider logs."
+    )
+    [error] = env.conv_store.list_items(session_id).data
+    assert isinstance(error.data, ErrorData)
+    assert error.data.message == f"The message could not be delivered: {run.error}"
+    assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
+    assert fake.terminated == ["late-sandbox"]
+    assert state.host_online_failure_hint is None
 
 
 async def _session_count(env: _Env) -> int:
