@@ -53,10 +53,10 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
+import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
-import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
-import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
+import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
   isBackdropOverlay,
   isInsidePopper,
@@ -81,6 +81,7 @@ import { isValidSandboxRepoUrl, splitSandboxWorkspace } from "@/lib/sandboxRepos
 import { localTimezone } from "@/lib/timezones";
 
 const PROVIDER_DEFAULT = "provider-default";
+const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
 
 export function CreateScheduledTaskDialog({
   open,
@@ -156,26 +157,27 @@ export function CreateScheduledTaskDialog({
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
 
-  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
-  const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
-    [agentList],
+  const curation = pickerCuration(info);
+  const curationPending = info === "loading" || isBootFallbackInfo(info);
+  const agentList = useMemo(
+    () => selectableSessionAgents(agents ?? [], curation.restrictToAgentNames),
+    [agents, curation.restrictToAgentNames],
   );
-  const agentEntries = useMemo(
-    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+  const { harnesses: harnessEntries, agents: agentEntries } = useMemo(
+    () => partitionPickerEntries(agentList),
     [agentList],
   );
   // Resolve the effective selection: the explicit pick if it's still in the
   // list, else the edited task's own agent (which may be hidden from the picker
-  // — never silently retarget it), else the first agent (so a fresh picker
-  // always has a concrete value).
-  const effectiveAgentId =
-    (agentList.some((a) => a.id === pickedAgentId)
-      ? pickedAgentId
-      : isEdit
-        ? editingTask?.agentId
-        : agentList[0]?.id) ?? null;
-  const selectedAgent = agentList.find((a) => a.id === effectiveAgentId);
+  // — never silently retarget it), else the deployment default or first agent.
+  const defaultAgentId =
+    agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+    agentList[0]?.id ??
+    null;
+  let effectiveAgentId: string | null = defaultAgentId;
+  if (agentList.some((agent) => agent.id === pickedAgentId)) effectiveAgentId = pickedAgentId;
+  else if (editingTask) effectiveAgentId = editingTask.agentId;
+  const selectedAgent = agents?.find((agent) => agent.id === effectiveAgentId);
   const agentLabel = selectedAgent
     ? selectedAgent.display_name
     : isEdit && editingTask
@@ -378,7 +380,7 @@ export function CreateScheduledTaskDialog({
     if (open) targetChosenRef.current = false;
   }, [open]);
   const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
-  const targetInputsLoaded = info !== "loading" && !hostsPending;
+  const targetInputsLoaded = !curationPending && !hostsPending;
   useEffect(() => {
     if (!open || isEdit || !targetInputsLoaded || targetChosenRef.current) return;
     if (managedSandboxesEnabled) {
@@ -398,7 +400,9 @@ export function CreateScheduledTaskDialog({
   // A picked project is shown by its id, so a rename elsewhere shows the new name.
   const pickedProject =
     pickedProjectId !== null ? projects.find((p) => p.id === pickedProjectId) : undefined;
-  const projectName = pickedProject?.name ?? projectChoice ?? savedProjectName ?? "";
+  const effectiveProjectChoice =
+    projectChoice ?? (!isEdit && projectsSupported ? DEFAULT_AUTOMATION_PROJECT : null);
+  const projectName = pickedProject?.name ?? effectiveProjectChoice ?? savedProjectName ?? "";
   const projectIcon = (pickedProject ?? projects.find((p) => p.name === projectName))?.icon;
   // The saved project has no name while the list loads, if it fails to load,
   // or once the project is deleted. Only a loaded list proves it is deleted,
@@ -528,6 +532,7 @@ export function CreateScheduledTaskDialog({
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
   const canSubmit =
+    !curationPending &&
     name.trim() !== "" &&
     effectivePrompt.trim() !== "" &&
     (trigger !== null || prompt.trim() !== "") &&
@@ -566,7 +571,7 @@ export function CreateScheduledTaskDialog({
   }
 
   async function handleSubmit() {
-    if (harnessSettings.blockedReason) return;
+    if (curationPending || harnessSettings.blockedReason) return;
     if (!editingTask && effectiveAgentId === null) return;
     setError(null);
     setSubmitting(true);
@@ -601,7 +606,7 @@ export function CreateScheduledTaskDialog({
       };
       const projectInput = await projectChangeInput(
         // Saving over a deleted project clears it, matching the "No project" shown.
-        projectChoice ?? (savedProjectDeleted ? "" : null),
+        effectiveProjectChoice ?? (savedProjectDeleted ? "" : null),
         pickedProjectId,
         savedProjectId,
         resolveProjectId,
@@ -1092,9 +1097,11 @@ export function CreateScheduledTaskDialog({
                 harnessEntries={harnessEntries}
                 effectiveAgentId={effectiveAgentId}
                 agentLabel={agentLabel}
-                hasAgents={agentList.length > 0}
-                // Needs-setup badges use the pinned host, else the first online host.
-                host={badgeHost}
+                hasAgents={selectedAgent !== undefined || agentList.length > 0}
+                loading={curationPending}
+                curatedEntries={curation.restrictToAgentNames.size > 0 ? agentList : undefined}
+                // Sandboxes provision their own harnesses; host badges only apply to hosts.
+                host={sandboxMode ? undefined : badgeHost}
                 onSelectAgent={handleSelectAgent}
                 pendingAgent={null}
                 pendingAgentId="__unused_pending_agent__"
@@ -1102,7 +1109,8 @@ export function CreateScheduledTaskDialog({
                 // Custom-agent creation is inert until there is a way to
                 // persist a new agent independently of creating a session.
                 onCreateCustomAgent={() => {}}
-                sandboxSelected={false}
+                sandboxSelected={sandboxMode}
+                allowCreateCustomAgent={false}
                 // Forward the dropdown open/close into the dialog's outside-click
                 // dismiss guard so opening the picker doesn't close the modal.
                 onOpenChange={handleSelectOpenChange}
@@ -1160,7 +1168,7 @@ export function CreateScheduledTaskDialog({
                       : effectivePermission
                   }
                   settings={harnessSettings}
-                  disabled={reusesExistingSession}
+                  disabled={curationPending || reusesExistingSession}
                   onModelChange={handleModelChange}
                   onEffortChange={setPickedEffort}
                   onPermissionModeChange={setPickedPermission}

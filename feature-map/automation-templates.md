@@ -31,6 +31,9 @@ to customize.
   and preserves the separate prompts when saved and reopened.
   The detail page also keeps the system prompt collapsed by default, with a
   bounded read-only preview when expanded; use Edit automation to change it.
+- `default-project`: new automations select Omnigent Automation. Saving reuses or
+  creates that project; canceling creates nothing. The project picker can choose
+  another project or remove the default. Editing preserves the saved project.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
   browsing again; saved paths and sandbox setup are preserved. When the default
@@ -45,7 +48,12 @@ to customize.
   when on, each new session starts in a fresh worktree from HEAD, and continuing
   runs reuse that session's worktree. Editing can turn it off again.
 - `harness-settings`: model, effort, and permission controls follow the selected
-  harness. Codex and Devin efforts follow the selected model; Pi exposes thinking
+  harness. The selector shares New Session's deployment restrictions, order,
+  and default agent; editing preserves a saved agent outside that list. Harness
+  selection, Advanced settings, and saving wait for deployment configuration,
+  including during the boot fallback. Sandbox choices do not inherit a connected
+  host's readiness badges.
+  Codex and Devin efforts follow the selected model; Pi exposes thinking
   levels. Connected hosts and sandboxes supply their own catalogs. Default keeps
   agent settings, and switching harnesses clears incompatible overrides. Catalogs
   are cached per server, user, target, and harness for reopening while offline.
@@ -122,7 +130,8 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 - `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
   uses its own built-SPA browser contract, with a synthetic provider catalog,
   to cover repository creation, replacement, clearing, and reopening on desktop
-  and mobile. It does not verify actual sandbox execution.
+  and mobile, plus deployment-curated harness choices in create and edit.
+  It does not verify actual sandbox execution.
 - In the creation modal, choose a connected host and Git repository, enable
   Random worktree, save, and reopen Edit to confirm it stayed enabled. Run twice
   with New session each run and check that the sessions have distinct worktree

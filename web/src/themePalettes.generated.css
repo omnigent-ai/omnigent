@@ -10,7 +10,7 @@
   --popover: #ffffff;
   --popover-foreground: #11171c;
   --primary: #df3c85;
-  --link: #1967b5;
+  --link: #c42f70;
   --primary-foreground: #ffffff;
   --selection-background: rgba(223, 60, 133, 0.1);
   --selection-foreground: #651249;
@@ -19,8 +19,8 @@
   --muted: #0000000f;
   --muted-foreground: #71717a;
   --code-bg: #0000000f;
-  --accent: #d7edfe;
-  --accent-foreground: #04355d;
+  --accent: #f2f1f2;
+  --accent-foreground: #27272a;
   --border: #e4e4e7;
   --border-strong: #a1a1aa;
   --button-border: #d6d6d6;
@@ -29,12 +29,12 @@
   --brand-accent: #df3c85;
   --sidebar: #fafafa;
   --sidebar-foreground: #27272a;
-  --sidebar-primary: #2272b4;
+  --sidebar-primary: var(--link);
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #d7edfe;
-  --sidebar-accent-foreground: #04355d;
+  --sidebar-accent: #f2f1f2;
+  --sidebar-accent-foreground: #27272a;
   --sidebar-border: #e4e4e7;
-  --sidebar-ring: #2272b4;
+  --sidebar-ring: var(--ring);
   --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
   --sidebar-active-foreground: var(--primary);
   --sidebar-background: var(--sidebar);
@@ -51,7 +51,7 @@
   --popover: rgba(26, 33, 41, 0.8);
   --popover-foreground: #f5f5f4;
   --primary: #df3c85;
-  --link: #72b7f5;
+  --link: #e65a9c;
   --primary-foreground: #11171c;
   --selection-background: rgba(223, 60, 133, 0.15);
   --selection-foreground: #f9a8d4;
@@ -60,8 +60,8 @@
   --muted: rgb(255 255 255 / 12%);
   --muted-foreground: rgb(245 245 244 / 56%);
   --code-bg: oklch(0.38 0.005 240);
-  --accent: #04355d;
-  --accent-foreground: #4299e0;
+  --accent: #28262e;
+  --accent-foreground: #f5f5f4;
   --border: oklch(0.28 0.005 240);
   --border-strong: #a1a1aa;
   --button-border: #d6d6d6;
@@ -70,7 +70,7 @@
   --brand-accent: #df3c85;
   --sidebar: #0e0b19;
   --sidebar-foreground: #f5f5f4;
-  --sidebar-primary: oklch(0.64 0.22 254);
+  --sidebar-primary: var(--link);
   --sidebar-primary-foreground: oklch(0.12 0.004 240);
   --sidebar-accent: oklch(0.245 0.005 240);
   --sidebar-accent-foreground: oklch(0.965 0.003 240);

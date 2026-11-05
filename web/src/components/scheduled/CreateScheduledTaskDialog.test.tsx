@@ -107,6 +107,10 @@ vi.mock("@/shell/NewChatDialog", () => ({
     contentClassName,
     harnessEntries,
     agentEntries,
+    curatedEntries,
+    sandboxSelected,
+    hasAgents,
+    loading,
   }: {
     onSelectAgent: (a: AvailableAgent) => void;
     onOpenChange?: (open: boolean) => void;
@@ -117,8 +121,13 @@ vi.mock("@/shell/NewChatDialog", () => ({
     contentClassName?: string;
     harnessEntries: AvailableAgent[];
     agentEntries: AvailableAgent[];
+    curatedEntries?: AvailableAgent[];
+    sandboxSelected: boolean;
+    hasAgents: boolean;
+    loading?: boolean;
   }) => (
-    <div
+    <fieldset
+      disabled={loading}
       data-testid="agent-picker-stub"
       data-effective={effectiveAgentId ?? ""}
       // Surface the host the dialog feeds the picker for badge computation, so
@@ -128,8 +137,10 @@ vi.mock("@/shell/NewChatDialog", () => ({
       data-content-class={contentClassName}
       data-harness-entries={harnessEntries.map((agent) => agent.name).join(",")}
       data-agent-entries={agentEntries.map((agent) => agent.name).join(",")}
+      data-curated-entries={curatedEntries?.map((agent) => agent.name).join(",")}
+      data-sandbox-selected={String(sandboxSelected)}
     >
-      <span>{agentLabel}</span>
+      <span>{hasAgents ? agentLabel : "No agents"}</span>
       {harnessEntries
         .filter((agent) => agent.name !== "claude-native-ui")
         .map((agent) => (
@@ -169,7 +180,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
       <button type="button" data-testid="picker-close" onClick={() => onOpenChange?.(false)}>
         close
       </button>
-    </div>
+    </fieldset>
   ),
 }));
 
@@ -284,6 +295,150 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
 }
 
 describe("agent picker readiness (needs-setup badges)", () => {
+  it.each([
+    ["pending probe", "loading" as const],
+    ["boot fallback", SERVER_INFO_OFFLINE_FALLBACK],
+  ])("waits for curation during %s", async (_label, pendingInfo) => {
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+      data: [...AGENTS, testAgent("ag_codex", "codex-native-ui", { harness: "codex-native" })],
+    } as ReturnType<typeof agentsHook.useAvailableAgents>);
+    const dialog = (
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialName="Nightly"
+        initialPrompt="Do it"
+      />
+    );
+    const view = render(<CapabilitiesProvider info={pendingInfo}>{dialog}</CapabilitiesProvider>);
+    // A valid explicit target isolates the curation gate from host loading.
+    fireEvent.click(screen.getByTestId("task-host-trigger"));
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+    expect(screen.getByTestId("pick-harness-claude")).toBeDisabled();
+    expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+    expect(screen.getByTestId("task-effort-trigger")).toBeDisabled();
+    const permission = screen.getByTestId("task-permission-trigger");
+    expect(permission).toBeDisabled();
+    await userEvent.click(permission);
+    expect(screen.queryByRole("option", { name: "Accept edits" })).not.toBeInTheDocument();
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.click(submit);
+    expect(mutateAsync).not.toHaveBeenCalled();
+
+    view.rerender(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_harness_settings: true,
+          picker: {
+            restrictToAgentNames: new Set(["codex-native-ui"]),
+            defaultAgentName: "codex-native-ui",
+          },
+        }}
+      >
+        {dialog}
+      </CapabilitiesProvider>,
+    );
+    const picker = screen.getByTestId("agent-picker-stub");
+    expect(screen.getByRole("button", { name: "pick codex-native" })).toBeEnabled();
+    expect(picker).toHaveAttribute("data-curated-entries", "codex-native-ui");
+    expect(picker).toHaveAttribute("data-harness-entries", "codex-native-ui");
+    expect(picker).toHaveAttribute("data-effective", "ag_codex");
+    expect(screen.getByTestId("task-model-trigger")).toBeEnabled();
+    expect(screen.getByTestId("task-permission-trigger")).toBeEnabled();
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].agentId).toBe("ag_codex");
+    for (const override of ["permissionMode", "modelOverride", "reasoningEffort"]) {
+      expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty(override);
+    }
+
+    // A settled older server has no curation and still offers the full roster.
+    view.rerender(
+      <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK }}>
+        {dialog}
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("pick-harness-claude")).toBeEnabled();
+    expect(picker).toHaveAttribute("data-harness-entries", "claude-native-ui,codex-native-ui");
+  });
+
+  it.each([
+    { editing: false, empty: false },
+    { editing: true, empty: false },
+    { editing: false, empty: true },
+    { editing: true, empty: true },
+  ])(
+    "honors deployment curation when editing=$editing and empty=$empty",
+    async ({ editing, empty }) => {
+      vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+        data: [
+          ...AGENTS,
+          testAgent("ag_cursor", "cursor-native-ui", {
+            display_name: "Cursor",
+            harness: "cursor-native",
+          }),
+          testAgent("ag_pi", "pi-native-ui", { harness: "pi-native" }),
+        ],
+      } as ReturnType<typeof agentsHook.useAvailableAgents>);
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "arclet",
+            picker: {
+              restrictToAgentNames: new Set(
+                empty ? ["not-installed"] : ["polly", "claude-native-ui", "pi-native-ui"],
+              ),
+              defaultAgentName: "pi-native-ui",
+            },
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={
+              editing
+                ? scheduledTask({ agentId: "ag_cursor", executionTarget: "managed_sandbox" })
+                : null
+            }
+          />
+        </CapabilitiesProvider>,
+      );
+      const picker = screen.getByTestId("agent-picker-stub");
+      expect(picker).toHaveAttribute(
+        "data-harness-entries",
+        empty ? "" : "claude-native-ui,pi-native-ui",
+      );
+      expect(picker).toHaveAttribute("data-agent-entries", empty ? "" : "polly");
+      expect(picker).toHaveAttribute(
+        "data-curated-entries",
+        empty ? "" : "polly,claude-native-ui,pi-native-ui",
+      );
+      expect(picker).toHaveAttribute("data-sandbox-selected", "true");
+      expect(picker).toHaveAttribute("data-badge-host", "");
+      if (editing) {
+        expect(picker).toHaveAttribute("data-effective", "ag_cursor");
+        expect(picker).toHaveTextContent("Cursor");
+        fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+        await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+        expect(updateMutateAsync.mock.calls[0][0].input.agentId).toBeUndefined();
+      } else if (empty) {
+        expect(picker).toHaveAttribute("data-effective", "");
+        expect(picker).toHaveTextContent("No agents");
+        fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+        fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+        expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Arclet Sandbox");
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      } else {
+        expect(picker).toHaveAttribute("data-effective", "ag_pi");
+      }
+    },
+  );
+
   it("shows the model + effort controls for the default (Claude-native) agent", () => {
     renderDialog();
     expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
@@ -1874,12 +2029,23 @@ describe("CreateScheduledTaskDialog project", () => {
     return mutateAsync.mock.calls[0][0];
   }
 
-  it("sends no project when none is picked", async () => {
+  it("files new automations in the default project at save time", async () => {
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_automation");
     renderWithProjects();
     fillRequired();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Omnigent Automation");
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_automation" });
+    expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Omnigent Automation");
+  });
+
+  it("allows opting out of the default project", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from/ }));
     expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
-    const arg = await submitCreate();
-    expect(arg).not.toHaveProperty("projectId");
+    expect(await submitCreate()).not.toHaveProperty("projectId");
     expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
   });
 
@@ -2649,7 +2815,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-condition-0-value", "error");
     type("task-trigger-instructions", "Reproduce it.");
     fireEvent.click(
-      screen.getByRole("checkbox", { name: "Reply in the thread with the session link" }),
+      screen.getByRole("checkbox", {
+        name: "Include the session link with the result in the thread",
+      }),
     );
 
     const prompt = await submittedPrompt();
@@ -2952,15 +3120,14 @@ describe("scheduler capabilities", () => {
               ...SERVER_INFO_OFFLINE_FALLBACK,
               features: enabled === undefined ? {} : { automations_v2: enabled },
             };
-      render(
-        <CapabilitiesProvider info={info}>
-          <CreateScheduledTaskDialog
-            open
-            onOpenChange={vi.fn()}
-            editingTask={scheduledTask({ rrule: rule })}
-          />
-        </CapabilitiesProvider>,
+      const dialog = (
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({ rrule: rule })}
+        />
       );
+      const view = render(<CapabilitiesProvider info={info}>{dialog}</CapabilitiesProvider>);
       expect(screen.getByRole("alert")).toHaveTextContent(
         "This server does not support custom schedules or occurrence limits",
       );
@@ -2988,6 +3155,14 @@ describe("scheduler capabilities", () => {
         }
       }
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      if (enabled === "loading") {
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+        view.rerender(
+          <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK }}>
+            {dialog}
+          </CapabilitiesProvider>,
+        );
+      }
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));

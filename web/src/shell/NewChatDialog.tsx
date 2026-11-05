@@ -2284,15 +2284,14 @@ export function NewChatLandingScreen() {
   // Filter and order selectable agents by deployment curation.
   const info = useServerInfo();
   const curation = pickerCuration(info);
-  const agentList = useMemo(() => {
-    const selectable = selectableSessionAgents(
-      (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
-    );
-    if (curation.restrictToAgentNames.size === 0) return selectable;
-    const allowed = selectable.filter((agent) => curation.restrictToAgentNames.has(agent.name));
-    const order = [...curation.restrictToAgentNames];
-    return allowed.sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
-  }, [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames]);
+  const agentList = useMemo(
+    () =>
+      selectableSessionAgents(
+        (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
+        curation.restrictToAgentNames,
+      ),
+    [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames],
+  );
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)

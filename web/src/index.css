@@ -165,11 +165,6 @@
   --text-xs--line-height: var(--text-sm--line-height);
 }
 
-/* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
- * ~#007AFF light, ~#0A84FF dark). Reserved for focus rings, charts,
- * unread state, and the active sidebar highlight; surfaces and primary
- * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
- * describes the older cobalt direction). */
 :root {
   /* User-controlled UI font size (see Appearance settings /
    * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
