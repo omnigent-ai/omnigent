@@ -556,6 +556,8 @@ export function CreateScheduledTaskDialog({
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
+  const pollingBlockedReason =
+    editingWorkerSettings && reusesExistingSession ? null : harnessSettings.blockedReason;
   const canSubmit =
     !curationPending &&
     name.trim() !== "" &&
@@ -566,9 +568,8 @@ export function CreateScheduledTaskDialog({
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
-    !(editingWorkerSettings
-      ? workerSettings !== null && workerHarnessSettings.blockedReason
-      : harnessSettings.blockedReason) &&
+    !pollingBlockedReason &&
+    !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
     !mutationPending;
 
   function resetForm() {
@@ -1114,6 +1115,12 @@ export function CreateScheduledTaskDialog({
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />
               Pick a host before pinning a workspace.
+            </p>
+          )}
+
+          {editingWorkerSettings && pollingBlockedReason && (
+            <p role="alert" className="text-sm text-destructive">
+              Polling session cannot start: {pollingBlockedReason}
             </p>
           )}
 

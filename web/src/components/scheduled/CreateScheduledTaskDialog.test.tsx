@@ -3010,17 +3010,18 @@ describe("editing template prompts", () => {
 
   it.each(
     [true, false].flatMap((workerReady) =>
-      [true, false].flatMap((moveToHost) =>
-        (["managed", "same_host"] as const).map((placement) => ({
-          workerReady,
-          moveToHost,
-          placement,
-        })),
-      ),
+      (
+        [
+          { change: "none", placement: "managed" },
+          { change: "host", placement: "managed" },
+          { change: "host", placement: "same_host" },
+          { change: "sandbox", placement: "same_host" },
+        ] as const
+      ).map((context) => ({ workerReady, ...context })),
     ),
   )(
-    "validates worker placement $placement after moving to host=$moveToHost (worker ready: $workerReady)",
-    async ({ workerReady, moveToHost, placement }) => {
+    "validates worker placement $placement after poller target change=$change (worker ready: $workerReady)",
+    async ({ workerReady, change, placement }) => {
       vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockImplementation(
         (_provider, _harness, agentId) =>
           ({
@@ -3047,22 +3048,37 @@ describe("editing template prompts", () => {
             onOpenChange={vi.fn()}
             editingTask={scheduledTask({
               prompt: original.replace('placement "same_host"', `placement "${placement}"`),
-              executionTarget: "managed_sandbox",
+              executionTarget: change === "sandbox" ? "connected_host" : "managed_sandbox",
+              hostId: change === "sandbox" ? "host_1" : null,
               sessionMode: "continue",
               sessionId: "poller",
             })}
           />
         </CapabilitiesProvider>,
       );
-      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-      if (moveToHost) {
+      if (change !== "sandbox")
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      if (change === "host") {
         fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
         fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
       }
       fireEvent.keyDown(screen.getByTestId("task-worker-agent-trigger"), { key: "Enter" });
       fireEvent.click(await screen.findByRole("option", { name: "Claude Code" }));
       const submit = screen.getByTestId("create-scheduled-task-submit");
-      if (workerReady || (moveToHost && placement === "same_host")) {
+      if (change === "sandbox") {
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByTestId("task-host-sandbox-option"));
+        expect(submit).toBeDisabled();
+        expect(screen.getByText(/Polling session cannot start:/)).toHaveTextContent(
+          "This harness is unavailable in the sandbox.",
+        );
+        fireEvent.click(submit);
+        expect(updateMutateAsync).not.toHaveBeenCalled();
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+        expect(screen.queryByText(/Polling session cannot start:/)).not.toBeInTheDocument();
+      }
+      if (workerReady || (change !== "none" && placement === "same_host")) {
         expect(submit).toBeEnabled();
         fireEvent.click(submit);
         await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
@@ -3081,6 +3097,45 @@ describe("editing template prompts", () => {
       }
     },
   );
+
+  it("keeps a customized creation call in the separate system prompt editor", async () => {
+    const task = scheduledTask({
+      prompt: original,
+      agentId: "ag_claude_native",
+      sessionMode: "continue",
+      sessionId: "poller",
+    });
+    const props = { onOpenChange: vi.fn(), editingTask: task };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    const editor = screen.getByRole("textbox", { name: "System prompt" }) as HTMLTextAreaElement;
+    fireEvent.change(editor, {
+      target: {
+        value: editor.value.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
+      },
+    });
+    expect(screen.queryByTestId("task-worker-settings")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-agent-picker")).not.toBeInTheDocument();
+    expect(screen.getByText(/Worker controls are unavailable/)).toBeVisible();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(input.prompt).toBe(
+      original.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
+    );
+    expect(input).not.toHaveProperty("agentId");
+    expect(input).not.toHaveProperty("sessionId");
+    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    rerender(
+      <CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt: input.prompt }} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit worker instructions" }));
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveFocus();
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(
+      splitTriggerPrompt(input.prompt).systemPrompt,
+    );
+  });
 
   it("keeps a hand-written heading editable for unrelated changes", async () => {
     const prompt = "Write a training document.\n\nInstructions for each session:\n";
