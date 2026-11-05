@@ -200,12 +200,16 @@ class _DiscoverySessions:
         return PaginatedList(data=list(self._by_parent.get(session_id, [])), has_more=False)
 
     async def child_sessions_tree(
-        self, session_id: str, *, max_depth: int = 3, limit: int = 100
+        self, session_id: str, *, max_depth: int = 3, limit: int = 100, **kwargs: Any
     ) -> list[dict[str, Any]]:
         # The recursion now lives in the SDK; reuse the real implementation
         # (it only needs this stub's ``child_sessions``).
         return await SessionsNamespace.child_sessions_tree(
-            self, session_id, max_depth=max_depth, limit=limit
+            self,  # type: ignore[arg-type]
+            session_id,
+            max_depth=max_depth,
+            limit=limit,
+            **kwargs,
         )
 
 

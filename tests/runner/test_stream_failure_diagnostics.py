@@ -12,7 +12,10 @@ edges at the runner's HTTP boundary (``POST /v1/sessions/{id}/events``):
 - a pane read that raises never masks the failure event itself;
 - an oversized pane snapshot is bounded by the shared trim budget;
 - a drop caused by the runner's own required-terminal release reports that
-  exit, while an exit recorded before the turn is not blamed for its drop.
+  exit, while an exit recorded before the turn is not blamed for its drop;
+- a pane Omnigent closed at its delivery timeout reports that timeout and the
+  pane's output when the release severs the stream first, and the release
+  waits for the turn's own error before it does.
 """
 
 from __future__ import annotations
@@ -429,6 +432,151 @@ async def test_stream_drop_after_required_terminal_exit_reports_the_exit(
     ]
     assert len(ended) == 1, caplog.text
     assert ended[0].attributes["exception_type"] == "ReadError"
+
+
+@pytest.mark.asyncio
+async def test_stream_drop_after_an_expected_close_reports_the_delivery_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A drop caused by releasing a pane Omnigent closed names that close, with the pane.
+
+    The claude-native executor reaps a pane whose input box never rendered and
+    then reports the readiness timeout. Releasing the harness subprocess 2 s
+    after the exit could sever the stream before that report arrived, and the
+    turn surfaced as ``connection_error`` / ``Harness stream connection error:
+    ReadError`` with no pane: the launcher prompt that held the terminal was
+    invisible to the person and to the failure's classification.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
+    app = _make_app(
+        cause="",
+        before_drop=lambda: publish["exit"](
+            _required_terminal_exit(session_was_idle=False, expected_close=True)
+        ),
+    )
+    publish["exit"] = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            failed, message = await _failed_event_message(app, _CONV_ID)
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    assert failed["error"]["code"] == "RuntimeError", failed
+    assert message.startswith(
+        "Claude Code terminal did not become ready before the message delivery timed out"
+    ), message
+    assert "Last captured terminal output:\nWaiting for the API key helper" in message, message
+    assert "Harness stream connection error" not in message, message
+    assert [
+        r for r in caplog.records if getattr(r, "event_name", None) == "harness_stream_failed"
+    ] == []
+
+
+class _LateFailureHarnessClient(_ScriptedHarnessClient):
+    """Harness client whose own failure frame arrives a moment after the pane exit."""
+
+    def __init__(self, order: list[str], on_exit: Callable[[], None], delay_s: float) -> None:
+        super().__init__([])
+        self._order = order
+        self._on_exit = on_exit
+        self._delay_s = delay_s
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        order, on_exit, delay_s = self._order, self._on_exit, self._delay_s
+
+        class _Ctx:
+            status_code = 200
+
+            async def __aenter__(self) -> _LateFailureHarnessClient._Handle:
+                return _LateFailureHarnessClient._Handle(order, on_exit, delay_s)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Ctx()
+
+    class _Handle:
+        status_code = 200
+
+        def __init__(self, order: list[str], on_exit: Callable[[], None], delay_s: float) -> None:
+            self._order, self._on_exit, self._delay_s = order, on_exit, delay_s
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            yield _sse({"type": "response.created", "response": {"id": "resp_late"}})
+            self._on_exit()
+            # The executor is still composing its readiness error after the reap.
+            await asyncio.sleep(self._delay_s)
+            self._order.append("failure_frame")
+            yield _sse(
+                {
+                    "type": "response.failed",
+                    "response": {"id": "resp_late", "status": "failed"},
+                    "error": {"code": "RuntimeError", "message": "inner executor error: late"},
+                }
+            )
+
+
+@pytest.mark.asyncio
+async def test_expected_close_release_waits_for_the_turns_own_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The harness is released only once the turn's own failure has been streamed.
+
+    The plain terminal-exit grace is short; a pane Omnigent closed itself waits
+    longer, so the executor's readiness error, not the release, ends the stream.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+
+    monkeypatch.setattr(runner_app, "_TERMINAL_EXIT_RELEASE_GRACE_S", 0.01)
+    monkeypatch.setattr(runner_app, "_EXPECTED_CLOSE_RELEASE_GRACE_S", 5.0, raising=False)
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    order: list[str] = []
+    publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
+    client = _LateFailureHarnessClient(
+        order,
+        on_exit=lambda: publish["exit"](
+            _required_terminal_exit(session_was_idle=False, expected_close=True)
+        ),
+        delay_s=0.3,
+    )
+    pm = _FakeProcessManager(client)
+    original_release = pm.release
+
+    async def _release(conversation_id: str, *args: Any, **kwargs: Any) -> Any:
+        order.append("release")
+        return await original_release(conversation_id, *args, **kwargs)
+
+    pm.release = _release  # type: ignore[method-assign]
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    publish["exit"] = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        events = await _streamed_events(app, _CONV_ID)
+        for _ in range(100):
+            if "release" in order:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    failed = [e for e in events if e.get("type") == "response.failed"]
+    assert [e["error"]["message"] for e in failed] == ["inner executor error: late"], events
+    assert order == ["failure_frame", "release"], order
 
 
 @pytest.mark.asyncio

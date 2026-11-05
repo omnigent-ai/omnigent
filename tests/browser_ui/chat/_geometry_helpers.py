@@ -253,7 +253,13 @@ def scroll_with_native_touch(page: Page, session: CDPSession | None = None) -> d
         )
         page.wait_for_timeout(16)
     session.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-    page.wait_for_timeout(600)
+    # Native momentum can outlast a fixed delay; measure after the gesture and
+    # any virtual-row remeasurement have both finished.
+    page.wait_for_function(
+        "() => window.__nativeTouchProbe.events.at(-1) === 'scrollend'",
+        timeout=15_000,
+    )
+    settled_geometry(page)
     return page.evaluate(
         """initial => { const {events, scroller} = window.__nativeTouchProbe; return {
           events, initialScrollTop: initial, settledScrollTop: Math.round(scroller.scrollTop),

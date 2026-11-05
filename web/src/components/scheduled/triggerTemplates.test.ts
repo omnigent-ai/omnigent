@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  combineTriggerPrompt,
   compileGithubQuery,
   compileJiraJql,
   describeLinearFilter,
   describeSlackFilter,
+  isTriggerPrompt,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
+  splitTriggerPrompt,
   splitJqlOrderBy,
   triggerFieldsComplete,
+  TRIGGER_SOURCES,
   type TriggerCondition,
   type TriggerFields,
   type TriggerPromptContext,
@@ -33,6 +37,98 @@ function fields(overrides: Partial<TriggerFields> = {}): TriggerFields {
 }
 
 const JQL = 'project = "ES" AND labels = "omnigent"';
+
+describe("saved trigger prompts", () => {
+  it.each(TRIGGER_SOURCES)("separates %s instructions and preserves the saved prompt", (source) => {
+    const original = renderTriggerPrompt(source, fields(), CTX);
+    const parts = splitTriggerPrompt(original);
+    expect(parts.userPrompt).toBe("Investigate the ticket.");
+    expect(parts.systemPrompt).toContain("This automation watches");
+    expect(parts.systemPrompt).not.toContain(parts.userPrompt);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(original);
+    expect(combineTriggerPrompt("Updated instructions.", parts.systemPrompt)).toBe(
+      original.replace(parts.userPrompt, "Updated instructions."),
+    );
+  });
+
+  it.each(
+    [true, false].flatMap((linkBack) =>
+      ["replace attribution", "append text", "trailing newline"].map((edit) => ({
+        linkBack,
+        edit,
+      })),
+    ),
+  )("preserves worker posting scope with link-back $linkBack: $edit", ({ linkBack, edit }) => {
+    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields({ linkBack }), CTX));
+    const [manager, posting] = parts.systemPrompt!.split(
+      "\n\nPosting instructions for each session:\n",
+    );
+    const editedPosting =
+      edit === "replace attribution"
+        ? posting.replace("Sent with Omnigent", "Automated reply")
+        : posting + (edit === "append text" ? "\nInclude a summary." : "\n");
+    const systemPrompt = `${manager}\n\nPosting instructions for each session:\n${editedPosting}`;
+    const saved = combineTriggerPrompt("New user prompt.", systemPrompt);
+    const [savedManager, workerInstructions] = saved.split("\n\nInstructions for each session:\n");
+    expect(savedManager).toBe(manager);
+    expect(workerInstructions).toBe(
+      `New user prompt.\n\nPosting instructions for each session:\n${editedPosting}`,
+    );
+    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "New user prompt.", systemPrompt });
+  });
+
+  it.each(["", "  \n"])("preserves intentionally cleared posting instructions (%j)", (posting) => {
+    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields(), CTX));
+    const [manager] = parts.systemPrompt!.split("\n\nPosting instructions for each session:\n");
+    const systemPrompt = `${manager}\n\nPosting instructions for each session:\n${posting}`;
+    const saved = combineTriggerPrompt(parts.userPrompt, systemPrompt);
+    expect(saved).toBe(
+      `${manager}\n\nInstructions for each session:\n${parts.userPrompt}\n\nPosting instructions for each session:\n${posting}`,
+    );
+    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: parts.userPrompt, systemPrompt });
+  });
+
+  it("preserves an independently specified saved template", () => {
+    const saved =
+      'This automation watches Jira issues.\n\nEach run:\nStart a session for each match.\n\nInstructions for each session:\nTriage the ticket.\nAnything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "Sent with Omnigent", since it posts with the owner\'s account.';
+    const systemPrompt =
+      'This automation watches Jira issues.\n\nEach run:\nStart a session for each match.\n\nPosting instructions for each session:\nAnything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "Sent with Omnigent", since it posts with the owner\'s account.';
+    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "Triage the ticket.", systemPrompt });
+    expect(combineTriggerPrompt("Triage the ticket.", systemPrompt)).toBe(saved);
+  });
+
+  it.each([
+    "A plain prompt\nwith multiple lines.",
+    "Write a training document.\n\nInstructions for each session:\nInclude the agenda.",
+    "Write a training document.\n\nInstructions for each session:\n",
+    "Write a training document.\n\nInstructions for each session:\n  \n",
+    "\n\nInstructions for each session:\nNo system instructions.",
+    "System\n\nInstructions for each session:\nAmbiguous\n\nInstructions for each session:\ntext",
+    renderTriggerPrompt("jira", fields({ instructions: "" }), CTX),
+    renderTriggerPrompt("jira", fields({ instructions: "  \n" }), CTX),
+    renderTriggerPrompt(
+      "jira",
+      fields({ instructions: "Include\n\nInstructions for each session:\nan agenda." }),
+      CTX,
+    ),
+    renderTriggerPrompt(
+      "jira",
+      fields({ instructions: "Include\n\nPosting instructions for each session:\nan agenda." }),
+      CTX,
+    ),
+  ])("keeps an unrecognized or ambiguous prompt intact", (prompt) => {
+    expect(splitTriggerPrompt(prompt)).toEqual({ userPrompt: prompt, systemPrompt: null });
+    expect(combineTriggerPrompt(prompt, null)).toBe(prompt);
+  });
+
+  it("keeps an unfamiliar posting-instruction placement intact", () => {
+    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields(), CTX));
+    const prompt = `${parts.systemPrompt}\n\nInstructions for each session:\n${parts.userPrompt}`;
+    const parsed = splitTriggerPrompt(prompt);
+    expect(parsed).toEqual({ userPrompt: prompt, systemPrompt: null });
+    expect(combineTriggerPrompt(parsed.userPrompt, parsed.systemPrompt)).toBe(prompt);
+  });
+});
 
 describe("triggerFieldsComplete", () => {
   // Instructions are capped so each worker's first message has room for the item.
@@ -213,6 +309,20 @@ describe("describeLinearFilter", () => {
     );
     expect(assignee("empty")).toBe("that are unassigned");
     expect(assignee("not_empty")).toBe("that are assigned to someone");
+  });
+});
+
+describe("isTriggerPrompt", () => {
+  it.each(["jira", "slack", "github", "linear"] as const)(
+    "recognizes a rendered %s prompt",
+    (source) => {
+      expect(isTriggerPrompt(renderTriggerPrompt(source, fields(), CTX))).toBe(true);
+    },
+  );
+
+  it("doesn't match a prompt written by hand", () => {
+    expect(isTriggerPrompt("Summarize the new Jira tickets.")).toBe(false);
+    expect(isTriggerPrompt(` ${renderTriggerPrompt("jira", fields(), CTX)}`)).toBe(false);
   });
 });
 
