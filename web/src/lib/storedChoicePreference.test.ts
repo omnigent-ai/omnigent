@@ -43,11 +43,16 @@ it("falls back to the default when storage is unavailable", () => {
   expect(preference.read()).toBe("medium");
 });
 
-it("keeps the stored choice when removing it fails", () => {
+it("keeps the stored choice when saving or removing another fails", () => {
   localStorage.setItem(STORAGE_KEY, "large");
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota exceeded");
+  });
   vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
     throw new Error("access denied");
   });
+  expect(() => preference.write("small")).not.toThrow();
+  expect(preference.read()).toBe("large");
   expect(() => preference.write("medium")).not.toThrow();
   expect(preference.read()).toBe("large");
 });

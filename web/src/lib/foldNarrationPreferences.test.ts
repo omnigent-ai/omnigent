@@ -7,7 +7,7 @@ import {
   writeFoldAssistantNarration,
 } from "./foldNarrationPreferences";
 
-// Storage failures and event filtering are covered by storedChoicePreference.test.ts.
+// Fold narration's key and boolean mapping; shared storage behavior is tested with the factory.
 afterEach(() => {
   localStorage.clear();
 });
