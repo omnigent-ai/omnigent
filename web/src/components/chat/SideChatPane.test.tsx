@@ -1773,6 +1773,37 @@ function renderRecoveringGridPane(state: Partial<ConversationState> = {}) {
   return entry;
 }
 
+it("adds a refused startup resend's files after the grid composer's newer files", () => {
+  const entry = renderRecoveringGridPane();
+  const newer = new File(["notes"], "notes.txt", { type: "text/plain" });
+  const recovered = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+  act(() =>
+    useChatStore
+      .getState()
+      .updateSideChatComposer(childId, () => ({ text: "newer", files: [newer] })),
+  );
+  act(() =>
+    entry.setState({
+      failedSendDraft: {
+        conversationId: childId,
+        text: "saved on server",
+        files: [recovered],
+        stableId: "stable_resend",
+        serverRefused: true,
+        startupInputIds: ["pending_first"],
+      },
+    }),
+  );
+  expect(screen.getByTestId("side-chat-input")).toHaveValue("newer\n\nsaved on server");
+  expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
+    text: "newer\n\nsaved on server",
+    files: [newer, recovered],
+    startupInputIds: ["pending_first"],
+    sentAs: ["stable_resend"],
+  });
+  expect(entry.getState().pendingRetryStableId).toBeNull();
+});
+
 it.each([
   {
     into: "after the grid composer's newer draft",
