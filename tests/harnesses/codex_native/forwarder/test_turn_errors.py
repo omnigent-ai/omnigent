@@ -1487,12 +1487,14 @@ async def _forward_output_limit_event(
     bridge_dir: Path,
     method: str,
     params: dict,
+    delta_coalescer: fwd._OutputTextDeltaCoalescer | None = None,
 ) -> None:
     await fwd._handle_event(
         client,  # type: ignore[arg-type]
         session_id="conv_x",
         bridge_dir=bridge_dir,
         event={"method": method, "params": params},
+        delta_coalescer=delta_coalescer,
         expected_thread_id="thread_123",
         usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
         elicitation_tracker=fwd._CodexElicitationTaskTracker(),
@@ -2099,7 +2101,19 @@ async def test_output_limit_claim_retires_completed_source_before_receipt_after_
         else:
             params.update(itemId="old-text", delta="stale source text")
             method = "item/agentMessage/delta"
-        await _forward_output_limit_event(client, codex, restarted, tmp_path, method, params)
+        coalescer = fwd._OutputTextDeltaCoalescer(client, "conv_x")
+        try:
+            await _forward_output_limit_event(
+                client,
+                codex,
+                restarted,
+                tmp_path,
+                method,
+                params,
+                delta_coalescer=coalescer,
+            )
+        finally:
+            await coalescer.close()
     owner = read_bridge_state(tmp_path)
     assert owner.active_turn_id is None
     assert owner.automatic_input_turn_id is None
@@ -2122,3 +2136,25 @@ async def test_output_limit_claim_retires_completed_source_before_receipt_after_
     assert any(_OUTPUT_LIMIT_ERROR["message"] in json.dumps(body) for _, body in client.posts)
     assert not any(body["type"] == "external_session_status" for _, body in client.posts)
     assert codex.requests == []
+
+
+@pytest.mark.parametrize(
+    "native_status", ["paused", "", "future-status", None, {"type": "paused"}]
+)
+async def test_output_limit_unknown_receipt_status_does_not_prove_native_completion(
+    tmp_path: Path,
+    native_status: object,
+) -> None:
+    client, codex, state = _RecordingClient(), _ContinuingCodexClient(), fwd._CodexForwarderState()
+    codex.turn_status = native_status
+    _seed_active_turn(tmp_path, "turn_a")
+    await _forward_output_limit_event(
+        client, codex, state, tmp_path, "turn/completed", _output_limit_completion()
+    )
+    owner = read_bridge_state(tmp_path)
+    assert owner.automatic_input_turn_id == "turn_auto"
+    assert owner.automatic_input_outcome == "uncertain"
+    assert owner.active_turn_id is None
+    assert [method for method, _ in codex.requests] == ["turn/start", "thread/read"]
+    assert any(_OUTPUT_LIMIT_ERROR["message"] in json.dumps(body) for _, body in client.posts)
+    assert not any(body["type"] == "external_session_status" for _, body in client.posts)

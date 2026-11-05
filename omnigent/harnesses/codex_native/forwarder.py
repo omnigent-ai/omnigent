@@ -4366,7 +4366,21 @@ def _receipt_from_thread(
             for item in items
         ):
             status = turn.get("status")
-            receipts[turn_id] = status if isinstance(status, str) else "unknown"
+            receipts[turn_id] = (
+                status
+                if isinstance(status, str)
+                and status
+                in {
+                    "inProgress",
+                    "completed",
+                    "interrupted",
+                    "cancelled",
+                    "canceled",
+                    "failed",
+                    "errored",
+                }
+                else "unknown"
+            )
     return next(iter(receipts.items())) if len(receipts) == 1 else None
 
 
@@ -4522,9 +4536,11 @@ async def _auto_continue_after_output_limit(
         )
         adopted = (
             settle_codex_automatic_input(bridge_dir, expected=claimed, outcome="accepted")
-            if proven is not None
+            if proven is not None and native_status != "unknown"
             else None
         )
+        if proven is not None and native_status == "unknown":
+            settle_codex_automatic_input(bridge_dir, expected=claimed, outcome="uncertain")
     except OSError:
         _logger.warning("Could not save the Codex continuation receipt", exc_info=True)
         adopted = None
@@ -4543,7 +4559,9 @@ async def _auto_continue_after_output_limit(
                 )
             except OSError:
                 proof = None
-            if proof is not None:
+            if proof is not None and (
+                native_status != "unknown" or codex_automatic_input_was_interrupted(proof)
+            ):
                 await _interrupt_output_limit_continuation(
                     codex_client,
                     client=client,
