@@ -54,7 +54,9 @@ describe("mobile sidebar drawer", () => {
     renderSidebar({ open: false });
 
     const scrim = screen.getByTestId("sidebar-scrim");
-    expect(scrim).toHaveClass("pointer-events-none", "opacity-0");
+    // Invisible too: on the macOS desktop shell even a transparent scrim is a
+    // no-drag region that keeps the title bar from dragging the window.
+    expect(scrim).toHaveClass("pointer-events-none", "invisible", "opacity-0");
     // Untappable is not enough for a focusable control: parked, it must also
     // leave the tab order and the a11y tree. (Not `inert` — React 18 drops the
     // boolean form, so this would silently stay reachable.)

@@ -8292,8 +8292,8 @@ def test_list_conversations_acl_with_cursor_pagination(
 ) -> None:
     """Cursor pagination composes with the ACL filter: walking every page
     yields exactly the granted rows (no leak, no overlap, none lost), and a
-    NON-granted conversation used as the cursor still returns the granted
-    rows that follow it — an empty page would not satisfy this.
+    NON-granted conversation used as the cursor is rejected as stale, since
+    paging from it would compare its sort key against the caller's rows.
 
     Owns the ACL-vs-cursor COMPOSITION: removing the filter (``needs_meta_filter
     = False``) fails here, because the ungranted rows appear. It deliberately
@@ -8325,13 +8325,57 @@ def test_list_conversations_acl_with_cursor_pagination(
     assert set(seen) == granted
     assert seen == [convs[0].id, convs[1].id, convs[4].id, convs[5].id]
 
-    # A non-granted conversation (c2, positioned between granted rows) as
-    # the cursor: position filter only, ACL still applied — so the result is
-    # exactly the granted rows after it, not an empty page.
-    page3 = conversation_store.list_conversations(
-        accessible_by="alice@example.com", limit=10, after=convs[2].id
-    )
-    assert [c.id for c in page3.data] == [convs[4].id, convs[5].id]
+    # A non-granted conversation (c2, positioned between granted rows) as the
+    # cursor fails like a deleted one rather than positioning the page.
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_conversations(
+            accessible_by="alice@example.com", limit=10, after=convs[2].id
+        )
+
+
+@pytest.mark.parametrize("sort_by", ["updated_at", "created_at"])
+@pytest.mark.parametrize("direction", ["after", "before"])
+@pytest.mark.parametrize("scope", ["accessible_by", "owned_by"])
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
+def test_list_cursor_on_ungranted_session_reveals_nothing(
+    request: pytest.FixtureRequest, store_fixture: str, scope: str, direction: str, sort_by: str
+) -> None:
+    """A cursor naming another user's private session can't position a page.
+
+    Otherwise which of the caller's own sessions come back would reveal how the
+    private session's sort key compares with theirs.
+    """
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
+    perms = _acl_perms(store._engine.url.render_as_string(hide_password=False))
+    # A read grant is enough to page an accessible listing; owned listings need ownership.
+    caller_level = LEVEL_READ if scope == "accessible_by" else LEVEL_OWNER
+    probes = [store.create_conversation(title=title) for title in ("first probe", "second probe")]
+    for probe in probes:
+        perms.grant("alice@example.com", probe.id, caller_level)
+    secret = store.create_conversation(title="secret")
+    perms.grant("bob@example.com", secret.id, LEVEL_OWNER)
+
+    def _page(**cursor: str) -> list[str]:
+        return [
+            c.id
+            for c in store.list_conversations(
+                **{scope: "alice@example.com"},  # type: ignore[arg-type]
+                **cursor,  # type: ignore[arg-type]
+                sort_by=sort_by,
+                order="asc",
+            ).data
+        ]
+
+    with pytest.raises(StaleCursorError):
+        _page(**{direction: secret.id})
+    # The caller's own cursors still page.
+    first, second = _page()
+    if direction == "after":
+        assert _page(after=first) == [second]
+    else:
+        assert _page(before=second) == [first]
 
 
 def test_list_projects_single_db_uses_exists_pushdown(
@@ -9255,3 +9299,83 @@ def test_profiled_host_binding_rejects_stale_rollback_state(conversation_store, 
             expected_binding=previous,
         )
     assert conversation_store.get_profile_host_binding(conversation.id) == current
+
+
+def test_list_conversations_sort_by_id_pages_a_spawn_tree_in_id_order(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``sort_by="id"`` orders one spawn tree by id, the order of the
+    ``(workspace_id, root_conversation_id, id)`` index, so a capped read of
+    the tree examines at most the cap; cursors page through it."""
+    root = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id
+    )
+    grandchildren = [
+        conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=child.id)
+        for _ in range(3)
+    ]
+    other = conversation_store.create_conversation()
+    conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=other.id)
+    expected = sorted([child.id, *(g.id for g in grandchildren)])
+
+    first = conversation_store.list_conversations(
+        limit=2, kind="sub_agent", root_conversation_id=root.id, order="asc", sort_by="id"
+    )
+    rest = conversation_store.list_conversations(
+        limit=10,
+        after=first.last_id,
+        kind="sub_agent",
+        root_conversation_id=root.id,
+        order="asc",
+        sort_by="id",
+    )
+
+    assert [c.id for c in first.data] == expected[:2]
+    assert first.has_more is True
+    assert [c.id for c in rest.data] == expected[2:]
+    assert rest.has_more is False
+
+
+def test_spawn_tree_read_examines_rows_through_the_root_index(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``list_spawn_tree`` (no kind or archived filter, ``sort_by="id"``)
+    is served in index order with no sort step, so ``limit`` bounds the rows
+    examined even when the tree holds many archived sub-agents."""
+    from sqlalchemy import event
+
+    if conversation_store._conv_engine.dialect.name != "sqlite":
+        pytest.skip("SQLite EXPLAIN QUERY PLAN only; other dialects keep the behavioural coverage")
+    root = conversation_store.create_conversation()
+    for i in range(30):
+        child = conversation_store.create_conversation(
+            kind="sub_agent", parent_conversation_id=root.id
+        )
+        if i % 2:
+            conversation_store.update_conversation(child.id, archived=True)
+    engine = conversation_store._conv_engine
+    statements: list[tuple[str, Any]] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, params: Any, *_: Any) -> None:
+        if "root_conversation_id" in statement and "ORDER BY" in statement:
+            statements.append((statement, params))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        page = conversation_store.list_spawn_tree(root.id, limit=5)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert len(page.data) == 5 and page.has_more
+    # Every read the tree load issues (rows, then SQLite insertion-order
+    # tiebreakers) walks the root index with no sort step.
+    assert len(statements) == 2
+    with engine.connect() as conn:
+        for statement, params in statements:
+            plan = " ".join(
+                str(row[-1])
+                for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, params)
+            )
+            assert "ix_conversations_root_conversation_id" in plan, plan
+            assert "TEMP B-TREE" not in plan, plan
