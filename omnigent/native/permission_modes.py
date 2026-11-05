@@ -13,6 +13,22 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
     },
     "codex-native": {
         "default": [],
+        "ask-for-approval": [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+            "-c",
+            'approvals_reviewer="user"',
+        ],
+        "approve-for-me": [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+            "-c",
+            'approvals_reviewer="auto_review"',
+        ],
         "full-access": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
         "read-only": ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
         "bypass": [],

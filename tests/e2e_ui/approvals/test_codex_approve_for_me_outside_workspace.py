@@ -1,32 +1,23 @@
-"""E2E regression: Codex Auto mode still asks for user approval.
+"""E2E: Codex "Approve for me" settles an out-of-workspace command itself.
 
-A codex-native session created with the default permission stance runs
-Codex's **Auto** approval preset (``workspace-write`` sandbox +
-``on-request`` approval — the ``/permissions`` popup's "Auto" entry, the
-New Chat dialog's "Default"). The reported bug: the session still parks
-turns on a human approval prompt, which the reporter pinned to "working on
-a folder that is outside of the working dir that codex started in" — an
-out-of-workspace write makes Codex escalate the command
-(``sandbox_permissions: "require_escalated"``), which raises
-``item/commandExecution/requestApproval``; the forwarder publishes it as a
-web elicitation and the SPA parks the turn on an ApprovalCard.
+A codex-native session created in the "Approve for me" permission mode runs
+Codex's automatic approval reviewer (``approvals_reviewer="auto_review"``).
+An out-of-workspace write makes Codex escalate the command
+(``sandbox_permissions: "require_escalated"``); in this mode the reviewer,
+not the user, decides it, so the turn must complete without the SPA parking
+on an ApprovalCard.
 
 Journey (all user-observable):
 
-1. create a codex-native session (default = Auto permission mode) whose
-   workspace is folder A;
+1. create a codex-native session in "Approve for me" whose workspace is
+   folder A;
 2. ask Codex to create a file in folder B, outside A;
-3. the turn stops on an approval card instead of completing — despite the
-   "auto" permission mode.
+3. the turn completes and the file exists, with no approval card.
 
 With ``LLM_API_KEY`` set (CI / local dev) the real gateway model drives the
-journey — asked to create a file outside the workspace, it escalates the
-command itself, which is exactly the reported trigger. Without the key, the
-in-process mock LLM serves a scripted turn with the same escalated
-``exec_command``, so the journey stays deterministic. Either way the
-assertion encodes the DESIRED behavior — the turn completes with no
-approval card — so this test FAILS while the bug is live and passes once
-auto mode stops parking on approval.
+journey; it escalates the command itself. Without the key, the in-process
+mock LLM serves a scripted turn with the same escalated ``exec_command`` and
+answers the reviewer, so the journey stays deterministic.
 """
 
 from __future__ import annotations
@@ -42,6 +33,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from tests.e2e_ui.conftest import (
     _create_native_codex_session,
     _ensure_runner_online,
@@ -69,7 +61,7 @@ _TURN_OUTCOME_TIMEOUT_MS = 240_000
 
 
 @pytest.fixture
-def codex_auto_mode_mock_session(
+def codex_approve_for_me_mock_session(
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
@@ -86,7 +78,11 @@ def codex_auto_mode_mock_session(
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(mock_llm_server_url, "codex"):
-        session_id = _create_native_codex_session(live_server, runner_id)
+        session_id = _create_native_codex_session(
+            live_server,
+            runner_id,
+            terminal_launch_args=PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+        )
         try:
             yield (live_server, session_id)
         finally:
@@ -101,14 +97,14 @@ def codex_auto_mode_mock_session(
 
 
 @pytest.mark.timeout(600)
-def test_codex_auto_mode_outside_workspace_completes_without_approval(
+def test_codex_approve_for_me_outside_workspace_completes_without_approval(
     page: Page,
-    codex_auto_mode_mock_session: tuple[str, str],
+    codex_approve_for_me_mock_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """An Auto-mode codex turn touching a folder outside the workspace
+    """An "Approve for me" codex turn touching a folder outside the workspace
     must complete without parking on a human approval card."""
-    base_url, session_id = codex_auto_mode_mock_session
+    base_url, session_id = codex_approve_for_me_mock_session
 
     nonce = uuid.uuid4().hex[:8]
     user_marker = f"autoesc-{nonce}"
@@ -179,11 +175,10 @@ def test_codex_auto_mode_outside_workspace_completes_without_approval(
     # token bubble rendered) or it parked on the approval card.
     expect(approval_card.or_(reply).first).to_be_visible(timeout=_TURN_OUTCOME_TIMEOUT_MS)
 
-    # THE BUG: despite the Auto permission mode, the escalated
-    # out-of-workspace command parks the turn on a human approval card.
+    # The automatic reviewer, not the user, must settle the escalation.
     expect(
         approval_card,
-        "Codex Auto permission mode still asked for user approval: an "
+        'Codex "Approve for me" still asked for user approval: an '
         "out-of-workspace command raised an approval card instead of running.",
     ).to_have_count(0)
 

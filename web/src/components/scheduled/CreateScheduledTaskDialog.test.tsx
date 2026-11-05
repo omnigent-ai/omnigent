@@ -3867,7 +3867,7 @@ describe("automation harness settings", () => {
     await choose("model", "Model B");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Default");
     await choose("effort", "Low");
-    await choose("permission", "Read only");
+    await choose("permission", "Read Only");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0]).toMatchObject({
@@ -3900,7 +3900,7 @@ describe("automation harness settings", () => {
     );
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("saved-model");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("high");
-    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Read only");
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Read Only");
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", "codex-native", false);
     await choose("model", "Default");
     await choose("permission", "Default");

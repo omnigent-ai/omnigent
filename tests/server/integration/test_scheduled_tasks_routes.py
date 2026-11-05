@@ -741,7 +741,14 @@ async def test_create_rejects_invalid_reasoning_effort(
     [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
     + [
         (CODEX_NATIVE_AGENT_NAME, mode)
-        for mode in ("default", "full-access", "read-only", "bypass")
+        for mode in (
+            "default",
+            "ask-for-approval",
+            "approve-for-me",
+            "full-access",
+            "read-only",
+            "bypass",
+        )
     ],
 )
 async def test_create_persists_permission_mode(
