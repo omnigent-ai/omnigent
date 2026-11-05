@@ -441,14 +441,14 @@ describe("loading / not-found states", () => {
 });
 
 describe("header actions", () => {
-  it("Run now shows 'Run started' toast on success", () => {
+  it("Run now confirms the run was triggered and will start shortly on success", () => {
     runNowMutate.mockImplementation(
       (_id: string, opts?: { onSuccess?: () => void; onError?: () => void }) => opts?.onSuccess?.(),
     );
     setTask(task());
     renderPage();
     fireEvent.click(screen.getByTestId("task-detail-run-now"));
-    expect(showToast).toHaveBeenCalledWith("Run started");
+    expect(showToast).toHaveBeenCalledWith("Run triggered, it will start shortly");
   });
 
   it("Run now shows error toast on a generic (non-409) failure", () => {
@@ -570,6 +570,58 @@ describe("header actions", () => {
       vi.useRealTimers();
     }
   });
+
+  it.each([
+    { conversationId: null, delay: 0 },
+    { conversationId: "c_new", delay: 30_000 },
+  ])(
+    "briefly highlights a new run with $conversationId after $delay ms",
+    ({ conversationId, delay }) => {
+      vi.useFakeTimers();
+      try {
+        const oldRun = run({ id: "run_old", conversationId: null });
+        setTask(task());
+        setRuns([oldRun]);
+        runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
+          opts?.onSuccess?.(),
+        );
+        const { rerender, container } = renderPage();
+        const highlighted = () =>
+          container.querySelectorAll<HTMLElement>(".animate-message-highlight");
+        expect(highlighted()).toHaveLength(0);
+        fireEvent.click(screen.getByTestId("task-detail-run-now"));
+        act(() => vi.advanceTimersByTime(delay));
+        expect(highlighted()).toHaveLength(0);
+
+        const newRun = run({ id: "run_new", status: "running", conversationId });
+        setRuns([newRun, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(1);
+        expect(screen.getAllByTestId("task-detail-run")[0]).toContainElement(highlighted()[0]);
+        expect(highlighted()[0]).toHaveStyle({ animationDuration: "3000ms" });
+
+        act(() => vi.advanceTimersByTime(1_500));
+        setRuns([{ ...newRun, status: "succeeded" }, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(1);
+        act(() => vi.advanceTimersByTime(1_500));
+        expect(highlighted()).toHaveLength(0);
+        setRuns([{ ...newRun, status: "succeeded" }, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(0);
+
+        // Opening a different task must not carry over the pending highlight.
+        fireEvent.click(screen.getByTestId("task-detail-run-now"));
+        routeParams = { taskId: "st_2" };
+        setTask(task({ id: "st_2" }));
+        setRuns([run({ id: "other_task_run" })]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("toggling the Switch off pauses an active task (update to paused)", () => {
     setTask(task({ state: "active" }));

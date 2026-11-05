@@ -66,6 +66,8 @@ import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
 import { cn } from "@/lib/utils";
 
+const RUN_HIGHLIGHT_DURATION_MS = 3_000;
+
 export function TaskDetailPage() {
   const { taskId = "" } = useParams<{ taskId: string }>();
   // Remount per task: the run-tracking state below belongs to one task's
@@ -86,6 +88,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const [awaitingRunRow, setAwaitingRunRow] = useState(false);
   const preFireNewestIdRef = useRef<string | null>(null);
   const awaitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRunHighlightRef = useRef(false);
+  const [highlightedRunId, setHighlightedRunId] = useState<string | null>(null);
 
   const { data: task, isLoading, isError, error, refetch } = useScheduledTask(taskId);
   // Run history only fetches once we have a real id.
@@ -114,12 +118,22 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
   // Clear the flag when a new run row appears (newestId changed from snapshot).
   useEffect(() => {
-    if (!awaitingRunRow) return;
+    if (!awaitingRunRow && !pendingRunHighlightRef.current) return;
     const newestId = runs?.[0]?.id ?? null;
     if (newestId != null && newestId !== preFireNewestIdRef.current) {
+      if (pendingRunHighlightRef.current) {
+        pendingRunHighlightRef.current = false;
+        setHighlightedRunId(newestId);
+      }
       clearAwaitingRunRow();
     }
   }, [runs, awaitingRunRow]);
+
+  useEffect(() => {
+    if (highlightedRunId == null) return;
+    const timer = setTimeout(() => setHighlightedRunId(null), RUN_HIGHLIGHT_DURATION_MS);
+    return () => clearTimeout(timer);
+  }, [highlightedRunId]);
 
   // Unmount cleanup for the local safety timer so it can't fire into an
   // unmounted page. The run-history refresh needs no cleanup here: it's a
@@ -282,7 +296,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
     preFireNewestIdRef.current = runs?.[0]?.id ?? null;
     runNowMutation.mutate(task!.id, {
       onSuccess: () => {
-        showToast("Run started");
+        showToast("Run triggered, it will start shortly");
+        // Keep tracking the new row even after the button's loading timeout.
+        pendingRunHighlightRef.current = true;
         // Keep the button in loading state until the new run row appears, and —
         // because the row is written a few seconds AFTER this 202 — keep the run
         // history polling across that gap so the row is picked up at all.
@@ -525,7 +541,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
       ) : (
         <ul className="flex flex-col gap-1" data-testid="task-detail-runs">
           {(runs ?? []).map((run) => (
-            <RunRow key={run.id} run={run} now={now} />
+            <RunRow key={run.id} run={run} now={now} highlighted={run.id === highlightedRunId} />
           ))}
         </ul>
       )}
@@ -602,9 +618,17 @@ function useRunUnread(run: ScheduledTaskRun): boolean {
  * (a real `<Link>`: keyboard-focusable, Enter/Space activate natively) that
  * navigates to `/c/:conversationId`, with a hover highlight + pointer cursor.
  * Runs without a conversation (e.g. skipped) render as a plain, non-interactive
- * row: no highlight, no pointer, not focusable.
+ * row: no hover highlight, no pointer, not focusable.
  */
-function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
+function RunRow({
+  run,
+  now,
+  highlighted,
+}: {
+  run: ScheduledTaskRun;
+  now: Date;
+  highlighted: boolean;
+}) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.
@@ -668,7 +692,9 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
           className={cn(
             commonClassName,
             "cursor-pointer transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none",
+            highlighted && "animate-message-highlight",
           )}
+          style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
         >
           {body}
         </Link>
@@ -682,7 +708,8 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
       data-testid="task-detail-run"
       data-run-status={run.status}
       data-run-unread={run.status === "succeeded" ? unread : undefined}
-      className={commonClassName}
+      className={cn(commonClassName, highlighted && "animate-message-highlight")}
+      style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
     >
       {body}
     </li>
