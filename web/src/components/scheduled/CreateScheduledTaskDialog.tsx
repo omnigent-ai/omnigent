@@ -53,6 +53,7 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
@@ -156,6 +157,7 @@ export function CreateScheduledTaskDialog({
   const [pickedPermission, setPickedPermission] = useState<string>("");
 
   const curation = pickerCuration(info);
+  const curationPending = info === "loading" || isBootFallbackInfo(info);
   const agentList = useMemo(
     () => selectableSessionAgents(agents ?? [], curation.restrictToAgentNames),
     [agents, curation.restrictToAgentNames],
@@ -377,7 +379,7 @@ export function CreateScheduledTaskDialog({
     if (open) targetChosenRef.current = false;
   }, [open]);
   const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
-  const targetInputsLoaded = info !== "loading" && !hostsPending;
+  const targetInputsLoaded = !curationPending && !hostsPending;
   useEffect(() => {
     if (!open || isEdit || !targetInputsLoaded || targetChosenRef.current) return;
     if (managedSandboxesEnabled) {
@@ -527,6 +529,7 @@ export function CreateScheduledTaskDialog({
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
   const canSubmit =
+    !curationPending &&
     name.trim() !== "" &&
     effectivePrompt.trim() !== "" &&
     (trigger !== null || prompt.trim() !== "") &&
@@ -565,7 +568,7 @@ export function CreateScheduledTaskDialog({
   }
 
   async function handleSubmit() {
-    if (harnessSettings.blockedReason) return;
+    if (curationPending || harnessSettings.blockedReason) return;
     if (!editingTask && effectiveAgentId === null) return;
     setError(null);
     setSubmitting(true);
@@ -1092,6 +1095,7 @@ export function CreateScheduledTaskDialog({
                 effectiveAgentId={effectiveAgentId}
                 agentLabel={agentLabel}
                 hasAgents={selectedAgent !== undefined || agentList.length > 0}
+                loading={curationPending}
                 curatedEntries={curation.restrictToAgentNames.size > 0 ? agentList : undefined}
                 // Sandboxes provision their own harnesses; host badges only apply to hosts.
                 host={sandboxMode ? undefined : badgeHost}
