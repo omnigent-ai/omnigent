@@ -95,6 +95,22 @@ def test_fork_drops_import_provenance_labels(
     assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_the_automation_run_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork serves no automation run, so what its agent records is not the run's."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id, {SCHEDULED_TASK_RUN_LABEL_KEY: "0123456789abcdef0123456789abcdef"}
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert SCHEDULED_TASK_RUN_LABEL_KEY not in fork.labels
+
+
 def test_fork_drops_sandbox_repo_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

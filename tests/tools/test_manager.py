@@ -82,13 +82,12 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_policy_registry",
         # Scheduled-task management tools are always auto-registered
         # so agents can create, list, update, and delete recurring
-        # runs, and record a fired run's outcome, without spec opt-in.
-        # They are runner-dispatched via the Omnigent server's REST API.
+        # runs without spec opt-in. They are runner-dispatched via
+        # the Omnigent server's REST API.
         "sys_scheduled_task_create",
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
-        "sys_scheduled_task_record_outcome",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -1707,7 +1706,6 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
             "sys_scheduled_task_list",
             "sys_scheduled_task_update",
             "sys_scheduled_task_delete",
-            "sys_scheduled_task_record_outcome",
         }
     ),
     "comments": frozenset({"list_comments", "update_comment"}),
@@ -1745,13 +1743,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
 
 def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
-    With every group off, the 17 gated tools are gone but the session
+    With every group off, the 16 gated tools are gone but the session
     reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
     participation and async handles depend on them, so they have no key.
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 17
+    assert len(gated) == 16
     assert not (gated & names)
     assert {
         "sys_session_list",

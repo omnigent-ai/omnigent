@@ -6,9 +6,7 @@ Covers the runner-side half:
   the correct ``/v1/scheduled-tasks`` REST verb + payload over ``server_client``,
   pass the JSON body through verbatim, and translate a server 4xx/5xx and a
   missing id into clean error JSON.
-- ``sys_scheduled_task_record_outcome``: records on the caller's own session
-  and turns an older or non-automation server answer into a clear error.
-- Registration: the five ``sys_scheduled_task_*`` names are always registered by
+- Registration: the four ``sys_scheduled_task_*`` names are always registered by
   ``ToolManager`` (no spec opt-in) and are members of the local-dispatch and
   native-relay tool sets.
 """
@@ -35,7 +33,6 @@ _ALL_NAMES = {
     "sys_scheduled_task_list",
     "sys_scheduled_task_update",
     "sys_scheduled_task_delete",
-    "sys_scheduled_task_record_outcome",
 }
 _TASK_ID = "0123456789abcdef0123456789abcdef"
 _REVIEW_FIELDS = {"prompt": "Review every issue.", "permission_mode": None}
@@ -99,18 +96,6 @@ class _RecordingClient:
 
     async def delete(self, url: str, *, timeout: object = None) -> _Resp:
         self.calls.append(("DELETE", url, None))
-        return self._response
-
-    async def put(
-        self,
-        url: str,
-        *,
-        json: dict | None = None,
-        headers: dict[str, str] | None = None,
-        timeout: object = None,
-    ) -> _Resp:
-        self.calls.append(("PUT", url, json))
-        self.headers.append(headers)
         return self._response
 
 
@@ -540,7 +525,7 @@ async def test_no_server_client_errors() -> None:
 
 
 def test_tools_registered_without_spec_optin() -> None:
-    """All five tools register on a minimal spec (always-on, like policy)."""
+    """All four tools register on a minimal spec (always-on, like policy)."""
     from omnigent.spec.types import AgentSpec
     from omnigent.tools.manager import ToolManager
 
@@ -607,83 +592,3 @@ async def test_update_forwards_session_fields() -> None:
     )
     _, _, body = client.calls[-1]
     assert body == {**_REVIEW_FIELDS, "session_mode": "continue", "session_id": None}
-
-
-_OUTCOME_ARGS = {"success": True, "emoji": "🚀", "text": "Opened 2 PRs"}
-_SESSION_ID = "fedcba9876543210fedcba9876543210"
-
-
-@pytest.mark.asyncio
-async def test_record_outcome_puts_for_the_calling_session() -> None:
-    """The session is always the caller's: a session id in the arguments is not forwarded."""
-    outcome = {"success": True, "emoji": "🚀", "text": "Opened 2 PRs", "recorded_at": 5}
-    client = _RecordingClient(_Resp(body={"id": "run_1", "outcome": outcome}))
-    out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_record_outcome",
-        json.dumps({**_OUTCOME_ARGS, "session_id": "0" * 32}),
-        server_client=client,  # type: ignore[arg-type]
-        conversation_id=_SESSION_ID,
-    )
-    assert json.loads(out) == {"recorded": True, "run_id": "run_1", "outcome": outcome}
-    assert client.calls == [
-        (
-            "PUT",
-            "/v1/scheduled-tasks/run-outcome",
-            {"session_id": _SESSION_ID, **_OUTCOME_ARGS},
-        )
-    ]
-    assert client.headers == [{ORCHESTRATION_SOURCE_HEADER: _SESSION_ID}]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("status", "message"),
-    [
-        (404, "not started by a scheduled task"),
-        (405, "does not record run outcomes"),
-        (409, "still starting"),
-        (422, "server returned 422"),
-    ],
-)
-async def test_record_outcome_server_errors_are_explained(status: int, message: str) -> None:
-    client = _RecordingClient(_Resp(status_code=status, body={"detail": "x"}))
-    out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_record_outcome",
-        json.dumps(_OUTCOME_ARGS),
-        server_client=client,  # type: ignore[arg-type]
-        conversation_id=_SESSION_ID,
-    )
-    assert message in json.dumps(json.loads(out))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("args", "conversation_id", "message"),
-    [
-        (_OUTCOME_ARGS, None, "needs the calling session"),
-        ({**_OUTCOME_ARGS, "success": "yes"}, _SESSION_ID, "success must be true or false"),
-        ({**_OUTCOME_ARGS, "text": 3}, _SESSION_ID, "must be strings"),
-    ],
-)
-async def test_record_outcome_bad_calls_never_reach_the_server(
-    args: dict[str, object], conversation_id: str | None, message: str
-) -> None:
-    client = _RecordingClient()
-    out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_record_outcome",
-        json.dumps(args),
-        server_client=client,  # type: ignore[arg-type]
-        conversation_id=conversation_id,
-    )
-    assert message in json.loads(out)["error"]
-    assert client.calls == []
-
-
-def test_record_outcome_schema_requires_every_field() -> None:
-    from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskRecordOutcomeTool
-
-    schema = SysScheduledTaskRecordOutcomeTool().get_schema()["function"]["parameters"]
-    assert set(schema["required"]) == {"success", "emoji", "text"}
-    jsonschema.validate(_OUTCOME_ARGS, schema)
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({**_OUTCOME_ARGS, "text": "x" * 81}, schema)

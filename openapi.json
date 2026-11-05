@@ -5388,6 +5388,57 @@
         "title": "ReasoningTextDeltaEvent",
         "type": "object"
       },
+      "RecordObjectiveRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/sessions/{session_id}/objectives`.",
+        "properties": {
+          "objective": {
+            "title": "Objective",
+            "type": "string"
+          }
+        },
+        "required": [
+          "objective"
+        ],
+        "title": "RecordObjectiveRequest",
+        "type": "object"
+      },
+      "RecordOutcomeRequest": {
+        "additionalProperties": false,
+        "description": "Body for `PUT /v1/sessions/{session_id}/objectives/outcome`.\n\n`objective_id` names the objective to resolve; without it the latest one\nis resolved (the latest of the automation run the session serves, if any).",
+        "properties": {
+          "emoji": {
+            "title": "Emoji",
+            "type": "string"
+          },
+          "objective_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Objective Id"
+          },
+          "success": {
+            "title": "Success",
+            "type": "boolean"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "success",
+          "emoji",
+          "text"
+        ],
+        "title": "RecordOutcomeRequest",
+        "type": "object"
+      },
       "ResetSessionModelOverrideRequest": {
         "additionalProperties": false,
         "description": "Reset a launch-time model selection only while that selection is current.",
@@ -16015,6 +16066,187 @@
         "summary": "Reset Session Model Override",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/objectives": {
+      "get": {
+        "description": "List the session's objectives, oldest first; requires read access.",
+        "operationId": "list_session_objectives_v1_sessions__session_id__objectives_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Session Objectives V1 Sessions  Session Id  Objectives Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Objectives",
+        "tags": [
+          "session_objectives"
+        ]
+      },
+      "post": {
+        "description": "Record an objective; it becomes the session's latest. Requires edit access.",
+        "operationId": "record_session_objective_v1_sessions__session_id__objectives_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordObjectiveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Record Session Objective V1 Sessions  Session Id  Objectives Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Session Objective",
+        "tags": [
+          "session_objectives"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/objectives/outcome": {
+      "put": {
+        "description": "Record how an objective went, replacing an earlier outcome for it.\n\nRequires edit access. 404 when `objective_id` names no objective of\nthe session.",
+        "operationId": "record_session_objective_outcome_v1_sessions__session_id__objectives_outcome_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordOutcomeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Record Session Objective Outcome V1 Sessions  Session Id  Objectives Outcome Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Session Objective Outcome",
+        "tags": [
+          "session_objectives"
         ]
       }
     },

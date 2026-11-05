@@ -30,10 +30,11 @@ from omnigent.tools.builtins import (
     SysCancelAsyncTool,
     SysListModelsTool,
     SysReadInboxTool,
+    SysRecordObjectiveTool,
+    SysRecordOutcomeTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
-    SysScheduledTaskRecordOutcomeTool,
     SysScheduledTaskUpdateTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
@@ -191,6 +192,7 @@ class ToolManager:
         self._register_comment_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
+        self._register_objective_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -215,10 +217,10 @@ class ToolManager:
         Auto-register the scheduled-task management builtins.
 
         Registered without spec opt-in so an agent can create, list,
-        update, and delete recurring scheduled tasks at runtime, and record
-        a fired run's outcome; ``tool_groups.scheduled_tasks: false`` drops
-        all five. The runner dispatches them via the Omnigent server's
-        ``/v1/scheduled-tasks`` REST endpoints.
+        update, and delete recurring scheduled tasks at runtime;
+        ``tool_groups.scheduled_tasks: false`` drops all four. The runner
+        dispatches them via the Omnigent server's ``/v1/scheduled-tasks``
+        REST endpoints.
         """
         if not self._spec.tool_groups.scheduled_tasks:
             return
@@ -227,8 +229,22 @@ class ToolManager:
             SysScheduledTaskListTool(),
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
-            SysScheduledTaskRecordOutcomeTool(),
         ):
+            self._tools[tool.name()] = tool
+
+    def _register_objective_tools(self) -> None:
+        """
+        Register ``sys_record_objective`` and ``sys_record_outcome`` when enabled.
+
+        Only ``tool_groups.objectives: true`` registers them. A spec that
+        leaves the group unset (``None``) gets them from the runner, which
+        turns the group on in sessions an automation serves. The runner
+        dispatches both via the server's ``/v1/sessions/{id}/objectives``
+        endpoints.
+        """
+        if self._spec.tool_groups.objectives is not True:
+            return
+        for tool in (SysRecordObjectiveTool(), SysRecordOutcomeTool()):
             self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:

@@ -454,57 +454,42 @@ async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
     assert store.get(claimed.task.id).session_id == _CONV_ID
 
 
-async def test_an_outcome_recorded_during_continued_dispatch_lands_on_the_claimed_run(
-    store,
-) -> None:
-    """While the prompt is being delivered, recording waits for this firing's run.
+async def test_a_continued_fire_names_its_run_on_the_session_before_sending(store) -> None:
+    """What the agent records about this firing goes to its run, on any replica.
 
-    Before the fire records it, the session's newest delivered run is the earlier
-    firing's, which must not take this turn's outcome.
+    The session names the claimed run before the prompt goes in. That label is
+    stored with the session, so a report that arrives after a restart, or on a
+    replica that never saw the fire, still lands on this run rather than on the
+    earlier run, which the session's run row does not name until delivery.
     """
-    from omnigent.server.scheduled.run_outcome import (
-        PROMPTS_IN_FLIGHT,
-        record_outcome_once_delivered,
-    )
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 
     claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
-    earlier_id = uuid.uuid4().hex
-    store.create_run(
-        run_id=earlier_id,
-        scheduled_task_id=claimed.task.id,
-        status="succeeded",
-        scheduled_at=1,
-        conversation_id=_CONV_ID,
-        fired_at=1,
-        finished_at=2,
-    )
     conversations = _ExistingConversationStore(
-        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
+        _FakeConversation(
+            id=_CONV_ID,
+            agent_id=_AGENT_ID,
+            host_id=_HOST_ID,
+            workspace="/repo",
+            labels={SCHEDULED_TASK_RUN_LABEL_KEY: "e" * 32},
+        )
     )
-    recording: list[asyncio.Task[ScheduledTaskRun | None]] = []
+    at_dispatch: list[tuple[str | None, str | None]] = []
 
     async def dispatch(conv: Any, task: ScheduledTask) -> None:
-        assert PROMPTS_IN_FLIGHT.in_flight(_CONV_ID)
-        recording.append(
-            asyncio.create_task(
-                record_outcome_once_delivered(
-                    store, _CONV_ID, success=True, emoji="✅", text="Done", recorded_at=5
-                )
+        at_dispatch.append(
+            (
+                conversations.label_writes.get(_CONV_ID, {}).get(SCHEDULED_TASK_RUN_LABEL_KEY),
+                conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY),
             )
         )
-        await asyncio.sleep(0.2)
-        assert not recording[0].done()
 
     executor = ClaimedRunExecutor(
         _deps(store, conversation_store=conversations), launch_dispatch=dispatch
     )
     await executor.fire(claimed.task, claimed.lease)
-    recorded = await recording[0]
 
-    assert not PROMPTS_IN_FLIGHT.in_flight(_CONV_ID)
-    assert recorded is not None and recorded.id == claimed.lease.run.id
-    outcomes = {run.id: run.outcome_success for run in _runs(store, claimed.task)}
-    assert outcomes == {claimed.lease.run.id: True, earlier_id: None}
+    assert at_dispatch == [(claimed.lease.run.id, claimed.lease.run.id)]
 
 
 async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> None:

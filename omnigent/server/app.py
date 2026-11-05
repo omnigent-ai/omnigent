@@ -166,6 +166,7 @@ from omnigent.server.server_config import (
     RESTRICT_TO_AGENT_NAMES_KEY,
     PickerCuration,
 )
+from omnigent.server.session_objectives import create_session_objectives_router
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -3927,6 +3928,15 @@ def create_app(
         ),
         prefix="/v1",
         tags=["session_mcp_servers"],
+    )
+    app.include_router(
+        create_session_objectives_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["session_objectives"],
     )
     if comment_store is not None:
         app.include_router(

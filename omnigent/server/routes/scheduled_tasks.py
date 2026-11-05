@@ -23,11 +23,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
-from omnigent.entities.scheduled_task import normalize_run_outcome
+from omnigent.entities.session_objective import SessionObjective
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -55,20 +55,20 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_support,
 )
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
-from omnigent.server.scheduled.run_outcome import (
-    RunStillStartingError,
-    record_outcome_once_delivered,
-)
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
+from omnigent.server.session_objectives import objective_to_response
+from omnigent.server.session_objectives import open_store as open_objective_store
 from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import AutomationFailure, ScheduledTaskStore
-from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
+
+# How many of a run's newest objectives its history entry shows.
+RUN_OBJECTIVES_SHOWN = 5
 
 # Execution targets a task may run on. ``connected_host`` pins/resolves the
 # owner's own machine; ``managed_sandbox`` provisions a FRESH server-managed
@@ -132,27 +132,6 @@ class CreateScheduledTaskRequest(BaseModel):
         _validate_worktree_target(
             self.base_branch, self.execution_target, self.host_id, self.workspace
         )
-        return self
-
-
-class RecordRunOutcomeRequest(BaseModel):
-    """Body for ``PUT /v1/scheduled-tasks/run-outcome``.
-
-    Records the outcome on the latest run of ``session_id``: whether the run
-    reached its goal, and a Slack-status-style emoji and a few words.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: str = Field(min_length=1)
-    success: StrictBool
-    emoji: str
-    text: str
-
-    @model_validator(mode="after")
-    def _check_status_fields(self) -> RecordRunOutcomeRequest:
-        """Trim and bound ``emoji`` and ``text``; ``emoji`` must be exactly one emoji."""
-        self.emoji, self.text = normalize_run_outcome(self.emoji, self.text)
         return self
 
 
@@ -278,6 +257,7 @@ def _run_to_response(
     viewer_last_seen: int | None = None,
     viewer_unread: bool | None = None,
     session_cost_usd: float | None = None,
+    objectives: tuple[list[SessionObjective], bool] | None = None,
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
 
@@ -300,7 +280,10 @@ def _run_to_response(
         so the frontend never needs a separate session fetch.
     :param session_cost_usd: Current cumulative session cost, or ``None`` when
         unreported. Runs continuing the same session share this total.
+    :param objectives: The newest objectives the agent recorded during the run,
+        in order, and whether it recorded more; ``None`` when it recorded none.
     """
+    shown, more = objectives or ([], False)
     return {
         "id": run.id,
         "scheduled_task_id": run.scheduled_task_id,
@@ -310,24 +293,13 @@ def _run_to_response(
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
-        "outcome": _outcome_to_response(run),
         "conversation_updated_at": conversation_updated_at,
         "conversation_status": conversation_status,
         "viewer_last_seen": viewer_last_seen,
         "viewer_unread": viewer_unread,
         "session_cost_usd": session_cost_usd,
-    }
-
-
-def _outcome_to_response(run: ScheduledTaskRun) -> dict[str, Any] | None:
-    """The outcome the agent recorded for *run*, or ``None`` when it recorded none."""
-    if run.outcome_success is None:
-        return None
-    return {
-        "success": run.outcome_success,
-        "emoji": run.outcome_emoji,
-        "text": run.outcome_text,
-        "recorded_at": run.outcome_recorded_at,
+        "objectives": [objective_to_response(objective) for objective in shown],
+        "more_objectives": more,
     }
 
 
@@ -837,7 +809,10 @@ def create_scheduled_tasks_router(
         Cursor-paginated so history is never silently truncated: pass ``limit``
         (1-1000, default 100) and ``after`` (a prior page's ``next_cursor``).
         The response is ``{"runs": [...], "next_cursor": <id or null>}``; a
-        ``null`` cursor marks the last page.
+        ``null`` cursor marks the last page. Each run lists the newest
+        objectives its agent recorded during the run (``objectives``, at most
+        :data:`RUN_OBJECTIVES_SHOWN`), with ``more_objectives`` set when there
+        are more; the session's full list is ``GET /v1/sessions/{id}/objectives``.
 
         Lazy-on-read backstop: before listing, force-fail any of this task's
         runs still ``running`` past the 6h max age (``incomplete``). Completion
@@ -861,6 +836,16 @@ def create_scheduled_tasks_router(
         # Runs without a conversation_id (skipped/failed) contribute null fields.
         conv_ids = [r.conversation_id for r in runs if r.conversation_id is not None]
         sessions = conversation_store.get_session_activity(conv_ids) if conv_ids else {}
+        objective_store = open_objective_store(conversation_store)
+        # Only a run that reached a session can have objectives.
+        run_objectives = (
+            objective_store.list_run_objectives(
+                [r.id for r in runs if r.conversation_id is not None],
+                limit_per_run=RUN_OBJECTIVES_SHOWN,
+            )
+            if objective_store is not None and conv_ids
+            else {}
+        )
         run_rows = []
         for r in runs:
             session = sessions.get(r.conversation_id) if r.conversation_id is not None else None
@@ -877,10 +862,11 @@ def create_scheduled_tasks_router(
                         viewer_last_seen=last_seen,
                         viewer_unread=explicit_unread,
                         session_cost_usd=session.total_cost_usd,
+                        objectives=run_objectives.get(r.id),
                     )
                 )
             else:
-                run_rows.append(_run_to_response(r))
+                run_rows.append(_run_to_response(r, objectives=run_objectives.get(r.id)))
         return {
             "runs": run_rows,
             "next_cursor": next_cursor,
@@ -940,67 +926,6 @@ def create_scheduled_tasks_router(
                 code=ErrorCode.CONFLICT,
             )
         return {"triggered": True, "id": task.id}
-
-    def _outcome_session(owner: str, session_id: str) -> Conversation:
-        """The session recording an outcome; 404 unless the caller owns it."""
-        if auth_provider is None or owner == RESERVED_USER_LOCAL:
-            session = conversation_store.get_conversation(normalize_uuid(session_id) or "")
-            if session is None:
-                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
-            return session
-        if permission_store is None:
-            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
-        try:
-            return require_owned_session(session_id, owner, conversation_store, permission_store)
-        except OmnigentError as exc:
-            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND) from exc
-
-    @router.put("/scheduled-tasks/run-outcome")
-    async def record_scheduled_task_run_outcome(
-        request: Request,
-        body: RecordRunOutcomeRequest,
-    ) -> dict[str, Any]:
-        """Record an owned session's latest delivered-run outcome.
-
-        A runner-marked call must come from the session's bound runner. Waits for
-        a fire still recording the session's run; 409 if it does not finish in
-        time. Returns 404 when the session has no eligible run.
-        """
-        owner = _owner(request)
-        source_id = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
-        if source_id is not None and source_id.strip() != body.session_id:
-            raise OmnigentError(
-                "A session can record only its own run's outcome",
-                code=ErrorCode.FORBIDDEN,
-            )
-        require_scheduled_task_agent_origin(
-            request,
-            owner=owner,
-            auth_provider=auth_provider,
-            conversation_store=conversation_store,
-            permission_store=permission_store,
-        )
-        session = await asyncio.to_thread(_outcome_session, owner, body.session_id)
-        try:
-            run = await record_outcome_once_delivered(
-                store,
-                session.id,
-                success=body.success,
-                emoji=body.emoji,
-                text=body.text,
-                recorded_at=int(datetime.now(UTC).timestamp()),
-            )
-        except RunStillStartingError as exc:
-            raise OmnigentError(
-                "The automation run that sent this prompt is still starting; retry shortly",
-                code=ErrorCode.CONFLICT,
-            ) from exc
-        if run is None:
-            raise OmnigentError(
-                "This session was not started by a scheduled task",
-                code=ErrorCode.NOT_FOUND,
-            )
-        return _run_to_response(run)
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(

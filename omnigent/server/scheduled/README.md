@@ -338,41 +338,25 @@ stateDiagram-v2
   still `running` after 6 hours is failed as `incomplete` when the task's runs are
   read.
 
-### Run outcome
+### Objectives a run records
 
-A run's status says whether the run finished, not whether it reached the goal
-in its prompt. The agent records that separately with the
-`sys_scheduled_task_record_outcome` tool, which calls
-`PUT /v1/scheduled-tasks/run-outcome`. The note added to every fired prompt asks
-the agent to call it once, before its final reply.
+The agent reports whether it reached a run's goal with the objective tools
+(see `docs/session-objectives.md`). Attribution to the run is durable and
+independent of the fire's progress:
 
-- The outcome is a boolean `success`, exactly one emoji, and a few words (at
-  most 80 characters), e.g. `🚀 Opened 2 PRs`. The run list returns it as `outcome`,
-  or `null` when the agent recorded none.
-- It goes on the calling session's newest delivered run: `running` or
-  `succeeded`, newest by `scheduled_at`. A new-session task has one such run;
-  a continued session has one per delivered firing. A firing still starting,
-  or failed or skipped before delivery, never takes the outcome, and neither
-  does a run that failed after delivery. A later call replaces the earlier
-  outcome.
-- A fire sends the prompt before it records its run, so the agent can call the
-  tool first. The fire marks the session in flight for that span
-  (`run_outcome.PROMPTS_IN_FLIGHT`), and recording waits up to 10 seconds for
-  it, then answers 409. The mark is per process; a fire on another replica
-  leaves the gap of one run-row write.
-- The runner always sends its own session, so an agent cannot record on
-  another session's run. Like task changes from an agent, the server checks
-  that the session's bound runner sent the call. The owner can also set it
-  through the API.
-- Recording never changes `status`. A `succeeded` run can have
-  `outcome.success` `false`, and a run whose agent never called the tool keeps
-  `outcome` `null`.
-- Storage: `outcome_success` and `outcome_recorded_at` are typed columns. The
-  emoji and text can repeat task content, so they are stored together in
-  `outcome_payload`, an envelope private to the store
-  (`{"plaintext": {"emoji", "text"}}`, with `ciphertext` reserved for an
-  encrypting store) that a CHECK caps at 2,048 bytes. The store validates the
-  values itself, whoever calls it.
+- The fire knows the run's ID before it sends the prompt: a claimed run's, or
+  for legacy timers one chosen when the recorder is made and used for the row
+  written at the end.
+- A new session is created with the `omnigent.scheduled_task_run` label set to
+  that ID. A continued session gets the label written just before dispatch; if
+  the write fails, the run fails with `launch_failed` and nothing is sent.
+- What the agent records reads the label from the session, so it goes to the
+  run that sent the latest prompt on any replica, also after a restart, even
+  though a continued run's row names its session only once the prompt is
+  delivered (recovery depends on that).
+- The label also marks the session as one an automation serves, which turns
+  on the objective tools, and is part of the session's agent revision, so a
+  session an automation starts continuing gets them with the first prompt.
 
 ### When the server stops partway
 

@@ -984,13 +984,17 @@ byte-bounded provider counts every advertised tool against its limit.
 ```yaml
 tool_groups:
   browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
-  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete / _record_outcome
+  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  objectives: true        # sys_record_objective / sys_record_outcome
 ```
 
-Every group defaults to `true`, so omitting the block changes nothing. Values
+Every group but `objectives` defaults to `true`, so omitting the block changes
+nothing. `objectives` is unset by default: the runner turns it on only in
+sessions an automation serves (see [Session objectives](session-objectives.md));
+`true` or `false` applies to every session of the agent. Values
 must be booleans and group names must match exactly; a typo fails the load
 rather than silently leaving the group registered. Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt. The block

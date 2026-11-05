@@ -46,6 +46,7 @@ from omnigent.tools.builtins.load_skill import (
 )
 from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
 from omnigent.tools.builtins.nimble_research import NimbleResearchTool
+from omnigent.tools.builtins.objectives import SysRecordObjectiveTool, SysRecordOutcomeTool
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
@@ -53,7 +54,6 @@ from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
-    SysScheduledTaskRecordOutcomeTool,
     SysScheduledTaskUpdateTool,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
@@ -90,10 +90,11 @@ __all__ = [
     "SysCancelAsyncTool",
     "SysListModelsTool",
     "SysReadInboxTool",
+    "SysRecordObjectiveTool",
+    "SysRecordOutcomeTool",
     "SysScheduledTaskCreateTool",
     "SysScheduledTaskDeleteTool",
     "SysScheduledTaskListTool",
-    "SysScheduledTaskRecordOutcomeTool",
     "SysScheduledTaskUpdateTool",
     "SysSessionCloseTool",
     "SysSessionCreateTool",

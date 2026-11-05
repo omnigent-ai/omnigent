@@ -378,51 +378,6 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
-    def record_run_outcome(
-        self,
-        conversation_id: str,
-        *,
-        success: bool,
-        emoji: str,
-        text: str,
-        recorded_at: int,
-    ) -> ScheduledTaskRun | None:
-        """
-        Record the agent's outcome on the conversation's latest delivered run.
-
-        A delivered run is one whose prompt reached the session: ``running``
-        (a new session's run until its turn ends) or ``succeeded`` (also a
-        continued session's run once its prompt is delivered). Of those, the
-        newest by ``scheduled_at`` gets the outcome, so a later firing that is
-        still starting, or that failed or was skipped before delivering its
-        prompt, does not take an earlier turn's outcome; nor does a run that
-        failed after delivery. If a continued session receives the next
-        firing's prompt while still working on the previous one, the outcome
-        lands on the newer run. The endpoint waits for a fire still recording
-        its run before calling this (see ``server/scheduled/run_outcome.py``). A later call
-        overwrites the earlier outcome. ``status`` is left alone, so a run that
-        finished but missed its goal stays ``succeeded`` with
-        ``outcome_success`` ``False``. Workspace-scoped like every other store
-        read.
-
-        :param conversation_id: The fired conversation recording its outcome.
-        :param success: Whether the run reached its goal.
-        :param emoji: The emoji summarizing the outcome, e.g. ``"🚀"``.
-        :param text: A few words on the outcome, e.g. ``"Opened 2 PRs"``.
-        :param recorded_at: Unix epoch seconds of this recording.
-        The default records nothing and returns ``None``, so a store written
-        before outcomes existed still loads; the endpoint then answers 404.
-
-        :returns: The updated :class:`ScheduledTaskRun`, or ``None`` when the
-            conversation has no delivered run (for example, it was not started
-            by a scheduled task), the run's task is gone, or the store does not
-            record outcomes.
-        :raises ValueError: If the emoji or text fails
-            :func:`~omnigent.entities.scheduled_task.normalize_run_outcome`.
-        """
-        del conversation_id, success, emoji, text, recorded_at
-        return None
-
     @abstractmethod
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """

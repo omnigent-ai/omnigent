@@ -134,8 +134,9 @@ describe("listScheduledTaskRuns", () => {
       firedAt: 1_700_000_005,
       finishedAt: 1_700_000_050,
       errorCode: null,
-      // An older server sends no outcome and no session read state.
-      outcome: null,
+      // An older server sends no session read state and no objectives.
+      objectives: [],
+      moreObjectives: false,
       conversationUpdatedAt: null,
       conversationStatus: null,
       viewerLastSeen: null,
@@ -144,7 +145,7 @@ describe("listScheduledTaskRuns", () => {
     });
   });
 
-  it("maps a run's outcome and session read state when the server sends them", async () => {
+  it("maps a run's session read state when the server sends it", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         runs: [
@@ -162,30 +163,51 @@ describe("listScheduledTaskRuns", () => {
             viewer_last_seen: 1_700_000_055,
             viewer_unread: false,
             session_cost_usd: 0,
-            outcome: {
-              success: false,
-              emoji: "🚧",
-              text: "Blocked: CI is down",
-              recorded_at: 1_700_000_040,
-            },
+            objectives: [
+              {
+                id: "o1",
+                session_id: "conv_1",
+                objective: "Get CI green",
+                created_at: 1_700_000_010,
+                scheduled_task_run_id: "run_1",
+                outcome: {
+                  success: false,
+                  emoji: "🚧",
+                  text: "Blocked",
+                  recorded_at: 1_700_000_040,
+                },
+              },
+              {
+                id: "o2",
+                session_id: "conv_1",
+                objective: null,
+                created_at: 1_700_000_020,
+                scheduled_task_run_id: "run_1",
+                outcome: null,
+              },
+            ],
+            more_objectives: true,
           },
         ],
       }),
     );
     const [run] = await listScheduledTaskRuns("st_1");
-    // `success: false` must survive the mapping rather than read as "no outcome".
-    expect(run.outcome).toEqual({
-      success: false,
-      emoji: "🚧",
-      text: "Blocked: CI is down",
-      recordedAt: 1_700_000_040,
-    });
     expect(run).toMatchObject({
       conversationUpdatedAt: 1_700_000_060,
       conversationStatus: "idle",
       viewerLastSeen: 1_700_000_055,
       viewerUnread: false,
       sessionCostUsd: 0,
+      objectives: [
+        {
+          id: "o1",
+          objective: "Get CI green",
+          createdAt: 1_700_000_010,
+          outcome: { success: false, emoji: "🚧", text: "Blocked", recordedAt: 1_700_000_040 },
+        },
+        { id: "o2", objective: null, createdAt: 1_700_000_020, outcome: null },
+      ],
+      moreObjectives: true,
     });
   });
 });

@@ -1,17 +1,17 @@
-"""Validation of ``PUT /v1/scheduled-tasks/run-outcome`` bodies (``RecordRunOutcomeRequest``)."""
+"""Validation of the objective and outcome request bodies of the objectives API."""
 
 from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
 
-from omnigent.server.routes.scheduled_tasks import RecordRunOutcomeRequest
+from omnigent.server.session_objectives import RecordObjectiveRequest, RecordOutcomeRequest
 
 
-def _request(**overrides: object) -> RecordRunOutcomeRequest:
-    body: dict[str, object] = {"session_id": "s", "success": True, "emoji": "✅", "text": "Done"}
+def _request(**overrides: object) -> RecordOutcomeRequest:
+    body: dict[str, object] = {"success": True, "emoji": "✅", "text": "Done"}
     body.update(overrides)
-    return RecordRunOutcomeRequest.model_validate(body)
+    return RecordOutcomeRequest.model_validate(body)
 
 
 @pytest.mark.parametrize(
@@ -99,3 +99,26 @@ def test_success_must_be_a_boolean(success: object) -> None:
 def test_unknown_fields_are_rejected() -> None:
     with pytest.raises(ValidationError):
         _request(run_id="r")
+    with pytest.raises(ValidationError):
+        RecordObjectiveRequest.model_validate({"objective": "Ship it", "run_id": "r"})
+
+
+def test_objective_id_is_normalized_and_must_be_a_uuid() -> None:
+    dashed = "0123abcd-0123-4567-89ab-0123456789ab"
+    assert _request(objective_id=dashed).objective_id == dashed.replace("-", "")
+    with pytest.raises(ValidationError, match="objective's ID"):
+        _request(objective_id="latest")
+
+
+def test_objective_is_collapsed_and_bounded() -> None:
+    def objective(value: str) -> str:
+        return RecordObjectiveRequest.model_validate({"objective": value}).objective
+
+    assert objective("  Get the\n nightly  build green ") == "Get the nightly build green"
+    assert objective("x" * 200) == "x" * 200
+    with pytest.raises(ValidationError, match="at most 200"):
+        objective("x" * 201)
+    with pytest.raises(ValidationError, match="must not be empty"):
+        objective("\t ")
+    with pytest.raises(ValidationError, match="valid Unicode"):
+        objective("a\ud800")

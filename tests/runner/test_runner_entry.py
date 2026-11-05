@@ -3203,6 +3203,45 @@ def _spec_bundle(name: str) -> bytes:
     return buf.getvalue()
 
 
+@pytest.mark.parametrize(
+    ("spec_groups", "header", "expected"),
+    [
+        ("", "1", True),
+        ("", None, None),
+        ("tool_groups:\n  objectives: false\n", "1", False),
+        ("tool_groups:\n  objectives: true\n", None, True),
+    ],
+)
+async def test_an_automation_session_gets_the_objective_tools_unless_its_spec_decides(
+    tmp_path: Path, spec_groups: str, header: str | None, expected: bool | None
+) -> None:
+    """The bundle response marks an automation session; only an undecided spec follows it."""
+    from omnigent.automation_session import AUTOMATION_SESSION_HEADER
+
+    config = (
+        "spec_version: 1\nname: objectives-agent\nexecutor:\n  config:\n"
+        f"    harness: claude-sdk\n{spec_groups}"
+    )
+    headers = {"X-Agent-Version": "1"}
+    if header is not None:
+        headers[AUTOMATION_SESSION_HEADER] = header
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=bundle_files({"config.yaml": config.encode()}), headers=headers
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server.test"
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path), "ag_objectives", session_id="conv_test"
+        )
+
+    assert resolved is not None
+    assert resolved.spec.tool_groups.objectives is expected
+
+
 @pytest.mark.parametrize("cached", [False, True])
 async def test_resolve_agent_spec_keeps_loop_responsive_during_bundle_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cached: bool

@@ -365,18 +365,6 @@ async def test_agent_mutations_validate_origin_at_http_boundary(
         assert updated.status_code == expected_status, updated.text
         stored = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
         assert stored.json()["state"] == ("paused" if expected_status == 200 else "active")
-        # Recording a run's outcome takes the same runner-origin check.
-        run_id = uuid.uuid4().hex
-        _seed_run(db_uri, task_id, run_id, status="running", conversation_id=source.id)
-        outcome = await client.put(
-            "/v1/scheduled-tasks/run-outcome",
-            json={"session_id": source.id, "success": True, "emoji": "✅", "text": "Done"},
-            headers=headers,
-        )
-        assert outcome.status_code == expected_status, outcome.text
-        recorded = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(source.id)
-        assert recorded is not None
-        assert recorded.outcome_success is (True if expected_status == 200 else None)
 
 
 async def test_automations_gate_is_checked_per_request(
@@ -1778,8 +1766,6 @@ async def test_list_runs_returns_history_for_owned_task(
     assert newest["scheduled_task_id"] == task_id
     # The free-text error blob is not exposed on the run list.
     assert "error" not in newest
-    # No agent recorded an outcome for either run.
-    assert [r["outcome"] for r in runs] == [None, None]
     # The run's session doesn't exist, so it carries no session read state.
     assert newest["conversation_updated_at"] is None
     assert newest["conversation_status"] is None
@@ -3274,162 +3260,45 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     assert "Minimum interval is 60 minutes" in retry.text
 
 
-async def _seed_fired_session(
-    auth_client: httpx.AsyncClient, db_uri: str, *, owner_level: int = 4
-) -> tuple[str, str, dict[str, str]]:
-    """A task, a session alice owns bound to a token runner, and a run for it.
+async def test_run_history_lists_each_runs_objectives(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A continued session's runs each show what was recorded during them, newest last."""
+    from omnigent.stores.session_objective_store import SessionObjectiveStore
 
-    :returns: The run id, the session id, and the headers the session's runner sends.
-    """
+    monkeypatch.setattr(scheduled_tasks_routes, "RUN_OBJECTIVES_SHOWN", 2)
     created = await auth_client.post(
         "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
     )
     assert created.status_code == 200, created.text
-    conversations = SqlAlchemyConversationStore(db_uri)
-    session = conversations.create_conversation()
-    SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", session.id, owner_level)
-    token = "outcome-runner-token"
-    conversations.set_runner_id(session.id, token_bound_runner_id(token))
-    run_id = uuid.uuid4().hex
-    _seed_run(db_uri, created.json()["id"], run_id, status="running", conversation_id=session.id)
-    runner_headers = {
-        **_headers(),
-        ORCHESTRATION_SOURCE_HEADER: session.id,
-        RUNNER_TUNNEL_TOKEN_HEADER: token,
-    }
-    return run_id, session.id, runner_headers
-
-
-async def test_run_outcome_is_recorded_from_the_runner_and_listed(
-    auth_client: httpx.AsyncClient, db_uri: str
-) -> None:
-    """The session's runner records the outcome; the run list shows it beside the status."""
-    run_id, session_id, runner_headers = await _seed_fired_session(auth_client, db_uri)
-    resp = await auth_client.put(
-        "/v1/scheduled-tasks/run-outcome",
-        json={"session_id": session_id, "success": False, "emoji": " 🚧 ", "text": "Blocked:  CI"},
-        headers=runner_headers,
+    task_id = created.json()["id"]
+    session = SqlAlchemyConversationStore(db_uri).create_conversation()
+    first_run, second_run, skipped = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
+    _seed_run(db_uri, task_id, first_run, scheduled_at=1000, conversation_id=session.id)
+    _seed_run(db_uri, task_id, second_run, scheduled_at=2000, conversation_id=session.id)
+    _seed_run(db_uri, task_id, skipped, scheduled_at=3000, status="skipped", conversation_id=None)
+    objectives = SessionObjectiveStore(db_uri)
+    objectives.record_objective(session.id, "Triage", scheduled_task_run_id=first_run)
+    objectives.record_outcome(
+        session.id, success=True, emoji="✅", text="Triaged 3", scheduled_task_run_id=first_run
     )
+    for goal in ("One", "Two", "Three"):
+        objectives.record_objective(session.id, goal, scheduled_task_run_id=second_run)
+    objectives.record_outcome(
+        session.id, success=False, emoji="🧯", text="API down", scheduled_task_run_id=second_run
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+
     assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["id"] == run_id
-    assert body["status"] == "running"
-    assert body["outcome"]["success"] is False
-    assert (body["outcome"]["emoji"], body["outcome"]["text"]) == ("🚧", "Blocked: CI")
-    assert isinstance(body["outcome"]["recorded_at"], int)
-
-    # The owner may also set it from the UI or API, without a runner.
-    resp = await auth_client.put(
-        "/v1/scheduled-tasks/run-outcome",
-        json={"session_id": session_id, "success": True, "emoji": "🚀", "text": "Shipped"},
-        headers=_headers(),
-    )
-    assert resp.status_code == 200, resp.text
-    runs = (
-        await auth_client.get(
-            f"/v1/scheduled-tasks/{body['scheduled_task_id']}/runs", headers=_headers()
-        )
-    ).json()["runs"]
-    assert runs[0]["outcome"]["success"] is True
-    assert runs[0]["outcome"]["text"] == "Shipped"
-
-
-async def test_run_outcome_waits_for_a_fire_still_recording_its_run(
-    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """While a fire for the session is in flight, recording waits, then gives up with 409."""
-    from omnigent.server.scheduled import run_outcome
-
-    run_id, session_id, headers = await _seed_fired_session(auth_client, db_uri)
-    monkeypatch.setattr(run_outcome, "PROMPT_SETTLE_TIMEOUT_S", 0.2)
-    body = {"session_id": session_id, "success": True, "emoji": "✅", "text": "Done"}
-    with run_outcome.PROMPTS_IN_FLIGHT.track(session_id):
-        resp = await auth_client.put("/v1/scheduled-tasks/run-outcome", json=body, headers=headers)
-    assert resp.status_code == 409, resp.text
-    run = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(session_id)
-    assert run is not None and run.id == run_id and run.outcome_success is None
-    # Once the fire is done, the same call records.
-    resp = await auth_client.put("/v1/scheduled-tasks/run-outcome", json=body, headers=headers)
-    assert resp.status_code == 200, resp.text
-
-
-async def test_run_outcome_with_invalid_unicode_is_422_and_keeps_the_earlier_outcome(
-    auth_client: httpx.AsyncClient, db_uri: str
-) -> None:
-    """A lone surrogate in raw JSON is a 422, not a 500, and changes nothing."""
-    _, session_id, headers = await _seed_fired_session(auth_client, db_uri)
-    first = await auth_client.put(
-        "/v1/scheduled-tasks/run-outcome",
-        json={"session_id": session_id, "success": True, "emoji": "🚀", "text": "Shipped"},
-        headers=headers,
-    )
-    assert first.status_code == 200, first.text
-    # json.dumps writes the lone surrogate as a \\ud800 escape, which httpx's own
-    # serializer would refuse to send.
-    bad = {"session_id": session_id, "success": False, "emoji": "✅", "text": "a\ud800"}
-    raw = json.dumps(bad)
-    resp = await auth_client.put(
-        "/v1/scheduled-tasks/run-outcome",
-        content=raw.encode(),
-        headers={**headers, "content-type": "application/json"},
-    )
-    assert resp.status_code == 422, resp.text
-    # The stock 422 body echoes the input; the lone surrogate comes back escaped.
-    assert "valid Unicode text" in resp.text
-    assert "\\ud800" in resp.json()["detail"][0]["input"]["text"]
-    run = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(session_id)
-    assert run is not None
-    assert (run.outcome_success, run.outcome_emoji, run.outcome_text) == (True, "🚀", "Shipped")
-
-
-@pytest.mark.parametrize(
-    ("case", "expected_status"),
-    [
-        ("other-source", 403),
-        ("unowned-session", 404),
-        ("no-run", 404),
-        ("failed-before-delivery", 404),
-        ("long-text", 422),
-    ],
-)
-async def test_run_outcome_rejections(
-    auth_client: httpx.AsyncClient, db_uri: str, case: str, expected_status: int
-) -> None:
-    """A foreign or unowned session, no delivered run, or a bad body records nothing.
-
-    Field-level validation is covered against ``RecordRunOutcomeRequest`` in
-    ``tests/server/routes/test_scheduled_task_run_outcome_request.py``; one case
-    here checks a rejected body never reaches the store.
-    """
-    run_id, session_id, headers = await _seed_fired_session(
-        auth_client, db_uri, owner_level=1 if case == "unowned-session" else 4
-    )
-    body: dict[str, object] = {
-        "session_id": session_id,
-        "success": True,
-        "emoji": "✅",
-        "text": "Done",
-    }
-    if case == "other-source":
-        body["session_id"] = uuid.uuid4().hex
-    elif case == "unowned-session":
-        headers = _headers()
-    elif case == "no-run":
-        other = SqlAlchemyConversationStore(db_uri).create_conversation()
-        SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", other.id, 4)
-        body["session_id"] = other.id
-        headers = _headers()
-    elif case == "failed-before-delivery":
-        SqlAlchemyScheduledTaskStore(db_uri).update_run(
-            run_id, status="failed", finished_at=1003, error_code="launch_failed"
-        )
-    elif case == "long-text":
-        body["text"] = "x" * 81
-    resp = await auth_client.put("/v1/scheduled-tasks/run-outcome", json=body, headers=headers)
-    assert resp.status_code == expected_status, resp.text
-    tasks = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
-    task_id = tasks["scheduled_tasks"][0]["id"]
-    runs = (
-        await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
-    ).json()
-    assert [(r["id"], r["outcome"]) for r in runs["runs"]] == [(run_id, None)]
+    by_id = {run["id"]: run for run in resp.json()["runs"]}
+    assert [(o["objective"], o["outcome"]["text"]) for o in by_id[first_run]["objectives"]] == [
+        ("Triage", "Triaged 3")
+    ]
+    assert by_id[first_run]["more_objectives"] is False
+    second = by_id[second_run]
+    assert [o["objective"] for o in second["objectives"]] == ["Two", "Three"]
+    assert second["objectives"][-1]["outcome"]["success"] is False
+    assert second["objectives"][0]["outcome"] is None
+    assert second["more_objectives"] is True
+    assert (by_id[skipped]["objectives"], by_id[skipped]["more_objectives"]) == ([], False)

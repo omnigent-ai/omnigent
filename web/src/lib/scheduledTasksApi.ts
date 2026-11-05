@@ -91,23 +91,34 @@ export interface ScheduledTask {
   nextRunAt: string | null;
 }
 
-/** One run of a scheduled task, camelCased from `_run_to_response`. */
 /**
- * What the agent recorded about reaching a run's goal with
- * `sys_scheduled_task_record_outcome`. Independent of the run's `status`, which
- * only says whether the run finished.
+ * How the agent says an attempt at an objective went, recorded with
+ * `sys_record_outcome`. Independent of the run's `status`, which only says
+ * whether the run finished.
  */
-export interface ScheduledTaskRunOutcome {
-  /** Whether the run reached its goal. */
+export interface SessionObjectiveOutcome {
+  /** Whether the agent reached the objective. */
   success: boolean;
   /** Emoji the agent chose, e.g. `🚀`. */
   emoji: string;
   /** A few words on the outcome, e.g. `Opened 2 PRs`. */
   text: string;
   /** Epoch seconds of the latest recording. */
-  recordedAt: number | null;
+  recordedAt: number;
 }
 
+/** An objective the agent recorded with `sys_record_objective`, with its outcome. */
+export interface SessionObjective {
+  id: string;
+  /** What the agent set out to do; `null` for an outcome recorded without one. */
+  objective: string | null;
+  /** Epoch seconds when it was recorded. */
+  createdAt: number;
+  /** The latest outcome; `null` until the agent records one. */
+  outcome: SessionObjectiveOutcome | null;
+}
+
+/** One run of a scheduled task, camelCased from `_run_to_response`. */
 export interface ScheduledTaskRun {
   /** Current cumulative session cost; null when not reported (not a per-run delta). */
   sessionCostUsd: number | null;
@@ -120,8 +131,13 @@ export interface ScheduledTaskRun {
   finishedAt: number | null;
   /** Queryable failure classification, e.g. `no_online_host`; `null` on success. */
   errorCode: string | null;
-  /** The outcome the agent recorded; `null` when it recorded none or the server predates outcomes. */
-  outcome: ScheduledTaskRunOutcome | null;
+  /**
+   * The newest objectives the agent recorded during the run, oldest first;
+   * empty when it recorded none or the server predates objectives.
+   */
+  objectives: SessionObjective[];
+  /** Whether the run recorded more objectives than `objectives` holds. */
+  moreObjectives: boolean;
   /** Epoch seconds of the conversation's last update; `null` for runs without a conversation. */
   conversationUpdatedAt: number | null;
   /**
@@ -263,11 +279,37 @@ interface ScheduledTaskRunWire {
   fired_at: number | null;
   finished_at: number | null;
   error_code: string | null;
-  outcome?: { success: boolean; emoji: string; text: string; recorded_at: number | null } | null;
+  // Absent from servers that predate objectives.
+  objectives?: SessionObjectiveWire[];
+  more_objectives?: boolean;
   conversation_updated_at: number | null;
   conversation_status: string | null;
   viewer_last_seen: number | null;
   viewer_unread: boolean | null;
+}
+
+/** Wire shape of an objective, matching `objective_to_response`. */
+interface SessionObjectiveWire {
+  id: string;
+  objective: string | null;
+  created_at: number;
+  outcome: { success: boolean; emoji: string; text: string; recorded_at: number } | null;
+}
+
+function objectiveFromWire(wire: SessionObjectiveWire): SessionObjective {
+  return {
+    id: wire.id,
+    objective: wire.objective,
+    createdAt: wire.created_at,
+    outcome: wire.outcome
+      ? {
+          success: wire.outcome.success,
+          emoji: wire.outcome.emoji,
+          text: wire.outcome.text,
+          recordedAt: wire.outcome.recorded_at,
+        }
+      : null,
+  };
 }
 
 /**
@@ -350,14 +392,8 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
     firedAt: wire.fired_at,
     finishedAt: wire.finished_at,
     errorCode: wire.error_code,
-    outcome: wire.outcome
-      ? {
-          success: wire.outcome.success,
-          emoji: wire.outcome.emoji,
-          text: wire.outcome.text,
-          recordedAt: wire.outcome.recorded_at,
-        }
-      : null,
+    objectives: (wire.objectives ?? []).map(objectiveFromWire),
+    moreObjectives: wire.more_objectives ?? false,
     conversationUpdatedAt: wire.conversation_updated_at ?? null,
     conversationStatus: wire.conversation_status ?? null,
     viewerLastSeen: wire.viewer_last_seen ?? null,

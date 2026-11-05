@@ -22,127 +22,6 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict
 
-# Bounds on the outcome an agent records for a run. An emoji can span several
-# code points (skin tones, ZWJ sequences, flags), so its bound is in code points.
-RUN_OUTCOME_EMOJI_MAX_CHARS = 16
-RUN_OUTCOME_TEXT_MAX_CHARS = 80
-
-# Unicode's Extended_Pictographic ranges (emoji-data.txt): the code points that
-# can start an emoji. General symbol categories also hold math, box-drawing and
-# currency signs, which are not emoji.
-_EXTENDED_PICTOGRAPHIC: tuple[tuple[int, int], ...] = (
-    (0x00A9, 0x00A9), (0x00AE, 0x00AE), (0x203C, 0x203C), (0x2049, 0x2049),
-    (0x2122, 0x2122), (0x2139, 0x2139), (0x2194, 0x2199), (0x21A9, 0x21AA),
-    (0x231A, 0x231B), (0x2328, 0x2328), (0x2388, 0x2388), (0x23CF, 0x23CF),
-    (0x23E9, 0x23F3), (0x23F8, 0x23FA), (0x24C2, 0x24C2), (0x25AA, 0x25AB),
-    (0x25B6, 0x25B6), (0x25C0, 0x25C0), (0x25FB, 0x25FE), (0x2600, 0x2605),
-    (0x2607, 0x2612), (0x2614, 0x2685), (0x2690, 0x2705), (0x2708, 0x2712),
-    (0x2714, 0x2714), (0x2716, 0x2716), (0x271D, 0x271D), (0x2721, 0x2721),
-    (0x2728, 0x2728), (0x2733, 0x2734), (0x2744, 0x2744), (0x2747, 0x2747),
-    (0x274C, 0x274C), (0x274E, 0x274E), (0x2753, 0x2755), (0x2757, 0x2757),
-    (0x2763, 0x2767), (0x2795, 0x2797), (0x27A1, 0x27A1), (0x27B0, 0x27B0),
-    (0x27BF, 0x27BF), (0x2934, 0x2935), (0x2B05, 0x2B07), (0x2B1B, 0x2B1C),
-    (0x2B50, 0x2B50), (0x2B55, 0x2B55), (0x3030, 0x3030), (0x303D, 0x303D),
-    (0x3297, 0x3297), (0x3299, 0x3299), (0x1F000, 0x1F0FF), (0x1F10D, 0x1F10F),
-    (0x1F12F, 0x1F12F), (0x1F16C, 0x1F171), (0x1F17E, 0x1F17F), (0x1F18E, 0x1F18E),
-    (0x1F191, 0x1F19A), (0x1F1AD, 0x1F1E5), (0x1F201, 0x1F20F), (0x1F21A, 0x1F21A),
-    (0x1F22F, 0x1F22F), (0x1F232, 0x1F23A), (0x1F23C, 0x1F23F), (0x1F249, 0x1F3FA),
-    (0x1F400, 0x1F53D), (0x1F546, 0x1F64F), (0x1F680, 0x1F6FF), (0x1F774, 0x1F77F),
-    (0x1F7D5, 0x1F7FF), (0x1F80C, 0x1F80F), (0x1F848, 0x1F84F), (0x1F85A, 0x1F85F),
-    (0x1F888, 0x1F88F), (0x1F8AE, 0x1F8FF), (0x1F90C, 0x1F93A), (0x1F93C, 0x1F945),
-    (0x1F947, 0x1FAFF), (0x1FC00, 0x1FFFD),
-)  # fmt: skip
-_EMOJI_ZWJ = "\u200d"
-_EMOJI_KEYCAP = "\u20e3"
-_EMOJI_VARIATION_SELECTORS = frozenset("\ufe0e\ufe0f")
-_EMOJI_KEYCAP_BASES = frozenset("0123456789#*")
-
-
-def _is_extended_pictographic(cp: int) -> bool:
-    return any(start <= cp <= end for start, end in _EXTENDED_PICTOGRAPHIC)
-
-
-_EMOJI_SKIN_TONES = range(0x1F3FB, 0x1F400)
-# Tag characters spell a subdivision flag after the black flag, e.g. Scotland.
-_EMOJI_TAGS = range(0xE0020, 0xE0080)
-_EMOJI_BLACK_FLAG = 0x1F3F4
-
-
-def is_single_emoji(value: str) -> bool:
-    """Whether *value* is one emoji, counting a ZWJ or keycap sequence or a flag as one.
-
-    Approximates one emoji grapheme without a Unicode segmentation dependency.
-    Each part of the sequence is an Extended_Pictographic character, a keycap
-    base followed by its keycap mark, or a regional-indicator pair, optionally
-    followed by one variation selector and one skin tone; tag characters may
-    follow only the black flag. Parts are joined by single ZWJs, but a flag or
-    a keycap is never part of a joined sequence.
-    Extended_Pictographic also contains a few symbols that rarely render as
-    emoji (for example ``☉`` and ``🂠``); they are accepted, since the value is
-    only shown, never interpreted.
-    """
-    if not value or len(value) > RUN_OUTCOME_EMOJI_MAX_CHARS:
-        return False
-    parts = value.split(_EMOJI_ZWJ)
-    if len(parts) > 1 and any(not part for part in parts):
-        return False
-    if not all(_is_emoji_part(part) for part in parts):
-        return False
-    # A ZWJ does not join a flag or a keycap to another emoji: that is two emoji.
-    return len(parts) == 1 or not any(_is_flag(part) or _is_keycap(part) for part in parts)
-
-
-def _is_flag(part: str) -> bool:
-    return len(part) == 2 and all(0x1F1E6 <= ord(ch) <= 0x1F1FF for ch in part)
-
-
-def _is_keycap(part: str) -> bool:
-    return part[:1] in _EMOJI_KEYCAP_BASES
-
-
-def _is_emoji_part(part: str) -> bool:
-    """One emoji without ZWJs: a base, then at most one selector, one tone, or tags."""
-    if _is_flag(part):
-        return True
-    base, rest = part[0], part[1:]
-    if base in _EMOJI_KEYCAP_BASES:
-        return rest in (_EMOJI_KEYCAP, "\ufe0f" + _EMOJI_KEYCAP)
-    if not _is_extended_pictographic(ord(base)):
-        return False
-    if rest[:1] in _EMOJI_VARIATION_SELECTORS:
-        rest = rest[1:]
-    if rest[:1] and ord(rest[0]) in _EMOJI_SKIN_TONES:
-        rest = rest[1:]
-    if rest and ord(base) == _EMOJI_BLACK_FLAG:
-        return all(ord(ch) in _EMOJI_TAGS for ch in rest)
-    return not rest
-
-
-def normalize_run_outcome(emoji: str, text: str) -> tuple[str, str]:
-    """Trim and check an outcome's emoji and text, returning the values to store.
-
-    :param emoji: Exactly one emoji, e.g. ``"🚀"``; surrounding spaces are dropped.
-    :param text: A few words; runs of whitespace collapse to single spaces.
-    :returns: The trimmed emoji and the collapsed text.
-    :raises ValueError: If either value is not valid Unicode text, the emoji is
-        not exactly one emoji, or the text is empty or longer than
-        :data:`RUN_OUTCOME_TEXT_MAX_CHARS`.
-    """
-    emoji = emoji.strip()
-    if not is_single_emoji(emoji):
-        raise ValueError("emoji must be exactly one emoji, e.g. '🚀'")
-    for name, raw in (("emoji", emoji), ("text", text)):
-        try:
-            raw.encode("utf-8")
-        except UnicodeEncodeError as exc:  # e.g. an unpaired surrogate from raw JSON
-            raise ValueError(f"{name} must be valid Unicode text") from exc
-    text = " ".join(text.split())
-    if not text:
-        raise ValueError("text must not be empty")
-    if len(text) > RUN_OUTCOME_TEXT_MAX_CHARS:
-        raise ValueError(f"text must be at most {RUN_OUTCOME_TEXT_MAX_CHARS} characters")
-    return emoji, text
-
 
 class ScheduledRunLogContext(BaseModel):
     """Occurrence identity retained with a saved prompt across replica changes."""
@@ -271,16 +150,6 @@ class ScheduledTaskRun:
     :param error_code: Short failure classification (e.g. ``"timeout"``,
         ``"rate_limited"``) for future retry logic; ``None`` unless
         ``status == "failed"``.
-    :param outcome_success: Whether the agent reached the run's goal, as it
-        recorded with ``sys_scheduled_task_record_outcome``; ``None`` when it recorded
-        nothing. Independent of ``status``, which only says whether the run
-        finished: a ``succeeded`` run can still have missed its goal.
-    :param outcome_emoji: The emoji the agent chose for the outcome, e.g.
-        ``"🚀"``; ``None`` when no outcome was recorded.
-    :param outcome_text: A few words on the outcome, e.g. ``"Opened 2 PRs"``;
-        ``None`` when no outcome was recorded.
-    :param outcome_recorded_at: Unix epoch seconds the outcome was last
-        recorded, or ``None``.
     """
 
     id: str
@@ -296,7 +165,3 @@ class ScheduledTaskRun:
     trigger_key: str | None = None
     host_id: str | None = None
     lease_expires_at: int | None = None
-    outcome_success: bool | None = None
-    outcome_emoji: str | None = None
-    outcome_text: str | None = None
-    outcome_recorded_at: int | None = None

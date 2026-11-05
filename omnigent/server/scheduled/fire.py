@@ -73,12 +73,12 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
+from omnigent.automation_session import session_agent_revision
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
@@ -104,7 +104,6 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
-from omnigent.server.scheduled.run_outcome import PROMPTS_IN_FLIGHT
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.scheduled.telemetry import (
     current_fire_stage,
@@ -121,6 +120,7 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
 )
 
@@ -270,6 +270,11 @@ class _FireRecorder(Protocol):
     records progress on the run it already claimed, under a startup lease.
     """
 
+    @property
+    def run_id(self) -> str:
+        """The run's ID, known before the run row exists for legacy timers."""
+        ...
+
     async def check(self) -> None:
         """Raise before an external action if the fire may no longer proceed."""
         ...
@@ -303,6 +308,12 @@ class _NewRunRecorder:
         self._deps = deps
         self._task = task
         self._scheduled_at = scheduled_at
+        # Chosen now so the session can name its run before the row is written.
+        self._run_id = _new_id()
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
 
     async def check(self) -> None:
         return None
@@ -326,6 +337,7 @@ class _NewRunRecorder:
             status=status,
             error=error,
             error_code=error_code,
+            run_id=self._run_id,
         )
 
     async def hand_off_managed(
@@ -371,11 +383,12 @@ UNATTENDED_RUN_NOTE = (
     "independent work that does not depend on those decisions. If an action is denied or "
     "requires unavailable approval, skip that action and explain the blocker. Continue "
     "independent work and permitted alternatives. Do not change permission settings to "
-    "get past the restriction. If you have the sys_scheduled_task_record_outcome tool, call "
-    "it once before your final reply to record whether you reached the goal above, with an "
-    "emoji and a few words. Lead your final reply with unresolved decisions and assumptions, "
-    "prioritizing those the user is most likely to want to change, then summarize what "
-    "you did and anything you couldn't do."
+    "get past the restriction. If you have the sys_record_objective and sys_record_outcome "
+    "tools, record the goal above as an objective before you start on it, and before your "
+    "final reply record whether you reached it, with an emoji and a few words. Lead your "
+    "final reply with unresolved decisions and assumptions, prioritizing those the user "
+    "is most likely to want to change, then summarize what you did and anything you "
+    "couldn't do."
 )
 
 
@@ -667,7 +680,11 @@ async def _run_fire_for_task(
     try:
         start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
-        conv = await _create_session(deps, effective, labels=_session_labels(task))
+        conv = await _create_session(
+            deps,
+            effective,
+            labels={**_session_labels(task), SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id},
+        )
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
         _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
@@ -744,34 +761,31 @@ async def _run_fire_for_task(
         )
 
     await recorder.check()
-    # The agent can record its outcome as soon as the prompt is accepted, before
-    # the run below exists; the mark lets that recording wait for it.
-    with PROMPTS_IN_FLIGHT.track(conv.id):
-        try:
-            start_fire_stage("sandbox_create" if managed else "runner_start", session_id=conv.id)
-            await dispatch(conv, effective)
-        except Exception:
-            # The session + grant are already persisted and owner-visible, so a
-            # launch/dispatch failure still records a run — just a failed one.
-            _logger.exception(
-                "scheduled fire: launch/dispatch failed for task %s (session %s)",
-                task.id,
-                conv.id,
-            )
-            await recorder.finish(
-                "failed",
-                conversation_id=conv.id,
-                error="runner launch/dispatch failed",
-                error_code="launch_failed",
-            )
-            return
+    try:
+        start_fire_stage("sandbox_create" if managed else "runner_start", session_id=conv.id)
+        await dispatch(conv, effective)
+    except Exception:
+        # The session + grant are already persisted and owner-visible, so a
+        # launch/dispatch failure still records a run — just a failed one.
+        _logger.exception(
+            "scheduled fire: launch/dispatch failed for task %s (session %s)",
+            task.id,
+            conv.id,
+        )
+        await recorder.finish(
+            "failed",
+            conversation_id=conv.id,
+            error="runner launch/dispatch failed",
+            error_code="launch_failed",
+        )
+        return
 
-        if hand_off:
-            await recorder.hand_off_managed(
-                conv, replace(effective, workspace=task.workspace), fire_dispatch.managed_start
-            )
-        else:
-            await recorder.finish("running", conversation_id=conv.id)
+    if hand_off:
+        await recorder.hand_off_managed(
+            conv, replace(effective, workspace=task.workspace), fire_dispatch.managed_start
+        )
+    else:
+        await recorder.finish("running", conversation_id=conv.id)
     _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
 
 
@@ -853,26 +867,33 @@ async def _continue_session(
             error_code="continued_session_budget_conflict",
         )
         return
-    # Until the run below is recorded, an outcome would land on the session's
-    # previous run; the mark lets that recording wait for this one.
-    with PROMPTS_IN_FLIGHT.track(session_id):
-        try:
-            start_fire_stage("runner_start", session_id=session_id)
-            await dispatch(conv, task)
-        except Exception:
-            _logger.exception(
-                "scheduled fire: dispatch into continued session %s failed for task %s",
-                session_id,
-                task.id,
-            )
-            await recorder.finish(
-                "failed",
-                conversation_id=session_id,
-                error="runner launch/dispatch failed",
-                error_code="launch_failed",
-            )
-            return
-        await recorder.finish("succeeded", conversation_id=session_id)
+    try:
+        # Stamped before the prompt goes in, so what the agent records about this
+        # run is attributed to it on any replica, even after a restart.
+        await asyncio.to_thread(
+            deps.conversation_store.set_labels,
+            session_id,
+            {SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id},
+        )
+        # The dispatch derives the agent revision from these labels, so a session
+        # the automation just started serving rebuilds its tools for this turn.
+        conv.labels[SCHEDULED_TASK_RUN_LABEL_KEY] = recorder.run_id
+        start_fire_stage("runner_start", session_id=session_id)
+        await dispatch(conv, task)
+    except Exception:
+        _logger.exception(
+            "scheduled fire: dispatch into continued session %s failed for task %s",
+            session_id,
+            task.id,
+        )
+        await recorder.finish(
+            "failed",
+            conversation_id=session_id,
+            error="runner launch/dispatch failed",
+            error_code="launch_failed",
+        )
+        return
+    await recorder.finish("succeeded", conversation_id=session_id)
     _logger.info("scheduled fire: task %s continued session %s", task.id, session_id)
 
 
@@ -1374,7 +1395,7 @@ async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
     """The bundle the kickoff runs, so the runner can tell when it later changes."""
     agent = await asyncio.to_thread(deps.agent_store.get, conv.agent_id) if conv.agent_id else None
     return (
-        mcp_selection_revision(agent.bundle_location, conv.labels) if agent is not None else None
+        session_agent_revision(agent.bundle_location, conv.labels) if agent is not None else None
     )
 
 
@@ -1705,6 +1726,7 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Stamp last_run_* on the task and write a scheduled_task_runs row."""
     await asyncio.to_thread(
@@ -1716,6 +1738,7 @@ async def _record_run(
         status,
         error=error,
         error_code=error_code,
+        run_id=run_id,
     )
 
 
@@ -1728,11 +1751,12 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = _stamp_last_run_sync(deps, task, conversation_id)
     deps.scheduled_task_store.create_run(
-        _new_id(),
+        run_id or _new_id(),
         task.id,
         status,
         scheduled_at,
@@ -2221,6 +2245,10 @@ class _ClaimedRunRecorder:
         self._task = task
         self._lease = lease
         self._registration_timeout_s = registration_timeout_s
+
+    @property
+    def run_id(self) -> str:
+        return self._lease.run.id
 
     async def check(self) -> None:
         await self._lease.check()
