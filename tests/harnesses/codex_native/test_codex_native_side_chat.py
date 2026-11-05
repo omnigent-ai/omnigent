@@ -795,7 +795,17 @@ async def test_side_input_preserves_authored_text_and_child_routing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "fault", ["old_peer", "disk", "rebind", "rebind_after_fork", "downgrade", "cancel", "lost_ack"]
+    "fault",
+    [
+        "old_peer",
+        "disk",
+        "rebind",
+        "rebind_after_fork",
+        "downgrade",
+        "cancel",
+        "lost_ack",
+        "empty_ack",
+    ],
 )
 async def test_queued_large_side_request_survives_refusal_without_replay(
     tmp_path: Path,
@@ -831,6 +841,8 @@ async def test_queued_large_side_request_survives_refusal_without_replay(
             raise asyncio.CancelledError
         if method == "turn/start" and fault == "lost_ack":
             raise TimeoutError("synthetic lost turn acknowledgement")
+        if method == "turn/start" and fault == "empty_ack":
+            return {"result": {}}
         return response
 
     monkeypatch.setattr(client, "request", request)
@@ -854,14 +866,14 @@ async def test_queued_large_side_request_survives_refusal_without_replay(
     [record] = list((tmp_path / location).glob("*.json"))
     assert json.loads(record.read_text())["question"] == question
     turns = [params for method, params in client.calls if method == "turn/start"]
-    assert len(turns) == int(fault in {"cancel", "lost_ack"})
+    assert len(turns) == int(fault in {"cancel", "lost_ack", "empty_ack"})
     if turns:
         assert turns[0]["threadId"] == "thread_side"
     if fault != "cancel":
         assert notices.await_count == 1
         assert notices.call_args.args[1] == "conv_parent"
         assert json.loads(record.with_suffix(".failure").read_text())["undelivered"] == (
-            fault != "lost_ack"
+            fault not in {"lost_ack", "empty_ack"}
         )
 
 

@@ -448,7 +448,11 @@ async def open_side_chat_on_client(
     )
     if child_thread_id is None:
         return None
-    await submit_side_turn(codex_client, child_thread_id, question, _prepared=prepared)
+    turn_id = await submit_side_turn(codex_client, child_thread_id, question, _prepared=prepared)
+    if turn_id is None:
+        raise RuntimeError(
+            "Codex did not confirm the side turn's identity; delivery is uncertain."
+        )
     return child_thread_id
 
 
