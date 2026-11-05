@@ -107,9 +107,14 @@ def test_touch_screens_reveal_timestamps_and_pending_steering(
     page.wait_for_function(f"element => ({opacity})(element) >= 0.39", arg=notice.element_handle())
     assert notice.evaluate(opacity) >= 0.39
     footer = notice.locator("..")
-    pending_timestamp = footer.get_by_test_id("message-timestamp")
-    notice_box = notice.bounding_box()
-    timestamp_box = pending_timestamp.bounding_box()
+    # Read both boxes in one frame while the pending bubble animates into place.
+    notice_box, timestamp_box = footer.evaluate(
+        """footer => {
+          const bounds = testId => footer.querySelector(`[data-testid="${testId}"]`)
+            ?.getBoundingClientRect().toJSON();
+          return [bounds('message-awaiting-agent'), bounds('message-timestamp')];
+        }"""
+    )
     assert notice_box is not None and timestamp_box is not None
     assert notice_box["y"] == pytest.approx(timestamp_box["y"], abs=1)
     assert notice_box["x"] + notice_box["width"] <= timestamp_box["x"] + 1
@@ -121,7 +126,7 @@ def test_attachment_only_steering_explanation_stays_visible_on_desktop(
     """A text-less steer has no focusable footer control, so it must not hide."""
     chat = chat_session_contract
     chat.harness = "codex-native"
-    chat.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+    chat.update_session(status="running", labels={"omnigent.wrapper": "codex-native-ui"})
     chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
     chat.reject_uploads = False
     page.set_viewport_size({"width": 1280, "height": 900})
@@ -165,6 +170,11 @@ def test_bare_idle_clears_the_live_working_indicator(
 
     chat.emit_busy("browser-turn")
     expect(working).to_be_visible(timeout=10_000)
+    working_font = working.locator(".text-shimmer").evaluate(
+        "element => getComputedStyle(element).fontFamily"
+    )
+    body_font = page.evaluate("() => getComputedStyle(document.body).fontFamily")
+    assert working_font == body_font
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)

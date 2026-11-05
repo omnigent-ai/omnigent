@@ -107,10 +107,12 @@ def test_composer_input_font_setting_and_alignment(
     page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     page.goto(f"{base_url}/")
     landing = page.get_by_test_id("new-chat-landing-input")
-    hint = page.get_by_text("Describe a task, or try a skill", exact=True)
+    hint = landing if mobile else page.get_by_text("Describe a task, or try a skill", exact=True)
     expect(hint).to_be_visible(timeout=30_000)
+    if mobile:
+        expect(landing).to_have_attribute("placeholder", "Describe a task...")
     observed = {"landing-hint": _metrics(hint)}
-    skill_metrics = _metrics(page.get_by_test_id("skill-pill-context"))
+    skill_metrics = None if mobile else _metrics(page.get_by_test_id("skill-pill-context"))
     page.screenshot(path=tmp_path / "landing-placeholder.png", animations="disabled")
     _exercise_input(page, landing, mobile=mobile)
     observed.update(
@@ -167,7 +169,8 @@ def test_composer_input_font_setting_and_alignment(
             measured,
         )
     assert quote_metrics["fontSize"] == pytest.approx(expected_size - 1, abs=0.01)
-    assert skill_metrics["fontSize"] == pytest.approx(expected_size, abs=0.01)
+    if skill_metrics is not None:
+        assert skill_metrics["fontSize"] == pytest.approx(expected_size, abs=0.01)
 
     textarea_metrics, overlay_metrics = observed["slash-input"], observed["slash-overlay"]
     for property_name in (
