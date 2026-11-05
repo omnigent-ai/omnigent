@@ -54,12 +54,15 @@ def claude_sdk_run(
     try:
         yield run
     finally:
-        for session_id in run.created:
-            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except Exception:  # best-effort teardown
-                respawned.kill()
-                respawned.wait(timeout=5)
+        try:
+            for session_id in run.created:
+                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
+            # A failed delete must not leave the respawned runner behind.
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except Exception:  # best-effort teardown
+                    respawned.kill()
+                    respawned.wait(timeout=5)
