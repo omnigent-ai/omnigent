@@ -7,14 +7,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { BlockRenderer, rendersOnlyWorkedFold } from "./BlockRenderer";
+import { BlockRenderer, pointsBackward, rendersOnlyWorkedFold } from "./BlockRenderer";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 afterEach(cleanup);
@@ -556,7 +556,7 @@ describe("BlockRenderer dispatch", () => {
   );
 
   describe("settled-turn process fold (Worked row)", () => {
-    const tool = (n: number, name = `tool_${n}`): RenderItem => ({
+    const tool = (n: number, name = `tool_${n}`, output = "ok"): RenderItem => ({
       kind: "tool",
       itemId: `fc_${n}`,
       execution: {
@@ -566,9 +566,9 @@ describe("BlockRenderer dispatch", () => {
         callId: `c_${n}`,
         agentName: "nessie",
         executedBy: "server",
-        output: "ok",
+        output,
       },
-      output: "ok",
+      output,
       state: "output-available",
       startedAt: null,
       duration: undefined,
@@ -794,6 +794,372 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.queryByText("Reading the tests.")).toBeNull();
     });
 
+    it("keeps Codex shell output readable when the final answer points to it above", () => {
+      const reportLine = "REPORT line 2: tests-42-passed";
+      const report = `REPORT line 1: build-ok\n${reportLine}\nREPORT line 3: failures-0\n`;
+      const items: RenderItem[] = [
+        {
+          kind: "tool",
+          itemId: "fc_report",
+          execution: {
+            name: "shell",
+            arguments: { command: "/bin/bash -lc \"printf 'REPORT line %d: %s\\n' 1 build-ok\"" },
+            argsSummary: "",
+            callId: "call_report",
+            agentName: "codex",
+            executedBy: "server",
+            output: report,
+          },
+          output: report,
+          state: "output-available",
+          startedAt: null,
+          duration: undefined,
+        },
+        {
+          kind: "text",
+          itemId: "m_final",
+          text: "Done. The full report is printed above; scroll up to read it.",
+          final: true,
+          phase: "final_answer",
+        },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" workedForS={2} />
+        </FileViewerContext.Provider>,
+      );
+      const fold = screen.getByRole("button", { name: "Worked for 2s" });
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      const pinned = screen.getByText(new RegExp(reportLine));
+      expect(pinned).toBeVisible();
+      expect(fold.compareDocumentPosition(pinned) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it("keeps Codex commentary readable when the final answer points to it above", () => {
+      const summary = "Service summary: api-gateway healthy, billing-worker degraded";
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: summary, final: true, phase: "commentary" },
+        tool(1, "shell"),
+        {
+          kind: "text",
+          itemId: "m1",
+          text: "Done. The service summary is in my update above.",
+          final: true,
+          phase: "final_answer",
+        },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" workedForS={5} />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByText(summary)).toBeVisible();
+    });
+
+    const codexTurnEndingWith = (answer: string): RenderItem[] => [
+      {
+        kind: "text",
+        itemId: "m0",
+        text: "Checking the services.",
+        final: true,
+        phase: "commentary",
+      },
+      tool(1, "shell", "api-gateway healthy"),
+      { kind: "text", itemId: "m1", text: answer, final: true, phase: "final_answer" },
+    ];
+
+    it.each([
+      "Scroll up for the full report.",
+      "See above.",
+      "The full report is shown above.",
+      "Above is the full report.",
+      "The output is above.",
+      "The log shown above the summary has the details.",
+      "The test output above shows the failure.",
+      "All set. The summary is above.",
+      "As noted above, billing is degraded.",
+      "Here you go\n\nAbove is the full log.",
+    ])("shows the narration and output an answer points back to: %s", (answer) => {
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={codexTurnEndingWith(answer)} sessionStatus="idle" workedForS={3} />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Worked for 3s" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      expect(screen.getByText("Checking the services.")).toBeVisible();
+      expect(screen.getByText(/api-gateway healthy/)).toBeVisible();
+    });
+
+    it.each([
+      "All checks passed.",
+      "CPU usage stayed above 90% during the run.",
+      "Latency is above the threshold.",
+      "Latency was above-average today.",
+      "Above all, the build is green.",
+      "Error logs above 1GB were rotated.",
+      "Results above the baseline were flagged.",
+      "The results are above expectations.",
+      "Results above average were flagged.",
+      "Logs above threshold were rotated.",
+      // Points within the answer itself, not to earlier output.
+      "The table above lists each step.",
+    ])("keeps narration and output folded when no earlier output is meant: %s", (answer) => {
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={codexTurnEndingWith(answer)} sessionStatus="idle" workedForS={3} />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+      expect(screen.queryByText("Checking the services.")).toBeNull();
+      expect(screen.queryByText(/api-gateway healthy/)).toBeNull();
+    });
+
+    it("checks a long blank run for a backward reference in linear time", () => {
+      const blankRun = "\n".repeat(100_000);
+      const start = performance.now();
+      expect(pointsBackward(`Report:${blankRun}x`)).toBe(false);
+      expect(pointsBackward(`Report:${" \n".repeat(50_000)}x`)).toBe(false);
+      expect(pointsBackward(`Report:${blankRun}Above is the full log.`)).toBe(true);
+      expect(performance.now() - start).toBeLessThan(1000);
+    });
+
+    it("opens only the latest tool output that has text, between the fold and the answer", () => {
+      const items: RenderItem[] = [
+        tool(1, "Bash", "first output"),
+        tool(2, "Bash", "second output"),
+        tool(3, "Bash", "  \n"),
+        tool(4, "turn_diff", "diff --git a/x b/x"),
+        { kind: "text", itemId: "m1", text: "The output is above.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      const fold = screen.getByRole("button", { name: "Worked" });
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      const pinned = screen.getByText("second output");
+      expect(screen.queryByText("first output")).toBeNull();
+      expect(screen.queryByText(/diff --git/)).toBeNull();
+      expect(fold.compareDocumentPosition(pinned) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(
+        pinned.compareDocumentPosition(screen.getByText("The output is above.")) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+
+      fireEvent.click(fold);
+      fireEvent.click(screen.getByText("Ran 3 shell commands, called 1 other tool"));
+      const foldBody = screen.getByTestId("turn-worked-fold");
+      for (const card of within(foldBody).getAllByRole("button", { name: "Bash" })) {
+        fireEvent.click(card);
+      }
+      expect(within(foldBody).getByText("first output")).toBeVisible();
+      expect(within(foldBody).getByText("second output")).toBeVisible();
+      expect(foldBody.contains(pinned)).toBe(false);
+      expect(pinned).toBeVisible();
+    });
+
+    it("shows the output an answer points back to once in a fold that starts open", () => {
+      const items: RenderItem[] = [
+        tool(1, "Bash", "the report"),
+        { kind: "text", itemId: "m1", text: "The output is above.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" defaultExpanded />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      expect(screen.getAllByText("the report")).toHaveLength(1);
+      expect(screen.getByText("the report")).toBeVisible();
+    });
+
+    const dispatch: RenderItem = {
+      kind: "tool",
+      itemId: "fc_send",
+      execution: {
+        name: "sys_session_send",
+        arguments: { agent: "deep_thought", title: "q1" },
+        argsSummary: "",
+        callId: "c_send",
+        agentName: "nessie",
+        executedBy: "server",
+        output: "ok",
+      },
+      output: "ok",
+      state: "output-available",
+      startedAt: null,
+      duration: undefined,
+    };
+
+    it("finds the output an answer points back to past a visible dispatch card", () => {
+      const items: RenderItem[] = [
+        tool(1, "Bash", "the report"),
+        dispatch,
+        { kind: "text", itemId: "m1", text: "The output is above.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      const pinned = screen.getByText("the report");
+      expect(pinned).toBeVisible();
+      expect(
+        screen.getByText(/Start child session/).compareDocumentPosition(pinned) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it.each([
+      ["a visible dispatch card", dispatch],
+      ["an outputless run", tool(2, "Bash", "  \n")],
+    ])(
+      "copies the output once when commentary and the answer both point back past %s",
+      (_, between) => {
+        const items: RenderItem[] = [
+          tool(1, "Bash", "the report"),
+          { kind: "text", itemId: "m0", text: "See above.", final: true, phase: "commentary" },
+          between,
+          {
+            kind: "text",
+            itemId: "m1",
+            text: "The output is above.",
+            final: true,
+            phase: "final_answer",
+          },
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        const folds = screen.getAllByRole("button", { name: "Worked" });
+        for (const fold of folds) expect(fold).toHaveAttribute("aria-expanded", "false");
+        expect(screen.getAllByText("the report")).toHaveLength(1);
+        const pinned = screen.getByText("the report");
+        expect(
+          pinned.compareDocumentPosition(screen.getByText("See above.")) &
+            Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+
+        fireEvent.click(folds[0]!);
+        const firstRun = screen.getAllByTestId("turn-worked-fold")[0]!;
+        fireEvent.click(within(firstRun).getByText("Ran 1 shell command"));
+        fireEvent.click(within(firstRun).getByRole("button", { name: "Bash" }));
+        expect(within(firstRun).getByText("the report")).toBeVisible();
+      },
+    );
+
+    it("opens no card when nothing before the answer printed output", () => {
+      const items: RenderItem[] = [
+        tool(1, "Bash", "  \n"),
+        { kind: "text", itemId: "m1", text: "The output is above.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      expect(screen.queryByRole("button", { name: "Bash" })).toBeNull();
+    });
+
+    it("splits interleaved commentary into runs when the answer points back", () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking the api.", final: true, phase: "commentary" },
+        tool(1, "shell", "api output"),
+        { kind: "text", itemId: "m1", text: "Now billing.", final: true, phase: "commentary" },
+        tool(2, "shell", "billing output"),
+        {
+          kind: "text",
+          itemId: "m2",
+          text: "The output is above.",
+          final: true,
+          phase: "final_answer",
+        },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" workedForS={4} />
+        </FileViewerContext.Provider>,
+      );
+      const folds = screen.getAllByRole("button", { name: "Worked" });
+      expect(folds).toHaveLength(2);
+      for (const fold of folds) expect(fold).toHaveAttribute("aria-expanded", "false");
+      expect(screen.getByText("Checking the api.")).toBeVisible();
+      expect(screen.getByText("Now billing.")).toBeVisible();
+      expect(screen.queryByText("api output")).toBeNull();
+      const pinned = screen.getByText("billing output");
+      expect(
+        folds[1]!.compareDocumentPosition(pinned) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        pinned.compareDocumentPosition(screen.getByText("The output is above.")) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it.each([
+      ["commentary", true],
+      ["final_answer", false],
+    ] as const)(
+      "with a %s message before an outputless run, shows the earlier output: %s",
+      (phase, revealed) => {
+        const items: RenderItem[] = [
+          tool(1, "shell", "REPORT"),
+          { kind: "text", itemId: "m0", text: "Checking the services.", final: true, phase },
+          tool(2, "shell", "  \n"),
+          {
+            kind: "text",
+            itemId: "m1",
+            text: "The output is above.",
+            final: true,
+            phase: "final_answer",
+          },
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        const folds = screen.getAllByRole("button", { name: "Worked" });
+        expect(folds).toHaveLength(2);
+        for (const fold of folds) expect(fold).toHaveAttribute("aria-expanded", "false");
+        if (!revealed) {
+          expect(screen.queryByText("REPORT")).toBeNull();
+          return;
+        }
+        const pinned = screen.getByText("REPORT");
+        expect(
+          folds[1]!.compareDocumentPosition(pinned) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+        expect(
+          pinned.compareDocumentPosition(screen.getByText("The output is above.")) &
+            Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+
+        fireEvent.click(folds[0]!);
+        const firstRun = screen.getAllByTestId("turn-worked-fold")[0]!;
+        fireEvent.click(within(firstRun).getByText("Ran 1 shell command"));
+        fireEvent.click(within(firstRun).getByRole("button", { name: "Shell" }));
+        expect(within(firstRun).getByText("REPORT")).toBeVisible();
+      },
+    );
+
     describe("with foldNarration", () => {
       it("folds narration and work behind one row, leaving the last message", () => {
         const items: RenderItem[] = [
@@ -889,6 +1255,21 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.getByText("Done.")).toBeDefined();
         expect(screen.getByText("Plan: multiply, then save.")).toBeDefined();
         expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
+      });
+
+      it("keeps narration visible when the last message points back to it", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Summary: three services checked.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "See the summary above.", final: true },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+          "aria-expanded",
+          "false",
+        );
+        expect(screen.getByText("Summary: three services checked.")).toBeVisible();
+        expect(screen.getByText("See the summary above.")).toBeVisible();
       });
 
       it("folds commentary that follows the final answer", () => {
@@ -1214,23 +1595,6 @@ describe("BlockRenderer dispatch", () => {
     });
 
     it("keeps persistent dispatch cards visible outside the fold", () => {
-      const dispatch: RenderItem = {
-        kind: "tool",
-        itemId: "fc_send",
-        execution: {
-          name: "sys_session_send",
-          arguments: { agent: "deep_thought", title: "q1" },
-          argsSummary: "",
-          callId: "c_send",
-          agentName: "nessie",
-          executedBy: "server",
-          output: "ok",
-        },
-        output: "ok",
-        state: "output-available",
-        startedAt: null,
-        duration: undefined,
-      };
       const items: RenderItem[] = [
         { kind: "text", itemId: "m0", text: "Dispatching.", final: true },
         dispatch,
