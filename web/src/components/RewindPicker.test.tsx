@@ -31,7 +31,10 @@ describe("RewindPicker", () => {
     const prompts = vi
       .spyOn(sessionsApi, "fetchRewindPrompts")
       .mockResolvedValueOnce({
-        prompts: [{ itemId: "msg_recent", text: "Add parser tests" }],
+        prompts: [
+          { itemId: "msg_recent", text: "Add parser tests" },
+          { itemId: "msg_attachment", text: "" },
+        ],
         olderCursor: "msg_cursor",
       })
       .mockRejectedValueOnce(new Error("Network down"))
@@ -52,7 +55,7 @@ describe("RewindPicker", () => {
     const loadOlder = await within(picker).findByText("Network down — try again");
     expect(search).toHaveValue("repo");
     fireEvent.change(search, { target: { value: "" } });
-    expect(rowTexts(picker)).toEqual(["Add parser tests"]);
+    expect(rowTexts(picker)).toEqual(["Add parser tests", "(attachment)"]);
     fireEvent.change(search, { target: { value: "repo" } });
     fireEvent.click(loadOlder);
 
@@ -64,10 +67,13 @@ describe("RewindPicker", () => {
     ]);
     expect(within(picker).queryByTestId("rewind-load-older")).toBeNull();
     fireEvent.click(older);
-    expect(onPick).toHaveBeenCalledExactlyOnceWith({
-      itemId: "msg_oldest",
-      text: "Set up the repo",
-    });
+    // An attachment-only prompt is listed by its label and picked by its id.
+    fireEvent.change(search, { target: { value: "" } });
+    fireEvent.click(within(picker).getByText("(attachment)"));
+    expect(onPick.mock.calls).toEqual([
+      [{ itemId: "msg_oldest", text: "Set up the repo" }],
+      [{ itemId: "msg_attachment", text: "" }],
+    ]);
   });
 
   it("moves, loads older prompts and picks one from the keyboard alone", async () => {
