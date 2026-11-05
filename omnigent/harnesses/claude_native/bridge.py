@@ -288,10 +288,13 @@ _MCP_SERVER_NAME = "omnigent"
 MANAGED_MCP_RELAY_PYTHON_ENV = "OMNIGENT_MCP_RELAY_PYTHON"
 MANAGED_MCP_RELAY_BRIDGE_DIR_ENV = "OMNIGENT_MCP_RELAY_BRIDGE_DIR"
 MANAGED_MCP_RELAY_TMPDIR_ENV = "OMNIGENT_MCP_RELAY_TMPDIR"
+# A private directory for serve-mcp's control socket; empty keeps the shared default.
+MANAGED_MCP_RELAY_SOCKET_DIR_ENV = "OMNIGENT_MCP_RELAY_SOCKET_DIR"
 MANAGED_MCP_RELAY_ENV_NAMES = (
     MANAGED_MCP_RELAY_PYTHON_ENV,
     MANAGED_MCP_RELAY_BRIDGE_DIR_ENV,
     MANAGED_MCP_RELAY_TMPDIR_ENV,
+    MANAGED_MCP_RELAY_SOCKET_DIR_ENV,
 )
 MANAGED_MCP_RELAY_MISSING_WARNING = (
     "Claude Code has an enterprise managed-mcp.json without Omnigent's relay entry; "
@@ -2422,8 +2425,24 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
     }
 
 
-def _serve_mcp_entry(python: str, bridge_dir: str, tmpdir: str) -> _JsonObject:
-    """One Claude Code MCP server entry that runs ``serve-mcp`` for a bridge directory."""
+def _serve_mcp_entry(
+    python: str, bridge_dir: str, tmpdir: str, *, socket_dir: str | None = None
+) -> _JsonObject:
+    """One Claude Code MCP server entry that runs ``serve-mcp`` for a bridge directory.
+
+    :param socket_dir: Directory for its control socket, or ``None`` for the shared
+        harness socket root.
+    """
+    from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+
+    env = {
+        "PYTHONUNBUFFERED": "1",
+        # The bridge root is derived from tempfile at import time. Keep it
+        # aligned with the runner when Claude inherits a different TMPDIR.
+        "TMPDIR": tmpdir,
+    }
+    if socket_dir is not None:
+        env[HARNESS_TMP_PARENT_ENV_VAR] = socket_dir
     return {
         "command": python,
         "args": [
@@ -2434,12 +2453,7 @@ def _serve_mcp_entry(python: str, bridge_dir: str, tmpdir: str) -> _JsonObject:
             "--bridge-dir",
             bridge_dir,
         ],
-        "env": {
-            "PYTHONUNBUFFERED": "1",
-            # The bridge root is derived from tempfile at import time. Keep it
-            # aligned with the runner when Claude inherits a different TMPDIR.
-            "TMPDIR": tmpdir,
-        },
+        "env": env,
     }
 
 
@@ -2454,23 +2468,51 @@ def managed_mcp_relay_entry() -> _JsonObject:
         f"${{{MANAGED_MCP_RELAY_PYTHON_ENV}}}",
         f"${{{MANAGED_MCP_RELAY_BRIDGE_DIR_ENV}}}",
         f"${{{MANAGED_MCP_RELAY_TMPDIR_ENV}}}",
+        # Empty when unset, which leaves serve-mcp on the shared default socket root.
+        socket_dir=f"${{{MANAGED_MCP_RELAY_SOCKET_DIR_ENV}:-}}",
     )
 
 
 def managed_mcp_relay_env(
-    bridge_dir: Path, *, python_executable: str | None = None
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+    socket_dir: Path | None = None,
 ) -> dict[str, str]:
     """Environment that points :func:`managed_mcp_relay_entry` at one session's bridge.
 
     :param bridge_dir: Bridge directory ``serve-mcp`` serves.
     :param python_executable: Python with Omnigent installed; ``None`` uses this one.
+    :param socket_dir: Private control-socket directory, e.g. one a sandbox grants;
+        ``None`` leaves serve-mcp on the shared harness socket root.
     :returns: Claude Code environment, e.g. ``{"OMNIGENT_MCP_RELAY_BRIDGE_DIR": "/tmp/x", ...}``.
     """
     return {
         MANAGED_MCP_RELAY_PYTHON_ENV: python_executable or sys.executable,
         MANAGED_MCP_RELAY_BRIDGE_DIR_ENV: str(bridge_dir),
         MANAGED_MCP_RELAY_TMPDIR_ENV: str(_TRUSTED_PARENT),
+        # Set even when empty, so an inherited value can't pick another session's.
+        MANAGED_MCP_RELAY_SOCKET_DIR_ENV: str(socket_dir) if socket_dir is not None else "",
     }
+
+
+def prepare_relay_socket_dir() -> Path:
+    """Create a short, private control-socket directory for one relay.
+
+    It sits under the harness socket root, kept short because a Unix socket path is
+    capped at 104 bytes on macOS, so a sandbox can grant this one directory rather
+    than the root that holds other sessions' sockets.
+
+    :returns: The new directory, e.g. ``/tmp/omnigent-501/r-1a2b3c4d``.
+    """
+    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
+
+    root = resolve_harness_tmp_parent()
+    root.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(root, os.getuid())
+    socket_dir = root / f"r-{secrets.token_hex(4)}"
+    _ensure_private_dir(socket_dir, os.getuid())
+    return socket_dir
 
 
 def claude_terminal_relay_env(

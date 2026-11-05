@@ -906,6 +906,7 @@ class _ManagedMcpRelay:
 
     Claude Code refuses the in-process SDK server while that file exists, so the CLI
     launches the shared ``serve-mcp`` relay itself and finds its bridge through ``env``.
+    Its control socket gets a private directory, which a sandbox can grant on its own.
     """
 
     def __init__(
@@ -914,11 +915,16 @@ class _ManagedMcpRelay:
         from omnigent.harnesses.claude_native.bridge import (
             managed_mcp_relay_env,
             prepare_acp_mcp_bridge_dir,
+            prepare_relay_socket_dir,
             start_tool_relay,
         )
 
         self._bridge_dir = prepare_acp_mcp_bridge_dir()
+        # Windows control servers listen on loopback TCP instead of a socket file.
+        self._socket_dir: pathlib.Path | None = None
         try:
+            if os.name != "nt":
+                self._socket_dir = prepare_relay_socket_dir()
             self._relay = start_tool_relay(
                 bridge_dir=self._bridge_dir,
                 tools=list(tools),
@@ -926,21 +932,31 @@ class _ManagedMcpRelay:
                 loop=loop,
             )
         except BaseException:
-            shutil.rmtree(self._bridge_dir, ignore_errors=True)
+            self._remove_dirs()
             raise
-        self.env = managed_mcp_relay_env(self._bridge_dir)
+        self.env = managed_mcp_relay_env(self._bridge_dir, socket_dir=self._socket_dir)
 
     @property
     def bridge_dir(self) -> pathlib.Path:
         """The private directory this relay's ``serve-mcp`` reads and writes."""
         return self._bridge_dir
 
+    @property
+    def socket_dir(self) -> pathlib.Path | None:
+        """The private directory for ``serve-mcp``'s control socket, if it uses one."""
+        return self._socket_dir
+
     def close(self) -> None:
-        """Stop the relay and remove its bridge directory."""
+        """Stop the relay and remove its directories."""
         try:
             self._relay.close()
         finally:
-            shutil.rmtree(self._bridge_dir, ignore_errors=True)
+            self._remove_dirs()
+
+    def _remove_dirs(self) -> None:
+        shutil.rmtree(self._bridge_dir, ignore_errors=True)
+        if self._socket_dir is not None:
+            shutil.rmtree(self._socket_dir, ignore_errors=True)
 
 
 @dataclass
@@ -1783,16 +1799,20 @@ def _client_cli_sandbox(
     *,
     managed_config_dirs: Sequence[pathlib.Path],
     bridge_dir: pathlib.Path | None,
+    socket_dir: pathlib.Path | None = None,
 ) -> SandboxPolicy:
     """The CLI sandbox for one client under an enterprise MCP config.
 
-    Bubblewrap gives the CLI a private ``/tmp`` and a fixed set of ``/etc`` paths, so
-    the managed config is granted read-only and this client's relay bridge read-write.
-    The relay root is never granted: it holds every other session's relay token.
+    Bubblewrap gives the CLI a private ``/tmp`` and a fixed set of ``/etc`` paths, and
+    Seatbelt denies writes outside its grants, so the managed config is granted
+    read-only and this client's relay bridge and control-socket directory read-write.
+    Neither shared root is granted: they hold every other session's relay token and
+    socket. A bwrap bind keeps the socket on the host, where it can be reached.
     """
     policy = with_additional_read_roots(base, managed_config_dirs)
-    if bridge_dir is not None:
-        policy = with_additional_write_roots(policy, [bridge_dir])
+    relay_dirs = [path for path in (bridge_dir, socket_dir) if path is not None]
+    if relay_dirs:
+        policy = with_additional_write_roots(policy, relay_dirs)
     return policy
 
 
@@ -2315,6 +2335,7 @@ class ClaudeSDKExecutor(Executor):
                     self._cli_sandbox,
                     managed_config_dirs=_claude_managed_config_dirs(),
                     bridge_dir=relay.bridge_dir if relay is not None else None,
+                    socket_dir=relay.socket_dir if relay is not None else None,
                 ),
             )
         except BaseException:

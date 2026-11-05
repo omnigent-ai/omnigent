@@ -4020,10 +4020,11 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
 ) -> None:
     """A relay outlives no CLI: a turn cancelled mid-reconnect evicts its client and the
     next turn recovers on a fresh relay; one whose CLI fails, hangs past the connect
-    timeout or is cancelled while connecting never keeps it; and one that fails to start
-    leaves nothing."""
+    timeout or is cancelled while connecting never keeps it; and one whose sandbox
+    launcher or relay fails to start leaves nothing."""
     from omnigent.harnesses.claude_native import bridge
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ManagedMcpRelay
+    from omnigent.inner.sandbox import SandboxPolicy
 
     _deploy_managed_mcp(tmp_path, monkeypatch, {"omnigent": bridge.managed_mcp_relay_entry()})
     status_file = tmp_path / "mcp-auth-status.json"
@@ -4130,8 +4131,41 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         assert "managed" not in executor._clients
         assert not relay_dir(stalled).exists()
 
-        # A relay that cannot start leaves no bridge directory and starts no CLI.
+        # A sandbox launcher that cannot be built stops the relay started for it.
         connect_outcome = "connects"
+        executor._real_cli_path = "/usr/bin/claude"
+        executor._cli_sandbox = SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        )
+        started: list[_ManagedMcpRelay] = []
+        relay_init = _ManagedMcpRelay.__init__
+
+        def record_relay(relay: _ManagedMcpRelay, *args: object) -> None:
+            relay_init(relay, *args)
+            started.append(relay)
+
+        def refuse_launcher(*_args: object, **_kwargs: object) -> str:
+            raise OSError("profile too large")
+
+        monkeypatch.setattr(_ManagedMcpRelay, "__init__", record_relay)
+        monkeypatch.setattr(
+            "omnigent.inner.claude_sdk_executor.create_exec_launcher", refuse_launcher
+        )
+        clients_before = len(fake_sdk.created_clients)
+        with pytest.raises(OSError, match="profile too large"):
+            [event async for event in executor.run_turn(messages, tools, "")]
+        assert len(fake_sdk.created_clients) == clients_before
+        assert "managed" not in executor._clients
+        assert len(started) == 1
+        assert not started[0].bridge_dir.exists() and not started[0].socket_dir.exists()
+        executor._cli_sandbox = None
+
+        # A relay that cannot start leaves no bridge directory and starts no CLI.
         allocated: list[Path] = []
         prepare = bridge.prepare_acp_mcp_bridge_dir
 
@@ -4168,20 +4202,46 @@ async def _managed_turn(executor, session_key: str, tools: list[dict]) -> object
     return executor._clients[session_key].client
 
 
-@pytest.mark.asyncio
-async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_only(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Under bwrap the CLI gets a private /tmp and a fixed /etc, so each CLI needs its own
-    launcher exposing the managed config and its own bridge, never another session's."""
-    from omnigent.harnesses.claude_native import bridge
+def _sandbox_grants(backend: str, policy, workspace: Path) -> tuple[set[str], set[str], str]:
+    """The (read, write) subtrees a launcher policy grants, and the full wrap text."""
+    import re
+
     from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
+    from omnigent.inner.seatbelt_sandbox import SeatbeltSandboxBackend
+
+    wrapper = BwrapSandboxBackend() if backend == "linux_bwrap" else SeatbeltSandboxBackend()
+    argv = wrapper.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], policy, workspace, target="/usr/bin/claude"
+    )
+    if backend == "linux_bwrap":
+        mounts = list(zip(argv, argv[1:], argv[2:], strict=False))
+        reads = {src for flag, src, dst in mounts if flag == "--ro-bind-try" and src == dst}
+        writes = {src for flag, src, dst in mounts if flag == "--bind-try" and src == dst}
+        return reads, writes, " ".join(argv)
+    profile = Path(argv[argv.index("-f") + 1]).read_text()
+    reads = set(re.findall(r'\(allow file-read\* \(subpath "([^"]+)"\)\)', profile))
+    writes = set(re.findall(r'\(allow file-write\* \(subpath "([^"]+)"\)\)', profile))
+    return reads, writes, profile
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["linux_bwrap", "darwin_seatbelt"])
+async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, backend: str
+) -> None:
+    """A sandboxed CLI can reach only its own relay: bwrap gives it a private /tmp and a
+    fixed /etc, and Seatbelt denies writes outside its grants, so each CLI's launcher
+    grants the managed config, its own bridge and its own control-socket directory, and
+    never another session's or a shared root."""
+    from omnigent.harnesses.claude_native import bridge
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.sandbox import SandboxPolicy
 
     _deploy_managed_mcp(tmp_path, monkeypatch, {"omnigent": bridge.managed_mcp_relay_entry()})
-    managed_dir = (tmp_path / "etc-claude-code").resolve()
+    socket_root = tmp_path / "sockets"
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(socket_root))
+    managed_dir = str((tmp_path / "etc-claude-code").resolve())
     workspace = tmp_path / "work"
     workspace.mkdir()
     launchers: dict[str, SandboxPolicy] = {}
@@ -4193,7 +4253,7 @@ async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_o
         return str(path)
 
     base = SandboxPolicy(
-        backend_type="linux_bwrap",
+        backend_type=backend,
         active=True,
         read_roots=None,
         write_roots=[],
@@ -4210,7 +4270,7 @@ async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_o
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap", allow_network=True),
+            sandbox=OSEnvSandboxSpec(type=backend, allow_network=True),
         )
     )
     base_launcher = executor._cli_path
@@ -4218,31 +4278,132 @@ async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_o
     async def tool_executor(name: str, arguments: dict) -> dict:
         return {}
 
+    def relay_dirs(client) -> tuple[str, str]:
+        env = client.options.env
+        return (
+            str(Path(env[bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV]).resolve()),
+            str(Path(env[bridge.MANAGED_MCP_RELAY_SOCKET_DIR_ENV]).resolve()),
+        )
+
     executor._tool_executor = tool_executor
     tools = [{"name": "sys_ping", "parameters": {"type": "object", "properties": {}}}]
     with patch(f"{prefix}._ensure_sdk", return_value=_make_recovery_fake_sdk()):
         clients = {key: await _managed_turn(executor, key, tools) for key in ("one", "two")}
         for key, client in clients.items():
-            other = clients["two" if key == "one" else "one"]
             assert client.options.cli_path != base_launcher
-            own_dir = Path(client.options.env[bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV]).resolve()
-            other_dir = Path(other.options.env[bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV]).resolve()
-            argv = BwrapSandboxBackend().wrap_launcher_argv(
-                [sys.executable, "-c", "pass"],
-                launchers[client.options.cli_path],
-                workspace,
-                target="/usr/bin/claude",
+            own_bridge, own_socket = relay_dirs(client)
+            other_bridge, other_socket = relay_dirs(clients["two" if key == "one" else "one"])
+            reads, writes, text = _sandbox_grants(
+                backend, launchers[client.options.cli_path], workspace
             )
-            mounts = list(zip(argv, argv[1:], argv[2:], strict=False))
-            assert ("--bind-try", str(own_dir), str(own_dir)) in mounts
-            assert ("--ro-bind-try", str(managed_dir), str(managed_dir)) in mounts
-            # Other sessions' relay tokens stay out of reach, as does the relay root.
-            assert str(other_dir) not in argv
-            assert str(own_dir.parent) not in argv
+            assert {own_bridge, own_socket} <= writes
+            assert managed_dir in reads
+            # Other sessions' relay tokens and sockets stay out of reach, as do the roots.
+            assert other_bridge not in text and other_socket not in text
+            shared_roots = {str(Path(own_bridge).parent), str(socket_root.resolve())}
+            assert not shared_roots & (reads | writes)
         launcher = Path(clients["one"].options.cli_path)
+        own_bridge, own_socket = relay_dirs(clients["one"])
         await executor.close_session("one")
         assert not launcher.exists()
+        assert not Path(own_bridge).exists() and not Path(own_socket).exists()
         await executor.close_session("two")
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not shutil.which("sandbox-exec"), reason="needs macOS Seatbelt"
+)
+def test_seatbelt_relay_answers_with_its_control_socket_dir_still_uncreated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Seatbelt denies writes outside the launcher's grants, so ``serve-mcp`` must find
+    its control-socket directory already granted rather than create the shared root."""
+    import asyncio
+    import re
+
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.claude_sdk_executor import _client_cli_sandbox, _ManagedMcpRelay
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import (
+        create_exec_launcher,
+        resolve_sandbox,
+        with_additional_read_roots,
+    )
+
+    # Short, because a Unix socket path is capped at 104 bytes on macOS.
+    scratch = Path(tempfile.mkdtemp(prefix="og-", dir="/tmp"))
+    socket_root = scratch / "s"
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(socket_root))
+    workspace = scratch / "w"
+    workspace.mkdir()
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt", allow_network=True),
+    )
+    # The checkout is an editable install outside the venv; grant it as an install would be.
+    base = with_additional_read_roots(
+        resolve_sandbox(spec, workspace), [Path(__file__).resolve().parents[2]]
+    )
+    loop = asyncio.new_event_loop()
+
+    async def tool_executor(name: str, arguments: dict) -> dict:
+        return {}
+
+    tools = [{"name": "sys_ping", "description": "Ping.", "parameters": {"type": "object"}}]
+    relay = _ManagedMcpRelay(tools, tool_executor, loop)
+    launcher = None
+    try:
+        policy = _client_cli_sandbox(
+            base,
+            managed_config_dirs=[],
+            bridge_dir=relay.bridge_dir,
+            socket_dir=relay.socket_dir,
+        )
+        # The sandboxed CLI starts the entry's command with the entry's env on top of
+        # its own, so the launcher runs ``env`` to apply it after the sandbox's setup.
+        launcher = create_exec_launcher("/usr/bin/env", policy)
+        entry = bridge.managed_mcp_relay_entry()
+        env = {**os.environ, **relay.env}
+
+        def expand(value: str) -> str:
+            return re.sub(
+                r"\$\{(\w+)(?::-([^}]*))?\}",
+                lambda match: env.get(match.group(1)) or match.group(2) or "",
+                value,
+            )
+
+        child = subprocess.Popen(
+            [
+                launcher,
+                *(f"{key}={expand(value)}" for key, value in entry["env"].items()),
+                expand(entry["command"]),
+                *(expand(arg) for arg in entry["args"]),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            env=env,
+            cwd=workspace,
+        )
+        try:
+            write_json_line(
+                child.stdin, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+            )
+            assert "result" in read_json_line(child.stdout, timeout_s=30)
+            write_json_line(
+                child.stdin, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+            )
+            listed = read_json_line(child.stdout, timeout_s=30)["result"]["tools"]
+            assert [tool["name"] for tool in listed] == ["sys_ping"]
+        finally:
+            stop_process(child)
+    finally:
+        relay.close()
+        loop.close()
+        if launcher is not None:
+            os.unlink(launcher)
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 @pytest.mark.skipif(
