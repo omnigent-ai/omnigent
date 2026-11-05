@@ -75,6 +75,7 @@ import {
   SquareCheckIcon,
   Trash2Icon,
   UserRoundIcon,
+  UsersIcon,
   WalletIcon,
   XIcon,
   type LucideIcon,
@@ -5162,11 +5163,13 @@ function ConversationRowImpl({
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
+  // The server reports `shared_with_others` only to the owner; absent means not shared.
+  const showSharedIndicator = isOwner && conversation.shared_with_others === true;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
-  const hasTrailingIndicator = hasSessionIndicator || showUpdated;
+  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -5428,12 +5431,18 @@ function ConversationRowImpl({
         // rest, before hover reveals the controls.
         !selectionMode &&
           (sessionState?.kind === "awaiting"
-            ? "pr-29"
+            ? showSharedIndicator
+              ? "pr-36"
+              : "pr-29"
             : showUpdated
-              ? "pr-11"
-              : hasTrailingIndicator
-                ? "pr-8"
-                : "pr-2"),
+              ? showSharedIndicator
+                ? "pr-18"
+                : "pr-11"
+              : hasSessionIndicator && showSharedIndicator
+                ? "pr-14"
+                : hasTrailingIndicator
+                  ? "pr-8"
+                  : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -5674,6 +5683,20 @@ function ConversationRowImpl({
           <SessionUpdatedLabel updatedAt={conversation.updated_at} />
         </span>
       ) : null}
+      {!selectionMode && showSharedIndicator && (
+        <span
+          role="img"
+          aria-label="Shared session"
+          title="Shared with others"
+          className={cn(
+            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+            overlayTop,
+            hasSessionIndicator ? "right-8" : showUpdated ? "right-11" : "right-1",
+          )}
+        >
+          <UsersIcon className="size-3.5" aria-hidden="true" />
+        </span>
+      )}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
           row, so their spacing is defined once (gap-0.5) and stays aligned
           with the project-folder header actions, which use the same pattern.
@@ -6026,6 +6049,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "background_work_running",
   "blocked_on",
   "provisional",
+  "shared_with_others",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {

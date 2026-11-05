@@ -5,7 +5,8 @@ import { useLoadedConversations } from "@/hooks/useSidebarData";
  */
 
 import { useMemo } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { PINNED_CONVERSATIONS_KEY } from "@/hooks/useConversations";
 import {
   type Permission,
   derivePermissionLevel,
@@ -53,26 +54,33 @@ export function useSessionOwner(sessionId: string | null) {
   });
 }
 
-/** Grant or update a permission. Invalidates the permissions list on success. */
+/**
+ * Refetch the grants and every session list after a share change, so rows pick up
+ * the server's `shared_with_others`. Invalidation also restarts in-flight reads.
+ */
+function invalidateAfterShareChange(qc: QueryClient, sessionId: string): void {
+  void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
+  void qc.invalidateQueries({ queryKey: ["conversations"] });
+  void qc.invalidateQueries({ queryKey: ["project-sessions"] });
+  void qc.invalidateQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
+}
+
+/** Grant or update a permission. Invalidates the grants and session lists on success. */
 export function useGrantPermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ userId, level }: { userId: string; level: number }) =>
       grantPermission(sessionId, userId, level),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
-    },
+    onSuccess: () => invalidateAfterShareChange(qc, sessionId),
   });
 }
 
-/** Revoke a permission. Invalidates the permissions list on success. */
+/** Revoke a permission. Invalidates the grants and session lists on success. */
 export function useRevokePermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (userId: string) => revokePermission(sessionId, userId),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
-    },
+    onSuccess: () => invalidateAfterShareChange(qc, sessionId),
   });
 }
 

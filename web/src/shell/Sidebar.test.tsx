@@ -434,6 +434,79 @@ describe("Sidebar session list", () => {
     expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
   });
 
+  it("marks the viewer's own sessions only when the server says they're shared", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      mockConversations([
+        conv("owned_shared", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: true,
+        }),
+        conv("owned_shared_running", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: true,
+          status: "running",
+        }),
+        conv("owned_private", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: false,
+        }),
+        // Older servers omit the field; an owned row then shows no icon.
+        conv("owned_legacy", "Claude Code", { owner: "viewer@example.com" }),
+      ]);
+      renderSidebar();
+      selectSessionFilter("all");
+
+      const sharedRow = screen.getByText("owned_shared").closest("li")!;
+      const icon = within(sharedRow).getByRole("img", { name: "Shared session" });
+      expect(icon).toHaveAttribute("title", "Shared with others");
+      expect(icon).toHaveClass("right-1");
+      // The icon sits left of the session state, which keeps the rightmost slot.
+      const runningRow = screen.getByText("owned_shared_running").closest("li")!;
+      expect(within(runningRow).getByRole("img", { name: "Shared session" })).toHaveClass(
+        "right-8",
+      );
+      expect(within(runningRow).getByTestId("session-state-badge").parentElement).toHaveClass(
+        "right-1",
+      );
+      const privateRow = screen.getByText("owned_private").closest("li")!;
+      expect(within(privateRow).queryByRole("img", { name: "Shared session" })).toBeNull();
+      const legacyRow = screen.getByText("owned_legacy").closest("li")!;
+      expect(within(legacyRow).queryByRole("img", { name: "Shared session" })).toBeNull();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
+  it("re-renders a rendered row when its shared flag flips", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      const row = (shared: boolean) =>
+        conv("owned", "Claude Code", { owner: "viewer@example.com", shared_with_others: shared });
+      mockConversations([row(false)]);
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = () => (
+        <QueryClientProvider client={qc}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/"]}>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree());
+      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+
+      mockConversations([row(true)]);
+      rerender(tree());
+      expect(screen.getByRole("img", { name: "Shared session" })).toBeInTheDocument();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);
     renderSidebar();

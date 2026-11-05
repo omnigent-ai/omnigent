@@ -274,6 +274,11 @@ export interface Conversation {
    */
   pull_requests_synced?: boolean | null;
   /**
+   * Whether the viewer owns this session and has shared it with anyone else.
+   * Absent for non-owners and on older servers; treat absent as "not shared".
+   */
+  shared_with_others?: boolean | null;
+  /**
    * The requesting user's "last seen" wall-clock baseline (seconds) for
    * this session, or null/undefined when they've never seen it. Per-viewer,
    * served by the per-user read-state cache; the sidebar's unread dot shows

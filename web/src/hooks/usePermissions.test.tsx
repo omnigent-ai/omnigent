@@ -15,16 +15,28 @@ vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTest
 // and the loading-is-permissive invariant directly, without standing
 // up a QueryClient or re-testing the resolution order.
 
-import { renderHook } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook } from "@testing-library/react";
 import type { Conversation } from "./useConversations";
+import type * as ConversationsModule from "./useConversations";
+import type * as PermissionsApiModule from "@/lib/permissionsApi";
 import type { Session } from "@/lib/types";
 
-vi.mock("./useConversations", () => ({ useConversations: vi.fn() }));
+vi.mock("./useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof ConversationsModule>()),
+  useConversations: vi.fn(),
+}));
 vi.mock("./useSession", () => ({ useSession: vi.fn() }));
+vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof PermissionsApiModule>()),
+  grantPermission: vi.fn().mockResolvedValue({}),
+  revokePermission: vi.fn().mockResolvedValue(undefined),
+}));
 
-import { useConversations } from "./useConversations";
+import { PINNED_CONVERSATIONS_KEY, useConversations } from "./useConversations";
 import { useSession } from "./useSession";
-import { useCanEdit } from "./usePermissions";
+import { useCanEdit, useGrantPermission, useRevokePermission } from "./usePermissions";
 
 const useConversationsMock = vi.mocked(useConversations);
 const useSessionMock = vi.mocked(useSession);
@@ -131,5 +143,35 @@ describe("useCanEdit — safe defaults", () => {
     // sidebar settles. derivePermissionLevel returns null → permissive.
     setHooks({ session: null, sessionLoading: false, conversations: undefined });
     expect(renderHook(() => useCanEdit("conv_1")).result.current).toBe(true);
+  });
+});
+
+describe("share mutations refresh the session lists", () => {
+  function renderWithClient<T>(hook: () => T) {
+    const qc = new QueryClient();
+    const invalidate = vi.spyOn(qc, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+    return { invalidate, result: renderHook(hook, { wrapper }).result };
+  }
+  // The server owns `shared_with_others`; refetching the lists is how rows pick it up.
+  const expectedKeys = [
+    ["permissions", "conv_1"],
+    ["conversations"],
+    ["project-sessions"],
+    PINNED_CONVERSATIONS_KEY,
+  ];
+
+  it("grant invalidates the grants and every session list", async () => {
+    const { invalidate, result } = renderWithClient(() => useGrantPermission("conv_1"));
+    await act(() => result.current.mutateAsync({ userId: "bob", level: 1 }));
+    expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(expectedKeys);
+  });
+
+  it("revoke invalidates the grants and every session list", async () => {
+    const { invalidate, result } = renderWithClient(() => useRevokePermission("conv_1"));
+    await act(() => result.current.mutateAsync("bob"));
+    expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(expectedKeys);
   });
 });
