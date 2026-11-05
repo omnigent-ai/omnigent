@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import time
@@ -899,6 +900,43 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
+class _ManagedMcpRelay:
+    """Omnigent's tools served to one CLI through the ``omnigent`` entry in ``managed-mcp.json``.
+
+    Claude Code refuses the in-process SDK server while that file exists, so the CLI
+    launches the shared ``serve-mcp`` relay itself and finds its bridge through ``env``.
+    """
+
+    def __init__(
+        self, tools: list[ToolSpec], tool_executor: ToolExecutor, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        from omnigent.harnesses.claude_native.bridge import (
+            managed_mcp_relay_env,
+            prepare_acp_mcp_bridge_dir,
+            start_tool_relay,
+        )
+
+        self._bridge_dir = prepare_acp_mcp_bridge_dir()
+        try:
+            self._relay = start_tool_relay(
+                bridge_dir=self._bridge_dir,
+                tools=list(tools),
+                tool_executor=tool_executor,
+                loop=loop,
+            )
+        except BaseException:
+            shutil.rmtree(self._bridge_dir, ignore_errors=True)
+            raise
+        self.env = managed_mcp_relay_env(self._bridge_dir)
+
+    def close(self) -> None:
+        """Stop the relay and remove its bridge directory."""
+        try:
+            self._relay.close()
+        finally:
+            shutil.rmtree(self._bridge_dir, ignore_errors=True)
+
+
 @dataclass
 class _ClaudeClientState:
     client: _ClaudeClient
@@ -908,6 +946,15 @@ class _ClaudeClientState:
     effort: str | None = None
     # Host-reported account state of each Claude MCP server when last checked.
     mcp_auth: dict[str, str] = field(default_factory=dict)
+    # Serves Omnigent's tools to this client's CLI under an enterprise MCP config.
+    mcp_relay: _ManagedMcpRelay | None = None
+
+
+async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
+    """Stop the relay of a client whose CLI has gone; its shutdown blocks briefly."""
+    if state.mcp_relay is not None:
+        relay, state.mcp_relay = state.mcp_relay, None
+        await asyncio.to_thread(relay.close)
 
 
 def _claude_mcp_auth_statuses() -> dict[str, str]:
@@ -2216,6 +2263,12 @@ class ClaudeSDKExecutor(Executor):
         if state is None:
             return
         try:
+            await self._disconnect_client_state(session_key, state)
+        finally:
+            await _close_managed_mcp_relay(state)
+
+    async def _disconnect_client_state(self, session_key: str, state: _ClaudeClientState) -> None:
+        try:
             current_loop = asyncio.get_running_loop()
             current_task = asyncio.current_task()
         except RuntimeError:
@@ -2255,9 +2308,15 @@ class ClaudeSDKExecutor(Executor):
             return
         # Close in the background: an await here runs under an in-flight
         # cancellation and could itself be cancelled, leaking the CLI process.
-        task = asyncio.create_task(self._force_close_client(state.client))
+        task = asyncio.create_task(self._force_close_evicted_client(state))
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
+
+    async def _force_close_evicted_client(self, state: _ClaudeClientState) -> None:
+        try:
+            await self._force_close_client(state.client)
+        finally:
+            await _close_managed_mcp_relay(state)
 
     async def _evict_terminated_client(self, session_key: str) -> None:
         """Discard a cached client after its CLI child exits."""
@@ -2926,19 +2985,34 @@ class ClaudeSDKExecutor(Executor):
                 resume_session = False
                 prompt = self._build_prompt(messages, resume_session=False)
 
-        # Build MCP tools from Omnigent tool schemas
-        mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
+        from omnigent.harnesses.claude_native.bridge import (
+            MANAGED_MCP_RELAY_MISSING_WARNING,
+            managed_mcp_relay_configured,
+        )
+        from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
         # Create MCP server config for Omnigent tools. The SDK's
         # ``McpServerConfig`` union is opaque to us — we pass through
         # whatever ``create_sdk_mcp_server`` returns.
         mcp_servers: dict[str, Any] = {}  # type: ignore[explicit-any]
-        if mcp_tools:
+        # Tools a new client's CLI reaches through the managed relay entry instead.
+        managed_relay_tools: list[ToolSpec] | None = None
+        omnigent_tools_reachable = bool(tools)
+        if tools and claude_code_managed_mcp_present():
+            # Claude Code refuses --mcp-config while an enterprise MCP config exists.
+            if not managed_mcp_relay_configured():
+                if session_key not in self._clients:
+                    logger.warning(MANAGED_MCP_RELAY_MISSING_WARNING)
+            elif self._tool_executor is not None:
+                managed_relay_tools = tools
+            omnigent_tools_reachable = managed_relay_tools is not None
+        elif tools:
             mcp_servers["omnigent"] = sdk.create_sdk_mcp_server(
                 name="omnigent",
                 version="1.0.0",
-                tools=mcp_tools,
+                tools=_build_mcp_tools(tools, self._tool_executor),
             )
+        if omnigent_tools_reachable:
             system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
                 system_prompt,
                 tools,
@@ -3309,12 +3383,30 @@ class ClaudeSDKExecutor(Executor):
                 compacted_messages=compacted_messages,
             )
 
-        client = await self._get_or_create_client(
-            sdk,
-            session_key=session_key,
-            options=options,
-            model=model,
-        )
+        mcp_relay = None
+        if (
+            managed_relay_tools is not None
+            and self._tool_executor is not None
+            and session_key not in self._clients
+        ):
+            # Only a new CLI reads the relay environment; a live one keeps its relay.
+            mcp_relay = _ManagedMcpRelay(
+                managed_relay_tools, self._tool_executor, asyncio.get_running_loop()
+            )
+            options.env.update(mcp_relay.env)
+        try:
+            client = await self._get_or_create_client(
+                sdk,
+                session_key=session_key,
+                options=options,
+                model=model,
+            )
+        except BaseException:
+            if mcp_relay is not None:
+                await asyncio.to_thread(mcp_relay.close)
+            raise
+        if mcp_relay is not None:
+            self._clients[session_key].mcp_relay = mcp_relay
 
         # ── LLM_REQUEST policy evaluation ────────────────────────
         # If the executor adapter installed a ``_policy_evaluator``

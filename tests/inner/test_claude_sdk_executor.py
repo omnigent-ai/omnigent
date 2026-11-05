@@ -3886,6 +3886,127 @@ async def test_mcp_servers_signed_in_mid_session_reconnect_before_the_next_turn(
         close.assert_awaited_with(third)
 
 
+def _serve_mcp_round_trip(entry: dict[str, object], env: dict[str, str], tool: str) -> list[dict]:
+    """Run a Claude Code MCP entry as Claude Code would, expanding ``${VAR}``s from ``env``."""
+    import re
+    import subprocess
+
+    def expand(value: str) -> str:
+        return re.sub(r"\$\{(\w+)\}", lambda match: env[match.group(1)], value)
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": tool}},
+    ]
+    process_env = {**os.environ, **{k: expand(v) for k, v in entry["env"].items()}}
+    process = subprocess.Popen(
+        [expand(entry["command"]), *(expand(arg) for arg in entry["args"])],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=process_env,
+    )
+    replies: list[dict] = []
+    try:
+        # serve-mcp cancels in-flight calls when stdin closes, so keep it open until done.
+        for request in requests:
+            process.stdin.write(json.dumps(request) + "\n")
+            process.stdin.flush()
+            while not replies or replies[-1].get("id") != request["id"]:
+                replies.append(json.loads(process.stdout.readline()))
+    finally:
+        process.stdin.close()
+        process.wait(timeout=30)
+    return replies
+
+
+def _deploy_managed_mcp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, servers: dict[str, object]
+) -> None:
+    managed_dir = tmp_path / "etc-claude-code"
+    managed_dir.mkdir(exist_ok=True)
+    (managed_dir / "managed-mcp.json").write_text(json.dumps({"mcpServers": servers}))
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed_dir / "managed-settings.json",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Claude Code refuses ``--mcp-config`` under ``managed-mcp.json``; the static entry
+    reaches the session's tools instead, and without it the session starts tool-less."""
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    entry = bridge.managed_mcp_relay_entry()
+    _deploy_managed_mcp(tmp_path, monkeypatch, {"omnigent": entry})
+    tools = [
+        {
+            "name": "sys_ping",
+            "description": "Ping.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+    called: list[str] = []
+
+    async def tool_executor(name: str, arguments: dict) -> dict:
+        called.append(name)
+        return {"result": "pong"}
+
+    fake_sdk = _make_recovery_fake_sdk()
+    fake_sdk.tool = _SDKTools.tool
+    fake_sdk.create_sdk_mcp_server = _SDKTools.create_sdk_mcp_server
+    executor = ClaudeSDKExecutor()
+    executor._tool_executor = tool_executor
+    messages: list[dict[str, object]] = []
+
+    async def turn(text: str):
+        messages.append({"role": "user", "content": text, "session_id": "managed"})
+        events = [event async for event in executor.run_turn(messages, tools, "Be terse.")]
+        assert not [event for event in events if isinstance(event, ExecutorError)]
+        messages.append({"role": "assistant", "content": f"answer to {text}"})
+        return executor._clients["managed"].client
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.logger.warning",
+        lambda message, *args, **kwargs: warnings.append(str(message)),
+    )
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        first = await turn("q0")
+        assert first.options.mcp_servers == {}
+        relay_env = {
+            key: value for key, value in first.options.env.items() if key.startswith("OMNIGENT_")
+        }
+        bridge_dir = Path(relay_env[bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV])
+        replies = await asyncio.to_thread(_serve_mcp_round_trip, entry, relay_env, "sys_ping")
+        listed = next(reply for reply in replies if reply.get("id") == 2)["result"]["tools"]
+        assert [tool["name"] for tool in listed] == ["sys_ping"]
+        result = next(reply for reply in replies if reply.get("id") == 3)["result"]
+        assert "pong" in json.dumps(result)
+        assert called == ["sys_ping"]
+        assert "mcp__omnigent__" in first.options.system_prompt
+        # The live CLI keeps its relay; closing the session stops it.
+        assert await turn("q1") is first
+        await executor.close_session("managed")
+        assert not bridge_dir.exists()
+        assert warnings == []
+
+        # Without the entry nothing reaches the tools, so none are promised to the model.
+        _deploy_managed_mcp(tmp_path, monkeypatch, {"linear": {"url": "https://l.example/mcp"}})
+        messages.clear()
+        bare = await turn("q2")
+        assert bare.options.mcp_servers == {}
+        assert bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV not in bare.options.env
+        assert "mcp__omnigent__" not in (bare.options.system_prompt or "")
+        assert warnings == [bridge.MANAGED_MCP_RELAY_MISSING_WARNING]
+        await executor.close_session("managed")
+
+
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
     """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
     against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd
