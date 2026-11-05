@@ -3148,9 +3148,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         };
         setterFor(draftSessionId)((s) => {
           const waiting = s.failedSendDraft;
-          // Messages a failed launch handed back meanwhile may still wait for the composer.
-          const handedBack = waiting?.recovered === true && waiting.stableId === undefined;
-          return { failedSendDraft: handedBack ? joinFailedSendDrafts(waiting, failed) : failed };
+          // Handed-back messages, or a failed resend holding them, may still wait for the composer.
+          const keepsWaiting =
+            (waiting?.recovered === true && waiting.stableId === undefined) ||
+            (waiting?.startupInputIds?.length ?? 0) > 0;
+          return { failedSendDraft: keepsWaiting ? joinFailedSendDrafts(waiting, failed) : failed };
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:

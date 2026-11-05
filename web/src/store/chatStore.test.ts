@@ -4284,28 +4284,47 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(blocks.at(-1)).toBe(notices[0]);
   });
 
-  it.each([
-    { outcome: "denied", resend: "resend", command: false, refused: false, via: "send" },
-    {
-      outcome: "denied",
-      resend: "skill-command resend",
-      command: true,
-      refused: false,
-      via: "send",
-    },
-    { outcome: "refused", resend: "resend", command: false, refused: true, via: "send" },
-    {
-      outcome: "refused",
-      resend: "skill-command resend",
-      command: true,
-      refused: true,
-      via: "send",
-    },
-    { outcome: "denied", resend: "resend", command: false, refused: false, via: "message" },
-    { outcome: "refused", resend: "resend", command: false, refused: true, via: "message" },
-  ])(
-    "doesn't name the startup inputs a $outcome $resend took back in a $via queued behind it",
-    async ({ command, refused, via }) => {
+  it.each(
+    [
+      { outcome: "denied", resend: "resend", command: false, refused: false, via: "send" },
+      {
+        outcome: "denied",
+        resend: "skill-command resend",
+        command: true,
+        refused: false,
+        via: "send",
+      },
+      { outcome: "refused", resend: "resend", command: false, refused: true, via: "send" },
+      {
+        outcome: "refused",
+        resend: "skill-command resend",
+        command: true,
+        refused: true,
+        via: "send",
+      },
+      { outcome: "denied", resend: "resend", command: false, refused: false, via: "message" },
+      { outcome: "refused", resend: "resend", command: false, refused: true, via: "message" },
+      {
+        outcome: "refused",
+        resend: "resend",
+        command: false,
+        refused: true,
+        via: "send",
+        behind: "refused",
+      },
+      {
+        outcome: "refused",
+        resend: "skill-command resend",
+        command: true,
+        refused: true,
+        via: "send",
+        behind: "refused",
+      },
+    ].map((row) => ({ behind: "accepted", ...row })),
+  )(
+    "doesn't name the startup inputs a $outcome $resend took back in a $via queued behind it that is $behind",
+    async ({ command, refused, via, behind }) => {
+      const behindRefused = behind === "refused";
       onTestFinished(clearSessionDrafts);
       seedSession("conv_real");
       failManagedLaunch("conv_real", "saved on server");
@@ -4330,6 +4349,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
                     : mockResponse({ queued: false, denied: true }),
                 );
             });
+          if (posts.length === 2 && behindRefused)
+            return Promise.resolve(
+              mockResponse(
+                { error: { code: "conflict", message: "Rejected" } },
+                { ok: false, status: 409 },
+              ),
+            );
         }
         return defaultFetchHandler(input, init);
       });
@@ -4358,10 +4384,14 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       expect(posts).toHaveLength(2);
       expect(posts[0]).toMatchObject({ replaces_failed_inputs: ["pending_first"] });
       expect(posts[1]).not.toHaveProperty("replaces_failed_inputs");
+      const resent = command && refused ? "/review saved on server" : "saved on server";
+      // A refused send behind the resend waits with it rather than replacing it.
       expect(useChatStore.getState().failedSendDraft).toMatchObject({
-        text: command && refused ? "/review saved on server" : "saved on server",
+        text: behindRefused ? `${resent}\n\nsomething else` : resent,
         startupInputIds: ["pending_first"],
       });
+      await useChatStore.getState().send("unrelated", "agent_xyz");
+      expect(posts.at(-1)).not.toHaveProperty("replaces_failed_inputs");
     },
   );
 
