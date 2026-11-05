@@ -67,7 +67,7 @@ to customize.
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
   failures still allow Default.
-- `trigger-controls`: with `automation_trigger_ui` enabled by default, continued trigger templates
+- `trigger-controls`: continued trigger templates
   show polling cadence instead of schedule controls, Run now, or next-run times.
   New templates use `automation_trigger_poll_minutes` from the server (10–240 minutes,
   default 10), otherwise hourly when the requested cadence is unsupported; saved
@@ -87,7 +87,7 @@ to customize.
   keep one session, and editing keeps only the reset to a new session.
 - `responsive`: gallery items have icons, descriptions, access requirements,
   pointer cursors, and keyboard focus indicators. Continued trigger cadence is
-  fixed when `automation_trigger_ui` is enabled; other tasks expose schedule controls.
+  fixed; other tasks expose schedule controls.
   Host occupies a full row above Schedule. Project and Workspace (or Repository)
   share a row on desktop and stack on narrow screens. Gallery cards use two
   columns on desktop and one on narrow screens.
@@ -120,11 +120,10 @@ host; run it with plain pytest and `--ui-skip-build` after building the SPA.
 No agent turn is needed.
 Minute-schedule checks use the server’s advertised sub-hour capability and `automations_v2`.
 
-- `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`
+- `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`
   covers the preview and Templates tab with reload. It creates
   a Jira automation and cross-checks the saved schedule and prompt through REST
-  with trigger controls enabled and disabled. With the flag enabled, it also
-  converts a template to new-session mode and verifies schedule controls, list
+  with trigger controls always active. It also converts a template to new-session mode and verifies schedule controls, list
   Run now/next-run, and detail Run now/next-run remain available.
   The mobile preview uses equals with one project; the desktop Templates path selects in with two
   comma-separated projects and verifies that both appear in the saved query.
@@ -184,7 +183,7 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 ## Gotchas
 
 - Templates poll every hour, or every ten minutes for new templates with
-  `automation_trigger_ui` and sub-hour support enabled. The server can configure
+  sub-hour support enabled. The server can configure
   new-template polling from 10 to 240 minutes; they do not receive webhooks.
 - Templates remain available even if loading the user's automation list fails.
 - Selecting a template does not create an automation until the modal is submitted.

@@ -2529,7 +2529,7 @@ describe("CreateScheduledTaskDialog session mode", () => {
           }),
         }),
         {
-          features: { automations_v2: true, automation_trigger_ui: trigger },
+          features: { automations_v2: true },
           automation_trigger_poll_minutes: 240,
           ...(supported === undefined ? {} : { scheduled_task_subhour: supported }),
         },
@@ -2676,7 +2676,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     "uses server polling $configured with subhour support $subhour",
     async ({ configured, subhour, minutes }) => {
       renderTrigger("jira", {
-        features: { automations_v2: true, automation_trigger_ui: true },
+        features: { automations_v2: true },
         scheduled_task_subhour: subhour,
         automation_trigger_poll_minutes: configured,
       });
@@ -2695,7 +2695,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
 
   it("restores schedule controls after converting a template to new-session mode", async () => {
     renderTrigger("jira", {
-      features: { automations_v2: true, automation_trigger_ui: true },
+      features: { automations_v2: true },
       scheduled_task_subhour: true,
     });
     fillJira();
@@ -2718,7 +2718,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");
     expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where project");
-    expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every hour");
+    expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Hourly");
     // The trigger always keeps one session, so the form doesn't ask.
     expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
     expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(

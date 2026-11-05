@@ -61,7 +61,7 @@ import {
   formatRunTimestamp,
 } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
+import { sandboxOptionLabel } from "@/lib/capabilities";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
 import { cn } from "@/lib/utils";
@@ -276,10 +276,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
     );
   }
 
-  const triggerMode =
-    isFeatureEnabled(info, "automation_trigger_ui") &&
-    task.sessionMode === "continue" &&
-    isTriggerPrompt(task.prompt);
+  const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const paused = task.state === "paused";
   const { userPrompt, systemPrompt } = splitTriggerPrompt(task.prompt);
   const permissionOption = nativePermissionOptions(harness).find(

@@ -70,7 +70,6 @@ export type FeatureKey =
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"
-  | "automation_trigger_ui"
   | "splittable_terminal_view_ui"
   | "session_orchestration";
 

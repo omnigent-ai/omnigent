@@ -37,7 +37,6 @@ class Feature(StrEnum):
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
-    AUTOMATION_TRIGGER_UI = "automation_trigger_ui"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
 
 
@@ -54,13 +53,6 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
-    FeatureDefinition(
-        feature=Feature.AUTOMATION_TRIGGER_UI,
-        description="Trigger-focused automation controls and server-configured polling defaults",
-        owner="server",
-        review_by_release="0.23.0",
-        default_enabled=True,
-    ),
     FeatureDefinition(
         feature=Feature.CODEX_PLAN_AT_LAUNCH,
         description="Start Codex in Plan mode with host compatibility checks",

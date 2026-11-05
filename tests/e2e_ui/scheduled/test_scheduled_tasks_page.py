@@ -1005,28 +1005,13 @@ def test_scheduled_task_create_persists_continuing_one_session(
 
 @pytest.mark.usefixtures("automations_v2_host")
 @pytest.mark.parametrize("entry", ["preview", "templates"])
-@pytest.mark.parametrize(
-    "automations_v2_server",
-    ["automations_v2,-automation_trigger_ui", "automations_v2"],
-    indirect=True,
-)
-def test_scheduled_task_trigger_template_creates_hourly_manager_task(
+def test_scheduled_task_trigger_template_creates_polling_manager_task(
     page: Page,
     automations_v2_server: str,
     entry: str,
-    request: pytest.FixtureRequest,
 ) -> None:
     """Create from either gallery and edit user/system prompts independently."""
     live_server = automations_v2_server
-    trigger_ui = "-automation_trigger_ui" not in request.node.callspec.params[
-        "automations_v2_server"
-    ].split(",")
-    assert (
-        httpx.get(f"{live_server}/v1/info", timeout=10)
-        .json()["features"]
-        .get("automation_trigger_ui", False)
-        == trigger_ui
-    )
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
     scope = "ES, OPS" if entry == "templates" else "ES"
     project_query = 'project in ("ES", "OPS")' if entry == "templates" else 'project = "ES"'
@@ -1096,12 +1081,9 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     automation_projects = [p for p in projects if p["name"] == "Omnigent Automation"]
     assert len(automation_projects) == 1
     assert created["project_id"] == automation_projects[0]["id"]
-    assert created["rrule"].startswith(
-        "FREQ=MINUTELY;INTERVAL=10" if trigger_ui else "FREQ=HOURLY"
-    ), created
-    if trigger_ui:
-        expect(_row_by_name(page, name)).to_contain_text("Runs when new items match")
-        expect(_row_by_name(page, name).get_by_test_id("task-next-run")).to_have_count(0)
+    assert created["rrule"].startswith("FREQ=MINUTELY;INTERVAL=10"), created
+    expect(_row_by_name(page, name)).to_contain_text("Runs when new items match")
+    expect(_row_by_name(page, name).get_by_test_id("task-next-run")).to_have_count(0)
     # The prompt's details are covered by the dialog and renderer tests.
     assert f'({project_query} AND labels = "omnigent")' in created["prompt"], created
     expect(page.get_by_role("region", name="Suggested Automations")).to_be_visible()
@@ -1110,9 +1092,8 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-edit").click()
     user_prompt = page.get_by_label("Your prompt", exact=True)
-    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0 if trigger_ui else 1)
-    if trigger_ui:
-        expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
     system_toggle = page.get_by_role("dialog").get_by_role(
         "button", name="System prompt", exact=True
     )
@@ -1139,9 +1120,8 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     detail_system_toggle.click()
     page.get_by_test_id("task-detail-edit").click()
     expect(user_prompt).to_have_value("Investigate the ticket and propose a fix.")
-    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0 if trigger_ui else 1)
-    if trigger_ui:
-        expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
     expect(system_toggle).to_have_attribute("aria-expanded", "false")
     system_toggle.click()
     system_editor = page.get_by_role("textbox", name="System prompt", exact=True)
@@ -1173,28 +1153,27 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
         "placeholder", "eng-support, bugs"
     )
     expect(page.locator("[role='listbox']")).to_have_count(0)
-    if trigger_ui:
-        expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
-        expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
-        manual_name = f"Manual from template {uuid.uuid4().hex[:8]}"
-        page.get_by_test_id("task-name-input").fill(manual_name)
-        page.get_by_test_id("task-trigger-scope").fill("#support")
-        page.get_by_test_id("task-trigger-instructions").fill("Summarize new messages.")
-        page.get_by_test_id("task-trigger-preview").locator("summary").click()
-        page.get_by_test_id("task-trigger-edit-as-prompt").click()
-        _pick_select_option(page, "task-session-mode-trigger", "New session each run")
-        expect(page.get_by_test_id("schedule-preset-trigger")).to_be_visible()
-        expect(page.get_by_test_id("task-trigger-cadence")).to_have_count(0)
-        page.get_by_test_id("create-scheduled-task-submit").click()
-        expect(page.get_by_role("dialog")).to_have_count(0)
-        manual_row = _row_by_name(page, manual_name)
-        expect(manual_row.get_by_test_id("task-next-run")).to_be_visible()
-        manual_row.get_by_test_id("task-row-menu").click()
-        expect(page.get_by_test_id("task-run-now")).to_be_visible()
-        page.keyboard.press("Escape")
-        manual_row.get_by_test_id("task-row-open").click()
-        expect(page.get_by_test_id("task-detail-run-now")).to_be_visible()
-        expect(page.get_by_test_id("task-detail-schedule")).to_contain_text("Next run")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
+    manual_name = f"Manual from template {uuid.uuid4().hex[:8]}"
+    page.get_by_test_id("task-name-input").fill(manual_name)
+    page.get_by_test_id("task-trigger-scope").fill("#support")
+    page.get_by_test_id("task-trigger-instructions").fill("Summarize new messages.")
+    page.get_by_test_id("task-trigger-preview").locator("summary").click()
+    page.get_by_test_id("task-trigger-edit-as-prompt").click()
+    _pick_select_option(page, "task-session-mode-trigger", "New session each run")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_be_visible()
+    expect(page.get_by_test_id("task-trigger-cadence")).to_have_count(0)
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    manual_row = _row_by_name(page, manual_name)
+    expect(manual_row.get_by_test_id("task-next-run")).to_be_visible()
+    manual_row.get_by_test_id("task-row-menu").click()
+    expect(page.get_by_test_id("task-run-now")).to_be_visible()
+    page.keyboard.press("Escape")
+    manual_row.get_by_test_id("task-row-open").click()
+    expect(page.get_by_test_id("task-detail-run-now")).to_be_visible()
+    expect(page.get_by_test_id("task-detail-schedule")).to_contain_text("Next run")
 
 
 def test_ten_minute_host_schedule_round_trip(

@@ -60,7 +60,7 @@ const NOW = new Date("2026-03-10T12:00:00Z");
 function renderRow(
   t: ScheduledTask,
   handlers: Partial<Parameters<typeof ScheduledTaskRow>[0]> = {},
-  { detailPage = false, triggerUi = false }: { detailPage?: boolean; triggerUi?: boolean } = {},
+  { detailPage = false }: { detailPage?: boolean } = {},
 ) {
   const props = {
     task: t,
@@ -76,7 +76,7 @@ function renderRow(
     <CapabilitiesProvider
       info={{
         ...FALLBACK_SERVER_INFO,
-        features: { automations_v2: detailPage, automation_trigger_ui: triggerUi },
+        features: { automations_v2: detailPage },
       }}
     >
       <MemoryRouter>
@@ -206,8 +206,6 @@ it.each(["continue", "new"] as const)(
         sessionMode,
         nextRunAt: "2026-03-10T14:00:00Z",
       }),
-      {},
-      { triggerUi: true },
     );
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     expect(await screen.findByTestId("task-edit")).toBeInTheDocument();

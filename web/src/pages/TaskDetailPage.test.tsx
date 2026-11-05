@@ -1204,7 +1204,7 @@ it.each(["continue", "new"] as const)(
       <CapabilitiesProvider
         info={{
           ...SERVER_INFO_OFFLINE_FALLBACK,
-          features: { automations_v2: true, automation_trigger_ui: true },
+          features: { automations_v2: true },
         }}
       >
         {pageTree()}

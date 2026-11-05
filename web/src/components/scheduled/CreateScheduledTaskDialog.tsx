@@ -109,7 +109,6 @@ export function CreateScheduledTaskDialog({
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
-  const triggerUiEnabled = isFeatureEnabled(info, "automation_trigger_ui");
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
   const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
@@ -303,10 +302,10 @@ export function CreateScheduledTaskDialog({
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
   const defaultTriggerSchedule = useMemo(
     () =>
-      triggerUiEnabled && anchoredScheduling && (subhourSupported || triggerPollMinutes >= 60)
+      anchoredScheduling && (subhourSupported || triggerPollMinutes >= 60)
         ? { ...TRIGGER_SCHEDULE_MODEL, interval: triggerPollMinutes }
         : HOURLY_SCHEDULE_MODEL,
-    [triggerUiEnabled, anchoredScheduling, subhourSupported, triggerPollMinutes],
+    [anchoredScheduling, subhourSupported, triggerPollMinutes],
   );
   const savedSchedule = useMemo(
     () => (editingTask ? parseRRuleToScheduleModel(editingTask.rrule) : null),
@@ -541,9 +540,8 @@ export function CreateScheduledTaskDialog({
   const effectivePrompt =
     trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
   const triggerMode =
-    triggerUiEnabled &&
-    (trigger !== null ||
-      (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt))));
+    trigger !== null ||
+    (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
