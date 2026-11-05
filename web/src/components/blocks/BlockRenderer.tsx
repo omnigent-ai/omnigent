@@ -1025,13 +1025,14 @@ const REFERENCE_DEFINITION = /^\s*\[(?!\^)(?:[^[\]\\]|\\.)+\]:/;
 const LABEL_OPEN = /^\s*\[(?!\^)((?:[^[\]\\]|\\.)*)$/;
 const LABEL_REST = /^((?:[^[\]\\]|\\.)*)(\]:)?/;
 const MAX_LABEL_LENGTH = 999;
-const CONTAINER_PREFIX = /^(?: {0,3}(?:>|[-*+]|\d{1,9}[.)])[ \t]?)+/;
+// Blockquote and list markers at any indent, so nested containers are read too.
+const CONTAINER_PREFIX = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)]))+/;
 
 /**
- * Whether markdown may define a reference link, including inside a blockquote or list
- * item. Such a link resolves only when static mode renders the whole document. Lines
- * in code count too: a false match only keeps the static rendering every reply used
- * to get. One pass over the lines, so long or pathological text stays linear.
+ * Conservatively detects a reference link definition, which resolves only when
+ * static mode renders the whole document. It reads past blockquote and list markers
+ * and doesn't exclude code, so it can match where markdown wouldn't but shouldn't
+ * miss a definition. One pass over the lines, so long or pathological text stays linear.
  */
 export function mayDefineReferenceLink(text: string): boolean {
   // Length of a label left open by earlier lines, or -1.

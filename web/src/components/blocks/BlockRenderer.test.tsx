@@ -397,6 +397,7 @@ describe("BlockRenderer dispatch", () => {
   it.each([
     ["at the top level", "[docs]: https://example.com/docs"],
     ["in a blockquote", "> [docs]: https://example.com/docs"],
+    ["in a blockquote inside a list item", "10. q\n\n    > [docs]: https://example.com/docs"],
   ])("resolves a settled streamed reply's reference link defined %s", (_where, definition) => {
     // Streamed text stays in streaming mode, which renders each block alone, so a
     // reply with a link definition in another block settles into static mode.
@@ -429,6 +430,7 @@ describe("BlockRenderer dispatch", () => {
     ["an escaped bracket in the label", String.raw`[foo\]]: /url`, true],
     ["a definition in a list item", "- [docs]: https://example.com", true],
     ["a definition on a list item's continuation", "10. See [docs][].\n\n    [docs]: /url", true],
+    ["a blockquote in a list item's continuation", "See [x][a].\n\n10. q\n\n    > [a]: /url", true],
     ["a label split across lines", "See [foo bar][].\n\n[foo\nbar]: /url", true],
     ["a label split across blockquote lines", "> [foo\n> bar]: /url", true],
     // Code isn't parsed: matching there only keeps the static rendering.

@@ -4399,6 +4399,12 @@ describe("buildBubbles — anonymous blocks join the surrounding turn", () => {
     const more = live(textDone(null, "resp_1", "Two names."));
     const [first, second] = assistants(buildBubbles([user, stamped, call, queued, more], null));
     expect(second!.stableId).not.toBe(first!.stableId);
+    // A cached build reusing that first reply numbers the next one as a fresh build does.
+    const cache = createBubbleCache();
+    const before = buildBubbles([user, stamped, call, queued], null, cache);
+    const after = buildBubbles([user, stamped, call, queued, more], null, cache);
+    expect(after[1]).toBe(before[1]);
+    expect(assistants(after).map((b) => b.stableId)).toEqual([first!.stableId, second!.stableId]);
     // An empty segment is dropped once a non-empty text lands; the answer keeps its key.
     const empty = live(textDone(null, "resp_1", ""));
     const chunk = live({
