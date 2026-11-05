@@ -1034,6 +1034,19 @@
             "description": "Status of the latest task, e.g. `\"completed\"`, `\"in_progress\"`, `\"failed\"`. `None` if no tasks exist.",
             "title": "Current Task Status"
           },
+          "depth": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Levels below the queried session, `1` for a direct child. Set only by `?descendants=true`, so a client can tell the server returned the whole subtree; `None` otherwise.",
+            "title": "Depth"
+          },
           "id": {
             "description": "Child conversation/session identifier, e.g. `\"conv_child123\"`.",
             "title": "Id",
@@ -15279,6 +15292,30 @@
                 }
               ],
               "title": "Session Name"
+            }
+          },
+          {
+            "description": "Return the whole subtree down to *max_depth* in one response instead of one level, so a client drawing the sub-agent tree makes one request rather than one per node. Rows come breadth-first, each parent's children newest-first (the order a per-level walk sees), with `parent_session_id` set to the row's own parent and `depth` set. *limit* and *after* page through that order. A spawn tree of more than 2000 sub-agents gets the one-level listing instead (rows without `depth`), as from a server without this flag. *before*, *order* and the title filters do not apply.",
+            "in": "query",
+            "name": "descendants",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Descendants",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Levels to return with *descendants*, `1` for direct children only.",
+            "in": "query",
+            "name": "max_depth",
+            "required": false,
+            "schema": {
+              "default": 3,
+              "maximum": 10,
+              "minimum": 1,
+              "title": "Max Depth",
+              "type": "integer"
             }
           }
         ],

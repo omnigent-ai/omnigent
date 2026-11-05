@@ -928,6 +928,9 @@ class ChildSessionSummary(BaseModel):
         ``RoutingDecisionData.decision_id``. Read from the child's
         ``omnigent.routing.decision_id`` label, stamped when routing pins
         the model. ``None`` when the child was not routed.
+    :param depth: Levels below the queried session, ``1`` for a direct
+        child. Set only by ``?descendants=true``, so a client can tell the
+        server returned the whole subtree; ``None`` otherwise.
     """
 
     id: str
@@ -951,6 +954,7 @@ class ChildSessionSummary(BaseModel):
     pending_elicitations_count: int = 0
     routed_model: str | None = None
     routing_decision_id: str | None = None
+    depth: int | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
