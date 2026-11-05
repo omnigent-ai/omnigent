@@ -3,6 +3,10 @@ import type { ReviewThreadAnchor } from "./pullRequestReviewThreads";
 
 export type LocalReviewAnchor = Omit<ReviewThreadAnchor, "path"> & { pr_url: string };
 
+export function isFileComment(comment: Comment): boolean {
+  return !comment.anchor_metadata;
+}
+
 /** Validate persisted draft context before using its coordinates or body. */
 export function isLocalReviewComment(value: unknown): value is Comment {
   if (!value || typeof value !== "object") return false;
