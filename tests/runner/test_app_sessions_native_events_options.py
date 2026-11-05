@@ -4005,7 +4005,7 @@ async def test_events_clear_on_claude_sdk_releases_the_idle_client(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("queued_ahead", ["message", "cancelled_compacts"])
+@pytest.mark.parametrize("queued_ahead", ["message", "held_ticket"])
 async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
     monkeypatch: pytest.MonkeyPatch, queued_ahead: str
 ) -> None:
@@ -4013,12 +4013,20 @@ async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
 
     Tunnel teardown cancels in-flight requests. The cancelled clear's place in
     the ingest gate is given up once the message ahead of it finishes, so the
-    next input for the session still runs. Cancelled compacts ahead of it keep
-    the gate stalled (they give up no place), so the clear's retirement waits;
-    deleting the session still ends it.
+    next input for the session still runs. With an earlier ticket that is
+    never served still ahead of it, the clear's retirement waits; deleting the
+    session still ends it.
     """
     from omnigent.runner import app as runner_app
 
+    gate: dict[str, Any] = {}
+    build = runner_app.build_native_controls
+
+    def keep_gate(**kwargs: Any) -> Any:
+        gate["next_seq"] = kwargs["_ingest_next_seq"]
+        return build(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", keep_gate)
     app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
     sid = "f5b4cad6e7f38d9e1f2a3b4c53647566"
     ingest_held, release_ingest = asyncio.Event(), asyncio.Event()
@@ -4044,27 +4052,24 @@ async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
         assert create_resp.status_code == 201, create_resp.text
         ahead = asyncio.create_task(client.post(f"/v1/sessions/{sid}/events", json=message))
         await asyncio.wait_for(ingest_held.wait(), timeout=5)
-        # Queued in order: the compacts (if any), then the clear.
-        queued_requests = [{"type": "compact"}] * (
-            2 if queued_ahead == "cancelled_compacts" else 0
-        )
-        queued_requests.append({"type": "clear", "continue_in_new_session": True})
-        queued_tasks = []
-        for body in queued_requests:
-            queued_tasks.append(
-                asyncio.create_task(client.post(f"/v1/sessions/{sid}/events", json=body))
+        held_ticket = queued_ahead == "held_ticket"
+        if held_ticket:
+            # An input between the message and the clear holds its place unserved.
+            gate["next_seq"][sid] += 1
+        clear = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "clear", "continue_in_new_session": True},
             )
-            for _ in range(20):  # Let it take its place in line before the next.
-                await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- queue it
-        *compacts, clear = queued_tasks
-        for queued in (*compacts, clear):
-            queued.cancel()
-        for queued in (*compacts, clear):
-            with pytest.raises(asyncio.CancelledError):
-                await queued
+        )
+        for _ in range(20):  # Let the clear take its place in line.
+            await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- queue it
+        clear.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await clear
         release_ingest.set()
         assert (await asyncio.wait_for(ahead, timeout=5)).status_code < 300
-        if compacts:
+        if held_ticket:
             retiring = [
                 task for task in asyncio.all_tasks() if task.get_name() == f"retire-ingest-{sid}"
             ]
