@@ -369,6 +369,10 @@ MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # available before the host binds, and never copied from a fork's source.
 REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 
+# The provider a managed create asked for, so a retry after a failed first
+# launch provisions the same one. Never copied from a fork's source.
+MANAGED_PROVIDER_LABEL_KEY = "omnigent.sandbox.provider"
+
 
 def managed_host_name(host_id: str) -> str:
     """

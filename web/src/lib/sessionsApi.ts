@@ -82,7 +82,8 @@ export interface PostEventResponse {
   /** True only when retry performed a usable runner or terminal recovery. */
   recovered?: boolean;
   /** Machine-readable recovery outcome for retry_session control events. */
-  recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
+  recovery?:
+    "already_connected" | "native_terminal_ready" | "runner_relaunched" | "sandbox_relaunched";
 }
 
 /**

@@ -140,6 +140,9 @@ class ManagedStartupInputs:
         self.hosts = hosts
         _services.add(self)
         self.dispatch: StartupDispatch | None = None
+        # The create's managed-launch scheduler, used to retry a failed first launch.
+        self.schedule_launch: Callable[..., Coroutine[Any, Any, None]] | None = None
+        self._relaunching: set[tuple[int, str]] = set()
         self._workers: dict[
             tuple[int, str], tuple[HostConnection, asyncio.Task[None], asyncio.Event]
         ] = {}
@@ -555,6 +558,61 @@ class ManagedStartupInputs:
                     status="in_progress",
                 )
         return changed
+
+    async def relaunch_failed_start(
+        self, request: Any, conv: Conversation, user_id: str | None
+    ) -> bool:
+        """
+        Launch a new sandbox for a session whose first launch failed before binding a host.
+
+        The session's undelivered inputs are queued again first, so the new host
+        delivers them, or a failure of the new launch reports them again.
+
+        :param request: The ``retry_session`` request (for ``app.state``).
+        :param conv: The session being retried.
+        :param user_id: The caller, used when the session has no owner grant.
+        :returns: ``True`` when a launch for the session is now under way,
+            ``False`` when the session has a host or its startup didn't fail.
+        """
+        from omnigent.server.managed_hosts import (
+            MANAGED_PROVIDER_LABEL_KEY,
+            REQUESTED_HOST_ID_LABEL_KEY,
+            read_managed_repo_workspaces,
+        )
+
+        if self.schedule_launch is None or conv.host_id is not None:
+            return False
+        key = (current_workspace_id(), conv.id)
+        launch = request.app.state.managed_launches.get(conv.id)
+        if key in self._relaunching or (launch is not None and not launch.settled.is_set()):
+            return True
+        if conv.labels.get(STARTUP_LABEL) != "failed":
+            return False
+        self._relaunching.add(key)
+        try:
+            await self.retry(conv.id)
+            owner = await asyncio.to_thread(
+                self.conversations.get_session_owner, conv.id, owner_only=True
+            )
+            # The failed host's id stays reserved until its sandbox is cleaned up, so a
+            # create that chose its host's id (to route by it) chooses a fresh one.
+            requested_host_id = uuid4().hex if REQUESTED_HOST_ID_LABEL_KEY in conv.labels else None
+            try:
+                await self.schedule_launch(
+                    request,
+                    session_id=conv.id,
+                    agent_id=conv.agent_id,
+                    user_id=owner or user_id,
+                    sandbox_provider=conv.labels.get(MANAGED_PROVIDER_LABEL_KEY),
+                    workspaces=read_managed_repo_workspaces(conv.labels),
+                    requested_host_id=requested_host_id,
+                )
+            except Exception as exc:
+                await self.record_launch_failure(conv.id, str(exc))
+                raise
+        finally:
+            self._relaunching.discard(key)
+        return True
 
     async def cancel(self, session_id: str) -> None:
         items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)

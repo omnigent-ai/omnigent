@@ -836,4 +836,40 @@ describe("undelivered startup messages", () => {
     expect(await notes?.text()).toBe("meeting notes");
     expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);
   });
+
+  it("say why when the server can't try again", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(
+        {
+          error: {
+            code: "runner_unavailable",
+            message: "No runner is available to recover this session.",
+          },
+        },
+        503,
+      ),
+    );
+    const toasts: unknown[] = [];
+    const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", recordToast);
+    const [bubble] = buildUndeliveredBubbles([lost], null);
+    render(
+      <MemoryRouter>
+        <ConversationScopeContext.Provider value="conv_failed">
+          <BubbleView bubble={bubble!} isLastAssistant={false} />
+        </ConversationScopeContext.Provider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+
+    await waitFor(() =>
+      expect(toasts).toEqual(["No runner is available to recover this session."]),
+    );
+    window.removeEventListener("omnigent:toast", recordToast);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe("/v1/sessions/conv_failed/events");
+    expect(JSON.parse(String(init?.body))).toMatchObject({ type: "retry_session" });
+    expect(screen.getByRole("button", { name: "Try again" })).toBeEnabled();
+  });
 });

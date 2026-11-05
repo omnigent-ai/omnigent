@@ -75,6 +75,7 @@ import {
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
+  retrySession,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -4882,23 +4883,32 @@ async function refreshSessionBinding(id: string): Promise<void> {
   setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch));
 }
 
-// The newest post-failure read per conversation; an older one that lands later is dropped.
-const failedLaunchReads = new Map<string, number>();
+/** A pending bubble for a message the snapshot says the server holds. */
+function pendingBubbleFromSnapshot(input: PendingInput): PendingUserMessage {
+  return {
+    tempId: input.pendingId,
+    content: input.content,
+    ...(input.createdBy !== undefined ? { author: input.createdBy } : {}),
+  };
+}
+
+// The newest startup re-read per conversation; an older one that lands later is dropped.
+const startupReads = new Map<string, number>();
 
 /**
- * Re-read a session after its sandbox launch failed, so the messages it never
- * delivered show as undelivered instead of vanishing with their bubbles.
+ * Re-read a session's saved startup messages after its launch failed or was retried.
  *
  * A launch can report "failed" before the server has marked its saved inputs
  * failed, then again once it has; each report starts a fresh read rather than
  * joining one in flight, and only the newest applies. The snapshot also ends
- * the startup state the failed launch leaves behind.
+ * the startup state a failed launch leaves behind.
  *
- * @param id - Conversation/session id whose launch failed.
+ * @param id - Conversation/session id to re-read.
+ * @param showQueued - Also show the messages the server queued again as sending.
  */
-async function refreshAfterFailedLaunch(id: string): Promise<void> {
-  const read = (failedLaunchReads.get(id) ?? 0) + 1;
-  failedLaunchReads.set(id, read);
+async function refreshStartupInputs(id: string, showQueued = false): Promise<void> {
+  const read = (startupReads.get(id) ?? 0) + 1;
+  startupReads.set(id, read);
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, setterForState(id));
   let session: Session | null = null;
   try {
@@ -4906,15 +4916,36 @@ async function refreshAfterFailedLaunch(id: string): Promise<void> {
   } catch {
     // The next bind reads the snapshot again.
   }
-  if (failedLaunchReads.get(id) !== read) return;
-  failedLaunchReads.delete(id);
+  if (startupReads.get(id) !== read) return;
+  startupReads.delete(id);
   if (session === null) return;
   const fresh = session;
   queryClient?.setQueryData(["session", id], fresh);
-  setterFor(id)((s) => ({
-    ...sessionBindingPatch(fresh, s, launchBeforeFetch),
-    pendingUserMessages: withoutFailedInputs(s.pendingUserMessages, fresh.failedInputs ?? []),
-  }));
+  setterFor(id)((s) => {
+    const pending = withoutFailedInputs(s.pendingUserMessages, fresh.failedInputs ?? []);
+    const shown = new Set(pending.flatMap((message) => [message.tempId, message.pendingId]));
+    const queued = showQueued
+      ? (fresh.pendingInputs ?? []).filter((input) => !shown.has(input.pendingId))
+      : [];
+    return {
+      ...sessionBindingPatch(fresh, s, launchBeforeFetch),
+      pendingUserMessages: [...pending, ...queued.map(pendingBubbleFromSnapshot)],
+    };
+  });
+}
+
+/**
+ * Retry a session whose saved startup messages were never delivered.
+ *
+ * The server queues them again, starting a new sandbox when the first launch
+ * failed before binding a host; the session is then re-read so they show as sending.
+ *
+ * @param id - The session to retry.
+ * @throws ApiError when the server refuses the retry.
+ */
+export async function retryFailedStartup(id: string): Promise<void> {
+  await retrySession(id);
+  await refreshStartupInputs(id, true);
 }
 
 /**
@@ -5120,16 +5151,11 @@ async function bindStream(
       // ``pending_inputs`` twin: the server entry carries the durable
       // pending id, so the eventual consumed event clears it precisely —
       // keeping both would double-render and strand one of them.
-      const toPending = (p: PendingInput): PendingUserMessage => ({
-        tempId: p.pendingId,
-        content: p.content,
-        ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
-      });
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
         candidatePending = state.pendingUserMessages;
       } else {
-        const serverPending = (session.pendingInputs ?? []).map(toPending);
+        const serverPending = (session.pendingInputs ?? []).map(pendingBubbleFromSnapshot);
         // One-to-one consumption so two identical queued sends still match
         // pairwise. Content (not text) equality so image-only messages
         // correlate too.
@@ -8202,7 +8228,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.stage === "action_required" ? s.sandboxActionDismissed : null,
             },
       );
-      if (event.stage === "failed") void refreshAfterFailedLaunch(event.conversationId);
+      if (event.stage === "failed") void refreshStartupInputs(event.conversationId);
       // The sandbox host is bound before its runner starts; refetch the binding and a
       // host list cached before that host registered, so the composer can name it.
       if (event.stage === "connecting" || event.stage === "ready") {

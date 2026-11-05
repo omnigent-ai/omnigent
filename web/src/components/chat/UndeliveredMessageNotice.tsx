@@ -6,6 +6,9 @@ import { PENDING_FILE_PREFIX, type MessageContentBlock } from "@/lib/blocks";
 import { downloadSessionFile } from "@/lib/filesApi";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import { useNavigate } from "@/lib/routing";
+import { retryFailedStartup } from "@/store/chatStore";
+
+const LINK_CLASS = "h-auto px-1 text-[11px] text-destructive underline underline-offset-2";
 
 /**
  * Download a message's uploaded attachments so a new session can send them again.
@@ -36,9 +39,10 @@ async function recoverAttachments(
 }
 
 /**
- * The status line under a startup message the server never delivered, with a
- * way to start a new session from it. The failed session has no host to resend
- * on, so the message (text and attachments) moves to the new-session composer.
+ * The status line under a startup message the server never delivered. "Try
+ * again" asks the server to deliver it in this session, starting a new sandbox
+ * when the first one never came up; "Start a new session" moves the message
+ * (text and attachments) to the new-session composer instead.
  *
  * @param sessionId - The session the message was saved in.
  * @param text - The message text, as the bubble's Copy action copies it.
@@ -55,6 +59,19 @@ export function UndeliveredMessageNotice({
 }) {
   const navigate = useNavigate();
   const [starting, setStarting] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+
+  async function tryAgain() {
+    if (sessionId === null) return;
+    setRetrying(true);
+    try {
+      await retryFailedStartup(sessionId);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Couldn't retry. Try again later.");
+    } finally {
+      setRetrying(false);
+    }
+  }
 
   async function startNewSession() {
     setStarting(true);
@@ -75,8 +92,18 @@ export function UndeliveredMessageNotice({
       <Button
         variant="link"
         size="xs"
-        className="h-auto px-1 text-[11px] text-destructive underline underline-offset-2"
-        disabled={starting}
+        className={LINK_CLASS}
+        disabled={retrying || starting || sessionId === null}
+        onClick={() => void tryAgain()}
+      >
+        Try again
+      </Button>
+      <span aria-hidden>·</span>
+      <Button
+        variant="link"
+        size="xs"
+        className={LINK_CLASS}
+        disabled={retrying || starting}
         onClick={() => void startNewSession()}
       >
         Start a new session with this message

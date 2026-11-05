@@ -3780,6 +3780,11 @@ def create_app(
             register_initial_file_upload=lambda handler: setattr(
                 app.state, "initial_file_upload", handler
             ),
+            register_managed_launch=lambda handler: (
+                setattr(startup_inputs, "schedule_launch", handler)
+                if startup_inputs is not None
+                else None
+            ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
             ),

@@ -627,6 +627,10 @@ already uploaded or registered an agent. The response is the full
     SDK dispatch activates them into ordinary history; native transcript echoes
     replace their pending rows. The normal SDK history recovery is unchanged.
     A failure before submission retains the saved input for `retry_session`.
+    When the create's own launch failed before a host was bound, `retry_session`
+    starts a new sandbox with the same provider, repositories and agent, and
+    answers `{"queued": true, "recovery": "sandbox_relaunched"}`; the new host
+    delivers the saved inputs.
     After native submission, recovery restores receipt matching without resending
     the prompt: a missing acknowledgement cannot prove it was not executed.
     `interrupt` and `stop_session` cancel inputs that have not been submitted,

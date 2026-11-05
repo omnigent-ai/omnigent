@@ -105,6 +105,7 @@ import {
   type PendingUserMessage,
   bindConversationForTest,
   releaseConversation,
+  retryFailedStartup,
   withoutFailedInputs,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
@@ -7825,6 +7826,41 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         failedInputs: [{ pendingId: "pending_first", content: [lost] }],
         pendingUserMessages: [],
         startupPending: false,
+      });
+    });
+
+    it("shows a retried undelivered message as sending again", async () => {
+      const lost = { type: "input_text" as const, text: "Summarize the open PRs" };
+      fetchMock
+        .mockResolvedValueOnce(mockResponse({ queued: true, recovery: "sandbox_relaunched" }))
+        .mockResolvedValueOnce(
+          mockResponse({
+            id: "conv_abc",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: { "omnigent.startup": "pending" },
+            pending_elicitations: [],
+            pending_inputs: [{ pending_id: "pending_first", content: [lost] }],
+            failed_inputs: [],
+          }),
+        );
+      useChatStore.setState({
+        startupPending: false,
+        failedInputs: [{ pendingId: "pending_first", content: [lost] }],
+        pendingUserMessages: [],
+      });
+
+      await retryFailedStartup("conv_abc");
+
+      const [url, init] = fetchMock.mock.calls[0]!;
+      expect(String(url)).toBe("/v1/sessions/conv_abc/events");
+      expect(JSON.parse(String(init?.body))).toMatchObject({ type: "retry_session" });
+      expect(useChatStore.getState()).toMatchObject({
+        failedInputs: [],
+        pendingUserMessages: [{ tempId: "pending_first", content: [lost] }],
+        startupPending: true,
       });
     });
 

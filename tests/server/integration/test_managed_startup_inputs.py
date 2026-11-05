@@ -25,7 +25,11 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.managed_hosts import parse_sandbox_config
+from omnigent.server.managed_hosts import (
+    MANAGED_PROVIDER_LABEL_KEY,
+    REQUESTED_HOST_ID_LABEL_KEY,
+    parse_sandbox_config,
+)
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
 from omnigent.server.scheduled.telemetry import scheduled_run_scope
@@ -972,6 +976,60 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     assert (
         await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
     )
+
+
+async def test_retry_after_unbound_launch_failure_provisions_again(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = startup_env
+    launches: list[dict[str, Any]] = []
+    tasks: list[asyncio.Task[Any]] = []
+
+    async def record_launch(**options: Any) -> None:
+        launches.append(options)
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        await asyncio.Future()
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", record_launch)
+    startup = env.app.state.startup_inputs
+    events = f"/v1/sessions/{(session_id := await _create(env, sandbox_provider='modal'))}/events"
+    try:
+        # The host never came online, so the launch failed before binding one.
+        failed_host_id = uuid4().hex
+        env.conv_store.set_labels(session_id, {REQUESTED_HOST_ID_LABEL_KEY: failed_host_id})
+        env.app.state.managed_launches.fail(session_id, "managed host did not come online")
+        await startup.record_launch_failure(session_id, "managed host did not come online")
+        retried = await env.client.post(events, json={"type": "retry_session"})
+        assert retried.status_code == 202, retried.text
+        assert retried.json() == {"queued": True, "recovery": "sandbox_relaunched"}
+        # A second click while that launch runs doesn't start another one.
+        assert (await env.client.post(events, json={"type": "retry_session"})).status_code == 202
+        [first, second] = launches
+        assert (second["provider"], second["agent_id"]) == ("modal", first["agent_id"])
+        assert second["owner"] == first["owner"]
+        conv = env.conv_store.get_conversation(session_id)
+        assert conv is not None and conv.labels[STARTUP_LABEL] == "pending"
+        assert conv.labels[MANAGED_PROVIDER_LABEL_KEY] == "modal"
+        # The new host gets its own id to route by; the failed one stays reserved.
+        assert second["host_id"] == conv.labels[REQUESTED_HOST_ID_LABEL_KEY] != failed_host_id
+        snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot["failed_inputs"] == []
+        assert [entry["content"] for entry in snapshot["pending_inputs"]] == [
+            _INPUT["data"]["content"]
+        ]
+        # If the new launch fails too, the message is undelivered again.
+        env.app.state.managed_launches.fail(session_id, "still offline")
+        await startup.record_launch_failure(session_id, "still offline")
+        snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+        assert [entry["content"] for entry in snapshot["failed_inputs"]] == [
+            _INPUT["data"]["content"]
+        ]
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _session_count(env: _Env) -> int:

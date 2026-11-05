@@ -236,6 +236,9 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # source's id would route the fork to the wrong host. Mirrors the server's
 # ``REQUESTED_HOST_ID_LABEL_KEY`` (cross-checked by a store test).
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
+# The provider a managed create asked for; the fork's own launch records its own.
+# Mirrors the server's ``MANAGED_PROVIDER_LABEL_KEY`` (cross-checked by a store test).
+_SANDBOX_PROVIDER_LABEL_KEY = "omnigent.sandbox.provider"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
@@ -243,6 +246,7 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
+    _SANDBOX_PROVIDER_LABEL_KEY,
 }
 
 
