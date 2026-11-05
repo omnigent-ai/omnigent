@@ -132,12 +132,10 @@ export function addSessionDraftStartupInputs(
   sentAs: string[] = [],
 ): void {
   const draft = sessionDrafts.get(conversationId) ?? { text, files };
-  const startupInputIds = [...new Set([...(draft.startupInputIds ?? []), ...ids])];
-  const sends = [...new Set([...(draft.sentAs ?? []), ...sentAs])];
   setSessionDraft(conversationId, {
     ...draft,
-    ...(startupInputIds.length > 0 ? { startupInputIds } : {}),
-    ...(sends.length > 0 ? { sentAs: sends } : {}),
+    startupInputIds: [...new Set([...(draft.startupInputIds ?? []), ...ids])],
+    sentAs: [...new Set([...(draft.sentAs ?? []), ...sentAs])],
   });
 }
 
@@ -158,17 +156,8 @@ export function replaceSessionDraftStartupInputs(
   files: File[] = [],
   sentAs: string[] = [],
 ): void {
-  if (retiredDraftIds.has(conversationId)) return;
   const draft = sessionDrafts.get(conversationId) ?? { text, files };
-  // Without the old entry, setSessionDraft has no held ids to carry over.
-  sessionDrafts.delete(conversationId);
-  setSessionDraft(conversationId, {
-    text: draft.text,
-    files: draft.files,
-    ...(draft.replyDraft ? { replyDraft: draft.replyDraft } : {}),
-    ...(ids.length > 0 ? { startupInputIds: ids } : {}),
-    ...(sentAs.length > 0 ? { sentAs } : {}),
-  });
+  setSessionDraft(conversationId, { ...draft, startupInputIds: ids, sentAs });
 }
 
 /** Remove a draft and ignore any late cleanup write for the retired id. */
