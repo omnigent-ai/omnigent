@@ -332,11 +332,16 @@ class SessionActivity:
         ``"waiting"``, ``"failed"``), or ``None`` when none is recorded.
     :param total_cost_usd: Recorded cost for this session, excluding descendants;
         ``None`` when unpriced.
+    :param pending_elicitation_count: Current unresolved session approvals/questions;
+        ``None`` when not reported.
+    :param runner_id: Bound runner, or ``None`` for an in-process session.
     """
 
     updated_at: int
     live_status: str | None
     total_cost_usd: float | None = None
+    pending_elicitation_count: int | None = None
+    runner_id: str | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -969,7 +974,9 @@ class ConversationStore(ABC):
             list endpoint.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+            ``"updated_at"``, or ``"id"`` for index order, which bounds the
+            rows a ``root_conversation_id`` read examines. A store without
+            an ``id`` order may fall back to ``"created_at"``.
         :param search_query: Case-insensitive substring filter on
             the conversation title OR conversation item content
             (``search_text``). ``None`` or empty string disables
@@ -1710,6 +1717,37 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_background_work_running(
+        self,
+        conversation_id: str,
+        running: bool,
+        *,
+        runner_id: str | None = None,
+        unseen_since: int | None = None,
+        reported_at: int | None = None,
+    ) -> None:
+        """
+        Persist whether a session's background shells outlive its ended turn.
+
+        Every replica's session list reads this value to show the session as
+        working. Must NOT bump ``updated_at``. Changing or clearing the
+        session's runner resets it.
+
+        :param conversation_id: Session/conversation identifier.
+        :param running: ``True`` while a background shell outlives the turn.
+        :param runner_id: When set, write only while the session is still bound
+            to this runner, so clearing a departed runner's flag cannot erase a
+            replacement runner's report.
+        :param unseen_since: When set, write only while ``runner_last_seen`` is
+            NULL or earlier than this epoch second, so a runner that reconnected
+            keeps its report.
+        :param reported_at: When the runner decided *running*, in its epoch
+            nanoseconds. When set, write only if no newer report is stored, and
+            store it with the value.
+        """
+        ...
+
+    @abstractmethod
     def set_background_task_count(self, conversation_id: str, count: int) -> None:
         """
         Persist the running background-shell count for one session.
@@ -1719,6 +1757,21 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param count: Background shells still running, ``>= 0``.
+        """
+        ...
+
+    @abstractmethod
+    def set_blocked_on(self, conversation_id: str, blocked_on: str | None) -> None:
+        """
+        Persist why a running session's agent is parked on a terminal prompt.
+
+        Written by the replica that published the session's last status edge
+        so any replica's session list can show it as needing input. Must NOT
+        bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param blocked_on: The reason, at most 128 characters, e.g.
+            ``"permission prompt"``, or ``None`` when not parked.
         """
         ...
 
@@ -1904,6 +1957,40 @@ class ConversationStore(ABC):
     ) -> bool:
         """Restore a failed profile rotation unless its binding changed or is authoritative."""
         raise NotImplementedError
+
+    def list_spawn_tree(self, root_conversation_id: str, *, limit: int) -> PagedList[Conversation]:
+        """Read one spawn tree in a single bounded read, to rebuild its hierarchy.
+
+        Returns up to *limit* conversations of the tree rooted at
+        *root_conversation_id*: the root and sub-agents at every depth,
+        archived included. They are ordered newest first, with timestamp ties
+        broken the way :meth:`list_conversations` breaks them, so each
+        parent's children appear in the order a one-level listing returns
+        them. ``has_more`` means the tree holds more than *limit* rows.
+
+        The default reads in id order (``sort_by="id"``, the root index's
+        order in SQL stores, so *limit* bounds the rows examined) and breaks
+        ties by id.
+
+        :param root_conversation_id: Root of the spawn tree.
+        :param limit: Maximum conversations to return.
+        :returns: The tree's conversations in listing order.
+        """
+        page = self.list_conversations(
+            limit=limit,
+            kind=None,
+            include_archived=True,
+            root_conversation_id=root_conversation_id,
+            order="asc",
+            sort_by="id",
+        )
+        rows = sorted(page.data, key=lambda c: (c.created_at, c.id), reverse=True)
+        return PagedList(
+            data=rows,
+            first_id=rows[0].id if rows else None,
+            last_id=rows[-1].id if rows else None,
+            has_more=page.has_more,
+        )
 
     @abstractmethod
     def list_conversations_by_runner_id(

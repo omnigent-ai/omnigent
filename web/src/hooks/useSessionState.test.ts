@@ -2,12 +2,16 @@ import { describe, expect, it } from "vitest";
 import { getSessionState } from "./useSessionState";
 import type { Conversation } from "@/hooks/useConversations";
 
-type StateFields = Pick<
+type SessionFields = Pick<
   Conversation,
-  "status" | "pending_elicitations_count" | "background_task_count"
+  | "status"
+  | "pending_elicitations_count"
+  | "background_work_running"
+  | "background_task_count"
+  | "blocked_on"
 >;
 
-function conv(partial: Partial<StateFields>): StateFields {
+function conv(partial: Partial<SessionFields>): SessionFields {
   return partial;
 }
 
@@ -35,6 +39,70 @@ describe("getSessionState — priority composition", () => {
 
   it("returns null when nothing is happening", () => {
     expect(getSessionState(conv({ status: "idle" }))).toBeNull();
+  });
+
+  it("shows a turn parked on a terminal prompt as awaiting, after web prompts", () => {
+    expect(getSessionState(conv({ status: "running", blocked_on: "dialog open" }))).toEqual({
+      kind: "awaiting",
+      count: 0,
+      terminalReason: "dialog open",
+    });
+    expect(
+      getSessionState(
+        conv({ status: "running", blocked_on: "permission prompt", pending_elicitations_count: 1 }),
+      ),
+    ).toEqual({ kind: "awaiting", count: 1 });
+    // A reason left on a session that is no longer running is not a prompt.
+    expect(getSessionState(conv({ status: "idle", blocked_on: "dialog open" }))).toBeNull();
+  });
+
+  it("shows an ended turn with a running background shell as working", () => {
+    expect(getSessionState(conv({ status: "idle", background_work_running: true }))).toEqual({
+      kind: "running",
+      background: true,
+    });
+    // A recovered runner that reports its shells shows them.
+    expect(
+      getSessionState(
+        conv({ status: "failed", background_work_running: true }),
+        "recovered_disconnect",
+      ),
+    ).toEqual({ kind: "running", background: true });
+  });
+
+  it("counts background shells when the harness reports them", () => {
+    expect(getSessionState(conv({ status: "idle", background_task_count: 2 }))).toEqual({
+      kind: "running",
+      background: true,
+      count: 2,
+    });
+    expect(
+      getSessionState(
+        conv({ status: "idle", background_work_running: true, background_task_count: 0 }),
+      ),
+    ).toEqual({ kind: "running", background: true });
+    expect(getSessionState(conv({ status: "failed", background_task_count: 2 }))).toEqual({
+      kind: "error",
+    });
+    expect(getSessionState(conv({ status: "running", background_task_count: 2 }))).toEqual({
+      kind: "running",
+    });
+  });
+
+  it("ranks prompts, turns, disconnects and errors ahead of background shells", () => {
+    const shells = { background_work_running: true };
+    expect(getSessionState(conv({ ...shells, pending_elicitations_count: 1 }))).toEqual({
+      kind: "awaiting",
+      count: 1,
+    });
+    expect(getSessionState(conv({ ...shells, status: "running" }))).toEqual({ kind: "running" });
+    expect(getSessionState(conv({ ...shells, status: "idle" }), "disconnected")).toEqual({
+      kind: "disconnected",
+    });
+    expect(getSessionState(conv({ ...shells, status: "failed" }))).toEqual({ kind: "error" });
+    expect(getSessionState(conv({ ...shells, status: "idle" }), "error")).toEqual({
+      kind: "error",
+    });
   });
 
   it("flags a latest-message error even when the session has settled to idle", () => {
@@ -82,33 +150,6 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ status: "running" }))).toEqual({
       kind: "running",
     });
-  });
-
-  it("returns background while shells outlive an ended turn", () => {
-    expect(getSessionState(conv({ status: "idle", background_task_count: 2 }))).toEqual({
-      kind: "background",
-      count: 2,
-    });
-    // An active turn and a parked approval both win.
-    expect(getSessionState(conv({ status: "running", background_task_count: 2 }))).toEqual({
-      kind: "running",
-    });
-    expect(
-      getSessionState(
-        conv({ status: "idle", background_task_count: 2, pending_elicitations_count: 1 }),
-      ),
-    ).toEqual({ kind: "awaiting", count: 1 });
-    expect(getSessionState(conv({ status: "idle", background_task_count: 0 }))).toBeNull();
-    // A failure is more actionable than a long-lived shell.
-    expect(getSessionState(conv({ status: "failed", background_task_count: 2 }))).toEqual({
-      kind: "error",
-    });
-    expect(getSessionState(conv({ status: "idle", background_task_count: 2 }), "error")).toEqual({
-      kind: "error",
-    });
-    expect(
-      getSessionState(conv({ status: "idle", background_task_count: 2 }), "recovered_disconnect"),
-    ).toEqual({ kind: "background", count: 2 });
   });
 
   it("returns null when conversation is null (missing record)", () => {

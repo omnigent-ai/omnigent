@@ -51,9 +51,10 @@ function routeFetch(routes: Record<string, Response>) {
 
 function wrapper({ children }: { children: ReactNode }) {
   // retry off so the no-network/error case resolves on the first
-  // attempt instead of stalling the test on TanStack's backoff.
+  // attempt instead of stalling the test on TanStack's backoff. Queries
+  // that set their own retry policy still retry, so make that immediate.
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
   });
   return (
     <QueryClientProvider client={client}>

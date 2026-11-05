@@ -34,14 +34,18 @@ import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import { TriggerWorkerSettingsFields } from "./TriggerWorkerSettingsFields";
 import {
   combineTriggerPrompt,
   emptyTriggerFields,
   isTriggerPrompt,
+  readTriggerWorkerPlacement,
+  readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
+  updateTriggerWorkerSettings,
   type TriggerFields,
   type TriggerSource,
 } from "@/components/scheduled/triggerTemplates";
@@ -53,10 +57,10 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
+import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
-import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
-import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
+import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
   isBackdropOverlay,
   isInsidePopper,
@@ -79,8 +83,10 @@ import {
 } from "@/lib/scheduledTasksApi";
 import { isValidSandboxRepoUrl, splitSandboxWorkspace } from "@/lib/sandboxRepositories";
 import { localTimezone } from "@/lib/timezones";
+import { describeSchedule } from "@/lib/scheduleText";
 
 const PROVIDER_DEFAULT = "provider-default";
+const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
 
 export function CreateScheduledTaskDialog({
   open,
@@ -109,6 +115,7 @@ export function CreateScheduledTaskDialog({
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
+  const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
   // gates on). "loading" → treat as disabled until /v1/info resolves.
@@ -140,12 +147,16 @@ export function CreateScheduledTaskDialog({
     editingTask !== null &&
     editingTask.sessionMode === "continue" &&
     isTriggerPrompt(editingTask.prompt);
+  // Temporary prompt edits must not expose controls that can rebind the poller.
+  const editingWorkerSettings =
+    editingTemplateTrigger && readTriggerWorkerSettings(editingTask.prompt) !== null;
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
   const [systemPromptOpen, setSystemPromptOpen] = useState(false);
   const [editingSystemPrompt, setEditingSystemPrompt] = useState(false);
+  const promptFieldsRef = useRef<HTMLDivElement>(null);
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
 
@@ -156,26 +167,27 @@ export function CreateScheduledTaskDialog({
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
 
-  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
-  const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
-    [agentList],
+  const curation = pickerCuration(info);
+  const curationPending = info === "loading" || isBootFallbackInfo(info);
+  const agentList = useMemo(
+    () => selectableSessionAgents(agents ?? [], curation.restrictToAgentNames),
+    [agents, curation.restrictToAgentNames],
   );
-  const agentEntries = useMemo(
-    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+  const { harnesses: harnessEntries, agents: agentEntries } = useMemo(
+    () => partitionPickerEntries(agentList),
     [agentList],
   );
   // Resolve the effective selection: the explicit pick if it's still in the
   // list, else the edited task's own agent (which may be hidden from the picker
-  // — never silently retarget it), else the first agent (so a fresh picker
-  // always has a concrete value).
-  const effectiveAgentId =
-    (agentList.some((a) => a.id === pickedAgentId)
-      ? pickedAgentId
-      : isEdit
-        ? editingTask?.agentId
-        : agentList[0]?.id) ?? null;
-  const selectedAgent = agentList.find((a) => a.id === effectiveAgentId);
+  // — never silently retarget it), else the deployment default or first agent.
+  const defaultAgentId =
+    agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+    agentList[0]?.id ??
+    null;
+  let effectiveAgentId: string | null = defaultAgentId;
+  if (agentList.some((agent) => agent.id === pickedAgentId)) effectiveAgentId = pickedAgentId;
+  else if (editingTask) effectiveAgentId = editingTask.agentId;
+  const selectedAgent = agents?.find((agent) => agent.id === effectiveAgentId);
   const agentLabel = selectedAgent
     ? selectedAgent.display_name
     : isEdit && editingTask
@@ -295,6 +307,13 @@ export function CreateScheduledTaskDialog({
   );
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
+  const defaultTriggerSchedule = useMemo(
+    () =>
+      anchoredScheduling && (subhourSupported || triggerPollMinutes >= 60)
+        ? { ...TRIGGER_SCHEDULE_MODEL, interval: triggerPollMinutes }
+        : HOURLY_SCHEDULE_MODEL,
+    [anchoredScheduling, subhourSupported, triggerPollMinutes],
+  );
   const savedSchedule = useMemo(
     () => (editingTask ? parseRRuleToScheduleModel(editingTask.rrule) : null),
     [editingTask],
@@ -346,7 +365,7 @@ export function CreateScheduledTaskDialog({
         setStartNewSession(false);
         setTrigger(initialTrigger);
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
-        setSchedule(initialTrigger ? HOURLY_SCHEDULE_MODEL : DEFAULT_SCHEDULE_MODEL);
+        setSchedule(initialTrigger ? defaultTriggerSchedule : DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
         setWorkspace("");
@@ -363,6 +382,7 @@ export function CreateScheduledTaskDialog({
     initialName,
     initialPrompt,
     initialTrigger,
+    defaultTriggerSchedule,
     editingTask,
     savedSchedule,
     savedWorkspace,
@@ -378,7 +398,7 @@ export function CreateScheduledTaskDialog({
     if (open) targetChosenRef.current = false;
   }, [open]);
   const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
-  const targetInputsLoaded = info !== "loading" && !hostsPending;
+  const targetInputsLoaded = !curationPending && !hostsPending;
   useEffect(() => {
     if (!open || isEdit || !targetInputsLoaded || targetChosenRef.current) return;
     if (managedSandboxesEnabled) {
@@ -398,7 +418,9 @@ export function CreateScheduledTaskDialog({
   // A picked project is shown by its id, so a rename elsewhere shows the new name.
   const pickedProject =
     pickedProjectId !== null ? projects.find((p) => p.id === pickedProjectId) : undefined;
-  const projectName = pickedProject?.name ?? projectChoice ?? savedProjectName ?? "";
+  const effectiveProjectChoice =
+    projectChoice ?? (!isEdit && projectsSupported ? DEFAULT_AUTOMATION_PROJECT : null);
+  const projectName = pickedProject?.name ?? effectiveProjectChoice ?? savedProjectName ?? "";
   const projectIcon = (pickedProject ?? projects.find((p) => p.name === projectName))?.icon;
   // The saved project has no name while the list loads, if it fails to load,
   // or once the project is deleted. Only a loaded list proves it is deleted,
@@ -414,6 +436,23 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
+  const workerSettings = editingWorkerSettings
+    ? readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt))
+    : null;
+  const workerPlacement = editingWorkerSettings
+    ? readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt))
+    : null;
+  const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
+  const workerAgent = agents?.find(
+    (agent) => agent.id === (workerSettings?.agentId ?? editingTask?.agentId),
+  );
+  const workerHarnessSettings = useScheduledHarnessSettings(
+    workerAgent,
+    workerSandboxMode ? undefined : selectedHost,
+    workerSandboxMode,
+    workerSettings?.model ?? "",
+    open && workerSettings !== null,
+  );
   const harnessSettings = useScheduledHarnessSettings(
     agents?.find((agent) => agent.id === effectiveAgentId),
     selectedHost,
@@ -518,16 +557,26 @@ export function CreateScheduledTaskDialog({
           // or each in its own sandbox.
           placement: sandboxMode ? "managed" : "same_host",
           sessionLink,
+          pollingIntervalMinutes:
+            schedule.preset === "custom" && schedule.customFreq === "minutely"
+              ? schedule.interval
+              : 60,
           model: supportsModel && pickedModel !== "" ? pickedModel : undefined,
           effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
         })
       : "";
   const effectivePrompt =
     trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
+  const triggerMode =
+    trigger !== null ||
+    (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
+  const pollingBlockedReason =
+    editingWorkerSettings && reusesExistingSession ? null : harnessSettings.blockedReason;
   const canSubmit =
+    !curationPending &&
     name.trim() !== "" &&
     effectivePrompt.trim() !== "" &&
     (trigger !== null || prompt.trim() !== "") &&
@@ -536,7 +585,8 @@ export function CreateScheduledTaskDialog({
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
-    !harnessSettings.blockedReason &&
+    !pollingBlockedReason &&
+    !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
     !mutationPending;
 
   function resetForm() {
@@ -566,7 +616,7 @@ export function CreateScheduledTaskDialog({
   }
 
   async function handleSubmit() {
-    if (harnessSettings.blockedReason) return;
+    if (!canSubmit) return;
     if (!editingTask && effectiveAgentId === null) return;
     setError(null);
     setSubmitting(true);
@@ -601,7 +651,7 @@ export function CreateScheduledTaskDialog({
       };
       const projectInput = await projectChangeInput(
         // Saving over a deleted project clears it, matching the "No project" shown.
-        projectChoice ?? (savedProjectDeleted ? "" : null),
+        effectiveProjectChoice ?? (savedProjectDeleted ? "" : null),
         pickedProjectId,
         savedProjectId,
         resolveProjectId,
@@ -697,9 +747,11 @@ export function CreateScheduledTaskDialog({
         <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
           <DialogTitle>{isEdit ? "Edit automation" : "New automation"}</DialogTitle>
           <DialogDescription>
-            {isEdit
-              ? "Update this recurring agent session."
-              : "Runs an agent session on a recurring schedule."}
+            {triggerMode
+              ? "Starts an agent session for each matching item."
+              : isEdit
+                ? "Update this recurring agent session."
+                : "Runs an agent session on a recurring schedule."}
           </DialogDescription>
         </DialogHeader>
 
@@ -794,7 +846,7 @@ export function CreateScheduledTaskDialog({
               }}
             />
           ) : (
-            <div className="flex flex-col gap-1.5">
+            <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
               <Label htmlFor="task-prompt">
                 {systemPrompt === null ? "Prompt" : "Your prompt"}
               </Label>
@@ -839,6 +891,7 @@ export function CreateScheduledTaskDialog({
                     {editingSystemPrompt ? (
                       <Textarea
                         aria-label="System prompt"
+                        autoFocus
                         value={systemPrompt}
                         rows={8}
                         className="max-h-80 resize-y text-ui"
@@ -893,27 +946,54 @@ export function CreateScheduledTaskDialog({
             <p className="text-sm text-muted-foreground">{getHostHelpText()}</p>
           </div>
 
-          <ScheduleFields
-            timezone={timezone}
-            onTimezoneChange={setTimezone}
-            model={schedule}
-            anchoredScheduling={anchoredScheduling}
-            sessionMode={sessionMode}
-            executionTarget={executionTarget}
-            subhourSupported={subhourSupported}
-            recurrenceUnsupported={scheduleUnsupported}
-            allowPastEnd={allowPastEnd}
-            onChange={setSchedule}
-            onRecurrenceSelect={() => setScheduleUnsupported(false)}
-            onSelectOpenChange={handleSelectOpenChange}
-          />
-          {scheduleUnsupported && (
+          {!triggerMode && (
+            <ScheduleFields
+              timezone={timezone}
+              onTimezoneChange={setTimezone}
+              model={schedule}
+              anchoredScheduling={anchoredScheduling}
+              sessionMode={sessionMode}
+              executionTarget={executionTarget}
+              subhourSupported={subhourSupported}
+              recurrenceUnsupported={scheduleUnsupported}
+              allowPastEnd={allowPastEnd}
+              onChange={setSchedule}
+              onRecurrenceSelect={() => setScheduleUnsupported(false)}
+              onSelectOpenChange={handleSelectOpenChange}
+            />
+          )}
+          {triggerMode && !scheduleInvalid && (
+            <p className="text-sm text-muted-foreground" data-testid="task-trigger-cadence">
+              Checks for new matches: {describeSchedule(buildRRule(schedule))}. Matching items start
+              sessions automatically.
+            </p>
+          )}
+          {triggerMode && scheduleInvalid && (
+            <div className="space-y-2">
+              <p className="text-sm text-destructive" role="alert">
+                This polling configuration is no longer supported. Use the server default to save
+                your changes.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setSchedule(defaultTriggerSchedule);
+                  setScheduleUnsupported(false);
+                }}
+              >
+                Use server default ({describeSchedule(buildRRule(defaultTriggerSchedule))})
+              </Button>
+            </div>
+          )}
+          {!triggerMode && scheduleUnsupported && (
             <p className="text-sm text-destructive" role="alert">
               This schedule can&apos;t be edited in this form yet. Choose a frequency to replace it.
             </p>
           )}
 
-          {unsupportedByScheduler && (
+          {!triggerMode && unsupportedByScheduler && (
             <p className="text-sm text-destructive" role="alert">
               This server does not support custom schedules or occurrence limits. Choose a supported
               frequency and ending to replace this schedule.
@@ -1084,109 +1164,175 @@ export function CreateScheduledTaskDialog({
             </p>
           )}
 
-          <div className="flex flex-col gap-1.5">
-            <Label>Harness</Label>
-            <div data-testid="task-agent-picker">
-              <AgentHarnessPicker
-                agentEntries={agentEntries}
-                harnessEntries={harnessEntries}
-                effectiveAgentId={effectiveAgentId}
-                agentLabel={agentLabel}
-                hasAgents={agentList.length > 0}
-                // Needs-setup badges use the pinned host, else the first online host.
-                host={badgeHost}
-                onSelectAgent={handleSelectAgent}
-                pendingAgent={null}
-                pendingAgentId="__unused_pending_agent__"
-                onSelectPending={() => {}}
-                // Custom-agent creation is inert until there is a way to
-                // persist a new agent independently of creating a session.
-                onCreateCustomAgent={() => {}}
-                sandboxSelected={false}
-                // Forward the dropdown open/close into the dialog's outside-click
-                // dismiss guard so opening the picker doesn't close the modal.
-                onOpenChange={handleSelectOpenChange}
-                // This picker is nested inside a Dialog. Radix DropdownMenu's
-                // default modal mode can turn an inside-dialog click into a
-                // parent Dialog outside interaction while the menu dismisses.
-                dropdownModal={false}
-                // The shared menu caps against available viewport height, so
-                // constrained screens scroll without clipping taller screens.
-                contentClassName="w-80"
-                // Full-width trigger → left-align the menu's edge to it.
-                contentAlign="start"
-                // Match the Host select's full-width, bordered h-8 styling.
-                triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input"
-                triggerLabelClassName="max-w-none text-ui"
-              />
-            </div>
-            {agentChanged && (
-              <p className="text-sm text-muted-foreground">
-                Future runs use {agentLabel}; past runs keep the agent they ran with
-              </p>
-            )}
-            {!showAdvanced && (
-              <p className="text-sm text-muted-foreground">
-                Uses this agent&apos;s default model, effort, and permission settings
-              </p>
-            )}
-          </div>
-
-          {harnessSettings.blockedReason && (
-            <p
-              role="alert"
-              data-testid="task-harness-unsupported"
-              className="text-sm text-destructive"
-            >
-              {harnessSettings.blockedReason}
+          {editingWorkerSettings && pollingBlockedReason && (
+            <p role="alert" className="text-sm text-destructive">
+              Polling session cannot start: {pollingBlockedReason}
             </p>
           )}
-          {/* Each harness exposes only the launch settings it supports. */}
-          {showAdvanced && (
-            <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-              <CollapsibleTrigger className="group flex cursor-pointer items-center gap-2 rounded-sm py-1 text-muted-foreground text-ui outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-                Advanced
-                <ChevronDownIcon className="size-4 transition-transform group-data-[state=open]:rotate-180" />
-              </CollapsibleTrigger>
-              <CollapsibleContent className="pt-3" data-testid="task-model-effort-field">
-                <ModelEffortFields
-                  model={reusesExistingSession ? (editingTask?.modelOverride ?? "") : pickedModel}
-                  effort={
-                    reusesExistingSession ? (editingTask?.reasoningEffort ?? "") : pickedEffort
-                  }
-                  permissionMode={
-                    reusesExistingSession
-                      ? (editingTask?.permissionMode ?? "")
-                      : effectivePermission
-                  }
-                  settings={harnessSettings}
-                  disabled={reusesExistingSession}
-                  onModelChange={handleModelChange}
-                  onEffortChange={setPickedEffort}
-                  onPermissionModeChange={setPickedPermission}
-                  onSelectOpenChange={handleSelectOpenChange}
-                />
-                {reusesExistingSession ? (
-                  <div
-                    className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
-                    data-testid="task-session-settings-note"
-                    role="status"
-                  >
-                    <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
-                    <p>
-                      To change model, effort, or permission mode, edit the existing session
-                      directly.
-                    </p>
-                  </div>
-                ) : (
-                  <p className="mt-1.5 text-sm text-muted-foreground">
-                    Leave on Default to use the agent&apos;s configured model, effort, and
-                    permission mode. Automations run unattended; modes that require approval may
-                    pause until you respond.
+
+          {editingWorkerSettings && workerSettings !== null && editingTask ? (
+            <TriggerWorkerSettingsFields
+              value={workerSettings}
+              pollingAgentId={editingTask.agentId}
+              agents={agentList}
+              selectedAgent={workerAgent}
+              settings={workerHarnessSettings}
+              disabled={curationPending}
+              onSelectOpenChange={handleSelectOpenChange}
+              onChange={(settings) => {
+                const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
+                if (updated === null) return;
+                const parts = splitTriggerPrompt(updated);
+                setPrompt(parts.userPrompt);
+                setSystemPrompt(parts.systemPrompt);
+              }}
+            />
+          ) : editingWorkerSettings ? (
+            <p className="text-sm text-muted-foreground" role="status">
+              Worker controls are unavailable for these customized instructions. Edit the prompt or
+              system prompt above to configure matching sessions.
+            </p>
+          ) : (
+            <>
+              <div className="flex flex-col gap-1.5">
+                <Label>Harness</Label>
+                <div data-testid="task-agent-picker">
+                  <AgentHarnessPicker
+                    agentEntries={agentEntries}
+                    harnessEntries={harnessEntries}
+                    effectiveAgentId={effectiveAgentId}
+                    agentLabel={agentLabel}
+                    hasAgents={selectedAgent !== undefined || agentList.length > 0}
+                    loading={curationPending}
+                    curatedEntries={curation.restrictToAgentNames.size > 0 ? agentList : undefined}
+                    // Sandboxes provision their own harnesses; host badges only apply to hosts.
+                    host={sandboxMode ? undefined : badgeHost}
+                    onSelectAgent={handleSelectAgent}
+                    pendingAgent={null}
+                    pendingAgentId="__unused_pending_agent__"
+                    onSelectPending={() => {}}
+                    // Custom-agent creation is inert until there is a way to
+                    // persist a new agent independently of creating a session.
+                    onCreateCustomAgent={() => {}}
+                    sandboxSelected={sandboxMode}
+                    allowCreateCustomAgent={false}
+                    // Forward the dropdown open/close into the dialog's outside-click
+                    // dismiss guard so opening the picker doesn't close the modal.
+                    onOpenChange={handleSelectOpenChange}
+                    // This picker is nested inside a Dialog. Radix DropdownMenu's
+                    // default modal mode can turn an inside-dialog click into a
+                    // parent Dialog outside interaction while the menu dismisses.
+                    dropdownModal={false}
+                    // The shared menu caps against available viewport height, so
+                    // constrained screens scroll without clipping taller screens.
+                    contentClassName="w-80"
+                    // Full-width trigger → left-align the menu's edge to it.
+                    contentAlign="start"
+                    // Match the Host select's full-width, bordered h-8 styling.
+                    triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input"
+                    triggerLabelClassName="max-w-none text-ui"
+                  />
+                </div>
+                {agentChanged && (
+                  <p className="text-sm text-muted-foreground">
+                    Future runs use {agentLabel}; past runs keep the agent they ran with
                   </p>
                 )}
-              </CollapsibleContent>
-            </Collapsible>
+                {!showAdvanced && (
+                  <p className="text-sm text-muted-foreground">
+                    Uses this agent&apos;s default model, effort, and permission settings
+                  </p>
+                )}
+              </div>
+
+              {harnessSettings.blockedReason && (
+                <p
+                  role="alert"
+                  data-testid="task-harness-unsupported"
+                  className="text-sm text-destructive"
+                >
+                  {harnessSettings.blockedReason}
+                </p>
+              )}
+              {/* Each harness exposes only the launch settings it supports. */}
+              {showAdvanced && (
+                <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+                  <CollapsibleTrigger className="group flex cursor-pointer items-center gap-2 rounded-sm py-1 text-muted-foreground text-ui outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+                    Advanced
+                    <ChevronDownIcon className="size-4 transition-transform group-data-[state=open]:rotate-180" />
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="pt-3" data-testid="task-model-effort-field">
+                    <ModelEffortFields
+                      model={
+                        reusesExistingSession ? (editingTask?.modelOverride ?? "") : pickedModel
+                      }
+                      effort={
+                        reusesExistingSession ? (editingTask?.reasoningEffort ?? "") : pickedEffort
+                      }
+                      permissionMode={
+                        reusesExistingSession
+                          ? (editingTask?.permissionMode ?? "")
+                          : effectivePermission
+                      }
+                      settings={harnessSettings}
+                      disabled={curationPending || reusesExistingSession}
+                      onModelChange={handleModelChange}
+                      onEffortChange={setPickedEffort}
+                      onPermissionModeChange={setPickedPermission}
+                      onSelectOpenChange={handleSelectOpenChange}
+                    />
+                    {reusesExistingSession ? (
+                      <div
+                        className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
+                        data-testid="task-session-settings-note"
+                        role="status"
+                      >
+                        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                        <p>
+                          This automation continues in an existing session, so its model, effort,
+                          and permission mode are controlled by that session. Edit the session
+                          directly to change them.
+                          {editingTemplateTrigger && (
+                            <>
+                              {" "}
+                              Trigger automations reuse a polling session even though each match
+                              starts a new worker. To change the model or harness for future
+                              workers, edit the worker creation instructions in the{" "}
+                              {systemPrompt === null ? "prompt" : "system prompt"}.{" "}
+                              <button
+                                type="button"
+                                className="underline underline-offset-2"
+                                onClick={() => {
+                                  if (systemPrompt !== null) {
+                                    setSystemPromptOpen(true);
+                                    setEditingSystemPrompt(true);
+                                  }
+                                  promptFieldsRef.current
+                                    ?.querySelector<HTMLTextAreaElement>(
+                                      systemPrompt === null
+                                        ? "#task-prompt"
+                                        : 'textarea[aria-label="System prompt"]',
+                                    )
+                                    ?.focus();
+                                }}
+                              >
+                                Edit worker instructions
+                              </button>
+                            </>
+                          )}
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="mt-1.5 text-sm text-muted-foreground">
+                        Leave on Default to use the agent&apos;s configured model, effort, and
+                        permission mode. Automations run unattended; modes that require approval may
+                        pause until you respond.
+                      </p>
+                    )}
+                  </CollapsibleContent>
+                </Collapsible>
+              )}
+            </>
           )}
 
           {error && (
@@ -1251,6 +1397,13 @@ async function projectChangeInput(
   if (pickedId !== null) return pickedId === savedProjectId ? {} : { projectId: pickedId };
   return { projectId: await resolveProjectId(choice) };
 }
+
+const TRIGGER_SCHEDULE_MODEL: ScheduleModel = {
+  ...DEFAULT_SCHEDULE_MODEL,
+  preset: "custom",
+  customFreq: "minutely",
+  interval: 10,
+};
 
 const HOURLY_SCHEDULE_MODEL: ScheduleModel = { ...DEFAULT_SCHEDULE_MODEL, preset: "hourly" };
 

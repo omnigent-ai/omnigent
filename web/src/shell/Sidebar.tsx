@@ -1551,7 +1551,7 @@ function ProjectFolder({
     visibleCount: number,
   ) => void;
 }) {
-  const { registerFolder, sortBy, customOrder } = useSidebarData();
+  const { registerFolder, sortBy, customOrder, applyLocalResolutions } = useSidebarData();
   const viewerId = useViewerId();
   const query = useProjectSessions(name, expanded, sortBy, archived);
   const watchedRows = useMemo(
@@ -1568,8 +1568,10 @@ function ProjectFolder({
     // window, window rows winning: those carry the move overlay
     // (useMoveToProject), so a just-filed session shows here immediately
     // instead of waiting out the PATCH + folder refetch round-trips.
+    // Window rows already carry the answer overlay; only the folder's own rows get it here.
     const byId = new Map<string, Conversation>();
-    for (const c of query.data?.pages.flatMap((page) => page.data) ?? []) byId.set(c.id, c);
+    for (const row of applyLocalResolutions(query.data?.pages.flatMap((page) => page.data) ?? []))
+      byId.set(row.id, row);
     for (const c of windowConversations) byId.set(c.id, c);
     // Pins take precedence over live folders.
     return sortConversations(
@@ -1587,6 +1589,7 @@ function ProjectFolder({
   }, [
     query.data,
     windowConversations,
+    applyLocalResolutions,
     pinnedSet,
     activeOverride,
     frozenSortKeys,
@@ -3337,9 +3340,9 @@ function projectMarkerState(
   startingConversationId: string | null,
 ): SessionState | null {
   let awaiting = 0;
+  let terminalReason: string | undefined;
   let running = false;
   let starting = false;
-  let background = 0;
   let error = false;
   let disconnected = false;
   let unseen = false;
@@ -3347,12 +3350,11 @@ function projectMarkerState(
     const state = getSessionState(c, errors[i]);
     if (state?.kind === "awaiting") {
       awaiting += state.count;
+      terminalReason ??= state.terminalReason;
     } else if (state?.kind === "running") {
       running = true;
     } else if (c.id === startingConversationId) {
       starting = true;
-    } else if (state?.kind === "background") {
-      background += state.count;
     } else if (state?.kind === "error") {
       error = true;
     } else if (state?.kind === "disconnected") {
@@ -3362,11 +3364,11 @@ function projectMarkerState(
     }
   }
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
+  if (terminalReason) return { kind: "awaiting", count: 0, terminalReason };
   if (running) return { kind: "running" };
   if (starting) return { kind: "starting" };
   if (error) return { kind: "error" };
   if (disconnected) return { kind: "disconnected" };
-  if (background > 0) return { kind: "background", count: background };
   if (unseen) return { kind: "unseen" };
   return null;
 }
@@ -3501,7 +3503,8 @@ function SectionHeader({
           />
         </span>
       ) : null}
-      <span className="min-w-0 truncate">{title}</span>
+      {/* Project folder names sit heavier than their session rows. */}
+      <span className={cn("min-w-0 truncate", icon && "font-medium")}>{title}</span>
       {/* Trailing chevron, rotating on expand. Headers without a leading icon
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}
@@ -6043,7 +6046,9 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "project_id",
   "owner",
   "pending_elicitations_count",
+  "background_work_running",
   "background_task_count",
+  "blocked_on",
   "provisional",
 ];
 

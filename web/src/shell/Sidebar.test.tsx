@@ -2960,7 +2960,7 @@ describe("Sidebar collapsed project marker", () => {
     ).toBeInTheDocument();
   });
 
-  it("sums hidden rows' background tasks ahead of an unread sibling", () => {
+  it("shows hidden rows' background tasks as running ahead of an unread sibling", () => {
     projectsMock.push("Customer X");
     seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
     mockConversations([
@@ -2983,9 +2983,9 @@ describe("Sidebar collapsed project marker", () => {
     renderSidebar();
 
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    expect(within(header).getByRole("img", { name: "3 background tasks running" })).toHaveAttribute(
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
-      "background",
+      "running",
     );
   });
 

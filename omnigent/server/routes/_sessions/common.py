@@ -134,6 +134,11 @@ _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
 )
 
 
+# Work that outlives the ended turn (a background shell, a Codex goal running
+# between turns). Sidebar-only: it publishes no status edge.
+_EXTERNAL_BACKGROUND_WORK_TYPE: str = "external_background_work"
+
+
 _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT: int = 1000
 
 
@@ -592,6 +597,7 @@ _RUNNER_SESSION_EVENT_TYPES: frozenset[str] = frozenset(
         _EXTERNAL_BTW_SIDECHAT_TYPE,
         _EXTERNAL_ELICITATION_RESOLVED_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
+        _EXTERNAL_BACKGROUND_WORK_TYPE,
         _SUBAGENT_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
         _EXTERNAL_PULL_REQUESTS_TYPE,
@@ -668,6 +674,12 @@ _session_background_task_count_cache: WorkspaceScopedCache[str, int] = Workspace
 _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
     WorkspaceScopedCache()
 )
+
+
+# Why a running session's agent is parked on a terminal prompt, as of the last
+# status edge this replica published; ``""`` when that edge was not parked.
+# Absent when this replica has no edge, in which case the list reads the row.
+_session_blocked_on_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
 _read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCache()
@@ -1162,6 +1174,7 @@ __all__ = [
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
+    "_EXTERNAL_BACKGROUND_WORK_TYPE",
     "_EXTERNAL_BTW_DISMISS_TYPE",
     "_EXTERNAL_BTW_SIDECHAT_TYPE",
     "_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE",
@@ -1288,6 +1301,7 @@ __all__ = [
     "_session_active_response_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
+    "_session_blocked_on_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

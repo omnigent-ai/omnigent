@@ -77,8 +77,8 @@ describe("SessionCard", () => {
     const { card } = renderCard({
       conversation: conversation({ status: "idle", background_task_count: 1 }),
     });
-    expect(card).toHaveAttribute("data-state", "background");
-    expect(screen.getByText("Background tasks running")).toBeInTheDocument();
+    expect(card).toHaveAttribute("data-state", "running");
+    expect(screen.getByText("Running")).toBeInTheDocument();
     expect(screen.getByTestId("running-dot")).toBeInTheDocument();
   });
 

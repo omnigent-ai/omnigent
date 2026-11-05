@@ -504,11 +504,15 @@ _LONG_API_ERROR_ENVELOPE = "API Error: 500 " + json.dumps(
 _PANE_FAILURE_DETAILS = {
     "pane_detail": "API Error: 499 Authorization: Bearer synthetic-secret-token",
     "pane_envelope": _LONG_API_ERROR_ENVELOPE,
+    # Claude's own refusal of a turn whose context is full; no StopFailure hook follows.
+    "pane_overflow": "Prompt is too long",
 }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_source", ["forwarder", "pane", "pane_detail", "pane_envelope"])
+@pytest.mark.parametrize(
+    "status_source", ["forwarder", "pane", "pane_detail", "pane_envelope", "pane_overflow"]
+)
 async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
@@ -555,6 +559,13 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
                 context = failures[0]["failure_context"]
                 assert context["native_error_message"] == _API_ERROR_CAUSE
                 assert context["http_status"] == 500
+                assert context["failure_source"] == "claude_program_status"
+            elif status_source == "pane_overflow":
+                assert failures[0]["error"]["code"] == "context_length_exceeded"
+                assert failures[0]["error"]["message"].startswith("Context limit reached")
+                assert "/compact" in failures[0]["error"]["message"]
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == "Prompt is too long"
                 assert context["failure_source"] == "claude_program_status"
             else:
                 assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"

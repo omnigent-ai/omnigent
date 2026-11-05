@@ -627,6 +627,10 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, automations_v2_se
     expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
 
     page.get_by_test_id("task-timezone-trigger").click()
+    zones = page.get_by_role("listbox")
+    zones.hover()
+    page.mouse.wheel(0, 400)
+    page.wait_for_function("document.querySelector('[cmdk-list]').scrollTop > 0")
     page.get_by_placeholder("Search timezones…").fill("Singapore")
     page.get_by_role("option", name="Asia/Singapore", exact=True).click()
     expect(page.get_by_test_id("task-timezone-trigger")).to_contain_text("Asia/Singapore")
@@ -1001,7 +1005,7 @@ def test_scheduled_task_create_persists_continuing_one_session(
 
 @pytest.mark.usefixtures("automations_v2_host")
 @pytest.mark.parametrize("entry", ["preview", "templates"])
-def test_scheduled_task_trigger_template_creates_hourly_manager_task(
+def test_scheduled_task_trigger_template_creates_polling_manager_task(
     page: Page,
     automations_v2_server: str,
     entry: str,
@@ -1009,6 +1013,8 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     """Create from either gallery and edit user/system prompts independently."""
     live_server = automations_v2_server
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
+    scope = "ES, OPS" if entry == "templates" else "ES"
+    project_query = 'project in ("ES", "OPS")' if entry == "templates" else 'project = "ES"'
     page.set_viewport_size({"width": 390 if entry == "preview" else 1280, "height": 900})
     _open_automations_page(page, live_server)
     if entry == "templates":
@@ -1055,7 +1061,10 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     expect(page.get_by_test_id("task-template-trigger")).to_have_count(0)
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     page.get_by_test_id("task-name-input").fill(name)
-    page.get_by_test_id("task-trigger-scope").fill("ES")
+    expect(page.get_by_test_id("task-trigger-scope-operator")).to_have_text("equals")
+    if entry == "templates":
+        _pick_select_option(page, "task-trigger-scope-operator", "in")
+    page.get_by_test_id("task-trigger-scope").fill(scope)
     page.get_by_test_id("task-trigger-add-condition").click()
     page.get_by_test_id("task-trigger-condition-0-value").fill("omnigent")
     page.get_by_test_id("task-trigger-instructions").fill("Triage the ticket.")
@@ -1068,15 +1077,23 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == name)
     assert created["session_mode"] == "continue", created
-    assert created["rrule"].startswith("FREQ=HOURLY"), created
+    projects = httpx.get(f"{live_server}/v1/projects", timeout=10).json()["data"]
+    automation_projects = [p for p in projects if p["name"] == "Omnigent Automation"]
+    assert len(automation_projects) == 1
+    assert created["project_id"] == automation_projects[0]["id"]
+    assert created["rrule"].startswith("FREQ=MINUTELY;INTERVAL=10"), created
+    expect(_row_by_name(page, name)).to_contain_text("Runs when new items match")
+    expect(_row_by_name(page, name).get_by_test_id("task-next-run")).to_have_count(0)
     # The prompt's details are covered by the dialog and renderer tests.
-    assert '(project = "ES" AND labels = "omnigent")' in created["prompt"], created
+    assert f'({project_query} AND labels = "omnigent")' in created["prompt"], created
     expect(page.get_by_role("region", name="Suggested Automations")).to_be_visible()
 
     row = _row_by_name(page, name)
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-edit").click()
     user_prompt = page.get_by_label("Your prompt", exact=True)
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
     system_toggle = page.get_by_role("dialog").get_by_role(
         "button", name="System prompt", exact=True
     )
@@ -1099,23 +1116,23 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     expect(detail_system_toggle).to_have_attribute("aria-expanded", "false")
     expect(page.get_by_test_id("task-detail-system-prompt")).to_have_count(0)
     detail_system_toggle.click()
-    expect(page.get_by_test_id("task-detail-system-prompt")).to_contain_text('project = "ES"')
+    expect(page.get_by_test_id("task-detail-system-prompt")).to_contain_text(project_query)
     detail_system_toggle.click()
     page.get_by_test_id("task-detail-edit").click()
     expect(user_prompt).to_have_value("Investigate the ticket and propose a fix.")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
     expect(system_toggle).to_have_attribute("aria-expanded", "false")
     system_toggle.click()
     system_editor = page.get_by_role("textbox", name="System prompt", exact=True)
     expect(system_editor).to_have_count(0)
     page.get_by_role("button", name="Edit system prompt", exact=True).click()
-    updated_system_prompt = system_editor.input_value().replace(
-        'project = "ES"', 'project = "OPS"'
-    )
+    updated_system_prompt = system_editor.input_value().replace(project_query, 'project = "OPS"')
     system_editor.fill(updated_system_prompt)
     page.get_by_test_id("create-scheduled-task-submit").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
     updated = httpx.get(f"{live_server}/v1/scheduled-tasks/{created['id']}", timeout=10).json()
-    assert updated["prompt"] == saved["prompt"].replace('project = "ES"', 'project = "OPS"')
+    assert updated["prompt"] == saved["prompt"].replace(project_query, 'project = "OPS"')
     page.get_by_test_id("task-detail-edit").click()
     expect(system_toggle).to_have_attribute("aria-expanded", "false")
     expect(user_prompt).to_have_value("Investigate the ticket and propose a fix.")
@@ -1127,6 +1144,36 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page.goto(f"{live_server}/tasks")
     page.get_by_test_id("suggestion-trigger-slack").click()
     expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
+    expect(page.get_by_test_id("task-trigger-scope-operator")).to_have_text("equals")
+    expect(page.get_by_test_id("task-trigger-scope")).to_have_attribute(
+        "placeholder", "eng-support"
+    )
+    _pick_select_option(page, "task-trigger-scope-operator", "in")
+    expect(page.get_by_test_id("task-trigger-scope")).to_have_attribute(
+        "placeholder", "eng-support, bugs"
+    )
+    expect(page.locator("[role='listbox']")).to_have_count(0)
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
+    manual_name = f"Manual from template {uuid.uuid4().hex[:8]}"
+    page.get_by_test_id("task-name-input").fill(manual_name)
+    page.get_by_test_id("task-trigger-scope").fill("#support")
+    page.get_by_test_id("task-trigger-instructions").fill("Summarize new messages.")
+    page.get_by_test_id("task-trigger-preview").locator("summary").click()
+    page.get_by_test_id("task-trigger-edit-as-prompt").click()
+    _pick_select_option(page, "task-session-mode-trigger", "New session each run")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_be_visible()
+    expect(page.get_by_test_id("task-trigger-cadence")).to_have_count(0)
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    manual_row = _row_by_name(page, manual_name)
+    expect(manual_row.get_by_test_id("task-next-run")).to_be_visible()
+    manual_row.get_by_test_id("task-row-menu").click()
+    expect(page.get_by_test_id("task-run-now")).to_be_visible()
+    page.keyboard.press("Escape")
+    manual_row.get_by_test_id("task-row-open").click()
+    expect(page.get_by_test_id("task-detail-run-now")).to_be_visible()
+    expect(page.get_by_test_id("task-detail-schedule")).to_contain_text("Next run")
 
 
 def test_ten_minute_host_schedule_round_trip(

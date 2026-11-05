@@ -4775,6 +4775,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "OMNIGENT_LOG_TTY_FD": "9",
         "OMNIGENT_WRAPPER_COMMAND": "isaac omni",
         "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND": "credential-helper --format raw",
+        "OMNIGENT_MCP_AUTH_STATUS_FILE": "/srv/omnigent/mcp-auth-status.json",
     }
 
     env = _build_runner_env(
@@ -4821,6 +4822,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
     # The claude-sdk harness sends this as the Claude CLI entrypoint.
     assert env["OMNIGENT_CLAUDE_CODE_ENTRYPOINT"] == "gateway-client"
+    # The executor must read the same MCP sign-in status file the host lists.
+    assert env["OMNIGENT_MCP_AUTH_STATUS_FILE"] == "/srv/omnigent/mcp-auth-status.json"
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"
@@ -4880,6 +4883,25 @@ def test_build_runner_env_omits_cleanup_owner_without_active_janitor() -> None:
     )
 
     assert RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR not in env
+
+
+def test_build_runner_env_resolves_relative_auth_status_file_in_host_cwd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The runner starts in the session workspace, so a relative override is anchored here."""
+    host_cwd = tmp_path / "host"
+    host_cwd.mkdir()
+    monkeypatch.chdir(host_cwd)
+    env = _build_runner_env(
+        {"OMNIGENT_MCP_AUTH_STATUS_FILE": "status.json"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace=str(tmp_path / "workspace"),
+        parent_pid=42,
+    )
+
+    assert env["OMNIGENT_MCP_AUTH_STATUS_FILE"] == str(Path.cwd() / "status.json")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Symlink path is POSIX-only.")

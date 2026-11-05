@@ -1,5 +1,6 @@
 // Per-row state derivation for the sidebar badge.
-// Priority: awaiting > running > error > background > no badge.
+// Priority: awaiting (web prompts, then terminal prompts) > running > disconnected
+// > error > background work > no badge.
 //
 // Liveness (runner / host reachability) is no longer a sidebar state:
 // it surfaces in the open-session view (see `useSessionLiveness`), so the
@@ -13,11 +14,11 @@ import type { Conversation } from "@/hooks/useConversations";
 import type { LatestSessionError } from "@/lib/sessionError";
 
 export type SessionState =
-  | { kind: "awaiting"; count: number }
-  | { kind: "running" }
-  // The turn ended but background shells still run; the server zeroes the
-  // count once the bound runner's liveness lapses.
-  | { kind: "background"; count: number }
+  // `terminalReason`: no web card; the agent is parked on a prompt in its terminal.
+  | { kind: "awaiting"; count: number; terminalReason?: string }
+  // `background`: the turn ended but work outlives it (a background shell or a Codex goal);
+  // `count`: how many background shells, when the harness reports them.
+  | { kind: "running"; background?: true; count?: number }
   | { kind: "error" }
   | { kind: "disconnected" }
   | { kind: "unseen" }
@@ -29,20 +30,29 @@ export type SessionState =
 
 export function getSessionState(
   conversation:
-    | Pick<Conversation, "status" | "pending_elicitations_count" | "background_task_count">
+    | Pick<
+        Conversation,
+        | "status"
+        | "pending_elicitations_count"
+        | "background_work_running"
+        | "background_task_count"
+        | "blocked_on"
+      >
     | undefined
     | null,
   latestError: LatestSessionError | null = null,
 ): SessionState | null {
   const pending = conversation?.pending_elicitations_count ?? 0;
   if (pending > 0) return { kind: "awaiting", count: pending };
+  if (conversation?.status === "running" && conversation.blocked_on) {
+    return { kind: "awaiting", count: 0, terminalReason: conversation.blocked_on };
+  }
   if (conversation?.status === "running") return { kind: "running" };
   if (latestError === "disconnected") return { kind: "disconnected" };
-  const failed =
-    latestError !== "recovered_disconnect" &&
-    (conversation?.status === "failed" || latestError === "error");
-  if (failed) return { kind: "error" };
-  const background = conversation?.background_task_count ?? 0;
-  if (background > 0) return { kind: "background", count: background };
+  const failed = conversation?.status === "failed" || latestError === "error";
+  if (failed && latestError !== "recovered_disconnect") return { kind: "error" };
+  const count = conversation?.background_task_count ?? 0;
+  if (count > 0) return { kind: "running", background: true, count };
+  if (conversation?.background_work_running) return { kind: "running", background: true };
   return null;
 }

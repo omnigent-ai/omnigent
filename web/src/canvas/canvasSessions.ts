@@ -136,6 +136,7 @@ function sessionSignature(sessions: readonly Conversation[]): string {
         row.title,
         row.pending_elicitations_count,
         row.background_task_count,
+        row.background_work_running,
         row.git_branch,
         row.project_id,
         row.workspace,
@@ -316,6 +317,7 @@ function sameCard(left: Conversation, right: Conversation): boolean {
     left.updated_at === right.updated_at &&
     (left.pending_elicitations_count ?? 0) === (right.pending_elicitations_count ?? 0) &&
     (left.background_task_count ?? 0) === (right.background_task_count ?? 0) &&
+    (left.background_work_running ?? false) === (right.background_work_running ?? false) &&
     (left.git_branch ?? null) === (right.git_branch ?? null) &&
     (left.project_id ?? null) === (right.project_id ?? null) &&
     (left.workspace ?? null) === (right.workspace ?? null) &&
@@ -396,6 +398,7 @@ export function useCanvasSessions(): CanvasSessions {
   const sessionsRef = useRef(state.sessions);
   const completeRef = useRef(state.complete);
   const inFlightRef = useRef<Promise<void> | null>(null);
+  const lastRefreshAtRef = useRef(Number.NEGATIVE_INFINITY);
   const aliveRef = useRef(true);
 
   useEffect(() => {
@@ -431,6 +434,7 @@ export function useCanvasSessions(): CanvasSessions {
 
   const refresh = useCallback((): Promise<void> => {
     if (inFlightRef.current) return inFlightRef.current;
+    lastRefreshAtRef.current = Date.now();
     const existing = sessionsRef.current;
     // Once the full list is known, routine refreshes stay quiet.
     if (!completeRef.current) {
@@ -484,12 +488,18 @@ export function useCanvasSessions(): CanvasSessions {
   }, [queryClient]);
 
   // Initial load, then poll like the sidebar does and catch up when the tab
-  // becomes visible or the window regains focus.
+  // becomes visible or the window regains focus after a poll interval.
   useEffect(() => {
     if (awaitingStoredIdentity) return;
     void refresh();
     const refreshIfVisible = () => {
       if (!document.hidden) void refresh();
+    };
+    // Focus and visibility flip every time the user switches windows, and each
+    // refresh walks every session; within a poll interval the timer covers it.
+    const refreshOnReturn = () => {
+      if (Date.now() - lastRefreshAtRef.current < SESSION_POLL_INTERVAL_MS) return;
+      refreshIfVisible();
     };
     // The updates stream mirrors changes in place for cards it watches, but its
     // watch set is bounded (sidebar-loaded + active sessions), so canvas cards
@@ -506,12 +516,12 @@ export function useCanvasSessions(): CanvasSessions {
       if (sessionUpdatesSocket.isConnected() && tick % connectedTickStride !== 0) return;
       refreshIfVisible();
     }, SESSION_POLL_INTERVAL_MS);
-    window.addEventListener("focus", refreshIfVisible);
-    document.addEventListener("visibilitychange", refreshIfVisible);
+    window.addEventListener("focus", refreshOnReturn);
+    document.addEventListener("visibilitychange", refreshOnReturn);
     return () => {
       clearInterval(timer);
-      window.removeEventListener("focus", refreshIfVisible);
-      document.removeEventListener("visibilitychange", refreshIfVisible);
+      window.removeEventListener("focus", refreshOnReturn);
+      document.removeEventListener("visibilitychange", refreshOnReturn);
     };
   }, [awaitingStoredIdentity, refresh]);
 

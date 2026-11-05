@@ -2226,15 +2226,14 @@ export function NewChatLandingScreen() {
   // Filter and order selectable agents by deployment curation.
   const info = useServerInfo();
   const curation = pickerCuration(info);
-  const agentList = useMemo(() => {
-    const selectable = selectableSessionAgents(
-      (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
-    );
-    if (curation.restrictToAgentNames.size === 0) return selectable;
-    const allowed = selectable.filter((agent) => curation.restrictToAgentNames.has(agent.name));
-    const order = [...curation.restrictToAgentNames];
-    return allowed.sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
-  }, [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames]);
+  const agentList = useMemo(
+    () =>
+      selectableSessionAgents(
+        (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
+        curation.restrictToAgentNames,
+      ),
+    [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames],
+  );
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -6344,13 +6343,14 @@ export function NewChatLandingScreen() {
           ? "Working directory: No host selected"
           : `Working directory: ${visibleWorkspace || "Not selected"}`
       }
-      title={
-        workspacePopoverOpen
-          ? undefined
-          : noExecutionTargetSelected
-            ? "No host selected"
-            : visibleWorkspace || "Working directory not selected"
+      tooltip={
+        noExecutionTargetSelected
+          ? "No host selected"
+          : visibleWorkspace
+            ? `Working directory: ${visibleWorkspace}`
+            : "Working directory not selected"
       }
+      menuOpen={workspacePopoverOpen}
       disabled={noExecutionTargetSelected || workspaceLoading}
       aria-busy={workspaceLoading || undefined}
       className={noExecutionTargetSelected || workspaceLoading ? "disabled:opacity-100" : undefined}
@@ -6594,15 +6594,14 @@ export function NewChatLandingScreen() {
                             ? "No host selected"
                             : visibleWorktreeHeader.branchDescription
                         }
-                        title={
-                          worktreePopoverOpen
-                            ? undefined
-                            : noExecutionTargetSelected
-                              ? "No host selected"
-                              : workspaceLoading || worktreeControlAvailable
-                                ? visibleWorktreeHeader.branchDescription
-                                : "Choose a Git working directory to use worktrees"
+                        tooltip={
+                          noExecutionTargetSelected
+                            ? "No host selected"
+                            : workspaceLoading || worktreeControlAvailable
+                              ? visibleWorktreeHeader.branchDescription
+                              : "Choose a Git working directory to use worktrees"
                         }
+                        menuOpen={worktreePopoverOpen}
                         disabled={
                           noExecutionTargetSelected || workspaceLoading || !worktreeControlAvailable
                         }
