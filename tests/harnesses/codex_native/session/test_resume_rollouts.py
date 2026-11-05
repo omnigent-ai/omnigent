@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -1329,6 +1330,149 @@ def _user_message(text: str, response_id: str = "codex_turn_1") -> dict[str, Any
         "content": [{"type": "input_text", "text": text}],
         "response_id": response_id,
     }
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+def test_rollout_records_bound_aggregate_completed_arguments(compacted: bool) -> None:
+    """Many individually valid calls must not make a rebuilt request exceed 32 MiB."""
+    arguments = '{"cmd":"' + "x" * 899_980 + '"}'
+    items = [
+        item
+        for index in range(40)
+        for item in (
+            {**_tool_call(f"call_{index}"), "arguments": arguments},
+            _tool_output(f"call_{index}"),
+        )
+    ]
+    if compacted:
+        items = [{"type": "compaction", "compacted_messages": items[:40]}, *items[40:]]
+    items.append(_user_message('Keep my current input exactly: 界\\"', "codex_turn_2"))
+    original = deepcopy(items)
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+    history = []
+    for record in records:
+        if record["type"] == "compacted":
+            history = list(record["payload"]["replacement_history"])
+        elif record["type"] == "response_item":
+            history.append(record["payload"])
+    request_bytes = len(
+        json.dumps({"input": history}, ensure_ascii=False, separators=(",", ":")).encode()
+    )
+    assert request_bytes < 32 * 1024 * 1024
+    calls = [item for item in history if item["type"] == "function_call"]
+    assert len(calls) == 40
+    assert "omitted" in json.loads(calls[0]["arguments"])
+    assert calls[-1]["arguments"] == arguments
+    assert [item["call_id"] for item in calls] == [f"call_{index}" for index in range(40)]
+    assert [item["output"] for item in history if item["type"] == "function_call_output"] == [
+        f"call_{index} done" for index in range(40)
+    ]
+    assert history[-1]["content"] == original[-1]["content"]
+    assert items == original
+
+
+@pytest.mark.parametrize("text", ["x", "界", '\\"\n'])
+@pytest.mark.parametrize("headroom", [-1, 0, 1])
+def test_replay_argument_byte_budget_counts_utf8_and_json_escaping(
+    monkeypatch: pytest.MonkeyPatch, text: str, headroom: int
+) -> None:
+    """Measure serialized bytes, preserving a history exactly at its byte budget."""
+    arguments = json.dumps({"cmd": text * 300}, ensure_ascii=False)
+    history = [{**_tool_call("call_1"), "arguments": arguments}, _tool_output("call_1")]
+    history_bytes = len(json.dumps(history, ensure_ascii=False, separators=(",", ":")).encode())
+    monkeypatch.setattr(codex_native, "_MAX_REPLAYED_HISTORY_BYTES", history_bytes + headroom)
+    records = [{"type": "response_item", "payload": item} for item in history]
+
+    codex_native._bound_codex_replay_argument_bytes(records)
+
+    if headroom >= 0:
+        assert history[0]["arguments"] == arguments
+    else:
+        assert "omitted" in json.loads(history[0]["arguments"])
+    assert len(json.dumps(history, ensure_ascii=False, separators=(",", ":")).encode()) <= (
+        history_bytes + headroom
+    )
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+@pytest.mark.parametrize("pending_type", ["function_call", "function_call_output"])
+def test_rollout_byte_budget_preserves_source_pending_status(
+    monkeypatch: pytest.MonkeyPatch, compacted: bool, pending_type: str
+) -> None:
+    """Conversion must not lose an explicit source status before budget eligibility."""
+    arguments = json.dumps({"cmd": "x" * 500})
+    history = [
+        item
+        for index in range(4)
+        for item in (
+            {**_tool_call(f"call_{index}"), "arguments": arguments},
+            _tool_output(f"call_{index}"),
+        )
+    ]
+    history[0 if pending_type == "function_call" else 1]["status"] = "in_progress"
+    original = deepcopy(history)
+    monkeypatch.setattr(codex_native, "_MAX_REPLAYED_HISTORY_BYTES", 1_500)
+    records = codex_native._codex_rollout_records_from_session_items(
+        [{"type": "compaction", "compacted_messages": history}] if compacted else history,
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+    payloads = (
+        records[1]["payload"]["replacement_history"]
+        if compacted
+        else [record["payload"] for record in records if record["type"] == "response_item"]
+    )
+    assert payloads[0]["arguments"] == arguments
+    assert any(
+        item.get("arguments") != arguments
+        for item in payloads[2:]
+        if item["type"] == "function_call"
+    )
+    assert history == original
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        [_tool_call("call_1")],
+        [_tool_call("call_1"), _tool_call("call_1"), _tool_output("call_1")],
+        [_tool_call("call_1"), _tool_output("call_1"), _tool_output("call_1")],
+        [_tool_output("call_1"), _tool_call("call_1")],
+        [{**_tool_call("call_1"), "status": "in_progress"}, _tool_output("call_1")],
+        [_tool_call("call_1"), {**_tool_output("call_1"), "status": "in_progress"}],
+        [_tool_call("call_1"), {**_tool_output("call_1"), "output": None}],
+        [_tool_call("call_1"), _tool_output("call_1"), {"type": "other", "call_id": "call_1"}],
+        [{**_tool_call("call_1"), "name": ""}, _tool_output("call_1")],
+        [{**_tool_call("call_1"), "namespace": None}, _tool_output("call_1")],
+    ],
+)
+def test_replay_argument_byte_budget_preserves_open_or_ambiguous_calls(
+    monkeypatch: pytest.MonkeyPatch, history: list[dict[str, Any]]
+) -> None:
+    """A size limit cannot authorize changing executable or ambiguously paired JSON."""
+    history = deepcopy(history)
+    for item in history:
+        if item["type"] == "function_call":
+            item["arguments"] = json.dumps({"cmd": "x" * 500})
+    history.append(_user_message("preserve user text" * 100))
+    original = deepcopy(history)
+    monkeypatch.setattr(codex_native, "_MAX_REPLAYED_HISTORY_BYTES", 100)
+
+    codex_native._bound_codex_replay_argument_bytes(
+        [{"type": "response_item", "payload": item} for item in history]
+    )
+
+    assert history == original
 
 
 @pytest.mark.parametrize(
