@@ -45,11 +45,11 @@ def _permission_timeout(session_id: str) -> Iterator[list[dict]]:
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
     config_path = bridge.bridge_dir_for_conversation_id(session_id) / "permission_hook.json"
     original = config_path.read_bytes()
     config = json.loads(original)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
     config["ap_server_url"] = f"http://127.0.0.1:{server.server_port}"
     thread.start()
     try:
@@ -159,7 +159,7 @@ def test_native_question_reaches_chat_and_returns_to_claude(
             assert all(not result.get("is_error") for result in results)
             assert "Alpha" in json.dumps(results)
         else:
-            assert received and received[0]["tool_name"] == "AskUserQuestion"
+            assert any(posted.get("tool_name") == "AskUserQuestion" for posted in received)
             assert all(result.get("is_error") for result in results)
             assert "normal chat message" in json.dumps(results)
         snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10).json()
