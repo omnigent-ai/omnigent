@@ -21,7 +21,7 @@ const WIKI_URL = "https://wiki.example.com/onboarding";
 // Main-process stand-ins, loaded before main.js. Only the fake hosts are
 // served locally; every other request keeps the production policy and network.
 const STAND_IN_PRELOAD = `
-const { app, BrowserWindow, net, shell } = require("electron");
+const { app, BrowserWindow, shell } = require("electron");
 const mod = require(${JSON.stringify(path.resolve(__dirname, "../src/browserViewRegistry.js"))});
 
 const FAKE_HOSTS = new Set([
@@ -99,7 +99,7 @@ function serveFake(request) {
 
 app.on("session-created", (ses) => {
   ses.protocol.handle("https", (request) =>
-    isFake(request.url) ? serveFake(request) : net.fetch(request, { bypassCustomProtocolHandlers: true }),
+    isFake(request.url) ? serveFake(request) : ses.fetch(request, { bypassCustomProtocolHandlers: true }),
   );
 });
 
@@ -142,9 +142,9 @@ async function openBrowserPane({ scratch, recordDir }) {
     await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
     const expand = window.getByRole("button", { name: "Expand right panel", exact: true });
     if (await expand.isVisible()) await expand.click();
-    await window.waitForTimeout(1000);
+    await pace(window, 1000);
     await window.getByRole("button", { name: "Open new", exact: true }).click();
-    await window.waitForTimeout(600);
+    await pace(window, 600);
     await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
     return { backend, desktop };
   } catch (error) {
@@ -183,7 +183,7 @@ async function typeAddress(window, url) {
   const bar = window.getByRole("textbox", { name: "Address bar" });
   await bar.click();
   await bar.pressSequentially(url, { delay: 35 });
-  await window.waitForTimeout(400);
+  await pace(window, 400);
   await bar.press("Enter");
 }
 
@@ -210,6 +210,11 @@ async function closeDesktop(desktop, recordDir, name) {
   await desktop.electronApp.close();
   if (name) console.log(saveRecording(recordDir, name));
   fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+}
+
+// Pauses that only pace a kept recording for viewers.
+function pace(window, ms) {
+  return process.env.OMNIGENT_DESKTOP_RECORD_DIR ? window.waitForTimeout(ms) : Promise.resolve();
 }
 
 // Without OMNIGENT_DESKTOP_RECORD_DIR, clips go to scratch and are removed with it.
@@ -250,11 +255,11 @@ it(
         "accounts.google.com/signin/sso",
         "access.workspace.google.com/remediate",
       ]);
-      await window.waitForTimeout(3000);
+      await pace(window, 3000);
 
       await window.getByRole("button", { name: "Continue in browser", exact: true }).click();
       assert.deepEqual(await waitForOpened(electronApp, DOC_URL), [DOC_URL]);
-      await window.waitForTimeout(3500);
+      await pace(window, 3500);
     }),
 );
 
@@ -283,10 +288,10 @@ it(
           .count(),
         0,
       );
-      await window.waitForTimeout(2500);
+      await pace(window, 2500);
 
       await window.getByRole("button", { name: "Open in browser", exact: true }).click();
       assert.deepEqual(await waitForOpened(electronApp, WIKI_URL), [WIKI_URL]);
-      await window.waitForTimeout(3500);
+      await pace(window, 3500);
     }),
 );

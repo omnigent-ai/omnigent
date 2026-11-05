@@ -63,11 +63,17 @@ describe("browserSystemHandoff — navigation trail", () => {
 });
 
 describe("browserSystemHandoff — systemBrowserCandidates", () => {
-  it("lists continue targets, then loaded pages, then the block page", () => {
-    const LANDING = "https://docs.google.com/";
+  const LANDING = "https://docs.google.com/";
+  const MAIL = "https://mail.google.com/mail/u/0/";
+  const PHISH = "https://attacker.example/phish";
+  const signInTo = (url) =>
+    `https://accounts.google.com/ServiceLogin?continue=${encodeURIComponent(url)}`;
+
+  it("lists continue targets, then loaded pages, then the opened page and block page", () => {
     assert.deepEqual(
       systemBrowserCandidates({
         currentUrl: BLOCKED,
+        requestedUrl: LANDING,
         navigationTrail: [LANDING, DOC, SIGN_IN, BLOCKED],
       }),
       [DOC, LANDING, BLOCKED],
@@ -87,54 +93,89 @@ describe("browserSystemHandoff — systemBrowserCandidates", () => {
 
   it("sends a blocked sign-in to the page it was continuing to", () => {
     assert.equal(
-      systemBrowserUrl({ currentUrl: BLOCKED, navigationTrail: [DOC, SIGN_IN, BLOCKED] }),
+      systemBrowserUrl({
+        currentUrl: BLOCKED,
+        requestedUrl: DOC,
+        navigationTrail: [DOC, SIGN_IN, BLOCKED],
+      }),
       DOC,
     );
     const blockedWithContinue = `https://access.workspace.google.com/remediate?continue=${encodeURIComponent(
       `${DOC}/edit`,
     )}`;
     assert.equal(
-      systemBrowserUrl({ currentUrl: blockedWithContinue, navigationTrail: [DOC, SIGN_IN] }),
+      systemBrowserUrl({
+        currentUrl: blockedWithContinue,
+        requestedUrl: DOC,
+        navigationTrail: [DOC, SIGN_IN],
+      }),
       `${DOC}/edit`,
     );
   });
 
-  it("prefers the newest continue target on an origin the tab loaded", () => {
-    const MAIL = "https://mail.google.com/mail/u/0/";
-    const signInTo = (url) =>
-      `https://accounts.google.com/ServiceLogin?continue=${encodeURIComponent(url)}`;
-    const unvisited = signInTo("https://unvisited.example/");
+  it("prefers the newest continue target on the opened origin", () => {
     assert.equal(
       systemBrowserUrl({
         currentUrl: BLOCKED,
-        navigationTrail: [DOC, MAIL, SIGN_IN, signInTo(MAIL), unvisited, BLOCKED],
+        requestedUrl: LANDING,
+        navigationTrail: [LANDING, SIGN_IN, signInTo(`${DOC}/edit`), signInTo(MAIL), BLOCKED],
       }),
-      MAIL,
+      `${DOC}/edit`,
     );
   });
 
-  it("never opens a continue target on an origin the tab didn't load", () => {
-    const blockedToElsewhere = `https://access.workspace.google.com/remediate?continue=${encodeURIComponent(
-      "https://unvisited.example/",
-    )}`;
+  it("trusts a sign-in link's continue target when that link was opened", () => {
     assert.equal(
-      systemBrowserUrl({
-        currentUrl: blockedToElsewhere,
-        navigationTrail: [DOC, blockedToElsewhere],
-      }),
+      systemBrowserUrl({ currentUrl: BLOCKED, requestedUrl: SIGN_IN, navigationTrail: [BLOCKED] }),
       DOC,
     );
-    assert.equal(
-      systemBrowserUrl({ currentUrl: blockedToElsewhere, navigationTrail: [blockedToElsewhere] }),
-      blockedToElsewhere,
+  });
+
+  it("ignores continue targets and pages a page routed the tab to", () => {
+    // A hostile page on the opened origin sends the tab through sign-in to the block page.
+    assert.deepEqual(
+      systemBrowserCandidates({
+        currentUrl: BLOCKED,
+        requestedUrl: DOC,
+        navigationTrail: [DOC, PHISH, signInTo(PHISH), MAIL, BLOCKED],
+      }),
+      [DOC, BLOCKED],
+    );
+    const blockedToPhish = `https://access.workspace.google.com/remediate?continue=${encodeURIComponent(PHISH)}`;
+    assert.deepEqual(
+      systemBrowserCandidates({
+        currentUrl: blockedToPhish,
+        requestedUrl: DOC,
+        navigationTrail: [DOC, blockedToPhish],
+      }),
+      [DOC, blockedToPhish],
     );
   });
 
-  it("falls back to the newest non-sign-in page, then to the blocked page itself", () => {
-    const LANDING = "https://docs.google.com/";
+  it("falls back to the block page when nothing was explicitly opened", () => {
+    for (const requestedUrl of [
+      undefined,
+      "",
+      "about:blank",
+      "https://accounts.google.com/signin",
+    ]) {
+      assert.deepEqual(
+        systemBrowserCandidates({
+          currentUrl: BLOCKED,
+          requestedUrl,
+          navigationTrail: [DOC, SIGN_IN, BLOCKED],
+        }),
+        [BLOCKED],
+        String(requestedUrl),
+      );
+    }
+  });
+
+  it("falls back to the newest loaded page, then to the opened page", () => {
     assert.equal(
       systemBrowserUrl({
         currentUrl: BLOCKED,
+        requestedUrl: LANDING,
         navigationTrail: [LANDING, DOC, "https://accounts.google.com/signin", BLOCKED],
       }),
       DOC,
@@ -142,9 +183,10 @@ describe("browserSystemHandoff — systemBrowserCandidates", () => {
     assert.equal(
       systemBrowserUrl({
         currentUrl: BLOCKED,
+        requestedUrl: DOC,
         navigationTrail: ["https://accounts.google.com/signin", BLOCKED],
       }),
-      BLOCKED,
+      DOC,
     );
   });
 });

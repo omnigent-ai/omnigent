@@ -1108,7 +1108,7 @@ describe("browserIpc — Chrome cookie import", () => {
 describe("browserIpc — open in system browser", () => {
   const BLOCKED = "https://access.workspace.google.com/remediate?continue=x";
 
-  function setupHandoff({ url, navigationTrail, openExternal }) {
+  function setupHandoff({ url, requestedUrl, navigationTrail, openExternal }) {
     const opened = [];
     const wc = makeWebContents();
     wc.getURL = () => url;
@@ -1121,6 +1121,7 @@ describe("browserIpc — open in system browser", () => {
         }),
     });
     if (navigationTrail) ctx.registry.get("conv_1").navigationTrail = navigationTrail;
+    if (requestedUrl) ctx.registry.get("conv_1").lastRequestedUrl = requestedUrl;
     const invoke = (conversationId = "conv_1") =>
       ctx.ipcMain.invoke("omnigent:browser-open-in-system-browser", ctx.event, {
         conversationId,
@@ -1137,6 +1138,7 @@ describe("browserIpc — open in system browser", () => {
   it("opens the page the blocked sign-in was continuing to", async () => {
     const { invoke, opened } = setupHandoff({
       url: BLOCKED,
+      requestedUrl: "https://docs.google.com/document/d/1",
       navigationTrail: [
         "https://docs.google.com/document/d/1",
         "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fdocs.google.com%2Fdocument%2Fd%2F1",
@@ -1150,19 +1152,43 @@ describe("browserIpc — open in system browser", () => {
 
   it("skips candidates the view's policy refuses and reports the refusal", async () => {
     const DOC = "https://docs.google.com/document/d/1";
-    const INTERNAL = "https://wiki.corp.internal/";
-    const ctx = setupHandoff({ url: BLOCKED, navigationTrail: [DOC, INTERNAL, BLOCKED] });
+    const NEWER_DOC = "https://docs.google.com/document/d/2";
+    const ctx = setupHandoff({
+      url: BLOCKED,
+      requestedUrl: DOC,
+      navigationTrail: [DOC, NEWER_DOC, BLOCKED],
+    });
     const checked = [];
     ctx.registry.checkSystemBrowserUrl = async (_conversationId, candidate) => {
       checked.push(candidate);
-      return candidate === INTERNAL ? { ok: false, error: "navigation blocked" } : { ok: true };
+      return candidate === NEWER_DOC ? { ok: false, error: "navigation blocked" } : { ok: true };
     };
     assert.deepEqual(await ctx.invoke(), { ok: true, url: DOC });
-    assert.deepEqual(checked, [INTERNAL, DOC, BLOCKED]);
+    assert.deepEqual(checked, [NEWER_DOC, DOC]);
 
     ctx.registry.checkSystemBrowserUrl = async () => ({ ok: false, error: "navigation blocked" });
     assert.deepEqual(await ctx.invoke(), { ok: false, error: "navigation blocked" });
     assert.deepEqual(ctx.opened, [DOC]);
+  });
+
+  it("opens nothing when the tab moves on or closes during the policy check", async () => {
+    const ctx = setupHandoff({ url: "https://example.com/page" });
+    const wc = ctx.registry.get("conv_1").view.webContents;
+    ctx.registry.checkSystemBrowserUrl = async () => {
+      wc.getURL = () => "https://example.com/next";
+      return { ok: true };
+    };
+    assert.deepEqual(await ctx.invoke(), { ok: false, error: "The page changed. Try again." });
+
+    wc.getURL = () => "https://example.com/page";
+    ctx.registry.checkSystemBrowserUrl = async () => {
+      wc.getURL = () => {
+        throw new Error("Object has been destroyed");
+      };
+      return { ok: true };
+    };
+    assert.deepEqual(await ctx.invoke(), { ok: false, error: "The page changed. Try again." });
+    assert.deepEqual(ctx.opened, []);
   });
 
   it("refuses a missing view or a tab with no web page", async () => {

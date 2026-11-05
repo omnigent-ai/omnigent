@@ -666,6 +666,14 @@ function registerBrowserIpc({
     return { ok: true };
   });
 
+  function viewStillShows(viewRegistry, conversationId, entry, url) {
+    try {
+      return viewRegistry.get(conversationId) === entry && entry.view.webContents.getURL() === url;
+    } catch {
+      return false;
+    }
+  }
+
   // ── Toolbar: open in the system browser ──────────────────────────────────
   // Main picks the URL from the view itself, and only one the view's own
   // navigation policy allows, so the renderer can't choose the destination.
@@ -674,26 +682,34 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    let currentUrl;
     let candidates;
     try {
+      currentUrl = entry.view.webContents.getURL();
       candidates = systemBrowserCandidates({
-        currentUrl: entry.view.webContents.getURL(),
+        currentUrl,
+        requestedUrl: entry.lastRequestedUrl,
         navigationTrail: entry.navigationTrail,
       });
     } catch {
       return { ok: false, error: "browser closed" };
     }
-    if (candidates.length === 0) {
-      return { ok: false, error: "This tab has no web page to open." };
+    let url;
+    let refusal = "This tab has no web page to open.";
+    for (const candidate of candidates) {
+      // oxlint-disable-next-line no-await-in-loop -- stop at the first allowed candidate
+      const verdict = await g.registry.checkSystemBrowserUrl(args.conversationId, candidate);
+      if (verdict.ok) {
+        url = candidate;
+        break;
+      }
+      refusal = verdict.error;
     }
-    const verdicts = await Promise.all(
-      candidates.map((candidate) =>
-        g.registry.checkSystemBrowserUrl(args.conversationId, candidate),
-      ),
-    );
-    const allowed = verdicts.findIndex((verdict) => verdict.ok);
-    if (allowed === -1) return { ok: false, error: verdicts.at(-1).error };
-    const url = candidates[allowed];
+    if (!url) return { ok: false, error: refusal };
+    // The policy check can wait on DNS; don't open a page the tab has left.
+    if (!viewStillShows(g.registry, args.conversationId, entry, currentUrl)) {
+      return { ok: false, error: "The page changed. Try again." };
+    }
     try {
       await openExternal(url);
       return { ok: true, url };

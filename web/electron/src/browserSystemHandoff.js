@@ -72,23 +72,32 @@ function recordNavigation(trail, url) {
 
 /**
  * URLs to open in the system browser for a view, best first. Normally just the
- * current page; on Google's access block page, sign-in `continue` targets on
- * origins the view loaded (newest first), then the pages it loaded (newest
- * first), then the block page. Callers still apply the view's navigation policy.
+ * current page. On Google's access block page, pages on the origin the user or
+ * agent explicitly opened: sign-in `continue` targets, then loaded pages (both
+ * newest first), then the opened page; else the block page itself. Callers
+ * still apply the view's navigation policy.
  *
- * @param {{ currentUrl: string, navigationTrail?: string[] }} view
+ * @param {{ currentUrl: string, requestedUrl?: string, navigationTrail?: string[] }} view
  * @returns {string[]} Empty when the view shows no http(s) page.
  */
-function systemBrowserCandidates({ currentUrl, navigationTrail = [] }) {
+function systemBrowserCandidates({ currentUrl, requestedUrl, navigationTrail = [] }) {
   const current = parseWebUrl(currentUrl);
   if (!current) return [];
   if (!isGoogleAccessBlockedUrl(current.href)) return [current.href];
-  const visitedPages = navigationTrail.filter((url) => parseWebUrl(url) && !isGoogleSignInUrl(url));
-  const visitedOrigins = new Set(visitedPages.map((url) => new URL(url).origin));
-  const continueTargets = [current.href, ...[...navigationTrail].reverse()]
-    .map(signInContinueUrl)
-    .filter((target) => target && visitedOrigins.has(new URL(target).origin));
-  return [...new Set([...continueTargets, ...[...visitedPages].reverse(), current.href])];
+  // A page can route the tab through sign-in with any `continue` target, so
+  // only the origin that was explicitly opened is trusted.
+  const requestedPage =
+    signInContinueUrl(requestedUrl) ??
+    (isGoogleSignInUrl(requestedUrl) ? null : (parseWebUrl(requestedUrl)?.href ?? null));
+  if (!requestedPage) return [current.href];
+  const requestedOrigin = new URL(requestedPage).origin;
+  const onRequestedOrigin = (url) => parseWebUrl(url)?.origin === requestedOrigin;
+  const newestFirst = [current.href, ...[...navigationTrail].reverse()];
+  const continueTargets = newestFirst.map(signInContinueUrl).filter(onRequestedOrigin);
+  const loadedPages = newestFirst.filter(
+    (url) => !isGoogleSignInUrl(url) && onRequestedOrigin(url),
+  );
+  return [...new Set([...continueTargets, ...loadedPages, requestedPage, current.href])];
 }
 
 module.exports = {
