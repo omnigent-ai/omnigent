@@ -104,6 +104,15 @@ describe("session drafts", () => {
     expect(reloaded.getDroppedDraftSends("conversation")).toEqual(["stable_first"]);
     reloaded.setSessionDraft("conversation", { text: "new", files: [] });
     expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ conversation: "new" });
+    reloaded.addSessionDraftStartupInputs("conversation", "new", ["pending_first"], [], ["sent"]);
+    reloaded.setSessionDraft("conversation", {
+      text: "new",
+      files: [],
+      startupInputIds: [],
+      sentAs: [],
+    });
+    expect(reloaded.getSessionDraft("conversation")).toEqual({ text: "new", files: [] });
+    expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ conversation: "new" });
     reloaded.clearSessionDrafts();
     expect(reloaded.getDroppedDraftSends("conversation")).toEqual([]);
   });

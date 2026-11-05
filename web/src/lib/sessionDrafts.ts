@@ -103,12 +103,12 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
     sessionDrafts.delete(conversationId);
   } else {
     const held = sessionDrafts.get(conversationId);
-    const startupInputIds = draft.startupInputIds ?? held?.startupInputIds;
-    const sentAs = draft.sentAs ?? held?.sentAs;
+    const { startupInputIds = held?.startupInputIds, sentAs = held?.sentAs, ...rest } = draft;
+    // An explicit empty list clears the held one and is kept as none, as a reload reads it.
     sessionDrafts.set(conversationId, {
-      ...draft,
-      ...(startupInputIds ? { startupInputIds } : {}),
-      ...(sentAs ? { sentAs } : {}),
+      ...rest,
+      ...(startupInputIds?.length ? { startupInputIds } : {}),
+      ...(sentAs?.length ? { sentAs } : {}),
     });
   }
   saveDraftsToStorage();
