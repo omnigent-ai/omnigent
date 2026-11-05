@@ -121,7 +121,7 @@ def test_attachment_only_steering_explanation_stays_visible_on_desktop(
     """A text-less steer has no focusable footer control, so it must not hide."""
     chat = chat_session_contract
     chat.harness = "codex-native"
-    chat.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+    chat.update_session(status="running", labels={"omnigent.wrapper": "codex-native-ui"})
     chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
     chat.reject_uploads = False
     page.set_viewport_size({"width": 1280, "height": 900})
