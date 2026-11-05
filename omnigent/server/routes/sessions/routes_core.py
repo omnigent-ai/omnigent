@@ -2305,7 +2305,10 @@ def register_core_routes(
           per ``watch`` (full state for the new set), then
           ``{"type": "changed", "items": [...]}`` /
           ``{"type": "removed", "ids": [...]}`` deltas as watched
-          sessions change, and ``{"type": "heartbeat"}`` when idle.
+          sessions change, ``{"type": "access_changed", "ids": [...]}``
+          when a watched session is newly shared with the user (its row
+          may be unchanged, so list membership must be re-read), and
+          ``{"type": "heartbeat"}`` when idle.
 
         Watched-row freshness is pull-based — each interval the server
         re-reads the watched ids (the same read ``GET /v1/sessions`` does)
@@ -2509,12 +2512,16 @@ def register_core_routes(
                     if not isinstance(sid, str):
                         continue
                     async with emit_lock:
-                        # Already watched ⇒ the normal diff already covers it.
-                        if sid in watched:
-                            continue
                         try:
                             items = await _fetch_watched_items([sid], user_id)
-                            if items:
+                            if items and sid in watched:
+                                # The interval diff covers the row, but a grant
+                                # that leaves the row unchanged (e.g. a direct
+                                # read share of a session already readable by
+                                # link) emits no delta. Tell the client its access
+                                # changed so it re-reads list membership.
+                                await _send({"type": "access_changed", "ids": [sid]})
+                            elif items:
                                 await _send({"type": "changed", "items": items})
                         except WebSocketDisconnect:
                             # Client gone mid-send — propagate to tear the stream down.

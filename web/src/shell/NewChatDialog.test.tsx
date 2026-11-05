@@ -158,6 +158,11 @@ import {
 } from "@/lib/newChatPickerCache";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { clearSessionDrafts } from "@/lib/sessionDrafts";
+import {
+  NEW_SESSION_HANDOFF_PARAM,
+  newSessionLocation,
+  peekNewSessionHandoff,
+} from "@/lib/newSessionHandoff";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 describe("ComposerAddMenu", () => {
@@ -1505,6 +1510,40 @@ describe("prompt URL handoff", () => {
     renderLanding({}, "/?prompt=Linked&task=Unrelated");
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked");
     expect(screen.getByTestId("landing-location")).toHaveTextContent("/?task=Unrelated");
+  });
+
+  it("fills in a handed-off message, then releases it", () => {
+    const notes = new File(["meeting notes"], "notes.txt", { type: "text/plain" });
+    const link = newSessionLocation("Linked", [notes]);
+    const token = new URLSearchParams(link.split("?")[1]).get(NEW_SESSION_HANDOFF_PARAM);
+    // Strict Mode runs the read twice; the files must still land once.
+    renderLanding({}, link, undefined, true);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked");
+    expect(screen.getAllByRole("button", { name: "Remove notes.txt" })).toHaveLength(1);
+    expect(screen.getByTestId("landing-location").textContent).toBe("/");
+    expect(peekNewSessionHandoff(token)).toBeNull();
+  });
+
+  it.each([
+    ["text only", "Copied text", [] as File[], []],
+    ["attachments only", "", [new File(["notes"], "notes.txt")], ["notes.txt"]],
+  ])("replaces a parked draft with a handed-off message (%s)", (_case, text, files, names) => {
+    const parked = renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Unrelated draft" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [new File(["data"], "draft.png", { type: "image/png" })] },
+    });
+    expect(screen.getByAltText("draft.png")).toBeTruthy();
+    parked.unmount();
+
+    renderLanding({}, newSessionLocation(text, files));
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(text);
+    expect(screen.queryByAltText("draft.png")).toBeNull();
+    for (const name of names) {
+      expect(screen.getByRole("button", { name: `Remove ${name}` })).toBeTruthy();
+    }
   });
 
   it("does not treat task as a prompt parameter", () => {
@@ -2944,7 +2983,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
 
     const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
     const permission = screen.getByTestId("new-chat-landing-permission-chip");
-    expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
+    expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/repo");
     expect(permission).toHaveTextContent("Plan");
     for (const control of [workspace, permission]) {
       expect(control).toHaveAttribute("aria-busy", "true");
@@ -3002,7 +3041,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     renderLanding({}, "/", () => {
       const directory = screen.queryByTestId("new-chat-landing-workspace-chip");
       const permission = screen.queryByTestId("new-chat-landing-permission-chip");
-      if (directory) directories.push(directory.getAttribute("title")!);
+      if (directory) directories.push(directory.getAttribute("aria-label")!);
       if (permission) permissions.push(permission.textContent!);
     });
     expect(screen.getByRole("status", { name: "Loading working directory" })).toBeVisible();
@@ -3019,13 +3058,14 @@ describe("NewChatLandingScreen cached picker preview", () => {
       data: { entries: [fsEntry("/home/tester/projects")], truncated: false },
     } as ReturnType<typeof useHostFilesystem>);
     fireEvent.change(input, { target: { value: "Home directory resolved" } });
-    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
-      "title",
-      "/home/tester",
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      "Working directory: /home/tester",
     );
     expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
     expect(directories.length).toBeGreaterThan(0);
-    expect(directories.every((directory) => directory === "/home/tester")).toBe(true);
+    expect(directories.every((directory) => directory === "Working directory: /home/tester")).toBe(
+      true,
+    );
     expect(permissions.length).toBeGreaterThan(0);
     expect(permissions.every((permission) => permission === "Plan")).toBe(true);
   });
@@ -3065,16 +3105,14 @@ describe("NewChatLandingScreen cached picker preview", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-workspace-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
     fireEvent.click(screen.getByTestId("recent-workspace-select-1"));
-    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
-      "title",
-      "/work/second",
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      "Working directory: /work/second",
     );
     unmount();
     resetLandingDraft();
     renderLanding();
-    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
-      "title",
-      "/work/second",
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      "Working directory: /work/second",
     );
   });
 
@@ -4323,7 +4361,7 @@ describe("NewChatLandingScreen", () => {
     expect(permission.querySelector("span")).not.toHaveClass("hidden");
     expect(worktree).toHaveClass(
       "h-6",
-      "max-w-[calc(50%-0.25rem)]",
+      "max-w-full",
       "gap-1",
       "rounded-md",
       "bg-transparent",
@@ -4332,10 +4370,6 @@ describe("NewChatLandingScreen", () => {
       "leading-4",
     );
     expect(worktree).toHaveAccessibleName(
-      "Create or select a worktree from main repository branch: main",
-    );
-    expect(worktree).toHaveAttribute(
-      "title",
       "Create or select a worktree from main repository branch: main",
     );
     expect(worktree).toHaveTextContent("None");
@@ -4368,7 +4402,7 @@ describe("NewChatLandingScreen", () => {
     expect(actions).toHaveClass("flex-nowrap");
     expect(leftControls).toHaveClass("min-w-0", "flex-none", "gap-1", "overflow-visible");
     expect(leftControls).not.toHaveClass("overflow-hidden", "shrink-0", "absolute");
-    expect(rightControls).toHaveClass("flex", "shrink-0", "items-center", "gap-1");
+    expect(rightControls).toHaveClass("flex", "shrink", "items-center", "gap-1");
     expect(rightControls).toHaveClass("ml-auto", "max-w-full");
     expect(rightControls).not.toHaveClass("flex-1");
     for (const control of [attach, hostChip, permission]) {
@@ -4542,7 +4576,9 @@ describe("NewChatLandingScreen", () => {
     function selectWorkspace(path: string) {
       fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
       fireEvent.click(screen.getByRole("button", { name: path }));
-      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute("title", path);
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+        `Working directory: ${path}`,
+      );
     }
 
     async function selectNewWorktree(autoSeeded = false) {
@@ -5488,11 +5524,11 @@ describe("NewChatLandingScreen", () => {
 
     expect(screen.getByTestId("workspace-picker")).toBeVisible();
     expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/Users/corey/other");
-    expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
+    expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/repo");
 
     fireEvent.click(screen.getByTestId("workspace-picker-cancel"));
     expect(screen.queryByTestId("workspace-picker")).toBeNull();
-    expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
+    expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/repo");
   });
 
   it("separates the zero-session import action from an empty notice slot", () => {
@@ -5611,27 +5647,32 @@ describe("NewChatLandingScreen", () => {
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
     const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
     await waitFor(() =>
-      expect(worktreeTrigger).toHaveAttribute(
-        "title",
+      expect(worktreeTrigger).toHaveAccessibleName(
         "Create or select a worktree from main repository branch: main",
       ),
     );
     expect(workspaceTrigger).toHaveTextContent("repo");
-    expect(workspaceTrigger).toHaveAttribute("title", "/Users/corey/repo");
+    expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
   });
 
   it("dismisses sibling popovers and restores each trigger's focus on Escape", async () => {
+    const user = userEvent.setup();
     renderLanding();
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
     const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
 
+    await user.hover(workspaceTrigger);
+    expect(await screen.findByRole("tooltip", {}, { timeout: 3000 })).toHaveTextContent(
+      "Working directory: /Users/corey/repo",
+    );
     fireEvent.click(workspaceTrigger);
     expect(screen.getByTestId("new-chat-landing-workspace-open-folder")).toBeVisible();
-    expect(workspaceTrigger).not.toHaveAttribute("title");
+    // An open popover hides its trigger's tooltip.
+    expect(screen.queryByRole("tooltip")).toBeNull();
 
     fireEvent.click(worktreeTrigger);
     expect(await screen.findByTestId("new-chat-landing-branch-input")).toBeVisible();
-    expect(worktreeTrigger).not.toHaveAttribute("title");
+    expect(screen.queryByRole("tooltip")).toBeNull();
     await waitFor(() =>
       expect(screen.queryByTestId("new-chat-landing-workspace-open-folder")).toBeNull(),
     );
@@ -5639,13 +5680,14 @@ describe("NewChatLandingScreen", () => {
     closeMenu();
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
     expect(worktreeTrigger).toHaveFocus();
-    expect(worktreeTrigger).toHaveAttribute("title");
+    // Focus handed back on close doesn't reopen the tooltip.
+    expect(screen.queryByRole("tooltip")).toBeNull();
 
     fireEvent.click(worktreeTrigger);
     expect(await screen.findByTestId("new-chat-landing-branch-input")).toBeVisible();
     fireEvent.click(workspaceTrigger);
     expect(screen.getByTestId("new-chat-landing-workspace-open-folder")).toBeVisible();
-    expect(workspaceTrigger).not.toHaveAttribute("title");
+    expect(screen.queryByRole("tooltip")).toBeNull();
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
 
     closeMenu();
@@ -5653,6 +5695,7 @@ describe("NewChatLandingScreen", () => {
       expect(screen.queryByTestId("new-chat-landing-workspace-open-folder")).toBeNull(),
     );
     expect(workspaceTrigger).toHaveFocus();
+    expect(screen.queryByRole("tooltip")).toBeNull();
 
     fireEvent.click(worktreeTrigger);
     expect(await screen.findByTestId("new-chat-landing-branch-input")).toBeVisible();
@@ -7124,7 +7167,7 @@ describe("NewChatLandingScreen", () => {
     expect(workspaceLabel).toHaveClass("min-w-0", "truncate", "text-left");
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveClass(
       "h-6",
-      "max-w-[calc(50%-0.25rem)]",
+      "max-w-full",
       "gap-1",
       "px-1",
       "text-xs",
@@ -7978,8 +8021,7 @@ describe("NewChatLandingScreen", () => {
 
     const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
     await waitFor(() =>
-      expect(worktreeTrigger).toHaveAttribute(
-        "title",
+      expect(worktreeTrigger).toHaveAccessibleName(
         "Existing detached worktree: /Users/corey/repo-worktrees/review",
       ),
     );
@@ -9412,6 +9454,35 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByText("Review a pull request")).not.toBeInTheDocument();
     typeMessage("/");
     expect(screen.queryByTestId("slash-menu-item-cross-review")).not.toBeInTheDocument();
+  });
+
+  it("shows a cut-off skill description in a tooltip once the user arrows onto it", () => {
+    const triage =
+      "Given the current conversation's context (a bug, error, crash, regression, or test " +
+      "failure), file a ticket with reproduction steps and the owning team.";
+    mockSkills({
+      skills: [
+        { name: "review-pr", description: "Review a pull request" },
+        { name: "triage", description: triage },
+      ],
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    renderLanding();
+    typeMessage("/");
+    const description = screen.getByTestId("slash-menu-description-triage");
+    // jsdom has no layout, so report the overflow of a cut-off line.
+    Object.defineProperty(description, "scrollWidth", { configurable: true, value: 900 });
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toHaveAttribute("data-active", "true");
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "ArrowDown" });
+    expect(screen.getByTestId("slash-menu-item-triage")).toHaveAttribute("data-active", "true");
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).not.toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
   });
 
   it("shows Retry for discovery failures and an empty state after successful retry", () => {

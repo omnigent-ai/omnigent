@@ -1964,6 +1964,159 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
   });
 });
 
+describe("ApprovalCard — file edit diff", () => {
+  const editInput = {
+    file_path: "/repo/config.py",
+    old_string: "TIMEOUT = 30\nRETRIES = 3\n",
+    new_string: "TIMEOUT = 60\nRETRIES = 3\n",
+    replace_all: false,
+  };
+  const props = {
+    elicitationId: "elic_edit",
+    message: "Claude wants to call **Edit**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: `Edit(${JSON.stringify(editInput)})`,
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it("shows a gated edit from the event stream as a diff in place of its JSON", () => {
+    const events = parseEventLines([
+      JSON.stringify({
+        event: "response.elicitation_request",
+        data: {
+          type: "response.elicitation_request",
+          elicitation_id: props.elicitationId,
+          params: {
+            mode: "form",
+            message: props.message,
+            phase: props.phase,
+            policy_name: props.policyName,
+            content_preview: props.contentPreview,
+            requestedSchema: {},
+            file_edit: { tool_name: "Edit", tool_input: editInput },
+          },
+        },
+      }),
+    ]);
+    const bubble = buildBubbles(new BlockStream().reduceSync([...events]), null)[0];
+    if (bubble.kind !== "assistant") throw new Error("Expected an assistant bubble");
+    const item = bubble.items[0];
+    if (item.kind !== "elicitation") throw new Error("Expected an elicitation card");
+
+    const { container } = render(
+      <TooltipProvider>
+        <ElicitationCard item={item} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("+1").parentElement?.textContent).toBe("/repo/config.py+1-1");
+    expect(container.textContent).toContain("-TIMEOUT = 30");
+    expect(container.textContent).toContain("+TIMEOUT = 60");
+    expect(container.textContent).not.toContain('"old_string"');
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeInTheDocument();
+  });
+
+  it("shows a write over a file as its full content", () => {
+    const content = "# Notes\n";
+    const { container } = render(
+      <TooltipProvider>
+        <ApprovalCard
+          {...props}
+          message="Claude wants to call **Write**"
+          contentPreview="Write({...})"
+          fileEdit={{ toolName: "Write", toolInput: { file_path: "/repo/notes.md", content } }}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("/repo/notes.md (whole file written)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy file" })).toBeInTheDocument();
+    expect(container.textContent).toContain("# Notes");
+  });
+
+  it("says when an edit in a batch replaces every occurrence", () => {
+    // WHY: the diff renders a replace-all edit the same as a single replacement.
+    const edits = [
+      { old_string: "a", new_string: "b" },
+      { old_string: "c", new_string: "d" },
+    ];
+    const note = /replaces every occurrence/i;
+    const renderBatch = (batch: Record<string, unknown>[]) =>
+      render(
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            message="Claude wants to call **MultiEdit**"
+            contentPreview="MultiEdit({...})"
+            fileEdit={{
+              toolName: "MultiEdit",
+              toolInput: { file_path: "/repo/a.py", edits: batch },
+            }}
+          />
+        </TooltipProvider>,
+      );
+
+    renderBatch(edits);
+    expect(screen.queryByText(note)).toBeNull();
+    cleanup();
+    renderBatch([edits[0]!, { ...edits[1]!, replace_all: true }]);
+    expect(screen.getByText(note)).toBeVisible();
+  });
+
+  it("shows the full request on demand", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} fileEdit={{ toolName: "Edit", toolInput: editInput }} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.queryByTestId("tool-value-view")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show request" }));
+    expect(screen.getByTestId("tool-value-view")).toHaveTextContent("Replace allNo");
+  });
+
+  it("previews a long diff and expands it in full", () => {
+    const oldLines = Array.from({ length: 120 }, (_, i) => `old ${i}`);
+    const newLines = Array.from({ length: 120 }, (_, i) => `new ${i}`);
+    const { container } = render(
+      <TooltipProvider>
+        <ApprovalCard
+          {...props}
+          fileEdit={{
+            toolName: "Edit",
+            toolInput: {
+              file_path: "/repo/big.py",
+              old_string: oldLines.join("\n"),
+              new_string: newLines.join("\n"),
+            },
+          }}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(container.textContent).not.toContain("+new 119");
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(container.textContent).toContain("+new 119");
+  });
+
+  it.each([
+    { label: "no file edit", fileEdit: null },
+    { label: "an unsupported tool", fileEdit: { toolName: "NotebookEdit", toolInput: editInput } },
+    {
+      label: "an edit with no change",
+      fileEdit: { toolName: "Edit", toolInput: { ...editInput, new_string: editInput.old_string } },
+    },
+  ])("keeps the JSON preview for $label", ({ fileEdit }) => {
+    const { container } = render(<ApprovalCard {...props} fileEdit={fileEdit} />);
+
+    expect(container.textContent).toContain('"old_string"');
+    expect(screen.queryByRole("button", { name: "Copy diff" })).toBeNull();
+  });
+});
+
 describe("ApprovalCard — resolved-elsewhere pill", () => {
   const props = {
     elicitationId: "elic_auto",
