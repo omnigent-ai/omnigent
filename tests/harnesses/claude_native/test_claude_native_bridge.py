@@ -16061,12 +16061,13 @@ def test_btw_overlay_takes_current_turn_and_flags_truncation(history_hint: str) 
     assert overlay.truncated is True
 
 
-def test_btw_overlay_none_while_generating() -> None:
+@_BTW_HISTORY_HINTS
+def test_btw_overlay_none_while_generating(history_hint: str) -> None:
     """An overlay still generating (Answering… / no copy·fork) is skipped."""
     pane = _btw_pane(
         "    /btw write a long thing",
         "      ✻ Answering…",
-        "    ←/→ to switch · x to clear history · Esc to close",
+        f"    {history_hint} · x to clear history · Esc to close",
     )
     assert claude_native_bridge._btw_overlay_from_pane(pane) is None
 
@@ -16128,6 +16129,15 @@ def test_btw_overlay_present_matches_settled_multiturn_and_generating(
     assert claude_native_bridge._btw_overlay_present(settled) is True
     assert claude_native_bridge._btw_overlay_present(multiturn) is True
     assert claude_native_bridge._btw_overlay_present(generating) is True
+
+
+@_BTW_HISTORY_HINTS
+def test_btw_overlay_present_from_history_footer_alone(history_hint: str) -> None:
+    """Stacked side turns are recognised by the history hint without copy/fork or a spinner."""
+    pane = _btw_pane(
+        "    /btw q1", "    /btw q2", f"    {history_hint} · x to clear history · Esc to close"
+    )
+    assert claude_native_bridge._btw_overlay_present(pane) is True
 
 
 @pytest.mark.parametrize("quoted_overlay", ["none", "one-row", "wrapped"])
