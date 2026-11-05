@@ -242,6 +242,9 @@ def cross_harness_rig(
                         "OMNIGENT_RUNNER_ID": runner_id,
                         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": token,
                         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+                        "OMNIGENT_PROCESS_LOG_FILE": str(
+                            tmp_path / ".omnigent" / "logs" / "runner-process.log"
+                        ),
                         "RUNNER_SERVER_URL": base_url,
                     },
                     stdout=runner_log,
