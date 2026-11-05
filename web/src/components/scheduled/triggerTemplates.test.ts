@@ -6,11 +6,13 @@ import {
   describeLinearFilter,
   describeSlackFilter,
   isTriggerPrompt,
+  readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
   splitTriggerPrompt,
   splitJqlOrderBy,
   triggerFieldsComplete,
+  updateTriggerWorkerSettings,
   TRIGGER_SOURCES,
   type TriggerCondition,
   type TriggerFields,
@@ -39,6 +41,57 @@ function fields(overrides: Partial<TriggerFields> = {}): TriggerFields {
 const JQL = 'project = "ES" AND labels = "omnigent"';
 
 describe("saved trigger prompts", () => {
+  it.each(TRIGGER_SOURCES)(
+    "edits %s worker settings without changing authored instructions",
+    (source) => {
+      const original = renderTriggerPrompt(source, fields(), {
+        ...CTX,
+        model: "old-model",
+        effort: "high",
+      }).replace("Each run:", "Keep this custom instruction.\n\nEach run:");
+      expect(readTriggerWorkerSettings(original)).toEqual({
+        agentId: null,
+        model: "old-model",
+        effort: "high",
+      });
+      const settings = { agentId: "worker-agent", model: 'model-with-"quotes"', effort: "low" };
+      const updated = updateTriggerWorkerSettings(original, settings)!;
+      expect(readTriggerWorkerSettings(updated)).toEqual(settings);
+      expect(updated).toContain('agent_id "worker-agent", placement "same_host"');
+      expect(updated).toContain('model "model-with-\\"quotes\\"", reasoning_effort "low"');
+      expect(updated).toContain("Keep this custom instruction.");
+      expect(splitTriggerPrompt(updated).userPrompt).toBe(splitTriggerPrompt(original).userPrompt);
+      expect(
+        updateTriggerWorkerSettings(updated, { agentId: null, model: "old-model", effort: "high" }),
+      ).toBe(original);
+      const defaults = updateTriggerWorkerSettings(updated, {
+        agentId: null,
+        model: "",
+        effort: "",
+      })!;
+      expect(readTriggerWorkerSettings(defaults)).toEqual({ agentId: null, model: "", effort: "" });
+      expect(defaults).not.toContain('reasoning_effort "low"');
+    },
+  );
+
+  it("leaves customized or ambiguous worker calls unchanged", () => {
+    const prompt = renderTriggerPrompt("jira", fields(), CTX);
+    const call = prompt.match(/call sys_session_create with [^\n]+?8000 characters\./)![0];
+    for (const customized of [
+      "A handwritten automation.",
+      prompt.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
+      prompt.replace(call, `${call}\n${call}`),
+    ]) {
+      expect(readTriggerWorkerSettings(customized)).toBeNull();
+      expect(
+        updateTriggerWorkerSettings(customized, { agentId: null, model: "", effort: "" }),
+      ).toBeNull();
+    }
+    // The worker's task can quote an API call without changing manager configuration.
+    const quoted = renderTriggerPrompt("jira", fields({ instructions: call }), CTX);
+    expect(readTriggerWorkerSettings(quoted)).toEqual({ agentId: null, model: "", effort: "" });
+  });
+
   it.each(TRIGGER_SOURCES)("separates %s instructions and preserves the saved prompt", (source) => {
     const original = renderTriggerPrompt(source, fields(), CTX);
     const parts = splitTriggerPrompt(original);

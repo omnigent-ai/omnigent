@@ -33,7 +33,12 @@ import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
-import { emptyTriggerFields, renderTriggerPrompt, splitTriggerPrompt } from "./triggerTemplates";
+import {
+  emptyTriggerFields,
+  readTriggerWorkerSettings,
+  renderTriggerPrompt,
+  splitTriggerPrompt,
+} from "./triggerTemplates";
 
 const gitWorkspace = vi.hoisted(() => ({
   available: true as boolean | undefined,
@@ -2915,6 +2920,53 @@ describe("editing template prompts", () => {
     { ...emptyTriggerFields("jira"), scope: "ENG", instructions: "Triage the ticket." },
     { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
   );
+
+  it("saves worker harness, model, and effort without rebinding the polling session", async () => {
+    const task = scheduledTask({ prompt: original, sessionMode: "continue", sessionId: "poller" });
+    const props = { onOpenChange: vi.fn(), editingTask: task };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+    const select = async (id: string, name: string) => {
+      fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Polly");
+    await select("task-worker-agent-trigger", "Claude Code");
+    await select("task-model-trigger", "Opus");
+    await select("task-effort-trigger", "High");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+      agentId: "ag_claude_native",
+      model: "opus",
+      effort: "high",
+    });
+    for (const key of [
+      "agentId",
+      "modelOverride",
+      "reasoningEffort",
+      "sessionId",
+      "permissionMode",
+    ])
+      expect(input).not.toHaveProperty(key);
+    expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Triage the ticket.");
+    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    rerender(
+      <CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt: input.prompt }} />,
+    );
+    expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Claude Code");
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+    await select("task-worker-agent-trigger", "Polly");
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(2));
+    expect(readTriggerWorkerSettings(updateMutateAsync.mock.calls[1][0].input.prompt)).toEqual({
+      agentId: "ag_1",
+      model: "",
+      effort: "",
+    });
+  });
 
   it("keeps a hand-written heading editable for unrelated changes", async () => {
     const prompt = "Write a training document.\n\nInstructions for each session:\n";

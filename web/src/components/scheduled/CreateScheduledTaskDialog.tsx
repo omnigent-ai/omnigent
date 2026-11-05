@@ -34,14 +34,17 @@ import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import { TriggerWorkerSettingsFields } from "./TriggerWorkerSettingsFields";
 import {
   combineTriggerPrompt,
   emptyTriggerFields,
   isTriggerPrompt,
+  readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
+  updateTriggerWorkerSettings,
   type TriggerFields,
   type TriggerSource,
 } from "@/components/scheduled/triggerTemplates";
@@ -419,6 +422,19 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
+  const workerSettings = editingTemplateTrigger
+    ? readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt))
+    : null;
+  const workerAgent = agents?.find(
+    (agent) => agent.id === (workerSettings?.agentId ?? editingTask?.agentId),
+  );
+  const workerHarnessSettings = useScheduledHarnessSettings(
+    workerAgent,
+    selectedHost,
+    sandboxMode,
+    workerSettings?.model ?? "",
+    open && workerSettings !== null,
+  );
   const harnessSettings = useScheduledHarnessSettings(
     agents?.find((agent) => agent.id === effectiveAgentId),
     selectedHost,
@@ -542,7 +558,7 @@ export function CreateScheduledTaskDialog({
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
-    !harnessSettings.blockedReason &&
+    !(workerSettings === null ? harnessSettings : workerHarnessSettings).blockedReason &&
     !mutationPending;
 
   function resetForm() {
@@ -1091,141 +1107,164 @@ export function CreateScheduledTaskDialog({
             </p>
           )}
 
-          <div className="flex flex-col gap-1.5">
-            <Label>Harness</Label>
-            <div data-testid="task-agent-picker">
-              <AgentHarnessPicker
-                agentEntries={agentEntries}
-                harnessEntries={harnessEntries}
-                effectiveAgentId={effectiveAgentId}
-                agentLabel={agentLabel}
-                hasAgents={selectedAgent !== undefined || agentList.length > 0}
-                loading={curationPending}
-                curatedEntries={curation.restrictToAgentNames.size > 0 ? agentList : undefined}
-                // Sandboxes provision their own harnesses; host badges only apply to hosts.
-                host={sandboxMode ? undefined : badgeHost}
-                onSelectAgent={handleSelectAgent}
-                pendingAgent={null}
-                pendingAgentId="__unused_pending_agent__"
-                onSelectPending={() => {}}
-                // Custom-agent creation is inert until there is a way to
-                // persist a new agent independently of creating a session.
-                onCreateCustomAgent={() => {}}
-                sandboxSelected={sandboxMode}
-                allowCreateCustomAgent={false}
-                // Forward the dropdown open/close into the dialog's outside-click
-                // dismiss guard so opening the picker doesn't close the modal.
-                onOpenChange={handleSelectOpenChange}
-                // This picker is nested inside a Dialog. Radix DropdownMenu's
-                // default modal mode can turn an inside-dialog click into a
-                // parent Dialog outside interaction while the menu dismisses.
-                dropdownModal={false}
-                // The shared menu caps against available viewport height, so
-                // constrained screens scroll without clipping taller screens.
-                contentClassName="w-80"
-                // Full-width trigger → left-align the menu's edge to it.
-                contentAlign="start"
-                // Match the Host select's full-width, bordered h-8 styling.
-                triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input"
-                triggerLabelClassName="max-w-none text-ui"
-              />
-            </div>
-            {agentChanged && (
-              <p className="text-sm text-muted-foreground">
-                Future runs use {agentLabel}; past runs keep the agent they ran with
-              </p>
-            )}
-            {!showAdvanced && (
-              <p className="text-sm text-muted-foreground">
-                Uses this agent&apos;s default model, effort, and permission settings
-              </p>
-            )}
-          </div>
-
-          {harnessSettings.blockedReason && (
-            <p
-              role="alert"
-              data-testid="task-harness-unsupported"
-              className="text-sm text-destructive"
-            >
-              {harnessSettings.blockedReason}
-            </p>
-          )}
-          {/* Each harness exposes only the launch settings it supports. */}
-          {showAdvanced && (
-            <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-              <CollapsibleTrigger className="group flex cursor-pointer items-center gap-2 rounded-sm py-1 text-muted-foreground text-ui outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-                Advanced
-                <ChevronDownIcon className="size-4 transition-transform group-data-[state=open]:rotate-180" />
-              </CollapsibleTrigger>
-              <CollapsibleContent className="pt-3" data-testid="task-model-effort-field">
-                <ModelEffortFields
-                  model={reusesExistingSession ? (editingTask?.modelOverride ?? "") : pickedModel}
-                  effort={
-                    reusesExistingSession ? (editingTask?.reasoningEffort ?? "") : pickedEffort
-                  }
-                  permissionMode={
-                    reusesExistingSession
-                      ? (editingTask?.permissionMode ?? "")
-                      : effectivePermission
-                  }
-                  settings={harnessSettings}
-                  disabled={curationPending || reusesExistingSession}
-                  onModelChange={handleModelChange}
-                  onEffortChange={setPickedEffort}
-                  onPermissionModeChange={setPickedPermission}
-                  onSelectOpenChange={handleSelectOpenChange}
-                />
-                {reusesExistingSession ? (
-                  <div
-                    className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
-                    data-testid="task-session-settings-note"
-                    role="status"
-                  >
-                    <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
-                    <p>
-                      This automation continues in an existing session, so its model, effort, and
-                      permission mode are controlled by that session. Edit the session directly to
-                      change them.
-                      {editingTemplateTrigger && (
-                        <>
-                          {" "}
-                          Trigger automations reuse a polling session even though each match starts
-                          a new worker. To change the model or harness for future workers, edit the
-                          worker creation instructions in the{" "}
-                          {systemPrompt === null ? "prompt" : "system prompt"}.{" "}
-                          <button
-                            type="button"
-                            className="underline underline-offset-2"
-                            onClick={() => {
-                              if (systemPrompt !== null) {
-                                setSystemPromptOpen(true);
-                                setEditingSystemPrompt(true);
-                              }
-                              promptFieldsRef.current
-                                ?.querySelector<HTMLTextAreaElement>(
-                                  systemPrompt === null
-                                    ? "#task-prompt"
-                                    : 'textarea[aria-label="System prompt"]',
-                                )
-                                ?.focus();
-                            }}
-                          >
-                            Edit worker instructions
-                          </button>
-                        </>
-                      )}
-                    </p>
-                  </div>
-                ) : (
-                  <p className="mt-1.5 text-sm text-muted-foreground">
-                    Leave on Default to use the agent&apos;s configured model, effort, and
-                    permission mode. Automations run unattended; modes that require approval may
-                    pause until you respond.
+          {workerSettings !== null && editingTask ? (
+            <TriggerWorkerSettingsFields
+              value={workerSettings}
+              pollingAgentId={editingTask.agentId}
+              agents={agentList}
+              selectedAgent={workerAgent}
+              settings={workerHarnessSettings}
+              disabled={curationPending}
+              onSelectOpenChange={handleSelectOpenChange}
+              onChange={(settings) => {
+                const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
+                if (updated === null) return;
+                const parts = splitTriggerPrompt(updated);
+                setPrompt(parts.userPrompt);
+                setSystemPrompt(parts.systemPrompt);
+              }}
+            />
+          ) : (
+            <>
+              <div className="flex flex-col gap-1.5">
+                <Label>Harness</Label>
+                <div data-testid="task-agent-picker">
+                  <AgentHarnessPicker
+                    agentEntries={agentEntries}
+                    harnessEntries={harnessEntries}
+                    effectiveAgentId={effectiveAgentId}
+                    agentLabel={agentLabel}
+                    hasAgents={selectedAgent !== undefined || agentList.length > 0}
+                    loading={curationPending}
+                    curatedEntries={curation.restrictToAgentNames.size > 0 ? agentList : undefined}
+                    // Sandboxes provision their own harnesses; host badges only apply to hosts.
+                    host={sandboxMode ? undefined : badgeHost}
+                    onSelectAgent={handleSelectAgent}
+                    pendingAgent={null}
+                    pendingAgentId="__unused_pending_agent__"
+                    onSelectPending={() => {}}
+                    // Custom-agent creation is inert until there is a way to
+                    // persist a new agent independently of creating a session.
+                    onCreateCustomAgent={() => {}}
+                    sandboxSelected={sandboxMode}
+                    allowCreateCustomAgent={false}
+                    // Forward the dropdown open/close into the dialog's outside-click
+                    // dismiss guard so opening the picker doesn't close the modal.
+                    onOpenChange={handleSelectOpenChange}
+                    // This picker is nested inside a Dialog. Radix DropdownMenu's
+                    // default modal mode can turn an inside-dialog click into a
+                    // parent Dialog outside interaction while the menu dismisses.
+                    dropdownModal={false}
+                    // The shared menu caps against available viewport height, so
+                    // constrained screens scroll without clipping taller screens.
+                    contentClassName="w-80"
+                    // Full-width trigger → left-align the menu's edge to it.
+                    contentAlign="start"
+                    // Match the Host select's full-width, bordered h-8 styling.
+                    triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input"
+                    triggerLabelClassName="max-w-none text-ui"
+                  />
+                </div>
+                {agentChanged && (
+                  <p className="text-sm text-muted-foreground">
+                    Future runs use {agentLabel}; past runs keep the agent they ran with
                   </p>
                 )}
-              </CollapsibleContent>
-            </Collapsible>
+                {!showAdvanced && (
+                  <p className="text-sm text-muted-foreground">
+                    Uses this agent&apos;s default model, effort, and permission settings
+                  </p>
+                )}
+              </div>
+
+              {harnessSettings.blockedReason && (
+                <p
+                  role="alert"
+                  data-testid="task-harness-unsupported"
+                  className="text-sm text-destructive"
+                >
+                  {harnessSettings.blockedReason}
+                </p>
+              )}
+              {/* Each harness exposes only the launch settings it supports. */}
+              {showAdvanced && (
+                <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+                  <CollapsibleTrigger className="group flex cursor-pointer items-center gap-2 rounded-sm py-1 text-muted-foreground text-ui outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+                    Advanced
+                    <ChevronDownIcon className="size-4 transition-transform group-data-[state=open]:rotate-180" />
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="pt-3" data-testid="task-model-effort-field">
+                    <ModelEffortFields
+                      model={
+                        reusesExistingSession ? (editingTask?.modelOverride ?? "") : pickedModel
+                      }
+                      effort={
+                        reusesExistingSession ? (editingTask?.reasoningEffort ?? "") : pickedEffort
+                      }
+                      permissionMode={
+                        reusesExistingSession
+                          ? (editingTask?.permissionMode ?? "")
+                          : effectivePermission
+                      }
+                      settings={harnessSettings}
+                      disabled={curationPending || reusesExistingSession}
+                      onModelChange={handleModelChange}
+                      onEffortChange={setPickedEffort}
+                      onPermissionModeChange={setPickedPermission}
+                      onSelectOpenChange={handleSelectOpenChange}
+                    />
+                    {reusesExistingSession ? (
+                      <div
+                        className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
+                        data-testid="task-session-settings-note"
+                        role="status"
+                      >
+                        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                        <p>
+                          This automation continues in an existing session, so its model, effort,
+                          and permission mode are controlled by that session. Edit the session
+                          directly to change them.
+                          {editingTemplateTrigger && (
+                            <>
+                              {" "}
+                              Trigger automations reuse a polling session even though each match
+                              starts a new worker. To change the model or harness for future
+                              workers, edit the worker creation instructions in the{" "}
+                              {systemPrompt === null ? "prompt" : "system prompt"}.{" "}
+                              <button
+                                type="button"
+                                className="underline underline-offset-2"
+                                onClick={() => {
+                                  if (systemPrompt !== null) {
+                                    setSystemPromptOpen(true);
+                                    setEditingSystemPrompt(true);
+                                  }
+                                  promptFieldsRef.current
+                                    ?.querySelector<HTMLTextAreaElement>(
+                                      systemPrompt === null
+                                        ? "#task-prompt"
+                                        : 'textarea[aria-label="System prompt"]',
+                                    )
+                                    ?.focus();
+                                }}
+                              >
+                                Edit worker instructions
+                              </button>
+                            </>
+                          )}
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="mt-1.5 text-sm text-muted-foreground">
+                        Leave on Default to use the agent&apos;s configured model, effort, and
+                        permission mode. Automations run unattended; modes that require approval may
+                        pause until you respond.
+                      </p>
+                    )}
+                  </CollapsibleContent>
+                </Collapsible>
+              )}
+            </>
           )}
 
           {error && (

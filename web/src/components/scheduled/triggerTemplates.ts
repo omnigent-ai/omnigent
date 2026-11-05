@@ -353,6 +353,70 @@ export function combineTriggerPrompt(userPrompt: string, systemPrompt: string | 
   return `${managerInstructions}${SESSION_INSTRUCTIONS}${userPrompt}${postingSeparator}${postingInstructions}`;
 }
 
+export interface TriggerWorkerSettings {
+  /** Null keeps the polling session's agent. */
+  agentId: string | null;
+  model: string;
+  effort: string;
+}
+
+const QUOTED_WORKER_VALUE = String.raw`"(?:[^"\\]|\\.)*"`;
+const WORKER_SETTINGS_PATTERN = new RegExp(
+  `call sys_session_create with agent_id (set to your agent ID|${QUOTED_WORKER_VALUE}), ` +
+    `(placement "(?:same_host|managed)", title [^\\n]+?)` +
+    `(?:, model (${QUOTED_WORKER_VALUE}))?` +
+    `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
+    `, and a message under 8000 characters\\.`,
+  "g",
+);
+
+function workerSettingsMatch(prompt: string) {
+  const parts = splitTriggerPrompt(prompt);
+  if (parts.systemPrompt === null) return null;
+  const manager = parts.systemPrompt.split(SESSION_POSTING_INSTRUCTIONS)[0];
+  const matches = [...manager.matchAll(WORKER_SETTINGS_PATTERN)];
+  if (matches.length !== 1) return null;
+  const match = matches[0];
+  // Unknown argument edits must stay under the author's control.
+  if (match[2].includes(", model ") || match[2].includes(", reasoning_effort ")) return null;
+  try {
+    const settings: TriggerWorkerSettings = {
+      agentId: match[1] === "set to your agent ID" ? null : JSON.parse(match[1]),
+      model: match[3] === undefined ? "" : JSON.parse(match[3]),
+      effort: match[4] === undefined ? "" : JSON.parse(match[4]),
+    };
+    return { parts, match, settings };
+  } catch {
+    return null;
+  }
+}
+
+/** Read the generated creation call without treating worker task text as configuration. */
+export function readTriggerWorkerSettings(prompt: string): TriggerWorkerSettings | null {
+  return workerSettingsMatch(prompt)?.settings ?? null;
+}
+
+/** Change only the creation-call settings, preserving the rest of the authored prompt. */
+export function updateTriggerWorkerSettings(
+  prompt: string,
+  settings: TriggerWorkerSettings,
+): string | null {
+  const parsed = workerSettingsMatch(prompt);
+  if (parsed === null) return null;
+  const { parts, match } = parsed;
+  const args = [
+    `agent_id ${settings.agentId === null ? "set to your agent ID" : JSON.stringify(settings.agentId)}`,
+    match[2],
+    ...(settings.model ? [`model ${JSON.stringify(settings.model)}`] : []),
+    ...(settings.effort ? [`reasoning_effort ${JSON.stringify(settings.effort)}`] : []),
+  ];
+  const systemPrompt = parts.systemPrompt!.replace(
+    match[0],
+    () => `call sys_session_create with ${args.join(", ")}, and a message under 8000 characters.`,
+  );
+  return combineTriggerPrompt(parts.userPrompt, systemPrompt);
+}
+
 const SERVICE_NAMES: Record<TriggerSource, string> = {
   jira: "Jira",
   slack: "Slack",
