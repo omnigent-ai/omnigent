@@ -10,6 +10,7 @@ import tarfile
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ import yaml
 from omnigent.claude_launcher import ClaudeLauncher
 from omnigent.harnesses.claude_native import plugin_discovery
 from omnigent.host.frames import HostSkillsFrame
+from omnigent.host.skill_content import read_skill_content
 from omnigent.host.skills import (
     INCOMPLETE_CATALOG_TTL_SECONDS,
     SKILLS_CACHE_TTL_SECONDS,
@@ -30,6 +32,7 @@ from omnigent.host.skills import (
 from omnigent.spec import load
 from omnigent.spec.skill_sources import resolve_session_skills
 from tests._helpers.claude_launch import configure_claude_launch
+from tests._helpers.polling import poll_until
 from tests._helpers.providers import isolate_provider_resolution
 
 
@@ -446,3 +449,103 @@ def test_slow_claude_launch_probe_does_not_delay_catalogs(
     assert loaded == [(["local", "dev:review"], [])] * 2
     assert resolved == [True]
     assert len(launches.read_text().splitlines()) == 1
+
+
+@pytest.mark.posix_only
+def test_skill_reads_wait_for_a_claude_launch_until_its_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _no_configured_claude_launch: Callable[[], bool],
+) -> None:
+    """Session skills and skill content wait for a launch's plugins, but not past its deadline.
+
+    A launcher plugin that hangs is then reported as failed rather than loading forever.
+    """
+    for name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
+    )
+    now = [0.0]
+    monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    resolve = threading.Event()
+    entered: list[str] = []
+    resolved: list[bool] = []
+
+    class GatedLauncher(ClaudeLauncher):
+        def launch(self, command: str, args: list[str]) -> tuple[str, list[str]]:
+            entered.append(os.environ["OMNIGENT_CLAUDE_LAUNCHER"])
+            resolved.append(resolve.wait(10))
+            return command, args
+
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "gated")
+    monkeypatch.setattr("omnigent.claude_launcher._load_launcher", lambda _name: GatedLauncher())
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    plugin = tmp_path / "launch" / "dev"
+    (plugin / "skills" / "review").mkdir(parents=True)
+    (plugin / "skills" / "review" / "SKILL.md").write_text(_skill("review"))
+    plugins = [{"name": "dev", "path": str(plugin), "source": "dev@inline"}]
+    init = {"type": "system", "subtype": "init", "plugins": plugins}
+    launches = tmp_path / "launches.jsonl"
+    configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
+        launches,
+        f"print({json.dumps(init)!r})\n",
+    )
+    spec = load(
+        _bundle({}, executor={"config": {"harness": "claude-native"}}),
+        dest=tmp_path / "bundle",
+        expand_env=False,
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def session_skills() -> tuple[list[str], list[str]]:
+        warnings: list[str] = []
+        skills = resolve_session_skills(spec, (workspace,), None, warnings=warnings)
+        return [skill.name for skill in skills], warnings
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        waiting = [
+            pool.submit(session_skills),
+            pool.submit(read_skill_content, "claude-native", "dev:review"),
+        ]
+        try:
+            poll_until(lambda: entered or None, timeout_s=10, interval_s=0.05)
+            done, _ = futures_wait(waiting, timeout=0.5)
+        finally:
+            resolve.set()
+        assert not done
+        assert waiting[0].result(timeout=20) == (["dev:review"], [])
+        assert "Private instructions" in waiting[1].result(timeout=20)["content"]
+
+    # A new launch identity starts a probe whose launcher plugin hangs past its deadline.
+    resolve.clear()
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "hung")
+    try:
+        with pytest.raises(plugin_discovery.LaunchPluginsPending):
+            plugin_discovery.claude_launch_plugin_dirs(wait=False)
+        now[0] += plugin_discovery.LAUNCH_PLUGINS_TIMEOUT_S + 5
+        stalled = (
+            "Claude plugins added by the configured launch are missing: the launch "
+            "did not answer within 15s; see the host log for details."
+        )
+        assert session_skills() == ([], [stalled])
+        with pytest.raises(LookupError):
+            read_skill_content("claude-native", "dev:review")
+        assert entered == ["gated", "hung"]
+        assert caplog.text.count("did not answer within 15s") == 1
+        generation = plugin_discovery.launch_plugins_generation()
+    finally:
+        resolve.set()
+    poll_until(
+        lambda: plugin_discovery.launch_plugins_generation() > generation,
+        timeout_s=10,
+        interval_s=0.05,
+    )
+    assert session_skills() == (["dev:review"], [])
+    assert resolved == [True, True]
+    assert len(launches.read_text().splitlines()) == 2

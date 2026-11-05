@@ -1274,7 +1274,8 @@ def test_unchanged_claude_launch_is_probed_once_until_it_changes(
 ) -> None:
     """Repeated catalogs reuse one answer until the launch changes or the safety TTL passes.
 
-    A launcher plugin picks its executable itself, so that executable is checked too.
+    A launcher plugin picks its executable itself, so that executable is checked too. The
+    launch reports whichever plugin the answer file names, so a refresh shows the new one.
     """
     now = [0.0]
     monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
@@ -1300,34 +1301,49 @@ def test_unchanged_claude_launch_is_probed_once_until_it_changes(
         monkeypatch.setattr(
             "omnigent.claude_launcher._load_launcher", lambda _name: WrapperLauncher()
         )
-    install(_print_init([]))
+    answer = tmp_path / "answer.json"
 
-    def launch_count(workspace: str) -> int:
-        resolve_harness_skills(_ctx(tmp_path / workspace, home), "claude-native")
-        return len(launches.read_text().splitlines())
+    def report(plugin_name: str) -> None:
+        plugin = tmp_path / "plugins" / plugin_name
+        _write_skill(plugin / "skills", "review")
+        record = {"name": plugin_name, "path": str(plugin), "source": f"{plugin_name}@inline"}
+        answer.write_text(json.dumps({"type": "system", "subtype": "init", "plugins": [record]}))
 
-    assert [launch_count(workspace) for workspace in ("first", "second", "first")] == [1, 1, 1]
+    report("one")
+    script = f"print(open({str(answer)!r}).read())\n"
+    install(script)
+
+    def catalog(workspace: str) -> tuple[int, list[str]]:
+        skills = resolve_harness_skills(_ctx(tmp_path / workspace, home), "claude-native")
+        return len(launches.read_text().splitlines()), [skill.name for skill in skills]
+
+    assert [catalog(workspace) for workspace in ("first", "second", "first")] == [
+        (1, ["one:review"])
+    ] * 3
+    # The launch would now answer differently, but an unchanged launch is not asked again.
+    report("two")
     now[0] = plugin_discovery.LAUNCH_PLUGINS_TTL_S - 1
-    assert launch_count("second") == 1
+    assert catalog("second") == (1, ["one:review"])
     if change == "executable":
-        install(_print_init([]) + "# upgraded\n")
+        install(script + "# upgraded\n")
     elif change == "args":
         (config_home / "config.yaml").write_text(
             json.dumps({"harness": {"claude-native": {"args": ["--debug"]}}})
         )
     else:
         monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "renamed")
-    assert launch_count("second") == 2
+    assert catalog("second") == (2, ["two:review"])
     # Past the TTL the last answer is served while one background probe refreshes it.
+    report("three")
     generation = plugin_discovery.launch_plugins_generation()
     now[0] += plugin_discovery.LAUNCH_PLUGINS_TTL_S
-    launch_count("first")
+    assert catalog("first")[1] == ["two:review"]
     poll_until(
         lambda: plugin_discovery.launch_plugins_generation() > generation,
         timeout_s=10,
         interval_s=0.05,
     )
-    assert launch_count("first") == 3
+    assert catalog("first") == (3, ["three:review"])
 
 
 @pytest.mark.posix_only

@@ -47,6 +47,8 @@ class _LaunchProbe:
     backoff_s: float = 0.0
     refresh_at: float = 0.0
     running: threading.Event | None = None
+    # A launcher plugin can hang, so waiting and "still loading" end here.
+    deadline: float = 0.0
     # A launcher plugin can resolve to an executable outside the configured launch.
     executable: str | None = None
     executable_identity: object = None
@@ -127,11 +129,13 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
     launcher adds with ``--plugin-dir``, before it would contact a model. One
     background probe at a time resolves each launch, including any launcher
     plugin, and asks it; its answer is reused until the configured launch or an
-    executable it runs changes.
+    executable it runs changes. A probe that misses its deadline is reported as
+    failed, and the launch is asked again only once that probe returns.
 
-    :param wait: Wait for a first answer rather than raise :class:`LaunchPluginsPending`.
+    :param wait: Wait for a first answer, up to the probe's deadline, rather than
+        raise :class:`LaunchPluginsPending`.
     :raises LaunchPluginsPending: The launch has not answered yet.
-    :raises LaunchPluginsFailed: The last probe failed and the next waits out a backoff.
+    :raises LaunchPluginsFailed: The last probe failed, or the running one missed its deadline.
     :raises CONFIG_READ_ERRORS: The Omnigent config could not be read.
     """
     from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR
@@ -141,6 +145,7 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
     command, args = _configured_command()
     launcher = os.environ.get(CLAUDE_LAUNCHER_ENV_VAR, "").strip()
     key = (launcher, command, *args, binary_identity(command))
+    budget_s = LAUNCH_PLUGINS_TIMEOUT_S + 5
     with _probes_lock:
         probe = _probes.get(key)
         executable = probe.executable if probe is not None else None
@@ -158,6 +163,7 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
             probe = _probes[key] = _LaunchProbe()
         if probe.running is None and probe.refresh_at <= time.monotonic():
             probe.running = threading.Event()
+            probe.deadline = time.monotonic() + budget_s
             try:
                 # Not a daemon, so exiting still waits for a stalled launch to be killed.
                 threading.Thread(
@@ -166,14 +172,19 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
             except RuntimeError:
                 probe.running = None
                 raise
-        running = probe.running
+        running, deadline = probe.running, probe.deadline
     if wait and running is not None and probe.plugins is None:
-        running.wait(LAUNCH_PLUGINS_TIMEOUT_S + 5)
+        running.wait(max(0.0, deadline - time.monotonic()))
     with _probes_lock:
         if probe.plugins is not None:
             return dict(probe.plugins)
         if probe.running is not None:
-            raise LaunchPluginsPending
+            if time.monotonic() < probe.deadline:
+                raise LaunchPluginsPending
+            stalled = f"did not answer within {budget_s:g}s"
+            if probe.failure != stalled:
+                probe.failure = stalled
+                _log.warning("The configured Claude launch %s", stalled)
         raise LaunchPluginsFailed(probe.failure)
 
 
