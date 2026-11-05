@@ -1424,6 +1424,9 @@ async def test_child_sessions_tree_restarts_the_walk_when_a_later_page_cannot_co
     dropped and the tree is walked from scratch, never stitched together."""
     requests: list[httpx.Request] = []
     per_level = _tree_handler(_DEEP_TREE)
+    # The first page saw a sub-agent that the walk no longer finds; keeping
+    # any already-read page would leak it into the result.
+    before_restart = {**_DEEP_TREE, "root": [_child("gone"), *_DEEP_TREE["root"]]}
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -1432,7 +1435,7 @@ async def test_child_sessions_tree_restarts_the_walk_when_a_later_page_cannot_co
             return per_level(request)
         if "after" not in params:
             return httpx.Response(
-                200, json=_descendants_body(_DEEP_TREE, "root", params, page_size=2)
+                200, json=_descendants_body(before_restart, "root", params, page_size=2)
             )
         if later_page == "stale_cursor":
             return httpx.Response(
@@ -1453,6 +1456,7 @@ async def test_child_sessions_tree_restarts_the_walk_when_a_later_page_cannot_co
         ("a1", "a"),
         ("a1x", "a1"),
     ]
+    assert "gone" not in {n["id"] for n in nodes}
     walk = [r for r in requests if "descendants" not in r.url.params]
     assert [r.url.path.split("/")[-2] for r in walk] == ["root", "a", "b", "a1"]
 
