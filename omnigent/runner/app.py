@@ -3659,7 +3659,12 @@ def create_runner_app(
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _turn_pending_ids.pop(session_id, None)
-        _ingest_cond.pop(session_id, None)
+        ingest_cond = _ingest_cond.pop(session_id, None)
+        if ingest_cond is not None:
+            # Wake waiters on the dropped gate, so a cancelled ticket's
+            # retirement sees it gone and ends instead of waiting forever.
+            async with ingest_cond:
+                ingest_cond.notify_all()
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
