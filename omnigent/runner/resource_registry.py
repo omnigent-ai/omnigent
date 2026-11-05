@@ -761,6 +761,38 @@ class SessionResourceRegistry:
         with self._lock:
             return self._published_session_status.get(session_id)
 
+    def _claim_inferred_status_edge(
+        self,
+        session_id: str,
+        expected: tuple[str, str | None] | None,
+        claimed: tuple[str, str | None],
+    ) -> bool:
+        """Compare-and-set an inferred edge while its turn is still active.
+
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+        :param expected: Edge the caller based its inference on.
+        :param claimed: Edge to record, e.g. ``("running", "terminal prompt")``.
+        :returns: ``True`` when *expected* was still published and is replaced.
+        """
+        with self._lock:
+            if (
+                self._published_session_status.get(session_id) != expected
+                or session_id not in self._active_session_turns
+            ):
+                return False
+            self._published_session_status[session_id] = claimed
+            return True
+
+    def _inferred_status_edge_is_current(
+        self, session_id: str, edge: tuple[str, str | None]
+    ) -> bool:
+        """Whether *edge* is still published for a session whose turn is active."""
+        with self._lock:
+            return (
+                self._published_session_status.get(session_id) == edge
+                and session_id in self._active_session_turns
+            )
+
     def _sync_status_edge(self, session_id: str, status: str) -> None:
         """Adopt an external status and let native state reconcile a missing edge."""
         with self._lock:
@@ -1724,6 +1756,22 @@ class SessionResourceRegistry:
             else None
         )
 
+        def _publish_inferred_running(
+            expected: tuple[str, str | None] | None, blocked_on: str | None
+        ) -> None:
+            claimed = ("running", blocked_on)
+            if not _owns_terminal() or not self._claim_inferred_status_edge(
+                session_id, expected, claimed
+            ):
+                return
+
+            def deliver() -> None:
+                # Completion, failure or a reported reason may land while this is queued.
+                if self._inferred_status_edge_is_current(session_id, claimed):
+                    _publish_status_if_current("running", blocked_on)
+
+            loop.call_soon_threadsafe(deliver)
+
         def _check_hidden_input_box(
             probe: Callable[[str, TerminalInstance], bool],
             watch: _HiddenInputBoxWatch,
@@ -1749,9 +1797,9 @@ class SessionResourceRegistry:
                         terminal_instance_id=instance.diagnostic_id,
                     ),
                 )
-                _publish_status("running", NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
+                _publish_inferred_running(edge, NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
             elif alerting and input_box_visible:
-                _publish_status("running")
+                _publish_inferred_running(edge, None)
 
         def _on_tick() -> None:
             nonlocal native_input_ready

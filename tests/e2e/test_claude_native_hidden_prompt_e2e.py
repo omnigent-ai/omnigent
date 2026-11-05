@@ -6,7 +6,6 @@ local Messages API streams one slow reply; Claude, tmux and the runner watcher r
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import shutil
@@ -14,7 +13,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,7 +22,6 @@ import pytest
 
 from omnigent.harnesses.claude_native import bridge
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import resource_registry
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -31,7 +29,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.terminals import TerminalRegistry
-from tests._helpers.polling import poll_until_async
+from tests._helpers.polling import poll_until_async, wait_for_terminal_screen
 
 _CLAUDE_BINARY = shutil.which("claude")
 
@@ -136,24 +134,6 @@ def _slow_messages_api() -> Iterator[str]:
         thread.join(timeout=5)
 
 
-async def _wait_for_pane(
-    terminal: TerminalInstance,
-    predicate: Callable[[str], bool],
-    *,
-    timeout: float = 30,
-    description: str,
-) -> str:
-    deadline = time.monotonic() + timeout
-    screen = ""
-    while time.monotonic() < deadline:
-        result = await terminal.read()
-        screen = str(result.get("screen", result))
-        if predicate(screen):
-            return screen
-        await asyncio.sleep(0.1)
-    raise AssertionError(f"Timed out waiting for {description}; actual Claude pane:\n{screen}")
-
-
 async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -241,27 +221,27 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
             await resources.observe_required_terminal(
                 session_id, "claude", "main", terminal, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
             )
-            await _wait_for_pane(
+            await wait_for_terminal_screen(
                 terminal, bridge.claude_pane_text_ready, description="Claude's ready input box"
             )
             assert await terminal.send("Write a long reply.", keys="") == {"status": "sent"}
-            await _wait_for_pane(
+            await wait_for_terminal_screen(
                 terminal,
                 lambda pane: "Write a long reply." in pane,
                 description="the typed prompt",
             )
             assert await terminal.send(keys="Enter") == {"status": "sent"}
-            await _wait_for_pane(
+            await wait_for_terminal_screen(
                 terminal, lambda pane: "word2" in pane, description="the reply streaming"
             )
             await poll_until_async(lambda: statuses[-1:] == [("running", None)], timeout_s=10)
 
             assert await terminal.send("/model", keys="") == {"status": "sent"}
-            await _wait_for_pane(
+            await wait_for_terminal_screen(
                 terminal, lambda pane: "/model" in pane, description="/model typed"
             )
             assert await terminal.send(keys="Enter") == {"status": "sent"}
-            picker = await _wait_for_pane(
+            picker = await wait_for_terminal_screen(
                 terminal,
                 lambda pane: not bridge.claude_pane_text_ready(pane),
                 description="the model picker covering the input box",
@@ -278,7 +258,7 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
             assert statuses.count(alert) == 1
 
             assert await terminal.send(keys="Escape") == {"status": "sent"}
-            await _wait_for_pane(
+            await wait_for_terminal_screen(
                 terminal, bridge.claude_pane_text_ready, description="the input box after Esc"
             )
             await poll_until_async(lambda: statuses[-1:] == [("running", None)], timeout_s=10)

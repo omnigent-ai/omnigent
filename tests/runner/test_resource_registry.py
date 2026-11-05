@@ -32,6 +32,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
+    _native_input_ready_probe,
     _sanitize_session_id,
     _session_workspace,
     _terminal_exit_diagnostics,
@@ -1378,6 +1379,70 @@ _CLAUDE_NOTICE_PANE = """\
 """
 
 
+class _HiddenInputBoxSession:
+    """A Claude terminal under a real poller, driven by a fake clock and pane."""
+
+    def __init__(
+        self,
+        tick: Callable[[], None],
+        instance: TerminalInstance,
+        registry: SessionResourceRegistry,
+        status_file: Path,
+        published: list[tuple[str, str | None]],
+        clock: dict[str, float],
+    ) -> None:
+        self.registry = registry
+        self.published = published
+        self._tick = tick
+        self._instance = instance
+        self._status_file = status_file
+        self._clock = clock
+
+    def write_claude_status(self, status: str, waiting_for: str | None = None) -> None:
+        record = {"pid": 123, "sessionId": "claude-hidden", "kind": "interactive"}
+        record |= {"status": status, "statusUpdatedAt": int(self._clock["now"] * 1000)}
+        if waiting_for is not None:
+            record["waitingFor"] = waiting_for
+        self._status_file.write_text(json.dumps(record), encoding="utf-8")
+
+    async def tick_at(self, now: float, pane: str, *, drain: bool = True) -> None:
+        self._clock["now"] = now
+        self._instance._remember_pane_snapshot(pane)
+        self._tick()
+        if drain:
+            await asyncio.sleep(0)
+
+
+async def _hidden_input_box_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+    *,
+    during_probe: Callable[[], None] | None = None,
+) -> _HiddenInputBoxSession:
+    """Observe a Claude terminal whose input-box probe can run *during_probe*."""
+    clock = {"now": 100.0}
+    monkeypatch.setattr("omnigent.runner.resource_registry._monotonic", lambda: clock["now"])
+    if during_probe is not None:
+        real_probe = _native_input_ready_probe(CLAUDE_NATIVE_TERMINAL_ROLE)
+        assert real_probe is not None
+
+        def probe(probed_session_id: str, probed_instance: TerminalInstance) -> bool:
+            ready = real_probe(probed_session_id, probed_instance)
+            during_probe()
+            return ready
+
+        monkeypatch.setattr(
+            "omnigent.runner.resource_registry._native_input_ready_probe", lambda _role: probe
+        )
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    published: list[tuple[str, str | None]] = []
+    on_tick, _statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id, instance=instance, published=published
+    )
+    return _HiddenInputBoxSession(on_tick, instance, registry, status_file, published, clock)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("claude_status", "waiting_for", "expected_reason"),
@@ -1395,65 +1460,121 @@ async def test_running_turn_with_hidden_input_box_points_chat_at_terminal(
     expected_reason: str,
 ) -> None:
     """A surface Claude does not report must not leave chat on a bare spinner."""
-    session_id = "conv_hidden_input_box"
-    clock = {"now": 100.0}
-    monkeypatch.setattr("omnigent.runner.resource_registry._monotonic", lambda: clock["now"])
-    instance = make_test_terminal_instance("claude", "main", tmp_path)
-    published: list[tuple[str, str | None]] = []
-    on_tick, _statuses, registry, status_file = await _observe_native_with_real_poller(
-        tmp_path, monkeypatch, session_id, instance=instance, published=published
-    )
-    record = {"pid": 123, "sessionId": "claude-hidden", "kind": "interactive"}
-    record |= {"status": claude_status, "statusUpdatedAt": 1000}
-    if waiting_for is not None:
-        record["waitingFor"] = waiting_for
-    status_file.write_text(json.dumps(record), encoding="utf-8")
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_input_box")
+    published = session.published
+    session.write_claude_status(claude_status, waiting_for)
 
-    async def tick_at(now: float, pane: str) -> None:
-        clock["now"] = now
-        instance._remember_pane_snapshot(pane)
-        on_tick()
-        await asyncio.sleep(0)
-
-    await tick_at(100.0, _CLAUDE_WORKING_PANE)
-    await tick_at(130.0, _CLAUDE_WORKING_PANE)
+    await session.tick_at(100.0, _CLAUDE_WORKING_PANE)
+    await session.tick_at(130.0, _CLAUDE_WORKING_PANE)
     assert published == [("running", waiting_for)]
 
-    await tick_at(131.0, _CLAUDE_NOTICE_PANE)
-    await tick_at(145.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(131.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(145.0, _CLAUDE_NOTICE_PANE)
     assert published == [("running", waiting_for)]
 
-    await tick_at(146.0, _CLAUDE_NOTICE_PANE)
-    await tick_at(150.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(146.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(150.0, _CLAUDE_NOTICE_PANE)
     assert published[-1] == ("running", expected_reason)
     assert len(published) == (2 if expected_reason == "terminal prompt" else 1)
 
     # Answering the prompt restores the input box, and chat drops the alert.
-    await tick_at(151.0, _CLAUDE_WORKING_PANE)
+    await session.tick_at(151.0, _CLAUDE_WORKING_PANE)
     assert published[-1] == ("running", waiting_for)
-    assert registry.session_turn_is_active(session_id)
+    assert session.registry.session_turn_is_active("conv_hidden_input_box")
 
 
 @pytest.mark.asyncio
-async def test_hidden_input_box_after_the_turn_ends_publishes_no_alert(
+async def test_reported_reason_replaces_hidden_input_box_alert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A finished turn has nothing to wait on, even if a notice hides the box."""
-    clock = {"now": 100.0}
-    monkeypatch.setattr("omnigent.runner.resource_registry._monotonic", lambda: clock["now"])
-    instance = make_test_terminal_instance("claude", "main", tmp_path)
-    published: list[tuple[str, str | None]] = []
-    on_tick, _statuses, _registry, status_file = await _observe_native_with_real_poller(
-        tmp_path, monkeypatch, "conv_hidden_idle", instance=instance, published=published
+    """Once Claude names what it waits on, that reason wins over the inferred one."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_reason")
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+    assert session.published == [("running", None), ("running", "terminal prompt")]
+
+    session.write_claude_status("waiting", "dialog open")
+    for now in (117.0, 140.0, 170.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    assert session.published[2:] == [("running", "dialog open")]
+
+
+@pytest.mark.asyncio
+async def test_turn_ending_behind_hidden_input_box_alert_stays_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished turn has nothing to wait on, even while a notice hides the box."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_idle")
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+
+    session.write_claude_status("idle")
+    for now in (117.0, 140.0, 170.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(171.0, _CLAUDE_WORKING_PANE)
+    assert session.published[2:] == [("idle", None)]
+    assert not session.registry.session_turn_is_active("conv_hidden_idle")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_status", ["idle", "failed"])
+@pytest.mark.parametrize("alerting", [False, True], ids=["raise", "clear"])
+async def test_turn_end_during_input_box_probe_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_status: str, alerting: bool
+) -> None:
+    """A turn that ends while the pane is probed keeps its final status."""
+    session_id = "conv_hidden_probe_race"
+    armed = {"value": False}
+
+    def end_turn_mid_probe() -> None:
+        if armed["value"]:
+            armed["value"] = False
+            session.registry.note_external_session_status(session_id, final_status)
+
+    session = await _hidden_input_box_session(
+        tmp_path, monkeypatch, session_id, during_probe=end_turn_mid_probe
     )
-    record = {"pid": 123, "sessionId": "claude-idle", "kind": "interactive"}
-    status_file.write_text(json.dumps(record | {"status": "idle"}), encoding="utf-8")
-    instance._remember_pane_snapshot(_CLAUDE_NOTICE_PANE)
-    for now in (100.0, 120.0, 140.0):
-        clock["now"] = now
-        on_tick()
-        await asyncio.sleep(0)
-    assert published == [("idle", None)]
+    session.write_claude_status("busy")
+    # Once the box has been seen, only the hidden-box check probes the pane.
+    await session.tick_at(99.0, _CLAUDE_WORKING_PANE)
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    if alerting:
+        await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+        assert session.published[-1] == ("running", "terminal prompt")
+    published_before = len(session.published)
+
+    armed["value"] = True
+    await session.tick_at(117.0, _CLAUDE_WORKING_PANE if alerting else _CLAUDE_NOTICE_PANE)
+    assert session.published[published_before:] == []
+    assert session.registry._published_status_edge(session_id) == (final_status, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_status", ["idle", "failed"])
+@pytest.mark.parametrize("alerting", [False, True], ids=["raise", "clear"])
+async def test_turn_end_before_queued_alert_delivery_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_status: str, alerting: bool
+) -> None:
+    """A queued alert change is dropped when the turn ends before it is delivered."""
+    session_id = "conv_hidden_delivery_race"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    if alerting:
+        await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+        assert session.published[-1] == ("running", "terminal prompt")
+    published_before = len(session.published)
+
+    await session.tick_at(
+        117.0, _CLAUDE_WORKING_PANE if alerting else _CLAUDE_NOTICE_PANE, drain=False
+    )
+    session.registry.note_external_session_status(session_id, final_status)
+    await asyncio.sleep(0)
+    assert session.published[published_before:] == []
+    assert session.registry._published_status_edge(session_id) == (final_status, None)
 
 
 @pytest.mark.asyncio
