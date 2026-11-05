@@ -143,6 +143,7 @@ class FakeScheduledTaskStore:
         # Fail adopt_session, after committing the session when ``adopt_commits``.
         self.adopt_error: Exception | None = None
         self.adopt_commits = False
+        self.released: list[tuple[str, str]] = []
 
     def get(self, scheduled_task_id: str) -> ScheduledTask | None:
         self.get_workspace_ids.append(current_workspace_id())
@@ -199,6 +200,14 @@ class FakeScheduledTaskStore:
                 self._rows[key] = replace(self._rows[key], session_id=session_id)
             raise self.adopt_error
         return self.adopt_outcome
+
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        key = next((k for k, t in self._rows.items() if t.id == scheduled_task_id), None)
+        if key is None or self._rows[key].session_id != session_id:
+            return False
+        self._rows[key] = replace(self._rows[key], session_id=None)
+        self.released.append((scheduled_task_id, session_id))
+        return True
 
     def get_running_run_by_conversation(self, conversation_id: str) -> Any:
         if conversation_id in self.running_runs:
@@ -2818,7 +2827,6 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
 @pytest.mark.parametrize(
     ("existing", "task_overrides", "error_code"),
     [
-        (None, {}, "continued_session_missing"),
         (_continued_session(archived=True), {}, "continued_session_archived"),
         (
             _continued_session(parent_conversation_id="conv_root"),
@@ -2921,6 +2929,46 @@ async def test_continue_never_replaces_an_unusable_session(
     assert conv_store.created == []
     assert [(run["status"], run["error_code"]) for run in store.runs] == [("failed", error_code)]
     assert "start a new session" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_continue_starts_a_new_session_when_the_old_one_was_deleted() -> None:
+    """The owner deleted the session between runs: the task starts and keeps a fresh one."""
+    conv_store = _ExistingConversationStore()  # conv_prev is gone
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert store.released == [("task_1", "conv_prev")]
+    [(task_id, new_session_id)] = store.adopted
+    assert task_id == "task_1"
+    assert new_session_id != "conv_prev"
+    assert [conv.id for conv in launched] == [new_session_id]
+    assert [run["status"] for run in store.runs] == ["running"]
+    assert store.runs[0].get("error_code") is None
+
+
+@pytest.mark.asyncio
+async def test_continue_follows_a_replacement_another_run_recorded_first() -> None:
+    """Two runs find the session gone; the loser continues the winner's new session."""
+    conv_store = _ExistingConversationStore(_continued_session(id="conv_new"))
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    def release_after_a_competing_run(task_id: str, session_id: str) -> bool:
+        # The competing run released conv_prev and recorded conv_new before this one.
+        store._rows["task_1"] = replace(store._rows["task_1"], session_id="conv_new")
+        return False
+
+    store.release_session = release_after_a_competing_run  # type: ignore[method-assign]
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert store.adopted == []
+    assert conv_store.created == []
+    assert [conv.id for conv in launched] == ["conv_new"]
+    assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
+        ("succeeded", "conv_new")
+    ]
 
 
 _SANDBOX_TASK_ID = "5a1d0c9e8b7f4a3d2c1b0a9f8e7d6c5b"
