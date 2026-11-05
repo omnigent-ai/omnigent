@@ -395,6 +395,11 @@ import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
+import {
+  NEW_SESSION_HANDOFF_PARAM,
+  forgetNewSessionHandoff,
+  peekNewSessionHandoff,
+} from "@/lib/newSessionHandoff";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -1204,6 +1209,7 @@ export function AgentHarnessPicker({
   sandboxSelected,
   allowCreateCustomAgent = true,
   onOpenChange,
+  open: controlledOpen,
   dropdownModal = false,
   contentClassName,
   contentAlign = "end",
@@ -1260,6 +1266,9 @@ export function AgentHarnessPicker({
   // `triggerLabelClassName`).
   /** Notified when the picker dropdown opens/closes. */
   onOpenChange?: (open: boolean) => void;
+  /** Controlled visibility; pair with onOpenChange and update open when it fires.
+   * Omit open to let the picker manage its own visibility. */
+  open?: boolean;
   /** Whether the dropdown blocks outside interaction. Defaults false so composer clicks reach their target. */
   dropdownModal?: boolean;
   /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
@@ -1315,7 +1324,15 @@ export function AgentHarnessPicker({
   entriesFailed?: boolean;
 }) {
   // Controlled so picking a row can close the menu.
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = controlledOpen ?? internalOpen;
+  const changeOpen = useCallback(
+    (next: boolean) => {
+      setInternalOpen(next);
+      onOpenChange?.(next);
+    },
+    [onOpenChange],
+  );
   // Tracks the last-applied openNonce so the imperative-open effect (below,
   // after the drill-in state it drives) skips the initial value.
   const appliedOpenNonce = useRef(0);
@@ -1428,6 +1445,8 @@ export function AgentHarnessPicker({
     if (!open) {
       setMenuPage(null);
       setConfigAgentId(null);
+      pendingConfigAgentId.current = null;
+      setFocusConfigAgentId(null);
     }
   }, [open]);
 
@@ -1453,8 +1472,8 @@ export function AgentHarnessPicker({
         pendingConfigAgentId.current = effectiveAgentId;
       }
     }
-    setOpen(true);
-  }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open]);
+    changeOpen(true);
+  }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open, changeOpen]);
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
@@ -1626,13 +1645,19 @@ export function AgentHarnessPicker({
         .map((agent) => agent.id),
     [visibleCuratedEntries, readyHarnessEntries, harnessEntries],
   );
-  // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
-  const prefetchedOpenNonce = useRef(0);
+  const prefetchedOpenNonce = useRef<number | null>(null);
   useEffect(() => {
-    if (!openNonce || openNonce === prefetchedOpenNonce.current) return;
+    if (!open) {
+      prefetchedOpenNonce.current = null;
+      return;
+    }
+    if (prefetchedOpenNonce.current === openNonce) return;
     prefetchedOpenNonce.current = openNonce;
+    for (const agent of [...harnessEntries, ...agentEntries]) {
+      void prefetchAvailableAgentDetails(agent, queryClient);
+    }
     onPrefetchEntries?.(prefetchIds);
-  }, [openNonce, onPrefetchEntries, prefetchIds]);
+  }, [open, openNonce, harnessEntries, agentEntries, queryClient, onPrefetchEntries, prefetchIds]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
@@ -1746,22 +1771,7 @@ export function AgentHarnessPicker({
       cyclePreview={cyclePreview}
       onDismissCyclePreview={onDismissCyclePreview}
       open={open}
-      onOpenChange={(next) => {
-        if (!next) {
-          pendingConfigAgentId.current = null;
-          setFocusConfigAgentId(null);
-        }
-        setOpen(next);
-        onOpenChange?.(next);
-        if (next) {
-          // Prefetch harness/description/skills for all session-discovered
-          // agents so the list is stable before the user reads it.
-          for (const agent of [...harnessEntries, ...agentEntries]) {
-            void prefetchAvailableAgentDetails(agent, queryClient);
-          }
-          onPrefetchEntries?.(prefetchIds);
-        }
-      }}
+      onOpenChange={changeOpen}
       trigger={{
         disabled: disabledLabel !== undefined || previewOnly || (!hasAgents && !curated),
         "aria-busy": loading || undefined,
@@ -1904,7 +1914,6 @@ export function AgentHarnessPicker({
                 onSelect={() => {
                   if (!autoHarnessAvailable) return;
                   onSelectAutoHarness?.();
-                  setOpen(false);
                 }}
                 className="mobile-touch-target group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
               >
@@ -2095,6 +2104,10 @@ export function NewChatLandingScreen() {
   const location = useLocation();
   const [searchParams] = useSearchParams();
   const linkedPrompt = searchParams.get("prompt");
+  const handoffToken = searchParams.get(NEW_SESSION_HANDOFF_PARAM);
+  // A copied message replaces the whole draft, even with no text or files. Read
+  // once: the link effect below releases the token.
+  const [handoff] = useState(() => peekNewSessionHandoff(handoffToken));
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -2235,15 +2248,14 @@ export function NewChatLandingScreen() {
   // Filter and order selectable agents by deployment curation.
   const info = useServerInfo();
   const curation = pickerCuration(info);
-  const agentList = useMemo(() => {
-    const selectable = selectableSessionAgents(
-      (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
-    );
-    if (curation.restrictToAgentNames.size === 0) return selectable;
-    const allowed = selectable.filter((agent) => curation.restrictToAgentNames.has(agent.name));
-    const order = [...curation.restrictToAgentNames];
-    return allowed.sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
-  }, [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames]);
+  const agentList = useMemo(
+    () =>
+      selectableSessionAgents(
+        (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
+        curation.restrictToAgentNames,
+      ),
+    [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames],
+  );
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -2307,20 +2319,31 @@ export function NewChatLandingScreen() {
           ),
         };
 
-  const [message, setMessage] = useState<string>(() =>
-    linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? ""),
-  );
+  const [message, setMessage] = useState<string>(() => {
+    if (handoff !== null) return handoff.text;
+    return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
+  });
   useEffect(() => {
-    if (!searchParams.has("prompt")) return;
+    if (!searchParams.has("prompt") && handoffToken === null) return;
     if (linkedPrompt?.trim()) setMessage(linkedPrompt);
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
+    remaining.delete(NEW_SESSION_HANDOFF_PARAM);
+    forgetNewSessionHandoff(handoffToken);
     navigate(
       { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [linkedPrompt, searchParams, location.pathname, location.hash, location.state, navigate]);
+  }, [
+    linkedPrompt,
+    handoffToken,
+    searchParams,
+    location.pathname,
+    location.hash,
+    location.state,
+    navigate,
+  ]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2353,7 +2376,9 @@ export function NewChatLandingScreen() {
     restoreFiles,
     onPaste,
     clearError,
-  } = useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
+  } = useComposerAttachments({
+    initialFiles: handoff?.files ?? restoredDraft?.files ?? [],
+  });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
@@ -6375,13 +6400,14 @@ export function NewChatLandingScreen() {
           ? "Working directory: No host selected"
           : `Working directory: ${visibleWorkspace || "Not selected"}`
       }
-      title={
-        workspacePopoverOpen
-          ? undefined
-          : noExecutionTargetSelected
-            ? "No host selected"
-            : visibleWorkspace || "Working directory not selected"
+      tooltip={
+        noExecutionTargetSelected
+          ? "No host selected"
+          : visibleWorkspace
+            ? `Working directory: ${visibleWorkspace}`
+            : "Working directory not selected"
       }
+      menuOpen={workspacePopoverOpen}
       disabled={noExecutionTargetSelected || workspaceLoading}
       aria-busy={workspaceLoading || undefined}
       className={noExecutionTargetSelected || workspaceLoading ? "disabled:opacity-100" : undefined}
@@ -6625,15 +6651,14 @@ export function NewChatLandingScreen() {
                             ? "No host selected"
                             : visibleWorktreeHeader.branchDescription
                         }
-                        title={
-                          worktreePopoverOpen
-                            ? undefined
-                            : noExecutionTargetSelected
-                              ? "No host selected"
-                              : workspaceLoading || worktreeControlAvailable
-                                ? visibleWorktreeHeader.branchDescription
-                                : "Choose a Git working directory to use worktrees"
+                        tooltip={
+                          noExecutionTargetSelected
+                            ? "No host selected"
+                            : workspaceLoading || worktreeControlAvailable
+                              ? visibleWorktreeHeader.branchDescription
+                              : "Choose a Git working directory to use worktrees"
                         }
+                        menuOpen={worktreePopoverOpen}
                         disabled={
                           noExecutionTargetSelected || workspaceLoading || !worktreeControlAvailable
                         }

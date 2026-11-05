@@ -15,11 +15,9 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
-  ClockIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
-  ImageIcon,
   Link2Icon,
   Loader2Icon,
   SplitIcon,
@@ -50,9 +48,14 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
-import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import {
+  isSystemUserContent,
+  parseSystemMessage,
+  stripAutomationContext,
+} from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
+import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
@@ -68,7 +71,7 @@ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
-import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
@@ -81,14 +84,15 @@ import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
-import { InlineImage, SessionImage } from "@/components/SessionImage";
+import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
-import type { SessionStatus } from "@/lib/types";
+import type { PendingInput, SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
   type TranscriptScrollbarDragDetail,
@@ -111,10 +115,12 @@ function sliceByCodePoint(str: string, limit: number): string {
 export const SessionSharedContext = createContext(false);
 
 export function extractUserText(content: MessageContentBlock[]): string {
-  return content
-    .filter(isTextBlock)
-    .map((c) => c.text)
-    .join("")
+  return stripAutomationContext(
+    content
+      .filter(isTextBlock)
+      .map((c) => c.text)
+      .join(""),
+  )
     .replace(ATTACHED_RE, "")
     .trimEnd();
 }
@@ -230,6 +236,72 @@ export function buildPendingBubbles(
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
     };
   });
+}
+
+/**
+ * Build "Not delivered" user bubbles from a session's undelivered startup inputs.
+ *
+ * @param failedInputs - The snapshot's `failedInputs`, in submission order.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function buildUndeliveredBubbles(
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  return failedInputs.map((input) => {
+    const author = input.createdBy ?? selfAuthor;
+    return {
+      kind: "user",
+      itemId: input.pendingId,
+      // No transcript item exists, so there is nothing to link to.
+      pending: true,
+      undelivered: true,
+      content: input.content,
+      ...(author !== null ? { createdBy: author } : {}),
+    };
+  });
+}
+
+function isStartupFailureBubble(bubble: Bubble): boolean {
+  return (
+    bubble.kind === "assistant" &&
+    bubble.items.some((item) => item.kind === "error" && item.code === "startup_input_failed")
+  );
+}
+
+/**
+ * Place undelivered messages above the startup failure notice that explains
+ * them, or at the end of the transcript when that notice isn't loaded.
+ */
+export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble[]): Bubble[] {
+  if (undelivered.length === 0) return committed;
+  const notice = committed.findIndex(isStartupFailureBubble);
+  if (notice === -1) return [...committed, ...undelivered];
+  return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
+}
+
+/**
+ * Add a conversation's uncommitted user messages to its committed bubbles: the
+ * undelivered startup messages, and the optimistic sends they don't replace.
+ *
+ * @param committed - Bubbles built from the transcript.
+ * @param pendingUserMessages - The conversation's optimistic sends.
+ * @param failedInputs - The snapshot's undelivered startup messages.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function withUncommittedUserBubbles(
+  committed: Bubble[],
+  pendingUserMessages: PendingUserMessage[],
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  const withUndelivered = placeUndeliveredBubbles(
+    committed,
+    buildUndeliveredBubbles(failedInputs, selfAuthor),
+  );
+  const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
+  if (pending.length === 0) return withUndelivered;
+  return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, selfAuthor));
 }
 
 // A committed bubble that exists ONLY to render one or more
@@ -468,10 +540,29 @@ export function WorkingIndicator() {
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
   const tick = useWorkingLabelTick();
-  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
-  // the state and the shimmer stays off (it would misread as the agent still
-  // thinking). While the turn is active the shimmer shows, with the pill beside it.
-  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
+  // Background shells outliving a finished turn keep the session in progress,
+  // but the agent isn't thinking: show a plain spinner instead of the shimmer.
+  // The main composer's pill announces the count; side chats have no pill.
+  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
+    const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
+    return (
+      <>
+        {scopedConversationId && (
+          <span role="status" aria-live="polite" className="sr-only">
+            {label}
+          </span>
+        )}
+        <Message from="assistant" data-testid="background-tasks-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
+              <RunningDot className="size-3.5" />
+              <span className="text-sm font-mono">{label}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
+    );
+  }
   const label = workingIndicatorLabel(tick, blockedOn, {
     answerableInChat: hasOwnPendingElicitation,
     // The toggle switches to the root session's terminal, not a side chat's.
@@ -762,6 +853,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
+  const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
@@ -790,9 +882,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
-        {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
-            immediately left of the right-aligned bubble. */}
-        <div className="flex w-fit max-w-full items-center gap-1.5">
+        {/* Keep the avatar beside the attachments and text as one aligned message. */}
+        <div className="flex w-fit max-w-full items-end gap-1.5">
           {showAuthorBadge && author && (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -813,20 +904,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               <TooltipContent>{author}</TooltipContent>
             </Tooltip>
           )}
-          <MessageContent
-            className={flashing ? "animate-message-highlight" : undefined}
-            // Another contributor's bubble takes their avatar color at low
-            // alpha instead of the default bg-muted.
-            style={
-              showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
-            }
-          >
-            {/* Inline image previews. Wrap rather than scroll horizontally:
-                a landscape image fills the bubble width, so a second one in a
-                non-wrapping strip would sit off-screen in the overflow and
-                look like it never rendered. */}
+          <div className="flex min-w-0 max-w-full flex-col items-end gap-1.5">
             {images.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap items-start gap-2">
+              <div
+                data-testid="user-image-attachments"
+                className={cn(
+                  "flex max-w-full flex-wrap justify-end gap-1.5",
+                  flashing && "animate-message-highlight rounded-lg",
+                )}
+              >
                 {keyedAttachments(
                   images,
                   (img) => img.file_id ?? img.image_url ?? img.filename,
@@ -842,7 +928,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                             : undefined
                         }
                         alt={preview.alt}
-                        className="rounded-md object-contain"
+                        variant="userAttachment"
                       />
                     );
                   }
@@ -852,115 +938,148 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         key={key}
                         src={preview.src}
                         alt={preview.alt}
-                        className="rounded-md object-contain"
+                        variant="userAttachment"
                       />
                     );
                   }
-                  // In-flight upload, or a block with nothing renderable on it.
-                  return <AttachmentChip key={key} icon={ImageIcon} label={preview.label} />;
+                  return (
+                    <ImageAttachmentPlaceholder
+                      key={key}
+                      label={preview.label}
+                      pending={preview.kind === "pending"}
+                    />
+                  );
                 })}
               </div>
             )}
-            {/* Non-image file chips */}
-            {fileChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
-                  ({ key, item: att }) => (
-                    <AttachmentChip key={key} icon={FileTextIcon} label={attachmentLabel(att)} />
-                  ),
+            {(text || fileChips.length > 0 || mentionedChips.length > 0) && (
+              <MessageContent
+                data-testid="user-message-content"
+                className={flashing ? "animate-message-highlight" : undefined}
+                // Another contributor's bubble takes their avatar color at low
+                // alpha instead of the default bg-muted.
+                style={
+                  showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
+                }
+              >
+                {/* Non-image file chips */}
+                {fileChips.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
+                      ({ key, item: att }) => (
+                        <AttachmentChip
+                          key={key}
+                          icon={FileTextIcon}
+                          label={attachmentLabel(att)}
+                        />
+                      ),
+                    )}
+                  </div>
                 )}
-              </div>
-            )}
-            {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
-            {mentionedChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {mentionedChips.map((item) => (
-                  <span
-                    key={mentionItemPath(item)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    {item.isDir ? (
-                      <FolderIcon className="size-3 shrink-0" />
-                    ) : (
-                      <FileTextIcon className="size-3 shrink-0" />
-                    )}
-                    <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
-                      @{item.path}
-                      {item.isDir ? "/" : ""}
-                    </span>
-                    {item.lineRange && (
-                      <span className="shrink-0">
-                        :{item.lineRange.start}-{item.lineRange.end}
+                {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
+                {mentionedChips.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {mentionedChips.map((item) => (
+                      <span
+                        key={mentionItemPath(item)}
+                        className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                      >
+                        {item.isDir ? (
+                          <FolderIcon className="size-3 shrink-0" />
+                        ) : (
+                          <FileTextIcon className="size-3 shrink-0" />
+                        )}
+                        <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
+                          @{item.path}
+                          {item.isDir ? "/" : ""}
+                        </span>
+                        {item.lineRange && (
+                          <span className="shrink-0">
+                            :{item.lineRange.start}-{item.lineRange.end}
+                          </span>
+                        )}
                       </span>
-                    )}
-                  </span>
-                ))}
-              </div>
-            )}
-            {/* Render user text as markdown, matching the assistant bubble.
+                    ))}
+                  </div>
+                )}
+                {/* Render user text as markdown, matching the assistant bubble.
               `breaks` keeps single newlines as line breaks. Empty text renders
               nothing rather than an empty markdown block.
               For long prompts, only the visible slice is passed to the renderer
               so the Markdown parser never processes hidden text. */}
-            {text && (
-              <>
-                <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
-                  {isShellCommand ? (
-                    <pre className="whitespace-pre-wrap break-words font-mono text-sm">
-                      <code>{visibleText}</code>
-                    </pre>
-                  ) : (
-                    <FilePathAwareMessageResponse
-                      className="text-message"
-                      breaks
-                      mode="static"
-                      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                    >
-                      {visibleText}
-                    </FilePathAwareMessageResponse>
-                  )}
-                  {/* Gradient fade at the bottom of collapsed prompts to signal
+                {text && (
+                  <>
+                    <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
+                      {isShellCommand ? (
+                        <pre className="whitespace-pre-wrap break-words font-mono text-sm">
+                          <code>{visibleText}</code>
+                        </pre>
+                      ) : (
+                        <FilePathAwareMessageResponse
+                          className="text-message"
+                          breaks
+                          mode="static"
+                          remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                        >
+                          {visibleText}
+                        </FilePathAwareMessageResponse>
+                      )}
+                      {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
-                  {isCollapsed && isLong && (
-                    <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
-                  )}
-                </div>
-                {isLong && (
-                  <button
-                    type="button"
-                    onClick={() => setIsCollapsed((c) => !c)}
-                    className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    {isCollapsed
-                      ? `Show full prompt (${text.length.toLocaleString()} chars)`
-                      : "Collapse prompt"}
-                  </button>
+                      {isCollapsed && isLong && (
+                        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
+                      )}
+                    </div>
+                    {isLong && (
+                      <button
+                        type="button"
+                        onClick={() => setIsCollapsed((c) => !c)}
+                        className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        {isCollapsed
+                          ? `Show full prompt (${text.length.toLocaleString()} chars)`
+                          : "Collapse prompt"}
+                      </button>
+                    )}
+                  </>
                 )}
-              </>
+              </MessageContent>
             )}
-          </MessageContent>
-        </div>
-        {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
-        {bubble.pending && bubble.awaitingAgent && (
-          <div
-            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
-            data-testid="message-awaiting-agent"
-          >
-            <ClockIcon size={12} aria-hidden />
-            The agent will read this after its current step
           </div>
+        </div>
+        {bubble.undelivered && (
+          <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
         )}
-        {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40">
+        {/* 40%-visible on touch, hover/focus-reveal on desktop. A text-less
+            steering message has no enabled footer control to focus (Copy is
+            absent and Copy link is disabled while pending), so keep its
+            explanation visible for keyboard users. */}
+        <div
+          className={cn(
+            "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
+            awaitingAgent && !text
+              ? "opacity-100"
+              : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 [@media(pointer:coarse)]:opacity-40",
+          )}
+        >
+          {awaitingAgent && (
+            <span
+              className="min-w-0 truncate text-sm leading-4 text-muted-foreground"
+              data-testid="message-awaiting-agent"
+              title="The agent will read this after its current step"
+            >
+              The agent will read this after its current step
+            </span>
+          )}
           {ts && (
             <span
-              className="select-none text-[11px] leading-4 text-foreground/56"
+              className="shrink-0 select-none whitespace-nowrap text-[11px] leading-4 text-foreground/56"
               data-testid="message-timestamp"
             >
               {ts}
             </span>
           )}
-          <MessageActions>
+          <MessageActions className="shrink-0">
             {text && (
               <MessageAction
                 tooltip="Copy"
@@ -1256,35 +1375,62 @@ export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   return null;
 }
 
-/** Keep bottom-locked readers pinned when the composer changes viewport height. */
-export function KeepBottomOnViewportResize() {
+const POINTER_STATE_EVENTS = ["pointerdown", "pointerup", "pointercancel"] as const;
+
+/** Keep bottom-locked readers pinned when the viewport or the transcript changes height. */
+export function KeepBottomOnResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef?: React.RefObject<HTMLElement>;
   };
   const scrollRef = ctx.scrollRef;
+  const contentRef = ctx.contentRef;
   const state = ctx.state;
   const scrollToBottom = ctx.scrollToBottom;
 
   useEffect(() => {
     const el = scrollRef?.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
-    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
     let clientHeight = el.clientHeight;
+    let scrollHeight = el.scrollHeight;
+    // At the end of the last observed layout or the current one: a pin's own scroll
+    // event can arrive after the next line grew the transcript, and a shrink's
+    // clamp before its resize callback.
+    const isAtEnd = () => {
+      const end = Math.min(scrollHeight - clientHeight, el.scrollHeight - el.clientHeight);
+      return end - el.scrollTop <= 1;
+    };
+    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isAtEnd();
+    let pointerDown = false;
     let frame: number | null = null;
     const onScroll = () => {
-      wasBottomLocked = isPhysicallyAtBottom();
+      wasBottomLocked = isAtEnd();
+    };
+    const onPointer = (event: Event) => {
+      pointerDown = event.type === "pointerdown";
+    };
+    // Like the library, hold still while the reader drags a selection in the transcript.
+    const isSelecting = () => {
+      const selection = document.getSelection();
+      if (!pointerDown || !selection || selection.isCollapsed) return false;
+      const common = selection.getRangeAt(0).commonAncestorContainer;
+      return common.contains(el) || el.contains(common);
     };
     const observer = new ResizeObserver(() => {
-      const nextHeight = el.clientHeight;
-      if (nextHeight === clientHeight) return;
-      clientHeight = nextHeight;
-      if (!wasBottomLocked) return;
+      const viewportResized = el.clientHeight !== clientHeight;
+      const contentGrew = el.scrollHeight > scrollHeight;
+      clientHeight = el.clientHeight;
+      scrollHeight = el.scrollHeight;
+      // Rechecked by the follow-up frame: the reader may scroll away or start selecting first.
+      const shouldPin = () =>
+        wasBottomLocked &&
+        !isSelecting() &&
+        (viewportResized || (contentGrew && state.isAtBottom && !state.escapedFromLock));
+      if (!shouldPin()) return;
       // Gecko delivers this callback before the frame paints, but the
       // library's scrollToBottom always lands a frame later (it defers
-      // through a rAF promise), so the shrink paints with the transcript
-      // shoved up before the follow-up pin snaps it back — a visible
-      // bounce on every wrapped composer line. Pin synchronously here
+      // through a rAF promise), so the resize paints with the transcript
+      // off its end before the follow-up pin snaps it back — a visible
+      // bounce on every wrapped composer or streamed line. Pin synchronously here
       // first; the async pins below stay as a safety net for engines that
       // deliver the callback after paint. Target the library's park
       // position (one pixel short) so the settle is identical whether our
@@ -1294,18 +1440,22 @@ export function KeepBottomOnViewportResize() {
       if (frame !== null) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         frame = null;
+        if (!shouldPin()) return;
         el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 1);
         scrollToBottom("instant");
       });
     });
     el.addEventListener("scroll", onScroll, { passive: true });
+    for (const type of POINTER_STATE_EVENTS) document.addEventListener(type, onPointer, true);
     observer.observe(el);
+    if (contentRef.current) observer.observe(contentRef.current);
     return () => {
       el.removeEventListener("scroll", onScroll);
+      for (const type of POINTER_STATE_EVENTS) document.removeEventListener(type, onPointer, true);
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [scrollRef, scrollToBottom, state]);
+  }, [scrollRef, contentRef, scrollToBottom, state]);
 
   return null;
 }

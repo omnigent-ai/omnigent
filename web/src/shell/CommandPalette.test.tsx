@@ -309,6 +309,31 @@ describe("CommandPalette — sessions", () => {
     }
   });
 
+  it("lists recent sessions newest first after a pushed update reorders them", () => {
+    // The updates stream patches updated_at in place without refetching, so
+    // the cached page can hold a just-bumped session below older ones.
+    useConversations.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [
+              { ...conv("older", "Older session"), updated_at: 1 },
+              { ...conv("bumped", "Bumped session"), updated_at: 3 },
+              { ...conv("middle", "Middle session"), updated_at: 2 },
+            ],
+          },
+        ],
+      },
+      isFetching: false,
+    });
+    renderPalette();
+    const rows = screen
+      .getAllByRole("option")
+      .map((option) => option.textContent ?? "")
+      .filter((text) => text.includes(" session"));
+    expect(rows.map((text) => text.split(" session")[0])).toEqual(["Bumped", "Middle", "Older"]);
+  });
+
   it("dedupes sessions that appear on overlapping pages", () => {
     useConversations.mockReturnValue({
       data: {
