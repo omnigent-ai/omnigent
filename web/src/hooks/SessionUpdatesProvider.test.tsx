@@ -707,6 +707,39 @@ describe("SessionUpdatesProvider open-session row", () => {
 
     expect(client.getQueryData<Conversation>(key)).toBe(row);
   });
+
+  it("drops a remotely removed session's fetched row", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    client.setQueryData<Conversation>(key, { ...conv("conv_old"), archived: true });
+    renderProvider(client, ["/c/conv_old"]);
+
+    act(() => frameHandler()({ type: "removed", ids: ["conv_old"] }));
+
+    expect(client.getQueryData(key)).toBeNull();
+  });
+
+  it("keeps a removed session's row gone when its outstanding fetch answers late", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    let answer: (row: Conversation) => void = () => undefined;
+    const fetching = client.fetchQuery<Conversation | null>({
+      queryKey: key,
+      queryFn: () =>
+        new Promise<Conversation>((resolve) => {
+          answer = resolve;
+        }),
+    });
+    renderProvider(client, ["/c/conv_old"]);
+
+    act(() => frameHandler()({ type: "removed", ids: ["conv_old"] }));
+    answer({ ...conv("conv_old"), archived: true });
+    await fetching.catch(() => undefined);
+
+    expect(client.getQueryData(key)).toBeNull();
+  });
 });
 
 describe("SessionUpdatesProvider list invalidation", () => {

@@ -436,6 +436,14 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
                   }
                 : previous,
           );
+          // The open session's fetched sidebar row sits outside every list. Cancel
+          // its request first so a late response can't bring the row back.
+          for (const id of frame.ids) {
+            const backfillKey = ["conversation-backfill", id];
+            if (queryClient.getQueryState(backfillKey) === undefined) continue;
+            void queryClient.cancelQueries({ queryKey: backfillKey, exact: true });
+            queryClient.setQueryData<Conversation | null>(backfillKey, null);
+          }
           if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();
           return;
         case "snapshot":
