@@ -21,19 +21,23 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
+import io
 import json
 import logging
 import mimetypes
 import os
 import re
+import stat
+import tarfile
 import tempfile
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, BinaryIO, Protocol, cast
 
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
@@ -3693,14 +3697,34 @@ async def _execute_session_create(
     )
 
 
-def _bundle_local_agent_source(source: Path) -> bytes:
+_BUNDLE_WALK_BENEATH_SUPPORTED = (
+    all(fn in os.supports_dir_fd for fn in (os.open, os.stat, os.readlink))
+    and os.listdir in os.supports_fd
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+_BUNDLE_DIR_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+# O_NONBLOCK keeps a FIFO swapped in after the lstat from hanging the open.
+_BUNDLE_FILE_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _bundle_local_agent_source(root: Path, source: Path) -> bytes:
     """
     Build gzipped agent-bundle bytes from a local source path.
 
     Handles the same source shapes as the CLI bundler: a standalone
-    agent YAML file or an agent directory is materialized into a
-    uniform bundle directory and tarred; any other file (e.g. a
-    pre-built ``.tar.gz``) passes through as raw bytes for the
+    agent YAML file or an agent directory is tarred; any other file
+    (e.g. a pre-built ``.tar.gz``) passes through as raw bytes for the
     server's bundle validation to accept or reject.
 
     Unlike the CLI bundler, no ``${VAR}`` env expansion is performed:
@@ -3708,30 +3732,96 @@ def _bundle_local_agent_source(source: Path) -> bytes:
     secrets into the uploaded bundle. Configs with unresolved env
     references fail loud in the server's spec validation instead.
 
-    :param source: Local agent config YAML, agent directory, or
-        bundle file, e.g.
+    The source is agent-controlled, so no symlink is followed: nested
+    links are packed as link members, which the server refuses, and a
+    component swapped for a symlink after resolution fails the walk.
+    Platforms without ``dir_fd`` traversal are refused outright.
+
+    :param root: Resolved os_env cwd containing ``source``, e.g.
+        ``Path("/work")``.
+    :param source: Resolved local agent config YAML, agent directory,
+        or bundle file under ``root``, e.g.
         ``Path("/work/.omnigent/agent-configs/helper.yaml")``.
     :returns: Gzipped tarball bytes for the multipart ``bundle`` part.
-    :raises FileNotFoundError: If ``source`` does not exist.
+    :raises OSError: If the platform lacks ``dir_fd`` traversal, a
+        component is missing or was swapped for a symlink, or the source
+        contains a special file such as a FIFO.
     """
-    import io
-    import tarfile
-
-    from omnigent.spec import materialize_bundle
-
-    if source.is_file() and source.suffix.lower() not in {".yaml", ".yml"}:
-        return source.read_bytes()
-    with tempfile.TemporaryDirectory() as tmpdir:
-        bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
+    if not _BUNDLE_WALK_BENEATH_SUPPORTED:
+        raise OSError("safe directory traversal is unavailable on this platform")
+    parts = source.relative_to(root).parts
+    name = parts[-1] if parts else "."
+    parent_fd = os.open(root, _BUNDLE_DIR_OPEN_FLAGS)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, _BUNDLE_DIR_OPEN_FLAGS, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISREG(entry.st_mode) and source.suffix.lower() not in {".yaml", ".yml"}:
+            with _open_bundle_file(name, parent_fd) as (handle, _):
+                return handle.read()
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-            for file_path in sorted(bundle_dir.rglob("*")):
-                if file_path.is_file():
-                    tf.add(
-                        str(file_path),
-                        arcname=str(file_path.relative_to(bundle_dir)),
-                    )
+            _add_bundle_entry(
+                tf, name, parent_fd, "" if stat.S_ISDIR(entry.st_mode) else source.name
+            )
         return buf.getvalue()
+    finally:
+        os.close(parent_fd)
+
+
+def _add_bundle_entry(tf: tarfile.TarFile, name: str, dir_fd: int, arcname: str) -> None:
+    """
+    Add one bundle-source entry to ``tf``, recursing into directories.
+
+    :param tf: Open tarball being written.
+    :param name: Entry name relative to ``dir_fd``.
+    :param dir_fd: Descriptor of the already-opened parent directory.
+    :param arcname: Bundle member name, ``""`` for the root directory,
+        e.g. ``"skills/review/SKILL.md"``.
+    """
+    entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if stat.S_ISLNK(entry.st_mode):
+        link = tarfile.TarInfo(arcname)
+        link.type = tarfile.SYMTYPE
+        link.linkname = os.readlink(name, dir_fd=dir_fd)
+        tf.addfile(link)
+        return
+    if stat.S_ISDIR(entry.st_mode):
+        child_dir_fd = os.open(name, _BUNDLE_DIR_OPEN_FLAGS, dir_fd=dir_fd)
+        try:
+            for child in sorted(os.listdir(child_dir_fd)):
+                child_arcname = f"{arcname}/{child}" if arcname else child
+                _add_bundle_entry(tf, child, child_dir_fd, child_arcname)
+        finally:
+            os.close(child_dir_fd)
+        return
+    if not stat.S_ISREG(entry.st_mode):
+        raise OSError(f"agent config contains an unsupported file type: {arcname}")
+    with _open_bundle_file(name, dir_fd) as (handle, opened):
+        member = tarfile.TarInfo(arcname)
+        member.size = opened.st_size
+        member.mtime = int(opened.st_mtime)
+        member.mode = stat.S_IMODE(opened.st_mode)
+        tf.addfile(member, handle)
+
+
+@contextlib.contextmanager
+def _open_bundle_file(name: str, dir_fd: int) -> Iterator[tuple[BinaryIO, os.stat_result]]:
+    """
+    Open a regular file without following a final symlink.
+
+    :yields: The open file and its ``fstat``, so callers stream the
+        verified descriptor instead of reopening the path.
+    :raises OSError: If the file is a symlink or not a regular file.
+    """
+    fd = os.open(name, _BUNDLE_FILE_OPEN_FLAGS, dir_fd=dir_fd)
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(f"agent config contains an unsupported file type: {name}")
+        yield handle, opened
 
 
 async def _post_child_first_message(
@@ -3826,7 +3916,7 @@ async def _upload_config_bundle(
     if not source.exists():
         return json.dumps({"error": "config_not_found", "config_path": config_path})
     try:
-        bundle_bytes = await asyncio.to_thread(_bundle_local_agent_source, source)
+        bundle_bytes = await asyncio.to_thread(_bundle_local_agent_source, resolved_cwd, source)
     except Exception as exc:  # noqa: BLE001 — disk/tar errors become a typed tool error.
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
