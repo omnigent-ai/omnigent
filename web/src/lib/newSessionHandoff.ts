@@ -1,36 +1,31 @@
-// Opens the new-session composer prefilled with a message from elsewhere in the
-// app. Text rides in the existing `?prompt=` link; files can't go in a URL, so
-// they wait here under a one-time token the link names.
+// Copies a message into the new-session composer. Files can't ride in a URL, so
+// the message waits here under a one-time token the link names.
 import { randomUUID } from "@/lib/randomUUID";
 
-/** Search param naming the handed-off attachments, e.g. `?attachments=<token>`. */
-export const NEW_SESSION_ATTACHMENTS_PARAM = "attachments";
+/** Search param naming a handed-off message, e.g. `?handoff=<token>`. */
+export const NEW_SESSION_HANDOFF_PARAM = "handoff";
 
-const handedOffAttachments = new Map<string, File[]>();
+/** A message copied into the new-session composer, replacing its draft. */
+export interface NewSessionHandoff {
+  text: string;
+  files: File[];
+}
 
-/**
- * The location of the new-session composer prefilled with `text` and `files`.
- *
- * @param text - Composer text, e.g. ``"Summarize the open PRs"``.
- * @param files - Attachments for the composer; none adds no token.
- * @returns A router location such as ``"/?prompt=Summarize&attachments=<token>"``.
- */
+const handoffs = new Map<string, NewSessionHandoff>();
+
+/** The new-session composer's location, holding `text` and `files` as its whole draft. */
 export function newSessionLocation(text: string, files: File[]): string {
-  const search = new URLSearchParams({ prompt: text });
-  if (files.length > 0) {
-    const token = randomUUID();
-    handedOffAttachments.set(token, files);
-    search.set(NEW_SESSION_ATTACHMENTS_PARAM, token);
-  }
-  return `/?${search.toString()}`;
+  const token = randomUUID();
+  handoffs.set(token, { text, files });
+  return `/?${new URLSearchParams({ [NEW_SESSION_HANDOFF_PARAM]: token })}`;
 }
 
-/** The attachments a link's token names, or `null` for no or an unknown token. */
-export function peekNewSessionAttachments(token: string | null): File[] | null {
-  return token === null ? null : (handedOffAttachments.get(token) ?? null);
+/** The message a link's token names, or `null` for no or an unknown token. */
+export function peekNewSessionHandoff(token: string | null): NewSessionHandoff | null {
+  return token === null ? null : (handoffs.get(token) ?? null);
 }
 
-/** Release a token's attachments once the composer has taken them. */
-export function forgetNewSessionAttachments(token: string | null): void {
-  if (token !== null) handedOffAttachments.delete(token);
+/** Release a token's message once the composer has taken it. */
+export function forgetNewSessionHandoff(token: string | null): void {
+  if (token !== null) handoffs.delete(token);
 }

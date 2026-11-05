@@ -6,7 +6,7 @@ import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { NEW_SESSION_ATTACHMENTS_PARAM, peekNewSessionAttachments } from "@/lib/newSessionHandoff";
+import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import {
   BubbleView,
   buildUndeliveredBubbles,
@@ -830,8 +830,10 @@ describe("undelivered startup messages", () => {
     await waitFor(() => expect(screen.getByTestId("location").textContent).toMatch(/^\/\?/));
     window.removeEventListener("omnigent:toast", recordToast);
     const search = new URLSearchParams(screen.getByTestId("location").textContent!.slice(1));
-    expect(search.get("prompt")).toBe("Summarize these");
-    const [notes] = peekNewSessionAttachments(search.get(NEW_SESSION_ATTACHMENTS_PARAM)) ?? [];
+    const handoff = peekNewSessionHandoff(search.get(NEW_SESSION_HANDOFF_PARAM));
+    expect(handoff?.text).toBe("Summarize these");
+    const [notes] = handoff?.files ?? [];
+    expect(handoff?.files).toHaveLength(1);
     expect(notes?.name).toBe("notes.txt");
     expect(await notes?.text()).toBe("meeting notes");
     expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);

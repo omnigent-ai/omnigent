@@ -39,10 +39,7 @@ async function recoverAttachments(
 }
 
 /**
- * The status line under a startup message the server never delivered.
- * "Relaunch sandbox" asks the server to deliver it in this session, starting a
- * new sandbox when the first one never came up; "Copy message to new session"
- * moves the message (text and attachments) to the new-session composer instead.
+ * Recovery actions for a startup input that was never delivered.
  *
  * @param sessionId - The session the message was saved in.
  * @param text - The message text, as the bubble's Copy action copies it.

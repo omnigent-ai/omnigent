@@ -1986,6 +1986,8 @@ export function initChatStore(client: QueryClient): void {
   // the next one (production calls this once at boot; tests call it per case).
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
+  startupReads.clear();
+  deliveredStartupInputs.clear();
   queryClient = client;
   unsubscribeSettingsMutations = client.getMutationCache().subscribe((event) => {
     if (event.type !== "updated" || !["success", "error"].includes(event.action.type)) return;
@@ -4837,8 +4839,25 @@ function startupInputsPatch(
       session.labels?.["omnigent.startup"] === "pending" ||
       (session.labels?.["omnigent.startup"] === "ready" &&
         (session.pendingInputs ?? []).length > 0),
-    failedInputs: session.failedInputs ?? [],
+    failedInputs: withoutDeliveredInputs(session.id, session.failedInputs),
   };
+}
+
+// Startup inputs this page saw delivered, per conversation. A delivered input never
+// becomes undelivered again, so a snapshot read before its receipt can't restore it.
+const deliveredStartupInputs = new Map<string, Set<string>>();
+
+/** Note a delivered startup input, e.g. from its `session_input_consumed` receipt. */
+function noteStartupInputDelivered(id: string, pendingId: string): void {
+  const delivered = deliveredStartupInputs.get(id) ?? new Set<string>();
+  delivered.add(pendingId);
+  deliveredStartupInputs.set(id, delivered);
+}
+
+/** A snapshot's startup inputs, less those this page saw delivered. */
+function withoutDeliveredInputs(id: string, inputs: PendingInput[] | undefined): PendingInput[] {
+  const delivered = deliveredStartupInputs.get(id);
+  return (inputs ?? []).filter((input) => !delivered?.has(input.pendingId));
 }
 
 /**
@@ -4919,15 +4938,10 @@ function pendingBubbleFromSnapshot(input: PendingInput): PendingUserMessage {
   };
 }
 
-// The newest startup re-read per conversation, and the inputs delivered while it
-// was out. Read numbers are never reused, so an older read can't pass for it.
+// The newest startup re-read per conversation. Read numbers are never reused, so
+// an older read that lands later can't pass for the newest.
 let startupReadCount = 0;
-const startupReads = new Map<string, { read: number; delivered: Set<string> }>();
-
-/** Note a delivered startup input, so a re-read still in flight doesn't bring it back. */
-function noteStartupInputDelivered(id: string, pendingId: string): void {
-  startupReads.get(id)?.delivered.add(pendingId);
-}
+const startupReads = new Map<string, number>();
 
 /**
  * Re-read a session's saved startup messages after its launch failed or was retried.
@@ -4943,35 +4957,35 @@ function noteStartupInputDelivered(id: string, pendingId: string): void {
 async function refreshStartupInputs(id: string, showQueued = false): Promise<void> {
   startupReadCount += 1;
   const read = startupReadCount;
-  // Deliveries seen by a read this one replaces still postdate its snapshot.
-  const delivered = startupReads.get(id)?.delivered ?? new Set<string>();
-  startupReads.set(id, { read, delivered });
+  startupReads.set(id, read);
   let session: Session | null = null;
   try {
     session = await getSessionSlim(id);
   } catch {
     // The next bind reads the snapshot again.
   }
-  if (startupReads.get(id)?.read !== read) return;
+  if (startupReads.get(id) !== read) return;
   startupReads.delete(id);
   if (session === null) return;
   const fresh = session;
   queryClient?.setQueryData(["session", id], fresh);
-  const undelivered = (inputs: PendingInput[] | undefined) =>
-    (inputs ?? []).filter((input) => !delivered.has(input.pendingId));
+  // A snapshot listing an input already delivered predates that receipt.
+  const listed = [...(fresh.pendingInputs ?? []), ...(fresh.failedInputs ?? [])];
+  const predatesDelivery = withoutDeliveredInputs(id, listed).length < listed.length;
   setterFor(id)((s) => {
-    const failedInputs = undelivered(fresh.failedInputs);
+    const { startupPending, failedInputs } = startupInputsPatch(fresh);
     const pending = withoutFailedInputs(s.pendingUserMessages, failedInputs);
     const shown = new Set(pending.flatMap((message) => [message.tempId, message.pendingId]));
     const queued = showQueued
-      ? undelivered(fresh.pendingInputs).filter((input) => !shown.has(input.pendingId))
+      ? withoutDeliveredInputs(id, fresh.pendingInputs).filter(
+          (input) => !shown.has(input.pendingId),
+        )
       : [];
     // Only the startup fields: live events stay newer than this read for the
     // rest, e.g. a "failed" launch stage a replica without the launch doesn't know,
     // or a delivery that ended the startup the snapshot still shows.
-    const { startupPending } = startupInputsPatch(fresh);
     return {
-      ...(delivered.size === 0 ? { startupPending } : {}),
+      ...(predatesDelivery ? {} : { startupPending }),
       failedInputs,
       pendingUserMessages: [...pending, ...queued.map(pendingBubbleFromSnapshot)],
     };
@@ -5534,7 +5548,7 @@ function reconnectStatusPatch(
     // message on `waitForInitialDispatch` until its deadline.
     ...snapshotModelPatch(session, s),
     // A launch that failed during the gap still shows what it never delivered.
-    failedInputs: session.failedInputs ?? [],
+    failedInputs: withoutDeliveredInputs(session.id, session.failedInputs),
   };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.

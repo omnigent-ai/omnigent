@@ -14158,6 +14158,85 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     }
   });
 
+  it("doesn't restore an undelivered message a receipt cleared during reconnect reconciliation", async () => {
+    // The reconnect's snapshot was read before a relaunch delivered the message;
+    // the receipt arrives over the new stream before that snapshot lands.
+    seedSession("conv_relaunched", []);
+    const lost = { type: "input_text" as const, text: "Summarize the open PRs" };
+    const sinks = routeStreamOpens(["server-a", "server-b"]);
+    const normalFetch = fetchMock.getMockImplementation()!;
+    let answerSnapshot: ((response: Response) => void) | null = null;
+    let snapshotGets = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_relaunched" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotGets += 1;
+        if (snapshotGets === 1) {
+          return new Promise<Response>((resolve) => {
+            answerSnapshot = resolve;
+          });
+        }
+      }
+      return normalFetch(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_relaunched",
+      abortController: controller,
+      failedInputs: [{ pendingId: "pending_first", content: [lost] }],
+      blocks: [],
+    });
+    const loop = startStreamPump("conv_relaunched", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.error();
+      await vi.advanceTimersByTimeAsync(50);
+      await drainAsync(2);
+      expect(answerSnapshot).not.toBeNull();
+      sinks[1]!.push(
+        sse("session.input.consumed", {
+          data: {
+            item_id: "item_first",
+            type: "message",
+            data: { role: "user", content: [lost] },
+            cleared_pending_id: "pending_first",
+          },
+        }),
+      );
+      await drainAsync(2);
+      expect(useChatStore.getState().failedInputs).toEqual([]);
+
+      answerSnapshot!(
+        mockResponse({
+          id: "conv_relaunched",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.startup": "failed" },
+          pending_elicitations: [],
+          pending_inputs: [],
+          failed_inputs: [{ pending_id: "pending_first", content: [lost] }],
+        }),
+      );
+      await drainAsync(2);
+
+      expect(useChatStore.getState().failedInputs).toEqual([]);
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
   it("clears a stale 'running' via the reconnect catch-up burst, before the 60s reconcile", async () => {
     // Reproduces the mid-turn server-restart bug: the reconnect's immediate
     // reconcile reads a still-"running" snapshot (the restarted server hasn't

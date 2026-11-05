@@ -22,6 +22,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   fills an editable draft without starting a session. The consumed prompt is
   removed from the URL while other query parameters and the fragment remain.
   A new link replaces a parked draft; subsequent edits survive navigation.
+  **Copy message to new session** opens it with a one-time `?handoff=` token
+  instead, naming an in-memory copy of the message's text and attachments. That
+  copy replaces the whole parked draft, even with no text or no attachments; the
+  token leaves the URL and is released once the composer takes it.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.

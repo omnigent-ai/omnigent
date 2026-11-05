@@ -614,19 +614,18 @@ class ManagedStartupInputs:
             return True
         if conv.labels.get(STARTUP_LABEL) != "failed":
             return False
-        failed = [
-            item
-            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
-            if item.status == "failed"
-        ]
-        if not failed:
+        items = await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
+        if not any(item.status == "failed" for item in items):
             return False
-        # Moving the first input back is the claim: of concurrent retries on any
-        # replica, only the one whose transition lands provisions a sandbox.
-        if not await self._requeue(conv.id, failed[0].id):
+        # Moving the first saved input back is the claim: every retry, on any
+        # replica, contends for that same row, and only the one whose transition
+        # lands provisions a sandbox.
+        head, *rest = items
+        if head.status != "failed" or not await self._requeue(conv.id, head.id):
             return True
-        for item in failed[1:]:
-            await self._requeue(conv.id, item.id)
+        for item in rest:
+            if item.status == "failed":
+                await self._requeue(conv.id, item.id)
         owner = await asyncio.to_thread(
             self.conversations.get_session_owner, conv.id, owner_only=True
         )

@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -19,8 +19,9 @@ from fastapi import FastAPI
 from starlette.datastructures import Headers
 
 from omnigent.db.db_models import current_workspace_id
-from omnigent.entities.conversation import ErrorData
+from omnigent.entities.conversation import Conversation, ErrorData
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
@@ -1050,36 +1051,91 @@ async def test_retry_after_unbound_launch_failure_provisions_again(
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def test_concurrent_retries_on_two_replicas_provision_once(startup_env: _Env) -> None:
-    env = startup_env
+async def _failed_launch_with_followup(env: _Env) -> Conversation:
+    """A session whose launch failed with its first input and a follow-up saved."""
     session_id = await _create(env, sandbox_provider="modal")
+    followup = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "and then"}]},
+    }
+    saved = await env.client.post(f"/v1/sessions/{session_id}/events", json=followup)
+    assert saved.status_code == 202, saved.text
     env.app.state.managed_launches.fail(session_id, "managed host did not come online")
     await env.app.state.startup_inputs.record_launch_failure(session_id, "host offline")
+    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == [
+        "failed",
+        "failed",
+    ]
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None
+    return conv
+
+
+def _replica(
+    env: _Env, schedule_launch: Callable[..., Coroutine[Any, Any, None]]
+) -> tuple[ManagedStartupInputs, Any]:
+    """Its own service and launch tracker over the shared store, as on another replica."""
+    service = ManagedStartupInputs(env.conv_store, env.app.state.host_registry)
+    service.schedule_launch = schedule_launch
+    state = Mock(managed_launches=type(env.app.state.managed_launches)())
+    return service, Mock(app=Mock(state=state))
+
+
+async def test_concurrent_retries_on_two_replicas_provision_once(startup_env: _Env) -> None:
+    env = startup_env
+    conv = await _failed_launch_with_followup(env)
     launched: list[str] = []
 
     async def schedule_launch(_request: Any, *, session_id: str, **_: Any) -> None:
         launched.append(session_id)
 
-    def replica() -> tuple[ManagedStartupInputs, Any]:
-        # Its own service and launch tracker over the shared store, as on another replica.
-        service = ManagedStartupInputs(env.conv_store, env.app.state.host_registry)
-        service.schedule_launch = schedule_launch
-        state = Mock(managed_launches=type(env.app.state.managed_launches)())
-        return service, Mock(app=Mock(state=state))
-
-    (first, first_request), (second, second_request) = replica(), replica()
-    claims = await asyncio.gather(
-        first.relaunch_failed_start(first_request, conv, None),
-        second.relaunch_failed_start(second_request, conv, None),
+    (first, first_request), (second, second_request) = (
+        _replica(env, schedule_launch),
+        _replica(env, schedule_launch),
     )
+    # The first retry pauses once it has requeued one input, so the second reads
+    # the session halfway through.
+    paused, resume = asyncio.Event(), asyncio.Event()
+    requeue = first._requeue
 
-    assert claims == [True, True], "both requests answer queued"
-    assert launched == [session_id], "only the request that requeued the input provisions"
-    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == [
-        "in_progress"
+    async def requeue_then_pause(session_id: str, item_id: str) -> bool:
+        moved = await requeue(session_id, item_id)
+        if not paused.is_set():
+            paused.set()
+            await resume.wait()
+        return moved
+
+    first._requeue = requeue_then_pause  # type: ignore[method-assign]
+    first_retry = asyncio.create_task(first.relaunch_failed_start(first_request, conv, None))
+    await paused.wait()
+    second_claim = await second.relaunch_failed_start(second_request, conv, None)
+    resume.set()
+
+    assert [await first_retry, second_claim] == [True, True], "both requests answer queued"
+    assert launched == [conv.id], "only the request that requeued the first input provisions"
+    assert [item.status for item in env.conv_store.list_pending_inputs(conv.id)] == [
+        "in_progress",
+        "in_progress",
     ]
+
+
+async def test_relaunch_that_cannot_be_scheduled_fails_its_inputs_again(
+    startup_env: _Env,
+) -> None:
+    env = startup_env
+    conv = await _failed_launch_with_followup(env)
+
+    async def provider_gone(_request: Any, **_: Any) -> None:
+        raise OmnigentError(
+            "sandbox provider 'modal' is not configured", code=ErrorCode.INVALID_INPUT
+        )
+
+    service, request = _replica(env, provider_gone)
+    with pytest.raises(OmnigentError, match="not configured"):
+        await service.relaunch_failed_start(request, conv, None)
+
+    snapshot = (await env.client.get(f"/v1/sessions/{conv.id}")).json()
+    assert len(snapshot["failed_inputs"]) == 2 and snapshot["pending_inputs"] == []
 
 
 async def _session_count(env: _Env) -> int:
