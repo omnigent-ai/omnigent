@@ -4946,6 +4946,17 @@ function SessionTooltipContent({
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
 
+// Whether the row lies entirely inside its nearest scrolling ancestor (or the viewport).
+function isRowFullyVisible(row: HTMLElement): boolean {
+  let scroller = row.parentElement;
+  while (scroller && !/auto|scroll/.test(getComputedStyle(scroller).overflowY)) {
+    scroller = scroller.parentElement;
+  }
+  const bounds = scroller?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight };
+  const rect = row.getBoundingClientRect();
+  return rect.top >= bounds.top && rect.bottom <= bounds.bottom;
+}
+
 function ConversationRowImpl({
   conversation,
   isActive,
@@ -5000,13 +5011,14 @@ function ConversationRowImpl({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
-  // When this row becomes the active conversation (e.g. a freshly created
-  // session navigated to via `/c/:id`), scroll it toward the center of the
-  // sidebar so it's comfortably in view rather than pinned to an edge.
+  // When this row becomes active (e.g. a new session navigated to via `/c/:id`),
+  // center it if it is offscreen. A row already fully visible stays put, so
+  // clicking it does not slide the list.
   const rowRef = useRef<HTMLLIElement>(null);
   useEffect(() => {
-    if (!isActive) return;
-    rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const row = rowRef.current;
+    if (!isActive || !row || isRowFullyVisible(row)) return;
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [isActive]);
   const queryClient = useQueryClient();
   const rename = useRenameConversation();
