@@ -2922,10 +2922,17 @@ describe("automation trigger type", () => {
   );
 
   it("restores schedule and source drafts without carrying conditions between integrations", async () => {
+    async function chooseTimezone(zone: string) {
+      await userEvent.click(screen.getByLabelText("Timezone", { exact: true }));
+      fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: zone } });
+      await userEvent.click(await screen.findByRole("option", { name: zone.replaceAll("_", " ") }));
+    }
+
     render(dialog());
     type("task-name-input", "Team work");
     type("task-prompt-input", "Prepare the weekly report.");
     await choose("Every week", "schedule-preset-trigger");
+    await chooseTimezone("America/New_York");
     await choose("Jira");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Team work");
     expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(
@@ -2945,13 +2952,25 @@ describe("automation trigger type", () => {
     expect(screen.getByTestId("task-trigger-scope")).toHaveValue("ES");
     expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Triage the ticket.");
     expect(screen.getByTestId("task-trigger-condition-0-value")).toHaveValue("bug");
+    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
+    fireEvent.click(screen.getByTestId("task-session-mode-trigger"));
+    await choose("Every day", "schedule-preset-trigger");
+    await chooseTimezone("Europe/London");
     await choose("Schedule");
     expect(screen.getByTestId("task-prompt-input")).toHaveValue("Prepare the weekly report.");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every week");
+    expect(screen.getByLabelText("Timezone", { exact: true })).toHaveTextContent(
+      "America/New York",
+    );
     expect(screen.getByTestId("task-session-mode-trigger")).toBeChecked();
+    await choose("Jira");
+    expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every day");
+    expect(screen.getByLabelText("Timezone", { exact: true })).toHaveTextContent("Europe/London");
+    await choose("Schedule");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].rrule).toContain("FREQ=WEEKLY");
+    expect(mutateAsync.mock.calls[0][0].timezone).toBe("America/New_York");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("templateId");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
   });
@@ -2977,6 +2996,9 @@ describe("automation trigger type", () => {
       templateId: "github",
       prompt: expect.stringContaining("repo:acme/app"),
     });
+    expect(mutateAsync.mock.calls[0][0].prompt).toContain(
+      "Investigate it and add a regression test.",
+    );
   });
 
   it("clears canceled drafts and selects the next entry point's default", async () => {

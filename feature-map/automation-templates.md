@@ -153,12 +153,12 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   covers the preview and Templates tab with reload, plus New automation's
   trigger selector on desktop and mobile. It creates
   a Jira automation and cross-checks the saved schedule and prompt through REST
-  with trigger controls always active. It also converts a template to new-session mode and verifies schedule controls, list
+  with trigger controls always active. The gallery variants also convert a template to new-session mode and verify schedule controls, list
   Run now/next-run, and detail Run now/next-run remain available.
   The mobile preview uses equals with one project; the desktop Templates path selects in with two
   comma-separated projects and verifies that both appear in the saved query.
-  It edits the user prompt through the row menu and the system prompt through
-  the detail page, checks persistence through REST, and reopens the editor. The
+  The gallery variants edit the user prompt through the row menu and the system prompt through
+  the detail page, check persistence through REST, and reopen the editor. The
   preview entry runs at mobile width; the Templates entry runs at desktop width.
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
   covers new-session host creation, nine-minute rejection, reopening, and switching

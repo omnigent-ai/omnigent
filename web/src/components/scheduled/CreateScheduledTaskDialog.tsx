@@ -103,6 +103,7 @@ interface AutomationTypeDraft {
   trigger: TriggerSource | null;
   triggerFields: TriggerFields;
   schedule: ScheduleModel;
+  timezone: string;
   sessionMode: ScheduledTaskSessionMode;
 }
 
@@ -693,6 +694,7 @@ export function CreateScheduledTaskDialog({
       trigger,
       triggerFields,
       schedule,
+      timezone,
       sessionMode,
     };
     const previousDefaultName =
@@ -716,6 +718,7 @@ export function CreateScheduledTaskDialog({
     setSchedule(
       draft?.schedule ?? (next === "schedule" ? DEFAULT_SCHEDULE_MODEL : defaultTriggerSchedule),
     );
+    setTimezone(draft?.timezone ?? timezone);
     setSessionMode(draft?.sessionMode ?? (next === "schedule" ? "new" : "continue"));
     setScheduleUnsupported(false);
     setSystemPromptOpen(false);

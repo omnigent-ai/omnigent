@@ -1086,6 +1086,8 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     # The prompt's details are covered by the dialog and renderer tests.
     assert f'({project_query} AND labels = "omnigent")' in created["prompt"], created
     expect(page.get_by_role("region", name="Suggested Automations")).to_be_visible()
+    if entry.startswith("new-automation"):
+        return
 
     row = _row_by_name(page, name)
     row.get_by_test_id("task-row-menu").click()
