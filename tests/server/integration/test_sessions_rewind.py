@@ -19,6 +19,7 @@ from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS, MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, managed_repo_labels
+from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
 )
@@ -124,6 +125,16 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
         return list_files(self, session_id, *args, **kwargs)
 
     monkeypatch.setattr(SqlAlchemyFileStore, "list", record_listing)
+    history_checks: list[str] = []
+    check_history = routes_core._require_attachment_compatible_history
+
+    def record_history_check(session_id: str, *args: Any, **kwargs: Any) -> Any:
+        history_checks.append(session_id)
+        return check_history(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(
+        routes_core, "_require_attachment_compatible_history", record_history_check
+    )
 
     resp = await client.post(
         f"/v1/sessions/{source_id}/rewind", json={"item_id": items[item_index]}
@@ -134,6 +145,9 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     assert resp.json()["prompt"] == prompt
     # A text-only prompt has no attachments to look up among the fork's files.
     assert (resp.json()["attachments"], new_id in listed_files) == ([], False)
+    # /rewind frees no live client first, so the fork's checks run only once,
+    # with no preflight pass before it.
+    assert history_checks == [source_id]
     assert message_texts(store, new_id) == kept
     fork = store.get_conversation(new_id)
     assert fork is not None
