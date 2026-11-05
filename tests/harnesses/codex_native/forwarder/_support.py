@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import httpx
 
+from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
@@ -133,3 +135,30 @@ def _write_session_config(tmp_path: Path, body: str) -> None:
     home = codex_home_for_bridge_dir(tmp_path)
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.toml").write_text(body)
+
+
+async def _deliver_to_parent(
+    client: _RecordingClient,
+    bridge_dir: Path,
+    state: fwd._CodexForwarderState,
+    event: dict[str, Any],
+) -> None:
+    """
+    Deliver one Codex notification to the parent session ``conv_x``.
+
+    :param client: Recording HTTP client standing in for the Omnigent server.
+    :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
+    :param state: Forwarder state for the connection under test.
+    :param event: Codex notification envelope for thread ``thread_123``.
+    :returns: None.
+    """
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=bridge_dir,
+        event=event,
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        forwarder_state=state,
+    )
