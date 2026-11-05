@@ -423,11 +423,8 @@ RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
  && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages \
  && chown -R --from=root:root sandbox:sandbox /opt/venv
 
-# Sandbox launchers exec commands through `bash -lc`, and Debian's
-# /etc/profile unconditionally resets PATH for login shells — the ENV
-# PATH above would silently drop off and `omnigent` / `pip` would
-# resolve to the system Python instead of the venv. profile.d snippets
-# are sourced after that reset, so this puts the venv back in front.
+# Sandbox launchers run `bash -lc`, whose /etc/profile resets PATH to the system
+# Python; profile.d snippets are sourced after that, so this restores the venv.
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
 
 # ── OpenShell host venv builder ─────────────────────────
