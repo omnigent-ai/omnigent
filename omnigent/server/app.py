@@ -280,7 +280,7 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_harness_settings: bool = True
     scheduled_task_sandbox_workspaces: bool = True
     # Owner-private families and reuse of the source session's sandbox.
-    sibling_sessions: bool = True
+    sibling_sessions: bool = False
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
@@ -3652,7 +3652,7 @@ def create_app(
                 "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
-                "sibling_sessions": True,
+                "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,

@@ -36,7 +36,7 @@ def test_private_manager_launch_send_read_and_sharing(
     base_env = {k: v for k, v in os.environ.items() if k in {"PATH", "LANG", "TMPDIR"}}
     with tempfile.TemporaryDirectory(prefix="orch-native-", dir="/tmp") as native_state:
         env = {
-            "OMNIGENT_FEATURES": None,
+            "OMNIGENT_FEATURES": "sibling_sessions",
             "OMNIGENT_CONFIG_HOME": str(config),
             "OMNIGENT_CODEX_NATIVE_STATE_DIR": native_state,
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
@@ -194,7 +194,9 @@ def test_private_manager_launch_send_read_and_sharing(
                     wait_text(manager, "BEFORE_SWITCH_SENT")
                     wait_text(worker, "BEFORE_SWITCH_RESULT")
                     manager_runner = client.get(f"/v1/sessions/{manager}").json()["runner_id"]
-                    stack.restart_server(env={"OMNIGENT_FEATURES": "-session_orchestration"})
+                    stack.restart_server(
+                        env={"OMNIGENT_FEATURES": "sibling_sessions,-session_orchestration"}
+                    )
                     poll_until(
                         lambda: (
                             client.get(f"/v1/runners/{manager_runner}/status").json().get("online")

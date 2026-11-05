@@ -44,6 +44,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "automations_v2": False,
         "splittable_terminal_view_ui": False,
         "session_orchestration": True,
+        "sibling_sessions": False,
         "codex_plan_at_launch": True,
     }
 
@@ -95,8 +96,9 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
     } - {feature}
 
 
-def test_default_off_features_can_also_be_explicitly_disabled() -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: "usage_page,-usage_page"})
+@pytest.mark.parametrize("feature", ["usage_page", "sibling_sessions"])
+def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: f"{feature},-{feature}"})
 
     assert flags.enabled_names() == (
         "claude_osc_status",
@@ -138,6 +140,14 @@ def test_arca_shutdown_warnings_are_frontend_visible() -> None:
 
     assert flags.enabled(Feature.ARCA_SHUTDOWN_WARNINGS)
     assert flags.frontend_dict()["arca_shutdown_warnings"] is True
+
+
+def test_sibling_sessions_can_be_enabled_without_other_opt_in_features() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "sibling_sessions"})
+    assert flags.enabled_features == resolve_feature_flags({}).enabled_features | {
+        Feature.SIBLING_SESSIONS
+    }
+    assert flags.frontend_dict()["sibling_sessions"] is True
 
 
 @pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS])

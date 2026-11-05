@@ -116,9 +116,14 @@ so normal asynchronous defaults cannot replace the source sandbox. Drafts and
 picker caches are scoped to the clicked source. Normal model, agent, repository,
 profile and workspace controls are reused.
 
-`/v1/info` advertises `sibling_sessions`. The UI hides the action on older
-servers. MCP independent creation requires the capability to be explicitly true
-and fails without a fallback request. Uncertain creates are never auto-retried.
+The default-off `sibling_sessions` release feature controls both the `/v1/info`
+capability and server creation authorization. Enable it with
+`OMNIGENT_FEATURES=sibling_sessions`; embedded deployments may supply a
+per-request `FeatureFlags.enabled()` override backed by their rollout service.
+The UI hides creation and same-sandbox fork selection when disabled or absent.
+MCP independent creation requires the capability to be explicitly true and fails
+without a fallback request. Uncertain creates are never auto-retried. Disabling
+the feature leaves existing families and shared-compute protections intact.
 
 ### Compute lifecycle
 

@@ -6335,7 +6335,7 @@
             "type": "string"
           },
           "sibling_sessions": {
-            "default": true,
+            "default": false,
             "title": "Sibling Sessions",
             "type": "boolean"
           },

@@ -11,6 +11,7 @@ from fastapi import Request
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionFamily
 from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores.conversation_store import (
@@ -35,6 +36,8 @@ def authorize_sibling_source(
     parent_id: str | None,
     host_id: str | None,
 ) -> Conversation:
+    if not request.app.state.feature_flags.enabled(Feature.SIBLING_SESSIONS):
+        raise OmnigentError("Nested agents are disabled", code=ErrorCode.FORBIDDEN)
     if parent_id is not None or permissions is None or user_id is None:
         raise OmnigentError(
             "Siblings require an owned source and no execution parent",

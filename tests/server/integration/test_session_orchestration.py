@@ -1,6 +1,7 @@
 """Runner dispatch through authenticated routes and real ownership/sharing stores."""
 
 import json
+from contextvars import ContextVar
 from uuid import uuid4
 
 import pytest
@@ -8,7 +9,7 @@ import pytest
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.server.feature_flags import FeatureFlags
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -34,10 +35,7 @@ pytestmark = pytest.mark.asyncio
 @pytest.fixture(autouse=True)
 def orchestration_environment(monkeypatch, request):
     features = getattr(request, "param", None)
-    if features is None:
-        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
-    else:
-        monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    monkeypatch.setenv("OMNIGENT_FEATURES", f"sibling_sessions,{features or ''}")
     return features
 
 
@@ -1262,6 +1260,110 @@ async def test_same_host_creation_across_replicas(
         assert worker.parent_conversation_id is None
         assert worker.host_id == host_id and worker.workspace == "/worker"
         assert len(launches) == 1 and launches[0].session_id == worker.id
+
+
+@pytest.mark.parametrize("entry", ["json", "multipart", "same_host", "managed"])
+async def test_nested_agent_gate_tracks_request_context_before_creation(
+    auth_client, auth_app, peers, db_uri, monkeypatch, entry
+):
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.server.routes.sessions import routes_core
+    from tests.server.integration.test_sessions_permissions import (
+        _register_online_host,
+        build_agent_bundle,
+    )
+
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    store.set_host_id(source["id"], host_id, workspace="/tmp")
+    launched = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        else:
+            assert isinstance(frame, HostLaunchRunnerFrame)
+            launched.append(frame)
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+
+    async def launch(**kwargs):
+        launched.append(kwargs)
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    # Embedded deployments read their rollout service from the request context.
+    enabled = ContextVar("nested_agents_enabled", default=False)
+
+    class RequestFeatureFlags(FeatureFlags):
+        def enabled(self, feature):
+            return (
+                enabled.get() if feature == Feature.SIBLING_SESSIONS else super().enabled(feature)
+            )
+
+    auth_app.state.feature_flags = resolve_feature_flags({})
+    info = (await auth_client.get("/v1/info")).json()
+    assert info["sibling_sessions"] is info["features"]["sibling_sessions"] is False
+    auth_app.state.feature_flags = RequestFeatureFlags(resolve_feature_flags({}).enabled_features)
+    sibling_id = None
+    for active in (False, True, False):
+        token = enabled.set(active)
+        try:
+            info = (await auth_client.get("/v1/info")).json()
+            assert info["sibling_sessions"] is info["features"]["sibling_sessions"] is active
+            before = {row.id for row in store.list_conversations().data}
+            launches_before = len(launched)
+            metadata = {"sibling_source_id": source["id"]}
+            if entry == "multipart":
+                response = await auth_client.post(
+                    "/v1/sessions",
+                    data={"metadata": json.dumps(metadata)},
+                    files={
+                        "bundle": (
+                            "agent.tar.gz",
+                            build_agent_bundle(name="nested-agent"),
+                            "application/gzip",
+                        )
+                    },
+                )
+            elif entry == "json":
+                response = await auth_client.post(
+                    "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
+                )
+            else:
+                # Call the endpoint directly to prove stale MCP clients cannot bypass the gate.
+                response = await auth_client.post(
+                    "/v1/sessions/orchestrated",
+                    headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+                    json={
+                        "agent_id": source["agent_id"],
+                        "host_type": "managed" if entry == "managed" else "external",
+                    },
+                )
+            if active:
+                assert response.status_code == 201, response.text
+                sibling_id = response.json().get("id") or response.json()["session_id"]
+                assert store.get_conversation(sibling_id).family_id == source["id"]
+            else:
+                assert response.status_code == 403, response.text
+                assert "Nested agents are disabled" in response.text
+                assert {row.id for row in store.list_conversations().data} == before
+                assert len(launched) == launches_before
+        finally:
+            enabled.reset(token)
+    assert sibling_id is not None
+    assert (await auth_client.get(f"/v1/sessions/{sibling_id}")).status_code == 200
+    assert (await _send(auth_client, source, {"id": sibling_id})).get("queued") is True
+    for parent in ({}, {"parent_session_id": source["id"]}):
+        ordinary = await auth_client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], **parent}
+        )
+        assert ordinary.status_code == 201, ordinary.text
 
 
 @pytest.mark.parametrize("bundled", [False, True])

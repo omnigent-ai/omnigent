@@ -2175,7 +2175,7 @@ export function NewChatLandingScreen() {
   if (siblingSourceId && info !== "loading" && !supportsNested)
     return (
       <div role="alert" className="p-6">
-        This server needs an update before you can add a nested agent.
+        Nested agents are not available on this server.
       </div>
     );
   if (siblingSourceId && source.isPending)
@@ -6428,9 +6428,9 @@ function NewChatLandingContent({
     ? "What should this agent work on?"
     : isMobileViewport
       ? "Describe a task..."
-    : selectedProject
-      ? `Start a new session in ${selectedProject}`
-      : "Describe a task to start a new session…";
+      : selectedProject
+        ? `Start a new session in ${selectedProject}`
+        : "Describe a task to start a new session…";
 
   const isCloudHostEntry = (host: Host) =>
     !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");

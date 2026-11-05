@@ -21,6 +21,11 @@ from tests.e2e_ui.start_session.test_managed_first_message_routing import (
 )
 
 
+@pytest.fixture(autouse=True)
+def enable_siblings(monkeypatch):
+    monkeypatch.setenv("OMNIGENT_FEATURES", "sibling_sessions")
+
+
 @pytest.mark.timeout(300)
 def test_sibling_composer_placement_and_survivor(
     managed_replicas: ManagedReplicas,  # noqa: F811

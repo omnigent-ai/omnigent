@@ -1443,9 +1443,9 @@ function renderLanding(
   };
 }
 
-it("explains unsupported nested-agent links before showing a composer", () => {
-  renderLanding({ sibling_sessions: false }, "/?sibling=source");
-  expect(screen.getByRole("alert")).toHaveTextContent("This server needs an update");
+it.each([false, undefined])("explains unavailable nested-agent links (%s)", (capability) => {
+  renderLanding({ sibling_sessions: capability }, "/?sibling=source");
+  expect(screen.getByRole("alert")).toHaveTextContent("Nested agents are not available");
   expect(screen.queryByTestId("new-chat-landing-submit")).toBeNull();
 });
 

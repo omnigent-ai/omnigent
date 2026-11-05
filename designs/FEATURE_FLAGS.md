@@ -30,6 +30,7 @@ lifecycle metadata.
 | --- | --- | --- | --- | --- |
 | `codex_plan_at_launch` | On | Server | 0.22.0 | Allows the new-session composer to start Codex in Plan mode. Missing or disabled support disables this launch option; connected hosts must also advertise support. |
 | `session_orchestration` | On | Server | 0.22.0 | Private-owner peer messages and independent workers. Append `-session_orchestration` and restart every server replica to refuse new orchestration; already accepted work may finish. Existing reads and child operations remain available. Server-only; not exposed in `/v1/info`. |
+| `sibling_sessions` | Off | Server | 0.24.0 | Enables Add nested agent, same-sandbox fork selection, and new sibling creation through JSON, uploaded agents and MCP. Existing sessions, family metadata and shared-sandbox cleanup protections remain available while off. |
 | `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI rollout for automation improvements: scheduling, run management, execution targets and UI. Currently selects the DB scheduler instead of per-task timers and is exposed to the frontend. Requires a transactional store; a multi-replica deployment also supplies host ownership, and coordinated restart and startup draining are required when switching schedulers. See the [scheduler integration contract](../omnigent/server/scheduled/README.md). |
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
@@ -51,6 +52,22 @@ configuration. See the [native-harness feature map](../feature-map/native-harnes
 for Claude working-status acceptance and kill-switch verification.
 
 ## Rollout and rollback
+
+For nested agents, enable `OMNIGENT_FEATURES=sibling_sessions` on the test
+deployment first. Both `features.sibling_sessions` and the `sibling_sessions`
+capability in `/v1/info` report the same value. Embedded deployments can pass a
+`FeatureFlags` subclass to `create_app(feature_flags=...)` and override
+`enabled(Feature.SIBLING_SESSIONS)` with a per-request rollout-service read.
+That reader must default to false when configuration or request context is
+unavailable. The capability and creation authorization both evaluate it per
+request, including worker-thread context propagation. UI capabilities refresh
+after a page reload; stale clients are still refused by the server.
+
+Disabling nested agents stops new sibling admission, without cancelling accepted
+work or removing existing families. Keep shared-sandbox retention enabled: those
+protections apply to any sessions sharing compute, regardless of the flag.
+MCP child creation and ordinary user-created roots remain available; MCP
+`same_host` and `managed` placements fail without falling back to a root.
 
 1. Deploy an immutable image with `-feature_name` in `OMNIGENT_FEATURES` to
    explicitly disable the feature, including one that defaults on.
