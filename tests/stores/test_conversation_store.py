@@ -8112,8 +8112,9 @@ def test_runner_change_resets_a_flag_stored_after_the_row_was_read(
     assert reported is not None and reported.background_work_running is True
 
 
+@pytest.mark.parametrize("deleted_host", [False, True])
 def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
-    conversation_store: SqlAlchemyConversationStore, db_uri: str
+    conversation_store: SqlAlchemyConversationStore, db_uri: str, deleted_host: bool
 ) -> None:
     """
     Moving a session to another host's runner, and moving it back, reset the flag.
@@ -8123,7 +8124,16 @@ def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
     """
     store = conversation_store
     host_id = "c" * 32
-    _register_host(db_uri, host_id)
+    hosts = HostStore(db_uri)
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="reassignment-host",
+        user_id=RESERVED_USER_LOCAL,
+        token="launch-token",
+        provider="modal",
+        sandbox_id="sandbox",
+        token_expires_at=2**31,
+    )
     store.create_conversation(
         runner_id="runner_b", host_id=host_id, workspace="/repo", git_branch="main"
     )
@@ -8142,9 +8152,16 @@ def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
     store.set_background_work_running(target.id, True, runner_id="runner_b", reported_at=10)
     assert flag() is True
 
+    if deleted_host:
+        hosts.delete_host(host_id)
+    before_rollback = store.get_conversation(target.id)
     assert store.rollback_runner_reassignment(
         previous, expected_runner_id="runner_b", expected_host_id=host_id
-    )
+    ) is (not deleted_host)
+    if deleted_host:
+        assert store.get_conversation(target.id) == before_rollback
+        assert before_rollback is not None and before_rollback.host_id is None
+        return
     assert flag() is None
     store.set_background_work_running(target.id, False, runner_id="runner_a", reported_at=1)
     assert flag() is False
@@ -9613,9 +9630,9 @@ def test_profiled_host_binding_commits_atomically(conversation_store, db_uri, fa
 
 
 @pytest.mark.parametrize("accepted", [False, True])
-@pytest.mark.parametrize("newer_binding", [False, True])
+@pytest.mark.parametrize("binding_state", ["unchanged", "newer_runner", "deleted_host"])
 def test_profiled_host_rollback_preserves_prior_and_newer_bindings(
-    conversation_store, db_uri, accepted, newer_binding
+    conversation_store, db_uri, accepted, binding_state
 ):
     from omnigent.stores.sandbox_profile_store import SandboxProfileStore
 
@@ -9623,6 +9640,18 @@ def test_profiled_host_rollback_preserves_prior_and_newer_bindings(
     conversation = conversation_store.create_conversation()
     snapshot = _ACCEPTED_PROFILE
     host_id = uuid.uuid4().hex
+    if binding_state == "deleted_host":
+        hosts = HostStore(db_uri)
+        hosts.register_managed_host(
+            host_id=host_id,
+            name="profiled-host",
+            user_id=RESERVED_USER_LOCAL,
+            token="launch-token",
+            provider="modal",
+            sandbox_id="sandbox",
+            token_expires_at=2**31,
+        )
+        conversation_store.set_host_id(conversation.id, host_id, "/previous")
     if accepted:
         profiles.bind_session(conversation.id, snapshot)
     conversation = conversation_store.get_conversation(conversation.id)
@@ -9634,13 +9663,19 @@ def test_profiled_host_rollback_preserves_prior_and_newer_bindings(
         runner_id="attempt",
         git_branch="launch",
     )
-    if newer_binding:
+    if binding_state == "newer_runner":
         conversation_store.replace_runner_id(conversation.id, "replacement")
+    elif binding_state == "deleted_host":
+        hosts.delete_host(host_id)
+    before_rollback = conversation_store.get_conversation(conversation.id)
     assert conversation_store.rollback_profiled_host(
         previous, expected_host_id=host_id, expected_runner_id="attempt"
-    ) is (not newer_binding)
+    ) is (binding_state == "unchanged")
     current = conversation_store.get_conversation(conversation.id)
-    if newer_binding:
+    if binding_state == "deleted_host":
+        assert current == before_rollback and current.host_id is None
+        assert profiles.get_session_snapshot(conversation.id) == snapshot
+    elif binding_state == "newer_runner":
         assert current.runner_id == "replacement" and current.host_id == host_id
         assert current.workspace == "/workspace" and current.git_branch == "launch"
         assert profiles.get_session_host_id(conversation.id) == host_id

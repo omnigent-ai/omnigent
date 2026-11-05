@@ -5195,7 +5195,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         expected_host_id = uuid_to_bytes(expected_host_id).hex()
 
         def write(session: Session) -> bool:
-            lock_host_for_binding(session, previous.host_id)
+            previous_host = (
+                session.get(
+                    SqlHost, (current_workspace_id(), previous.host_id), with_for_update=True
+                )
+                if previous.host_id is not None
+                else None
+            )
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), previous.session_id),
@@ -5210,6 +5216,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     previous.git_branch,
                     previous.runner_id,
                 )
+            if previous_host is not None and previous_host.deleted_at is not None:
+                return False
             meta.host_id, meta.workspace, meta.git_branch = (
                 previous.host_id,
                 previous.workspace,
@@ -5241,10 +5249,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         """Undo a failed rotation without erasing a newer binding or the last host link."""
 
         def write(session: Session) -> bool:
-            for host_id in sorted(
-                {value for value in (previous.host_id, expected_host_id) if value}
-            ):
-                lock_host_for_binding(session, host_id)
+            hosts = {
+                host_id: session.get(
+                    SqlHost, (current_workspace_id(), host_id), with_for_update=True
+                )
+                for host_id in sorted(
+                    {value for value in (previous.host_id, expected_host_id) if value}
+                )
+            }
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), previous.id),
@@ -5261,6 +5273,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ):
                     return False
             if previous.runner_id is not None:
+                previous_host = hosts.get(previous.host_id) if previous.host_id else None
+                if previous_host is not None and previous_host.deleted_at is not None:
+                    return False
                 meta.host_id = previous.host_id
                 meta.workspace = previous.workspace
                 meta.git_branch = previous.git_branch

@@ -3335,9 +3335,16 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
 
 
-@pytest.mark.parametrize("connected_then_failed", [False, True])
+@pytest.mark.parametrize(
+    "connected_then_failed,cleanup_error",
+    [(False, None), (True, None)]
+    + [
+        (True, method)
+        for method in ("get_host", "detach_stale_managed_sandbox", "mark_sandbox_terminated")
+    ],
+)
 async def test_relaunch_failure_keeps_host_row_and_revokes_token(
-    db_uri: str, monkeypatch, connected_then_failed: bool
+    db_uri: str, monkeypatch, connected_then_failed: bool, cleanup_error: str | None
 ) -> None:
     """
     A FAILED relaunch must not delete the durable host row — deleting
@@ -3363,6 +3370,14 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(
         )
         if fail_launch:
             host_store.set_offline(invocation.host_id)
+            if cleanup_error:
+                original = getattr(host_store, cleanup_error)
+
+                def fail_cleanup_once(*args, **kwargs):
+                    monkeypatch.setattr(host_store, cleanup_error, original)
+                    raise RuntimeError("cleanup database unavailable")
+
+                monkeypatch.setattr(host_store, cleanup_error, fail_cleanup_once)
             raise RuntimeError("Host disconnected during startup")
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -3377,13 +3392,20 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(
         await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
 
     assert exc.value.status_code == 502
+    if connected_then_failed:
+        assert "Host disconnected during startup" in exc.value.detail
+    host = host_store.get_host(first.host_id)
+    assert host is not None
+    if cleanup_error in ("get_host", "detach_stale_managed_sandbox"):
+        # Unknown ownership must retain the sandbox for a later recovery attempt.
+        assert fake.terminated == ["sb-fake-1"]
+        assert host.sandbox_id == "sb-fake-2"
+        return
     # Both the dead generation 1 and the failed generation 2 sandboxes
     # were terminated — nothing leaks until the provider lifetime cap.
     assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
     # The row SURVIVES the failure (contrast the first-launch failure
     # tests, which delete it), so the session binding stays relaunchable.
-    host = host_store.get_host(first.host_id)
-    assert host is not None
     for invocation in fake.host_starts:
         assert host_store.resolve_launch_token(invocation.host_id, invocation.token) is None
 
