@@ -133,7 +133,7 @@ it(
             });
             if (!opened.ok) return { ok: false, error: opened.error };
             const entry = registry.get(args.id);
-            entry.agentNavLocked = true;
+            entry.navigationPolicyEnforced = true;
             entry.agentContext = context;
             registry.setActive(args.id);
             if (args.id === "hsts-fixture") {
@@ -391,7 +391,7 @@ it(
         const registry = global.omnigentTestBrowserRegistries[0];
         registry.openOrNavigate("response-fixture", null);
         const entry = registry.get("response-fixture");
-        entry.agentNavLocked = true;
+        entry.navigationPolicyEnforced = true;
         entry.agentContext = {};
         try {
           await Promise.race([

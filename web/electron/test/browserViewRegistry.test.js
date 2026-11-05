@@ -367,9 +367,8 @@ describe("browserViewRegistry — agent-navigation allowlist", () => {
     assert.deepEqual(loaded, ["https://example.com/"]);
   });
 
-  it("does NOT gate the user-typed URL-bar path (agent flag absent) — file:// still loads", () => {
-    // The URL bar is user-initiated; the strict allowlist is scoped to the
-    // agent path only. A user who types a local address keeps that ability.
+  it("does NOT gate a direct registry call without opts.agent — file:// still loads", () => {
+    // Direct registry calls can omit opts.agent; renderer IPC always sets it.
     const { registry, loaded } = makeLoadTrackingRegistry();
     const r = registry.openOrNavigate("conv_1", "file:///tmp/report.html", undefined, {
       force: true,
@@ -513,9 +512,9 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     first.registry.openOrNavigate("same-id", "http://localhost", undefined, { force: true });
     assert.equal(first.fire("will-redirect", "http://10.0.0.1").prevented, false);
   });
-  it("blocks an agent-locked will-redirect to the cloud-metadata IP", () => {
+  it("blocks a policy-enforced will-redirect to the cloud-metadata IP", () => {
     const { registry, sent, fire } = makeEventCapturingRegistry();
-    // Agent navigates to an allowed host (locks the view to agent policy).
+    // A registry call with opts.agent enables policy enforcement.
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     // The server 302s to the metadata endpoint — the guard must cancel it.
     const ev = fire("will-redirect", "http://169.254.169.254/latest/meta-data/");
@@ -525,21 +524,21 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     assert.match(blocked[0].payload.error, /navigation blocked/);
   });
 
-  it("blocks an agent-locked will-navigate to a loopback host", () => {
+  it("blocks a policy-enforced will-navigate to a loopback host", () => {
     const { registry, fire } = makeEventCapturingRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     const ev = fire("will-navigate", "http://127.0.0.1:8080/");
     assert.equal(ev.prevented, true);
   });
 
-  it("blocks an agent-locked will-navigate to an RFC-1918 private host", () => {
+  it("blocks a policy-enforced will-navigate to an RFC-1918 private host", () => {
     const { registry, fire } = makeEventCapturingRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     const ev = fire("will-navigate", "http://10.1.2.3/admin");
     assert.equal(ev.prevented, true);
   });
 
-  it("allows an agent-locked redirect between normal public https hosts", () => {
+  it("allows a policy-enforced redirect between normal public https hosts", () => {
     const { registry, sent, fire } = makeEventCapturingRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     const ev = fire("will-redirect", "https://cdn.example.net/asset");
@@ -547,26 +546,27 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     assert.equal(sent.filter((s) => s.channel === "browser-nav-blocked").length, 0);
   });
 
-  it("does NOT block redirects on a user-typed (non-agent) navigation", () => {
+  it("does NOT block redirects for a direct registry navigation without opts.agent", () => {
     const { registry, fire } = makeEventCapturingRegistry();
-    // User types a URL (no agent flag) → the view is NOT agent-locked, so its
-    // redirects — even to an internal host (auth-redirect chains) — are allowed.
     registry.openOrNavigate("conv_1", "https://intranet.example.com/", undefined, {
       force: true,
     });
     const ev = fire("will-redirect", "http://10.0.0.5/sso/callback");
-    assert.equal(ev.prevented, false, "user-driven nav stays permissive");
+    assert.equal(
+      ev.prevented,
+      false,
+      "direct registry navigation without opts.agent leaves enforcement off",
+    );
   });
 
-  it("re-locks correctly: a user nav after an agent nav flips enforcement off", () => {
+  it("a direct registry navigation without opts.agent clears prior enforcement", () => {
     const { registry, fire } = makeEventCapturingRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
-    // Then the user types a new address on the same view.
     registry.openOrNavigate("conv_1", "https://intranet.example.com/", undefined, {
       force: true,
     });
     const ev = fire("will-redirect", "http://192.168.1.10/");
-    assert.equal(ev.prevented, false, "the later user nav unlocked the view");
+    assert.equal(ev.prevented, false, "the later direct registry navigation cleared enforcement");
   });
 });
 
@@ -761,7 +761,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(registry.has("conv_1"), false, "the check creates no view");
   });
 
-  it("cancels an agent-locked redirect or frame request to a loopback alias", async () => {
+  it("cancels a policy-enforced redirect or frame request to a loopback alias", async () => {
     const { registry, sent, idOf } = makeNetworkGuardRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     const webContentsId = idOf("conv_1");
@@ -1104,7 +1104,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
   });
 
-  it("forces agent-locked network requests past the HTTP cache", () => {
+  it("forces policy-enforced network requests past the HTTP cache", () => {
     const { registry, idOf } = makeNetworkGuardRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     registry.openOrNavigate("browser-tab:conv_1:t1", "https://example.com/");
@@ -1129,7 +1129,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
         requestHeaders,
       }),
       {},
-      "the user's own tab keeps normal caching",
+      "the direct registry tab without opts.agent keeps normal caching",
     );
   });
 
@@ -1203,7 +1203,7 @@ describe("browserViewRegistry — child window.open is denied (S3)", () => {
     assert.deepEqual(loaded, ["https://example.com/linked-page"]);
   });
 
-  it("blocks an agent-locked window.open to an internal host (no in-place nav)", () => {
+  it("blocks a policy-enforced window.open to an internal host (no in-place nav)", () => {
     const { registry, windowOpen, loaded, sent } = makeEventCapturingRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     loaded.length = 0;

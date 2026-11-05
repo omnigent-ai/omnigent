@@ -508,9 +508,12 @@ request. Both an updated desktop and web bundle are required; older web bundles
 remain public-only without destroying existing public views.
 
 Eligibility is granted at navigation and re-checked at every navigation and agent
-read/action. A failed check revokes access before clearing the previous document;
-access stays revoked if clearing fails. Request and redirect checks use the
-in-memory grant and window trust gates, keeping disk reads off the request path.
+read/action. Local identity/enrollment results are cached per host/server pair for
+at most one second measured with a monotonic clock, so these checks can use
+enrollment information up to one second old. A failed check revokes access before
+clearing the previous document; access stays revoked if clearing fails. Request
+and redirect checks use the in-memory grant and window trust gates, keeping disk
+reads off the request path.
 
 Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.
@@ -602,7 +605,7 @@ other browser permissions remain denied.
 This controls Chromium's local-network permission answers, **not a network
 firewall**: Electron versions may not gate every local-network fetch on this
 permission. Approval does not bypass CORS, TLS certificate validation, or the
-agent navigation policy. A helper that rejects this origin through its own CORS
+browser navigation policy. A helper that rejects this origin through its own CORS
 policy must be configured to allow it; the pane does not rewrite those headers.
 
 ### Browser implementation
@@ -610,7 +613,8 @@ policy must be configured to allow it; the pane does not rewrite those headers.
 The browser runs on the user's machine (a native `WebContentsView`); the agent —
 which may run on a different host — drives it purely by messages: an action
 request fans out over the session stream, the renderer claims and executes it
-against its local Chromium, and the result is posted back.
+against its local Chromium, and the result is posted back. Every renderer navigation,
+including the address bar, chat links, and agent actions, enforces this policy.
 
 **Pieces:**
 
@@ -622,14 +626,14 @@ against its local Chromium, and the result is posted back.
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
   Page-initiated `window.open` / `target=_blank` never spawns a window: an
   http(s) target navigates the same view in place (still allowlist-checked on
-  an agent-locked view), and right-click offers "Open Link in Browser" /
+  a policy-enforced view), and right-click offers "Open Link in Browser" /
   "Copy Link Address".
-- `src/browserUrlPolicy.js` — the agent navigation policy: http(s) only, and
+- `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
   any literal form, except exact loopback hosts for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
-  policy to every HTTP(S) and WebSocket request of an agent-locked view through
+  policy to every HTTP(S) and WebSocket request of a policy-enforced view through
   `webRequest`, including frames, `<object>`/`<embed>`, scripts, styles, images,
   media, and fetch/XHR. Worker network requests use the owning view's policy;
   requests without a registered view use the most restrictive owner in the
@@ -875,6 +879,20 @@ server (see below), Connect, and you're in.
 > Note: this loads the UI from whatever server URL you give it — it does
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
+
+### Close Tab shortcut
+
+Cmd/Ctrl+W closes the selected visible workspace tab in an ordinary conversation.
+File tabs confirm unsaved edits before closing; terminal and side-chat tabs use
+their existing close behavior. With no closable visible tab, it returns to the
+new-session page. Outside a conversation, including grid workspaces, it closes
+the window. Grid panels do not participate in this shortcut yet.
+Cmd/Ctrl+Shift+W always requests window closure.
+
+The web app and shell must both support the Close Tab bridge; older combinations
+keep the window-close behavior. Verify on each supported desktop OS with focus
+inside an embedded browser: Cmd/Ctrl+W must close only its tab, and
+Cmd/Ctrl+Shift+W must close the window.
 
 ### Test desktop updates
 

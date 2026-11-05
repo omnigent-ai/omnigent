@@ -181,14 +181,8 @@ function createBrowserViewRegistry({
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
-      // Whether the CURRENT navigation was agent-initiated. Set on every
-      // openOrNavigate from opts.agent; read by the will-navigate/will-redirect
-      // guard so the allowlist is enforced on the agent's whole nav chain
-      // (initial load + every redirect / meta-refresh / location.href) but NOT
-      // on user-typed URL-bar browsing, which stays permissive. SECURITY: without
-      // this, the allowlist only guards the first hop and a redirect to an
-      // internal host slips through (SSRF via screenshot).
-      agentNavLocked: false,
+      // Enables navigation guards; renderer IPC always sets it.
+      navigationPolicyEnforced: false,
       agentContext: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
@@ -229,14 +223,9 @@ function createBrowserViewRegistry({
     return { ok: true, entry, created: true };
   }
 
-  // SECURITY: a visited page must not spawn windows from the desktop shell, so
-  // window.open / target=_blank still never creates a window here and is never
-  // routed to shell.openExternal (an agent-visited page popping the user's real
-  // browser to an arbitrary URL is itself an abuse vector). Instead an http(s)
-  // target navigates the SAME view in place — nothing the page couldn't already
-  // do with location.href — so a clicked link goes somewhere instead of dying
-  // silently. The agent nav guard cannot see this hop (will-navigate skips
-  // programmatic loadURL), so an agent-locked view is allowlist-checked here.
+  // Popups stay in this view: an agent-visited page opening the user's system
+  // browser is an abuse vector. Programmatic loadURL skips will-navigate,
+  // so enforce navigation policy here too when enabled.
   function installWindowOpenPolicy(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.setWindowOpenHandler !== "function") return;
@@ -250,7 +239,7 @@ function createBrowserViewRegistry({
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         return { action: "deny" };
       }
-      if (entry.agentNavLocked) {
+      if (entry.navigationPolicyEnforced) {
         const verdict = isAgentNavigationAllowed(url, {
           allowLocalhost: allowsLocalhost(entry.agentContext),
         });
@@ -303,21 +292,12 @@ function createBrowserViewRegistry({
     });
   }
 
-  // SECURITY (SSRF): enforce the agent-navigation allowlist on the child view's
-  // OWN navigation events, not just the first loadURL. A server 302 / meta-
-  // refresh / location.href during an agent-initiated navigation would otherwise
-  // redirect the view to an internal host (metadata / loopback / RFC-1918) with
-  // no re-check, and browser_screenshot could read it back. `will-navigate` and
-  // `will-redirect` (plus subframes via `will-frame-navigate`) are the blocking
-  // hooks — did-navigate is report-only and fires too late. Enforced ONLY while
-  // `entry.agentNavLocked` (set per-navigation from opts.agent), so user-typed
-  // URL-bar browsing — including legitimate auth-redirect chains to internal
-  // hosts — stays permissive.
+  // Hook will-navigate/will-redirect: they can block; did-navigate fires too late.
   function attachAgentNavGuard(conversationId, entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
-      if (!entry.agentNavLocked) return; // user-driven nav: permissive
+      if (!entry.navigationPolicyEnforced) return;
       const verdict = isAgentNavigationAllowed(targetUrl, {
         allowLocalhost: allowsLocalhost(entry.agentContext),
       });
@@ -448,7 +428,7 @@ function createBrowserViewRegistry({
   function requestPolicyFor(webContentsId, partition) {
     const entry = entryForWebContents(webContentsId);
     if (entry) {
-      return entry.agentNavLocked
+      return entry.navigationPolicyEnforced
         ? {
             allowLocalhost: allowsLocalhost(entry.agentContext),
             conversationId: entry.conversationId,
@@ -465,7 +445,9 @@ function createBrowserViewRegistry({
     return {
       allowLocalhost:
         owners.length > 0 &&
-        owners.every((owner) => owner.agentNavLocked && allowsLocalhost(owner.agentContext)),
+        owners.every(
+          (owner) => owner.navigationPolicyEnforced && allowsLocalhost(owner.agentContext),
+        ),
       partition,
     };
   }
@@ -547,11 +529,7 @@ function createBrowserViewRegistry({
     if (needsAgentViewRevocation(get(conversationId), opts?.agentContext)) {
       return { ok: false, error: "Previous browser page must be cleared before navigating" };
     }
-    // Agent-driven nav (opts.agent) is gated by an allowlist (see
-    // browserUrlPolicy) so the model can't point the view at file:// /
-    // metadata / loopback / private hosts and exfiltrate via screenshot. URL-bar
-    // (user-typed) nav stays permissive. Checked before getOrCreate so a
-    // rejected nav creates no blank view.
+    // Validate before creating a view.
     if (opts && opts.agent && url) {
       const verdict = isAgentNavigationAllowed(url, {
         allowLocalhost: allowsLocalhost(opts.agentContext),
@@ -563,12 +541,10 @@ function createBrowserViewRegistry({
     const result = getOrCreate(conversationId);
     if (!result.ok) return result;
     const { entry, created } = result;
-    // Latch who drives THIS navigation so the will-navigate/will-redirect guard
-    // enforces the allowlist on an agent nav's whole redirect chain, and leaves
-    // user-typed URL-bar nav permissive. Set only when a url is actually issued.
+    // Latch policy for this URL's redirect chain; URL-less remounts keep the prior state.
     if (url) {
-      entry.agentNavLocked = !!(opts && opts.agent);
-      entry.agentContext = entry.agentNavLocked ? (opts.agentContext ?? null) : null;
+      entry.navigationPolicyEnforced = !!(opts && opts.agent);
+      entry.agentContext = entry.navigationPolicyEnforced ? (opts.agentContext ?? null) : null;
     }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise

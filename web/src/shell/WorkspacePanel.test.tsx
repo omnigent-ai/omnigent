@@ -1,10 +1,11 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { ReactNode, RefObject } from "react";
+import { useLayoutEffect, type ReactNode, type RefObject } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
+import * as identity from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -15,6 +16,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { browserViewId } from "@/lib/browserTabs";
+import { LEVEL_EDIT } from "@/lib/permissionsApi";
 import { subagentTabId } from "@/lib/subagentTabs";
 import type { Session } from "@/lib/types";
 import type { ChangedSort } from "./FlatFileList";
@@ -37,15 +39,28 @@ vi.mock("./FileViewer", () => ({
     path,
     open,
     mediaActive,
+    closeTabRef,
+    onCloseTab,
   }: {
     path: string;
     open: boolean;
     mediaActive: boolean;
-  }) => (
-    <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
-      {path}
-    </div>
-  ),
+    closeTabRef?: RefObject<(() => void) | null>;
+    onCloseTab?: () => void;
+  }) => {
+    useLayoutEffect(() => {
+      if (!closeTabRef) return;
+      closeTabRef.current = onCloseTab ?? null;
+      return () => {
+        closeTabRef.current = null;
+      };
+    }, [closeTabRef, onCloseTab]);
+    return (
+      <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
+        {path}
+      </div>
+    );
+  },
 }));
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
@@ -106,7 +121,7 @@ vi.mock("@/components/chat/SideChatPane", () => ({
   }) => (
     <div
       data-testid="side-chat-pane-stub"
-      data-read-only={String(readOnly ?? false)}
+      data-read-only={readOnly === undefined ? undefined : String(readOnly)}
       data-full-session={String(fullSession ?? false)}
     >
       {childId}
@@ -162,6 +177,7 @@ function renderWorkspace(
   initialOverrides: {
     conversationId?: string;
     contained?: boolean;
+    width?: number;
     rightRailTab?: RightRailTab | null;
     openPanels?: DefaultWorkspaceTab[];
     selectedFilePath?: string | null;
@@ -183,6 +199,8 @@ function renderWorkspace(
     mobileSideChatsOpen?: boolean;
     queryClient?: QueryClient;
     initialPath?: string;
+    closeSelectedTabRef?: { current: (() => boolean) | null };
+    permissionLevel?: number | null;
   } = {},
 ) {
   let overrides = initialOverrides;
@@ -203,7 +221,7 @@ function renderWorkspace(
       <WorkspacePanel
         conversationId={overrides.conversationId ?? "conv_ws"}
         contained={overrides.contained}
-        width={360}
+        width={overrides.width ?? 360}
         open={overrides.open}
         animateVisibility={overrides.animateVisibility}
         resizing={overrides.resizing}
@@ -219,6 +237,7 @@ function renderWorkspace(
         onRightRailTabChange={onRightRailTabChange}
         openPanels={overrides.openPanels ?? []}
         onClosePanel={onClosePanel}
+        closeSelectedTabRef={overrides.closeSelectedTabRef}
         showFilesPanel={overrides.showFilesPanel ?? true}
         showContentSearch={overrides.showContentSearch}
         showGithubTab={overrides.showGithubTab ?? false}
@@ -240,7 +259,7 @@ function renderWorkspace(
         onCloseTerminal={onCloseTerminal}
         maximized={overrides.maximized ?? false}
         onToggleMaximized={onToggleMaximized}
-        permissionLevel={null}
+        permissionLevel={overrides.permissionLevel ?? null}
         filesPanelSort={"recent" as ChangedSort}
         onSortChange={vi.fn()}
         filesPanelShowHidden={false}
@@ -277,6 +296,110 @@ function renderWorkspace(
     view,
   };
 }
+
+describe("WorkspacePanel Close Tab", () => {
+  function renderWithCloser(overrides: Parameters<typeof renderWorkspace>[0]) {
+    const closeSelectedTabRef: { current: (() => boolean) | null } = { current: null };
+    const rendered = renderWorkspace({ ...overrides, closeSelectedTabRef });
+    return { ...rendered, closeSelectedTab: () => closeSelectedTabRef.current?.() };
+  }
+
+  it("closes the selected file tab", () => {
+    const { closeSelectedTab, onCloseFile, onClosePanel } = renderWithCloser({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    expect(closeSelectedTab()).toBe(true);
+    expect(onCloseFile).toHaveBeenCalledWith("README.md");
+    expect(onClosePanel).not.toHaveBeenCalled();
+  });
+
+  it.each([{ pending: true }, { open: false }, { width: 0 }])(
+    "does not close an invisible selected file (%j)",
+    (overrides) => {
+      const { closeSelectedTab, onCloseFile } = renderWithCloser({
+        openFiles: ["README.md"],
+        selectedFilePath: "README.md",
+        ...overrides,
+      });
+      expect(closeSelectedTab()).toBe(false);
+      expect(onCloseFile).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not close a panel when a stale terminal selection leaves it inactive", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { closeSelectedTab, onClosePanel } = renderWithCloser({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+      selectedTerminalKey: "terminal:gone",
+    });
+    expect(closeSelectedTab()).toBe(false);
+    expect(onClosePanel).not.toHaveBeenCalled();
+  });
+
+  it("closes a maximized panel even when its docked width is zero", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { closeSelectedTab, onClosePanel } = renderWithCloser({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+      maximized: true,
+      width: 0,
+    });
+    expect(closeSelectedTab()).toBe(true);
+    expect(onClosePanel).toHaveBeenCalledWith("changes");
+  });
+
+  it("closes the selected unpinned page tab", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { closeSelectedTab, onClosePanel } = renderWithCloser({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+    });
+    expect(closeSelectedTab()).toBe(true);
+    expect(onClosePanel).toHaveBeenCalledWith("changes");
+  });
+
+  it("closes the selected terminal tab", () => {
+    const { closeSelectedTab, onCloseTerminal } = renderWithCloser({
+      openTerminals: ["terminal:main"],
+      selectedTerminalKey: "terminal:main",
+    });
+    expect(closeSelectedTab()).toBe(true);
+    expect(onCloseTerminal).toHaveBeenCalledWith("terminal:main");
+  });
+
+  it("swallows Close Tab on a terminal a viewer can't close", () => {
+    const { closeSelectedTab, onCloseTerminal } = renderWithCloser({
+      openTerminals: ["terminal:main"],
+      selectedTerminalKey: "terminal:main",
+      permissionLevel: LEVEL_EDIT - 1,
+    });
+    expect(closeSelectedTab()).toBe(true);
+    expect(onCloseTerminal).not.toHaveBeenCalled();
+  });
+
+  it("reports nothing to close on a pinned nav tab", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { closeSelectedTab, onClosePanel, onCloseFile } = renderWithCloser({
+      rightRailTab: "files",
+      openFiles: ["README.md"],
+    });
+    expect(closeSelectedTab()).toBe(false);
+    expect(onClosePanel).not.toHaveBeenCalled();
+    expect(onCloseFile).not.toHaveBeenCalled();
+  });
+
+  it("clears the closer on unmount", () => {
+    const closeSelectedTabRef: { current: (() => boolean) | null } = { current: null };
+    const { view } = renderWorkspace({ closeSelectedTabRef });
+    expect(closeSelectedTabRef.current).not.toBeNull();
+    view.unmount();
+    expect(closeSelectedTabRef.current).toBeNull();
+  });
+});
 
 describe("WorkspacePanel surface presentation", () => {
   it("offers unpinned pages in + without requiring shell or browser support", () => {
@@ -989,6 +1112,26 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
+  it("opens a Side chat tab from the menu with its composer asked to take focus", async () => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    useChatStore.setState({ sessionHarness: "openai-agents", sideChatComposers: {} });
+    try {
+      const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "sidechat" });
+
+      fireEvent.pointerDown(await screen.findByRole("button", { name: "Open new" }), { button: 0 });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
+
+      const pendingId = screen.getByTestId("side-chat-pane-stub").firstChild?.textContent ?? "";
+      expect(pendingId).toMatch(/^pending:/);
+      expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+      expect(useChatStore.getState().sideChatComposers).toEqual({
+        [pendingId]: { text: "", files: [], autoFocus: true },
+      });
+    } finally {
+      useChatStore.setState({ sessionHarness: previousHarness, sideChatComposers: {} });
+    }
+  });
+
   it("does not launch on the multi-shell row when the session is offline", async () => {
     // The row is disabled on an offline session. Its click handler is a
     // sub-trigger's onClick (which Radix runs before its own disabled check), so
@@ -1216,7 +1359,7 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
-  it("uses page labels in tabs, close controls, and the panel picker", async () => {
+  it.each(["button", "shortcut"])("closes the selected browser using %s", async (entry) => {
     const title = "Documentation: a complete guide to configuring your workspace and browser";
     const firstView = browserViewId("conv_ws", "docs");
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
@@ -1235,7 +1378,8 @@ describe("WorkspacePanel browser tab", () => {
       openBrowsers: ["docs", "status"],
       selectedBrowserId: "docs",
     });
-    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    const closeSelectedTabRef: { current: (() => boolean) | null } = { current: null };
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser", closeSelectedTabRef });
     const tab = await screen.findByRole("tab", { name: title });
     expect(tab).toHaveAttribute("title", title);
     expect(tab).toHaveAttribute("aria-selected", "true");
@@ -1243,7 +1387,8 @@ describe("WorkspacePanel browser tab", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitem", { name: title }));
     await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
-    fireEvent.click(screen.getByRole("button", { name: `Close ${title}` }));
+    if (entry === "shortcut") act(() => expect(closeSelectedTabRef.current?.()).toBe(true));
+    else fireEvent.click(screen.getByRole("button", { name: `Close ${title}` }));
     await waitFor(() => expect(screen.queryByRole("tab", { name: title })).not.toBeInTheDocument());
     expect(browserClose).toHaveBeenCalledWith(firstView);
     expect(screen.getByRole("tab", { name: "status.example.com" })).toHaveAttribute(
@@ -1342,6 +1487,91 @@ describe("WorkspacePanel browser tab", () => {
   });
 });
 
+describe("WorkspacePanel restored side chats", () => {
+  it.each([false, true])("automatically adds saved side-chat tabs (mobile: %s)", async (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_ws"], {
+      id: "conv_ws",
+      sideChatAllowed: true,
+    });
+    const fetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ data: [{ id: "remote-side" }], has_more: true, last_id: "remote-side" }),
+        ),
+      );
+    try {
+      const view = renderWorkspace({ queryClient, mobileSideChatsOpen: mobile });
+      const container = mobile
+        ? screen.getByTestId("side-chats-panel-drawer")
+        : screen.getByRole("complementary", { name: "Workspace" });
+      const tab = await within(container).findByRole("tab", { name: "Side chat 1" });
+      expect(screen.queryByRole("button", { name: "Browse side chats" })).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledWith(
+        "/v1/sessions/conv_ws/side_chats?limit=20",
+        expect.anything(),
+      );
+      expect(view.onRightRailTabChange).not.toHaveBeenCalled();
+      expect(view.onReveal).not.toHaveBeenCalled();
+      fireEvent.click(tab);
+      if (!mobile) view.rerender({ rightRailTab: "sidechat" });
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("remote-side");
+      expect(screen.getByTestId("side-chat-pane-stub")).not.toHaveAttribute("data-read-only");
+      expect(fetch.mock.calls.filter(([url]) => String(url).includes("/side_chats"))).toHaveLength(
+        1,
+      );
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+
+  it.each([404, 500])("keeps local tabs when discovery returns %s", async (status) => {
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["local-side"],
+      selectedSideChatId: "local-side",
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_ws"], { id: "conv_ws", sideChatAllowed: true });
+    vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(new Response("{}", { status }));
+    try {
+      renderWorkspace({ queryClient, rightRailTab: "sidechat" });
+      await waitFor(() =>
+        expect(
+          queryClient.isFetching({ queryKey: ["conversation", "conv_ws", "side_chats"] }),
+        ).toBe(0),
+      );
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("local-side");
+      expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual(["local-side"]);
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+
+  it("restores the selected Codex child without overriding the pane's permissions", () => {
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    try {
+      // Restored from storage, e.g. on another device or after a reload.
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["conv_codex_side"],
+        selectedSideChatId: "conv_codex_side",
+      });
+      renderWorkspace({ rightRailTab: "sidechat" });
+
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_codex_side");
+      expect(screen.getByTestId("side-chat-pane-stub")).not.toHaveAttribute("data-read-only");
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+});
+
 describe("WorkspacePanel mobile side chats", () => {
   const openTabs = () =>
     writeSessionWorkspaceState("conv_ws", {
@@ -1349,9 +1579,10 @@ describe("WorkspacePanel mobile side chats", () => {
       selectedSideChatId: "conv_side_b",
     });
 
-  it.each([false, true])(
-    "keeps a side chat, draft, and queue when close fails (mobile=%s)",
-    async (mobile) => {
+  it.each(["desktop button", "mobile button", "shortcut"])(
+    "keeps a side chat, draft, and queue when close fails (%s)",
+    async (entry) => {
+      const mobile = entry === "mobile button";
       isMobileMock.mockReturnValue(mobile);
       openTabs();
       const followUp = {
@@ -1371,11 +1602,16 @@ describe("WorkspacePanel mobile side chats", () => {
         sideChatDrafts: { conv_side_b: "Keep this question" },
         queuedMessages: [followUp, otherChat],
       });
-      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+      const closeSelectedTabRef: { current: (() => boolean) | null } = { current: null };
+      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true, closeSelectedTabRef });
       const surface = mobile
         ? screen.getByTestId("side-chats-panel-drawer")
         : screen.getByRole("complementary", { name: "Workspace" });
-      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+      const close = () => {
+        if (entry === "shortcut") act(() => expect(closeSelectedTabRef.current?.()).toBe(true));
+        else fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+      };
+      close();
 
       await waitFor(() =>
         expect(toast.error).toHaveBeenCalledWith("Couldn't close side chat. Try again."),
@@ -1390,7 +1626,7 @@ describe("WorkspacePanel mobile side chats", () => {
         useChatStore.setState((s) => ({ queuedMessages: [...s.queuedMessages, queuedDuringStop] }));
         return { queued: false };
       });
-      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+      close();
       await waitFor(() =>
         expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
       );
@@ -1402,6 +1638,41 @@ describe("WorkspacePanel mobile side chats", () => {
       stop.mockRestore();
     },
   );
+
+  // Owner level either way: an admin has it without owning the session.
+  it.each([
+    [true, true],
+    [false, false],
+  ])("offers a new side chat when the server allows it (%s)", (sideChatAllowed, offered) => {
+    isMobileMock.mockReturnValue(true);
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_ws"], {
+      id: "conv_ws",
+      agentId: "agent",
+      status: "idle",
+      createdAt: 0,
+      labels: {},
+      permissionLevel: 4,
+      sideChatAllowed,
+    });
+    try {
+      renderWorkspace({
+        rightRailTab: "sidechat",
+        mobileSideChatsOpen: true,
+        permissionLevel: 4,
+        queryClient,
+      });
+
+      const drawer = screen.getByTestId("side-chats-panel-drawer");
+      expect(within(drawer).queryByRole("button", { name: "New side chat" }) !== null).toBe(
+        offered,
+      );
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
 
   it("shows the selected side chat in the drawer, not the hidden rail", () => {
     isMobileMock.mockReturnValue(true);
