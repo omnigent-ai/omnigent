@@ -152,7 +152,10 @@ def test_openshell_overlay_allows_server_egress_to_in_cluster_gateway() -> None:
     )
     assert any(
         {"protocol": "TCP", "port": 8080} in rule.get("ports", [])
-        and {"namespaceSelector": {"matchLabels": gateway_namespace}} in rule.get("to", [])
+        and any(
+            peer.get("namespaceSelector") == {"matchLabels": gateway_namespace}
+            for peer in rule.get("to", [])
+        )
         for rule in policy["egress"]
     )
 
