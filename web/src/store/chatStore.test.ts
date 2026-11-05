@@ -3900,23 +3900,6 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(notices()).toEqual([reminder]);
   });
 
-  it("reopening a session whose managed launch failed offers its first input for resending", async () => {
-    seedSession("conv_real");
-    failManagedLaunch("conv_real", "saved on server");
-
-    await useChatStore.getState().switchTo("conv_real");
-    await settle();
-
-    expect(useChatStore.getState().failedSendDraft).toEqual({
-      conversationId: "conv_real",
-      text: "saved on server",
-      files: [],
-      startupInputIds: ["pending_first"],
-      recovered: true,
-    });
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-  });
-
   it("offers a failed launch's input again when its stream died before the composer took it", async () => {
     seedSession("conv_real");
     seedSession("conv_other");
@@ -3933,6 +3916,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     };
     const entry = conversationRegistry.peek("conv_real")!;
     expect(entry.getState().failedSendDraft).toEqual(recovered);
+    expect(entry.getState().pendingUserMessages).toEqual([]);
     // A terminal 401 or 403 ends the background stream, so reopening rebuilds the entry.
     entry.setState({ abortController: null });
 

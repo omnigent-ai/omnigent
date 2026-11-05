@@ -1121,6 +1121,7 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
                     {entry["content"][0]["text"]: entry["pending_id"] for entry in entries}
                 )
                 return texts, pages
+            assert page["next_cursor"] > params.get("after", ""), page
             params["after"] = page["next_cursor"]
 
     # One saved input per page, so another sender's leaves an empty page.
