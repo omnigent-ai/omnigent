@@ -3235,6 +3235,12 @@ async def _replay_resume_response(
             items = turn.get("items")
             if not turn_id or not isinstance(items, list):
                 continue
+            if (
+                _is_completed_automatic_input_source(bridge_dir, turn_id)
+                and not _is_recovered_output_limit_source(bridge_dir, turn_id)
+                and (source_error := _terminal_error_from_turn({"turn": turn})) is not None
+            ):
+                await _present_output_limit_error(client, session_id, turn_id, source_error)
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -3343,7 +3349,7 @@ def _resume_turn_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
-        if status == "running" and _is_completed_automatic_input_source(bridge_dir, turn_id):
+        if _is_completed_automatic_input_source(bridge_dir, turn_id):
             return None
         if (
             state.automatic_input_turn_id == turn_id
@@ -4483,6 +4489,10 @@ async def _auto_continue_after_output_limit(
         or current.active_shell_turn_id is not None
         or time.time() >= deadline
     ):
+        try:
+            settle_codex_automatic_input(bridge_dir, expected=claimed, outcome="uncertain")
+        except OSError:
+            _logger.warning("Could not settle unsubmitted Codex continuation", exc_info=True)
         await _present_output_limit_error(client, session_id, turn_id, error)
         return True
     receipt: tuple[str, str] | None = None
@@ -5114,6 +5124,7 @@ async def _handle_terminal_turn_boundary_inner(
         pending.error if pending is not None else None
     )
     interrupted = _turn_status_is_interrupted(_turn_status_from_params(params))
+    retired_source = _is_completed_automatic_input_source(bridge_dir, terminal_turn_id)
     source_flushed = False
 
     async def flush_source() -> None:
@@ -5163,6 +5174,7 @@ async def _handle_terminal_turn_boundary_inner(
                     ).add(str(item.get("id", "unknown-tool")))
     continued = bool(
         method == "turn/completed"
+        and not retired_source
         and not interrupted
         and bridge_dir is not None
         and completed is not None
@@ -5186,7 +5198,7 @@ async def _handle_terminal_turn_boundary_inner(
     )
     terminal = (
         _PreparedTerminalTurn(handled=True, edge=None)
-        if continued
+        if continued or retired_source
         else _prepare_terminal_turn_event(
             bridge_dir,
             method,
@@ -5209,6 +5221,13 @@ async def _handle_terminal_turn_boundary_inner(
             )
             settle_codex_automatic_input(bridge_dir, expected=current, outcome=outcome)
     await flush_source()
+    if (
+        retired_source
+        and candidate_error is not None
+        and terminal_turn_id is not None
+        and not _is_recovered_output_limit_source(bridge_dir, terminal_turn_id)
+    ):
+        await _present_output_limit_error(client, session_id, terminal_turn_id, candidate_error)
     # Safety net: if a compaction was reported in progress but Codex never
     # emitted a completion signal we recognize (e.g. a protocol-spelling
     # drift), force the spinner closed at the turn boundary so it can't hang.
@@ -5252,6 +5271,7 @@ async def _handle_terminal_turn_boundary_inner(
         )
     if (
         handled
+        and not retired_source
         and method == "turn/completed"
         and bridge_dir is not None
         and codex_client is not None
