@@ -148,9 +148,34 @@ async function openBrowserPane({ scratch, recordDir }) {
     await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
     return { backend, desktop };
   } catch (error) {
-    if (desktop) await closeDesktop(desktop, recordDir, null);
-    await backend.close();
+    try {
+      if (desktop) await closeDesktop(desktop, recordDir, null);
+    } finally {
+      await backend.close();
+    }
     throw error;
+  }
+}
+
+/** Run a journey in a fresh shell; the clip is saved as `clip`, or `failed-<clip>`. */
+async function withBrowserPane({ name, clip }, journey) {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), `omni-${name}-`));
+  const recordDir = recordDirFor(name);
+  try {
+    const { backend, desktop } = await openBrowserPane({ scratch, recordDir });
+    let passed = false;
+    try {
+      await journey(desktop);
+      passed = true;
+    } finally {
+      try {
+        await closeDesktop(desktop, recordDir, passed ? clip : `failed-${clip}`);
+      } finally {
+        await backend.close();
+      }
+    }
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
   }
 }
 
@@ -197,13 +222,9 @@ function recordDirFor(name) {
 it(
   "continues a blocked Google Workspace sign-in in the system browser",
   { skip, timeout: 180_000 },
-  async () => {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-google-handoff-"));
-    const recordDir = recordDirFor("google-sign-in-handoff");
-    const { backend, desktop } = await openBrowserPane({ scratch, recordDir });
-    const { window, electronApp } = desktop;
-    let recorded = false;
-    try {
+  () =>
+    withBrowserPane({ name: "google-sign-in-handoff", clip: "demo-cuj-1" }, async (desktop) => {
+      const { window, electronApp } = desktop;
       await typeAddress(window, DOC_URL);
       const notice = window.getByRole("status").filter({
         hasText: "Google Workspace doesn't allow sign-in from Omnigent's browser",
@@ -216,35 +237,34 @@ it(
           url: entry.view.webContents.getURL(),
           text: await entry.view.webContents.executeJavaScript("document.body.innerText"),
           trail: entry.navigationTrail,
+          requests: global.fakeGoogleRequests
+            .map((url) => new URL(url))
+            .map((url) => url.host + url.pathname),
         };
       });
       assert.match(blockedText.url, /^https:\/\/access\.workspace\.google\.com\/remediate/);
       assert.match(blockedText.text, /Your organization isn't allowing access/);
       assert.equal(blockedText.trail[0], DOC_URL, JSON.stringify(blockedText.trail));
+      assert.deepEqual(blockedText.requests.slice(0, 4), [
+        "docs.google.com/document/d/omni-launch-plan/edit",
+        "accounts.google.com/ServiceLogin",
+        "accounts.google.com/signin/sso",
+        "access.workspace.google.com/remediate",
+      ]);
       await window.waitForTimeout(3000);
 
       await window.getByRole("button", { name: "Continue in browser", exact: true }).click();
       assert.deepEqual(await waitForOpened(electronApp, DOC_URL), [DOC_URL]);
       await window.waitForTimeout(3500);
-      recorded = true;
-    } finally {
-      await closeDesktop(desktop, recordDir, recorded ? "demo-cuj-1" : "failed-cuj-1");
-      await backend.close();
-      fs.rmSync(scratch, { recursive: true, force: true });
-    }
-  },
+    }),
 );
 
 it(
   "opens the current page in the system browser from the toolbar",
   { skip, timeout: 180_000 },
-  async () => {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-open-in-browser-"));
-    const recordDir = recordDirFor("open-in-browser");
-    const { backend, desktop } = await openBrowserPane({ scratch, recordDir });
-    const { window, electronApp } = desktop;
-    let recorded = false;
-    try {
+  () =>
+    withBrowserPane({ name: "open-in-browser", clip: "demo-cuj-2" }, async (desktop) => {
+      const { window, electronApp } = desktop;
       await typeAddress(window, WIKI_URL);
       const { eventually } = require("./desktopDesignPromptHarness");
       await eventually(
@@ -269,11 +289,5 @@ it(
       await window.getByRole("button", { name: "Open in browser", exact: true }).click();
       assert.deepEqual(await waitForOpened(electronApp, WIKI_URL), [WIKI_URL]);
       await window.waitForTimeout(3500);
-      recorded = true;
-    } finally {
-      await closeDesktop(desktop, recordDir, recorded ? "demo-cuj-2" : "failed-cuj-2");
-      await backend.close();
-      fs.rmSync(scratch, { recursive: true, force: true });
-    }
-  },
+    }),
 );

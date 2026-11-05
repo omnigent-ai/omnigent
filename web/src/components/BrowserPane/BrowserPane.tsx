@@ -192,6 +192,9 @@ export function BrowserPane({
   const [navigationError, setNavigationError] = useState<string | null>(null);
   // Set by the shell when the page is Google's context-aware access block page.
   const [googleAccessBlocked, setGoogleAccessBlocked] = useState(false);
+  // Set once a live url event arrives, so a slower remount snapshot can't overwrite it.
+  const urlEventSeenRef = useRef(false);
+  const [systemBrowserOpening, setSystemBrowserOpening] = useState(false);
   const systemBrowserSupported = !!getBridge()?.browserOpenInSystemBrowser;
   // Ref (not state): read synchronously in the url-changed listener; a
   // stale-closure state read would race.
@@ -233,12 +236,13 @@ export function BrowserPane({
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
+    urlEventSeenRef.current = false;
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && !viewChanged && r?.exists) {
         setHasView(true);
-        setGoogleAccessBlocked(r.googleAccessBlocked === true);
+        if (!urlEventSeenRef.current) setGoogleAccessBlocked(r.googleAccessBlocked === true);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
@@ -274,6 +278,7 @@ export function BrowserPane({
     if (!bridge) return;
     const unsubUrl = bridge.onBrowserUrlChanged?.((payload) => {
       if (payload.conversationId !== conversationId) return;
+      urlEventSeenRef.current = true;
       setGoogleAccessBlocked(payload.googleAccessBlocked === true);
       if (urlEditingRef.current) return;
       setCurrentUrl(payload.url);
@@ -353,13 +358,17 @@ export function BrowserPane({
   const handleOpenInSystemBrowser = useCallback(() => {
     const bridge = getBridge();
     if (!bridge?.browserOpenInSystemBrowser) return;
+    setSystemBrowserOpening(true);
     setNavigationError(null);
     void bridge
       .browserOpenInSystemBrowser(conversationId)
       .then((result) => {
         if (!result?.ok) setNavigationError(result?.error ?? "Couldn't open your browser.");
       })
-      .catch(() => setNavigationError("Couldn't open your browser."));
+      .catch(() => setNavigationError("Couldn't open your browser."))
+      .finally(() => {
+        setSystemBrowserOpening(false);
+      });
   }, [conversationId]);
 
   const handleToggleDesignMode = useCallback(() => {
@@ -692,7 +701,7 @@ export function BrowserPane({
           <button
             type="button"
             onClick={handleOpenInSystemBrowser}
-            disabled={!hasView}
+            disabled={!hasView || systemBrowserOpening}
             aria-label="Open in browser"
             title="Open this page in your default browser"
             className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
@@ -751,7 +760,12 @@ export function BrowserPane({
               browser instead.
             </p>
           </div>
-          <Button size="sm" variant="outline" onClick={handleOpenInSystemBrowser}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleOpenInSystemBrowser}
+            disabled={systemBrowserOpening}
+          >
             <ExternalLinkIcon className="size-3.5" />
             Continue in browser
           </Button>

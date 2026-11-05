@@ -531,10 +531,8 @@ function setup({
 
 it("restores URL, title and history state for the requested browser tab only", () => {
   const viewId = "browser-tab:conv_1:tab-two";
-  const { ipcMain, event } = setup({
-    conversationId: viewId,
-    webContents: makeWebContents({ canBack: true, title: "Restored page" }),
-  });
+  const webContents = makeWebContents({ canBack: true, title: "Restored page" });
+  const { ipcMain, event } = setup({ conversationId: viewId, webContents });
   assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
     exists: true,
     hostIsThisMachine: false,
@@ -544,6 +542,12 @@ it("restores URL, title and history state for the requested browser tab only", (
     canGoForward: false,
     googleAccessBlocked: false,
   });
+  webContents.getURL = () => "https://access.workspace.google.com/remediate?flow=caa";
+  assert.equal(
+    ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId })
+      .googleAccessBlocked,
+    true,
+  );
   assert.deepEqual(
     ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" }),
     { exists: false },
@@ -1162,25 +1166,6 @@ describe("browserIpc — open in system browser", () => {
       error: "Couldn't open your browser: no handler",
     });
   });
-
-  it("flags the Google access-blocked page in view snapshots and url events", async () => {
-    const { ipcMain, event } = setupHandoff({ url: BLOCKED });
-    const snapshot = ipcMain.invoke("omnigent:browser-has-view", event, {
-      conversationId: "conv_1",
-    });
-    assert.equal(snapshot.googleAccessBlocked, true);
-
-    const tracked = setup({ conversationId: null });
-    await tracked.ipcMain.invoke("omnigent:browser-open-or-navigate", tracked.event, {
-      conversationId: "conv_1",
-      url: "https://docs.google.com/",
-    });
-    const wc = tracked.registry.get("conv_1").view.webContents;
-    wc.getURL = () => BLOCKED;
-    wc.emit("did-navigate", BLOCKED);
-    const urlEvents = tracked.sent.filter((s) => s.channel === "browser-url-changed");
-    assert.equal(urlEvents.at(-1).payload.googleAccessBlocked, true);
-  });
 });
 
 describe("browserIpc — devtools toggle", () => {
@@ -1237,6 +1222,11 @@ describe("browserIpc — url live-tracking", () => {
       channel: "browser-url-changed",
       payload: { conversationId: viewId, url: wc.getURL(), title: "", googleAccessBlocked: false },
     });
+
+    wc.getURL = () => "https://access.workspace.google.com/remediate?flow=caa";
+    wc.emit("did-navigate", wc.getURL());
+    const blockedEvents = sent.filter((s) => s.channel === "browser-url-changed");
+    assert.equal(blockedEvents.at(-1).payload.googleAccessBlocked, true);
   });
 
   it("did-navigate-in-page only emits for the main frame", async () => {

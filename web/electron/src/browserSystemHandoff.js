@@ -72,9 +72,9 @@ function recordNavigation(trail, url) {
 
 /**
  * The URL to open in the system browser for a view. Normally the current
- * page; on Google's access block page, the page the user was signing in to:
- * the newest sign-in `continue` target, else the first non-sign-in page since
- * the view's last explicit navigation.
+ * page; on Google's access block page, the newest sign-in `continue` target
+ * on an origin the view loaded, else the newest non-sign-in page it loaded.
+ * A page can set `continue` freely, so unvisited origins are never opened.
  *
  * @param {{ currentUrl: string, navigationTrail?: string[] }} view
  * @returns {string | null} Null when the view shows no http(s) page.
@@ -83,13 +83,14 @@ function systemBrowserUrl({ currentUrl, navigationTrail = [] }) {
   const current = parseWebUrl(currentUrl);
   if (!current) return null;
   if (!isGoogleAccessBlockedUrl(current.href)) return current.href;
+  const visitedPages = navigationTrail.filter((url) => parseWebUrl(url) && !isGoogleSignInUrl(url));
+  const visitedOrigins = new Set(visitedPages.map((url) => new URL(url).origin));
   const newestFirst = [current.href, ...[...navigationTrail].reverse()];
   for (const url of newestFirst) {
     const target = signInContinueUrl(url);
-    if (target) return target;
+    if (target && visitedOrigins.has(new URL(target).origin)) return target;
   }
-  const origin = navigationTrail.find((url) => parseWebUrl(url) && !isGoogleSignInUrl(url));
-  return origin ?? current.href;
+  return visitedPages.at(-1) ?? current.href;
 }
 
 module.exports = {

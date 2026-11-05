@@ -78,19 +78,51 @@ describe("browserSystemHandoff — systemBrowserUrl", () => {
       DOC,
     );
     const blockedWithContinue = `https://access.workspace.google.com/remediate?continue=${encodeURIComponent(
-      "https://mail.google.com/",
+      `${DOC}/edit`,
     )}`;
     assert.equal(
       systemBrowserUrl({ currentUrl: blockedWithContinue, navigationTrail: [DOC, SIGN_IN] }),
-      "https://mail.google.com/",
+      `${DOC}/edit`,
     );
   });
 
-  it("falls back to the first non-sign-in page, then to the blocked page itself", () => {
+  it("prefers the newest continue target on an origin the tab loaded", () => {
+    const MAIL = "https://mail.google.com/mail/u/0/";
+    const signInTo = (url) =>
+      `https://accounts.google.com/ServiceLogin?continue=${encodeURIComponent(url)}`;
+    const unvisited = signInTo("https://unvisited.example/");
     assert.equal(
       systemBrowserUrl({
         currentUrl: BLOCKED,
-        navigationTrail: [DOC, "https://accounts.google.com/signin", BLOCKED],
+        navigationTrail: [DOC, MAIL, SIGN_IN, signInTo(MAIL), unvisited, BLOCKED],
+      }),
+      MAIL,
+    );
+  });
+
+  it("never opens a continue target on an origin the tab didn't load", () => {
+    const blockedToElsewhere = `https://access.workspace.google.com/remediate?continue=${encodeURIComponent(
+      "https://unvisited.example/",
+    )}`;
+    assert.equal(
+      systemBrowserUrl({
+        currentUrl: blockedToElsewhere,
+        navigationTrail: [DOC, blockedToElsewhere],
+      }),
+      DOC,
+    );
+    assert.equal(
+      systemBrowserUrl({ currentUrl: blockedToElsewhere, navigationTrail: [blockedToElsewhere] }),
+      blockedToElsewhere,
+    );
+  });
+
+  it("falls back to the newest non-sign-in page, then to the blocked page itself", () => {
+    const LANDING = "https://docs.google.com/";
+    assert.equal(
+      systemBrowserUrl({
+        currentUrl: BLOCKED,
+        navigationTrail: [LANDING, DOC, "https://accounts.google.com/signin", BLOCKED],
       }),
       DOC,
     );

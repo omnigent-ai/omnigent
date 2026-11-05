@@ -580,12 +580,25 @@ describe("BrowserPane system-browser handoff", () => {
     expect(screen.getByRole("button", { name: "Open in browser" })).toBeDisabled();
   });
 
-  it("opens the current page in the system browser from the toolbar", async () => {
-    const { bridge } = await renderWithView("conv_open");
-    fireEvent.click(screen.getByRole("button", { name: "Open in browser" }));
-    await waitFor(() =>
-      expect(bridge.browserOpenInSystemBrowser).toHaveBeenCalledWith("conv_open"),
-    );
+  it("opens the current page in the system browser once per click", async () => {
+    let finishOpen: (result: { ok: boolean }) => void = () => {};
+    const { bridge } = await renderWithView("conv_open", {
+      browserOpenInSystemBrowser: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finishOpen = resolve;
+          }),
+      ),
+    });
+    const button = screen.getByRole("button", { name: "Open in browser" });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(bridge.browserOpenInSystemBrowser).toHaveBeenCalledTimes(1);
+    expect(bridge.browserOpenInSystemBrowser).toHaveBeenCalledWith("conv_open");
+    expect(button).toBeDisabled();
+
+    await act(async () => finishOpen({ ok: true }));
+    expect(button).toBeEnabled();
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
@@ -633,6 +646,31 @@ describe("BrowserPane system-browser handoff", () => {
     expect(await screen.findByRole("status")).toHaveTextContent(
       "Your organization only allows approved browsers",
     );
+  });
+
+  it("keeps a live url event over a slower remount snapshot", async () => {
+    let finishProbe: (result: Record<string, unknown>) => void = () => {};
+    let fireUrl: ((p: { conversationId: string; url: string }) => void) | undefined;
+    installBridge({
+      browserHasView: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finishProbe = resolve;
+          }),
+      ),
+      browserOpenInSystemBrowser: vi.fn(),
+      onBrowserUrlChanged: vi.fn((cb: typeof fireUrl) => {
+        fireUrl = cb;
+        return () => {};
+      }),
+    });
+    render(<BrowserPane conversationId="conv_race" />);
+    act(() => fireUrl?.({ conversationId: "conv_race", url: "https://example.com/" }));
+    await act(async () =>
+      finishProbe({ exists: true, url: blockedUrl, googleAccessBlocked: true }),
+    );
+    expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
   it("keeps the old pane on a shell that can't hand off", async () => {
