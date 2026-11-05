@@ -247,6 +247,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_blocked_on_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -279,6 +280,7 @@ from omnigent.server.schemas import (
     ResponseObject,
     RetryErrorDetail,
     SandboxStatus,
+    SessionBackgroundTasksEvent,
     SessionBtwSidechatEvent,
     SessionChildSessionUpdatedEvent,
     SessionCodexApprovalModeEvent,
@@ -339,6 +341,8 @@ from omnigent.util.session_lifecycle import (
 )
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future
+
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 
@@ -1375,16 +1379,121 @@ def _session_status_with_child_rollup(
     own_status = _session_status_from_cache(conversation_id, db_status)
     if own_status == "running":
         return "running"
-    # Background shells outliving a turn do NOT make the row running: the
-    # session takes a new message immediately, and the tally only refreshes on
-    # the next ``Stop`` hook, so a spinner keyed off it can outlive the shells.
-    # The in-chat indicator still reports them from the count.
+    # Background shells outliving a turn do NOT make the row's status running:
+    # the session takes a new message immediately. The row reports them in its
+    # separate ``background_work_running`` field instead.
     if any(
         _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
     ):
         return "running"
     return own_status
+
+
+def _set_background_work_running(
+    session_id: str,
+    running: bool,
+    *,
+    runner_id: str | None = None,
+    handoffs: int | None = None,
+    reported_at: int | None = None,
+) -> Future[Any] | None:
+    """
+    Record whether a session's background shells outlive its ended turn.
+
+    The runner reports this from Claude's status file. The session list shows
+    such a session as working; its turn status is left alone, so a new message
+    still sends immediately. Every replica's list reads the stored row.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param running: ``True`` while a background shell outlives the turn.
+    :param runner_id: The reporting runner, when known; the stored flag is
+        written only while the session is still bound to it.
+    :param handoffs: ``session_live_state.handoff_count`` when the report arrived;
+        the stored write is skipped if the session was handed off since.
+    :param reported_at: When the runner decided *running*, in its epoch
+        nanoseconds; a report older than the stored one is not written.
+    :returns: Future of ``True`` once the write ran, or ``None`` without a store.
+    """
+    return session_live_state.persist_background_work_running(
+        session_id, running, runner_id=runner_id, handoffs=handoffs, reported_at=reported_at
+    )
+
+
+def _store_background_task_tally(
+    session_id: str, count: int, tasks: list[BackgroundTaskInfo] | None
+) -> None:
+    """
+    Keep a session's background-task tally for snapshots; ``0`` drops it.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param count: Background tasks still running, e.g. ``1``.
+    :param tasks: Detail for each counted task, or ``None`` when the runner
+        sent none.
+    """
+    if count > 0:
+        _session_background_task_count_cache[session_id] = count
+        _session_background_tasks_cache[session_id] = tasks or []
+    else:
+        _session_background_task_count_cache.pop(session_id, None)
+        _session_background_tasks_cache.pop(session_id, None)
+
+
+def _set_background_tasks(
+    session_id: str, count: int, tasks: list[BackgroundTaskInfo] | None
+) -> None:
+    """
+    Record and publish background tasks a runner listed between turns.
+
+    The composer shows them the same way as the shells on Claude's status edges.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param count: Background tasks still running, e.g. ``1``; ``0`` clears them.
+    :param tasks: Detail for each counted task, e.g. its command.
+    """
+    _store_background_task_tally(session_id, count, tasks)
+    event = SessionBackgroundTasksEvent(
+        type="session.background_tasks",
+        conversation_id=session_id,
+        background_task_count=count,
+        background_tasks=(tasks or []) if count > 0 else [],
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+# Longest parked reason kept for the session list; the live stream carries it whole.
+_BLOCKED_ON_LIST_MAX_CHARS = 128
+
+
+def _set_blocked_on(session_id: str, blocked_on: str | None) -> None:
+    """
+    Record why a session's agent is parked on a terminal prompt, if it is.
+
+    Called for every published status edge: an edge without a reason means
+    the session is no longer parked. The session list shows a parked session
+    as needing input even when no web card exists for the prompt.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param blocked_on: The edge's reason, e.g. ``"permission prompt"``, or ``None``.
+    """
+    reason = blocked_on[:_BLOCKED_ON_LIST_MAX_CHARS] if blocked_on else ""
+    _session_blocked_on_cache[session_id] = reason
+    session_live_state.persist_blocked_on(session_id, reason or None)
+
+
+def _blocked_on_for(conversation_id: str, db_value: str | None) -> str | None:
+    """
+    Return the session-list ``blocked_on`` value for one session.
+
+    :param conversation_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param db_value: The row's persisted reason, used when this replica has
+        published no status edge for the session.
+    :returns: Why the session's agent is parked on a terminal prompt, or ``None``.
+    """
+    cached = _session_blocked_on_cache.get(conversation_id)
+    if cached is not None:
+        return cached or None
+    return db_value or None
 
 
 async def _collect_descendant_conversation_ids(
@@ -1501,6 +1610,10 @@ async def _apply_liveness_to_items(
         # runner reconnects (see ``_on_runner_connect``'s pending resync).
         if not result.runner_online:
             item.pending_elicitations_count = 0
+            # Background shells end with their runner, which may die without
+            # reporting it; the runner re-reports on reconnect.
+            item.background_work_running = False
+            item.blocked_on = None
 
 
 def _targeted_elicitation_event(
@@ -5007,6 +5120,7 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    _set_blocked_on(session_id, blocked_on)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
@@ -5102,15 +5216,9 @@ def _publish_status(
     # count stores the detail — possibly empty when a runner sent count-only —
     # and a ``0`` / failure clears it). ``None`` leaves both untouched.
     if background_task_count is not None:
-        if background_task_count > 0:
-            _session_background_task_count_cache[session_id] = background_task_count
-            _session_background_tasks_cache[session_id] = background_tasks or []
-        else:
-            _session_background_task_count_cache.pop(session_id, None)
-            _session_background_tasks_cache.pop(session_id, None)
+        _store_background_task_tally(session_id, background_task_count, background_tasks)
     elif status == "failed":
-        _session_background_task_count_cache.pop(session_id, None)
-        _session_background_tasks_cache.pop(session_id, None)
+        _store_background_task_tally(session_id, 0, None)
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,
@@ -6429,10 +6537,6 @@ async def _launch_runner_on_host_locked(
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         request_id = secrets.token_hex(8)
-        launch_future: asyncio.Future[HostLaunchResult] = (
-            asyncio.get_running_loop().create_future()
-        )
-        host_conn.pending_launches[request_id] = launch_future
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -6452,22 +6556,40 @@ async def _launch_runner_on_host_locked(
                 superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
             )
         )
-        try:
-            host_registry.send_text(host_conn, launch_frame)
-        except ConnectionError:
-            host_conn.pending_launches.pop(request_id, None)
-            _logger.warning(
-                "Host %s connection lost while launching runner for %s",
-                conv.host_id,
-                conv.id,
-                extra=debug_event(
-                    "runner_launch_failed",
-                    session_id=conv.id,
-                    stage="runner_launch",
-                    error_code="host_launch_failed",
-                ),
+        for enqueue_attempt in range(2):
+            launch_future: asyncio.Future[HostLaunchResult] = (
+                asyncio.get_running_loop().create_future()
             )
-            return _HostLaunchAttempt(runner_id=new_runner_id)
+            host_conn.pending_launches[request_id] = launch_future
+            try:
+                host_registry.send_text(host_conn, launch_frame)
+            except ConnectionError:
+                host_conn.pending_launches.pop(request_id, None)
+                launch_future.cancel()
+                replacement = host_registry.get(host_conn.host_id)
+                if (
+                    enqueue_attempt == 0
+                    and replacement is not None
+                    and replacement is not host_conn
+                ):
+                    # send_text rejected before enqueue; reuse this binding and frame once.
+                    await host_registry.admit_launch(replacement, conv.id)
+                    host_conn = replacement
+                    continue
+                _logger.warning(
+                    "Host %s connection lost while launching runner for %s",
+                    conv.host_id,
+                    conv.id,
+                    extra=debug_event(
+                        "runner_launch_failed",
+                        session_id=conv.id,
+                        stage="runner_launch",
+                        error_code="host_launch_failed",
+                        enqueue_attempt=enqueue_attempt + 1,
+                    ),
+                )
+                return _HostLaunchAttempt(runner_id=new_runner_id)
+            break
         try:
             result = await asyncio.wait_for(
                 launch_future,
@@ -6476,7 +6598,6 @@ async def _launch_runner_on_host_locked(
         except TimeoutError:
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
-            host_conn.pending_launches.pop(request_id, None)
             # A slow host, not a refusal: the launch may still land.
             _logger.warning(
                 "Host launch acknowledgement timed out",
@@ -6490,6 +6611,10 @@ async def _launch_runner_on_host_locked(
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
+        finally:
+            host_conn.pending_launches.pop(request_id, None)
+            if not launch_future.done():
+                launch_future.cancel()
         if result.get("status") == "failed":
             refusal_code = result.get("error_code")
             # Unmapped codes (spawn failures) are attributed on the host's own row.
@@ -12348,6 +12473,7 @@ __all__ = [
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
     "_background_task_delivery_status",
+    "_blocked_on_for",
     "_build_actor",
     "_build_evaluation_context",
     "_build_new_item",
@@ -12524,6 +12650,9 @@ __all__ = [
     "_seed_missing_title_from_user_message",
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
+    "_set_background_tasks",
+    "_set_background_work_running",
+    "_set_blocked_on",
     "_set_read_state",
     "_signal_harness_elicitation_resolved_by_id",
     "_signal_terminal_resolved_harness_elicitation",

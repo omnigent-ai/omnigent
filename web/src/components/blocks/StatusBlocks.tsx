@@ -110,6 +110,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
   host_disk_full: "The host's disk is full, so the agent can't save the conversation.",
+  harness_not_configured: "The harness isn't set up on the host, so this session can't start.",
 };
 
 const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";

@@ -130,6 +130,7 @@ export const AUTOMATION_TEMPLATE_IDS = [
   "jira",
   "slack",
   "github",
+  "linear",
   "follow-up-monitor",
   "pr-sweep",
   "news-digest",
@@ -446,15 +447,17 @@ export async function deleteScheduledTask(id: string): Promise<void> {
 /**
  * Trigger an immediate ("run now") fire of a task. A manual override that
  * reuses the server's shared fire path; paused tasks are runnable. The server
- * responds `202 Accepted` (the run launches in the background), so this returns
- * `void` — callers invalidate the list + runs queries to pick up the new run's
- * status. A `409` (already in flight) surfaces as a {@link ScheduledTaskApiError}.
+ * responds `202 Accepted` with the queued run ID, or no run ID on older servers.
+ * Callers refresh the list and runs queries for its status. A `409` (already
+ * in flight) surfaces as a {@link ScheduledTaskApiError}.
  */
-export async function runScheduledTaskNow(id: string): Promise<void> {
+export async function runScheduledTaskNow(id: string): Promise<string | null> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/run`, {
     method: "POST",
   });
   if (!res.ok) throw await errorFromResponse(res);
+  const body = (await res.json()) as { run_id?: string };
+  return body.run_id ?? null;
 }
 
 /** Latest failed run from an automation without a session Inbox entry. */

@@ -419,12 +419,42 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string | null;
-  constructor(message: string, status: number, code: string | null) {
+  /** The response's `Retry-After`, in milliseconds, when it sent one. */
+  readonly retryAfterMs: number | null;
+  constructor(
+    message: string,
+    status: number,
+    code: string | null,
+    retryAfterMs: number | null = null,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.retryAfterMs = retryAfterMs;
   }
+}
+
+const IMF_FIXDATE =
+  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * Parse a `Retry-After` header, either delta-seconds or an HTTP date.
+ *
+ * @param value - The header value, or `null` when absent.
+ * @param now - Clock for the HTTP-date form.
+ * @returns Milliseconds to wait, or `null` when absent or malformed.
+ */
+export function parseRetryAfterMs(value: string | null, now: number = Date.now()): number | null {
+  if (value === null) return null;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1_000;
+  // Only IMF-fixdate, the form RFC 9110 requires senders to use. Date.parse
+  // accepts far more ("-1", "Mon 1", "January 1, 2027"), and a misread hint
+  // would skip or stretch the backoff; anything else falls back to it.
+  if (!IMF_FIXDATE.test(trimmed)) return null;
+  const date = Date.parse(trimmed);
+  return Number.isNaN(date) ? null : Math.max(0, date - now);
 }
 
 /**
@@ -463,7 +493,9 @@ export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
   }
-  return new ApiError(message, res.status, code);
+  // `headers` is optional on hand-built Response stand-ins.
+  const retryAfterMs = parseRetryAfterMs(res.headers?.get("Retry-After") ?? null);
+  return new ApiError(message, res.status, code, retryAfterMs);
 }
 
 function postEventResponseFromWire(wire: {

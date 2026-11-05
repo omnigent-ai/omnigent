@@ -62,7 +62,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 from urllib import request
 
@@ -669,7 +669,16 @@ class ClaudeTerminalDialog(RuntimeError):
     Deliberately not a :class:`ClaudePromptTimeout`: the pane is healthy and
     the dialog is answerable from the embedded terminal, so delivery handlers
     must report it without reaping the pane.
+
+    :param message: Human-readable refusal.
+    :param awaits_answer: Whether the refusal names a dialog waiting for the
+        person's answer and nothing was typed, so the same delivery can run
+        again once :func:`terminal_dialog_pending` reports it closed.
     """
+
+    def __init__(self, message: str, *, awaits_answer: bool = False) -> None:
+        super().__init__(message)
+        self.awaits_answer = awaits_answer
 
 
 class ClaudeInputBoxOccupied(ClaudeTerminalDialog):
@@ -2769,8 +2778,18 @@ def build_hook_settings(
     settings: _JsonObject = {"hooks": hooks}
     if launch_model:
         settings["model"] = launch_model
+    permissions: _JsonObject = {}
     if launch_permission_mode:
-        settings["permissions"] = {"defaultMode": launch_permission_mode}
+        permissions["defaultMode"] = launch_permission_mode
+    from omnigent.inner.native_attachments import attachment_cache_dir
+
+    # Pasted attachments are cached outside the workspace, so Claude would ask
+    # before reading them. Deny/ask rules and Omnigent policy hooks still apply.
+    attachment_read_rule = _claude_read_rule(attachment_cache_dir(bridge_dir))
+    if attachment_read_rule is not None:
+        permissions["allow"] = [attachment_read_rule]
+    if permissions:
+        settings["permissions"] = permissions
     if launch_bypass_permissions:
         # Bypass mode shows a one-time "Bypass Permissions mode" acceptance
         # dialog. Like the trust/onboarding gates it fires no
@@ -2809,6 +2828,31 @@ def build_hook_settings(
         status_command += f"; printf '%s' \"$p\" | ( {chain_command} )"
     settings["statusLine"] = {"type": "command", "command": status_command}
     return settings
+
+
+def _claude_read_rule(directory: PurePath) -> str | None:
+    """
+    Return a Claude Code ``Read`` allow rule for files under *directory*.
+
+    Claude writes absolute paths as ``//path`` and normalizes Windows drives,
+    so ``C:\\Users\\a`` becomes ``//c/Users/a``.
+
+    :param directory: Absolute directory, e.g. ``Path("/home/a/.omnigent/attachments/k")``.
+    :returns: A rule such as ``"Read(//home/a/.omnigent/attachments/k/**)"``, or
+        ``None`` when the path cannot be expressed exactly as a rule pattern.
+    """
+    if not directory.is_absolute():
+        return None
+    if isinstance(directory, PureWindowsPath):
+        drive = directory.drive
+        if len(drive) != 2 or drive[1] != ":":
+            return None
+        posix_path = "/".join(("", drive[0].lower(), *directory.parts[1:]))
+    else:
+        posix_path = directory.as_posix()
+    if any(char in posix_path for char in "*?[]{}\\"):
+        return None
+    return f"Read(/{posix_path.rstrip('/')}/**)"
 
 
 def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
@@ -2931,7 +2975,8 @@ def augment_claude_args(
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Optional raw ``AgentSpec.instructions``
         (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag.
+        Code's native ``--append-system-prompt`` flag, placed before a
+        caller-supplied inline prompt instead of replacing it.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -2974,8 +3019,7 @@ def augment_claude_args(
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    if append_system_prompt:
-        args.extend(["--append-system-prompt", append_system_prompt])
+    args = _merge_append_system_prompt(args, append_system_prompt)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -3060,6 +3104,41 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
         return args
     existing = [tool for tool in args[value_idx].split(",") if tool]
     args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
+    return args
+
+
+def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
+    """Put ``extra`` before the caller's ``--append-system-prompt`` value.
+
+    Claude Code keeps only the last value of the flag, so ``extra`` joins that
+    value in place, or a new flag carries it. The scan stops at a bare ``--``.
+    Other caller tokens, including an ``--append-system-prompt-file``, are left
+    as they are. Claude Code 2.1.295+ applies such a file before the inline
+    prompt; 2.1.161 and 2.1.278 refuse to start with both.
+
+    :param args: Claude CLI argument list to mutate-and-return.
+    :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
+    :returns: ``args`` whose last prompt value carries both prompts.
+    """
+    if not extra:
+        return args
+    flag = "--append-system-prompt"
+    joined_prefix = f"{flag}="
+    location: tuple[int, int] | None = None
+    idx = 0
+    while idx < len(args) and args[idx] != "--":
+        if args[idx].startswith(joined_prefix):
+            location = (idx, len(joined_prefix))
+        elif args[idx] == flag and idx + 1 < len(args):
+            location = (idx + 1, 0)
+            idx += 1
+        idx += 1
+    if location is None:
+        args.extend([flag, extra])
+        return args
+    value_idx, offset = location
+    existing = args[value_idx][offset:]
+    args[value_idx] = args[value_idx][:offset] + (f"{extra}\n\n{existing}" if existing else extra)
     return args
 
 
@@ -5104,7 +5183,8 @@ def inject_slash_command(
     )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
-            "Answer the pending Claude question or permission request before changing settings."
+            "Answer the pending Claude question or permission request before changing settings.",
+            nothing_typed=True,
         )
     # Clear any draft the user is mid-typing; otherwise the command below
     # concatenates with their text and Enter submits
@@ -6260,6 +6340,29 @@ def input_box_reads_clear(bridge_dir: Path, *, repaint: bool = False) -> bool:
     return False
 
 
+def terminal_dialog_pending(bridge_dir: Path) -> bool:
+    """
+    Check whether a dialog only the terminal shows still holds Claude Code.
+
+    The dialogs :func:`_terminal_dialog_headline` names (a settings error, an
+    exit confirmation, an MCP approval) have no web card; the person answers
+    them in the embedded terminal. A launcher's unanswered installation
+    confirmation, printed before Claude Code runs, is answered there too.
+
+    :param bridge_dir: The session's native bridge directory.
+    :returns: ``True`` while such a dialog is on screen; ``False`` once it
+        closed, or when the pane cannot be read.
+    """
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    pane = _capture_pane(socket_path, target)
+    return _terminal_dialog_headline(pane) is not None or launcher_install_prompt(pane)
+
+
 def auto_mode_billing_notice_visible(pane: str) -> bool:
     """Recognize the exact informational notice below the live pane's last rule."""
     return _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_NOTICE)
@@ -7175,8 +7278,9 @@ def _wait_for_claude_prompt_ready(
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
-        A launcher password or installation prompt on two consecutive polls
-        is reported the same way.
+        A launcher password prompt on two consecutive polls is reported the
+        same way; an installation prompt is reported as awaiting an answer,
+        so the delivery holds the message for it.
     :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
@@ -7266,7 +7370,8 @@ def _wait_for_claude_prompt_ready(
             raise ClaudeTerminalDialog(
                 f"Claude Code is waiting for an answer in its terminal ({headline}), "
                 "so the message was not delivered. Open the terminal, answer the "
-                "prompt, then resend your message." + _format_terminal_failure_tail(pane)
+                "prompt, then resend your message." + _format_terminal_failure_tail(pane),
+                awaits_answer=True,
             )
         dialog_headline = headline
         # A launcher asking for a password, e.g. sudo writing managed settings.
@@ -7282,11 +7387,15 @@ def _wait_for_claude_prompt_ready(
         waited_on_password = at_password_prompt
         at_install_prompt = launcher_install_prompt(pane)
         if at_install_prompt and waited_on_install:
+            # Nothing was typed, and the question is answered in this terminal,
+            # so the delivery can hold the message until it is (see
+            # :func:`terminal_dialog_pending`) instead of failing it.
             raise ClaudeTerminalDialog(
                 "Claude Code's launch command is waiting for installation confirmation "
                 "in its terminal, so the message was not delivered. Open the terminal, "
                 "answer the install prompt, then resend your message."
-                + _format_terminal_failure_tail(pane)
+                + _format_terminal_failure_tail(pane),
+                awaits_answer=True,
             )
         waited_on_install = at_install_prompt
         # A launcher sign-in prompt printed before Claude Code runs: an address
@@ -8831,7 +8940,30 @@ def _call_mcp_tool(
         conversation_id=read_active_session_id(bridge_dir),
     )
     result = tools[name].invoke(json.dumps(arguments), ctx)
-    return {"content": [{"type": "text", "text": result}]}
+    response: _JsonObject = {"content": [{"type": "text", "text": result}]}
+    if _local_result_is_error(result):
+        response["isError"] = True
+    return response
+
+
+def _local_result_is_error(result: object) -> bool:
+    """Whether a bridge-local tool's JSON result reports an error.
+
+    Relay-routed calls get ``isError`` from
+    :func:`omnigent.runtime.mcp_tool_result.mcp_response_from_tool_result`;
+    the local ``sys_os_*`` tools served outside an active turn return the same
+    ``{"error": ...}`` / ``{"blocked": true}`` shapes and must flag them the
+    same way, or the model reads a failure as a result.
+    """
+    if not isinstance(result, str):
+        return False
+    try:
+        payload = json.loads(result)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("blocked") is True or bool(payload.get("error"))
 
 
 def _read_relay_tool_names(bridge_dir: Path) -> set[str]:
@@ -10894,6 +11026,27 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
         return f"{text.rstrip()}\n\n{_login_guidance()}"
     return text
+
+
+def program_status_turn_error(text: str) -> tuple[str, str]:
+    """
+    Name the error code and display text for an error Claude reported itself.
+
+    Claude Code refuses a turn whose context is already full before calling
+    the model: it ends the turn with "Prompt is too long" in its terminal
+    status and fires no ``StopFailure`` hook, so that status is the only
+    record of the cause. The text gets the same rewrite as a ``StopFailure``
+    message, and an overflow gets its own code so the failure card describes
+    it instead of a generic turn error.
+
+    :param text: Claude's error text, e.g. ``"Prompt is too long"``.
+    :returns: ``(code, message)``, e.g. ``("context_length_exceeded",
+        "Context limit reached — ...")``; other errors keep
+        ``"native_turn_error"``.
+    """
+    if _CONTEXT_OVERFLOW_RE.match(text.strip()):
+        return "context_length_exceeded", _CONTEXT_OVERFLOW_REPLACEMENT
+    return "native_turn_error", _display_text(text, is_api_error=True)
 
 
 def _stripped_image_placeholder(source: _JsonObject) -> str:

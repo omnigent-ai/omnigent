@@ -7726,9 +7726,10 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
 
     ``updated_at`` drives sidebar ordering, so the tunnel replica's
     per-tunnel liveness stamps and per-transition status/pending writes
-    must not reorder the list. Round-trips all three columns:
+    must not reorder the list. Round-trips every live-state column:
     ``runner_last_seen`` (bulk by runner, cleared on disconnect),
-    ``live_status`` (enum round-trip), ``pending_elicitation_count``.
+    ``live_status`` (enum round-trip), ``pending_elicitation_count``,
+    ``background_work_running``, ``blocked_on``.
     """
     from omnigent.stores.conversation_store import runner_seen_is_fresh
 
@@ -7759,19 +7760,172 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     connectivity = conversation_store.get_session_connectivity([conv_a.id])
     assert connectivity[conv_a.id].runner_last_seen is None
 
-    # Status + pending count round-trip through the entity.
+    # Status, pending count and background flag round-trip through the entity.
+    assert before.background_work_running is None
     conversation_store.set_session_live_status(conv_a.id, "running")
     conversation_store.set_pending_elicitation_count(conv_a.id, 2)
+    conversation_store.set_background_work_running(conv_a.id, True)
     updated = conversation_store.get_conversation(conv_a.id)
     assert updated is not None
     assert updated.live_status == "running"
     assert updated.pending_elicitation_count == 2
+    assert updated.background_work_running is True
+    # A guarded clear for another runner leaves the flag; one for the bound runner clears it.
+    conversation_store.set_background_work_running(conv_a.id, False, runner_id="runner_other")
+    kept = conversation_store.get_conversation(conv_a.id)
+    assert kept is not None and kept.background_work_running is True
+    # The runner reconnected at 2,000: a clear for "unseen since 2,000" keeps its report.
+    conversation_store.touch_runner_liveness(["runner_live"], now=2_000)
+    conversation_store.set_background_work_running(
+        conv_a.id, False, runner_id="runner_live", unseen_since=2_000
+    )
+    kept = conversation_store.get_conversation(conv_a.id)
+    assert kept is not None and kept.background_work_running is True
+    conversation_store.set_background_work_running(
+        conv_a.id, False, runner_id="runner_live", unseen_since=2_001
+    )
+    conversation_store.set_blocked_on(conv_a.id, "permission prompt")
+    cleared = conversation_store.get_conversation(conv_a.id)
+    assert cleared is not None and cleared.background_work_running is False
+    assert cleared.blocked_on == "permission prompt"
+    conversation_store.set_blocked_on(conv_a.id, None)
+    unparked = conversation_store.get_conversation(conv_a.id)
+    assert unparked is not None and unparked.blocked_on is None
 
     # None of the live-state writes moved updated_at.
     assert updated.updated_at == before.updated_at
 
     # Empty runner list is a no-op (no query, no error).
     conversation_store.touch_runner_liveness([], now=1)
+
+
+def test_background_flag_keeps_the_newest_report_and_resets_with_the_runner(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    An older report never overwrites a newer one, and a runner change resets the flag.
+
+    Only the bound runner reports the flag, so a session moved to another runner
+    or unbound from one would otherwise keep the old runner's value forever.
+    """
+    conv = conversation_store.create_conversation(title="background")
+    assert conversation_store.set_runner_id(conv.id, "runner_a")
+
+    def flag() -> bool | None:
+        current = conversation_store.get_conversation(conv.id)
+        assert current is not None
+        return current.background_work_running
+
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_a", reported_at=2_000
+    )
+    conversation_store.set_background_work_running(
+        conv.id, False, runner_id="runner_a", reported_at=1_000
+    )
+    assert flag() is True
+    conversation_store.set_background_work_running(
+        conv.id, False, runner_id="runner_a", reported_at=3_000
+    )
+    assert flag() is False
+
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_a", reported_at=4_000
+    )
+    conversation_store.replace_runner_id(conv.id, "runner_b")
+    assert flag() is None
+    # The new runner's clock is not compared with the old one's.
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_b", reported_at=10
+    )
+    assert flag() is True
+
+    conversation_store.clear_runner_id(conv.id)
+    assert flag() is None
+
+    conversation_store.set_background_work_running(conv.id, True, reported_at=5_000)
+    assert conversation_store.set_runner_id(conv.id, "runner_c")
+    assert flag() is None
+
+
+def test_runner_change_resets_a_flag_stored_after_the_row_was_read(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A runner change resets a flag the old runner stored after the row was read.
+
+    Without a row lock, as on MySQL and PostgreSQL, the old runner's report can
+    commit between the store reading the session and writing the new runner.
+    """
+    from sqlalchemy.orm import object_session
+
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    conv = conversation_store.create_conversation(title="background")
+    assert conversation_store.set_runner_id(conv.id, "runner_a")
+    bind_runner = store_mod._bind_runner
+    table = SqlConversationMetadata.__table__
+
+    def report_lands_then_bind(meta: SqlConversationMetadata, runner_id: str | None) -> None:
+        # The old runner's report reaches the row, but not the copy already loaded.
+        session = object_session(meta)
+        assert session is not None
+        session.execute(
+            table.update()
+            .where(table.c.workspace_id == meta.workspace_id, table.c.id == meta.id)
+            .values(background_work_running=True, background_work_reported_at=4_000)
+        )
+        bind_runner(meta, runner_id)
+
+    monkeypatch.setattr(store_mod, "_bind_runner", report_lands_then_bind)
+    conversation_store.replace_runner_id(conv.id, "runner_b")
+    monkeypatch.setattr(store_mod, "_bind_runner", bind_runner)
+
+    moved = conversation_store.get_conversation(conv.id)
+    assert moved is not None and moved.background_work_running is None
+    conversation_store.set_background_work_running(
+        conv.id, True, runner_id="runner_b", reported_at=10
+    )
+    reported = conversation_store.get_conversation(conv.id)
+    assert reported is not None and reported.background_work_running is True
+
+
+def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    Moving a session to another host's runner, and moving it back, reset the flag.
+
+    Each runner's reports are compared only with its own, so the new runner's
+    first report is accepted whatever its time.
+    """
+    store = conversation_store
+    host_id = "c" * 32
+    _register_host(db_uri, host_id)
+    store.create_conversation(
+        runner_id="runner_b", host_id=host_id, workspace="/repo", git_branch="main"
+    )
+    target = store.create_conversation(runner_id="runner_a")
+    store.set_background_work_running(target.id, True, runner_id="runner_a", reported_at=4_000)
+    previous = store.get_conversation(target.id)
+    assert previous is not None
+
+    def flag() -> bool | None:
+        current = store.get_conversation(target.id)
+        assert current is not None
+        return current.background_work_running
+
+    store.reassign_runner_with_host(target.id, host_id, "runner_b", expected_runner_id="runner_a")
+    assert flag() is None
+    store.set_background_work_running(target.id, True, runner_id="runner_b", reported_at=10)
+    assert flag() is True
+
+    assert store.rollback_runner_reassignment(
+        previous, expected_runner_id="runner_b", expected_host_id=host_id
+    )
+    assert flag() is None
+    store.set_background_work_running(target.id, False, runner_id="runner_a", reported_at=1)
+    assert flag() is False
 
 
 def test_clear_runner_liveness_not_after_spares_a_newer_stamp(
@@ -8292,8 +8446,8 @@ def test_list_conversations_acl_with_cursor_pagination(
 ) -> None:
     """Cursor pagination composes with the ACL filter: walking every page
     yields exactly the granted rows (no leak, no overlap, none lost), and a
-    NON-granted conversation used as the cursor still returns the granted
-    rows that follow it — an empty page would not satisfy this.
+    NON-granted conversation used as the cursor is rejected as stale, since
+    paging from it would compare its sort key against the caller's rows.
 
     Owns the ACL-vs-cursor COMPOSITION: removing the filter (``needs_meta_filter
     = False``) fails here, because the ungranted rows appear. It deliberately
@@ -8325,13 +8479,57 @@ def test_list_conversations_acl_with_cursor_pagination(
     assert set(seen) == granted
     assert seen == [convs[0].id, convs[1].id, convs[4].id, convs[5].id]
 
-    # A non-granted conversation (c2, positioned between granted rows) as
-    # the cursor: position filter only, ACL still applied — so the result is
-    # exactly the granted rows after it, not an empty page.
-    page3 = conversation_store.list_conversations(
-        accessible_by="alice@example.com", limit=10, after=convs[2].id
-    )
-    assert [c.id for c in page3.data] == [convs[4].id, convs[5].id]
+    # A non-granted conversation (c2, positioned between granted rows) as the
+    # cursor fails like a deleted one rather than positioning the page.
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_conversations(
+            accessible_by="alice@example.com", limit=10, after=convs[2].id
+        )
+
+
+@pytest.mark.parametrize("sort_by", ["updated_at", "created_at"])
+@pytest.mark.parametrize("direction", ["after", "before"])
+@pytest.mark.parametrize("scope", ["accessible_by", "owned_by"])
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
+def test_list_cursor_on_ungranted_session_reveals_nothing(
+    request: pytest.FixtureRequest, store_fixture: str, scope: str, direction: str, sort_by: str
+) -> None:
+    """A cursor naming another user's private session can't position a page.
+
+    Otherwise which of the caller's own sessions come back would reveal how the
+    private session's sort key compares with theirs.
+    """
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
+    perms = _acl_perms(store._engine.url.render_as_string(hide_password=False))
+    # A read grant is enough to page an accessible listing; owned listings need ownership.
+    caller_level = LEVEL_READ if scope == "accessible_by" else LEVEL_OWNER
+    probes = [store.create_conversation(title=title) for title in ("first probe", "second probe")]
+    for probe in probes:
+        perms.grant("alice@example.com", probe.id, caller_level)
+    secret = store.create_conversation(title="secret")
+    perms.grant("bob@example.com", secret.id, LEVEL_OWNER)
+
+    def _page(**cursor: str) -> list[str]:
+        return [
+            c.id
+            for c in store.list_conversations(
+                **{scope: "alice@example.com"},  # type: ignore[arg-type]
+                **cursor,  # type: ignore[arg-type]
+                sort_by=sort_by,
+                order="asc",
+            ).data
+        ]
+
+    with pytest.raises(StaleCursorError):
+        _page(**{direction: secret.id})
+    # The caller's own cursors still page.
+    first, second = _page()
+    if direction == "after":
+        assert _page(after=first) == [second]
+    else:
+        assert _page(before=second) == [first]
 
 
 def test_list_projects_single_db_uses_exists_pushdown(
@@ -9255,3 +9453,83 @@ def test_profiled_host_binding_rejects_stale_rollback_state(conversation_store, 
             expected_binding=previous,
         )
     assert conversation_store.get_profile_host_binding(conversation.id) == current
+
+
+def test_list_conversations_sort_by_id_pages_a_spawn_tree_in_id_order(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``sort_by="id"`` orders one spawn tree by id, the order of the
+    ``(workspace_id, root_conversation_id, id)`` index, so a capped read of
+    the tree examines at most the cap; cursors page through it."""
+    root = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id
+    )
+    grandchildren = [
+        conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=child.id)
+        for _ in range(3)
+    ]
+    other = conversation_store.create_conversation()
+    conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=other.id)
+    expected = sorted([child.id, *(g.id for g in grandchildren)])
+
+    first = conversation_store.list_conversations(
+        limit=2, kind="sub_agent", root_conversation_id=root.id, order="asc", sort_by="id"
+    )
+    rest = conversation_store.list_conversations(
+        limit=10,
+        after=first.last_id,
+        kind="sub_agent",
+        root_conversation_id=root.id,
+        order="asc",
+        sort_by="id",
+    )
+
+    assert [c.id for c in first.data] == expected[:2]
+    assert first.has_more is True
+    assert [c.id for c in rest.data] == expected[2:]
+    assert rest.has_more is False
+
+
+def test_spawn_tree_read_examines_rows_through_the_root_index(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``list_spawn_tree`` (no kind or archived filter, ``sort_by="id"``)
+    is served in index order with no sort step, so ``limit`` bounds the rows
+    examined even when the tree holds many archived sub-agents."""
+    from sqlalchemy import event
+
+    if conversation_store._conv_engine.dialect.name != "sqlite":
+        pytest.skip("SQLite EXPLAIN QUERY PLAN only; other dialects keep the behavioural coverage")
+    root = conversation_store.create_conversation()
+    for i in range(30):
+        child = conversation_store.create_conversation(
+            kind="sub_agent", parent_conversation_id=root.id
+        )
+        if i % 2:
+            conversation_store.update_conversation(child.id, archived=True)
+    engine = conversation_store._conv_engine
+    statements: list[tuple[str, Any]] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, params: Any, *_: Any) -> None:
+        if "root_conversation_id" in statement and "ORDER BY" in statement:
+            statements.append((statement, params))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        page = conversation_store.list_spawn_tree(root.id, limit=5)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert len(page.data) == 5 and page.has_more
+    # Every read the tree load issues (rows, then SQLite insertion-order
+    # tiebreakers) walks the root index with no sort step.
+    assert len(statements) == 2
+    with engine.connect() as conn:
+        for statement, params in statements:
+            plan = " ".join(
+                str(row[-1])
+                for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, params)
+            )
+            assert "ix_conversations_root_conversation_id" in plan, plan
+            assert "TEMP B-TREE" not in plan, plan
