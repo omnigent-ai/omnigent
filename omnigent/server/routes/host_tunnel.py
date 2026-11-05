@@ -27,10 +27,11 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any
 
 import anyio
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
@@ -286,7 +287,13 @@ def create_host_tunnel_router(
                     and len(sandbox_config.configs) == 1
                     and sandbox_config.default.provider is None
                 ):
-                    provider_config = sandbox_config.default
+                    try:
+                        launcher = await asyncio.to_thread(sandbox_config.default.launcher_factory)
+                    except HTTPException:
+                        pass
+                    else:
+                        if launcher.provider == managed.sandbox_provider:
+                            provider_config = sandbox_config.default
                 if provider_config is not None:
                     managed_token_ttl_s = provider_config.token_ttl_s
         elif auth_provider is not None:
@@ -1318,6 +1325,7 @@ async def _heartbeat_loop(
     failure_count = 0
     last_failure_log_at = 0.0
     next_token_renewal_at = 0.0
+    heartbeat_cancelled = threading.Event()
     while True:
         await requested.wait()
         requested.clear()
@@ -1332,10 +1340,13 @@ async def _heartbeat_loop(
                     host_id,
                     managed_token=managed_token,
                     token_ttl_s=renewal_ttl_s,
+                    observed_at=now_epoch(),
+                    cancelled=heartbeat_cancelled.is_set,
                 )
             else:
                 await asyncio.to_thread(host_store.heartbeat, host_id)
         except asyncio.CancelledError:
+            heartbeat_cancelled.set()
             raise
         except Exception as exc:  # noqa: BLE001 -- persistence must not kill the tunnel
             failure_count += 1

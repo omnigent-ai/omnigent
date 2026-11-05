@@ -7,12 +7,13 @@ import contextlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import anyio
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -378,9 +379,15 @@ async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
         await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
 
 
+@pytest.mark.parametrize(
+    ("managed", "offline_fails"), [(False, False), (True, False), (True, True)]
+)
 async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    managed: bool,
+    offline_fails: bool,
 ) -> None:
     """A slow store write cannot block pings or race the offline transition."""
     import omnigent.server.routes.host_tunnel as tunnel_mod
@@ -389,24 +396,51 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
 
     app, registry, store = host_app
+    token = "blocked-heartbeat-token"
+    if managed:
+        _register_managed(store, host_id=_HOST_ID, token=token)
+        config = ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=FakeSandboxLauncher,
+            token_ttl_s=7200,
+            provider="modal",
+        )
+        app = FastAPI()
+        app.include_router(
+            create_host_tunnel_router(
+                registry, store, sandbox_config=ManagedSandboxDeployment.single(config)
+            ),
+            prefix="/v1",
+        )
+    if offline_fails:
+
+        def fail_offline(_host_id: str, **kwargs) -> None:
+            raise RuntimeError("offline persistence failed")
+
+        monkeypatch.setattr(store, "set_offline", fail_offline)
     original_heartbeat = store.heartbeat
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
     calls = 0
 
-    def slow_heartbeat(host_id: str) -> None:
+    def slow_heartbeat(host_id: str, **kwargs) -> None:
         nonlocal calls
         calls += 1
         started.set()
         release.wait(timeout=budget(5.0))
         try:
-            original_heartbeat(host_id)
+            original_heartbeat(host_id, **kwargs)
         finally:
             finished.set()
 
     monkeypatch.setattr(store, "heartbeat", slow_heartbeat)
-    comm = await _connect_route(app, _TUNNEL_PATH)
+    if managed:
+        comm = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+        await comm.send_input({"type": "websocket.connect"})
+        assert (await comm.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+    else:
+        comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
     try:
         assert await asyncio.to_thread(started.wait, budget(1.0))
@@ -414,10 +448,14 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
         await _receive_ping_and_pong(comm)
         assert registry.get(_HOST_ID) is not None
         assert calls == 1
+        with Session(get_or_create_engine(db_uri)) as session:
+            row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()
+            before = (row.updated_at, row.token_expires_at)
 
         await comm.send_input({"type": "websocket.disconnect", "code": 1000})
         await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
-        await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
+        if not offline_fails:
+            await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
         await comm.wait(timeout=budget(2.0))
     finally:
         release.set()
@@ -426,9 +464,14 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
             await comm.wait(timeout=budget(2.0))
 
     await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
-    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
     assert calls == 1
-    assert not store.is_online(_HOST_ID)
+    assert store.is_online(_HOST_ID) == offline_fails
+    if managed:
+        with Session(get_or_create_engine(db_uri)) as session:
+            row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()
+            assert row.token_expires_at == before[1]
+            if offline_fails:
+                assert row.updated_at == before[0]
 
 
 @pytest.mark.parametrize("wall_clock_step", [-3600.0, 0.0, 3600.0])
@@ -1664,14 +1707,24 @@ async def test_managed_heartbeat_renews_only_when_due_and_retries_failure(
 
     clock = 100.0
     monkeypatch.setattr(tunnel_mod, "monotonic", lambda: clock)
+    monkeypatch.setattr(tunnel_mod, "now_epoch", lambda: int(clock))
     requested = asyncio.Event()
     completed: asyncio.Queue[tuple[str | None, int | None]] = asyncio.Queue()
     loop = asyncio.get_running_loop()
     store = HostStore(db_uri)
     fail = False
 
-    def heartbeat(host_id: str, *, managed_token: str | None, token_ttl_s: int | None) -> None:
+    def heartbeat(
+        host_id: str,
+        *,
+        managed_token: str | None,
+        token_ttl_s: int | None,
+        observed_at: int,
+        cancelled: Callable[[], bool],
+    ) -> None:
         assert host_id == _HOST_ID
+        assert observed_at == int(clock)
+        assert not cancelled()
         try:
             if fail:
                 raise RuntimeError("temporary renewal failure")
@@ -1705,11 +1758,15 @@ async def test_managed_heartbeat_renews_only_when_due_and_retries_failure(
             await task
 
 
-@pytest.mark.parametrize("provider", [None, "modal", "daytona"])
+@pytest.mark.parametrize(
+    ("provider", "launcher_provider"),
+    [(None, "modal"), (None, "daytona"), (None, None), ("modal", "modal"), ("daytona", "daytona")],
+)
 async def test_managed_heartbeat_renews_token_for_reconnect(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     provider: str | None,
+    launcher_provider: str | None,
 ) -> None:
     """An authenticated live tunnel keeps its token usable beyond launch expiry."""
     import omnigent.server.routes.host_tunnel as tunnel_mod
@@ -1720,9 +1777,17 @@ async def test_managed_heartbeat_renews_token_for_reconnect(
     elapsed = 0.0
     monkeypatch.setattr(tunnel_mod, "monotonic", lambda: elapsed)
     token_ttl_s = 600
+    launcher = FakeSandboxLauncher()
+    monkeypatch.setattr(launcher, "provider", launcher_provider)
+
+    def launcher_factory() -> FakeSandboxLauncher:
+        if launcher_provider is None:
+            raise HTTPException(status_code=400, detail="provider unavailable")
+        return launcher
+
     config = ManagedSandboxConfig(
         server_url="https://managed-test.example.com",
-        launcher_factory=FakeSandboxLauncher,
+        launcher_factory=launcher_factory,
         token_ttl_s=token_ttl_s,
         provider=provider,
     )
@@ -1745,7 +1810,7 @@ async def test_managed_heartbeat_renews_token_for_reconnect(
         create_host_tunnel_router(registry, store, sandbox_config=deployment), prefix="/v1"
     )
     token = "long-lived-sandbox-token"
-    should_renew = provider != "daytona"
+    should_renew = provider == "modal" or (provider is None and launcher_provider == "modal")
     _register_managed(store, host_id=_HOST_ID, token=token)
     communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
     await communicator.send_input({"type": "websocket.connect"})
@@ -1756,6 +1821,7 @@ async def test_managed_heartbeat_renews_token_for_reconnect(
         renewed_at = now_epoch() + 7 * 24 * 3600
         elapsed += 7 * 24 * 3600
         monkeypatch.setattr(store_mod, "now_epoch", lambda: renewed_at)
+        monkeypatch.setattr(tunnel_mod, "now_epoch", lambda: renewed_at)
         await _wait_updated_at_at_least(store, _HOST_ID, renewed_at)
         if should_renew:
             await poll_until_async(

@@ -572,14 +572,18 @@ def test_heartbeat_noop_for_unknown_host(host_store: HostStore) -> None:
 
 
 @pytest.mark.parametrize(("expires_in", "token_ttl_s"), [(30, 60), (3600, 60), (30, None)])
+@pytest.mark.parametrize(
+    "write_state", ["ready", "delayed", "observed", "cancelled-before", "cancelled-after"]
+)
 def test_managed_heartbeat_renews_connected_host_token(
     host_store: HostStore,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     expires_in: int,
     token_ttl_s: int | None,
+    write_state: str,
 ) -> None:
-    """An authenticated connection renews without shortening or rotating its token."""
+    """Renewal uses observed liveness and stops when its tunnel is abandoned."""
     host_id = uuid.uuid4().hex
     started_at = now_epoch()
     host_store.register_managed_host(
@@ -591,41 +595,62 @@ def test_managed_heartbeat_renews_connected_host_token(
         sandbox_id="sandbox",
         token_expires_at=started_at + expires_in,
     )
-    host_store.upsert_on_connect(
+    connected = host_store.upsert_on_connect(
         host_id, "connected-sandbox", "alice@example.com", managed_token="launch-token"
     )
     heartbeat_at = started_at + 40
-    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: heartbeat_at)
+    current_time = heartbeat_at + (1000 if write_state == "observed" else 0)
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: current_time)
     if expires_in < 40:
         assert host_store.resolve_launch_token(host_id, "launch-token") is None
 
+    def delayed_transaction(*args, **kwargs):
+        nonlocal current_time
+        current_time += 1000
+        return run_write_transaction(*args, **kwargs)
+
+    if write_state == "delayed":
+        monkeypatch.setattr(
+            "omnigent.stores.host_store.run_write_transaction", delayed_transaction
+        )
+    cancelled = threading.Event()
+    if write_state == "cancelled-before":
+        cancelled.set()
     statements: list[str] = []
 
     def record_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
         statements.append(statement)
+        if write_state == "cancelled-after" and statement.startswith("UPDATE hosts"):
+            cancelled.set()
 
     engine = get_or_create_engine(db_uri)
-    event.listen(engine, "before_cursor_execute", record_statement)
+    event.listen(engine, "after_cursor_execute", record_statement)
     try:
-        host_store.heartbeat(host_id, managed_token="launch-token", token_ttl_s=token_ttl_s)
+        host_store.heartbeat(
+            host_id,
+            managed_token="launch-token",
+            token_ttl_s=token_ttl_s,
+            observed_at=heartbeat_at if write_state == "observed" else None,
+            cancelled=cancelled.is_set,
+        )
     finally:
-        event.remove(engine, "before_cursor_execute", record_statement)
+        event.remove(engine, "after_cursor_execute", record_statement)
     if token_ttl_s is None:
         operations = [statement.split()[0] for statement in statements]
-        assert [operation for operation in operations if operation not in {"PRAGMA", "BEGIN"}] == [
-            "UPDATE"
-        ]
+        assert [operation for operation in operations if operation not in {"PRAGMA", "BEGIN"}] == (
+            [] if write_state == "cancelled-before" else ["UPDATE"]
+        )
 
     expected_expiry = started_at + expires_in
-    if token_ttl_s is not None:
+    if token_ttl_s is not None and not cancelled.is_set():
         expected_expiry = max(expected_expiry, heartbeat_at + token_ttl_s)
     with Session(get_or_create_engine(db_uri)) as session:
         row = session.get(SqlHost, (current_workspace_id(), host_id))
         assert row is not None
         assert row.token_expires_at == expected_expiry
-        assert row.updated_at == heartbeat_at
+        assert row.updated_at == (connected.updated_at if cancelled.is_set() else heartbeat_at)
     assert (host_store.resolve_launch_token(host_id, "launch-token") is not None) == (
-        expected_expiry >= heartbeat_at
+        expected_expiry >= current_time
     )
 
 

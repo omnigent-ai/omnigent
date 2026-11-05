@@ -683,6 +683,8 @@ class HostStore:
         *,
         managed_token: str | None = None,
         token_ttl_s: int | None = None,
+        observed_at: int | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
@@ -703,12 +705,16 @@ class HostStore:
             Guards against renewing a revoked or replaced sandbox generation.
         :param token_ttl_s: Provider's validity window when renewal is due.
             ``None`` persists only liveness, keeping the existing expiry.
+        :param observed_at: Timestamp captured before dispatching the heartbeat.
+        :param cancelled: Whether the originating tunnel abandoned this write.
         """
         if token_ttl_s is not None and (managed_token is None or token_ttl_s <= 0):
             raise ValueError("token renewal requires a managed token and a positive TTL")
+        updated_at = now_epoch() if observed_at is None else observed_at
 
         def write(session: Session) -> None:
-            updated_at = now_epoch()
+            if cancelled is not None and cancelled():
+                return
             statement = (
                 update(SqlHost)
                 .where(
@@ -743,6 +749,9 @@ class HostStore:
                         )
                     )
             session.execute(statement)
+            # UPDATE may wait for a row lock after the tunnel has disconnected.
+            if cancelled is not None and cancelled():
+                session.rollback()
 
         run_write_transaction(self._session_immediate, "update_host_heartbeat", write)
 
