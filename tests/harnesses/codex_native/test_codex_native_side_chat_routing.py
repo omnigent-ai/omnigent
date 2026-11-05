@@ -31,7 +31,8 @@ def test_side_chat_text_from_content_joins_text_blocks() -> None:
         )
         == "a\nb"
     )
-    assert _side_chat_text_from_content("nope") == ""  # not a list
+    assert _side_chat_text_from_content("typed  ") == "typed"  # plain text is typed text
+    assert _side_chat_text_from_content(None) == ""
     assert _side_chat_text_from_content([]) == ""
 
 

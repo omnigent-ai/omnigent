@@ -1209,7 +1209,9 @@ class CodexNativeExecutor(Executor):
                 else:
                     try:
                         _require_codex_binding(self._bridge_dir, state)
-                        side_question = side_chat.side_chat_question(input_items)
+                        side_question = side_chat.side_chat_question_from_content(
+                            latest_user_content
+                        )
                         if shell_command is not None:
                             await _run_codex_shell_command(
                                 client,

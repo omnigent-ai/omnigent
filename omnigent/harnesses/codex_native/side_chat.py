@@ -16,7 +16,7 @@ Process split (native Codex runs across processes; each helper lives where its
 inputs do):
 
 * The **executor** (which injects turns via a bridge-state app-server client)
-  detects ``/side`` and opens the fork: :func:`side_chat_question` +
+  detects ``/side`` and opens the fork: :func:`side_chat_question_from_content` +
   :func:`open_side_chat_on_client`.
 * The **forwarder** (which watches the app-server event stream and holds the
   ``_CodexForwarderState`` + Omnigent HTTP client) auto-surfaces the fork as a
@@ -97,13 +97,15 @@ def side_chat_question_from_text(text: str) -> str | None:
 
 def side_chat_text_from_content(content: object) -> str:
     """
-    Join the user text of message content blocks, as the runner reads a message.
+    Join the text the user typed into a message, ignoring attachments.
 
-    :param content: A message body's ``content`` list, e.g.
+    :param content: A message's content: a string, or a list of blocks, e.g.
         ``[{"type": "input_text", "text": "and why?"}]``.
     :returns: The concatenated text with leading indentation preserved, or
         ``""`` when there is none.
     """
+    if isinstance(content, str):
+        return content.rstrip()
     if not isinstance(content, list):
         return ""
     parts: list[str] = []
@@ -119,8 +121,9 @@ def side_chat_question_from_content(content: object) -> str | None:
     """
     Return the question when a message's content is a ``/side`` command.
 
-    Reads the content exactly as the runner does before it forks, so a check
-    on the server sees every command the runner would act on.
+    Only typed text counts, never an attachment's contents. The server's owner
+    check, the runner and the executor all decide with this one function, so
+    none of them acts on a command the others don't see.
 
     :param content: A message body's ``content`` list, e.g.
         ``[{"type": "input_text", "text": "/side why?"}]``.
@@ -143,26 +146,6 @@ def is_side_chat_command(text: str) -> bool:
         main thread.
     """
     return side_chat_question_from_text(text) is not None
-
-
-def side_chat_question(input_items: list[_JsonObject]) -> str | None:
-    """
-    Return the question when normalized turn input is a ``/side`` command.
-
-    :param input_items: Codex ``turn/start`` input items, e.g.
-        ``[{"type": "text", "text": "/side why?"}]``.
-    :returns: The question with leading indentation preserved, or ``None`` when
-        the input is not a single ``/side <question>`` text item.
-    """
-    if len(input_items) != 1:
-        return None
-    item = input_items[0]
-    if item.get("type") != "text":
-        return None
-    text = item.get("text")
-    if not isinstance(text, str):
-        return None
-    return side_chat_question_from_text(text)
 
 
 async def fork_ephemeral_side_thread(

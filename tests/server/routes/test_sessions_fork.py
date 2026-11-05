@@ -799,6 +799,25 @@ async def test_only_the_owner_starts_and_lists_side_chats(
             headers=headers[editor],
         )
         assert smuggled.status_code == 403, smuggled.text
+    # A text attachment is an ordinary message: its contents never act as /side.
+    attached = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "filename": "note.txt",
+                        "file_data": "data:text/plain;base64,L3NpZGUgd2h5Pw==",
+                    }
+                ],
+            },
+        },
+        headers=headers[editor],
+    )
+    assert attached.status_code == 202, attached.text
     # Ordinary forks still need only read access.
     assert (await fork(reader, {})).status_code == 201
     started = await fork(owner, {"side_chat": True})

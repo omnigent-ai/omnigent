@@ -84,26 +84,39 @@ def _fork_started(
 
 
 # --------------------------------------------------------------------------- #
-# side_chat_question — /side detection on normalized turn input
+# side_chat_question_from_content — /side detection on typed message text
 # --------------------------------------------------------------------------- #
 def test_side_chat_question_extracts_question() -> None:
-    assert side_chat.side_chat_question(_text_items("/side why is the sky blue?")) == (
-        "why is the sky blue?"
+    assert side_chat.side_chat_question_from_content(
+        _text_items("/side why is the sky blue?")
+    ) == ("why is the sky blue?")
+    assert side_chat.side_chat_question_from_content("/side and as a string?") == (
+        "and as a string?"
     )
 
 
 def test_side_chat_question_preserves_first_line_indentation() -> None:
-    assert side_chat.side_chat_question(_text_items("/side   - First\n  - Second")) == (
-        "  - First\n  - Second"
-    )
+    assert side_chat.side_chat_question_from_content(
+        _text_items("/side   - First\n  - Second")
+    ) == ("  - First\n  - Second")
 
 
 def test_side_chat_question_ignores_non_side_and_empty() -> None:
-    assert side_chat.side_chat_question(_text_items("hello")) is None
-    assert side_chat.side_chat_question(_text_items("/sidebar thing")) is None  # needs the space
-    assert side_chat.side_chat_question(_text_items("/side   ")) is None  # empty question
-    assert side_chat.side_chat_question([]) is None
-    assert side_chat.side_chat_question(_text_items("a") + _text_items("b")) is None  # multi-item
+    assert side_chat.side_chat_question_from_content(_text_items("hello")) is None
+    assert side_chat.side_chat_question_from_content(_text_items("/sidebar thing")) is None
+    assert side_chat.side_chat_question_from_content(_text_items("/side   ")) is None
+    assert side_chat.side_chat_question_from_content([]) is None
+    assert side_chat.side_chat_question_from_content(_text_items("a") + _text_items("b")) is None
+
+
+def test_an_attachment_never_reads_as_a_side_command() -> None:
+    attachment = {
+        "type": "input_file",
+        "filename": "note.txt",
+        # "/side why?"
+        "file_data": "data:text/plain;base64,L3NpZGUgd2h5Pw==",
+    }
+    assert side_chat.side_chat_question_from_content([attachment]) is None
 
 
 # --------------------------------------------------------------------------- #
