@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from omnigent.harnesses.claude_native.bridge import (
     write_active_session_id,
 )
 from omnigent.native import native_policy_hook, policy_allow_cache
+from omnigent.native.elicitation_reattach import PRE_RESOLVED_ELICITATION_TTL_S
 from tests.native_hook_helpers import make_failing_client, make_verdict_client
 
 
@@ -1255,10 +1257,10 @@ def test_permission_request_hook_moves_unforwarded_question_to_chat_text(
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
-    holds: list[object] = []
+    windows: list[object] = []
 
     def _no_verdict(*_args: object, **kwargs: object) -> httpx.Response | None:
-        holds.append(kwargs.get("hold_through_outages"))
+        windows.append(kwargs.get("answer_window_s"))
         return httpx.Response(200) if empty_response else None
 
     monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", _no_verdict)
@@ -1278,7 +1280,9 @@ def test_permission_request_hook_moves_unforwarded_question_to_chat_text(
     decision = output["hookSpecificOutput"]["decision"]
     assert decision["behavior"] == "deny"
     assert "normal chat message" in decision["message"]
-    assert holds == [True], "a question must be held through outages before it is denied"
+    assert windows == [
+        PRE_RESOLVED_ELICITATION_TTL_S - claude_native_hook._QUESTION_ANSWER_WINDOW_MARGIN_S
+    ], "a lost question poll keeps retrying only while the server holds its answer"
 
 
 @pytest.mark.parametrize("empty_response", [False, True], ids=["transport-failed", "timed-out"])
@@ -1296,10 +1300,10 @@ def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
-    holds: list[object] = []
+    windows: list[object] = []
 
     def _no_verdict(*_args: object, **kwargs: object) -> httpx.Response | None:
-        holds.append(kwargs.get("hold_through_outages"))
+        windows.append(kwargs.get("answer_window_s"))
         return httpx.Response(200) if empty_response else None
 
     monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", _no_verdict)
@@ -1311,7 +1315,177 @@ def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
 
     assert exit_code == 0
     assert capsys.readouterr().out == ""
-    assert holds == [False], "other tools keep the bounded retry and terminal fallback"
+    assert windows == [None], "other tools keep the bounded retry and terminal fallback"
+
+
+def _run_scripted_permission_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tool_name: str,
+    script: list[tuple[str, float]],
+) -> type:
+    """
+    Run the permission-request hook for one tool call against a scripted server.
+
+    Backoff sleeps advance the fake clock, so elapsed times match production.
+
+    :param tmp_path: Test-scoped temp directory.
+    :param monkeypatch: Patches the bridge root, clock and HTTP client.
+    :param tool_name: Claude tool being gated, e.g. ``"AskUserQuestion"``.
+    :param script: Per-attempt plan for :func:`_scripted_client`.
+    :returns: The scripted client class, whose ``.calls`` holds attempt times.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_outage")
+    payload = {"hook_event_name": "PermissionRequest", "tool_name": tool_name, "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    client = _scripted_client(script=script, monkeypatch=monkeypatch, sleep_advances_clock=True)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    exit_code = claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    return client
+
+
+def _assert_chat_fallback(stdout: str) -> None:
+    """
+    Assert the hook denied a question with the ask-in-chat hint.
+
+    :param stdout: Hook stdout.
+    """
+    assert stdout, "the hook ended without a decision, leaving the question in the terminal"
+    decision = json.loads(stdout)["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "deny"
+    assert "normal chat message" in decision["message"]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "delivered"),
+    [("AskUserQuestion", True), ("Bash", False)],
+    ids=["question", "approval"],
+)
+def test_permission_request_hook_question_answer_survives_a_server_outage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tool_name: str,
+    delivered: bool,
+) -> None:
+    """
+    An answer submitted while the server returns 503s for ~150s reaches Claude.
+
+    The web form shows "Submitted" once the server stores the answer for the
+    lost poll, so the hook must keep re-POSTing until it can claim it. Other
+    prompts still give up after the hard-failure cap.
+    """
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    held = floor + 290.0
+    script = [("severed", held)] + [("5xx", 0.0)] * (cap + 1) + [("ok", 0.0)]
+
+    client = _run_scripted_permission_hook(
+        tmp_path, monkeypatch, tool_name=tool_name, script=script
+    )
+
+    stdout = capsys.readouterr().out
+    if delivered:
+        assert stdout, "the submitted answer never reached Claude"
+        assert json.loads(stdout) == {"ok": True}
+        assert len(client.calls) == cap + 3
+        assert client.calls[-1] - held >= 150.0
+    else:
+        assert stdout == ""
+        assert len(client.calls) == cap + 1, "other prompts keep the hard-failure cap"
+
+
+def test_permission_request_hook_moves_a_question_to_chat_after_its_answer_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An outage that outlasts the server's stored answer moves the question to chat.
+
+    The last re-POST still lands before the server drops an answer submitted
+    when the poll was lost, and the hook then denies instead of exiting silently.
+    """
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+    script = [("severed", held), ("5xx", 0.0)]
+
+    client = _run_scripted_permission_hook(
+        tmp_path, monkeypatch, tool_name="AskUserQuestion", script=script
+    )
+
+    _assert_chat_fallback(capsys.readouterr().out)
+    assert len(client.calls) > claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES + 1
+    last_retry_after_loss = client.calls[-1] - held
+    assert last_retry_after_loss < PRE_RESOLVED_ELICITATION_TTL_S
+    assert last_retry_after_loss == pytest.approx(
+        PRE_RESOLVED_ELICITATION_TTL_S - claude_native_hook._QUESTION_ANSWER_WINDOW_MARGIN_S
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "renewed"),
+    [("401", False), ("403", False), ("403", True)],
+    ids=["401-mint-fails", "403-mint-fails", "403-after-renewal"],
+)
+def test_permission_request_hook_moves_a_rejected_question_to_chat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+    renewed: bool,
+) -> None:
+    """
+    A question the server rejects before any held poll is asked in chat.
+
+    Without a decision, Claude leaves it in a terminal picker a web-only user
+    never sees.
+    """
+    mints: list[int] = []
+
+    def _reauth_factory(
+        _server_url: str, headers: dict[str, str]
+    ) -> Callable[[], dict[str, str] | None]:
+        def _reauth() -> dict[str, str] | None:
+            mints.append(1)
+            return {**headers, "Authorization": "Bearer fresh"} if renewed else None
+
+        return _reauth
+
+    monkeypatch.setattr(native_policy_hook, "policy_hook_reauth", _reauth_factory)
+
+    client = _run_scripted_permission_hook(
+        tmp_path, monkeypatch, tool_name="AskUserQuestion", script=[(status, 0.0)]
+    )
+
+    _assert_chat_fallback(capsys.readouterr().out)
+    assert len(mints) == 1
+    assert len(client.calls) == (2 if renewed else 1), "a rejection must not be retried"
+
+
+def test_permission_request_hook_answers_a_question_before_claudes_hook_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A question whose held polls never get a reply is denied before Claude's timeout.
+
+    Claude kills the hook a day after starting it. No request or backoff may run
+    past that, or the question is left in the terminal picker.
+    """
+    client = _run_scripted_permission_hook(
+        tmp_path, monkeypatch, tool_name="AskUserQuestion", script=[("silent", 0.0)]
+    )
+
+    _assert_chat_fallback(capsys.readouterr().out)
+    # Claude's timer also covers interpreter startup before the hook's clock starts.
+    assert client.clock["t"] <= claude_native_hook._PERMISSION_TIMEOUT_S - 30.0
 
 
 def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set(
@@ -2406,6 +2580,7 @@ def _scripted_client(
     *,
     script: list[tuple[str, float]],
     monkeypatch: pytest.MonkeyPatch,
+    sleep_advances_clock: bool = False,
 ) -> type:
     """Build an httpx.Client stub whose POSTs fail per a scripted plan.
 
@@ -2417,25 +2592,39 @@ def _scripted_client(
       * ``"connect"`` — :class:`httpx.ConnectError` (server never reached: hard)
       * ``"severed"`` — :class:`httpx.RemoteProtocolError` (established then
         dropped: a held-poll sever iff ``held_s`` >= the floor)
+      * ``"silent"``  — :class:`httpx.ReadTimeout` once the attempt's read
+        timeout elapses (a held poll whose reply never arrives; ignores ``held_s``)
       * ``"5xx"``     — a 503 response (hard iff ``held_s`` < the floor; a
         gateway 5xx ending a held poll is a sever)
+      * ``"401"`` / ``"403"`` — an auth rejection
       * ``"ok"``      — a 200 response (the human answered: final)
 
     :param script: Per-attempt ``(kind, held_s)`` plan.
-    :param monkeypatch: Installs the fake clock + no-op sleep.
-    :returns: A drop-in ``httpx.Client`` class; ``.calls`` counts POSTs.
+    :param monkeypatch: Installs the fake clock and sleep.
+    :param sleep_advances_clock: Whether backoff sleeps advance the fake clock;
+        by default they are no-ops.
+    :returns: A drop-in ``httpx.Client`` class; ``.calls`` holds each POST's
+        fake-clock start time and ``.clock["t"]`` the current time.
     """
     clock = {"t": 0.0}
-    calls: list[str] = []
+    calls: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        if sleep_advances_clock:
+            clock["t"] += seconds
 
     monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
-    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(claude_native_hook.time, "sleep", _sleep)
 
     class _ScriptedClient:
-        calls: list[str] = []
+        calls: list[float] = []
+        clock: dict[str, float] = {}
 
-        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
-            del headers, timeout
+        def __init__(
+            self, *, headers: dict[str, str], timeout: httpx.Timeout, **_kwargs: object
+        ) -> None:
+            del headers
+            self._timeout = timeout
 
         def __enter__(self) -> _ScriptedClient:
             return self
@@ -2446,21 +2635,28 @@ def _scripted_client(
         def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
             del json
             i = len(calls)
-            calls.append(url)
+            calls.append(clock["t"])
             kind, held_s = script[i] if i < len(script) else script[-1]
+            if kind == "silent":
+                held_s = self._timeout.read or 0.0
             clock["t"] += held_s  # this attempt "took" held_s before failing
             req = httpx.Request("POST", url)
             if kind == "connect":
                 raise httpx.ConnectError("AP unreachable", request=req)
             if kind == "severed":
                 raise httpx.RemoteProtocolError("server dropped the poll", request=req)
+            if kind == "silent":
+                raise httpx.ReadTimeout("no reply before the read timeout", request=req)
             if kind == "5xx":
                 return httpx.Response(503, text="upstream down", request=req)
+            if kind in ("401", "403"):
+                return httpx.Response(int(kind), text="Invalid Token", request=req)
             if kind == "ok":
                 return httpx.Response(200, json={"ok": True}, request=req)
             raise AssertionError(f"unknown scripted kind {kind!r}")
 
     _ScriptedClient.calls = calls
+    _ScriptedClient.clock = clock
     return _ScriptedClient
 
 
@@ -2487,92 +2683,15 @@ def test_reattach_bounds_consecutive_hard_failures(monkeypatch: pytest.MonkeyPat
     )
 
 
-@pytest.mark.parametrize("kind", ["connect", "5xx"])
-def test_reattach_held_question_outlasts_the_hard_failure_cap(
-    monkeypatch: pytest.MonkeyPatch, kind: str
+@pytest.mark.parametrize("answer_window_s", [None, 270.0], ids=["approval", "question"])
+def test_reattach_5xx_counts_as_hard_failure(
+    monkeypatch: pytest.MonkeyPatch, answer_window_s: float | None
 ) -> None:
-    """A held question keeps retrying a down server until it answers again.
-
-    Giving up would drop the web card and leave the question in a terminal
-    picker a web-only user never sees.
-    """
-    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
-    client = _scripted_client(
-        script=[(kind, 0.0)] * (cap * 3) + [("ok", 0.0)], monkeypatch=monkeypatch
-    )
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
-
-    resp = claude_native_hook._post_hook_with_reattach(
-        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
-        headers={},
-        payload={"hook_event_name": "PermissionRequest"},
-        hook_label="permission",
-        hold_through_outages=True,
-    )
-
-    assert resp is not None and resp.status_code == 200
-    assert len(client.calls) == cap * 3 + 1
-
-
-def test_reattach_held_question_retries_auth_before_its_first_held_poll(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A held question waits out a login that can't be renewed yet, even unparked."""
-    clock = {"t": 0.0}
-    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
-    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
-    seen_auth: list[str] = []
-
-    class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
-            del timeout
-            self._headers = headers
-
-        def __enter__(self) -> _Client:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            del args
-
-        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
-            del json
-            auth = self._headers.get("Authorization", "")
-            seen_auth.append(auth)
-            req = httpx.Request("POST", url)
-            if auth == "Bearer fresh":
-                return httpx.Response(200, json={"ok": True}, request=req)
-            return httpx.Response(403, request=req)
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
-    failed_mints = {"left": 2}
-
-    def _reauth() -> dict[str, str] | None:
-        """
-        Fail to mint until the user has signed in again.
-
-        :returns: Fresh headers once signed in, else ``None``.
-        """
-        failed_mints["left"] -= 1
-        return None if failed_mints["left"] >= 0 else {"Authorization": "Bearer fresh"}
-
-    resp = claude_native_hook._post_hook_with_reattach(
-        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
-        headers={"Authorization": "Bearer stale"},
-        payload={"hook_event_name": "PermissionRequest"},
-        hook_label="permission",
-        reauth=_reauth,
-        hold_through_outages=True,
-    )
-
-    assert resp is not None and resp.status_code == 200
-    assert seen_auth == ["Bearer stale"] * 3 + ["Bearer fresh"], seen_auth
-
-
-def test_reattach_5xx_counts_as_hard_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """A server stuck returning 5xx is a hard failure and is bounded (#1782).
 
     A sick server that keeps 500-ing is the spin just as much as an
-    unreachable one, so it must hit the same cap.
+    unreachable one, so it must hit the same cap. A question gets no answer
+    window before a held poll, since the server holds no answer for it yet.
     """
     client = _scripted_client(script=[("5xx", 0.0)], monkeypatch=monkeypatch)
     monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
@@ -2582,6 +2701,7 @@ def test_reattach_5xx_counts_as_hard_failure(monkeypatch: pytest.MonkeyPatch) ->
         headers={},
         payload={"hook_event_name": "PreToolUse"},
         hook_label="permission",
+        answer_window_s=answer_window_s,
     )
 
     assert resp is None
@@ -3097,10 +3217,18 @@ def test_reattach_auth_rejection_without_renewal(
         assert seen_auth == ["Bearer stale"], "a rejection before any held poll must not retry"
 
 
+@pytest.mark.parametrize("answer_window_s", [None, 270.0], ids=["approval", "question"])
 def test_reattach_auth_lapse_retry_stops_at_deadline(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answer_window_s: float | None,
 ) -> None:
-    """A parked prompt whose login is never renewed backs off, capped, until the deadline."""
+    """
+    A parked prompt whose login is never renewed backs off, capped, then fails ask.
+
+    Approvals retry until the deadline; a question stops when its answer window
+    ends, since the server no longer holds an answer submitted meanwhile.
+    """
     floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
     clock = {"t": 0.0}
     sleeps: list[float] = []
@@ -3140,13 +3268,21 @@ def test_reattach_auth_lapse_retry_stops_at_deadline(
         payload={"hook_event_name": "PreToolUse"},
         hook_label="permission",
         reauth=lambda: None,
+        answer_window_s=answer_window_s,
     )
 
     assert resp is None
-    assert clock["t"] >= claude_native_hook._PERMISSION_TIMEOUT_S
+    if answer_window_s is None:
+        assert clock["t"] == pytest.approx(
+            claude_native_hook._PERMISSION_TIMEOUT_S
+            - claude_native_hook._PERMISSION_DEADLINE_MARGIN_S
+        )
+        assert "retry budget exhausted" in capsys.readouterr().err
+    else:
+        assert clock["t"] == pytest.approx(floor + 290.0 + answer_window_s)
+        assert "within the answer window" in capsys.readouterr().err
     assert sleeps[:6] == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0], sleeps[:6]
     assert max(sleeps) == claude_native_hook._PERMISSION_RETRY_MAX_BACKOFF_S
-    assert "retry budget exhausted" in capsys.readouterr().err
 
 
 def test_reattach_fast_flapping_connection_is_hard_failure(

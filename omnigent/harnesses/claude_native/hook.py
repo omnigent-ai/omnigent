@@ -68,6 +68,12 @@ _PERMISSION_CONNECT_TIMEOUT_S = 30.0
 # Re-POST a silent held poll just past the gateway's 300s idle cut: after a
 # host network outage the gateway's reply never arrives and the socket is dead.
 _PERMISSION_POLL_READ_TIMEOUT_S = 330.0
+# Claude starts its matching command-hook timeout before this process starts,
+# so retrying stops early enough to still write a final decision.
+_PERMISSION_DEADLINE_MARGIN_S = 60.0
+# A question stops retrying a lost poll this long before the server drops an
+# answer submitted meanwhile, leaving time for the last re-POST to claim it.
+_QUESTION_ANSWER_WINDOW_MARGIN_S = 30.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -727,6 +733,17 @@ def _conversation_url_for_active_session(
     return fallback_url
 
 
+def _sleep_before_retry(backoff_s: float, retry_by: float) -> None:
+    """
+    Back off before the next re-POST, waking no later than *retry_by*.
+
+    :param backoff_s: Current backoff, e.g. ``4.0``.
+    :param retry_by: :func:`time.monotonic` time the next attempt must not
+        start after, e.g. the retry deadline.
+    """
+    time.sleep(max(0.0, min(backoff_s, retry_by - time.monotonic())))
+
+
 def _post_hook_with_reattach(
     url: str,
     headers: dict[str, str],
@@ -734,7 +751,7 @@ def _post_hook_with_reattach(
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
     wait_marker: Path | None = None,
-    hold_through_outages: bool = False,
+    answer_window_s: float | None = None,
 ) -> httpx.Response | None:
     """
     POST one permission-style hook payload, surviving severed long-polls.
@@ -797,7 +814,9 @@ def _post_hook_with_reattach(
     keeps the card alive until the server recovers.
 
     The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling bounds the total wait on
-    every path, matching the day-long human-answer window.
+    every path, matching the day-long human-answer window. It ends
+    :data:`_PERMISSION_DEADLINE_MARGIN_S` early, and no request or backoff runs
+    past it, so the hook returns before Claude's own hook timeout kills it.
 
     :param url: Absolute hook endpoint URL, e.g.
         ``"http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request"``.
@@ -819,11 +838,16 @@ def _post_hook_with_reattach(
         :func:`approval_wait_marker_path`, so the idle pane reaper spares a
         pane parked on this prompt. ``None`` skips the marker (non-approval
         callers).
-    :param hold_through_outages: Keep retrying auth lapses and hard failures
-        until the deadline, as a parked wait does, even before the first held
-        poll. For prompts with no useful terminal-only fallback.
-    :returns: The successful (2xx) response, or ``None`` when rejected
-        or out of budget — callers fail-ask as before.
+    :param answer_window_s: For prompts with no useful terminal-only fallback:
+        after a held poll is lost, keep retrying hard failures past the cap for
+        this many seconds, while the server can still hand back an answer
+        submitted meanwhile. An auth lapse that can't be renewed then stops
+        retrying too, instead of waiting for the deadline. ``None`` keeps the
+        count-based cap alone.
+    :returns: The successful (2xx) response, or ``None`` when the server
+        rejects the request (a 4xx, including an auth rejection that can't be
+        re-minted before any held poll), or when the hard-failure cap, answer
+        window, or deadline runs out.
     """
     body = {
         **payload,
@@ -837,20 +861,16 @@ def _post_hook_with_reattach(
         is_loopback_url,
     )
 
-    timeout = httpx.Timeout(
-        _PERMISSION_TIMEOUT_S,
-        connect=_PERMISSION_CONNECT_TIMEOUT_S,
-        read=_PERMISSION_POLL_READ_TIMEOUT_S,
-    )
     # Absolute backstop: even a run of held-poll severs (which don't count
     # toward the hard-failure cap) can't loop past the day-long human-answer
     # window — matches the read budget and the server's ask_timeout.
-    deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
+    deadline = time.monotonic() + _PERMISSION_TIMEOUT_S - _PERMISSION_DEADLINE_MARGIN_S
     reauthed = False
     consecutive_hard_failures = 0
     # Once the server has held a poll, the card is live: ride out a network
     # outage until the deadline so the re-POST re-publishes it on reconnect.
     parked = False
+    answer_window_ends_at: float | None = None
     marker_scope = (
         hold_approval_wait_marker(wait_marker)
         if wait_marker is not None
@@ -860,6 +880,19 @@ def _post_hook_with_reattach(
         trust_env = not is_loopback_url(url)
         while True:
             attempt_started = time.monotonic()
+            remaining_s = deadline - attempt_started
+            if remaining_s <= 0.0:
+                print(
+                    f"omnigent {hook_label} hook: retry budget exhausted "
+                    f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
+                    file=sys.stderr,
+                )
+                return None
+            timeout = httpx.Timeout(
+                remaining_s,
+                connect=min(_PERMISSION_CONNECT_TIMEOUT_S, remaining_s),
+                read=min(_PERMISSION_POLL_READ_TIMEOUT_S, remaining_s),
+            )
             never_connected = False
             try:
                 with httpx.Client(
@@ -892,25 +925,28 @@ def _post_hook_with_reattach(
             except httpx.HTTPStatusError as exc:
                 if (
                     reauth is not None
-                    and (parked or hold_through_outages)
+                    and parked
                     and _is_login_redirect_or_unauthorized(exc.response)
                 ):
                     # A parked prompt may outlive login; retry reauth until its deadline.
+                    retry_by = deadline
+                    if answer_window_ends_at is not None:
+                        if time.monotonic() >= answer_window_ends_at:
+                            print(
+                                f"omnigent {hook_label} hook: Omnigent auth could not "
+                                f"be renewed within the answer window — failing ask: {exc}",
+                                file=sys.stderr,
+                            )
+                            return None
+                        retry_by = min(deadline, answer_window_ends_at)
                     print(
                         f"omnigent {hook_label} hook: Omnigent auth lapsed and "
                         f"could not be renewed; retrying: {exc}",
                         file=sys.stderr,
                     )
                     reauthed = False
-                    time.sleep(backoff_s)
+                    _sleep_before_retry(backoff_s, retry_by)
                     backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
-                    if time.monotonic() >= deadline:
-                        print(
-                            f"omnigent {hook_label} hook: retry budget exhausted "
-                            f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
-                            file=sys.stderr,
-                        )
-                        return None
                     continue
                 if exc.response.status_code < 500:
                     print(
@@ -951,7 +987,7 @@ def _post_hook_with_reattach(
             if is_hard_failure:
                 # A connect that never reached the server cannot spin it, so a
                 # parked wait keeps backing off without counting toward the cap.
-                if not ((parked or hold_through_outages) and never_connected):
+                if not (parked and never_connected):
                     consecutive_hard_failures += 1
             else:
                 parked = True
@@ -965,10 +1001,14 @@ def _post_hook_with_reattach(
                 # re-mint is armed again: a wait longer than the token lifetime
                 # lapses once an hour, and each lapse must be re-mintable.
                 reauthed = False
-            if (
-                not hold_through_outages
-                and consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES
-            ):
+                if answer_window_s is not None:
+                    answer_window_ends_at = time.monotonic() + answer_window_s
+            retry_by = deadline
+            if answer_window_ends_at is not None and time.monotonic() < answer_window_ends_at:
+                # The server can still hand back an answer submitted since the
+                # poll was lost, so the cap waits for the window to end.
+                retry_by = min(deadline, answer_window_ends_at)
+            elif consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
                 print(
                     f"omnigent {hook_label} hook: giving up after "
                     f"{consecutive_hard_failures} consecutive hard failures "
@@ -977,15 +1017,8 @@ def _post_hook_with_reattach(
                 )
                 return None
             # Two-line backoff; not worth a retry lib in this dependency-light hook.
-            time.sleep(backoff_s)
+            _sleep_before_retry(backoff_s, retry_by)
             backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
-            if time.monotonic() >= deadline:
-                print(
-                    f"omnigent {hook_label} hook: retry budget exhausted "
-                    f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
-                    file=sys.stderr,
-                )
-                return None
 
 
 def _main_permission_request(argv: list[str]) -> int:
@@ -995,10 +1028,13 @@ def _main_permission_request(argv: list[str]) -> int:
     :param argv: CLI argv after the ``permission-request`` subcommand,
         e.g. ``["--bridge-dir", "/tmp/x", "--omnigent-server-url",
         "http://127.0.0.1:8787"]``.
-    :returns: Process exit code. Returns ``0`` on transport failures so
-        Claude Code falls back to its terminal prompt; an ``AskUserQuestion``
-        is denied instead so Claude asks it in chat text.
+    :returns: Process exit code. Returns ``0`` without a decision when no
+        web verdict arrives (Omnigent rejected the request, was unreachable
+        past the retry budget, or its wait expired), so Claude Code falls back
+        to its terminal prompt; an ``AskUserQuestion`` is denied instead so
+        Claude asks it in chat text.
     """
+    from omnigent.native.elicitation_reattach import PRE_RESOLVED_ELICITATION_TTL_S
     from omnigent.native.native_policy_hook import policy_hook_reauth
 
     args = _parse_permission_args(argv)
@@ -1045,9 +1081,11 @@ def _main_permission_request(argv: list[str]) -> int:
         "claude permission",
         reauth=policy_hook_reauth(ap_server_url, headers),
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
-        # Claude's picker stays answerable in the terminal while this waits, and
-        # the web card comes back as soon as Omnigent answers again.
-        hold_through_outages=is_question,
+        answer_window_s=(
+            PRE_RESOLVED_ELICITATION_TTL_S - _QUESTION_ANSWER_WINDOW_MARGIN_S
+            if is_question
+            else None
+        ),
     )
     # The server returns an empty 200 when the question wait expires.
     if resp is None or not resp.content:
