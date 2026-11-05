@@ -2385,6 +2385,7 @@ class SessionResourceRegistry:
                             self._session_activity_epoch.get(target_session_id, 0) + 1
                         )
                 self._active_session_turns.discard(source_session_id)
+                self._session_turn_generation.pop(source_session_id, None)
                 # The watcher restart below rebuilds the poller under the
                 # target, so drop the source's entry rather than leaving a
                 # retired poller to be re-armed on every later reconnect.
@@ -2431,6 +2432,7 @@ class SessionResourceRegistry:
         self._take_session_status_memo(session_id)
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
+            self._session_turn_generation.pop(session_id, None)
             self._client_surfaces.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)

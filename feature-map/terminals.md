@@ -179,7 +179,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e/test_claude_native_hidden_prompt_e2e.py::test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal`
   (real Claude Code and tmux against a slow local Messages API; needs `claude`
   on `PATH`), with timing cases in `tests/runner/test_resource_registry.py`
-  (`-k hidden_input_box`) and the label in `web/src/pages/ChatPage.test.ts`.
+  (`-k 'hidden_input_box or input_box_probe or queued_alert_delivery'`) and the
+  label in `web/src/pages/ChatPage.test.ts`.
   For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).

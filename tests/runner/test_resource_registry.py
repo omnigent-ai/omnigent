@@ -2248,11 +2248,13 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     assert "conv_cleanup" in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") > 0
     assert registry.session_turn_is_active("conv_cleanup")
+    assert registry._active_turn_generation("conv_cleanup") == 1
 
     await registry.cleanup_session("conv_cleanup")
 
     assert "conv_cleanup" not in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") == 0
+    assert "conv_cleanup" not in registry._session_turn_generation
     assert not registry.session_turn_is_active("conv_cleanup")
 
 
@@ -2308,6 +2310,7 @@ async def test_transfer_terminal_moves_status_memo(
     assert not registry.session_turn_is_active("conv_src")
     assert registry.session_turn_is_active("conv_dst")
     assert registry.session_activity_epoch("conv_dst") > 0
+    assert "conv_src" not in registry._session_turn_generation
 
 
 def test_get_resource_finds_default() -> None:
