@@ -23,7 +23,9 @@ _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 class Feature(StrEnum):
     """Canonical release-feature keys accepted by ``OMNIGENT_FEATURES``."""
 
+    SANDBOX_PROFILES = "sandbox_profiles"
     SESSION_ORCHESTRATION = "session_orchestration"
+    CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
@@ -51,6 +53,19 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.CODEX_PLAN_AT_LAUNCH,
+        description="Start Codex in Plan mode with host compatibility checks",
+        owner="server",
+        review_by_release="0.22.0",
+        default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.SANDBOX_PROFILES,
+        description="Sandbox profile discovery, configuration and launch selection",
+        owner="server",
+        review_by_release="0.22.0",
+    ),
     FeatureDefinition(
         feature=Feature.SESSION_ORCHESTRATION,
         description="Private-owner session messaging and independent worker creation",

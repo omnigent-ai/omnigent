@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Mirrors the response/error/usage types in
 // sdks/python-client/omnigent_client/_types.py.
 //
@@ -30,6 +31,12 @@ export interface ConversationRef {
 export interface RememberScope {
   tool: string;
   host?: string;
+}
+
+/** The untruncated file-edit tool call an approval gates, for rendering as a diff. */
+export interface FileEditRequest {
+  toolName: string;
+  toolInput: Record<string, unknown>;
 }
 
 /** Persistence scopes advertised by Codex for MCP tool approvals. */
@@ -274,6 +281,7 @@ export interface BackgroundTaskInfo {
 }
 
 export interface Session {
+  sandboxProfile?: SandboxProfile | null;
   projectId?: string | null;
   id: string;
   agentId: string;

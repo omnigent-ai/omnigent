@@ -19,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
 )
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
@@ -843,6 +844,108 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("active_turn_id", ["turn_running", None], ids=["busy", "idle"])
+async def test_events_codex_native_approval_mode_change_types_only_when_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    active_turn_id: str | None,
+) -> None:
+    """
+    An approval-mode switch while Codex runs a turn is refused, not keyed in.
+
+    Codex disables /permissions during a turn, and the Escape that opens it
+    interrupts the turn and drops the message it carries. The 409 detail tells
+    the person why the mode did not change. Once the session is idle the same
+    request drives the /permissions popup and reports the confirmed mode.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    popup = (
+        "  Update Model Permissions\n\n"
+        "› 1. Ask for approval  Read and edit workspace files and run commands\n"
+        "  2. Full Access       Use with caution: Codex can edit files outside\n\n"
+        "  enter select · esc back\n"
+    )
+    tmux_calls: list[tuple[str, ...]] = []
+
+    def _recording_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        tmux_calls.append(args)
+
+    def _fake_capture_pane(socket_path: str, target: str, **kwargs: Any) -> str:
+        del socket_path, target, kwargs
+        # The popup stays up until its Full Access row is picked; Codex then
+        # prints the confirmation line.
+        if any(call[-1] == "2" for call in tmux_calls):
+            return "• Permissions updated to Full Access\n"
+        return popup
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        # Session creation would otherwise rewrite the bridge state below.
+        del args, kwargs
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _recording_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture_pane)
+    monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    conv_id = "3c1f6be0b1f04e45a8d9e2f7c6b5a4d3"
+    codex_native_bridge.write_bridge_state(
+        codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=active_turn_id,
+        ),
+    )
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=terminal_registry
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_approval_mode_change", "approval_mode": "full-access"},
+        )
+
+    if active_turn_id is None:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"approval_mode": "full-access"}
+        target = instance.tmux_target
+        assert tmux_calls == [
+            ("send-keys", "-t", target, "Escape"),
+            ("send-keys", "-t", target, "C-u"),
+            ("send-keys", "-l", "-t", target, "/permissions"),
+            ("send-keys", "-t", target, "Enter"),
+            ("send-keys", "-l", "-t", target, "2"),
+            ("send-keys", "-l", "-t", target, "1"),
+        ]
+        return
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["error"] == "codex_native_approval_mode_busy"
+    assert body["detail"] == (
+        "Codex is working on a turn. Change the approval mode after it finishes, "
+        "or stop the turn first."
+    )
+    assert tmux_calls == []
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1286,55 +1389,20 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
 
 
 class _FakeOpenCodeCompactClient:
-    """OpenCode client stub recording ``summarize`` calls for compact tests.
+    """OpenCode client stub recording ``compact`` calls."""
 
-    Stands in for :class:`omnigent.harnesses.opencode_native.client.OpenCodeClient` so
-    the opencode-native compact handler's model-resolution + ``/summarize``
-    call is observable without a live ``opencode serve``.
-    """
-
-    def __init__(
-        self,
-        *,
-        session: Any,
-        messages: list[dict[str, Any]],
-        summarize_error: BaseException | None = None,
-    ) -> None:
-        """
-        Initialize with the session/messages the handler will resolve from.
-
-        :param session: The :class:`OpenCodeSession` ``get_session`` returns
-            (or ``None``).
-        :param messages: The list ``list_messages`` returns.
-        :param summarize_error: When set, ``summarize`` raises it instead of
-            recording the call (drives the 503 path).
-        :returns: None.
-        """
-        self._session = session
-        self._messages = messages
-        self._summarize_error = summarize_error
-        self.summarize_calls: list[tuple[str, str, str]] = []
+    def __init__(self, *, compact_error: BaseException | None = None) -> None:
+        self._compact_error = compact_error
+        self.compact_calls: list[str] = []
         self.closed = False
 
-    async def get_session(self, session_id: str) -> Any:
-        """Return the scripted session."""
-        del session_id
-        return self._session
-
-    async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
-        """Return the scripted messages."""
-        del session_id
-        return self._messages
-
-    async def summarize(self, session_id: str, *, provider_id: str, model_id: str) -> bool:
-        """Record the compaction call (or raise the scripted error)."""
-        if self._summarize_error is not None:
-            raise self._summarize_error
-        self.summarize_calls.append((session_id, provider_id, model_id))
-        return True
+    async def compact(self, session_id: str) -> dict[str, Any]:
+        if self._compact_error is not None:
+            raise self._compact_error
+        self.compact_calls.append(session_id)
+        return {"id": "msg_compaction", "type": "compaction"}
 
     async def aclose(self) -> None:
-        """Mark the client closed (the handler always closes in ``finally``)."""
         self.closed = True
 
 
@@ -1342,11 +1410,9 @@ class _FakeOpenCodeCompactServer:
     """``OpenCodeNativeServer`` stub whose ``client()`` returns a fixed stub."""
 
     def __init__(self, client: _FakeOpenCodeCompactClient) -> None:
-        """Wrap *client* so :meth:`client` returns it."""
         self._client = client
 
     def client(self, *, directory: str | None = None) -> _FakeOpenCodeCompactClient:
-        """Return the fixed compact client."""
         del directory
         return self._client
 
@@ -1356,71 +1422,37 @@ async def _drive_opencode_native_compact(
     tmp_path: Path,
     *,
     conv_id: str,
-    session_payload: dict[str, Any] | None,
-    messages: list[dict[str, Any]],
-    model_override: str | None,
-    summarize_error: BaseException | None = None,
+    compact_error: BaseException | None = None,
+    with_server: bool = True,
 ) -> tuple[httpx.Response, _FakeOpenCodeCompactClient]:
-    """
-    Build an opencode-native runner app and POST a ``compact`` control event.
-
-    Registers a pre-built opencode terminal so session creation skips the real
-    ``_auto_create_opencode_terminal`` launch, injects a live fake server into
-    ``_AUTO_OPENCODE_SERVERS``, and stubs ``read_bridge_state`` so the handler
-    resolves an ``opencode_session_id`` (+ optional ``model_override``).
-
-    :param conv_id: Conversation id to create and compact.
-    :param session_payload: Payload for the :class:`OpenCodeSession`
-        ``get_session`` returns, or ``None`` for no session.
-    :param messages: Messages ``list_messages`` returns.
-    :param model_override: Bridge-state ``model_override`` (qualified
-        ``provider/model``), or ``None``.
-    :param summarize_error: When set, ``summarize`` raises it (503 path).
-    :returns: ``(response, fake_client)`` for the compact POST.
-    """
+    """Create an opencode-native session and POST a ``compact`` control event."""
     from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
     from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _AUTO_OPENCODE_SERVERS, _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
-    opencode_native_spec = _harness_spec("opencode-native")
+    spec = _harness_spec("opencode-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the opencode-native spec for any agent_id."""
         del agent_id, session_id
-        return opencode_native_spec
+        return spec
 
-    # A pre-registered opencode terminal makes the create path's auto-launch a
-    # no-op (the per-session ensure-lock sees a live terminal and skips it).
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("opencode", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("opencode", "main")] = instance
-
-    session = (
-        OpenCodeSession.from_payload(session_payload) if session_payload is not None else None
-    )
-    client = _FakeOpenCodeCompactClient(
-        session=session, messages=messages, summarize_error=summarize_error
-    )
-    server = _FakeOpenCodeCompactServer(client)
-
+    client = _FakeOpenCodeCompactClient(compact_error=compact_error)
     state = OpenCodeNativeBridgeState(
         session_id=conv_id,
         server_base_url="http://127.0.0.1:1",
         opencode_session_id="ses_x",
-        model_override=model_override,
     )
     monkeypatch.setattr(opencode_native_bridge, "read_bridge_state", lambda _dir: state)
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
         terminal_registry=terminal_registry,
     )
-
     try:
         async with _runner_client(app) as http_client:
             create_resp = await http_client.post(
@@ -1429,11 +1461,10 @@ async def _drive_opencode_native_compact(
             )
             assert create_resp.status_code == 201, create_resp.text
             _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            # Inject AFTER create so the create flow's cleanup cannot evict it.
-            _AUTO_OPENCODE_SERVERS[conv_id] = server
+            if with_server:
+                _AUTO_OPENCODE_SERVERS[conv_id] = _FakeOpenCodeCompactServer(client)
             resp = await http_client.post(
-                f"/v1/sessions/{conv_id}/events",
-                json={"type": "compact"},
+                f"/v1/sessions/{conv_id}/events", json={"type": "compact"}
             )
         return resp, client
     finally:
@@ -1441,263 +1472,104 @@ async def _drive_opencode_native_compact(
         _session_event_queues_ref.pop(conv_id, None)
 
 
-def test_resolve_opencode_compact_model_prefers_latest_assistant_message() -> None:
-    """
-    The latest assistant message's live model wins over session/override.
-
-    On a MESSAGE the model keys are ``providerID`` + ``modelID``. The chain
-    must iterate in reverse and ignore user-role messages, picking the live
-    model even when a session ``model`` and a ``model_override`` also resolve.
-    """
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
-    from omnigent.runner.app import _resolve_opencode_compact_model
-
-    session = OpenCodeSession.from_payload(
-        {"id": "ses_x", "model": {"providerID": "stale", "id": "stale-model"}}
-    )
-    messages = [
-        {"info": {"role": "user"}, "parts": []},
-        {"info": {"role": "assistant", "providerID": "openai", "modelID": "gpt-old"}, "parts": []},
-        {"info": {"role": "user"}, "parts": []},
-        {
-            "info": {
-                "role": "assistant",
-                "providerID": "anthropic",
-                "modelID": "claude-sonnet-4-5",
-            },
-            "parts": [],
-        },
-    ]
-
-    provider_id, model_id = _resolve_opencode_compact_model(
-        session, messages, "override-prov/override-model"
-    )
-
-    assert (provider_id, model_id) == ("anthropic", "claude-sonnet-4-5")
-
-
-def test_resolve_opencode_compact_model_falls_back_to_session_model() -> None:
-    """
-    With no usable assistant message, the session ``model`` field resolves.
-
-    On the SESSION object the keys are ``providerID`` + ``id`` (NOT
-    ``modelID``). An assistant message missing ``modelID`` must be skipped so
-    the session field is used.
-    """
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
-    from omnigent.runner.app import _resolve_opencode_compact_model
-
-    session = OpenCodeSession.from_payload(
-        {"id": "ses_x", "model": {"providerID": "anthropic", "id": "claude-opus-4"}}
-    )
-    # Assistant message without a modelID is not usable → fall through.
-    messages = [{"info": {"role": "assistant", "providerID": "anthropic"}, "parts": []}]
-
-    provider_id, model_id = _resolve_opencode_compact_model(session, messages, None)
-
-    assert (provider_id, model_id) == ("anthropic", "claude-opus-4")
-
-
-def test_resolve_opencode_compact_model_falls_back_to_model_override() -> None:
-    """
-    With no message/session model, ``model_override`` splits on the first ``/``.
-
-    A model id may itself contain ``/`` (e.g. an OpenRouter slug), so only the
-    FIRST separator delimits provider from model.
-    """
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
-    from omnigent.runner.app import _resolve_opencode_compact_model
-
-    session = OpenCodeSession.from_payload({"id": "ses_x"})
-
-    provider_id, model_id = _resolve_opencode_compact_model(
-        session, [], "openrouter/anthropic/claude-3.5"
-    )
-
-    assert (provider_id, model_id) == ("openrouter", "anthropic/claude-3.5")
-
-
-def test_resolve_opencode_compact_model_returns_none_when_unresolvable() -> None:
-    """
-    Nothing resolvable → ``(None, None)`` so the handler 204s to AP-side.
-
-    Covers the live Omnigent flow: the session is created without a model and
-    has no assistant turn yet, and no override is set.
-    """
-    from omnigent.harnesses.opencode_native.client import OpenCodeSession
-    from omnigent.runner.app import _resolve_opencode_compact_model
-
-    session = OpenCodeSession.from_payload({"id": "ses_x"})
-
-    assert _resolve_opencode_compact_model(session, [], None) == (None, None)
-    # A bare token without ``/`` is not a qualified override.
-    assert _resolve_opencode_compact_model(None, [], "not-qualified") == (None, None)
-
-
 @pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_summarizes_from_assistant_message(
+async def test_events_compact_on_opencode_native_calls_compact(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    opencode-native compact resolves the live model and calls ``/summarize``.
+    """opencode-native compact calls ``POST /compact`` with no model and returns 200.
 
-    The model comes from the latest assistant message (``providerID`` +
-    ``modelID``) because Omnigent creates the session without a model. A 200
-    return is load-bearing: the Omnigent server reads it to skip its AP-side
-    compaction (the native ``/summarize`` path was previously dead, always
-    204ing because ``session.raw["model"]`` is empty).
+    The 200 is load-bearing: the Omnigent server reads it to skip its own
+    compaction for this session.
     """
     resp, client = await _drive_opencode_native_compact(
-        monkeypatch,
-        tmp_path,
-        conv_id="f67241520c2101c4de5f81b976467bad",
-        session_payload={"id": "ses_x"},
-        messages=[
-            {
-                "info": {
-                    "role": "assistant",
-                    "providerID": "anthropic",
-                    "modelID": "claude-sonnet-4-5",
-                },
-                "parts": [],
-            }
-        ],
-        model_override=None,
+        monkeypatch, tmp_path, conv_id="f67241520c2101c4de5f81b976467bad"
     )
-
-    assert resp.status_code == 200, (
-        f"opencode-native compact must 200 once /summarize is accepted; "
-        f"got {resp.status_code}: {resp.text}"
-    )
-    assert client.summarize_calls == [("ses_x", "anthropic", "claude-sonnet-4-5")], (
-        f"summarize must run with the assistant message's model; got {client.summarize_calls!r}."
-    )
-    assert client.closed, "the handler must close the client in its finally block."
+    assert resp.status_code == 200, resp.text
+    assert client.compact_calls == ["ses_x"]
+    assert client.closed
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_summarizes_from_session_model(
+async def test_events_compact_on_opencode_native_503_when_compact_raises(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    With no assistant message, the session ``model`` field drives ``/summarize``.
-
-    Covers create-with-model / TUI ``switchModel`` sessions: the SESSION keys
-    are ``providerID`` + ``id``.
-    """
-    resp, client = await _drive_opencode_native_compact(
-        monkeypatch,
-        tmp_path,
-        conv_id="7b333fd1a0e1c32b3961f98930f41bf3",
-        session_payload={
-            "id": "ses_x",
-            "model": {"providerID": "anthropic", "id": "claude-opus-4"},
-        },
-        messages=[],
-        model_override=None,
-    )
-
-    assert resp.status_code == 200, f"got {resp.status_code}: {resp.text}"
-    assert client.summarize_calls == [("ses_x", "anthropic", "claude-opus-4")], (
-        f"summarize must run with the session model; got {client.summarize_calls!r}."
-    )
-
-
-@pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_summarizes_from_model_override(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """
-    With no message/session model, bridge-state ``model_override`` resolves it.
-
-    The override is a qualified ``provider/model`` string split on the first
-    ``/``.
-    """
-    resp, client = await _drive_opencode_native_compact(
-        monkeypatch,
-        tmp_path,
-        conv_id="e45977bad8d13b2fdc00eb2bbdae2bd7",
-        session_payload={"id": "ses_x"},
-        messages=[],
-        model_override="openai/gpt-5",
-    )
-
-    assert resp.status_code == 200, f"got {resp.status_code}: {resp.text}"
-    assert client.summarize_calls == [("ses_x", "openai", "gpt-5")], (
-        f"summarize must run with the override model; got {client.summarize_calls!r}."
-    )
-
-
-@pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_503_when_model_unresolvable(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """
-    No resolvable model → 503 and ``/summarize`` is never called.
-
-    Without a model the compaction has nowhere to go; 503 tells the caller
-    to switch the model first.
-    """
-    resp, client = await _drive_opencode_native_compact(
-        monkeypatch,
-        tmp_path,
-        conv_id="90c89e7e5e9131aa4bb062fd427927ae",
-        session_payload={"id": "ses_x"},
-        messages=[],
-        model_override=None,
-    )
-
-    assert resp.status_code == 503, (
-        f"opencode-native compact must 503 when no model resolves; "
-        f"got {resp.status_code}: {resp.text}"
-    )
-    assert client.summarize_calls == [], (
-        f"summarize must NOT run when no model resolves; got {client.summarize_calls!r}."
-    )
-
-
-@pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_503_when_summarize_raises(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """
-    A failing ``/summarize`` surfaces 503 with the opencode error code.
-
-    The Omnigent server must see the failure (rather than a silent fallback)
-    so it does not run a duplicate compaction.
-    """
+    """A failing ``/compact`` surfaces 503 so the server does not double-compact."""
     from omnigent.harnesses.opencode_native.client import OpenCodeClientError
 
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
         tmp_path,
         conv_id="309c268a432cb4dbda4e8c15585578ee",
-        session_payload={"id": "ses_x"},
-        messages=[
-            {
-                "info": {
-                    "role": "assistant",
-                    "providerID": "anthropic",
-                    "modelID": "claude-sonnet-4-5",
-                },
-                "parts": [],
-            }
-        ],
-        model_override=None,
-        summarize_error=OpenCodeClientError("summarize failed: 500"),
+        compact_error=OpenCodeClientError("compact failed: 409"),
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json().get("error") == "opencode_native_compact_failed"
+    assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_opencode_native_503_when_not_active(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With no live server the compact reports 503 and never calls OpenCode."""
+    resp, client = await _drive_opencode_native_compact(
+        monkeypatch,
+        tmp_path,
+        conv_id="90c89e7e5e9131aa4bb062fd427927ae",
+        with_server=False,
+    )
+    assert resp.status_code == 503, resp.text
+    assert client.compact_calls == []
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_opencode_native_relaunches_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``/clear`` relaunches OpenCode without resuming, forking, or seeding."""
+    from omnigent.runner import native_controls
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "4f1c2b7e9d0a4c55b1e7a3c9d2f60a18"
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
     )
 
-    assert resp.status_code == 503, (
-        f"opencode-native compact must 503 on a failed /summarize; "
-        f"got {resp.status_code}: {resp.text}"
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_auto_create(*args: Any, **kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(native_controls, "_auto_create_opencode_terminal", _fake_auto_create)
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("opencode", "main")] = instance
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
     )
-    assert resp.json().get("error") == "opencode_native_compact_failed"
-    assert client.closed, "the handler must close the client even on failure."
+    async with _runner_client(app) as http_client:
+        create_resp = await http_client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag_1"}
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await http_client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 1
+    assert calls[0]["fresh"] is True
 
 
 @pytest.mark.asyncio
@@ -2024,6 +1896,7 @@ async def _post_model_change_with_status_sequence(
     pane_idle_after_polls: int | None = None,
     model_env: dict[str, str] | None = None,
     expected_command: str | None = None,
+    acknowledged_after_polls: int | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -2089,6 +1962,20 @@ async def _post_model_change_with_status_sequence(
         return script.pop(0) if len(script) > 1 else script[0]
 
     monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", _scripted_status)
+    acknowledgement_polls = 0
+
+    def _acknowledged(_bridge_dir: Any, *, command: str) -> bool:
+        nonlocal acknowledgement_polls
+        del command
+        acknowledgement_polls += 1
+        return (
+            acknowledged_after_polls is not None
+            and acknowledgement_polls >= acknowledged_after_polls
+        )
+
+    monkeypatch.setattr(
+        claude_native_bridge, "model_switch_acknowledged", _acknowledged, raising=False
+    )
     # No tmux behind these tests: the in-loop dialog check must not spend a
     # real 1 s tmux-info wait per poll.
     monkeypatch.setattr(
@@ -2178,9 +2065,11 @@ async def test_events_model_change_confirms_against_the_status_file(
         ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7[1m]", 204),
         ("opus[1m]", "system.ai.claude-opus-4-7[1M]", "claude-opus-4-7[1m]", 204),
         ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-6[1m]", 503),
-        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7", 503),
-        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
-        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-6", 503),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7", 204),
+        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 204),
+        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 204),
+        ("opus", "system.ai.claude-opus-4-7", "system.ai.claude-opus-4-7[1m]", 503),
         ("opus", None, "claude-opus-4-7", 503),
     ],
     ids=[
@@ -2190,9 +2079,11 @@ async def test_events_model_change_confirms_against_the_status_file(
         "uppercase-bracket-alias",
         "uppercase-pin-marker",
         "different-generation",
-        "different-context",
-        "bracket-alias-different-context",
-        "uppercase-bracket-alias-different-context",
+        "unmarked-different-generation",
+        "unmarked-status-for-1m-pin",
+        "unmarked-status-for-bracket-alias",
+        "unmarked-status-for-uppercase-bracket-alias",
+        "marked-status-for-plain-pin",
         "unpinned-alias",
     ],
 )
@@ -2203,7 +2094,12 @@ async def test_events_model_change_confirms_unchanged_model_against_launch_pin(
     status_model: str,
     status_code: int,
 ) -> None:
-    """An unchanged model confirms only the pin's exact generation and context."""
+    """An unchanged model confirms only the pin's exact generation and context.
+
+    Claude Code's statusLine names a 1M model without its ``[1m]`` marker, so
+    an unmarked status confirms a pick whose marker reached the pane; a marked
+    status still has to match the pick's context.
+    """
 
     async def _skip_terminal_creation(**_kwargs: Any) -> None:
         pass
@@ -2220,6 +2116,35 @@ async def test_events_model_change_confirms_unchanged_model_against_launch_pin(
         model_env={"ANTHROPIC_DEFAULT_OPUS_MODEL": pin_model} if pin_model else {},
     )
     assert resp.status_code == status_code, resp.text
+
+
+@pytest.mark.parametrize(
+    "status_values",
+    [
+        ["system.ai.claude-sonnet-5-5"],
+        [None, "system.ai.claude-sonnet-5-5"],
+        ["system.ai.claude-haiku-5-5", "system.ai.claude-sonnet-5-5"],
+    ],
+    ids=["already-on-the-model", "status-not-written-yet", "switched-from-another-model"],
+)
+async def test_events_model_change_confirms_a_typed_1m_pick_by_its_unmarked_name(
+    monkeypatch: pytest.MonkeyPatch,
+    status_values: list[str | None],
+) -> None:
+    """A typed 1M pick confirms once the status names its model without the marker.
+
+    After ``/model system.ai.claude-sonnet-5-5[1m]`` Claude Code's statusLine
+    reads ``system.ai.claude-sonnet-5-5``, so a pane already on that model, or
+    one whose status was not written before the switch, still confirms it.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        status_values,
+        model="system.ai.claude-sonnet-5-5[1m]",
+        picker_values=("system.ai.claude-sonnet-5-5[1m]",),
+        model_env={},
+    )
+    assert resp.status_code == 204, resp.text
 
 
 @pytest.mark.parametrize("translation", ["alias", "custom-slot", "picker"])
@@ -2285,6 +2210,42 @@ async def test_bound_claude_switch_preserves_private_model_id(
             monkeypatch,
             ["private/model-a", selected],
             model=selected,
+        )
+    assert response.status_code == 204, response.text
+
+
+async def test_bound_claude_1m_pick_is_confirmed_by_the_unmarked_status_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound 1M pick is confirmed by the statusLine's unmarked model name.
+
+    Claude Code's statusLine never carries ``[1m]``, so a bound session that
+    already runs the model and picks its 1M variant reads the same name before
+    and after. The unmarked name confirms the pick, as it does for a session
+    whose model is not bound.
+    """
+    from omnigent.inference_config import inference_config_scope
+
+    plain = "system.ai.claude-fable-5-1"
+    selected = f"{plain}[1m]"
+    config = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": plain,
+                    "model_allowlist": [plain, selected],
+                }
+            }
+        },
+    }
+    with inference_config_scope(config):
+        response = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            [plain],
+            model=selected,
+            expected_command=f"/model {selected}",
         )
     assert response.status_code == 204, response.text
 
@@ -2410,6 +2371,24 @@ async def test_events_model_change_unconfirmed_switch_answers_503(
     body = resp.json()
     assert body["error"] == "claude_native_model_unconfirmed"
     assert "did not confirm" in body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_confirmed_by_claudes_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude Code's own "Set model to" line confirms a switch the statusLine never does.
+
+    In production the statusLine snapshot kept its old reading for the whole
+    budget on an idle pane while the pane itself showed the acknowledgement, so
+    an applied switch was reported as "did not confirm the switch".
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        acknowledged_after_polls=2,
+    )
+    assert resp.status_code == 204, resp.text
 
 
 @pytest.mark.asyncio

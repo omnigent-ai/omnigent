@@ -846,6 +846,166 @@ def test_preload_codex_thread_closes_client_on_failure(
     assert fake_client.closed
 
 
+_PROVIDER_MISMATCH = {
+    "code": -32600,
+    "message": "provider mismatch",
+    "data": {
+        "type": "modelProviderMismatch",
+        "modelProvider": "omnigent_databricks",
+        "currentModelProvider": "Databricks",
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("error", "has_rollout"),
+    [
+        (_PROVIDER_MISMATCH, False),
+        ({**_PROVIDER_MISMATCH, "data": {"type": "modelProviderMismatch"}}, True),
+        ({**_PROVIDER_MISMATCH, "code": -32603}, True),
+        ({"code": -32600, "message": "no rollout found for thread id thread_test"}, True),
+    ],
+    ids=["no_rollout_path", "no_current_provider", "internal_error", "missing_rollout"],
+)
+def test_preload_codex_thread_surfaces_refusals_it_cannot_restamp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: dict[str, Any],
+    has_rollout: bool,
+) -> None:
+    """Only a provider mismatch naming Codex's provider restamps a known rollout."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"omnigent_databricks"}}\n'
+    rollout.write_bytes(original)
+    fake_client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(error)
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    with pytest.raises(codex_native_app_server.CodexAppServerResponseError):
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="omnigent_databricks",
+                rollout_path=rollout if has_rollout else None,
+            )
+        )
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert rollout.read_bytes() == original
+    assert fake_client.closed
+
+
+@pytest.mark.parametrize(
+    ("first_record", "replace_fails", "raised"),
+    [
+        (b'{"type":"turn_context","payload":{}}', False, ValueError),
+        (b"not json", False, ValueError),
+        (b'{"type":"session_meta","payload":{"model_provider":"p"}}', True, OSError),
+    ],
+    ids=["not_session_meta", "unparseable_record", "replace_fails"],
+)
+def test_preload_codex_thread_keeps_rollout_when_restamp_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    first_record: bytes,
+    replace_fails: bool,
+    raised: type[Exception],
+) -> None:
+    """A rollout that cannot be restamped stays intact and the resume is not retried."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = first_record + b'\n{"type":"response_item","payload":{}}\n'
+    rollout.write_bytes(original)
+    fake_client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(_PROVIDER_MISMATCH)
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    if replace_fails:
+
+        def _fail_replace(*_args: object) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(codex_native_app_server.os, "replace", _fail_replace)
+
+    with pytest.raises(raised):
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="omnigent_databricks",
+                rollout_path=rollout,
+            )
+        )
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert rollout.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [rollout]
+    assert fake_client.closed
+
+
+class _ScriptedResumeClient(_FakeCodexAppServerClient):
+    """Fake client that raises each scripted error once, then answers normally."""
+
+    def __init__(self, errors: list[Exception]) -> None:
+        super().__init__()
+        self.errors = errors
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.error = self.errors.pop(0) if self.errors else None
+        return await super().request(method, params)
+
+
+@pytest.mark.parametrize(
+    ("retain_client", "retry_refused"),
+    [(False, False), (True, False), (True, True)],
+    ids=["closes_client", "retains_client", "second_refusal_surfaces"],
+)
+def test_preload_codex_thread_retries_provider_mismatch_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    retain_client: bool,
+    retry_refused: bool,
+) -> None:
+    """A restamped resume retries once under Codex's provider and keeps client ownership."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"omnigent_databricks"}}\n'
+    )
+    refusals = [
+        codex_native_app_server.CodexAppServerResponseError(_PROVIDER_MISMATCH)
+        for _ in range(2 if retry_refused else 1)
+    ]
+    fake_client = _ScriptedResumeClient(list(refusals))
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    preload = codex_native_app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876",
+        "thread_test",
+        model_provider="omnigent_databricks",
+        retain_client=retain_client,
+        rollout_path=rollout,
+    )
+
+    if retry_refused:
+        with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as raised:
+            asyncio.run(preload)
+        assert raised.value is refusals[1]
+    else:
+        assert asyncio.run(preload) is (fake_client if retain_client else None)
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"] * 2
+    first, retry = (params for _method, params in fake_client.requests)
+    assert retry == {**first, "modelProvider": "Databricks"}
+    assert json.loads(rollout.read_text())["payload"]["model_provider"] == "Databricks"
+    assert fake_client.closed is (retry_refused or not retain_client)
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [
@@ -2249,10 +2409,15 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
     asyncio.run(run())
 
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/backgroundTerminals/list", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
-    assert ap_requests == []
+    # Only the startup background-work sync reaches the server; no dead letter is replayed.
+    assert [json.loads(request.content)["type"] for request in ap_requests] == [
+        "external_background_work"
+    ]
     assert (tmp_path / "dead_letter.jsonl").exists()
 
 
@@ -2299,7 +2464,9 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
 
     assert fake_client.connected
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/backgroundTerminals/list", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
 
@@ -6076,9 +6243,10 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         for event in session_events
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
-    # The cleared session gets only the /clear notice and redirect, never a
-    # stale child-thread event.
+    # The cleared session gets only the startup flag sync, the /clear notice and
+    # redirect, never a stale child-thread event.
     assert [event.body["type"] for event in session_events if event.session_id == "conv_old"] == [
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",
@@ -6972,6 +7140,118 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: 
     }
 
 
+@pytest.mark.parametrize(
+    ("raw_command", "typed_command"),
+    [
+        # Real app-server captures of ``thread/shellCommand`` items (codex 0.159).
+        ("/bin/bash -lc 'echo hi && pwd'", "echo hi && pwd"),
+        ('/bin/bash -lc "printf \\"x  y\\\\n\\" | cat"', 'printf "x  y\\n" | cat'),
+        ("/bin/bash -lc \"ls -la ~ && echo \\\\\"'$done'", "ls -la ~ && echo \\$done"),
+        ("/bin/bash -lc 'for i in 1 2; do\n  echo $i\ndone'", "for i in 1 2; do\n  echo $i\ndone"),
+        ("pwsh -NoProfile -Command ls", "pwsh -NoProfile -Command ls"),
+    ],
+)
+def test_user_shell_command_recovers_the_typed_command(
+    raw_command: str, typed_command: str
+) -> None:
+    """The mirrored input must equal the web ``!command`` so its bubble settles."""
+    item = {"type": "commandExecution", "source": "userShell", "command": raw_command}
+
+    assert codex_native_forwarder._user_shell_command(item) == typed_command
+    assert codex_native_forwarder._user_shell_command({**item, "source": "agent"}) is None
+
+
+@pytest.mark.parametrize("live", [True, False], ids=["live", "resume-backfill"])
+def test_forwarder_mirrors_user_shell_command_as_terminal_command(
+    tmp_path: Path, live: bool
+) -> None:
+    """A ``thread/shellCommand`` run is a terminal command, not a model tool call."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    started_item = {
+        "type": "commandExecution",
+        "id": "shell_1",
+        "command": "/bin/bash -lc 'gcloud auth list'",
+        "cwd": "/repo",
+        "source": "userShell",
+        "status": "inProgress",
+    }
+    completed_item = {
+        **started_item,
+        "status": "completed",
+        "aggregatedOutput": "No credentialed accounts.\n",
+        "exitCode": 1,
+    }
+
+    def event(method: str, **params: Any) -> dict[str, Any]:
+        return {
+            "method": method,
+            "params": {"threadId": "thread_123", "turnId": "turn_123", **params},
+        }
+
+    events = (
+        [
+            event("item/started", item=started_item),
+            event("item/commandExecution/outputDelta", itemId="shell_1", delta="No credentialed"),
+        ]
+        if live
+        else []
+    )
+    events.append(event("item/completed", item=completed_item))
+    state = codex_native_forwarder._CodexForwarderState()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
+                client, "conv_123", flush_interval_seconds=60.0, flush_char_threshold=1000
+            )
+            for codex_event in events:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=codex_event,
+                    delta_coalescer=coalescer,
+                    forwarder_state=state,
+                )
+            await coalescer.close()
+
+    asyncio.run(run())
+
+    assert [payload["data"] for payload in posted] == [
+        {
+            "item_type": "terminal_command",
+            "item_data": {"kind": "input", "input": "gcloud auth list"},
+            "response_id": "codex_turn_123",
+            "source_id": "thread_123:turn_123:shell_1:input",
+        },
+        {
+            "item_type": "terminal_command",
+            "item_data": {
+                "kind": "output",
+                "stdout": "No credentialed accounts.\n\n[exit code: 1]",
+                "stderr": None,
+            },
+            "response_id": "codex_turn_123",
+            "source_id": "thread_123:turn_123:shell_1:output",
+        },
+    ]
+
+
 def test_forwarder_surfaces_failed_command_exit_code() -> None:
     """
     A non-zero command exit is surfaced in the mirrored output.
@@ -7107,8 +7387,8 @@ def test_forwarder_sends_file_change_to_observer(
             "tool_name": "apply_patch",
             "tool_input": {
                 "changes": [
-                    {"path": "/repo/new.py", "kind": {"type": "add"}},
-                    {"path": "/repo/old.py", "kind": {"type": "delete"}},
+                    {"path": "/repo/new.py", "kind": {"type": "add"}, "diff": "new"},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}, "diff": "old"},
                 ]
             },
             "tool_response": {"type": "success"},

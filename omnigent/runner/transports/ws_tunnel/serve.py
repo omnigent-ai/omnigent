@@ -630,7 +630,7 @@ async def serve_tunnel(
                 http_status = _websocket_http_status(exc)
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
                     http_auth_rejection_streak += 1
-                    if http_auth_rejection_streak == 1:
+                    if http_auth_rejection_started is None:
                         http_auth_rejection_started = time.monotonic()
                     no_credential_to_send = (
                         auth_token is None
@@ -1398,8 +1398,8 @@ async def _serve_tunnel_once(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
                             )
-                            # Only the idle watchdog sets shutdown_event; tell the
-                            # server this exit attests no active work.
+                            # Only idle exits (idle watchdog, or a hung-up host's
+                            # finished work) set shutdown_event: attest no active work.
                             await ws.close(code=1000, reason=RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)
                             break
                         try:

@@ -1293,6 +1293,281 @@ async def test_external_session_status_event_lands_in_status_cache(
         sessions_module._session_status_cache.pop(session["id"], None)
 
 
+async def test_external_background_work_sets_sidebar_flag_without_status_edge(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_background_work`` sets the session-list flag and publishes no edge.
+
+    A background shell that outlives its turn keeps the session working. The
+    turn status stays as reported, so the session still takes a new message.
+    """
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def listed_item() -> dict[str, Any]:
+        """Return this session's row from the session list."""
+        list_resp = await client.get("/v1/sessions")
+        return next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+
+    status_before = (await listed_item())["status"]
+    published.clear()
+    for running in (True, False):
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_background_work", "data": {"running": running}},
+        )
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"queued": False}
+        assert (await listed_item())["background_work_running"] is running
+    assert published == []
+    assert (await listed_item())["status"] == status_before
+
+
+async def test_external_background_work_from_a_replaced_runner_is_rejected(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A report delayed past a rebind cannot overwrite the replacement runner's value."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server import session_live_state
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], token_bound_runner_id("token-a"))
+
+    async def report(token: str, running: bool) -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+            json={"type": "external_background_work", "data": {"running": running}},
+        )
+
+    assert (await report("token-a", False)).status_code == 202
+    store.replace_runner_id(session["id"], token_bound_runner_id("token-b"))
+    assert (await report("token-b", False)).status_code == 202
+
+    late = await report("token-a", True)
+
+    assert late.status_code == 403, late.text
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+    list_resp = await client.get("/v1/sessions")
+    row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+    assert row["background_work_running"] is False
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is False
+
+
+async def test_external_background_work_handed_off_mid_request_is_retried(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A report this replica hands off before writing gets a retryable 503 and writes nothing.
+
+    The runner's retry, once the session is settled, is written.
+    """
+    from omnigent.server import session_live_state
+    from omnigent.server.routes._sessions.orchestration import _relinquish_session_live_state
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    real_count = session_live_state.handoff_count
+    calls = 0
+
+    def handoff_while_authorizing(session_id: str) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            # Another replica takes the session after this request began.
+            _relinquish_session_live_state(session_id)
+        return real_count(session_id)
+
+    async def report() -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_background_work", "data": {"running": True}},
+        )
+
+    monkeypatch.setattr(routes_events, "handoff_count", handoff_while_authorizing)
+    handed_off = await report()
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+
+    assert handed_off.status_code == 503, handed_off.text
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is None
+
+    retried = await report()
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+
+    assert retried.status_code == 202, retried.text
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is True
+
+
+async def test_external_background_work_keeps_the_newest_report(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A runner's report that lands after a newer one, such as an abandoned retry, is not stored.
+
+    Only the session's runner orders its reports, so another caller's report time,
+    even a year ahead, cannot hold back the runner's later reports.
+    """
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], token_bound_runner_id("token-a"))
+
+    async def report(running: bool, reported_at: int, *, token: str | None = "token-a") -> None:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token} if token is not None else {},
+            json={
+                "type": "external_background_work",
+                "data": {"running": running, "reported_at": reported_at},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+    def flag() -> bool | None:
+        stored = store.get_conversation(session["id"])
+        assert stored is not None
+        return stored.background_work_running
+
+    await report(False, 2_000)
+    await report(True, 1_000)
+    assert flag() is False
+
+    await report(True, 2_000 + 365 * 24 * 3600 * 10**9, token=None)
+    assert flag() is True
+    await report(False, 3_000)
+    assert flag() is False
+    list_resp = await client.get("/v1/sessions")
+    row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+    assert row["background_work_running"] is False
+
+
+async def test_a_session_unbound_from_its_runner_lists_no_background_work(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """No runner is left to report the shell ending, so clearing the binding clears the flag."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], "runner_old")
+    store.set_background_work_running(session["id"], True, runner_id="runner_old")
+
+    store.clear_runner_id(session["id"])
+
+    list_resp = await client.get("/v1/sessions")
+    row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+    assert row["background_work_running"] is False
+
+
+async def test_external_background_work_lists_tasks_for_the_composer(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner's task list publishes ``session.background_tasks`` and reaches the snapshot.
+
+    It publishes no status edge and leaves the sidebar flag alone; ``0`` clears it.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def report(count: int, commands: list[str]) -> dict[str, Any]:
+        """Post one task list and return the session snapshot after it."""
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_background_work",
+                "data": {
+                    "background_task_count": count,
+                    "background_tasks": [{"command": command} for command in commands],
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        return (await client.get(f"/v1/sessions/{session['id']}")).json()
+
+    try:
+        flagged = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_background_work", "data": {"running": True}},
+        )
+        assert flagged.status_code == 202, flagged.text
+        published.clear()
+        listed = await report(1, ["npm run dev"])
+        cleared = await report(0, [])
+
+        assert listed["background_task_count"] == 1
+        assert [task["command"] for task in listed["background_tasks"]] == ["npm run dev"]
+        assert cleared.get("background_task_count") is None
+        assert [
+            (
+                event["type"],
+                event["background_task_count"],
+                [task["command"] for task in event["background_tasks"]],
+            )
+            for _, event in published
+        ] == [
+            ("session.background_tasks", 1, ["npm run dev"]),
+            ("session.background_tasks", 0, []),
+        ]
+        list_resp = await client.get("/v1/sessions")
+        row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+        assert row["background_work_running"] is True
+    finally:
+        sessions_module._session_background_task_count_cache.pop(session["id"], None)
+        sessions_module._session_background_tasks_cache.pop(session["id"], None)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"running": "yes"},
+        {"running": True, "reported_at": -1},
+        {"running": True, "reported_at": "1"},
+        {},
+        {"background_task_count": -1},
+        {"background_task_count": True},
+        {"running": True, "background_task_count": "1"},
+    ],
+)
+async def test_post_external_background_work_rejects_invalid_data(
+    client: httpx.AsyncClient, data: dict[str, Any]
+) -> None:
+    """A malformed flag, count or report time fails loud rather than setting either."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_background_work", "data": data},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "external_background_work" in resp.text
+
+
 # ── POST /v1/sessions/{id}/events external_session_superseded ─────
 
 
@@ -2803,9 +3078,19 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
     assert "no longer exists" in message
 
 
+@pytest.mark.parametrize(
+    ("text", "source_id"),
+    [
+        ("<skill>hidden</skill>", "codex-skill-meta"),
+        ("<skill>hidden</skill>", "peer-input:0:peer_message_wake"),
+        ("[System: Message from another session]", "user-input:0:message"),
+    ],
+)
 async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    source_id: str,
 ) -> None:
     """
     External bridge meta messages are durable and reach live subscribers flagged.
@@ -2830,11 +3115,11 @@ async def test_external_meta_user_message_persists_and_publishes_flagged_input_e
                 "item_type": "message",
                 "item_data": {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "<skill>hidden</skill>"}],
+                    "content": [{"type": "input_text", "text": text}],
                     "is_meta": True,
                 },
                 "response_id": "codex_turn_123",
-                "source_id": "codex-skill-meta",
+                "source_id": source_id,
             },
         },
     )
@@ -2843,7 +3128,7 @@ async def test_external_meta_user_message_persists_and_publishes_flagged_input_e
     items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
     meta = next(item for item in items if item["type"] == "message")
     assert meta["is_meta"] is True
-    assert meta["content"][0]["text"] == "<skill>hidden</skill>"
+    assert meta["content"][0]["text"] == text
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.status_code == 200
     assert snap.json()["title"] is None
@@ -3025,15 +3310,23 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
 
 
 @pytest.mark.parametrize(
-    "interrupt_text",
-    ["[Request interrupted by user]", "[Request interrupted by user for tool use]"],
+    ("marker_text", "source_id", "is_meta"),
+    [
+        ("[Request interrupted by user]", None, False),
+        ("[Request interrupted by user for tool use]", None, False),
+        ("[System: Message from another session]", "peer-input:0:peer_message_wake", False),
+        ("[System: Message from another session]", "peer-input:0:peer_message_wake", True),
+    ],
 )
-async def test_external_interrupt_record_leaves_pending_input_for_real_message(
+async def test_external_native_marker_leaves_pending_input_for_real_message(
     client: httpx.AsyncClient,
-    interrupt_text: str,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_text: str,
+    source_id: str | None,
+    is_meta: bool,
 ) -> None:
     """
-    Regression: steering with an upload must not feed it to the interrupt marker.
+    Regression: steering with an upload must not feed it to a native marker.
 
     Interrupting a turn to steer makes Claude write its own ``[Request
     interrupted by user...]`` record into the transcript BEFORE the steering
@@ -3045,9 +3338,14 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
     blank bubble (the real message's ``[Attached:]`` markers are stripped and
     its file blocks are gone). Assert the marker persists bare and the
     steering message keeps the image.
+
+    Bridge-generated peer labels also have no pending input of their own.
     """
     from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import _drains_pending_inputs
 
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
     pending_inputs.reset_for_tests()
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -3058,25 +3356,40 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
         [{"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"}],
     )
     try:
-        for text in (
-            interrupt_text,
-            "[Attached: /tmp/uploads/shot.png]",
+        for text, item_source_id, item_is_meta in (
+            (marker_text, source_id, is_meta),
+            ("[Attached: /tmp/uploads/shot.png]", None, False),
         ):
+            item_data = MessageData(
+                role="user", content=[{"type": "input_text", "text": text}], is_meta=item_is_meta
+            )
+            if item_is_meta:
+                # Older servers' metadata gate must also preserve queued uploads.
+                assert not _drains_pending_inputs(
+                    NewConversationItem(
+                        type="message", response_id="native_turn_1", data=item_data
+                    )
+                )
             resp = await client.post(
                 f"/v1/sessions/{session['id']}/events",
                 json={
                     "type": "external_conversation_item",
                     "data": {
                         "item_type": "message",
-                        "item_data": {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": text}],
-                        },
+                        "item_data": item_data.model_dump(),
                         "response_id": "native_turn_1",
+                        **({"source_id": item_source_id} if item_source_id else {}),
                     },
                 },
             )
             assert resp.status_code == 202, resp.text
+            if text == marker_text:
+                assert len(pending_inputs.snapshot_for(session["id"])) == 1
+                consumed = next(
+                    ev["data"] for _sid, ev in published if ev["type"] == "session.input.consumed"
+                )
+                assert consumed["cleared_pending_id"] is None
+                assert not consumed["data"].get("is_meta")
 
         items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
         messages = [item for item in items if item["type"] == "message"]
@@ -3084,7 +3397,8 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
         marker, steered = messages
         # The marker stays text-only, so the UI still classifies it as a
         # system marker instead of rendering it as user text beside an image.
-        assert marker["content"] == [{"type": "input_text", "text": interrupt_text}]
+        assert marker["content"] == [{"type": "input_text", "text": marker_text}]
+        assert not marker.get("is_meta")
         # The upload landed on the message that actually queued it.
         assert steered["content"][0] == {
             "type": "input_image",
@@ -3099,16 +3413,28 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
         pending_inputs.reset_for_tests()
 
 
-async def test_external_interrupt_lookalike_still_drains_pending_input(
+@pytest.mark.parametrize(
+    ("text", "source_id"),
+    [
+        ("[Request interrupted by user?]", None),
+        ("[System: Message from another session]", None),
+        ("[System: Message from another session]", "user-input:0:message"),
+        ("Please check the other session.", "peer-input:0:peer_message_wake"),
+    ],
+)
+async def test_external_native_marker_lookalike_still_drains_pending_input(
     client: httpx.AsyncClient,
+    text: str,
+    source_id: str | None,
 ) -> None:
     """
-    The interrupt-record exemption must not swallow real user messages.
+    Native marker exemptions must not swallow real user messages.
 
     A user can type a message that merely resembles the marker. Over-matching
     would skip the drain for it, stranding the pending entry and dropping the
     upload it carries — the same class of bug from the other direction. The
     regex is anchored, so a bracketed question is a normal message.
+    Peer labels also require their synthetic source id to skip the drain.
     """
     from omnigent.runtime import pending_inputs
 
@@ -3128,11 +3454,10 @@ async def test_external_interrupt_lookalike_still_drains_pending_input(
                     "item_type": "message",
                     "item_data": {
                         "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "[Request interrupted by user?]"}
-                        ],
+                        "content": [{"type": "input_text", "text": text}],
                     },
                     "response_id": "native_turn_1",
+                    **({"source_id": source_id} if source_id else {}),
                 },
             },
         )
@@ -13027,6 +13352,44 @@ async def test_native_message_to_hostless_gone_runner_is_refused(
     error = resp.json()["error"]
     assert error["code"] == "runner_unavailable"
     assert f"claude --resume {sid}" in error["message"]
+
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    assert not [i for i in items if i["type"] in {"message", "error"}], items
+    snap = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snap["status"] == "idle"
+
+
+async def test_native_message_to_side_chat_of_hostless_gone_source_is_refused(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A side chat whose host-less source runner is gone is refused like its source.
+
+    The side chat runs on its source's local-terminal runner, so recovery
+    through the source can't bring it back. The refusal names the source's
+    resume command and records nothing, so the client keeps the message.
+    """
+    agent = await create_test_agent(client)
+    labels = {"omnigent.wrapper": "claude-code-native-ui"}
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = (await _create_session(client, agent["id"], labels=labels))["id"]
+    side_chat_labels = {
+        **labels,
+        "omnigent.side_chat": "1",
+        "omnigent.side_chat.source_id": source_id,
+    }
+    assert store.set_runner_id(source_id, "runner_local_terminal")
+    sid = store.create_conversation(
+        agent_id=agent["id"], runner_id="runner_local_terminal", labels=side_chat_labels
+    ).id
+
+    resp = await _post_native_message(client, sid)
+    assert resp.status_code == 503, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "side chat" in error["message"]
+    assert f"claude --resume {source_id}" in error["message"]
 
     items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
     assert not [i for i in items if i["type"] in {"message", "error"}], items

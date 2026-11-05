@@ -566,6 +566,61 @@ async def test_managed_session_create_end_to_end(
     del tunnels
 
 
+async def test_deleting_one_session_keeps_a_shared_sandbox_host(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Several sessions can be bound to one sandbox host (a runner launch on
+    the host binds its session there). Deleting one keeps the sandbox for
+    the others; deleting the last tears it down.
+    """
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    agent = await create_test_agent(env.client, name="shared-host-agent")
+    resp = await env.client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+    )
+    assert resp.status_code == 201, resp.text
+    first = await _wait_for_managed_binding(env, resp.json()["id"])
+    tunnels = [await future for future in host_futures]
+    assert first.host_id is not None
+
+    resp = await env.client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert resp.status_code == 201, resp.text
+    second_id = resp.json()["id"]
+    env.conv_store.set_host_id(second_id, first.host_id, "/root/workspace")
+
+    delete_resp = await env.client.delete(f"/v1/sessions/{first.id}")
+    assert delete_resp.status_code == 200, delete_resp.text
+    assert fake.terminated == []
+    assert env.host_store.get_host(first.host_id) is not None
+
+    delete_resp = await env.client.delete(f"/v1/sessions/{second_id}")
+    assert delete_resp.status_code == 200, delete_resp.text
+    assert set(fake.terminated) == {"sb-fake-1"}
+    assert env.host_store.get_host(first.host_id) is None
+    del tunnels
+
+
 async def test_managed_session_create_with_repo_workspace_binds_cloned_dir(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
@@ -2196,7 +2251,10 @@ async def test_delete_managed_session_forwards_capture_logs(
     )
     teardowns: list[bool] = []
 
-    async def record_teardown(*args: object, capture_logs: bool = False) -> None:
+    async def record_teardown(
+        *args: object, keep_if_bound: bool = False, capture_logs: bool = False
+    ) -> None:
+        assert keep_if_bound
         teardowns.append(capture_logs)
 
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", record_teardown)
@@ -2504,7 +2562,7 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
 
     error = _persisted_task_error(conv_store, conv.id)
     assert error is not None
-    assert error["code"] == "runner_failed_to_start"
+    assert error["code"] == "runner_process_crash"
     decision = _disconnect_decisions(caplog, conv.id)[0]
     attributes = getattr(decision, "attributes", {})
     assert attributes["decision"] == "failed_mid_turn"

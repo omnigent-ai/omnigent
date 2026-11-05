@@ -32,6 +32,7 @@ from omnigent.entities import (
     ConversationItem,
 )
 from omnigent.inner.native_attachments import reject_authored_framework_notices
+from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -355,6 +356,10 @@ class AgentObject(BaseModel):
         built-in template and native agents are read-only.
     :param mcp_registry_editable: Whether this caller owns the session and can
         select managed MCP services independently of agent ownership.
+    :param loads_user_settings: Whether a claude-sdk session for this agent loads
+        the user's Claude settings and user-scope MCP servers. ``False`` when the
+        spec's ``skills: none`` runs the CLI with no setting sources; ``True``
+        when the bundle cannot be loaded.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -396,6 +401,7 @@ class AgentObject(BaseModel):
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
+    loads_user_settings: bool = True
     mcp_registry_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
@@ -922,6 +928,9 @@ class ChildSessionSummary(BaseModel):
         ``RoutingDecisionData.decision_id``. Read from the child's
         ``omnigent.routing.decision_id`` label, stamped when routing pins
         the model. ``None`` when the child was not routed.
+    :param depth: Levels below the queried session, ``1`` for a direct
+        child. Set only by ``?descendants=true``, so a client can tell the
+        server returned the whole subtree; ``None`` otherwise.
     """
 
     id: str
@@ -945,6 +954,7 @@ class ChildSessionSummary(BaseModel):
     pending_elicitations_count: int = 0
     routed_model: str | None = None
     routing_decision_id: str | None = None
+    depth: int | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
@@ -1159,6 +1169,8 @@ class CreateResponseRequest(BaseModel):
     pending_id: str | None = None
     delivery_attempt_id: str | None = None
     input_enqueued_at_ms: int | None = None
+    # Runner-validated authorization for one delivery, separate from user content/history.
+    authorized_native_shell_command: str | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
@@ -1514,7 +1526,23 @@ _MAX_MANAGED_WORKSPACES = 10
 _MANAGED_HOST_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
-class _SessionCreateRequestBase(BaseModel):
+class _SandboxProfileSelection(BaseModel):
+    sandbox_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+    sandbox_profile_revision: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _check_sandbox_profile_selection(self) -> Self:
+        if self.sandbox_profile_revision is not None and self.sandbox_profile_id is None:
+            raise ValueError("sandbox_profile_revision requires sandbox_profile_id")
+        if self.sandbox_profile_id is not None:
+            if getattr(self, "host_type", None) != "managed":
+                raise ValueError("sandbox_profile_id requires host_type 'managed'")
+            if getattr(self, "parent_session_id", None) is not None:
+                raise ValueError("Child sessions inherit their parent's sandbox profile")
+        return self
+
+
+class _SessionCreateRequestBase(_SandboxProfileSelection):
     """
     JSON request body for ``POST /v1/sessions``.
 
@@ -1859,7 +1887,7 @@ class ProjectSessionCreateRequest(_SessionCreateRequestBase):
 SessionCreateInput = SessionCreateRequest | ProjectSessionCreateRequest
 
 
-class SessionCreateMetadata(BaseModel):
+class SessionCreateMetadata(_SandboxProfileSelection):
     """
     Metadata JSON part for multipart ``POST /v1/sessions``.
 
@@ -2456,6 +2484,7 @@ class SessionResponse(BaseModel):
     inference_configured: bool = False
     inference_error: str | None = None
     terminal_pending: bool = False
+    sandbox_profile: SandboxProfileSummary | None = None
     sandbox_status: SandboxStatus | None = None
     # Per-MCP-server startup state for native harness sessions
     # (codex-native), present while the harness boots its MCP servers or
@@ -2756,7 +2785,7 @@ class ClearCodexGoalResponse(BaseModel):
     cleared: bool
 
 
-class SessionForkRequest(BaseModel):
+class SessionForkRequest(_SandboxProfileSelection):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.
 
@@ -2821,11 +2850,18 @@ class SessionForkRequest(BaseModel):
     :param workspace: Git repository URL (optionally ``#<branch>``) the
         server clones into the fork's sandbox as its working directory,
         e.g. ``"https://github.com/org/repo#release-1.2"``. **Omitting**
-        the field inherits the repository the source session recorded, so
-        cloning a sandbox session lands the fork in the same checkout; an
+        both workspace fields inherits all repositories the source session
+        recorded, so cloning a sandbox session preserves its checkouts; an
         explicit value overrides it and an explicit ``null`` gives the
         fork an empty sandbox. Only valid with ``host_type: "managed"`` —
         an external fork's directory is chosen when it binds a host.
+    :param workspaces: Repository URLs (each optionally ``#<branch>``) to
+        clone into the fork's sandbox, replacing the source's repositories.
+        Send only when ``GET /v1/info`` reports ``session_fork_workspaces``.
+        Several repositories require a provider with ``multi_repo`` support.
+        Mutually exclusive with ``workspace``; explicitly sending ``[]`` or
+        ``null`` gives the fork an empty sandbox. Only valid with
+        ``host_type: "managed"``.
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -2839,6 +2875,7 @@ class SessionForkRequest(BaseModel):
     sandbox_provider: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    workspaces: list[str] | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
     # side-chat tab). It may share its parent's runner.
@@ -2852,8 +2889,8 @@ class SessionForkRequest(BaseModel):
         Enforce the per-``host_type`` contract for a fork.
 
         Mirrors :meth:`_SessionCreateRequestBase._check_managed_host_fields`:
-        a managed fork's ``workspace``, when given, must be a git repository
-        URL (optionally ``#<branch>``) the server clones into the sandbox —
+        a managed fork's workspace(s), when given, must be git repository
+        URLs (optionally ``#<branch>``) the server clones into the sandbox —
         a filesystem path points at nothing in a sandbox that doesn't exist
         yet. Both ``sandbox_provider`` and ``workspace`` are meaningless on
         an external fork, which picks its host and directory afterwards.
@@ -2863,8 +2900,8 @@ class SessionForkRequest(BaseModel):
         :returns: The validated instance.
         :raises ValueError: On a managed workspace that isn't a valid
             repository URL, a malformed managed ``host_id``, or
-            ``host_id`` / ``sandbox_provider`` / ``workspace`` without
-            ``host_type: "managed"``.
+            conflicting or oversized workspace selections, or ``host_id`` /
+            ``sandbox_provider`` / workspace(s) without ``host_type: "managed"``.
         """
         # Lazy import: schemas is imported by nearly every module, so
         # pulling the (FastAPI/click-importing) managed-hosts module in
@@ -2876,13 +2913,26 @@ class SessionForkRequest(BaseModel):
                 raise ValueError(
                     "host_type 'managed' takes a host_id of 32 lowercase hex characters"
                 )
-            if self.workspace is not None:
+            if {"workspace", "workspaces"} <= self.model_fields_set:
+                raise ValueError(
+                    "set either 'workspace' (one repository) or 'workspaces' "
+                    "(several) for host_type 'managed', not both"
+                )
+            if self.workspaces is not None and len(self.workspaces) > _MAX_MANAGED_WORKSPACES:
+                raise ValueError(
+                    f"host_type 'managed' takes at most {_MAX_MANAGED_WORKSPACES} "
+                    f"repositories in 'workspaces' (got {len(self.workspaces)})"
+                )
+            workspaces = self.workspaces or (
+                [self.workspace] if self.workspace is not None else []
+            )
+            for workspace in workspaces:
                 try:
-                    parse_repo_workspace(self.workspace)
+                    parse_repo_workspace(workspace)
                 except ValueError as exc:
                     raise ValueError(
                         "host_type 'managed' takes a git repository URL "
-                        f"(optionally '#<branch>') as workspace: {exc}"
+                        f"(optionally '#<branch>') for each workspace: {exc}"
                     ) from exc
             return self
         if self.host_id is not None:
@@ -2898,6 +2948,11 @@ class SessionForkRequest(BaseModel):
         if self.workspace is not None:
             raise ValueError(
                 "workspace only applies to host_type 'managed' — an external "
+                "fork picks its directory when it binds a host"
+            )
+        if "workspaces" in self.model_fields_set:
+            raise ValueError(
+                "workspaces only applies to host_type 'managed' — an external "
                 "fork picks its directory when it binds a host"
             )
         return self
@@ -2978,6 +3033,25 @@ class SessionPullRequest(SessionPullRequestSummary):
     last_seen_at: float
 
 
+class SessionRepositoryBranch(BaseModel):
+    """Current branch and remote availability for one managed repository.
+
+    ``pushed`` is true when the branch exists at the original clone URL,
+    false when confirmed absent, and null when availability is unknown.
+    It does not indicate whether local commits or working-tree changes are pushed.
+    """
+
+    url: str
+    branch: str | None = None
+    pushed: bool | None = None
+
+
+class SessionRepositoryBranchList(BaseModel):
+    """Managed repositories in their original launch order."""
+
+    repositories: list[SessionRepositoryBranch]
+
+
 class SessionPullRequestList(BaseModel):
     """
     A page of a session's linked pull requests in display order, keyed by URL.
@@ -3050,6 +3124,16 @@ class SessionListItem(BaseModel):
         passing through ``session_stream`` and decrements when a
         verdict is dispatched. ``0`` when the session has no
         outstanding elicitations.
+    :param background_work_running: ``True`` while work outlives the
+        session's ended turn, such as a background shell or a Codex goal that
+        keeps running between turns. The sidebar shows such a session as
+        working; ``status`` stays as reported, so the session still takes a new
+        message. ``False`` while the session's runner is offline.
+    :param blocked_on: Why the session's agent is parked on a terminal prompt,
+        e.g. ``"permission prompt"``, from the last status edge, truncated to
+        128 characters. The sidebar shows such a session as needing input even
+        when no web card exists for the prompt. ``None`` when it is not parked
+        or its runner is offline.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. ``None`` for
         sessions that haven't been bound to a host workspace.
@@ -3120,6 +3204,8 @@ class SessionListItem(BaseModel):
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
+    background_work_running: bool = False
+    blocked_on: str | None = None
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
@@ -3628,6 +3714,30 @@ class SessionCodexApprovalModeEvent(_SSEEventBase):
     type: Literal["session.codex_approval_mode"]
     conversation_id: str
     approval_mode: str
+
+
+class SessionBackgroundTasksEvent(_SSEEventBase):
+    """
+    Background tasks of a session changed between its turns.
+
+    Emitted when a codex-native forwarder's listing of its thread's background
+    terminals changes. Claude's shells ride on its turn's ``session.status``
+    edge instead, because Claude reports them only when a turn ends.
+
+    :param type: Always ``"session.background_tasks"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param background_task_count: Background tasks still running, e.g. ``1``.
+        ``0`` clears the composer's indicator.
+    :param background_tasks: Detail for each counted task, e.g. its command.
+
+    Category: **transient** (SSE-only). The session snapshot carries the same
+    tally, so reconnecting clients restore it.
+    """
+
+    type: Literal["session.background_tasks"]
+    conversation_id: str
+    background_task_count: int
+    background_tasks: list[BackgroundTaskInfo] = Field(default_factory=list)
 
 
 class SessionAgentChangedEvent(_SSEEventBase):
@@ -5060,6 +5170,7 @@ ServerStreamEvent = Annotated[
     | SessionCollaborationModeEvent
     | SessionPermissionModeEvent
     | SessionCodexApprovalModeEvent
+    | SessionBackgroundTasksEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
