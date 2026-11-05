@@ -6347,13 +6347,14 @@ export function NewChatLandingScreen() {
           ? "Working directory: No host selected"
           : `Working directory: ${visibleWorkspace || "Not selected"}`
       }
-      title={
-        workspacePopoverOpen
-          ? undefined
-          : noExecutionTargetSelected
-            ? "No host selected"
-            : visibleWorkspace || "Working directory not selected"
+      tooltip={
+        noExecutionTargetSelected
+          ? "No host selected"
+          : visibleWorkspace
+            ? `Working directory: ${visibleWorkspace}`
+            : "Working directory not selected"
       }
+      menuOpen={workspacePopoverOpen}
       disabled={noExecutionTargetSelected || workspaceLoading}
       aria-busy={workspaceLoading || undefined}
       className={noExecutionTargetSelected || workspaceLoading ? "disabled:opacity-100" : undefined}
@@ -6597,15 +6598,14 @@ export function NewChatLandingScreen() {
                             ? "No host selected"
                             : visibleWorktreeHeader.branchDescription
                         }
-                        title={
-                          worktreePopoverOpen
-                            ? undefined
-                            : noExecutionTargetSelected
-                              ? "No host selected"
-                              : workspaceLoading || worktreeControlAvailable
-                                ? visibleWorktreeHeader.branchDescription
-                                : "Choose a Git working directory to use worktrees"
+                        tooltip={
+                          noExecutionTargetSelected
+                            ? "No host selected"
+                            : workspaceLoading || worktreeControlAvailable
+                              ? visibleWorktreeHeader.branchDescription
+                              : "Choose a Git working directory to use worktrees"
                         }
+                        menuOpen={worktreePopoverOpen}
                         disabled={
                           noExecutionTargetSelected || workspaceLoading || !worktreeControlAvailable
                         }
