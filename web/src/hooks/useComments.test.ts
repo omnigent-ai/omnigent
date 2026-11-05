@@ -193,10 +193,10 @@ describe("useDeleteComment", () => {
     return renderHook(() => useDeleteComment("conv_1"), { wrapper: wrapperWith(queryClient) });
   }
 
-  it("DELETEs the encoded comment endpoint and invalidates the session list", async () => {
+  it.each([204, 404])("DELETE %s invalidates the session list", async (status) => {
     // The comment id is url-encoded so ids with reserved chars hit the
     // right route; success refreshes the session-wide list.
-    fetchMock.mockResolvedValueOnce(mockResponse(undefined));
+    fetchMock.mockResolvedValueOnce(mockResponse(undefined, { status, ok: status === 204 }));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderDelete(queryClient);
@@ -209,12 +209,15 @@ describe("useDeleteComment", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["comments", "conv_1"] });
   });
 
-  it("throws on non-2xx", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
+  it.each([403, 500])("preserves the cache when deletion fails with %s", async (status) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status }));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderDelete(queryClient);
     result.current.mutate("c1");
     await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.message).toContain(String(status));
+    expect(invalidateSpy).not.toHaveBeenCalled();
   });
 });
 
