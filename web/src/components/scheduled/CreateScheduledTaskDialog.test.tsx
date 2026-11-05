@@ -320,15 +320,22 @@ describe("onCreated", () => {
     });
   }
 
-  it("is called once after a successful create", async () => {
+  it("is called once, only after the create completes", async () => {
     const onCreated = vi.fn();
     const onOpenChange = vi.fn();
+    let finishCreate: (value: unknown) => void = () => {};
+    mutateAsync.mockReturnValueOnce(new Promise((resolve) => (finishCreate = resolve)));
     render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} onCreated={onCreated} />, {
       expandAdvanced: false,
     });
     fillRequiredFields();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(onCreated).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+
+    finishCreate({ id: "st_new" });
     await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(1));
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
