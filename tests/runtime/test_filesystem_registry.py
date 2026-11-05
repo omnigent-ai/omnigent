@@ -347,7 +347,8 @@ def test_get_baseline_returns_none_when_no_snapshot(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("operation,original", [("created", ""), ("modified", None)])
-def test_first_observation_preserves_known_or_unknown_original(
+@pytest.mark.asyncio
+async def test_first_observation_preserves_known_or_unknown_original(
     tmp_path: Path, operation: str, original: str | None
 ) -> None:
     registry = AgentEditFilesystemRegistry(tmp_path)
@@ -355,8 +356,8 @@ def test_first_observation_preserves_known_or_unknown_original(
     registry.record_change("file.txt", operation, "session")
     registry.seed_snapshot("file.txt", "intermediate", session_id="session")
     assert registry.revert_generation("file.txt", session_id="session") is None
-    registry.record_change(
-        "file.txt", "modified", "session", current_text="intermediate", revert_generation=1
+    await registry.record_tracked_change(
+        "file.txt", "modified", "session", AsyncMock(return_value="intermediate")
     )
     assert not registry.needs_snapshot("file.txt")
     assert registry.get_baseline("file.txt") == original
@@ -434,7 +435,7 @@ async def test_revert_read_overtaken_by_a_newer_change_keeps_the_path(
         "file.txt", "modified", "session", read_then_let_another_writer_record
     )
     listed = registry.list_changed_files("session", limit=10)
-    assert [entry["status"] for entry in listed] == ["modified"]
+    assert [entry["status"] for entry in listed] == [newer_operation]
 
     await registry.record_tracked_change(
         "file.txt", "modified", "session", AsyncMock(return_value="a\n")

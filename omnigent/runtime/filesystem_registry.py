@@ -567,9 +567,6 @@ class FilesystemRegistry(ABC):
         path: str,
         operation: str,
         session_id: str,
-        *,
-        current_text: str | None = None,
-        revert_generation: int | None = None,
     ) -> None:
         """Record a file change made by the agent via a tool call.
 
@@ -583,11 +580,6 @@ class FilesystemRegistry(ABC):
             ``"deleted"``.
         :param session_id: The session that made the change,
             e.g. ``"conv_abc123"``.
-        :param current_text: The file's complete text after the change, read
-            through the environment that made it, or ``None`` when not read.
-        :param revert_generation: What :meth:`revert_generation` returned
-            before *current_text* was read. A change of *path* recorded since
-            then makes *current_text* stale.
         """
         return
 
@@ -609,7 +601,7 @@ class FilesystemRegistry(ABC):
         session_id: str,
         read_text: Callable[[], Awaitable[str | None]],
     ) -> None:
-        """Record a tracked write, dropping *path* when it restores the session's original.
+        """Record a tracked write, then drop *path* if it restored the session's original.
 
         :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
         :param operation: One of ``"created"``, ``"modified"``, or ``"deleted"``.
@@ -618,22 +610,23 @@ class FilesystemRegistry(ABC):
             environment that made the change, or ``None``. Called only when
             :meth:`revert_generation` allows a revert check.
         """
+        self.record_change(path, operation, session_id)
         generation = (
             None if operation == "deleted" else self.revert_generation(path, session_id=session_id)
         )
-        current_text = None
-        try:
-            if generation is not None:
-                current_text = await read_text()
-        finally:
-            # The write already happened, so record it even if the read is cancelled.
-            self.record_change(
-                path,
-                operation,
-                session_id,
-                current_text=current_text,
-                revert_generation=generation,
-            )
+        if generation is not None:
+            self._drop_if_reverted(path, session_id, await read_text(), generation)
+
+    def _drop_if_reverted(
+        self, path: str, session_id: str, current_text: str | None, generation: int
+    ) -> None:
+        """Drop *session_id*'s events for *path* when *current_text* is its original.
+
+        :param current_text: The file's complete text, read after the change was recorded.
+        :param generation: What :meth:`revert_generation` returned before the
+            read. A change of *path* recorded since then makes *current_text* stale.
+        """
+        return
 
     def forget_original(self, path: str, *, session_id: str) -> None:
         """Make *session_id*'s original for *path* unknown, so no write drops *path*.
@@ -795,17 +788,12 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         path: str,
         operation: str,
         session_id: str,
-        *,
-        current_text: str | None = None,
-        revert_generation: int | None = None,
     ) -> None:
         """Record a file change made by the agent via a tool call.
 
         Appends a :class:`_FileEvent` to the session's event list.  The file
         is stat-ed at record time to capture size and mtime; stat errors are
-        silently suppressed (e.g. for deleted files).  When *current_text*
-        equals the session's original and no change of the path was recorded
-        since *revert_generation*, the path's events are dropped instead.
+        silently suppressed (e.g. for deleted files).
 
         Ephemeral process artifacts (see :data:`_EPHEMERAL_PATTERNS`) are
         silently ignored.
@@ -816,10 +804,6 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             ``"deleted"``.
         :param session_id: The session that made the change,
             e.g. ``"conv_abc123"``.
-        :param current_text: The file's complete text after the change, or
-            ``None`` when not read.
-        :param revert_generation: What :meth:`revert_generation` returned
-            before *current_text* was read.
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -849,20 +833,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             bytes=bytes_,
             modified_at=modified_at,
         )
-        original = self._revertible_original(session_id, norm, operation)
         with self._lock:
             generations = self._change_generations.setdefault(session_id, {})
-            generation = generations.get(norm, 0)
-            generations[norm] = generation + 1
-            events = self._session_events.setdefault(session_id, [])
-            if (
-                original is not None
-                and current_text == original
-                and revert_generation == generation
-            ):
-                events[:] = [event for event in events if event.path != norm]
-                return
-            events.append(fe)
+            generations[norm] = generations.get(norm, 0) + 1
+            self._session_events.setdefault(session_id, []).append(fe)
 
     def revert_generation(self, path: str, *, session_id: str) -> int | None:
         norm = _normalize_path(path, self._cwd)
@@ -871,6 +845,20 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._lock:
             return self._change_generations.get(session_id, {}).get(norm, 0)
 
+    def _drop_if_reverted(
+        self, path: str, session_id: str, current_text: str | None, generation: int
+    ) -> None:
+        norm = _normalize_path(path, self._cwd)
+        if norm is None or current_text is None:
+            return
+        if current_text != self._revertible_original(session_id, norm):
+            return
+        with self._lock:
+            if self._change_generations.get(session_id, {}).get(norm, 0) != generation:
+                return
+            events = self._session_events.get(session_id, [])
+            events[:] = [event for event in events if event.path != norm]
+
     def forget_original(self, path: str, *, session_id: str) -> None:
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -878,14 +866,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._snapshots_lock:
             self._session_originals.setdefault(session_id, {})[norm] = None
 
-    def _revertible_original(
-        self, session_id: str, norm: str, operation: str | None = None
-    ) -> str | None:
-        """Return *session_id*'s original for *norm*, unless its first change created the file.
-
-        :param operation: The change being recorded, which is the first one
-            when the session has no events for *norm*.
-        """
+    def _revertible_original(self, session_id: str, norm: str) -> str | None:
+        """Return *session_id*'s original for *norm*, unless its first change created the file."""
         with self._snapshots_lock:
             original = self._session_originals.get(session_id, {}).get(norm)
         if original is None:
@@ -893,7 +875,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._lock:
             first = next(
                 (e.operation for e in self._session_events.get(session_id, []) if e.path == norm),
-                operation,
+                None,
             )
         return None if first == "created" else original
 
