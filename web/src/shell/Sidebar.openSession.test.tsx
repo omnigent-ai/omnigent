@@ -35,6 +35,9 @@ vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
 
+// While true, the list hook reports its first page as still loading.
+let listLoading = false;
+
 const LOADED = [
   conversation("conv_recent", { title: "Recent work", updated_at: 300 }),
   conversation("conv_middle", { title: "Middle work", updated_at: 200 }),
@@ -56,11 +59,15 @@ function renderOpenSession(
   }: { config?: SidebarConfig; sharedWithMore?: Conversation[]; childId?: string } = {},
 ) {
   vi.mocked(useConversations).mockImplementation((...args) =>
-    sharedWithMore && args[4] === "shared"
-      ? ({ ...conversationPage(sharedWithMore), hasNextPage: true } as ReturnType<
+    listLoading
+      ? ({ ...conversationPage([]), data: undefined, isLoading: true } as unknown as ReturnType<
           typeof useConversations
         >)
-      : conversationPage(loaded),
+      : sharedWithMore && args[4] === "shared"
+        ? ({ ...conversationPage(sharedWithMore), hasNextPage: true } as ReturnType<
+            typeof useConversations
+          >)
+        : conversationPage(loaded),
   );
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   // A top-level session: the root walk resolves to the open session itself.
@@ -69,7 +76,7 @@ function renderOpenSession(
   if (childId)
     queryClient.setQueryData(["session", childId], { id: childId, parentSessionId: openId });
   if (pickedRow) rememberOpenSessionRow(queryClient, pickedRow);
-  return render(
+  const tree = () => (
     <QueryClientProvider client={queryClient}>
       <SidebarDataProvider config={config}>
         <TooltipProvider>
@@ -80,8 +87,10 @@ function renderOpenSession(
           </MemoryRouter>
         </TooltipProvider>
       </SidebarDataProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const view = render(tree());
+  return Object.assign(view, { rerenderTree: () => view.rerender(tree()) });
 }
 
 const scrollIntoView = vi.fn();
@@ -105,8 +114,14 @@ function sessionsSection() {
 beforeEach(() => {
   mocks.archive.mutate.mockReset();
   mocks.projects = [];
+  listLoading = false;
   scrollIntoView.mockReset();
   vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+  // jsdom has no layout: place every element below the viewport, so the open
+  // session's row is offscreen when it mounts and gets scrolled into view.
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue(
+    new DOMRect(0, 2000, 300, 40),
+  );
   // Search rows carry their owner; the viewer owns the "me" rows.
   vi.spyOn(identity, "getCurrentUserId").mockReturnValue("me");
 });
@@ -174,6 +189,20 @@ describe("Sidebar open session reveal", () => {
     const row = await findOpenRow(/Older work/);
     expect(sessionsSection()).toContainElement(row);
     expect(screen.queryByRole("button", { name: "Unarchive conversation" })).toBeNull();
+  });
+
+  it("adds the open session's row only once the first list page has loaded", async () => {
+    const older = conversation("conv_older", { title: "Older work", owner: "me", updated_at: 50 });
+    listLoading = true;
+    const view = renderOpenSession("conv_older", LOADED, older);
+
+    expect(await screen.findByText("Loading…")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Older work/ })).toBeNull();
+
+    listLoading = false;
+    view.rerenderTree();
+    const row = await findOpenRow(/Older work/);
+    expect(sessionsSection()).toContainElement(row);
   });
 
   it.each([

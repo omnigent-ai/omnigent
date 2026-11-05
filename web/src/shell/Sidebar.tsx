@@ -1997,8 +1997,11 @@ function ConversationList({
   // The open session is always listed, so opening one from search reveals it
   // here: an archived one (with its Unarchive control) or one older than the
   // loaded pages is added from its own fetch until a list page carries it.
+  // Only once the first page has loaded: a row added before it would sit alone at
+  // the top, then move down into place without being scrolled into view.
   const openSessionMissing =
     activeRootSessionId !== null &&
+    !conversationsQuery.isLoading &&
     !pagedConversations.some((c) => c.id === activeRootSessionId) &&
     !pinnedConversations.some((c) => c.id === activeRootSessionId);
   const openSessionRow = useOpenSessionRow(openSessionMissing ? activeRootSessionId : null);
