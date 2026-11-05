@@ -1786,7 +1786,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return run_write_transaction(self._session_immediate, "set_session_todos", write)
 
-    def _lock_session_family(self, session: Session, family_id: str) -> None:
+    def _lock_session_family(self, session: Session, family_id: str) -> SqlPreference:
         """Keep the family lock after its original session is deleted."""
         # ponytail: one retained lock per moved/grouped source; reclaim only with
         # coordinated deletion and admission across split databases.
@@ -1810,15 +1810,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             statement = pg_insert(SqlPreference).values(**values).on_conflict_do_nothing()
         session.execute(statement)
-        session.execute(
-            select(SqlPreference.key)
+        return session.execute(
+            select(SqlPreference)
             .where(
                 SqlPreference.workspace_id == current_workspace_id(),
                 SqlPreference.user_id == "__session_families__",
                 SqlPreference.key == family_id,
             )
             .with_for_update()
-        )
+        ).scalar_one()
 
     def _family_member_ids(self, session: Session, family_id: str) -> list[str]:
         ids = list(
@@ -1882,10 +1882,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels_session: Session,
             member_ids: list[str],
             *,
+            label_source_id: str,
             promote_pin: bool,
             project_id: str | None,
         ) -> None:
-            source_labels = _fetch_labels(labels_session, source_id)
+            source_labels = _fetch_labels(labels_session, label_source_id)
             updates: dict[str, str] = {}
             if project_id is None and PROJECT_LABEL_KEY in source_labels:
                 updates[PROJECT_LABEL_KEY] = source_labels[PROJECT_LABEL_KEY]
@@ -1894,7 +1895,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 labels_session.execute(
                     delete(SqlConversationLabel).where(
                         SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.conversation_id == source_id,
+                        SqlConversationLabel.conversation_id == label_source_id,
                         SqlConversationLabel.key == pin_key,
                     )
                 )
@@ -1904,8 +1905,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 for member_id in member_ids:
                     _upsert_prepared_labels(labels_session, member_id, updates, now_epoch())
 
-        def write(session: Session) -> bool:
-            self._lock_session_family(session, family_id)
+        def write(session: Session) -> None:
+            family_lock = self._lock_session_family(session, family_id)
             source_meta = session.get(SqlConversationMetadata, (current_workspace_id(), source_id))
             target_meta = session.get(
                 SqlConversationMetadata, (current_workspace_id(), session_id)
@@ -1941,22 +1942,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                     copy_labels(
                         labels_session,
                         [source_id, session_id],
+                        label_source_id=source_id,
                         promote_pin=source_meta.family_id is None,
                         project_id=source_meta.project_id,
                     )
-            new_family = source_meta.family_id is None
+            if self._conv_engine is not self._engine and source_meta.family_id is None:
+                family_lock.value = "pending_initial_labels"
             target_meta.project_id = source_meta.project_id
             source_meta.family_id = family_id
             target_meta.family_id = family_id
-            return new_family
 
-        new_family = run_write_transaction(
-            self._session_immediate, "create_sibling_membership", write
-        )
+        run_write_transaction(self._session_immediate, "create_sibling_membership", write)
         if self._conv_engine is not self._engine:
             # Commit membership before moving pins in a separate database.
             def finish_labels(session: Session) -> None:
-                self._lock_session_family(session, family_id)
+                family_lock = self._lock_session_family(session, family_id)
                 source_meta = session.get(
                     SqlConversationMetadata, (current_workspace_id(), source_id)
                 )
@@ -1965,13 +1965,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                     raise OmnigentError(
                         "Sibling source is no longer available", code=ErrorCode.CONFLICT
                     )
+                initialize_labels = family_lock.value == "pending_initial_labels"
                 with self._profile_label_session(session) as labels_session:
                     copy_labels(
                         labels_session,
-                        members if new_family else [session_id],
-                        promote_pin=new_family,
+                        members if initialize_labels else [session_id],
+                        label_source_id=family_id if initialize_labels else source_id,
+                        promote_pin=initialize_labels,
                         project_id=source_meta.project_id,
                     )
+                # Clear only after the separate label transaction commits.
+                family_lock.value = "{}"
 
             run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
 

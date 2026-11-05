@@ -9898,9 +9898,20 @@ async def test_family_limit_counts_archived_members_and_cleans_up_rejected_creat
     assert {member.id for member in store.get_session_family(source.id)} == retained
 
 
-@pytest.mark.parametrize("split_database", [False, True])
-def test_failed_family_membership_preserves_source_pin(tmp_path, monkeypatch, split_database):
-    from omnigent.stores.conversation_store import family_pinned_label_key, pinned_label_key
+@pytest.mark.parametrize(
+    "split_database,retry_from_member", [(False, False), (True, False), (True, True)]
+)
+def test_failed_family_membership_preserves_source_pin(
+    tmp_path, monkeypatch, split_database, retry_from_member
+):
+    import asyncio
+
+    from omnigent.server.session_families import complete_sibling_creation
+    from omnigent.stores.conversation_store import (
+        family_pinned_label_key,
+        pinned_label_key,
+        sqlalchemy_store,
+    )
 
     store = SqlAlchemyConversationStore(
         f"sqlite:///{tmp_path / 'metadata.db'}",
@@ -9931,7 +9942,32 @@ def test_failed_family_membership_preserves_source_pin(tmp_path, monkeypatch, sp
         assert saved.family_id is None
         assert family_pinned_label_key("alice") not in saved.labels
     assert store.get_conversation(source.id).labels[pinned_label_key("alice")] == "123"
-    store.delete_label(source.id, pinned_label_key("alice"))
+    retry_source_id = source.id
+    if split_database:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                sqlalchemy_store,
+                "_upsert_prepared_labels",
+                MagicMock(side_effect=RuntimeError("label commit failed")),
+            )
+            with pytest.raises(RuntimeError, match="label commit failed"):
+                if retry_from_member:
+                    store.add_new_sibling(source.id, target.id, user_id="alice")
+                else:
+                    asyncio.run(
+                        complete_sibling_creation(store, source.id, target.id, user_id="alice")
+                    )
+        if retry_from_member:
+            retry_source_id = target.id
+        else:
+            assert store.get_conversation(target.id) is None
+        assert store.get_conversation(source.id).labels[pinned_label_key("alice")] == "123"
+        target = store.create_conversation()
+    store.add_new_sibling(retry_source_id, target.id, user_id="alice")
+    for member in store.get_session_family(source.id):
+        assert member.labels[family_pinned_label_key("alice")] == "123"
+        assert pinned_label_key("alice") not in member.labels
+    store.set_family_pin(source.id, "", user_id="alice")
     assert not store.list_conversations(pinned=True, pinned_owner="alice").data
 
 
