@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
+import shutil
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -23,7 +27,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.executor import ExecutorConfig, ExecutorError, TextChunk, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
@@ -296,6 +300,98 @@ async def test_run_turn_points_auth_commands_at_a_remedy_reachable_from_the_host
         assert phrase in events[0].message
     assert unreachable_remedy not in events[0].message
     assert events[0].undelivered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("free_bytes", [4096, 512 * 1024 * 1024])
+async def test_run_turn_holds_a_message_until_the_transcript_disk_has_space(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    free_bytes: int,
+) -> None:
+    """
+    A full disk holds the message before typing and delivers once space returns.
+
+    Claude Code would otherwise run the message without recording it, leaving
+    the web transcript missing and later reporting a delivery failure.
+    """
+    transcript = tmp_path / "projects" / "session.jsonl"
+    (tmp_path / claude_bridge._STATE_FILE).write_text(
+        json.dumps({"transcript_path": str(transcript)}), encoding="utf-8"
+    )
+    checked: list[Path] = []
+    typed: list[str] = []
+
+    def fake_disk_usage(path: Path) -> SimpleNamespace:
+        checked.append(Path(path))
+        available = free_bytes if len(checked) == 1 else 512 * 1024 * 1024
+        return SimpleNamespace(total=1 << 40, used=(1 << 40) - available, free=available)
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        typed.append(content)
+
+    monkeypatch.setattr(shutil, "disk_usage", fake_disk_usage)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+    monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 0.0, raising=False)
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello from web"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert typed == ["hello from web"]
+    assert events == (
+        [
+            TextChunk(text=claude_native_executor._HOST_DISK_WAIT_MESSAGE),
+            TurnComplete(response=None),
+        ]
+        if free_bytes == 4096
+        else [TurnComplete(response=None)]
+    )
+    assert checked == [transcript.parent] if free_bytes > 4096 else [transcript.parent] * 2
+
+
+@pytest.mark.asyncio
+async def test_run_turn_cancels_a_full_disk_hold_without_failing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Closing a full-disk turn releases the wait without an error or keystrokes."""
+    transcript = tmp_path / "projects" / "session.jsonl"
+    (tmp_path / claude_bridge._STATE_FILE).write_text(
+        json.dumps({"transcript_path": str(transcript)}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_transcript_disk_full",
+        Mock(return_value=True),
+    )
+    injected = Mock()
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    executor = ClaudeNativeExecutor(tmp_path)
+    turn = executor.run_turn(
+        messages=[{"role": "user", "content": "hello from web"}],
+        tools=[],
+        system_prompt="ignored",
+    )
+
+    assert isinstance(await turn.__anext__(), TextChunk)
+    pending_next = asyncio.create_task(turn.__anext__())
+    await asyncio.sleep(0)
+    pending_next.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await pending_next
+    await turn.aclose()
+
+    injected.assert_not_called()
 
 
 @pytest.mark.asyncio

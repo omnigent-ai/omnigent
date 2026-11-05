@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   apiErrorFromResponse,
+  parseRetryAfterMs,
   approve,
   bindOnlyOnlineRunner,
   createBundledSession,
@@ -16,6 +17,7 @@ import {
   createSideChat,
   exportSessionTranscript,
   fetchSessionItemsPage,
+  fetchSessionRepositoryBranches,
   forkSession,
   getSession,
   getSessionSlim,
@@ -77,7 +79,62 @@ afterEach(() => {
   localStorage.clear();
 });
 
+describe("fetchSessionRepositoryBranches", () => {
+  it("reads per-repository branch availability and forwards cancellation", async () => {
+    const response = {
+      repositories: [
+        { url: "https://github.com/org/api", branch: "feature/api", pushed: true },
+        { url: "https://github.com/org/web", branch: "wip/web", pushed: false },
+        { url: "https://github.com/org/tools", branch: null, pushed: null },
+      ],
+    };
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(response));
+    const { signal } = new AbortController();
+    expect(await fetchSessionRepositoryBranches("session with space", signal)).toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/session%20with%20space/resources/repository-branches",
+      expect.objectContaining({ signal }),
+    );
+  });
+});
+
+describe("parseRetryAfterMs", () => {
+  it("reads delta-seconds and HTTP dates, and rejects anything else", () => {
+    const now = Date.parse("2026-11-04T00:00:00Z");
+    expect(parseRetryAfterMs("30", now)).toBe(30_000);
+    expect(parseRetryAfterMs(" 0 ", now)).toBe(0);
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:05 GMT", now)).toBe(5_000);
+    // A date already past means "now", not a negative wait.
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:00 GMT", now + 1_000)).toBe(0);
+    expect(parseRetryAfterMs(null, now)).toBeNull();
+    expect(parseRetryAfterMs("soon", now)).toBeNull();
+    // Malformed numbers aren't dates, so they mustn't read as "retry now".
+    expect(parseRetryAfterMs("-1", now)).toBeNull();
+    expect(parseRetryAfterMs("1.5", now)).toBeNull();
+    expect(parseRetryAfterMs("2026-11-04", now)).toBeNull();
+    // Looser date forms Date.parse would accept, read as "now" or a far-off wait.
+    expect(parseRetryAfterMs("Mon 1", now)).toBeNull();
+    expect(parseRetryAfterMs("January 1, 2027", now)).toBeNull();
+    expect(parseRetryAfterMs("Wednesday, 04-Nov-26 00:00:05 GMT", now)).toBeNull();
+  });
+});
+
 describe("apiErrorFromResponse", () => {
+  it("records the response's Retry-After for the retry policy", async () => {
+    const throttled = new Response(JSON.stringify({ error: { code: "rate_limited" } }), {
+      status: 429,
+      headers: { "Retry-After": "7" },
+    });
+    expect((await apiErrorFromResponse(throttled)).retryAfterMs).toBe(7_000);
+
+    const plain = new Response("{}", { status: 503 });
+    expect((await apiErrorFromResponse(plain)).retryAfterMs).toBeNull();
+    // Hand-built stand-ins have no headers at all.
+    expect(
+      (await apiErrorFromResponse(mockJsonResponse({}, { ok: false, status: 503 }))).retryAfterMs,
+    ).toBeNull();
+  });
+
   it("reads the AP `error` envelope (message + code)", async () => {
     const err = await apiErrorFromResponse(
       mockJsonResponse(
@@ -177,6 +234,7 @@ describe("createSession", () => {
       sideChatSettingsSupported: false,
       terminalPending: false,
       sandboxStatus: null,
+      sandboxProfile: null,
       mcpStartup: null,
       activeResponseId: null,
       workspace: null,
@@ -501,27 +559,42 @@ describe("forkSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({});
   });
 
-  it("asks for a managed sandbox when a sandbox target is given", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-      }),
-    );
+  it.each([
+    { profile: false, multiRepo: false },
+    { profile: true, multiRepo: false },
+    { profile: true, multiRepo: true },
+  ])(
+    "sends a managed sandbox target with profile=$profile and multiRepo=$multiRepo",
+    async ({ profile, multiRepo }) => {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: "conv_fork",
+          agent_id: "agent_clone",
+          status: "idle",
+          created_at: 1704067200,
+        }),
+      );
 
-    await forkSession("conv_src", {
-      sandbox: { provider: "modal", workspace: "https://github.com/org/repo#main" },
-    });
+      const repositoryFields = multiRepo
+        ? { workspaces: ["https://github.com/org/api#main", "https://github.com/org/web#dev"] }
+        : { workspace: "https://github.com/org/repo#main" };
+      await forkSession("conv_src", {
+        sandbox: {
+          provider: "modal",
+          ...repositoryFields,
+          ...(profile ? { profileId: "large", profileRevision: "revision-1" } : {}),
+        },
+      });
 
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({
-      host_type: "managed",
-      sandbox_provider: "modal",
-      workspace: "https://github.com/org/repo#main",
-    });
-  });
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(init.body as string)).toEqual({
+        host_type: "managed",
+        sandbox_provider: "modal",
+        ...repositoryFields,
+        ...(profile ? { sandbox_profile_id: "large", sandbox_profile_revision: "revision-1" } : {}),
+      });
+    },
+  );
 
   it("keeps an explicit null workspace, so a sandbox fork can start empty", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -540,6 +613,57 @@ describe("forkSession", () => {
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ host_type: "managed", workspace: null });
+  });
+
+  it.each([
+    {
+      workspaces: [
+        "https://github.com/org/api#fix-auth",
+        "https://github.com/org/web#update-login",
+      ],
+    },
+    { workspaces: [] },
+    { workspaces: null },
+  ])(
+    "forwards a sandbox fork's explicit repository selection: $workspaces",
+    async ({ workspaces }) => {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: "conv_fork",
+          agent_id: "agent_clone",
+          status: "idle",
+          created_at: 1704067200,
+        }),
+      );
+
+      await forkSession("conv_src", { sandbox: { provider: "kubernetes", workspaces } });
+
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(init.body as string)).toEqual({
+        host_type: "managed",
+        sandbox_provider: "kubernetes",
+        workspaces,
+      });
+    },
+  );
+
+  it("omits both repository fields when inheriting the source's entire selection", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", { sandbox: { provider: "kubernetes" } });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_type: "managed",
+      sandbox_provider: "kubernetes",
+    });
   });
 
   it("sends no host_type when no sandbox target is given (the fork stays unbound)", async () => {

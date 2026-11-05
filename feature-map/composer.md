@@ -14,6 +14,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
+- `touch-targets`: native iOS/Android apps and browsers with a coarse primary
+  pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
+  The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
+  compact controls regardless of viewport width.
 - `prompt-link`: opening the new-session page with `?prompt=`
   fills an editable draft without starting a session. The consumed prompt is
   removed from the URL while other query parameters and the fragment remain.
@@ -72,7 +76,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   or effort. States: no default, a Codex
   effort the pinned model lacks (or, with no project model, the remembered
   model lacks), an explicit composer pick, remembered Smart Routing, another
-  agent chosen.
+  agent chosen, and a configured agent that picker curation
+  (`restrict_to_agent_names`, see `native-harnesses.md`) does not offer, which
+  New Chat reports as unavailable until the user picks an offered agent while
+  project settings keeps storing it.
 - `config-cycle-hotkeys`: Ctrl+Alt+M cycles models and Ctrl+Alt+E cycles effort
   in both composers (Ctrl on every platform). The relevant menu briefly opens
   with the selected choice highlighted, preserving draft and input focus. In an
@@ -87,6 +94,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
+- `permissions-command`: in Codex native sessions, `/permissions` opens the
+  composer's approval-mode menu instead of Codex's own popup. Other sessions,
+  including Claude Code (whose `/permissions` edits tool rules) and Devin, don't
+  list it and send it as text. States: non-owner or change in flight (error, no
+  menu), arguments rejected.
 - `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
   Codex, and Devin native sessions steps through every mode in the chip's menu,
   including Full Access and Dangerous, wrapping while the chip is clickable. States:
@@ -96,6 +108,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   refused or failed (next press moves past it, or retries it when it is the only
   other mode), no other mode (native focus move, no
   `aria-keyshortcuts`).
+- `plan-mode`: the + menu's Plan row turns on plan mode. For Codex it can be
+  armed on the new-session composer before the first prompt (a "Plan mode"
+  badge), and the session starts in Codex's own Plan mode. States: armed,
+  cleared by an agent switch, unavailable for Smart Routing and unsaved custom
+  agents, and a connected host too old to start Codex in Plan mode (create refused).
 - `managed-mcp-picker`: choose administrator-configured services before launch
   on a host or sandbox. States: loading, empty, error/retry, selected, unavailable,
   remembered selection, explicitly none, restored connection needing sign-in.
@@ -103,6 +120,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   selection and launch wait for success. States: connected, pending, cancelled,
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
+  Rows show a one-line description. When the pointer or keyboard highlight rests
+  on a cut-off row for 400 ms, a scrollable tooltip shows the full text;
+  PageUp/PageDown page through a tall one while the composer keeps focus. The
+  tooltip fits within the viewport width, and on touch screens the highlight
+  doesn't open it.
   The main composer lists its full built-in set and the session's skills; a live
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
@@ -115,8 +137,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
-  to the active harness, and a host lookup failure leaves known agent entries
-  visible. It is absent before a session starts and from side chat. When the
+  to the active harness; a claude-sdk session on a host lists its Claude servers,
+  only the organization-managed ones when its agent sets `skills: none` (or, with a
+  status saying why, while the session-agent request is loading or after it
+  fails). A host lookup failure leaves known agent entries visible. It is absent before a session starts and from side chat. When the
   server has the MCP registry on, each registry service row also shows its
   account state. States: connected; sign-in required, with an inline **Sign in**
   that runs the popup sign-in and flips the row to connected, or a **Sign in
@@ -128,8 +152,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   reports it (via `~/.omnigent/mcp-auth-status.json`, see
   `docs/MCP_AUTH_STATUS.md`); its **Sign
   in** opens the reported URL in a new tab and the panel re-reads the host
-  inventory every few seconds until the row is connected. Custom agent servers
-  carry no account state.
+  inventory every few seconds until the row is connected. In a claude-sdk
+  session, the next turn after the row turns connected reaches that server
+  without starting a new session. Custom agent servers carry no account state.
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -151,6 +176,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `blocked-start`: hovering or focusing disabled Start explains the missing
   setup. Clicking, tapping, or trying to submit pins that explanation until
   dismissed or the missing setup is completed.
+- `sandbox-profiles`: participating providers add a [profile picker](sandbox-profiles.md)
+  to New session; Start waits for an authorized, current selection.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
   line indents it as a list item; the newline gesture continues the list
   (numbers increment) and ends it after an empty item.
@@ -163,7 +190,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
-  after its current step until it does.
+  after its current step in the timestamp row. It appears on desktop hover or
+  focus and stays visible with truncation on touch, without adding row height.
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
@@ -260,11 +288,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
   Design mode, and click an element. Type an instruction in the floating popup
   and use Send or Enter.
-- Change Settings → Always steer to choose whether busy-session follow-ups
-  queue or send immediately. Existing queued messages retain FIFO ordering.
+- Change Settings → Always steer (on by default) to choose whether
+  busy-session follow-ups queue or send immediately. Existing queued messages
+  retain FIFO ordering.
 
 **New-session composer** (landing page, or New session):
 
+- Select **Codex → + → Plan** and confirm the **Plan mode** badge before sending.
 - Write a prompt or attach a file before choosing a working directory. Hover
   or focus disabled Start to see what is missing; click, tap, or press Enter to
   keep the tooltip open. Click elsewhere or press Escape to dismiss it. Choose
@@ -357,6 +387,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
   example a server agent's name) keeps the dialog open with the server's reason.
+  Under picker curation (`restrict_to_agent_names`, see
+  `native-harnesses.md`) this New Chat entry point is absent: a curated
+  deployment offers no bundle import from New Chat.
 
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode
@@ -394,6 +427,11 @@ picker is hidden or the catalog is empty. Host and sandbox runners must support
 managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
+
+- **`touch-targets`, new-session and in-session composers:**
+  `tests/browser_ui/chat/test_composer_geometry_contract.py::test_landing_and_live_cards_share_the_geometry_contract`
+  uses the built SPA with mocked APIs (no server required), comparing touch and
+  mouse input at phone, tablet, and desktop widths.
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
@@ -519,6 +557,17 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/lib/permissionModeCycle.test.ts`.
   `web/src/shell/NewChatDialog.test.tsx` checks that Shift+Tab on the landing
   page leaves the launch mode unchanged and does not prevent focus traversal.
+- **`permissions-command`:** with a real Codex CLI (nightly),
+  `tests/e2e_ui/chat/test_codex_native_permissions_command.py::test_permissions_command_opens_codex_approval_picker`.
+  `tests/browser_ui/chat/test_slash_menu.py::test_permissions_command_opens_the_codex_approval_picker`
+  checks that the menu closes after a pick. Gating, the owner check, arguments,
+  and the plain-text fallback on Claude Code, Devin, and claude-sdk are in
+  `web/src/pages/ChatPage.composer.test.tsx`.
+- **`plan-mode`:** with a real Codex CLI and a mock model, creation in Plan mode
+  and subsequent composer toggles preserve the preset and agent instructions in
+  `tests/e2e_ui/chat/test_codex_plan_mode_instructions.py::test_codex_plan_mode_creation_and_toggles_preserve_instructions`.
+  Landing-page arming is in `web/src/shell/NewChatDialog.test.tsx`; the older-host
+  refusal is in `tests/server/integration/test_multipart_create_host_launch.py`.
 - **`model-picker`, `effort-picker`, `permission-mode`, Fork dialog:** the
   permission-mode picker has component coverage in
   `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and effort
@@ -564,6 +613,10 @@ Other connection providers alone do not enable the managed MCP picker.
   No running agent is needed.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_a_long_single_match_from_the_keyboard`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_highlight_opens_no_tooltip_on_a_touch_screen`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`
@@ -575,8 +628,17 @@ Other connection providers alone do not enable the managed MCP picker.
   Native host entries must match the active harness; a host error is shown
   without hiding MCPs declared by the bound session agent. While the host loads,
   its loading status stays visible alongside agent entries; a session without a
-  known host shows unavailable status rather than an empty inventory. Click
-  **Go to Settings** and confirm the session’s harness and host are selected.
+  known host shows unavailable status rather than an empty inventory (a claude-sdk session
+  without a host lists only its agent's servers). In a
+  claude-sdk session on a host with Claude MCP servers, expect them listed, and
+  only the managed ones when the agent sets `skills: none`. Click
+  **Go to Settings** and confirm the session’s harness and host are selected
+  (Claude’s page for a claude-sdk session). For the post-sign-in journey, start
+  a claude-sdk session while a Claude server needs sign-in, finish the sign-in
+  outside Omnigent, then send another message and expect the agent to use that
+  server's tool. Covered by
+  `tests/e2e_ui/chat/test_claude_sdk_host_mcp_servers.py::test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session`
+  and, for a reconnect that hangs, `tests/e2e/test_claude_sdk_mcp_reconnect_timeout_e2e.py`.
   Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
   row labels, the Sign in / Signing in… / error renderings and the Settings
   link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the
@@ -668,6 +730,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`.
   The native mid-turn notice has component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`.
+  `tests/browser_ui/chat/test_status_indicators.py::test_touch_screens_reveal_timestamps_and_pending_steering`
+  verifies phone and tablet touch visibility without hover.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing
@@ -755,6 +819,9 @@ Other connection providers alone do not enable the managed MCP picker.
 
 ## Gotchas
 
+- Test touch sizing with a real touch device or browser touch emulation; resizing
+  a mouse browser alone does not enable it.
+
 - The Arclet dbcert preflight needs both the updated desktop shell and web UI,
   with Databricks-internal features enabled for the managed server. Browsers,
   older shells, other sandbox providers, and already-connected hosts do not
@@ -794,6 +861,9 @@ Other connection providers alone do not enable the managed MCP picker.
   creators, so Claude and Codex catalogs normally stay flat. A model whose IDs
   don't name a known creator (a router alias such as Pi's `radius/balanced`)
   lands in Other models; that is expected, not a missing catalog.
+- The Claude and Codex pickers here list the native harnesses' catalogs. A
+  `claude-sdk` or `codex` SDK worker has no picker of its own, so don't verify
+  its models here: see the smart routing note in the [index](./README.md#not-yet-mapped).
 - The managed MCP picker uses only the administrator's registry; it does not
   add arbitrary MCP URLs or enable itself from existing GitHub/Databricks
   connections. Bearer-token accounts must be connected in settings first.
