@@ -180,6 +180,7 @@ async def test_clear_surfaces_a_failed_injection(
 _RUNNER_ID = "runner_live"
 _REVIEW_SKILL = {"name": "review", "description": "Review the change.", "content": "Review it."}
 _SKILL_INPUT = {"type": "slash_command", "data": {"kind": "skill", "name": "review"}}
+_COMPACT_INPUT = {"type": "compact", "data": {}}
 _MESSAGE_INPUT = {
     "type": "message",
     "data": {"role": "user", "content": [{"type": "input_text", "text": "Q3"}]},
@@ -482,9 +483,10 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A message, skill or second ``/clear`` sent mid-move, after the release, is refused.
+    """A message, skill, ``/compact`` or second ``/clear`` sent mid-move is refused.
 
-    The message or skill would otherwise run in the original chat while
+    Each arrives after the release. The message, skill or compact (an SDK
+    compact runs a turn) would otherwise run in the original chat while
     viewers follow the new, empty one; the second clear would release and fork
     again. The first clear still completes, and the guard ends with it.
     """
@@ -503,7 +505,7 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
                 f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
             )
         )
-        for turn_input in (_MESSAGE_INPUT, _SKILL_INPUT):
+        for turn_input in (_MESSAGE_INPUT, _SKILL_INPUT, _COMPACT_INPUT):
             sent.append(await client.post(f"/v1/sessions/{source_id}/events", json=turn_input))
 
     live_runner.on_clear = act_from_another_tab
@@ -515,8 +517,9 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
 
     assert resp.status_code == 202, resp.text
     new_id = resp.json()["session_id"]
-    assert [response.status_code for response in sent] == [409, 409], [r.text for r in sent]
+    assert [response.status_code for response in sent] == [409, 409, 409], [r.text for r in sent]
     assert all("moving to a new session" in response.text for response in sent)
+    assert [body for _path, body in live_runner.posts if body.get("type") == "compact"] == []
     assert [response.status_code for response in second_clear] == [409], second_clear[0].text
     assert "already moving" in second_clear[0].text
     assert len(clear_requests(live_runner)) == 1
@@ -535,6 +538,12 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
         },
     )
     assert resumed.status_code < 300, resumed.text
+    compacted = await client.post(f"/v1/sessions/{source_id}/events", json=_COMPACT_INPUT)
+    assert compacted.status_code < 300, compacted.text
+    assert [body for _path, body in live_runner.posts if body.get("type") == "compact"] == [
+        {"type": "compact"}
+    ]
+    assert not orchestration._session_is_starting(source_id)
 
 
 def install_managed_sandbox(
@@ -1204,6 +1213,7 @@ async def test_claude_sdk_clear_continuation_keeps_the_original_sharing(
         (200, "running", 400, "Stop the current turn"),
         (200, "starting", 400, "Stop the current turn"),
         (200, "skill_starting", 400, "Stop the current turn"),
+        (200, "compact_starting", 400, "Stop the current turn"),
         (200, "failed_starting", 400, "Stop the current turn"),
         (200, "startup_pending", 400, "Wait for this session's first message"),
         (200, "none", 503, "runner is offline"),
@@ -1225,9 +1235,9 @@ async def test_claude_sdk_clear_refusals_create_no_session(
 ) -> None:
     """A refused ``clear`` creates, initializes and supersedes nothing.
 
-    A busy, failing or unreachable runner, a running turn, one still reaching
-    its runner or saved for startup, no placement, a non-owner, a sub-agent or
-    a side chat refuses it.
+    A busy, failing or unreachable runner, a running turn, one (or an SDK
+    compact) still reaching its runner or saved for startup, no placement, a
+    non-owner, a sub-agent or a side chat refuses it.
     The caller and session checks run before the runner frees the client, so
     only a runner refusal reaches the runner.
     """
@@ -1266,7 +1276,10 @@ async def test_claude_sdk_clear_refusals_create_no_session(
         message_task = asyncio.create_task(
             auth_client.post(
                 f"/v1/sessions/{source_id}/events",
-                json=_SKILL_INPUT if placement == "skill_starting" else _MESSAGE_INPUT,
+                json={
+                    "skill_starting": _SKILL_INPUT,
+                    "compact_starting": _COMPACT_INPUT,
+                }.get(placement, _MESSAGE_INPUT),
                 headers={"X-Forwarded-Email": _OWNER},
             )
         )

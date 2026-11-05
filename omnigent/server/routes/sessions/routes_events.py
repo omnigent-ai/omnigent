@@ -878,6 +878,8 @@ _RUNNER_EVENT_TYPES = frozenset(
 # Inputs that can start a turn: each counts as in flight until its request
 # ends, and is refused while ``/clear`` moves the session.
 _TURN_STARTING_EVENT_TYPES = frozenset({"message", "session_message", _SLASH_COMMAND_TYPE})
+# Also given ``in_flight``: a claude-sdk ``/compact`` runs a harness turn.
+_IN_FLIGHT_EVENT_TYPES = _TURN_STARTING_EVENT_TYPES | {_COMPACT_TYPE}
 
 
 def register_events_routes(
@@ -1036,7 +1038,7 @@ def register_events_routes(
                                     session_id,
                                     event,
                                     in_flight=in_flight
-                                    if event.type in _TURN_STARTING_EVENT_TYPES
+                                    if event.type in _IN_FLIGHT_EVENT_TYPES
                                     else None,
                                 )
                             )
@@ -1052,7 +1054,7 @@ def register_events_routes(
                 request,
                 session_id,
                 body,
-                in_flight=in_flight if body.type in _TURN_STARTING_EVENT_TYPES else None,
+                in_flight=in_flight if body.type in _IN_FLIGHT_EVENT_TYPES else None,
             )
 
     router.include_router(event_router)
@@ -1311,15 +1313,28 @@ def register_events_routes(
             await _require_access_and_level(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
+        starts_turn = body.type in _TURN_STARTING_EVENT_TYPES or (
+            body.type == _COMPACT_TYPE
+            and await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            == "claude-sdk"
+        )
         # Checked and marked with no await between, so an input and a
         # ``/clear`` moving the session cannot both proceed. Covers saved
         # startup inputs too, which are dispatched without ``in_flight``.
-        if body.type in _TURN_STARTING_EVENT_TYPES and _session_is_moving(session_id):
+        # Any compact would work on the original chat, so none runs mid-move.
+        if (starts_turn or body.type == _COMPACT_TYPE) and _session_is_moving(session_id):
             raise OmnigentError(
-                "This chat is moving to a new session; send the message there.",
+                "This chat is moving to a new session; "
+                + (
+                    "run /compact there."
+                    if body.type == _COMPACT_TYPE
+                    else "send the message there."
+                ),
                 code=ErrorCode.CONFLICT,
             )
-        if in_flight is not None:
+        if in_flight is not None and starts_turn:
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.
             in_flight.enter_context(_mark_dispatch_in_flight(session_id))
