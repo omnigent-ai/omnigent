@@ -26,7 +26,7 @@ export function parseProjectFolderPageSize(text: string): number | undefined {
 
 const collapsePreference = createStoredPreference<boolean>(
   PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
-  (stored) => (stored === "true" ? true : stored === "false" ? false : undefined),
+  (stored) => (stored === "true" || stored === "false" ? stored === "true" : undefined),
   DEFAULT_PROJECT_FOLDER_COLLAPSE,
 );
 
@@ -63,7 +63,11 @@ export function migrateLegacyProjectFolderPagination(): void {
   try {
     const legacy = window.localStorage.getItem(LEGACY_PAGINATION_STORAGE_KEY);
     if (legacy === null) return;
-    if (legacy === "all") writeProjectFolderCollapse(false);
+    if (legacy === "all") {
+      writeProjectFolderCollapse(false);
+      // The write swallows storage failures; keep the legacy key until it sticks.
+      if (readProjectFolderCollapse()) return;
+    }
     window.localStorage.removeItem(LEGACY_PAGINATION_STORAGE_KEY);
   } catch {
     // localStorage access errors are non-fatal; the next start tries again.

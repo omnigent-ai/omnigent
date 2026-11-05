@@ -24,6 +24,9 @@ export function writeFoldAssistantNarration(enabled: boolean): void {
   preference.write(enabled ? "true" : "false");
 }
 
+/** Re-read after a same-tab write that bypassed `writeFoldAssistantNarration` (settings import). */
+export const notifyFoldAssistantNarrationChanged = preference.notifyChanged;
+
 /** Live value of the preference, including changes made in other windows. */
 export function useFoldAssistantNarration(): boolean {
   return preference.use() === "true";

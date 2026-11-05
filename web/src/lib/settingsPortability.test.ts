@@ -1,7 +1,10 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
-import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import {
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  useFoldAssistantNarration,
+} from "./foldNarrationPreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   readHiddenPickerAgents,
@@ -137,6 +140,19 @@ describe.each([
     });
     expect(localStorage.getItem(storageKey)).toBe("true");
   });
+});
+
+it("updates a mounted final-answer fold reader on import", () => {
+  const { result } = renderHook(() => useFoldAssistantNarration());
+  expect(result.current).toBe(false);
+
+  act(() => {
+    applyImportedSettings({
+      version: 1,
+      settings: { [FOLD_ASSISTANT_NARRATION_STORAGE_KEY]: "true" },
+    });
+  });
+  expect(result.current).toBe(true);
 });
 
 it("carries hidden picker entries through export and import and tells an open picker", () => {

@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   migrateLegacyProjectFolderPagination,
   parseProjectFolderPageSize,
@@ -16,6 +16,7 @@ const LEGACY_STORAGE_KEY = "omnigent:project-folder-pagination";
 // Storage failures and live updates are covered by storedChoicePreference.test.ts.
 afterEach(() => {
   localStorage.clear();
+  vi.restoreAllMocks();
 });
 
 it("collapses by default and stores only the switch being off", () => {
@@ -54,7 +55,9 @@ it.each([
   { text: "0", size: undefined },
   { text: "51", size: undefined },
   { text: "2.5", size: undefined },
+  { text: "-3", size: undefined },
   { text: "1e1", size: undefined },
+  { text: "abc", size: undefined },
   { text: "", size: undefined },
 ])("reads $text as page size $size", ({ text, size }) => {
   expect(parseProjectFolderPageSize(text)).toBe(size);
@@ -62,6 +65,14 @@ it.each([
 
 it("turns the switch off for an earlier build's All choice and drops its key", () => {
   localStorage.setItem(LEGACY_STORAGE_KEY, "all");
+  // A failed save keeps the legacy choice for the next start to retry.
+  const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota exceeded");
+  });
+  migrateLegacyProjectFolderPagination();
+  expect(localStorage.getItem(LEGACY_STORAGE_KEY)).toBe("all");
+
+  setItem.mockRestore();
   migrateLegacyProjectFolderPagination();
   expect(readProjectFolderCollapse()).toBe(false);
   expect(localStorage.getItem(LEGACY_STORAGE_KEY)).toBeNull();

@@ -1324,19 +1324,17 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("project-folder-page-size-input")).toHaveValue(3);
   });
 
-  it.each(["0", "51", "2.5", "-3", "abc", ""])(
-    "keeps the last valid session count when %j is entered",
-    (entry) => {
-      localStorage.setItem("omnigent:project-folder-page-size", "7");
-      renderPage("/settings/appearance");
-      const input = screen.getByTestId("project-folder-page-size-input") as HTMLInputElement;
+  // Other rejected entries are covered by projectFolderPaginationPreferences.test.ts.
+  it.each(["51", ""])("keeps the last valid session count when %j is entered", (entry) => {
+    localStorage.setItem("omnigent:project-folder-page-size", "7");
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("project-folder-page-size-input") as HTMLInputElement;
 
-      fireEvent.change(input, { target: { value: entry } });
-      expect(localStorage.getItem("omnigent:project-folder-page-size")).toBe("7");
-      fireEvent.blur(input);
-      expect(input.value).toBe("7");
-    },
-  );
+    fireEvent.change(input, { target: { value: entry } });
+    expect(localStorage.getItem("omnigent:project-folder-page-size")).toBe("7");
+    fireEvent.blur(input);
+    expect(input.value).toBe("7");
+  });
 
   it("shows the default code font size and steps it up, persisting the choice", () => {
     localStorage.clear();
