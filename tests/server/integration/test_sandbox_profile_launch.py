@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient, Response
@@ -1347,6 +1348,44 @@ class TestProviderManagedProfiles:
         assert env.recording.selections
         woken = env.conversations.get_conversation(continuation_id)
         assert woken is not None and woken.host_id == source.host_id
+
+    async def test_refused_live_clear_keeps_the_runner_client(
+        self, env: _Env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``/clear`` its continuation would be refused for never frees the live client.
+
+        The profile is revoked, so the continuation can't take over the
+        sandbox; that is found before the runner is asked to drop the source's
+        SDK client, which would otherwise force a transcript replay next turn.
+        """
+        source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+        env.app.state.tunnel_registry = env.app.state.profile_test_tunnels
+        register_test_runner(env.app, "profile-runner", harnesses=["codex"], owner=_OWNER)
+        env.conversations.replace_runner_id(source_id, "profile-runner")
+        sent: list[str] = []
+
+        def runner(request: httpx.Request) -> httpx.Response:
+            sent.append(request.content.decode())
+            return httpx.Response(200, json={})
+
+        runner_client = AsyncClient(transport=httpx.MockTransport(runner), base_url="http://r")
+        monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda *_a, **_k: "claude-sdk")
+        monkeypatch.setattr(
+            sessions_routes, "_get_runner_client", AsyncMock(return_value=runner_client)
+        )
+        sessions_before = env.persisted()[0]
+        env.recording.allowed_users.clear()
+
+        cleared = await env.client.post(
+            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+        )
+
+        assert cleared.status_code == 403, cleared.text
+        assert not [body for body in sent if '"clear"' in body]
+        assert env.persisted()[0] == sessions_before
+        source = env.conversations.get_conversation(source_id)
+        assert source is not None and source.runner_id == "profile-runner"
+        await runner_client.aclose()
 
     @pytest.mark.parametrize("failure", ["revoked", "revision-retired", "unavailable"])
     async def test_wake_denial_prevents_resume_and_allocation(

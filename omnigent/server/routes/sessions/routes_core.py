@@ -3987,7 +3987,9 @@ def register_core_routes(
             source's agent was removed or a required bundle copy finds
             its source missing.
         """
-        return await _fork_session(request, source_id, body)
+        fork = await _fork_session(request, source_id, body)
+        assert fork is not None
+        return fork
 
     async def _fork_session(
         request: Request,
@@ -3999,7 +4001,8 @@ def register_core_routes(
         copy_history: bool = True,
         continue_source: bool = False,
         fork_id: str | None = None,
-    ) -> SessionResponse:
+        validate_only: bool = False,
+    ) -> SessionResponse | None:
         """Fork *source_id* as :func:`fork_session` documents.
 
         :param before_item_id: Internal cutoff for rewind and clear: copy only
@@ -4015,6 +4018,8 @@ def register_core_routes(
             items or permission.
         :param fork_id: Id to create the fork under, e.g. so a caller can
             remove it by id even if this call fails part-way.
+        :param validate_only: Run every check that could refuse the fork, then
+            return ``None`` without creating anything.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4433,6 +4438,8 @@ def register_core_routes(
         if body.host_id is not None:
             await _check_requested_host_id(request, body.host_id, user_id)
 
+        if validate_only:
+            return None
         # Copied last, after every validation above; the copy row itself is
         # inserted inside fork_conversation's transaction.
         fork_agent_id = base_agent.id
@@ -4776,6 +4783,26 @@ def register_core_routes(
                 )
                 if not runner_online and not host_bound:
                     raise runner_offline
+                fork_request = SessionForkRequest(title=title)
+                fork_options: dict[str, Any] = {
+                    "before_item_id": before_item_id,
+                    "keep_sandbox_labels": True,
+                    "copy_history": copy_history,
+                    "continue_source": True,
+                }
+                # Refuse before the source's live client is freed, so a clear
+                # that can't continue leaves it untouched.
+                await _fork_session(
+                    request, source.id, fork_request, validate_only=True, **fork_options
+                )
+                profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+                if host_bound and profile_catalog is not None:
+                    await asyncio.to_thread(
+                        profile_catalog.require_session_host,
+                        source.id,
+                        source.host_id,
+                        bind=False,
+                    )
                 if prepare is not None:
                     await prepare()
 
@@ -4789,15 +4816,9 @@ def register_core_routes(
                 runner_dispatched = False
                 try:
                     fork = await _fork_session(
-                        request,
-                        source.id,
-                        SessionForkRequest(title=title),
-                        before_item_id=before_item_id,
-                        keep_sandbox_labels=True,
-                        copy_history=copy_history,
-                        continue_source=True,
-                        fork_id=fork_id,
+                        request, source.id, fork_request, fork_id=fork_id, **fork_options
                     )
+                    assert fork is not None
                     # The same conversation continues there, and every live viewer
                     # of the source is redirected to it, so it shares exactly as
                     # the source does (no creation default was applied).
@@ -4812,7 +4833,6 @@ def register_core_routes(
                                 f"This session's host went away during {command}; try again.",
                                 code=ErrorCode.CONFLICT,
                             )
-                        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
                         if profile_catalog is not None:
                             # Adopt and reauthorize the sandbox's accepted profile
                             # now, so the fork can wake it even with no runner.
