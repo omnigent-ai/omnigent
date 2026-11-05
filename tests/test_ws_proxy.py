@@ -9,6 +9,7 @@ import datetime
 import logging
 import socket
 import ssl
+import threading
 import time
 import types
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from omnigent.util.ws_proxy import (
     redact_proxy_url,
     ws_env_proxy_url,
 )
+from tests._helpers.polling import poll_until_async
 
 _TLS_HOST = "server.sandbox.test"
 _TUNNEL_URL = f"ws://{_TLS_HOST}:8000/v1/hosts/h/tunnel"
@@ -275,51 +277,47 @@ async def test_connect_rejects_malformed_proxy_url(proxy_url, ws_url, error):
         await open_proxy_connect_socket(proxy_url, ws_url, timeout=5)
 
 
-async def test_connect_closes_socket_when_awaiter_is_cancelled(monkeypatch):
-    """A socket the worker thread hands back after cancellation is closed, not orphaned."""
+def _held_dial(monkeypatch) -> tuple[socket.socket, threading.Event, threading.Event]:
+    """Block the dial worker until released; it then returns the socket.
+
+    :returns: The socket, an event set once the worker starts, and the release event.
+    """
     from omnigent.util import ws_proxy
 
-    sock = socket.socket()
+    sock, started, release = socket.socket(), threading.Event(), threading.Event()
 
-    def slow_connect(*_args):
-        time.sleep(0.2)
+    def held_dial(*_args):
+        started.set()
+        release.wait(5)
         return sock
 
-    monkeypatch.setattr(ws_proxy, "_connect_sync", slow_connect)
+    monkeypatch.setattr(ws_proxy, "_connect_sync", held_dial)
+    return sock, started, release
+
+
+async def test_connect_closes_socket_when_awaiter_is_cancelled(monkeypatch):
+    """A socket the worker thread hands back after cancellation is closed, not orphaned."""
+    sock, started, release = _held_dial(monkeypatch)
     dial = asyncio.ensure_future(
         open_proxy_connect_socket("http://127.0.0.1:1", _TUNNEL_URL, timeout=5)
     )
-    await asyncio.sleep(0.05)
+    await poll_until_async(started.is_set, timeout_s=5, interval_s=0.005)
     dial.cancel()
     with pytest.raises(asyncio.CancelledError):
         await dial
-    for _ in range(100):
-        if sock.fileno() == -1:
-            break
-        await asyncio.sleep(0.02)
-    assert sock.fileno() == -1
+    release.set()
+    await poll_until_async(lambda: sock.fileno() == -1, timeout_s=2)
 
 
 async def test_connect_timeout_bounds_a_slow_dial(monkeypatch):
     """The budget caps the dial itself, not only the handshake after it."""
-    from omnigent.util import ws_proxy
-
-    sock = socket.socket()
-
-    def slow_dial(*_args):
-        time.sleep(0.8)
-        return sock
-
-    monkeypatch.setattr(ws_proxy, "_connect_sync", slow_dial)
-    started = time.monotonic()
+    sock, _started, release = _held_dial(monkeypatch)
+    began = time.monotonic()
     with pytest.raises(TimeoutError, match=r"within 0\.3s"):
         await open_proxy_connect_socket("http://127.0.0.1:1", _TUNNEL_URL, timeout=0.3)
-    assert time.monotonic() - started < 0.7
-    for _ in range(100):
-        if sock.fileno() == -1:
-            break
-        await asyncio.sleep(0.02)
-    assert sock.fileno() == -1
+    assert time.monotonic() - began < 0.7
+    release.set()
+    await poll_until_async(lambda: sock.fileno() == -1, timeout_s=2)
 
 
 @pytest.mark.parametrize("dial_fails", [False, True])
