@@ -309,7 +309,19 @@ describe("stripAutomationContext", () => {
       "Explain <omnigent-automation-context> in this example.",
       "Task\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message,",
       "Task\n\n<omnigent-automation-context>\nUser text\n</omnigent-automation-context>",
+      "Review this example:\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message,\n</omnigent-automation-context>\nACTUAL USER TASK: explain the example and the extra closing tag.\n</omnigent-automation-context>",
     ])
       expect(stripAutomationContext(text)).toBe(text);
   });
+
+  it.each(["", "\n  "])(
+    "strips a complete trailing note with trailing whitespace %j",
+    (trailing) => {
+      const note =
+        "\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message, and no one is watching.\n</omnigent-automation-context>";
+      expect(stripAutomationContext(`Review the changes.${note}${trailing}`)).toBe(
+        "Review the changes.",
+      );
+    },
+  );
 });

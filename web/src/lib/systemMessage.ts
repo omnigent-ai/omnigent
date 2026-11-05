@@ -274,7 +274,10 @@ export function stripAutomationContext(text: string): string {
   const start = text.lastIndexOf(
     "\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message,",
   );
-  return start >= 0 && text.trimEnd().endsWith("\n</omnigent-automation-context>")
+  if (start < 0) return text;
+  const closingTag = "\n</omnigent-automation-context>";
+  const end = text.indexOf(closingTag, start);
+  return end >= 0 && text.slice(end + closingTag.length).trim() === ""
     ? text.slice(0, start)
     : text;
 }
