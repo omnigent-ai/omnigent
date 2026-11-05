@@ -612,3 +612,30 @@ export function overlayArchivedIntoCaches(
     old ? { ...old, archived } : old,
   );
 }
+
+/**
+ * Settle a known archive flag on the open session's fetched sidebar row,
+ * keeping its owner. A detail request in flight may have been served before the
+ * flag changed, so it is cancelled and restarted rather than left to land.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - The session whose archive flag is known.
+ * @param archived - The flag from the server.
+ */
+export function settleOpenSessionRowArchived(
+  queryClient: QueryClient,
+  id: string,
+  archived: boolean,
+): void {
+  const queryKey = ["conversation-backfill", id];
+  if (queryClient.getQueryState(queryKey) === undefined) return;
+  const fetching = queryClient.isFetching({ queryKey, exact: true }) > 0;
+  // invalidateQueries only joins a first fetch (no data yet), so cancel explicitly.
+  if (fetching) void queryClient.cancelQueries({ queryKey, exact: true });
+  const row = queryClient.getQueryData<Conversation | null>(queryKey);
+  if (row && (row.archived ?? false) !== archived) {
+    const settledRow: Conversation = { ...row, archived };
+    queryClient.setQueryData<Conversation | null>(queryKey, settledRow);
+  }
+  if (fetching) void queryClient.invalidateQueries({ queryKey, exact: true });
+}

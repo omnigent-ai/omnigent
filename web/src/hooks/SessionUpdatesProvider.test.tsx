@@ -777,7 +777,7 @@ describe("SessionUpdatesProvider open-session row", () => {
     },
   );
 
-  it("refetches, once, a first fetch that a streamed archive change may postdate", async () => {
+  it("restarts a first fetch that a streamed archive change may postdate", async () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_a"]);
     const key = ["conversation-backfill", "conv_old"];
@@ -793,17 +793,14 @@ describe("SessionUpdatesProvider open-session row", () => {
     const unsubscribe = observer.subscribe(() => undefined);
     renderProvider(client, ["/c/conv_old"]);
 
-    for (let frame = 0; frame < 2; frame++) {
-      act(() =>
-        frameHandler()({ type: "changed", items: [{ ...conv("conv_old"), archived: true }] }),
-      );
-    }
-    answers[0]({ ...conv("conv_old"), archived: false });
+    act(() =>
+      frameHandler()({ type: "changed", items: [{ ...conv("conv_old"), archived: true }] }),
+    );
     await waitFor(() => expect(answers).toHaveLength(2));
+    answers[0]({ ...conv("conv_old"), archived: false });
     answers[1]({ ...conv("conv_old"), archived: true });
 
     await waitFor(() => expect(client.getQueryData<Conversation>(key)?.archived).toBe(true));
-    expect(answers).toHaveLength(2);
     unsubscribe();
   });
 });
