@@ -1401,6 +1401,22 @@ def test_replay_argument_byte_budget_counts_utf8_and_json_escaping(
     )
 
 
+@pytest.mark.parametrize("text", ["\ud83d\ude00", "\ud800"])
+def test_rollout_byte_measurement_preserves_surrogate_content(text: str) -> None:
+    """Sizing accepts JSON-escaped surrogate code units without rewriting the message."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [_user_message(text)],
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+    message = next(record["payload"] for record in records if record["type"] == "response_item")
+    assert message["content"][0]["text"] == text
+    assert len(json.loads(json.dumps(records))) == len(records)
+
+
 @pytest.mark.parametrize("compacted", [False, True])
 @pytest.mark.parametrize("pending_type", ["function_call", "function_call_output"])
 def test_rollout_byte_budget_preserves_source_pending_status(

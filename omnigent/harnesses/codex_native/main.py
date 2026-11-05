@@ -2749,7 +2749,11 @@ def _bound_codex_replay_argument_bytes(
             history.append(payload)
 
     def encoded_bytes(value: object) -> int:
-        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        return len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8", errors="backslashreplace"
+            )
+        )
 
     history_bytes = 2 + sum(encoded_bytes(item) + 1 for item in history) - bool(history)
     if history_bytes <= _MAX_REPLAYED_HISTORY_BYTES:
