@@ -23,7 +23,7 @@ import {
 } from "@/lib/renderItems";
 import {
   BubbleView,
-  WorkingIndicator,
+  WorkingIndicatorRow,
   bubbleKey,
   computeIsWorking,
   computeIsTurnActive,
@@ -455,9 +455,10 @@ export function SideChatPane({
                   recoveryDisabled={readOnly}
                 />
               ))}
-              {shouldShowWorkingIndicator(showsWorking || showsBackgroundTasks, bubbles) && (
-                <WorkingIndicator />
-              )}
+              <WorkingIndicatorRow
+                key={childId}
+                show={shouldShowWorkingIndicator(showsWorking || showsBackgroundTasks, bubbles)}
+              />
               <div ref={bottomRef} />
             </div>
           )}
