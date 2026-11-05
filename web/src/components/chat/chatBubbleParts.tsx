@@ -911,6 +911,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                     </pre>
                   ) : (
                     <FilePathAwareMessageResponse
+                      className="text-message"
                       breaks
                       mode="static"
                       remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
@@ -950,7 +951,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </div>
         )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40">
           {ts && (
             <span
               className="select-none text-[11px] leading-4 text-foreground/56"
@@ -1123,11 +1124,16 @@ function AssistantBubble({
         data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
+        className={cn(
+          "mobile-app:gap-0",
+          spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]",
+        )}
       >
         {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
+            // The final code card has its own margin inside the custom pre wrapper.
+            "mobile-app:[&_.message-markdown>.chat-code-block:last-child>[data-streamdown=code-block]]:mb-0",
             (spansFullColumn || foldOnly || hasSubagentNotice || hasToolRows) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
@@ -1160,10 +1166,10 @@ function AssistantBubble({
         {!foldOnly && !errorOnly && (
           <div
             className={cn(
-              "flex items-center gap-3 py-1",
+              "flex mobile-app:flex-wrap items-center gap-3 py-1 mobile-app:py-0",
               actionsPersistent
                 ? "opacity-100"
-                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
             )}
           >
             <MessageActions>
@@ -1250,35 +1256,62 @@ export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   return null;
 }
 
-/** Keep bottom-locked readers pinned when the composer changes viewport height. */
-export function KeepBottomOnViewportResize() {
+const POINTER_STATE_EVENTS = ["pointerdown", "pointerup", "pointercancel"] as const;
+
+/** Keep bottom-locked readers pinned when the viewport or the transcript changes height. */
+export function KeepBottomOnResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef?: React.RefObject<HTMLElement>;
   };
   const scrollRef = ctx.scrollRef;
+  const contentRef = ctx.contentRef;
   const state = ctx.state;
   const scrollToBottom = ctx.scrollToBottom;
 
   useEffect(() => {
     const el = scrollRef?.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
-    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
     let clientHeight = el.clientHeight;
+    let scrollHeight = el.scrollHeight;
+    // At the end of the last observed layout or the current one: a pin's own scroll
+    // event can arrive after the next line grew the transcript, and a shrink's
+    // clamp before its resize callback.
+    const isAtEnd = () => {
+      const end = Math.min(scrollHeight - clientHeight, el.scrollHeight - el.clientHeight);
+      return end - el.scrollTop <= 1;
+    };
+    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isAtEnd();
+    let pointerDown = false;
     let frame: number | null = null;
     const onScroll = () => {
-      wasBottomLocked = isPhysicallyAtBottom();
+      wasBottomLocked = isAtEnd();
+    };
+    const onPointer = (event: Event) => {
+      pointerDown = event.type === "pointerdown";
+    };
+    // Like the library, hold still while the reader drags a selection in the transcript.
+    const isSelecting = () => {
+      const selection = document.getSelection();
+      if (!pointerDown || !selection || selection.isCollapsed) return false;
+      const common = selection.getRangeAt(0).commonAncestorContainer;
+      return common.contains(el) || el.contains(common);
     };
     const observer = new ResizeObserver(() => {
-      const nextHeight = el.clientHeight;
-      if (nextHeight === clientHeight) return;
-      clientHeight = nextHeight;
-      if (!wasBottomLocked) return;
+      const viewportResized = el.clientHeight !== clientHeight;
+      const contentGrew = el.scrollHeight > scrollHeight;
+      clientHeight = el.clientHeight;
+      scrollHeight = el.scrollHeight;
+      // Rechecked by the follow-up frame: the reader may scroll away or start selecting first.
+      const shouldPin = () =>
+        wasBottomLocked &&
+        !isSelecting() &&
+        (viewportResized || (contentGrew && state.isAtBottom && !state.escapedFromLock));
+      if (!shouldPin()) return;
       // Gecko delivers this callback before the frame paints, but the
       // library's scrollToBottom always lands a frame later (it defers
-      // through a rAF promise), so the shrink paints with the transcript
-      // shoved up before the follow-up pin snaps it back — a visible
-      // bounce on every wrapped composer line. Pin synchronously here
+      // through a rAF promise), so the resize paints with the transcript
+      // off its end before the follow-up pin snaps it back — a visible
+      // bounce on every wrapped composer or streamed line. Pin synchronously here
       // first; the async pins below stay as a safety net for engines that
       // deliver the callback after paint. Target the library's park
       // position (one pixel short) so the settle is identical whether our
@@ -1288,18 +1321,22 @@ export function KeepBottomOnViewportResize() {
       if (frame !== null) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         frame = null;
+        if (!shouldPin()) return;
         el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 1);
         scrollToBottom("instant");
       });
     });
     el.addEventListener("scroll", onScroll, { passive: true });
+    for (const type of POINTER_STATE_EVENTS) document.addEventListener(type, onPointer, true);
     observer.observe(el);
+    if (contentRef.current) observer.observe(contentRef.current);
     return () => {
       el.removeEventListener("scroll", onScroll);
+      for (const type of POINTER_STATE_EVENTS) document.removeEventListener(type, onPointer, true);
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [scrollRef, scrollToBottom, state]);
+  }, [scrollRef, contentRef, scrollToBottom, state]);
 
   return null;
 }

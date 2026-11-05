@@ -36,6 +36,7 @@ import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
 import { useContext, useMemo } from "react";
 import {
   CheckIcon,
+  ChevronRightIcon,
   ClipboardListIcon,
   ClockIcon,
   ExternalLinkIcon,
@@ -46,6 +47,7 @@ import {
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useDescendantSession } from "@/hooks/useChildSessions";
 import {
@@ -60,7 +62,8 @@ import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
-import type { AgyPermission, CodexPersistMode, RememberScope } from "@/lib/types";
+import { type FileEditDiff, getFileEditDiff } from "@/lib/toolEditDiff";
+import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { childPrimaryLabel } from "@/shell/subagentLabel";
 import { useChatStore } from "@/store/chatStore";
@@ -70,12 +73,15 @@ import {
 } from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import { ElicitationMessage } from "./ElicitationMessage";
+import { MOBILE_CHOICE_CLASS, MOBILE_CHOICE_LIST_CLASS } from "./mobileChoiceClasses";
 import {
   type ElicitationAnswers,
   ElicitationSchemaForm,
   schemaFields,
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+import { FileEditDiffView } from "./FileEditBody";
+import { ToolValueView } from "./ToolValueView";
 
 const AUTO_RESOLVED_DETAIL =
   "This request was answered outside this view, for example in the " +
@@ -143,6 +149,35 @@ export interface SubagentRequester {
  * Names and links the sub-agent behind a mirrored prompt, so the card is not
  * read as a request from the session being viewed.
  */
+/** A gated edit as a diff, with its full arguments on demand. */
+function FileEditApproval({
+  diff,
+  toolInput,
+}: {
+  diff: FileEditDiff;
+  toolInput: Record<string, unknown>;
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      {diff.replacesAll && (
+        <p className="text-sm font-medium">
+          Replaces every occurrence of the matched text; the diff shows one.
+        </p>
+      )}
+      <FileEditDiffView diff={diff} />
+      <Collapsible className="group text-sm">
+        <CollapsibleTrigger className="flex cursor-pointer items-center gap-1 text-muted-foreground hover:text-foreground">
+          <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
+          Show request
+        </CollapsibleTrigger>
+        <CollapsibleContent className="pt-2">
+          <ToolValueView value={toolInput} />
+        </CollapsibleContent>
+      </Collapsible>
+    </div>
+  );
+}
+
 function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequester) {
   const child = useDescendantSession(ancestorSessionId, sessionId);
   const search = sessionNavigationSearch(useLocation().search);
@@ -200,6 +235,8 @@ interface ApprovalCardProps {
    * plan-review actions. Optional/null for other elicitations.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** The full file-edit tool call; when it describes a change, the card shows it as a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command approval details. When present, the
    * card renders command metadata instead of the raw JSON preview.
@@ -272,6 +309,7 @@ export function ApprovalCard({
   response,
   askUserQuestion,
   exitPlanMode,
+  fileEdit,
   codexCommand,
   allowAllEdits,
   allowAutoMode,
@@ -409,13 +447,22 @@ export function ApprovalCard({
   const showPhase = phase !== "" && !isNativePolicy;
   const askUserQuestionTitle = questionPromptTitle(policyName, phase);
 
+  const fileEditDiff = useMemo(
+    () => (fileEdit ? getFileEditDiff(fileEdit.toolName, fileEdit.toolInput) : null),
+    [fileEdit],
+  );
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
   // button mode (the buttons render the choices). Codex command
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isSchemaForm || isCodexCommandApproval
+    isAskUserQuestion ||
+    isExitPlanMode ||
+    isMultiChoice ||
+    isSchemaForm ||
+    isCodexCommandApproval ||
+    fileEditDiff !== null
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -460,8 +507,13 @@ export function ApprovalCard({
       : `Won't ask again for any ${rememberScope.tool} call for the rest of this session`
     : undefined;
   const binaryButtons = (
-    <div className="flex flex-wrap gap-2 pt-1">
-      <Button size="sm" onClick={() => submitBinary("accept")} componentId="approval.approve">
+    <div className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}>
+      <Button
+        size="sm"
+        className={MOBILE_CHOICE_CLASS}
+        onClick={() => submitBinary("accept")}
+        componentId="approval.approve"
+      >
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
@@ -470,7 +522,7 @@ export function ApprovalCard({
           <Button
             size="sm"
             variant="outline"
-            className="h-auto max-w-full whitespace-normal text-left"
+            className={cn("h-auto max-w-full whitespace-normal text-left", MOBILE_CHOICE_CLASS)}
             onClick={() => submitPersist("session")}
             title={`Ask Antigravity to allow commands starting with “${agyPermission.alwaysAllowPattern}” for this conversation`}
             data-testid="approval-card-agy-session-allow"
@@ -488,7 +540,7 @@ export function ApprovalCard({
           <Button
             size="sm"
             variant="outline"
-            className="h-auto max-w-full whitespace-normal text-left"
+            className={cn("h-auto max-w-full whitespace-normal text-left", MOBILE_CHOICE_CLASS)}
             onClick={() => submitPersist("always")}
             title={`Ask Antigravity to save a rule allowing commands starting with “${agyPermission.alwaysAllowPattern}” for this Omnigent session`}
             data-testid="approval-card-agy-always-allow"
@@ -508,6 +560,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={() => submitPersist("session")}
           componentId="approval.approve_session"
         >
@@ -519,6 +572,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={() => submitPersist("always")}
           componentId="approval.approve_always"
         >
@@ -530,7 +584,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
-          className="h-auto min-h-8 whitespace-normal text-left"
+          className={cn("h-auto min-h-8 whitespace-normal text-left", MOBILE_CHOICE_CLASS)}
           onClick={() => submit(elicitationId, "accept", { allow_directories: true })}
           componentId="approval.approve_directories"
         >
@@ -542,6 +596,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={submitAutoMode}
           title="Approve this request and let Claude review future tool permissions automatically for this session"
           componentId="approval.approve_auto_mode"
@@ -554,6 +609,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={submitAllowAllEdits}
           componentId="approval.approve_allow_edits"
         >
@@ -565,6 +621,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={submitRemember}
           title={rememberTitle}
           data-testid="approval-card-remember"
@@ -577,6 +634,7 @@ export function ApprovalCard({
       <Button
         size="sm"
         variant="outline"
+        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
         onClick={() => submitBinary("decline")}
         componentId="approval.reject"
       >
@@ -586,9 +644,13 @@ export function ApprovalCard({
     </div>
   );
   const codexCommandButtons = (
-    <div className="flex flex-wrap items-center gap-2 pt-1" data-testid="codex-command-actions">
+    <div
+      className={cn("flex flex-wrap items-center gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}
+      data-testid="codex-command-actions"
+    >
       <Button
         size="sm"
+        className={MOBILE_CHOICE_CLASS}
         onClick={() => submitBinary("accept")}
         componentId="approval.approve_command"
       >
@@ -599,6 +661,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={() => submitExecPolicyAmendment(execPolicyAmendment)}
           componentId="approval.approve_command_remember"
         >
@@ -606,7 +669,12 @@ export function ApprovalCard({
           Approve and remember
         </Button>
       )}
-      <Button size="sm" variant="outline" onClick={() => submitBinary("decline")}>
+      <Button
+        size="sm"
+        variant="outline"
+        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+        onClick={() => submitBinary("decline")}
+      >
         <XIcon className="mr-1 size-3.5" />
         Reject
       </Button>
@@ -638,6 +706,9 @@ export function ApprovalCard({
             <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
               {formattedPreview}
             </pre>
+          )}
+          {fileEditDiff && fileEdit && (
+            <FileEditApproval diff={fileEditDiff} toolInput={fileEdit.toolInput} />
           )}
           {unconfirmed && nativeDelivery.action && (
             <div className="flex flex-wrap gap-2">
@@ -924,10 +995,13 @@ export function ApprovalCard({
                 {formattedPreview}
               </pre>
             )}
+            {fileEditDiff && fileEdit && (
+              <FileEditApproval diff={fileEditDiff} toolInput={fileEdit.toolInput} />
+            )}
             {directoryScope}
             {isExternalUrl ? (
-              <div className="flex flex-wrap gap-2 pt-1">
-                <Button size="sm" asChild>
+              <div className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}>
+                <Button size="sm" className={MOBILE_CHOICE_CLASS} asChild>
                   <a href={url!} target="_blank" rel="noopener noreferrer">
                     <ExternalLinkIcon className="mr-1 size-3.5" />
                     Open approval page
@@ -941,12 +1015,16 @@ export function ApprovalCard({
                 onReject={() => submitBinary("decline")}
               />
             ) : isMultiChoice ? (
-              <div className="flex flex-wrap gap-2 pt-1" data-testid="approval-card-options">
+              <div
+                className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}
+                data-testid="approval-card-options"
+              >
                 {optionLabels.map((optLabel) => (
                   <Button
                     key={optLabel}
                     size="sm"
                     variant="outline"
+                    className={MOBILE_CHOICE_CLASS}
                     onClick={() => submitOption(optLabel)}
                   >
                     {optLabel}
@@ -998,6 +1076,7 @@ export function ElicitationCard({
       response={item.response}
       askUserQuestion={item.askUserQuestion}
       exitPlanMode={item.exitPlanMode}
+      fileEdit={item.fileEdit}
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       allowAutoMode={item.allowAutoMode}
