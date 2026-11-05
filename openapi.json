@@ -16,6 +16,10 @@
             "description": "Plain-text snapshot of the selected range, used to re-anchor the comment after file edits. `None` if not provided.",
             "title": "Anchor Content"
           },
+          "anchor_metadata": {
+            "title": "Anchor Metadata",
+            "type": "null"
+          },
           "body": {
             "description": "The comment text.",
             "title": "Body",
@@ -15743,7 +15747,7 @@
     },
     "/v1/sessions/{session_id}/comments/send": {
       "post": {
-        "description": "Mark comments as addressed and format them into an agent message.\n\nFetches each requested comment, marks it `addressed`,\nand formats the full set into a grouped, sorted message string\nsuitable for pasting into the chat composer.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode because\nit transitions comment status from `draft` to `addressed`.\n\n**Parameters**\n\n- `body` \u2014 List of comment IDs to send, with an optional custom instruction prefix.\n\n**Returns:** `{\"formatted_message\": str, \"sent_comment_ids\": list[str]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, or 404 if any requested comment is not found or does not belong to this session.",
+        "description": "Mark Files comments addressed and format them into an agent message.\n\nFetches each requested comment, marks it `addressed`,\nand formats the full set into a grouped, sorted message string\nsuitable for pasting into the chat composer.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode because\nit transitions comment status from `draft` to `addressed`.\n\n**Parameters**\n\n- `body` \u2014 List of comment IDs to send, with an optional custom instruction prefix.\n\n**Returns:** `{\"formatted_message\": str, \"sent_comment_ids\": list[str]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, or 404 if any requested comment is not found or does not belong to this session; 400 if a requested comment belongs to a PR review.",
         "operationId": "send_to_agent_v1_sessions__session_id__comments_send_post",
         "parameters": [
           {
