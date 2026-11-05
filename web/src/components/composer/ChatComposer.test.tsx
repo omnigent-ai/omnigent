@@ -163,7 +163,7 @@ describe("ChatComposer", () => {
     expect(inputRef.current).toBe(screen.getByRole("textbox"));
     expect(inputRef.current?.parentElement).toHaveClass("relative", "overflow-hidden");
     expect(screen.getByText("Context controls").parentElement?.parentElement).toHaveClass(
-      "@container/composer-actions",
+      "group/composer-actions",
     );
     fireEvent.change(inputRef.current!, { target: { value: "Keep this draft" } });
     expect(onChange).toHaveBeenCalledOnce();

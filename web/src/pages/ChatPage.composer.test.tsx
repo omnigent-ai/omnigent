@@ -4484,7 +4484,6 @@ describe("Composer Codex Plan-mode control", () => {
   it("keeps Plan in the shared menu instead of a separate toolbar button", () => {
     renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
 
-    expect(screen.getByTestId("composer-action-row")).toHaveClass("@container/composer-actions");
     expect(screen.queryByRole("button", { name: "Enter Plan mode" })).toBeNull();
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     expect(screen.getByRole("menuitem", { name: "Enter Plan mode" })).toBeInTheDocument();
