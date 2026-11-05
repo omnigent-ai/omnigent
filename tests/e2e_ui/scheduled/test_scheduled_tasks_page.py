@@ -1007,7 +1007,7 @@ def test_scheduled_task_create_persists_continuing_one_session(
 @pytest.mark.parametrize("entry", ["preview", "templates"])
 @pytest.mark.parametrize(
     "automations_v2_server",
-    ["automations_v2", "automations_v2,automation_trigger_ui"],
+    ["automations_v2,-automation_trigger_ui", "automations_v2"],
     indirect=True,
 )
 def test_scheduled_task_trigger_template_creates_hourly_manager_task(
@@ -1018,7 +1018,7 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
 ) -> None:
     """Create from either gallery and edit user/system prompts independently."""
     live_server = automations_v2_server
-    trigger_ui = "automation_trigger_ui" in request.node.callspec.params[
+    trigger_ui = "-automation_trigger_ui" not in request.node.callspec.params[
         "automations_v2_server"
     ].split(",")
     assert (

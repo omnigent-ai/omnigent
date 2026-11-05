@@ -2505,18 +2505,45 @@ describe("CreateScheduledTaskDialog session mode", () => {
     },
   );
 
-  it.each([undefined, false, true])(
-    "negotiates minute schedules with subhour support %s",
-    async (supported) => {
+  it.each(
+    [undefined, false, true].flatMap((supported) =>
+      [false, true].map((trigger) => ({ supported, trigger })),
+    ),
+  )(
+    "negotiates minute schedules with subhour support $supported for trigger $trigger",
+    async ({ supported, trigger }) => {
       renderWithSessionModes(
-        scheduledTask({ sessionMode: "continue", rrule: "FREQ=MINUTELY;INTERVAL=10" }),
+        scheduledTask({
+          sessionMode: "continue",
+          rrule: "FREQ=MINUTELY;INTERVAL=10",
+          ...(trigger && {
+            prompt: renderTriggerPrompt(
+              "jira",
+              {
+                ...emptyTriggerFields("jira"),
+                scope: "ES",
+                instructions: "Triage it.",
+              },
+              { placement: "same_host", sessionLink: "https://omni.example.com/c/CONVERSATION_ID" },
+            ),
+          }),
+        }),
         {
-          features: { automations_v2: true },
+          features: { automations_v2: true, automation_trigger_ui: trigger },
+          automation_trigger_poll_minutes: 240,
           ...(supported === undefined ? {} : { scheduled_task_subhour: supported }),
         },
       );
-      expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
       const submit = screen.getByTestId("create-scheduled-task-submit");
+      if (trigger && supported) {
+        expect(screen.queryByTestId("custom-schedule-trigger")).toBeNull();
+        expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
+        fireEvent.click(submit);
+        await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+        expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
+        return;
+      }
+      expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
       if (supported) expect(submit).toBeEnabled();
       else {
         expect(submit).toBeDisabled();
@@ -2532,11 +2559,17 @@ describe("CreateScheduledTaskDialog session mode", () => {
       fireEvent.click(screen.getByRole("option", { name: "Hours" }));
       expect(screen.getByTestId("custom-interval")).toHaveValue(1);
       fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+      expect(submit).toBeEnabled();
+      if (trigger) {
+        expect(screen.queryByTestId("schedule-error")).toBeNull();
+        expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
+      }
       fireEvent.click(submit);
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
         "FREQ=HOURLY;INTERVAL=1;BYMINUTE=0",
       );
+      expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("sessionMode");
     },
   );
 
@@ -2613,20 +2646,32 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     return mutateAsync.mock.calls[0][0].prompt;
   }
 
-  it("uses ten-minute polling without schedule controls when trigger UI is enabled", async () => {
-    renderTrigger("jira", {
-      features: { automations_v2: true, automation_trigger_ui: true },
-      scheduled_task_subhour: true,
-    });
-    fillJira();
-    expect(screen.queryByLabelText("Frequency")).not.toBeInTheDocument();
-    expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
-    await submittedPrompt();
-    expect(mutateAsync.mock.calls[0][0]).toMatchObject({
-      rrule: "FREQ=MINUTELY;INTERVAL=10",
-      sessionMode: "continue",
-    });
-  });
+  it.each([
+    { configured: undefined, subhour: true, minutes: 10 },
+    { configured: 30, subhour: true, minutes: 30 },
+    { configured: 240, subhour: true, minutes: 240 },
+    { configured: 240, subhour: false, minutes: 240 },
+    { configured: 10, subhour: false, minutes: 60 },
+  ])(
+    "uses server polling $configured with subhour support $subhour",
+    async ({ configured, subhour, minutes }) => {
+      renderTrigger("jira", {
+        features: { automations_v2: true, automation_trigger_ui: true },
+        scheduled_task_subhour: subhour,
+        automation_trigger_poll_minutes: configured,
+      });
+      fillJira();
+      expect(screen.queryByLabelText("Frequency")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent(
+        minutes === 60 ? "Hourly" : `Every ${minutes} minutes`,
+      );
+      await submittedPrompt();
+      expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+        rrule: minutes === 60 ? "FREQ=HOURLY;BYMINUTE=0" : `FREQ=MINUTELY;INTERVAL=${minutes}`,
+        sessionMode: "continue",
+      });
+    },
+  );
 
   it("restores schedule controls after converting a template to new-session mode", async () => {
     renderTrigger("jira", {

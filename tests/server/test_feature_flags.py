@@ -22,7 +22,12 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
     flags = resolve_feature_flags(environ)
 
     assert flags.enabled_features == frozenset(
-        {Feature.CLAUDE_OSC_STATUS, Feature.CODEX_PLAN_AT_LAUNCH, Feature.SESSION_ORCHESTRATION}
+        {
+            Feature.CLAUDE_OSC_STATUS,
+            Feature.CODEX_PLAN_AT_LAUNCH,
+            Feature.SESSION_ORCHESTRATION,
+            Feature.AUTOMATION_TRIGGER_UI,
+        }
     )
     assert flags.frontend_dict() == {
         "sandbox_profiles": False,
@@ -36,7 +41,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": False,
-        "automation_trigger_ui": False,
+        "automation_trigger_ui": True,
         "splittable_terminal_view_ui": False,
         "session_orchestration": True,
         "codex_plan_at_launch": True,
@@ -49,6 +54,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
     assert flags.enabled(Feature.USAGE_PAGE)
     assert flags.enabled(Feature.HARNESS_INSTALL)
     assert flags.enabled_names() == (
+        "automation_trigger_ui",
         "claude_osc_status",
         "codex_plan_at_launch",
         "harness_install",
@@ -65,12 +71,15 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "-{feature},{feature}",
     ],
 )
-@pytest.mark.parametrize("feature", ["claude_osc_status", "session_orchestration"])
+@pytest.mark.parametrize(
+    "feature", ["claude_osc_status", "session_orchestration", "automation_trigger_ui"]
+)
 def test_explicit_disable_wins_and_preserves_other_features(override: str, feature: str) -> None:
     features = override.format(feature=feature)
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{features}"})
 
     assert set(flags.enabled_names()) == {
+        "automation_trigger_ui",
         "claude_osc_status",
         "codex_plan_at_launch",
         "session_orchestration",
@@ -82,6 +91,7 @@ def test_default_off_features_can_also_be_explicitly_disabled() -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: "usage_page,-usage_page"})
 
     assert flags.enabled_names() == (
+        "automation_trigger_ui",
         "claude_osc_status",
         "codex_plan_at_launch",
         "session_orchestration",
@@ -105,6 +115,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == (
+        "automation_trigger_ui",
         "canvas",
         "claude_osc_status",
         "codex_plan_at_launch",

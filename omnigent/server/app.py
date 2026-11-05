@@ -275,6 +275,7 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_session_modes: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
+    automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
     scheduled_task_sandbox_workspaces: bool = True
@@ -1774,6 +1775,7 @@ def create_app(
     )
 
     from omnigent.server.server_config import (
+        automation_trigger_poll_minutes,
         load_branding_snapshot,
         load_picker_curation,
         load_server_config,
@@ -1784,6 +1786,7 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     picker_curation = load_picker_curation(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
+    trigger_poll_minutes = automation_trigger_poll_minutes(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     if harness_install is None:
         app_harness_install: bool | Callable[[], bool] = resolved_feature_flags.enabled(
@@ -3650,6 +3653,7 @@ def create_app(
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_available,
                 "automations_enabled": automations_available,
+                "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
             }

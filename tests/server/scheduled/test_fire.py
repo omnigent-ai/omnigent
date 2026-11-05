@@ -636,7 +636,11 @@ async def test_active_creates_session_grant_and_run(trigger_ui: bool, trigger: b
             conversation_store=conv_store,
             app_state=SimpleNamespace(
                 feature_flags=resolve_feature_flags(
-                    {"OMNIGENT_FEATURES": "automation_trigger_ui" if trigger_ui else ""}
+                    {
+                        "OMNIGENT_FEATURES": "automation_trigger_ui"
+                        if trigger_ui
+                        else "-automation_trigger_ui"
+                    }
                 )
             ),
         ),

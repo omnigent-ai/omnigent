@@ -112,6 +112,7 @@ export function CreateScheduledTaskDialog({
   const triggerUiEnabled = isFeatureEnabled(info, "automation_trigger_ui");
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
+  const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
   // gates on). "loading" → treat as disabled until /v1/info resolves.
@@ -353,8 +354,10 @@ export function CreateScheduledTaskDialog({
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
         setSchedule(
           initialTrigger
-            ? triggerUiEnabled && anchoredScheduling && subhourSupported
-              ? TRIGGER_SCHEDULE_MODEL
+            ? triggerUiEnabled &&
+              anchoredScheduling &&
+              (subhourSupported || triggerPollMinutes >= 60)
+              ? { ...TRIGGER_SCHEDULE_MODEL, interval: triggerPollMinutes }
               : HOURLY_SCHEDULE_MODEL
             : DEFAULT_SCHEDULE_MODEL,
         );
@@ -377,6 +380,7 @@ export function CreateScheduledTaskDialog({
     triggerUiEnabled,
     anchoredScheduling,
     subhourSupported,
+    triggerPollMinutes,
     editingTask,
     savedSchedule,
     savedWorkspace,
@@ -916,7 +920,7 @@ export function CreateScheduledTaskDialog({
             <p className="text-sm text-muted-foreground">{getHostHelpText()}</p>
           </div>
 
-          {(!triggerMode || scheduleUnsupported || unsupportedByScheduler) && (
+          {(!triggerMode || scheduleInvalid) && (
             <ScheduleFields
               timezone={timezone}
               onTimezoneChange={setTimezone}

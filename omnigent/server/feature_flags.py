@@ -56,9 +56,10 @@ class FeatureDefinition:
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.AUTOMATION_TRIGGER_UI,
-        description="Trigger-focused automation controls and ten-minute polling defaults",
+        description="Trigger-focused automation controls and server-configured polling defaults",
         owner="server",
         review_by_release="0.23.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.CODEX_PLAN_AT_LAUNCH,

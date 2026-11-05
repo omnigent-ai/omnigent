@@ -64,10 +64,13 @@ to customize.
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
   failures still allow Default.
-- `trigger-controls`: with `automation_trigger_ui` enabled, continued trigger templates
+- `trigger-controls`: with `automation_trigger_ui` enabled by default, continued trigger templates
   show polling cadence instead of schedule controls, Run now, or next-run times.
-  New templates poll every ten minutes when supported, otherwise hourly; saved
-  schedules are preserved. Edit as prompt → New session each run restores the
+  New templates use `automation_trigger_poll_minutes` from the server (10–240 minutes,
+  default 10), otherwise hourly when the requested cadence is unsupported; saved
+  schedules are preserved. Invalid schedules expose the error and schedule controls
+  so users can choose a supported interval without changing session mode.
+  Edit as prompt → New session each run restores the
   scheduling controls, even when the prompt retains its template signature.
 - `schedule`: the shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
@@ -174,7 +177,8 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 ## Gotchas
 
 - Templates poll every hour, or every ten minutes for new templates with
-  `automation_trigger_ui` and sub-hour support enabled; they do not receive webhooks.
+  `automation_trigger_ui` and sub-hour support enabled. The server can configure
+  new-template polling from 10 to 240 minutes; they do not receive webhooks.
 - Templates remain available even if loading the user's automation list fails.
 - Selecting a template does not create an automation until the modal is submitted.
 - The introduction's Example automations are read-only educational content and

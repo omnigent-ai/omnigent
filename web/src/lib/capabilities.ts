@@ -242,6 +242,8 @@ export interface ServerInfo {
   scheduled_task_session_modes?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
+  /** Server default for new trigger templates, from 10 to 240 minutes. */
+  automation_trigger_poll_minutes?: number;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
@@ -578,6 +580,13 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
+          automation_trigger_poll_minutes:
+            typeof data.automation_trigger_poll_minutes === "number" &&
+            Number.isInteger(data.automation_trigger_poll_minutes) &&
+            data.automation_trigger_poll_minutes >= 10 &&
+            data.automation_trigger_poll_minutes <= 240
+              ? data.automation_trigger_poll_minutes
+              : 10,
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
