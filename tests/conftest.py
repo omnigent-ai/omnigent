@@ -326,14 +326,14 @@ def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def frozen_recurrence_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep a runner stall from tripping the RRULE search's elapsed-time limit.
+    """Keep a slow runner from tripping the RRULE search's CPU-time limit.
 
     Searches then end only on the deterministic work budget. Tests of the time
     limit patch this clock themselves, which overrides the frozen one.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", lambda: 0.0)
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.thread_time", lambda: 0.0)
 
 
 @pytest.fixture(autouse=True)

@@ -328,7 +328,8 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
 ) -> None:
     """Without a configured ``$CODEX_HOME`` both codex harnesses read ``~/.codex``.
 
-    Both Codex harnesses include ``~/.agents/skills``. Absent a resolved
+    Both Codex harnesses include ``~/.agents/skills`` and, like the Codex CLI,
+    ``.agents/skills`` from the workspace up to its repo root. Absent a resolved
     ``$CODEX_HOME`` (``ctx.codex_home is None``), the native provider falls back
     to the same ``~/.codex/skills`` the SDK path uses — so the two agree until a
     custom codex home is in play (see the divergence test below).
@@ -337,13 +338,27 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     _write_skill(home / ".codex" / "skills", "codex-host-skill")
     _write_skill(home / ".agents" / "skills", "agents-only-skill")
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
+    _write_skill(tmp_path / ".agents" / "skills", "outside-repo-skill")
+    repo = tmp_path / "repo"
+    workspace = repo / "ws"
+    workspace.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    _write_skill(workspace / ".agents" / "skills", "workspace-skill")
+    _write_skill(repo / ".agents" / "skills", "repo-root-skill")
     ctx = _ctx(workspace, home)
 
     native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
     sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
-    assert native == sdk == {"codex-host-skill", "agents-only-skill"}
+    assert (
+        native
+        == sdk
+        == {
+            "codex-host-skill",
+            "agents-only-skill",
+            "workspace-skill",
+            "repo-root-skill",
+        }
+    )
 
 
 def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
@@ -372,6 +387,44 @@ def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
     # Native reads $CODEX_HOME's skills; SDK ignores codex_home and reads ~/.codex.
     assert native == {"custom-codex-skill", "shared-skill"}
     assert sdk == {"default-codex-skill", "shared-skill"}
+
+
+@pytest.mark.parametrize("harness", ["codex", "codex-native"])
+def test_codex_repo_skills_outrank_same_named_user_skills(tmp_path: Path, harness: str) -> None:
+    """Like Codex, repo ``.agents`` skills outrank user skills; the nearest repo dir wins."""
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    workspace = repo / "app"
+    (repo / ".git").mkdir(parents=True)
+    for skills_dir in (home / ".codex" / "skills", home / ".agents" / "skills"):
+        _write_skill(skills_dir, "user-dup")
+    _write_skill(repo / ".agents" / "skills", "user-dup")
+    _write_skill(repo / ".agents" / "skills", "repo-dup")
+    _write_skill(workspace / ".agents" / "skills", "repo-dup")
+
+    menu = {s.name: s.skill_dir for s in resolve_harness_skills(_ctx(workspace, home), harness)}
+    assert menu["user-dup"].resolve() == (repo / ".agents" / "skills" / "user-dup").resolve()
+    assert menu["repo-dup"].resolve() == (workspace / ".agents" / "skills" / "repo-dup").resolve()
+
+
+@pytest.mark.parametrize("harness", ["codex", "codex-native"])
+@pytest.mark.parametrize(
+    ("skills_filter", "expected"),
+    [("none", {"repo-skill"}), (["picked"], {"repo-skill", "picked"})],
+)
+def test_codex_repo_skills_ignore_skills_filter(
+    tmp_path: Path, harness: str, skills_filter: str | list[str], expected: set[str]
+) -> None:
+    """Codex loads repo skills whatever the filter, so only the linked host skills are filtered."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    (workspace / ".git").mkdir(parents=True)
+    for name in ("picked", "other"):
+        _write_skill(home / ".codex" / "skills", name)
+    _write_skill(workspace / ".agents" / "skills", "repo-skill")
+
+    ctx = _ctx(workspace, home, skills_filter=skills_filter)
+    assert {s.name for s in resolve_harness_skills(ctx, harness)} == expected
 
 
 def test_claude_provider_defaults_user_tier_to_home_claude(
@@ -767,16 +820,16 @@ def test_codex_provider_surfaces_skills_by_dir_name(tmp_path: Path) -> None:
     assert "triage" not in names
 
 
-def test_codex_menu_set_matches_executor_linked_set(tmp_path: Path) -> None:
+def test_codex_menu_set_matches_executor_linked_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
-    Invariant: the menu provider and the executor's symlink path select the
-    SAME skill set from the SAME sources (both via codex_skill_sources +
-    select_codex_skill_dirs) — so a / menu entry is always actually linked.
+    Invariant: the menu provider and the executor's launch linking select the
+    SAME skill set from the SAME sources — so a / menu entry is always actually
+    linked — except workspace ``.agents`` skills, which Codex loads from its cwd
+    unlinked.
     """
-    from omnigent.inner.codex_executor import (
-        codex_skill_sources,
-        select_codex_skill_dirs,
-    )
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
 
     home = tmp_path / "home"
     host = home / ".codex" / "skills"
@@ -784,12 +837,18 @@ def test_codex_menu_set_matches_executor_linked_set(tmp_path: Path) -> None:
         d = host / n
         d.mkdir(parents=True)
         (d / "SKILL.md").write_text(f"---\nname: {n.split('--')[-1]}\ndescription: d\n---\nx\n")
+    workspace = tmp_path / "ws"
+    _write_skill(workspace / ".agents" / "skills", "workspace-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.chdir(workspace)
 
-    # What the executor would symlink (keys = dir names linked into CODEX_HOME).
-    linked = set(select_codex_skill_dirs("all", codex_skill_sources(None, home)))
+    codex_home = tmp_path / "codex-home"
+    populate_codex_skills_from_bundle(codex_home, None, "all")
+    linked = {entry.name for entry in (codex_home / "skills").iterdir()}
     # What the menu surfaces.
-    menu = {s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")}
-    assert menu == linked == {"alpha", "beta--gamma"}
+    menu = {s.name for s in resolve_harness_skills(_ctx(workspace, home), "codex-native")}
+    assert linked == {"alpha", "beta--gamma"}
+    assert menu == linked | {"workspace-skill"}
 
 
 def test_claude_provider_project_disable_overrides_global_enable(

@@ -98,6 +98,16 @@ class GitHubPullRequests:
             root, reference, head_sha=head_sha, base_sha=base_sha
         )
 
+    def review_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """List changed files whose revisions match the displayed patch."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_changed_files_at_revision(
+            root, reference, head_sha=head_sha, base_sha=base_sha
+        )
+
     def review_threads(
         self, root: str, reference: PullRequestRef, *, after: str, head_sha: str, base_sha: str
     ) -> dict[str, Any]:

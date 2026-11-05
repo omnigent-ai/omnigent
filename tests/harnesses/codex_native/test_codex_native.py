@@ -846,6 +846,166 @@ def test_preload_codex_thread_closes_client_on_failure(
     assert fake_client.closed
 
 
+_PROVIDER_MISMATCH = {
+    "code": -32600,
+    "message": "provider mismatch",
+    "data": {
+        "type": "modelProviderMismatch",
+        "modelProvider": "omnigent_databricks",
+        "currentModelProvider": "Databricks",
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("error", "has_rollout"),
+    [
+        (_PROVIDER_MISMATCH, False),
+        ({**_PROVIDER_MISMATCH, "data": {"type": "modelProviderMismatch"}}, True),
+        ({**_PROVIDER_MISMATCH, "code": -32603}, True),
+        ({"code": -32600, "message": "no rollout found for thread id thread_test"}, True),
+    ],
+    ids=["no_rollout_path", "no_current_provider", "internal_error", "missing_rollout"],
+)
+def test_preload_codex_thread_surfaces_refusals_it_cannot_restamp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: dict[str, Any],
+    has_rollout: bool,
+) -> None:
+    """Only a provider mismatch naming Codex's provider restamps a known rollout."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"omnigent_databricks"}}\n'
+    rollout.write_bytes(original)
+    fake_client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(error)
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    with pytest.raises(codex_native_app_server.CodexAppServerResponseError):
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="omnigent_databricks",
+                rollout_path=rollout if has_rollout else None,
+            )
+        )
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert rollout.read_bytes() == original
+    assert fake_client.closed
+
+
+@pytest.mark.parametrize(
+    ("first_record", "replace_fails", "raised"),
+    [
+        (b'{"type":"turn_context","payload":{}}', False, ValueError),
+        (b"not json", False, ValueError),
+        (b'{"type":"session_meta","payload":{"model_provider":"p"}}', True, OSError),
+    ],
+    ids=["not_session_meta", "unparseable_record", "replace_fails"],
+)
+def test_preload_codex_thread_keeps_rollout_when_restamp_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    first_record: bytes,
+    replace_fails: bool,
+    raised: type[Exception],
+) -> None:
+    """A rollout that cannot be restamped stays intact and the resume is not retried."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = first_record + b'\n{"type":"response_item","payload":{}}\n'
+    rollout.write_bytes(original)
+    fake_client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(_PROVIDER_MISMATCH)
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    if replace_fails:
+
+        def _fail_replace(*_args: object) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(codex_native_app_server.os, "replace", _fail_replace)
+
+    with pytest.raises(raised):
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="omnigent_databricks",
+                rollout_path=rollout,
+            )
+        )
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert rollout.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [rollout]
+    assert fake_client.closed
+
+
+class _ScriptedResumeClient(_FakeCodexAppServerClient):
+    """Fake client that raises each scripted error once, then answers normally."""
+
+    def __init__(self, errors: list[Exception]) -> None:
+        super().__init__()
+        self.errors = errors
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.error = self.errors.pop(0) if self.errors else None
+        return await super().request(method, params)
+
+
+@pytest.mark.parametrize(
+    ("retain_client", "retry_refused"),
+    [(False, False), (True, False), (True, True)],
+    ids=["closes_client", "retains_client", "second_refusal_surfaces"],
+)
+def test_preload_codex_thread_retries_provider_mismatch_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    retain_client: bool,
+    retry_refused: bool,
+) -> None:
+    """A restamped resume retries once under Codex's provider and keeps client ownership."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"omnigent_databricks"}}\n'
+    )
+    refusals = [
+        codex_native_app_server.CodexAppServerResponseError(_PROVIDER_MISMATCH)
+        for _ in range(2 if retry_refused else 1)
+    ]
+    fake_client = _ScriptedResumeClient(list(refusals))
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    preload = codex_native_app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876",
+        "thread_test",
+        model_provider="omnigent_databricks",
+        retain_client=retain_client,
+        rollout_path=rollout,
+    )
+
+    if retry_refused:
+        with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as raised:
+            asyncio.run(preload)
+        assert raised.value is refusals[1]
+    else:
+        assert asyncio.run(preload) is (fake_client if retain_client else None)
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"] * 2
+    first, retry = (params for _method, params in fake_client.requests)
+    assert retry == {**first, "modelProvider": "Databricks"}
+    assert json.loads(rollout.read_text())["payload"]["model_provider"] == "Databricks"
+    assert fake_client.closed is (retry_refused or not retain_client)
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [

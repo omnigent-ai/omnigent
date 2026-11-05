@@ -14,6 +14,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
+- `touch-targets`: native iOS/Android apps and browsers with a coarse primary
+  pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
+  The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
+  compact controls regardless of viewport width.
 - `prompt-link`: opening the new-session page with `?prompt=`
   fills an editable draft without starting a session. The consumed prompt is
   removed from the URL while other query parameters and the fragment remain.
@@ -116,6 +120,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   selection and launch wait for success. States: connected, pending, cancelled,
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
+  Rows show a one-line description. When the pointer or keyboard highlight rests
+  on a cut-off row for 400 ms, a scrollable tooltip shows the full text;
+  PageUp/PageDown page through a tall one while the composer keeps focus. The
+  tooltip fits within the viewport width, and on touch screens the highlight
+  doesn't open it.
   The main composer lists its full built-in set and the session's skills; a live
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
@@ -417,6 +426,11 @@ managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
 
+- **`touch-targets`, new-session and in-session composers:**
+  `tests/browser_ui/chat/test_composer_geometry_contract.py::test_landing_and_live_cards_share_the_geometry_contract`
+  uses the built SPA with mocked APIs (no server required), comparing touch and
+  mouse input at phone, tablet, and desktop widths.
+
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
   away: its tooltip should stay visible. Check dismissal by outside click,
@@ -597,6 +611,10 @@ Other connection providers alone do not enable the managed MCP picker.
   No running agent is needed.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_a_long_single_match_from_the_keyboard`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_highlight_opens_no_tooltip_on_a_touch_screen`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`;
@@ -789,6 +807,9 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
 
 ## Gotchas
+
+- Test touch sizing with a real touch device or browser touch emulation; resizing
+  a mouse browser alone does not enable it.
 
 - The Arclet dbcert preflight needs both the updated desktop shell and web UI,
   with Databricks-internal features enabled for the managed server. Browsers,
