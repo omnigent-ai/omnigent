@@ -7,7 +7,11 @@ import re
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.browser_ui.chat.session_contract import ChatSessionContract, session_status_event
+from tests.browser_ui.chat.session_contract import (
+    ChatSessionContract,
+    message_item,
+    session_status_event,
+)
 
 _WORKING_LABEL_RE = re.compile(
     r"^(Working|Cooking|Crunching|Tinkering|Pondering|Brewing|Noodling|Wrangling|"
@@ -62,6 +66,92 @@ def _pill(page: Page, count: int) -> Locator:
     )
 
 
+@pytest.mark.browser_context_args(has_touch=True)
+@pytest.mark.parametrize("width", [320, 390, 1024])
+def test_touch_screens_reveal_timestamps_and_pending_steering(
+    page: Page, chat_session_contract: ChatSessionContract, width: int
+) -> None:
+    chat = chat_session_contract
+    chat.harness = "codex-native"
+    chat.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
+    chat.set_items(
+        [
+            {
+                **message_item("answer", "assistant", "Previous answer", response_id="previous"),
+                "created_at": 1_762_000_000,
+            }
+        ]
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    assert page.evaluate("matchMedia('(pointer:coarse)').matches")
+    timestamp = page.get_by_test_id("message-timestamp")
+    expect(timestamp).to_be_visible()
+    opacity = """element => {
+      let value = 1;
+      for (let node = element; node; node = node.parentElement)
+        value *= Number(getComputedStyle(node).opacity);
+      return value;
+    }"""
+    assert timestamp.evaluate(opacity) >= 0.39
+    chat.emit_busy("current")
+    expect(page.get_by_test_id("working-indicator")).to_be_visible()
+    page.evaluate("localStorage.setItem('omnigent:always-steer', 'true')")
+    chat.event_ack = {"queued": True, "pending_id": "steer"}
+    page.get_by_label("Message the agent").fill("Keep this explanation visible on touch")
+    page.get_by_role("button", name="Send", exact=True).click()
+    notice = page.get_by_test_id("message-awaiting-agent")
+    expect(notice).to_be_visible()
+    page.wait_for_function(f"element => ({opacity})(element) >= 0.39", arg=notice.element_handle())
+    assert notice.evaluate(opacity) >= 0.39
+    footer = notice.locator("..")
+    pending_timestamp = footer.get_by_test_id("message-timestamp")
+    notice_box = notice.bounding_box()
+    timestamp_box = pending_timestamp.bounding_box()
+    assert notice_box is not None and timestamp_box is not None
+    assert notice_box["y"] == pytest.approx(timestamp_box["y"], abs=1)
+    assert notice_box["x"] + notice_box["width"] <= timestamp_box["x"] + 1
+
+
+def test_attachment_only_steering_explanation_stays_visible_on_desktop(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """A text-less steer has no focusable footer control, so it must not hide."""
+    chat = chat_session_contract
+    chat.harness = "codex-native"
+    chat.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
+    chat.reject_uploads = False
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    chat.emit_busy("current")
+    expect(page.get_by_test_id("working-indicator")).to_be_visible()
+    page.evaluate("localStorage.setItem('omnigent:always-steer', 'true')")
+    chat.event_ack = {"queued": True, "pending_id": "steer"}
+    page.locator('form.chat-composer-form input[type="file"]').set_input_files(
+        [{"name": "notes.txt", "mimeType": "text/plain", "buffer": b"Notes"}]
+    )
+    send = page.get_by_role("button", name="Send", exact=True)
+    expect(send).to_be_enabled()
+    send.click()
+    notice = page.get_by_test_id("message-awaiting-agent")
+    expect(notice).to_be_visible()
+    footer = notice.locator("..")
+    expect(footer.get_by_role("button", name="Copy", exact=True)).to_have_count(0)
+    expect(footer.get_by_test_id("copy-message-link")).to_be_disabled()
+    page.mouse.move(0, 0)
+    opacity = """element => {
+      let value = 1;
+      for (let node = element; node; node = node.parentElement)
+        value *= Number(getComputedStyle(node).opacity);
+      return value;
+    }"""
+    page.wait_for_function(f"element => ({opacity})(element) >= 0.99", arg=notice.element_handle())
+
+
 def test_bare_idle_clears_the_live_working_indicator(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -78,6 +168,48 @@ def test_bare_idle_clears_the_live_working_indicator(
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)
+
+
+# Pauses the indicator's animations and steps them through 3.4s, recording what moves.
+_STEP_WORKING_ANIMATIONS = """(indicator) => {
+  const starfish = indicator.querySelector(".otto-working");
+  const eye = starfish.querySelector(".otto-eye");
+  const label = indicator.querySelector(".text-shimmer");
+  const animations = indicator.getAnimations({ subtree: true });
+  for (const animation of animations) animation.pause();
+  const frames = [];
+  for (let time = 0; time <= 3400; time += 100) {
+    for (const animation of animations) animation.currentTime = time;
+    const row = starfish.parentElement.getBoundingClientRect();
+    frames.push({
+      starfishTop: starfish.getBoundingClientRect().top - row.top,
+      eyeHeight: eye.getBoundingClientRect().height,
+      labelShimmer: getComputedStyle(label).backgroundPosition,
+    });
+  }
+  return frames;
+}"""
+
+
+def test_working_starfish_holds_still_while_it_blinks_and_the_label_shimmers(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Only the starfish's eyes and the label animate while Working shows."""
+    chat = chat_session_contract
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    working = page.get_by_test_id("working-indicator")
+
+    chat.emit_busy("browser-turn")
+    expect(working).to_be_visible(timeout=10_000)
+
+    frames = working.evaluate(_STEP_WORKING_ANIMATIONS)
+    tops = sorted({frame["starfishTop"] for frame in frames})
+    assert len(tops) == 1, f"the starfish moved between offsets {tops}"
+    assert len({frame["eyeHeight"] for frame in frames}) > 1, "the eyes stopped blinking"
+    assert len({frame["labelShimmer"] for frame in frames}) > 1, "the label stopped shimmering"
 
 
 def test_blocked_reason_reaches_the_live_working_indicator(
@@ -148,6 +280,63 @@ def test_action_banner_follows_the_launch(
         }
     )
     expect(banner).to_be_hidden(timeout=10_000)
+
+
+@pytest.mark.parametrize("turns", [0, 1])
+@pytest.mark.parametrize("width", [1280, 375])
+def test_sandbox_failure_stays_in_transcript_above_composer(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    turns: int,
+    width: int,
+) -> None:
+    """Live and persisted launch failures replace progress in the conversation."""
+    chat = chat_session_contract
+    page.set_viewport_size({"width": width, "height": 844})
+    chat.seed_transcript(turns)
+    chat.set_health(runner_online=False, host_online=False)
+    chat.update_session(
+        host_id=None,
+        workspace=None,
+        sandbox_status={"stage": "provisioning", "provider": "arclet"},
+    )
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    expect(page.get_by_test_id("runner-starting-indicator")).to_be_visible(timeout=20_000)
+
+    # A queued turn can still be marked running when sandbox startup fails.
+    chat.emit_busy("launching-turn")
+    status = {"stage": "failed", "provider": "arclet", "error": "Sandbox allocation failed."}
+    chat.update_session(sandbox_status=status)
+    chat.emit(
+        {
+            "event": "session.sandbox_status",
+            "data": {
+                "type": "session.sandbox_status",
+                "conversation_id": chat.session_id,
+                **status,
+            },
+        }
+    )
+
+    failure = page.get_by_test_id("sandbox-failed-indicator")
+    for persisted in (False, True):
+        if persisted:
+            page.reload()
+        expect(failure).to_have_count(1)
+        expect(page.get_by_role("log").get_by_test_id("sandbox-failed-indicator")).to_be_visible()
+        expect(page.get_by_test_id("runner-starting-indicator")).to_be_hidden()
+        expect(page.get_by_test_id("working-indicator")).to_be_hidden()
+        composer = page.get_by_label("Message the agent")
+        expect(composer).to_be_visible()
+        failure_box = failure.bounding_box()
+        composer_box = composer.bounding_box()
+        assert failure_box is not None and composer_box is not None
+        assert failure_box["y"] + failure_box["height"] <= composer_box["y"]
+        failure.get_by_test_id("error-pill").click()
+        expect(failure.get_by_test_id("error-message-content")).to_contain_text(
+            "Sandbox allocation failed."
+        )
 
 
 @pytest.mark.parametrize(
