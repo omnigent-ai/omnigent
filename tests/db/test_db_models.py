@@ -743,7 +743,7 @@ class TestSqlSessionPermission:
 
 class TestSqlComment:
     def test_anchor_writes_enforce_stored_byte_limit(self) -> None:
-        assert "anchor_metadata" not in sa.inspect(SqlComment).columns
+        assert "anchor_metadata" in sa.inspect(SqlComment).columns
         table = SqlComment.__table__
         assert table.c.anchor_metadata.type.max_stored_bytes == 1_024
         anchor = '{"pr_url":"https://example.com/repo/pull/1","side":"LEFT","line":9}'
