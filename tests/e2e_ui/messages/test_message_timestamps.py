@@ -259,7 +259,7 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
 
         # The seeded reply is already on screen; the composer send still
         # exercises the real touch UI path for the user bubble.
-        assistant_bubble = page.locator(_ASSISTANT_BUBBLE).first
+        assistant_bubble = page.locator(_ASSISTANT_BUBBLE).last
         expect(assistant_bubble).to_be_visible(timeout=30_000)
 
         _send(page, "Touch timestamp probe: say anything.")
