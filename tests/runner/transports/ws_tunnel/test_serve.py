@@ -517,10 +517,12 @@ async def test_serve_tunnel_no_credential_error_after_streak(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["connected", "rejected", "cancelled", "shutdown"])
+@pytest.mark.parametrize("initial_credential", [None, "tok-refused"], ids=["missing", "refused"])
 async def test_serve_tunnel_rides_out_a_transient_missing_credential(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     outcome: str,
+    initial_credential: str | None,
 ) -> None:
     """Credential recovery past normal startup grace preserves a bounded pending launch."""
     monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
@@ -531,20 +533,27 @@ async def test_serve_tunnel_rides_out_a_transient_missing_credential(
     runner_id = "runner_transient_credential"
     upgrades: list[str | None] = []
     pending: list[bool] = []
+    deadlines: list[float] = []
     shutdown = asyncio.Event()
 
     def _mint() -> str | None:
-        return None if sum(sleeps) < 45 else "tok-recovered"
+        return initial_credential if sum(sleeps) < 45 else "tok-recovered"
 
     async def _serve_once(app: Any, *, auth_token: str | None = None, **kwargs: Any) -> None:
         del app
         upgrades.append(auth_token)
         pending.append(runner_sign_in_is_pending(marker, runner_id))
+        if len(upgrades) > 1:
+            assert pending[-1] is (sum(sleeps) < 120)
+            deadlines.append(
+                json.loads(sign_in_pending_marker_path(marker).read_text())["deadline"]
+            )
         if sum(sleeps) >= 30 and outcome == "shutdown":
             shutdown.set()
-        if auth_token is None or outcome == "rejected":
+        if auth_token != "tok-recovered" or outcome == "rejected":
             raise InvalidStatus(Response(401, "Unauthorized", [], b""))
         kwargs["on_connected"]()
+        assert not runner_sign_in_is_pending(marker, runner_id)
         raise asyncio.CancelledError
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
@@ -582,12 +591,12 @@ async def test_serve_tunnel_rides_out_a_transient_missing_credential(
             await task
 
     assert pending[0] is False
-    if outcome != "rejected":
-        assert all(pending[1:-1])
+    assert all(pending[1:-1])
+    assert pending[-1] is (outcome != "rejected")
+    assert len(set(deadlines)) == 1
     if outcome in {"connected", "rejected"}:
         assert upgrades[-1] == "tok-recovered"
         if outcome == "connected":
-            assert pending[-1] is False
             assert 30 < sum(sleeps) < 120
         else:
             # A refused token is retried for the whole window before the runner exits.
@@ -653,24 +662,36 @@ async def test_serve_tunnel_no_credential_exits_only_after_the_window(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("http_status", [401, 403])
 async def test_serve_tunnel_rejected_token_exits_only_after_the_window(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    http_status: int,
 ) -> None:
     """A never-connected runner whose token is refused re-mints until the window elapses."""
     monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
     monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 120.0)
     monkeypatch.setattr(serve_module.random, "uniform", lambda *_args: 0.0)
-    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(tmp_path / "runner.connected"))
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
     tokens_used: list[str | None] = []
+    deadlines: list[float] = []
 
     async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
         del app
         tokens_used.append(auth_token)
-        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+        if len(tokens_used) > 1:
+            assert runner_sign_in_is_pending(marker, "runner_rejected_token_window") is (
+                sum(sleeps) < 120
+            )
+            deadlines.append(
+                json.loads(sign_in_pending_marker_path(marker).read_text())["deadline"]
+            )
+        raise InvalidStatus(Response(http_status, "Unauthorized", [], b""))
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     sleeps = _clock_advanced_by_sleep(monkeypatch)
+    monkeypatch.setattr("omnigent.runner.identity.time", serve_module.time)
 
     with pytest.raises(serve_module.RunnerTunnelAuthRejectedError) as exc_info:
         await serve_tunnel(
@@ -685,6 +706,9 @@ async def test_serve_tunnel_rejected_token_exits_only_after_the_window(
     assert sum(sleeps) >= serve_module._NO_CREDENTIAL_FATAL_WINDOW_S
     assert len(tokens_used) > serve_module._HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
     assert sleeps[:6] == [0.5, 1.0, 2.0, 4.0, 8.0, 10.0]
+    assert len(set(deadlines)) == 1
+    assert not marker.exists()
+    assert not sign_in_pending_marker_path(marker).exists()
 
 
 class _SignInFactory:

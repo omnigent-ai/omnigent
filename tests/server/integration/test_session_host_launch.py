@@ -2997,7 +2997,9 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
         await comm.wait(timeout=budget(5.0))
 
 
-@pytest.mark.parametrize("startup_state", ["alive", "sign_in_pending", "missing_credential"])
+@pytest.mark.parametrize(
+    "startup_state", ["alive", "sign_in_pending", "missing_credential", "rejected_credential"]
+)
 async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -3040,7 +3042,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     pending_reported = asyncio.Event()
     tunnel_task: asyncio.Task[None] | None = None
 
-    if startup_state == "missing_credential":
+    if startup_state in {"missing_credential", "rejected_credential"}:
         from websockets.exceptions import InvalidStatus
         from websockets.http11 import Response
 
@@ -3069,7 +3071,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
             return result.status
 
         async def _upgrade(_app: object, *, auth_token: str | None, **kwargs: Any) -> None:
-            if auth_token is None:
+            if auth_token != "tok-recovered":
                 raise InvalidStatus(Response(401, "Unauthorized", [], b""))
             kwargs["on_connected"]()
             app.state.tunnel_registry.register(
@@ -3085,7 +3087,13 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
                 server_url="http://testserver",
                 runner_id=original_runner_id,
                 runner_version="0.1.0",
-                auth_token_factory=lambda: "tok-recovered" if credential_ready.is_set() else None,
+                auth_token_factory=lambda: (
+                    "tok-recovered"
+                    if credential_ready.is_set()
+                    else "tok-refused"
+                    if startup_state == "rejected_credential"
+                    else None
+                ),
             )
         )
 
@@ -3154,7 +3162,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
             )
         )
         await _wait_for_runner_connect_waiter(app, original_runner_id)
-        if startup_state == "missing_credential":
+        if startup_state in {"missing_credential", "rejected_credential"}:
             await asyncio.wait_for(pending_reported.wait(), timeout=budget(5.0))
         if startup_state != "alive":
             # Longer than normal startup grace, still inside the explicit sign-in window.
@@ -3162,7 +3170,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
             current = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
             assert current is not None and current.runner_id == original_runner_id
             assert not post_task.done()
-        if startup_state == "missing_credential":
+        if startup_state in {"missing_credential", "rejected_credential"}:
             credential_ready.set()
         else:
             app.state.tunnel_registry.register(

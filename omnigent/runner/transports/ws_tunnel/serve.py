@@ -550,7 +550,7 @@ async def serve_tunnel(
                         waited_s=round(waited_s, 1),
                     ),
                 )
-        if auth_token is not None:
+        if auth_token is not None and http_auth_rejection_started is None:
             mark_sign_in_pending(runner_id, None)
         reconnecting = ever_connected
         retry_reason = "connection closed cleanly"
@@ -659,11 +659,6 @@ async def serve_tunnel(
                                 "e.g. the host credential service's grant expired or was "
                                 f"rejected); {_reauth_hint(server_url)}"
                             ) from exc
-                        # Let the host and server preserve this launch while the
-                        # credential recovers, without renewing its deadline.
-                        mark_sign_in_pending(
-                            runner_id, http_auth_rejection_started + _NO_CREDENTIAL_FATAL_WINDOW_S
-                        )
                     elif not ever_connected and window_elapsed:
                         # A rejected token can be stale for a while (e.g. a grant that
                         # the host is refreshing), so give the re-mint the same window.
@@ -673,6 +668,12 @@ async def serve_tunnel(
                             f"{http_auth_rejection_streak} attempts over {int(waited_s)} s); "
                             f"{_reauth_hint(server_url)}"
                         ) from exc
+                    if not ever_connected:
+                        # A returned token still needs an accepted upgrade; keep this
+                        # launch's original credential deadline until that succeeds.
+                        mark_sign_in_pending(
+                            runner_id, http_auth_rejection_started + _NO_CREDENTIAL_FATAL_WINDOW_S
+                        )
                     # The rejection proves the server requires auth: drop the cached token
                     # and any recoverable mint decline so the guarded loop-top refresh re-mints.
                     await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
