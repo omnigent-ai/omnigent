@@ -15,7 +15,7 @@ import time
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import make_url
-from sqlalchemy.dialects import mysql, sqlite
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 
 from omnigent.db.db_models import (
@@ -743,6 +743,13 @@ class TestSqlSessionPermission:
 
 class TestSqlComment:
     def test_model_schema_bounds_anchor_bytes(self) -> None:
+        assert "anchor_metadata" in sa.inspect(SqlComment).columns
+        postgres_ddl = str(
+            sa.schema.CreateTable(SqlComment.__table__).compile(dialect=postgresql.dialect())
+        )
+        assert "ck_comments_anchor_metadata_bytes" in postgres_ddl
+        assert "octet_length(anchor_metadata) <= 16383" in postgres_ddl
+        assert "CAST(anchor_metadata AS BLOB)" not in postgres_ddl
         engine = sa.create_engine("sqlite://")
         try:
             SqlComment.__table__.create(engine)
