@@ -1375,6 +1375,137 @@
         "title": "CodexGoalResponse",
         "type": "object"
       },
+      "Comment": {
+        "description": "A single review comment anchored to a text range in a file.",
+        "properties": {
+          "anchor_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Plain-text snapshot of the selected range at comment creation time. Used to re-anchor the comment when the file is subsequently edited. `None` for legacy comments.",
+            "title": "Anchor Content"
+          },
+          "anchor_metadata": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PullRequestCommentAnchor"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Immutable provider-specific coordinates used to locate the comment outside a workspace file. When set, character offsets do not locate the comment in the workspace file."
+          },
+          "body": {
+            "description": "The comment text.",
+            "title": "Body",
+            "type": "string"
+          },
+          "conversation_id": {
+            "description": "The conversation this comment belongs to, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix timestamp (seconds) when the comment was created.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Email of the user who created the comment, e.g. `\"alice@example.com\"`. `None` for legacy comments created before per-user attribution was added, or in single-user mode.",
+            "title": "Created By"
+          },
+          "end_index": {
+            "description": "0-based absolute character offset (exclusive) within the file where the anchor range ends.",
+            "format": "int64",
+            "title": "End Index",
+            "type": "integer"
+          },
+          "id": {
+            "description": "UUID for this comment, e.g. `\"a1b2c3d4-...\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "path": {
+            "description": "File path relative to the workspace root, e.g. `\"src/App.tsx\"`.",
+            "title": "Path",
+            "type": "string"
+          },
+          "start_index": {
+            "description": "0-based absolute character offset (inclusive) within the file where the anchor range begins.",
+            "format": "int64",
+            "title": "Start Index",
+            "type": "integer"
+          },
+          "status": {
+            "description": "One of `\"draft\"` (open, not yet addressed) or `\"addressed\"` (fixed by the agent or user).",
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "Unix timestamp in **microseconds** when the comment was last mutated (body or status change); set at creation time for never-edited comments. Microsecond precision (vs `created_at`'s seconds) so back-to-back mutations inside the same second still produce distinct, ordered values for the session comments fingerprint, while staying an exact integer in JavaScript (epoch-\u00b5s < `Number.MAX_SAFE_INTEGER`).",
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "conversation_id",
+          "path",
+          "start_index",
+          "end_index",
+          "body",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "Comment",
+        "type": "object"
+      },
+      "CommentPage": {
+        "description": "A bounded comment page; filtered pages can be empty and still have a cursor.",
+        "properties": {
+          "comments": {
+            "items": {
+              "$ref": "#/components/schemas/Comment"
+            },
+            "title": "Comments",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "comments",
+          "next_cursor"
+        ],
+        "title": "CommentPage",
+        "type": "object"
+      },
       "CompactionCompletedEvent": {
         "description": "Conversation history compaction has finished.\n\nEmitted after compaction completes \u2014 either by the server after\n`compact_conversation_now()` (explicit `/compact`), or by a\nharness that compacted its own internal context. Clients that\nrendered a \"Compacting\u2026\" spinner on\n`CompactionInProgressEvent` should upgrade it to the\npermanent \"Conversation compacted\" marker on this event.\n\nWhen emitted by a harness, `summary` and `summary_model`\nare populated so the runner can persist a compaction item for\nsession resume. When emitted by the server's explicit\n`/compact` path, those fields are `None`.",
         "properties": {
@@ -15686,7 +15817,7 @@
     },
     "/v1/sessions/{session_id}/comments": {
       "get": {
-        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\n**Returns:** List of serialized comment dicts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
+        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\n**Returns:** A Files-only array, or a page in ID order when opted in. Path filtering happens after paging; follow next_cursor even when comments is empty. Pagination parameters apply only to this mode.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
         "operationId": "list_comments_v1_sessions__session_id__comments_get",
         "parameters": [
           {
@@ -15717,7 +15848,7 @@
             }
           },
           {
-            "description": "Opt in to revision-anchored comments that legacy clients cannot locate using workspace character offsets.",
+            "description": "Opt in to bounded pages including PR anchors. Legacy callers receive the Files-only array.",
             "in": "query",
             "name": "include_pr_comments",
             "required": false,
@@ -15726,6 +15857,37 @@
               "title": "Include Pr Comments",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Maximum rows examined per page, plus one continuation row.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exclusive comment ID from the previous page's next_cursor.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{32}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
           }
         ],
         "responses": {
@@ -15733,12 +15895,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "additionalProperties": true,
-                    "type": "object"
-                  },
-                  "title": "Response List Comments V1 Sessions  Session Id  Comments Get",
-                  "type": "array"
+                  "anyOf": [
+                    {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommentPage"
+                    }
+                  ],
+                  "title": "Response List Comments V1 Sessions  Session Id  Comments Get"
                 }
               }
             },

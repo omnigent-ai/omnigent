@@ -1185,7 +1185,7 @@ def test_reply_to_inline_review_conversation(
         f"{base_url}/v1/sessions/{session_id}/comments?include_pr_comments=true"
     )
     assert response.ok
-    local_comments = response.json()
+    local_comments = response.json()["comments"]
     assert len(local_comments) == 2
     assert {comment["anchor_metadata"]["side"] for comment in local_comments} == {"LEFT", "RIGHT"}
     page.screenshot(path=str(tmp_path / f"inline-{entry}-local-review.png"))
@@ -1224,7 +1224,7 @@ def test_reply_to_inline_review_conversation(
         f"{base_url}/v1/sessions/{session_id}/comments?include_pr_comments=true"
     )
     assert response.ok
-    assert [comment["id"] for comment in response.json()] == [old_comment["id"]]
+    assert [comment["id"] for comment in response.json()["comments"]] == [old_comment["id"]]
     chip.click()
     expect(file.get_by_role("region", name="Local review comment")).to_have_count(1)
     target.get_by_role("button", name="Delete local comment", exact=True).click()
@@ -1238,7 +1238,7 @@ def test_reply_to_inline_review_conversation(
         f"{base_url}/v1/sessions/{session_id}/comments?include_pr_comments=true"
     )
     assert response.ok
-    assert response.json() == []
+    assert response.json() == {"comments": [], "next_cursor": None}
 
 
 # Two additions match "added": the first on line 2, the second on line 4.

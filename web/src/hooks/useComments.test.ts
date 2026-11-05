@@ -89,10 +89,10 @@ describe("commentsQueryKey", () => {
 
 describe("fetchComments", () => {
   it("opts into PR comments without a path filter", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse([]));
+    fetchMock.mockResolvedValueOnce(mockResponse({ comments: [], next_cursor: null }));
     await fetchComments("conv_1");
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv_1/comments?include_pr_comments=true",
+      "/v1/sessions/conv_1/comments?include_pr_comments=true&limit=100",
     );
   });
 
@@ -102,14 +102,43 @@ describe("fetchComments", () => {
     fetchMock.mockResolvedValueOnce(mockResponse([]));
     await fetchComments("conv with space", "src/a b.ts");
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv%20with%20space/comments?path=src%2Fa%20b.ts&include_pr_comments=true",
+      "/v1/sessions/conv%20with%20space/comments?path=src%2Fa%20b.ts&include_pr_comments=true&limit=100",
     );
   });
 
-  it("returns the parsed comment array", async () => {
+  it("accepts a legacy server's comment array", async () => {
     const comments = [makeComment({ id: "c1", path: "a.ts" })];
     fetchMock.mockResolvedValueOnce(mockResponse(comments));
     await expect(fetchComments("conv_1")).resolves.toEqual(comments);
+  });
+
+  it("follows cursors through empty filtered pages and restores chronological order", async () => {
+    const earlier = makeComment({ id: "c3", path: "a.ts", created_at: 1 });
+    const later = makeComment({ id: "c1", path: "a.ts", created_at: 2 });
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ comments: [later], next_cursor: "c1" }))
+      .mockResolvedValueOnce(mockResponse({ comments: [], next_cursor: "c2" }))
+      .mockResolvedValueOnce(mockResponse({ comments: [earlier], next_cursor: null }));
+    const controller = new AbortController();
+    await expect(fetchComments("conv_1", "a.ts", controller.signal)).resolves.toEqual([
+      earlier,
+      later,
+    ]);
+    const url = "/v1/sessions/conv_1/comments?path=a.ts&include_pr_comments=true&limit=100";
+    expect(fetchMock.mock.calls.map(([request]) => request)).toEqual([
+      url,
+      `${url}&after=c1`,
+      `${url}&after=c2`,
+    ]);
+    expect(fetchMock.mock.calls.every(([, init]) => init.signal === controller.signal)).toBe(true);
+  });
+
+  it("rejects a failed continuation rather than returning a partial list", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ comments: [], next_cursor: "c1" }))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    await expect(fetchComments("conv_1")).rejects.toThrow(/500/);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("throws on non-2xx", async () => {
@@ -139,7 +168,7 @@ describe("useComments", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual(comments);
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv_1/comments?include_pr_comments=true",
+      "/v1/sessions/conv_1/comments?include_pr_comments=true&limit=100",
     );
   });
 });

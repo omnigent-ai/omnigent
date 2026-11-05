@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
@@ -224,11 +225,33 @@ async def test_local_pr_comment_round_trip(client: httpx.AsyncClient, session_id
             params={**params, "include_pr_comments": "true"},
         )
         assert listed.status_code == 200
-        assert {item["id"] for item in listed.json()} == {comment["id"], file_id}
+        assert listed.json()["next_cursor"] is None
+        assert {item["id"] for item in listed.json()["comments"]} == {comment["id"], file_id}
         assert (
-            next(item for item in listed.json() if item["id"] == comment["id"])["anchor_metadata"]
+            next(item for item in listed.json()["comments"] if item["id"] == comment["id"])[
+                "anchor_metadata"
+            ]
             == anchor
         )
+
+    ordered = sorted([comment, file_response.json()], key=lambda item: item["id"])
+    for path in ("src/App.tsx", "missing.py"):
+        params = {"include_pr_comments": "true", "limit": "1", "path": path}
+        first = await client.get(f"/v1/sessions/{session_id}/comments", params=params)
+        assert first.status_code == 200
+        assert first.json() == {
+            "comments": ordered[:1] if path == "src/App.tsx" else [],
+            "next_cursor": ordered[0]["id"],
+        }
+        second = await client.get(
+            f"/v1/sessions/{session_id}/comments",
+            params={**params, "after": first.json()["next_cursor"]},
+        )
+        assert second.status_code == 200
+        assert second.json() == {
+            "comments": ordered[1:] if path == "src/App.tsx" else [],
+            "next_cursor": None,
+        }
 
     for ids in ([comment["id"]], [file_id, comment["id"]]):
         rejected = await client.post(
@@ -239,7 +262,7 @@ async def test_local_pr_comment_round_trip(client: httpx.AsyncClient, session_id
         unchanged = await client.get(
             f"/v1/sessions/{session_id}/comments", params={"include_pr_comments": "true"}
         )
-        assert {item["status"] for item in unchanged.json()} == {"draft"}
+        assert {item["status"] for item in unchanged.json()["comments"]} == {"draft"}
 
     sent = await client.post(
         f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": [file_id]}
@@ -250,7 +273,19 @@ async def test_local_pr_comment_round_trip(client: httpx.AsyncClient, session_id
     listed = await client.get(
         f"/v1/sessions/{session_id}/comments", params={"include_pr_comments": "true"}
     )
-    assert {item["id"]: item["status"] for item in listed.json()} == {
+    assert {item["id"]: item["status"] for item in listed.json()["comments"]} == {
         file_id: "addressed",
         comment["id"]: "draft",
     }
+
+
+@pytest.mark.parametrize("params", [{"limit": "0"}, {"limit": "101"}, {"after": "invalid"}])
+async def test_comment_page_rejects_invalid_bounds(
+    client: httpx.AsyncClient, session_id: str, params: dict[str, str]
+) -> None:
+    """Page limits and continuation IDs are validated before querying."""
+    response = await client.get(
+        f"/v1/sessions/{session_id}/comments",
+        params={"include_pr_comments": "true", **params},
+    )
+    assert response.status_code == 422
