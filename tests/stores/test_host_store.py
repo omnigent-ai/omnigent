@@ -174,6 +174,41 @@ def test_last_session_delete_races_new_binding(
     assert conversations.list_conversations(limit=10).data == []
 
 
+def test_mysql_teardown_observes_binding_committed_after_snapshot(db_uri: str) -> None:
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name != "mysql":
+        pytest.skip("Requires MySQL REPEATABLE READ snapshots")
+    hosts = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="shared-token",
+        provider="modal",
+        sandbox_id="shared-sandbox",
+        token_expires_at=now_epoch() + 1000,
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    first = conversations.create_conversation(host_id=host_id, workspace="/work")
+    admitted = []
+
+    def admit_after_snapshot(connection, cursor, statement, parameters, context, executemany):
+        if "SELECT DISTINCT omnigent_conversation_metadata.host_id" in statement and not admitted:
+            assert connection.get_isolation_level() == "REPEATABLE READ"
+            admitted.append(conversations.create_conversation(host_id=host_id, workspace="/work"))
+
+    event.listen(engine, "after_cursor_execute", admit_after_snapshot)
+    try:
+        assert asyncio.run(conversations.delete_conversation(first.id))
+    finally:
+        event.remove(engine, "after_cursor_execute", admit_after_snapshot)
+    assert len(admitted) == 1
+    assert conversations.get_conversation(admitted[0].id).host_id == host_id
+    assert hosts.get_host(host_id).sandbox_id == "shared-sandbox"
+    assert hosts.resolve_launch_token(host_id, "shared-token") is not None
+
+
 def test_automatic_cleanup_cannot_delete_replacement_generation(
     host_store: HostStore,
 ) -> None:

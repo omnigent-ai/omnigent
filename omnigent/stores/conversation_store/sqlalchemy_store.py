@@ -1976,6 +1976,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
 
     def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
+        value = _prepare_label_updates({PINNED_LABEL_KEY: value})[PINNED_LABEL_KEY]
         source = self.get_conversation(session_id)
         if source is None or source.family_id is None:
             raise OmnigentError("Session has no family", code=ErrorCode.INVALID_INPUT)

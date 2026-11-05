@@ -2623,6 +2623,11 @@ function ConversationList({
         { id: dragged.id, project: dragged.project, isPinned: dragged.isPinned },
         target,
       );
+      if (
+        (action.kind === "move" || action.kind === "ungroup") &&
+        event.active.data.current?.canMoveProject === false
+      )
+        return;
       if (action.kind === "move") {
         moveToProject.mutate({ id: dragged.id, project: action.project });
         // Unpin a pinned session so it actually drops into the folder instead of
@@ -4156,8 +4161,10 @@ function ConversationSection({
   const familyRepresentatives = new Set(
     conversations.filter((row) => row.family?.representative_id === row.id).map((row) => row.id),
   );
+  const isNestedFamilyRow = (row: Conversation) =>
+    isIndentedSibling(row) && familyRepresentatives.has(row.family!.representative_id!);
   const visibleFamilyRows = conversations.filter(
-    (row) => !isIndentedSibling(row) || !row.family || !collapsedFamilies.has(row.family.id),
+    (row) => !isNestedFamilyRow(row) || !collapsedFamilies.has(row.family!.id),
   );
 
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
@@ -4275,10 +4282,7 @@ function ConversationSection({
                 <ConversationRow
                   key={conv.id}
                   conversation={conv}
-                  familyIndented={
-                    isIndentedSibling(conv) &&
-                    familyRepresentatives.has(conv.family!.representative_id!)
-                  }
+                  familyIndented={isNestedFamilyRow(conv)}
                   familyExpanded={
                     conv.family?.representative_id === conv.id &&
                     conversations.some(
@@ -5480,11 +5484,12 @@ function ConversationRowImpl({
       project: currentProject,
       isPinned,
       canManage: isOwner,
+      canMoveProject: !isIndentedSibling(conversation),
       reorderGroup: canReorder ? reorderGroup : undefined,
       reorderIndex,
     },
     disabled:
-      isIndentedSibling(conversation) ||
+      familyIndented ||
       (!isOwner && !gridsEnabled) ||
       selectionMode ||
       isArchived ||

@@ -68,7 +68,7 @@ async function dropOnto(
   targetId: string,
   { expectTarget = true, whileOver = () => {} } = {},
 ) {
-  const source = screen.getByRole("link", { name: sourceId }).closest("li")!;
+  const source = screen.getAllByRole("link", { name: sourceId })[0].closest("li")!;
   const start = rowCenter(sourceId);
   const target = rowCenter(targetId);
   fireEvent.mouseDown(source, { button: 0, ...start });
@@ -124,8 +124,19 @@ describe("dropping an unpinned session onto a pinned row", () => {
       expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_b", pinnedAt: 1002 }]),
     );
     await dropOnto("conv_a", "conv_peer", { expectTarget: false });
+    await dropOnto("conv_peer", "conv_a", { expectTarget: false });
     expect(mocks.pinFn).toHaveBeenCalledOnce();
     expect(mocks.reorderPins).toHaveBeenCalledOnce();
+  });
+
+  it("reorders an individually pinned sibling rendered without its family", async () => {
+    mocks.pinned[0].family = { id: "family", representative_id: "parent", pinned: false };
+    renderSidebar();
+
+    await dropOnto("conv_a", "conv_b");
+
+    expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_a", pinnedAt: 1001 }]);
+    expect(mocks.pinFn).not.toHaveBeenCalled();
   });
 
   it("leaves the existing pins alone when the new pin is rejected (e.g. at the pin cap)", async () => {

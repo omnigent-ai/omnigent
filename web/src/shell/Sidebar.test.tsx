@@ -2066,7 +2066,7 @@ describe("Sidebar sections", () => {
       conv("conv_sibling", "Codex", { family, labels: { "omnigent.pinned": "1" } }),
     ]);
     seedPins(["conv_sibling"]);
-    renderSidebar();
+    const { refresh } = renderSidebar();
 
     const link = screen.getByText("conv_parent").closest("a")!;
     const surface = link.parentElement!;
@@ -2081,6 +2081,25 @@ describe("Sidebar sections", () => {
     expect(
       within(pinnedSection).queryByRole("button", { name: "Collapse session family" }),
     ).toBeNull();
+
+    const setFamilyPinned = (pinned: boolean) => {
+      mockConversations([
+        conv("conv_parent", "Claude Code", { family: { ...family, pinned } }),
+        conv("conv_sibling", "Codex", {
+          family: { ...family, pinned },
+          labels: { "omnigent.pinned": "1" },
+        }),
+      ]);
+      seedPins(pinned ? ["conv_parent", "conv_sibling"] : ["conv_sibling"]);
+      refresh();
+    };
+    setFamilyPinned(true);
+    fireEvent.click(within(pinnedSection).getByRole("button", { name: "Collapse session family" }));
+    expect(within(pinnedSection).queryByText("conv_sibling")).toBeNull();
+    setFamilyPinned(false);
+    expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
+      "data-sibling-session",
+    );
   });
 
   it.each([false, true])(

@@ -1426,8 +1426,15 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
     assert response.status_code == 201, response.text
     sibling_id = response.json()["id"]
     store = SqlAlchemyConversationStore(db_uri)
-    pinned = await auth_client.patch(f"/v1/sessions/{source['id']}", json={"family_pinned": True})
+    pinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}",
+        json={"labels": {"omnigent.pinned": "1" * 300}, "title": "Pinned family"},
+    )
     assert pinned.status_code == 200, pinned.text
+    assert pinned.json()["title"] == "Pinned family"
+    for session_id in (source["id"], sibling_id):
+        snapshot = (await auth_client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot["family"]["pinned_at"] == "1" * 256
     store.set_conversation_project(source["id"], "a" * 32)
     refused = await auth_client.patch(f"/v1/sessions/{sibling_id}", json={"project_id": ""})
     assert refused.status_code == 409, refused.text

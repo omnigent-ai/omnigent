@@ -254,12 +254,20 @@ def host_has_bindings_in_session(session: Session, row: SqlHost) -> bool:
     """Check session and retained-task bindings while holding the host lock."""
     from omnigent.db.enum_codecs import encode_scheduled_task_state
 
+    # Current reads see admissions committed after a MySQL REPEATABLE READ snapshot.
     retained = session.get(
         SqlPreference,
         (current_workspace_id(), "__host_lifecycle__", "retained_sandbox:" + row.host_id),
+        with_for_update=True,
+        populate_existing=True,
     )
     if retained is not None:
-        task = session.get(SqlScheduledTask, (current_workspace_id(), retained.value))
+        task = session.get(
+            SqlScheduledTask,
+            (current_workspace_id(), retained.value),
+            with_for_update=True,
+            populate_existing=True,
+        )
         if task is not None and task.state != encode_scheduled_task_state("deleted"):
             return True
     bound = session.scalar(
@@ -269,6 +277,7 @@ def host_has_bindings_in_session(session: Session, row: SqlHost) -> bool:
             SqlConversationMetadata.host_id == row.host_id,
         )
         .limit(1)
+        .with_for_update()
     )
     return bound is not None
 
