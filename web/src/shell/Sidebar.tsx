@@ -1551,7 +1551,7 @@ function ProjectFolder({
     visibleCount: number,
   ) => void;
 }) {
-  const { registerFolder, sortBy, customOrder } = useSidebarData();
+  const { registerFolder, sortBy, customOrder, applyLocalResolutions } = useSidebarData();
   const viewerId = useViewerId();
   const query = useProjectSessions(name, expanded, sortBy, archived);
   const watchedRows = useMemo(
@@ -1568,8 +1568,10 @@ function ProjectFolder({
     // window, window rows winning: those carry the move overlay
     // (useMoveToProject), so a just-filed session shows here immediately
     // instead of waiting out the PATCH + folder refetch round-trips.
+    // Window rows already carry the answer overlay; only the folder's own rows get it here.
     const byId = new Map<string, Conversation>();
-    for (const c of query.data?.pages.flatMap((page) => page.data) ?? []) byId.set(c.id, c);
+    for (const row of applyLocalResolutions(query.data?.pages.flatMap((page) => page.data) ?? []))
+      byId.set(row.id, row);
     for (const c of windowConversations) byId.set(c.id, c);
     // Pins take precedence over live folders.
     return sortConversations(
@@ -1587,6 +1589,7 @@ function ProjectFolder({
   }, [
     query.data,
     windowConversations,
+    applyLocalResolutions,
     pinnedSet,
     activeOverride,
     frozenSortKeys,
