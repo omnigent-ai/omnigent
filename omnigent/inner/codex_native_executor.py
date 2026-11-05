@@ -103,6 +103,7 @@ _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
+_DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     message="Codex is still compacting, so this message was not delivered.",
@@ -111,7 +112,7 @@ _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     remediation="Wait for compaction to finish, then send your message again.",
 )
 _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
-    message="Codex disconnected while submitting this message. It may already be running.",
+    message="Codex did not confirm this message. It may already be running.",
     code="codex_delivery_unconfirmed",
     title="Codex delivery is unconfirmed",
     remediation="Check the native terminal for the message before sending it again.",
@@ -419,11 +420,16 @@ async def _native_delivery_request_once(
         requested_native_turn_id=requested_turn_id,
     )
     try:
-        response = await client.request(method, params)
+        # Turn input is acknowledged before execution; shell RPCs may await completion.
+        timeout = _DELIVERY_RPC_TIMEOUT_SECONDS if method in {"turn/start", "turn/steer"} else None
+        async with asyncio.timeout(timeout):
+            response = await client.request(method, params)
     except BaseException as exc:
         outcome = "rpc_error"
         if isinstance(exc, asyncio.CancelledError):
             outcome = "cancelled"
+        elif isinstance(exc, TimeoutError):
+            outcome = "timeout"
         elif isinstance(exc, CodexAppServerResponseError) and is_server_draining_error(exc):
             outcome = "rpc_rejected_draining"
         elif isinstance(exc, CodexAppServerResponseError) and is_compaction_steer_refusal(exc):
