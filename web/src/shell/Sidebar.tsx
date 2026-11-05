@@ -3861,11 +3861,7 @@ function ProjectHeaderActions({
                 </DropdownMenuRadioGroup>
               </DropdownMenuSubContent>
             </DropdownMenuSub>
-            <FilterMenuSub
-              label="Sessions per project"
-              value={PROJECT_FOLDER_PAGINATION_LABELS[folderPagination]}
-              testId="project-folder-pagination-menu"
-            >
+            <FilterMenuSub label="Sessions per project" testId="project-folder-pagination-menu">
               <DropdownMenuRadioGroup
                 value={folderPagination}
                 onValueChange={(next) => onFolderPaginationChange(next as ProjectFolderPagination)}

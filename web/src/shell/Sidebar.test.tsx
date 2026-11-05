@@ -2790,26 +2790,27 @@ describe("Sidebar project Show more", () => {
     toggleFolder();
     expect(folderRowIds()).toEqual(filedIds(PROJECT_FOLDER_PAGE_SIZE));
 
-    // The trigger shows the current choice, labelled from the page size.
+    // Like "Sort projects by", the trigger shows only its label; the submenu
+    // marks the current choice, labelled from the page size.
     openProjectsMenu();
     const trigger = screen.getByTestId("project-folder-pagination-menu");
-    expect(within(trigger).getByText("Sessions per project")).toBeInTheDocument();
-    expect(within(trigger).getByText(`First ${PROJECT_FOLDER_PAGE_SIZE}`)).toBeInTheDocument();
+    expect(trigger).toHaveTextContent(/^Sessions per project$/);
     expect(trigger.nextElementSibling).toHaveAttribute("role", "separator");
     fireEvent.keyDown(trigger, { key: "ArrowRight" });
-    expect(screen.getByTestId("project-folder-pagination-first-page")).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
+    const firstPage = screen.getByTestId("project-folder-pagination-first-page");
+    expect(firstPage).toHaveTextContent(`First ${PROJECT_FOLDER_PAGE_SIZE}`);
+    expect(firstPage).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByTestId("project-folder-pagination-all"));
     expect(folderRowIds()).toEqual(filedIds(7));
     expect(screen.queryByTestId("project-show-more")).toBeNull();
     expect(localStorage.getItem("omnigent:project-folder-pagination")).toBe("all");
 
     openProjectsMenu();
-    expect(
-      within(screen.getByTestId("project-folder-pagination-menu")).getByText("All"),
-    ).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByTestId("project-folder-pagination-menu"), { key: "ArrowRight" });
+    expect(screen.getByTestId("project-folder-pagination-all")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     closeProjectsMenu();
     chooseFolderPagination("first-page");
     expect(folderRowIds()).toEqual(filedIds(PROJECT_FOLDER_PAGE_SIZE));
