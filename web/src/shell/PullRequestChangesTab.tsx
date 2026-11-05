@@ -489,30 +489,24 @@ export function PullRequestChangesTab({
     setPathFilter("");
     setHideViewed(false);
     reveal(navigationTarget.path);
-    const container = scrollRef.current;
-    if (!container) return;
-    // Wait for the final placement; loading fallbacks are replaced by inline annotations.
+    // Tabs can mount their content after this effect; diff slots also settle asynchronously.
     let frame = 0;
     const focusComment = () => {
-      const element = container.querySelector<HTMLElement>(
+      const element = scrollRef.current?.querySelector<HTMLElement>(
         `[data-local-review-comment="${CSS.escape(navigationTarget.id)}"]`,
       );
-      if (!element || !element.getClientRects().length) return;
-      element.scrollIntoView({ block: "center" });
-      element.focus({ preventScroll: true });
-      observer.disconnect();
-      consumeLocalReviewNavigation(conversationId);
-    };
-    const observer = new MutationObserver(() => {
-      cancelAnimationFrame(frame);
+      if (element?.getClientRects().length) {
+        element.focus({ preventScroll: true });
+        if ((element.getRootNode() as Document | ShadowRoot).activeElement === element) {
+          element.scrollIntoView({ block: "center" });
+          consumeLocalReviewNavigation(conversationId);
+          return;
+        }
+      }
       frame = requestAnimationFrame(focusComment);
-    });
-    observer.observe(container, { childList: true, subtree: true, attributes: true });
-    frame = requestAnimationFrame(focusComment);
-    return () => {
-      observer.disconnect();
-      cancelAnimationFrame(frame);
     };
+    frame = requestAnimationFrame(focusComment);
+    return () => cancelAnimationFrame(frame);
   }, [
     changes.isLoading,
     changes.isFetching,

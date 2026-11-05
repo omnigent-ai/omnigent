@@ -134,6 +134,7 @@ function renderTab({
   threads = [],
   listing = {},
   loading = false,
+  selected = true,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
@@ -142,9 +143,11 @@ function renderTab({
   /** Changed-file list fields beyond the file array, such as truncation. */
   listing?: { has_more?: boolean; total_count?: number | null };
   loading?: boolean;
+  selected?: boolean;
 }) {
   const prUrl = prUrlFor(conversationId);
   let patchLoading = loading;
+  let tabSelected = selected;
   const tabProps = (current: string) =>
     ({
       conversationId,
@@ -156,7 +159,7 @@ function renderTab({
       pr: { url: prUrl, head_sha: "head", base_sha: "base", state: "OPEN" },
       prUrl,
       canEdit: false,
-      selected: true,
+      selected: tabSelected,
       changes: { data: { available: true, data: files, ...listing } },
       prDiff: {
         data: { head_sha: "head", base_sha: "base", patch: current },
@@ -172,7 +175,7 @@ function renderTab({
     }) as unknown as React.ComponentProps<typeof PullRequestChangesTab>;
   const element = (current: string) => (
     <TooltipProvider>
-      <Tabs value="changes">
+      <Tabs value={tabSelected ? "changes" : "summary"}>
         <PullRequestChangesTab {...tabProps(current)} />
       </Tabs>
     </TooltipProvider>
@@ -181,6 +184,7 @@ function renderTab({
   return {
     rerender: (next: string, pending = false) => {
       patchLoading = pending;
+      tabSelected = true;
       result.rerender(element(next));
     },
   };
@@ -208,46 +212,51 @@ describe("PullRequestChangesTab", () => {
     vi.unstubAllGlobals();
   });
 
-  it("waits for the patch before focusing a comment that moves from fallback to inline", async () => {
-    const conversationId = "local-comment-loading";
-    const comment = {
-      id: "local-comment",
-      conversation_id: conversationId,
-      path: "b.ts",
-      body: "Review this line",
-      status: "draft",
-      anchor_metadata: {
-        pr_url: prUrlFor(conversationId),
-        side: "RIGHT",
-        line: 2,
-        start_line: null,
-        head_sha: "head",
-        base_sha: "base",
-      },
-    } as Comment;
-    comments.data = [comment];
-    vi.spyOn(Element.prototype, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
-    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
-    const navigation = renderHook(() => useLocalReviewNavigation(conversationId));
-    const tab = renderTab({ conversationId, patch: "", loading: true });
-    vi.useFakeTimers();
-    try {
-      act(() => requestLocalReviewNavigation(comment));
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(100);
-      });
-      expect(navigation.result.current).toBe(comment);
-      expect(scroll).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-    }
-    tab.rerender(PATCH);
-    await waitFor(() =>
-      expect(diffOf("b.ts")?.querySelector("[data-local-review-comment]")).toHaveFocus(),
-    );
-    expect(navigation.result.current).toBeUndefined();
-    consumeLocalReviewNavigation(conversationId);
-  });
+  it.each([true, false])(
+    "waits for the patch, tab mount, and accepted focus (initially selected: %s)",
+    async (selected) => {
+      const conversationId = "local-comment-loading";
+      const comment = {
+        id: "local-comment",
+        conversation_id: conversationId,
+        path: "b.ts",
+        body: "Review this line",
+        status: "draft",
+        anchor_metadata: {
+          pr_url: prUrlFor(conversationId),
+          side: "RIGHT",
+          line: 2,
+          start_line: null,
+          head_sha: "head",
+          base_sha: "base",
+        },
+      } as Comment;
+      comments.data = [comment];
+      vi.spyOn(Element.prototype, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+      const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+      const navigation = renderHook(() => useLocalReviewNavigation(conversationId));
+      const tab = renderTab({ conversationId, patch: "", loading: true, selected });
+      vi.useFakeTimers();
+      try {
+        act(() => requestLocalReviewNavigation(comment));
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+        expect(navigation.result.current).toBe(comment);
+        expect(scroll).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+      const focus = vi.spyOn(HTMLElement.prototype, "focus").mockImplementationOnce(() => {});
+      tab.rerender(PATCH);
+      await waitFor(() =>
+        expect(diffOf("b.ts")?.querySelector("[data-local-review-comment]")).toHaveFocus(),
+      );
+      await waitFor(() => expect(navigation.result.current).toBeUndefined());
+      expect(focus.mock.calls.length).toBeGreaterThan(1);
+      consumeLocalReviewNavigation(conversationId);
+    },
+  );
 
   it("clears the path filter to navigate to a thread on a filtered-out file", () => {
     const conversationId = "changes-tab-nav";
