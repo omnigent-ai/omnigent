@@ -1586,10 +1586,13 @@ def test_multi_repo_parent_preserves_head_changes_and_recovers_without_hooks(
 
     # Existing fallback events must neither override Git nor omit loose-file edits.
     registry.seed_snapshot("alpha/same.txt", "wrong original", session_id="session")
+    # Git owns the listing for repository paths, so writers skip the revert read there.
+    assert not registry.can_detect_revert("alpha/same.txt", session_id="session")
     registry.record_change("alpha/same.txt", "created", "session")
     registry.record_change("alpha/phantom.txt", "modified", "session")
     (tmp_path / "notes.txt").write_text("after")
     registry.seed_snapshot("notes.txt", "before", session_id="session")
+    assert registry.can_detect_revert("notes.txt", session_id="session")
     registry.record_change("notes.txt", "modified", "session")
     assert {r["path"]: r["status"] for r in reader.list_changed_files("session", limit=100)} == {
         **expected,

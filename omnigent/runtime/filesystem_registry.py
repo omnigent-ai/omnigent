@@ -1538,6 +1538,9 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
     def needs_snapshot(self, path: str) -> bool:
         return self._owner(path) is None and super().needs_snapshot(path)
 
+    def can_detect_revert(self, path: str, *, session_id: str) -> bool:
+        return self._owner(path) is None and super().can_detect_revert(path, session_id=session_id)
+
     def with_git_runner(self, run_git: GitCommandRunner) -> MultiRepositoryFilesystemRegistry:
         """Bind one request's executor while sharing the existing fallback history."""
         reader = copy.copy(self)
