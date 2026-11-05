@@ -1332,8 +1332,8 @@ def _user_message(text: str, response_id: str = "codex_turn_1") -> dict[str, Any
     }
 
 
-@pytest.mark.parametrize("compacted", [False, True])
-def test_rollout_records_bound_aggregate_completed_arguments(compacted: bool) -> None:
+@pytest.mark.parametrize("compaction", ["none", "snapshot", "carried_call"])
+def test_rollout_records_bound_aggregate_completed_arguments(compaction: str) -> None:
     """Many individually valid calls must not make a rebuilt request exceed 32 MiB."""
     arguments = '{"cmd":"' + "x" * 899_980 + '"}'
     items = [
@@ -1344,7 +1344,7 @@ def test_rollout_records_bound_aggregate_completed_arguments(compacted: bool) ->
             _tool_output(f"call_{index}"),
         )
     ]
-    if compacted:
+    if compaction == "snapshot":
         superseded = [{"type": [], "call_id": "call_superseded"}]
         items = [
             {"type": "compaction", "compacted_messages": superseded},
@@ -1352,6 +1352,11 @@ def test_rollout_records_bound_aggregate_completed_arguments(compacted: bool) ->
             {"type": "compaction", "compacted_messages": items[:40]},
             *items[40:],
         ]
+    elif compaction == "carried_call":
+        # call_0 finishes after a summary-only snapshot, so conversion carries it as the oldest.
+        items.insert(
+            1, {"type": "compaction", "compacted_messages": [_user_message("Earlier work")]}
+        )
     items.append(_user_message('Keep my current input exactly: 界\\"', "codex_turn_2"))
     original = deepcopy(items)
     records = codex_native._codex_rollout_records_from_session_items(
