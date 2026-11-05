@@ -896,3 +896,65 @@ def test_side_request_claim_has_one_owner_and_preserves_storage_limit(
         side_chat.request_side_chat(tmp_path, "new question", parent_state=parent_bridge)
     [retained] = list((tmp_path / "side_chat_failed").glob("*.json"))
     assert json.loads(retained.read_text())["question"] == "original"
+
+
+@pytest.mark.parametrize("transition", ["claim", "failure", "completion"])
+def test_side_publication_and_transitions_share_quota_lock(
+    tmp_path: Path,
+    parent_bridge: CodexNativeBridgeState,
+    monkeypatch: pytest.MonkeyPatch,
+    transition: str,
+) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+
+    from omnigent.harnesses.codex_native import bridge
+    from omnigent.inner import native_attachments
+
+    side_chat.request_side_chat(tmp_path, "original", parent_state=parent_bridge)
+    [request] = side_chat.peek_side_chat_requests(tmp_path)
+    counted, release, transition_waiting = threading.Event(), threading.Event(), threading.Event()
+    original_stat, original_lock = Path.stat, bridge._bridge_state_lock
+    monkeypatch.setattr(native_attachments, "MAX_SESSION_FILESYSTEM_ATTACHMENTS", 2)
+
+    def gated_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == request.path and threading.current_thread().name.startswith("side-publisher"):
+            counted.set()
+            assert release.wait(5)
+        return original_stat(path, *args, **kwargs)
+
+    @contextmanager
+    def observed_lock(*args: Any, **kwargs: Any):
+        if threading.current_thread().name.startswith("side-transition"):
+            transition_waiting.set()
+        with original_lock(*args, **kwargs):
+            yield
+
+    def move_record() -> None:
+        if transition == "claim":
+            assert side_chat.claim_side_chat_request(request) is not None
+        elif transition == "failure":
+            side_chat.fail_side_chat_request(request, "synthetic refusal", undelivered=True)
+        else:
+            side_chat.discard_side_chat_request(request.path)
+
+    monkeypatch.setattr(Path, "stat", gated_stat)
+    monkeypatch.setattr(bridge, "_bridge_state_lock", observed_lock)
+    with (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="side-publisher") as publisher,
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="side-transition") as mover,
+    ):
+        publishing = publisher.submit(side_chat.request_side_chat, tmp_path, "new question")
+        try:
+            assert counted.wait(5)
+            moving = mover.submit(move_record)
+            assert transition_waiting.wait(2), "queue transitions must join the publisher's lock"
+            assert not moving.done()
+        finally:
+            release.set()
+        publishing.result(timeout=5)
+        moving.result(timeout=5)
+    assert [row.question for row in side_chat.peek_side_chat_requests(tmp_path)] == [
+        "new question"
+    ]

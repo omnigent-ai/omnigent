@@ -625,21 +625,24 @@ class SideChatRequest(NamedTuple):
 
 def fail_side_chat_request(request: SideChatRequest, reason: str, *, undelivered: bool) -> None:
     """Retain failed input outside the active queue; uncertain requests never replay."""
-    failed_dir = request.path.parent.parent / _SIDE_FAILED_DIRNAME
-    failed_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    retained = failed_dir / request.path.name
-    try:
-        os.link(request.path, retained, follow_symlinks=False)
-    except FileExistsError:
-        return
-    _unlink_quietly(request.path)
-    metadata = retained.with_suffix(".failure")
-    temporary = metadata.with_suffix(".tmp")
-    try:
-        temporary.write_text(json.dumps({"undelivered": undelivered, "reason": reason[:500]}))
-        temporary.replace(metadata)
-    finally:
-        _unlink_quietly(temporary)
+    from omnigent.harnesses.codex_native.bridge import _bridge_state_lock
+
+    with _bridge_state_lock(request.path.parent.parent, "side_chat_requests.lock"):
+        failed_dir = request.path.parent.parent / _SIDE_FAILED_DIRNAME
+        failed_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        retained = failed_dir / request.path.name
+        try:
+            os.link(request.path, retained, follow_symlinks=False)
+        except (FileExistsError, FileNotFoundError):
+            return
+        _unlink_quietly(request.path)
+        metadata = retained.with_suffix(".failure")
+        temporary = metadata.with_suffix(".tmp")
+        try:
+            temporary.write_text(json.dumps({"undelivered": undelivered, "reason": reason[:500]}))
+            temporary.replace(metadata)
+        finally:
+            _unlink_quietly(temporary)
 
 
 def peek_side_chat_requests(bridge_dir: Path) -> list[SideChatRequest]:
@@ -666,20 +669,26 @@ def peek_side_chat_requests(bridge_dir: Path) -> list[SideChatRequest]:
 
 def claim_side_chat_request(request: SideChatRequest) -> SideChatRequest | None:
     """Exclusively claim work across forwarders; crashes leave a non-replayable record."""
-    claimed_dir = request.path.parent.parent / _SIDE_CLAIMED_DIRNAME
-    claimed_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    claimed = claimed_dir / request.path.name
-    try:
-        os.link(request.path, claimed, follow_symlinks=False)
-    except (FileExistsError, FileNotFoundError):
-        return None
-    _unlink_quietly(request.path)
-    return request._replace(path=claimed)
+    from omnigent.harnesses.codex_native.bridge import _bridge_state_lock
+
+    with _bridge_state_lock(request.path.parent.parent, "side_chat_requests.lock"):
+        claimed_dir = request.path.parent.parent / _SIDE_CLAIMED_DIRNAME
+        claimed_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        claimed = claimed_dir / request.path.name
+        try:
+            os.link(request.path, claimed, follow_symlinks=False)
+        except (FileExistsError, FileNotFoundError):
+            return None
+        _unlink_quietly(request.path)
+        return request._replace(path=claimed)
 
 
 def discard_side_chat_request(path: Path) -> None:
-    """Remove a successfully handled side request; best effort."""
-    _unlink_quietly(path)
+    """Remove a successfully handled side request without racing quota accounting."""
+    from omnigent.harnesses.codex_native.bridge import _bridge_state_lock
+
+    with _bridge_state_lock(path.parent.parent, "side_chat_requests.lock"):
+        _unlink_quietly(path)
 
 
 def _unlink_quietly(path: Path) -> None:
