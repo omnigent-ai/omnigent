@@ -3343,6 +3343,8 @@ def _resume_turn_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
+        if status == "running" and _is_completed_automatic_input_source(bridge_dir, turn_id):
+            return None
         if (
             state.automatic_input_turn_id == turn_id
             and state.automatic_input_outcome in {"completed", "cancel_completed"}
@@ -3528,6 +3530,10 @@ async def _handle_event(
             event_bridge_dir = None
         elif control is not None:
             observed_turn = _terminal_turn_id_from_params(params)
+            if _is_completed_automatic_input_source(bridge_dir, observed_turn) and (
+                method == "turn/started" or method in _CODEX_STREAMING_DELTA_METHODS
+            ):
+                return
             automatic_turn = control.automatic_input_turn_id
             if automatic_turn is not None and observed_turn == automatic_turn:
                 if control.automatic_input_outcome in {"completed", "cancel_completed"}:
@@ -4231,6 +4237,25 @@ def _is_recovered_output_limit_source(bridge_dir: Path | None, turn_id: str | No
     )
 
 
+def _is_completed_automatic_input_source(bridge_dir: Path | None, turn_id: str | None) -> bool:
+    """The durable claim proves source completion before delivery is known."""
+    if bridge_dir is None or turn_id is None:
+        return False
+    state = read_bridge_state(bridge_dir)
+    return bool(
+        state is not None
+        and state.automatic_input_source_turn_id == turn_id
+        and state.automatic_input_client_message_id
+        and state.automatic_input_owner_scope
+        == (
+            state.session_id,
+            state.thread_id,
+            state.socket_path,
+            state.codex_home,
+        )
+    )
+
+
 async def _present_output_limit_error(
     client: httpx.AsyncClient, session_id: str, turn_id: str, error: _CodexTerminalError
 ) -> None:
@@ -4689,6 +4714,12 @@ async def _maybe_handle_turn_event(
                         "Codex forwarder ignored duplicate terminal error: turn_id=%s",
                         turn_id,
                     )
+                    return True
+                if _is_completed_automatic_input_source(bridge_dir, turn_id):
+                    assert turn_id is not None
+                    forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+                    forwarder_state.presented_output_limit_error_turns.add(turn_id)
+                    await _present_output_limit_error(client, session_id, turn_id, error)
                     return True
                 if (
                     bridge_dir is not None

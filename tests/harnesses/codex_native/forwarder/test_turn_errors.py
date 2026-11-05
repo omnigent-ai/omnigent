@@ -2047,3 +2047,78 @@ async def test_output_limit_status_publication_checks_final_generation(
         if change == "aba" or (change == "stop" and native_status != "inProgress")
         else "turn_auto"
     )
+
+
+@pytest.mark.parametrize("outcome", [None, "uncertain"])
+@pytest.mark.parametrize("activity", ["resume", "start", "delta"])
+async def test_output_limit_claim_retires_completed_source_before_receipt_after_restart(
+    tmp_path: Path,
+    outcome: str | None,
+    activity: str,
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import claim_codex_automatic_input
+
+    client, codex = _RecordingClient(), _ContinuingCodexClient()
+    _seed_active_turn(tmp_path, "turn_a")
+    claim = claim_codex_automatic_input(
+        tmp_path, read_bridge_state(tmp_path), client_message_id="exact"
+    )
+    assert claim is not None
+    if outcome is not None:
+        assert fwd.settle_codex_automatic_input(tmp_path, expected=claim, outcome=outcome)
+    restarted = fwd._CodexForwarderState()
+    if activity == "resume":
+        await fwd._replay_resume_response(
+            client,
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            response={
+                "result": {
+                    "thread": {
+                        "id": "thread_123",
+                        "turns": [
+                            {
+                                "id": "turn_a",
+                                "status": "inProgress",
+                                "items": [],
+                            }
+                        ],
+                    }
+                }
+            },
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            forwarder_state=restarted,
+            codex_client=codex,
+        )
+    else:
+        params = {"threadId": "thread_123", "turnId": "turn_a"}
+        if activity == "start":
+            params["turn"] = {"id": "turn_a"}
+            method = "turn/started"
+        else:
+            params.update(itemId="old-text", delta="stale source text")
+            method = "item/agentMessage/delta"
+        await _forward_output_limit_event(client, codex, restarted, tmp_path, method, params)
+    owner = read_bridge_state(tmp_path)
+    assert owner.active_turn_id is None
+    assert owner.automatic_input_turn_id is None
+    assert owner.automatic_input_outcome == outcome
+    assert codex.requests == []
+    assert not any(body["type"] == "external_session_status" for _, body in client.posts)
+    await _forward_output_limit_event(
+        client,
+        codex,
+        restarted,
+        tmp_path,
+        "error",
+        {
+            "threadId": "thread_123",
+            "turnId": "turn_a",
+            "willRetry": False,
+            "error": _OUTPUT_LIMIT_ERROR,
+        },
+    )
+    assert any(_OUTPUT_LIMIT_ERROR["message"] in json.dumps(body) for _, body in client.posts)
+    assert not any(body["type"] == "external_session_status" for _, body in client.posts)
+    assert codex.requests == []
