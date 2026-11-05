@@ -1196,6 +1196,8 @@ its discoverability.
   Use the row chevron to **Collapse session family** or **Expand session family**.
 - Opening a saved **Add nested agent** link on an older server shows an update
   message instead of a composer that cannot submit.
+- If the source disappears after a rejected create, **Continue in a new session**
+  carries the recovered prompt and attachments into the ordinary composer.
 - Sandbox expiry and explicit whole-host destruction remain separate from
   deleting one session. Shared compute means a shared filesystem, not history.
 

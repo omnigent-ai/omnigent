@@ -528,9 +528,13 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
-  it.each(["canvas=proj_alpha&project=Alpha", "sibling=source"])(
-    "keeps the composer scope and draft after a temporary create fails: %s",
-    async (query) => {
+  it.each([
+    { query: "canvas=proj_alpha&project=Alpha", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: true },
+  ])(
+    "keeps the composer draft after a temporary create fails: $query, sourceDeleted=$sourceDeleted",
+    async ({ query, sourceDeleted }) => {
       searchParams = new URLSearchParams(query);
       projects = [{ id: "proj_alpha", name: "Alpha" }];
       const previousUrl = window.location.href;
@@ -544,8 +548,12 @@ describe("NewChatLandingScreen create flow", () => {
       });
       removeLocalConversationMock.mockReturnValue(true);
       let resolveCreate!: (response: Response) => void;
+      let sourceUnavailable = false;
       vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
         if (String(url).startsWith("/v1/sessions/source?")) {
+          if (sourceUnavailable) {
+            return new Response(JSON.stringify({ detail: "Not found" }), { status: 404 });
+          }
           return new Response(
             JSON.stringify({
               id: "source",
@@ -574,6 +582,7 @@ describe("NewChatLandingScreen create flow", () => {
         fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
         await waitFor(() => expect(resolveCreate).toBeDefined());
         cleanup();
+        sourceUnavailable = sourceDeleted;
         await act(async () => {
           resolveCreate(
             new Response(JSON.stringify({ detail: "Source unavailable" }), { status: 403 }),
@@ -584,6 +593,14 @@ describe("NewChatLandingScreen create flow", () => {
         );
         searchParams = new URLSearchParams(window.location.search);
         renderLanding([], info);
+        if (sourceDeleted) {
+          expect(await screen.findByText("Source session is unavailable.")).toBeVisible();
+          fireEvent.click(screen.getByRole("button", { name: "Continue in a new session" }));
+          cleanup();
+          searchParams = new URLSearchParams(window.location.search);
+          expect(searchParams.has("sibling")).toBe(false);
+          renderLanding([], info);
+        }
         await waitForWorkspaceSeed();
         expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this scoped draft");
         expect(screen.getByText("notes.txt")).toBeVisible();

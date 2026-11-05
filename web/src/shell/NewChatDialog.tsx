@@ -396,6 +396,7 @@ import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDra
 import {
   NEW_SESSION_HANDOFF_PARAM,
   forgetNewSessionHandoff,
+  newSessionLocation,
   peekNewSessionHandoff,
 } from "@/lib/newSessionHandoff";
 
@@ -2162,6 +2163,7 @@ function NewChatWorkspaceControls({
 
 export function NewChatLandingScreen() {
   const [params] = useSearchParams();
+  const navigate = useNavigate();
   const siblingSourceId = params.get("sibling");
   const info = useServerInfo();
   const supportsNested = info !== "loading" && info.sibling_sessions === true;
@@ -2184,8 +2186,17 @@ export function NewChatLandingScreen() {
     );
   if (siblingSourceId && source.isError)
     return (
-      <div role="alert" className="p-6">
-        Source session is unavailable.
+      <div role="alert" className="space-y-3 p-6">
+        <p>Source session is unavailable.</p>
+        <Button
+          variant="outline"
+          onClick={() => {
+            const draft = landingDrafts.get(siblingSourceId)?.draft;
+            navigate(draft ? newSessionLocation(draft.message, draft.files) : "/");
+          }}
+        >
+          Continue in a new session
+        </Button>
       </div>
     );
   return (
