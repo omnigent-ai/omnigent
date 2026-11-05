@@ -4012,8 +4012,8 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
 async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A relay outlives no CLI: a turn cancelled mid-reconnect evicts its client and one
-    whose CLI fails to connect never keeps it."""
+    """A relay outlives no CLI: a turn cancelled mid-reconnect evicts its client, one
+    whose CLI fails to connect never keeps it, and one that fails to start leaves nothing."""
     from omnigent.harnesses.claude_native import bridge
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
@@ -4078,6 +4078,28 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         assert failed is not first
         assert "managed" not in executor._clients
         assert not relay_dir(failed).exists()
+
+        # A relay that cannot start leaves no bridge directory and starts no CLI.
+        fail_connect = False
+        allocated: list[Path] = []
+        prepare = bridge.prepare_acp_mcp_bridge_dir
+
+        def record_allocation() -> Path:
+            allocated.append(prepare())
+            return allocated[-1]
+
+        def refuse_to_start(**_kwargs: object) -> object:
+            raise OSError("no port for the relay")
+
+        monkeypatch.setattr(bridge, "prepare_acp_mcp_bridge_dir", record_allocation)
+        monkeypatch.setattr(bridge, "start_tool_relay", refuse_to_start)
+        clients_before = len(fake_sdk.created_clients)
+        with pytest.raises(OSError, match="no port for the relay"):
+            [event async for event in executor.run_turn(messages, tools, "")]
+        assert len(fake_sdk.created_clients) == clients_before
+        assert "managed" not in executor._clients
+        assert len(allocated) == 1
+        assert not allocated[0].exists()
 
 
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
