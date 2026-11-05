@@ -3219,7 +3219,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   it.each([
     ["arclet", true],
     ["modal", false],
-  ])("on a %s sandbox, hides the tools warning: %s", (provider, hidden) => {
+  ])("on a %s sandbox, hides the tools warning: %s", async (provider, hidden) => {
     renderTrigger("jira", {
       managed_sandboxes_enabled: true,
       sandbox_provider: provider,
@@ -3229,6 +3229,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(host);
     fireEvent.click(screen.getByRole("option", { name: "laptop" }));
+    // Radix Select commits its choice asynchronously, so wait until the host
+    // trigger reflects it before asserting on the tools warning below.
+    await waitFor(() => expect(host).toHaveTextContent("laptop"));
     // On a connected host the agent may lack the tools, so the warning shows.
     expect(showWarnings().getByTestId("task-trigger-tools-note")).toBeInTheDocument();
     fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
