@@ -55,7 +55,7 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
 
-# Recovery renews every 20 seconds; tolerate three missed renewals.
+# Expire recovery ownership after a minute without renewal.
 _MANAGED_RECOVERY_LEASE_S = 60
 
 

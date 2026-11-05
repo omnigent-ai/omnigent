@@ -2375,4 +2375,5 @@ async def test_deleted_automation_session_retains_reusable_sandbox(
     assert host_store.delete_host(host_id, keep_if_bound=True) is None
     assert host_store.get_host(host_id) is not None
     tasks.delete(task.id)
-    assert host_store.delete_host(host_id, keep_if_bound=True) is not None
+    retained_host = host_store.get_host(host_id, include_deleted=True)
+    assert retained_host is not None and retained_host.deleted_at is not None
