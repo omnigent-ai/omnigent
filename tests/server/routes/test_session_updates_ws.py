@@ -863,6 +863,68 @@ def test_runner_reported_pull_requests_are_stored_without_a_read(
     assert client.get(f"/v1/sessions/{sid}/pull-requests", headers=headers).json()["data"] == []
 
 
+def test_pull_requests_a_side_chat_reports_are_linked_to_its_editable_sources(
+    app: FastAPI, stores, db_uri: str
+) -> None:
+    """A nested side chat's PR reaches each source it forked from, not one it only views."""
+    from omnigent.stores.conversation_store import (
+        SIDE_CHAT_LABEL_KEY,
+        SIDE_CHAT_SOURCE_LABEL_KEY,
+    )
+
+    conversation_store, _, permission_store = stores
+    root = _seed_session(stores, owner=ALICE, title="main chat")
+    permission_store.grant(BOB, root, LEVEL_READ)
+
+    def side_chat(source_id: str, owner: str) -> str:
+        child = conversation_store.create_conversation(
+            title="side chat",
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source_id},
+        )
+        permission_store.ensure_user(owner)
+        permission_store.grant(owner, child.id, LEVEL_OWNER)
+        return child.id
+
+    side = side_chat(root, ALICE)
+    nested = side_chat(side, ALICE)
+    viewer_side = side_chat(root, BOB)
+
+    def report(session_id: str, user: str, number: int) -> str:
+        url = f"https://github.com/example/one/pull/{number}"
+        entry = {
+            "url": url,
+            "provider": "github",
+            "host": "github.com",
+            "repository": "example/one",
+            "number": number,
+            "relationship": "created",
+            "first_seen_at": 1.0,
+            "last_seen_at": 1.0,
+        }
+        response = TestClient(app).post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "external_pull_requests", "data": {"prs": [entry]}},
+            headers={"X-Forwarded-Email": user},
+        )
+        assert response.status_code == 202, response.text
+        return url
+
+    def linked(session_id: str, user: str) -> list[str]:
+        response = TestClient(app).get(
+            f"/v1/sessions/{session_id}/pull-requests", headers={"X-Forwarded-Email": user}
+        )
+        return [pr["url"] for pr in response.json()["data"]]
+
+    opened = report(nested, ALICE, 7)
+    viewer_opened = report(viewer_side, BOB, 8)
+
+    assert linked(nested, ALICE) == [opened]
+    assert linked(side, ALICE) == [opened]
+    assert linked(root, ALICE) == [opened]
+    assert linked(viewer_side, BOB) == [viewer_opened]
+
+
 def test_listed_sessions_that_need_it_are_refreshed_in_the_background(
     stores, liveness_state, comment_store, db_uri: str
 ) -> None:

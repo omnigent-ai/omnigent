@@ -310,6 +310,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
@@ -373,6 +374,8 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
 # A host that confirmed the spawn has a runner process that may still be
 # booting (slow imports on a busy machine), so it earns a longer connect wait.
 _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR = 2.0
+# Bounds the side-chat source walk; nested side chats rarely go past a few levels.
+_MAX_SIDE_CHAT_SOURCE_DEPTH = 16
 
 
 def _relaunch_connect_timeout_s(*, acknowledged: bool) -> float:
@@ -1062,21 +1065,58 @@ def register_events_routes(
 
     pull_request_store = server_prs.open_store(conversation_store)
 
-    async def _store_reported_pull_requests(session_id: str, body: SessionEventInput) -> None:
-        """Merge the PRs a runner discovered; the runner retries until this succeeds."""
+    async def _editable_side_chat_sources(user_id: str | None, conv: Conversation) -> list[str]:
+        """Return the sessions a side chat was forked from, nearest first.
+
+        Stops at the first source the reporter cannot edit, since a side chat
+        needs only read access to its source.
+        """
+        sources: list[str] = []
+        visited = {conv.id}
+        current = conv
+        while len(sources) < _MAX_SIDE_CHAT_SOURCE_DEPTH:
+            labels = current.labels or {}
+            source_id = labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            if labels.get(SIDE_CHAT_LABEL_KEY) != "1" or not source_id or source_id in visited:
+                break
+            visited.add(source_id)
+            try:
+                access = await _require_access_and_level(
+                    user_id, source_id, LEVEL_EDIT, permission_store, conversation_store
+                )
+            except OmnigentError:
+                break
+            source = access.conversation or await asyncio.to_thread(
+                conversation_store.get_conversation, source_id
+            )
+            if source is None:
+                break
+            sources.append(source_id)
+            current = source
+        return sources
+
+    async def _store_reported_pull_requests(
+        session_id: str, conv: Conversation, user_id: str | None, body: SessionEventInput
+    ) -> None:
+        """Merge the PRs a runner discovered; the runner retries until this succeeds.
+
+        A side chat's PRs are also linked to the sessions it was forked from.
+        """
         if pull_request_store is None:
             return
         reports = server_prs.parse_reports(body.data.get("prs"))
         if not reports:
             return
-        try:
-            await asyncio.to_thread(pull_request_store.apply_report, session_id, reports)
-        except UnreadablePullRequestsError:  # Retrying cannot help.
-            _logger.warning(
-                "Ignoring reported pull requests for an unreadable document",
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
+        targets = [session_id, *await _editable_side_chat_sources(user_id, conv)]
+        for target_id in targets:
+            try:
+                await asyncio.to_thread(pull_request_store.apply_report, target_id, reports)
+            except UnreadablePullRequestsError:  # Retrying cannot help.
+                _logger.warning(
+                    "Ignoring reported pull requests for an unreadable document",
+                    exc_info=True,
+                    extra={"session_id": target_id},
+                )
 
     async def _post_event_impl(
         request: Request | _RunnerEventContext | StartupInputContext,
@@ -2619,7 +2659,7 @@ def register_events_routes(
             _publish_mcp_startup(session_id, mcp_servers)
             return {"queued": False}
         if body.type == _EXTERNAL_PULL_REQUESTS_TYPE:
-            await _store_reported_pull_requests(session_id, body)
+            await _store_reported_pull_requests(session_id, conv, user_id, body)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
             # Persist the harness-reported cumulative usage so the
