@@ -626,6 +626,43 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
 });
 
 describe("NewChatLandingScreen nested agent creation", () => {
+  it.each(["", "Nested task"])(
+    "preserves drafts across composer scopes: %s",
+    async (nestedText) => {
+      vi.mocked(getSessionSlim).mockImplementation(async (id) => ({ ...SOURCE_SESSION, id }));
+      const drafts = [
+        { source: null, text: "Standalone task", file: "standalone.txt" },
+        { source: "first", text: nestedText, file: nestedText ? "first.txt" : null },
+        { source: "second", text: "Another nested task", file: "second.txt" },
+      ];
+      for (const draft of drafts) {
+        searchParams = new URLSearchParams(draft.source ? `sibling=${draft.source}` : "");
+        renderLanding({ sibling_sessions: true });
+        // oxlint-disable-next-line no-await-in-loop -- Each visit must unmount before the next.
+        const input = await screen.findByTestId("new-chat-landing-input");
+        expect(input).toHaveValue("");
+        fireEvent.change(input, { target: { value: draft.text } });
+        if (draft.file) {
+          fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+            target: { files: [new File(["notes"], draft.file, { type: "text/plain" })] },
+          });
+        }
+        cleanup();
+      }
+      for (const draft of drafts) {
+        searchParams = new URLSearchParams(draft.source ? `sibling=${draft.source}` : "");
+        renderLanding({ sibling_sessions: true });
+        // oxlint-disable-next-line no-await-in-loop -- Each visit must unmount before the next.
+        expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(draft.text);
+        for (const other of drafts) {
+          if (!other.file) continue;
+          expect(screen.queryByText(other.file) !== null).toBe(other === draft);
+        }
+        cleanup();
+      }
+    },
+  );
+
   it("keeps the ordinary host preference when explicitly selecting the source sandbox", async () => {
     const regular = host({ host_id: "regular", name: "Regular host" });
     const sandbox = host({ sandbox_provider: "modal" });

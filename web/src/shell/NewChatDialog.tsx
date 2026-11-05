@@ -2083,12 +2083,9 @@ export function AgentHarnessPicker({
   );
 }
 
-// In-memory draft for the new-session landing screen, so a half-composed
-// message, attachments and picker selections survive the unmount that happens
-// when the user navigates into an existing session and back. Module-scoped,
-// not persisted to storage (a page refresh starts clean); cleared on create.
+// Drafts survive navigation within this page load, with one slot per source.
+// Successful creation clears only its slot; a page refresh starts clean.
 interface LandingDraft {
-  siblingSourceId?: string | null;
   mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
@@ -2124,20 +2121,23 @@ interface LandingDraft {
   workspaceFromConfig: boolean;
 }
 
-let landingDraft: LandingDraft | null = null;
-let landingDraftRevision = 0;
 const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed";
+interface LandingDraftState {
+  draft: LandingDraft | null;
+  revision: number;
+}
+const landingDrafts = new Map<string | null, LandingDraftState>();
 
-function writeLandingDraft(draft: LandingDraft | null): void {
-  landingDraft = draft;
-  landingDraftRevision += 1;
+function writeLandingDraft(state: LandingDraftState, draft: LandingDraft | null): void {
+  state.draft = draft;
+  state.revision += 1;
 }
 
 // Test-only: clears the preserved landing draft so each case starts from a
 // clean module state (the draft is module-scoped and survives unmount by
 // design, which would otherwise leak between tests).
 export function resetLandingDraft(): void {
-  writeLandingDraft(null);
+  landingDrafts.clear();
 }
 
 function NewChatWorkspaceControls({
@@ -2204,6 +2204,12 @@ function NewChatLandingContent({
   siblingSourceId: string | null;
   siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
 }) {
+  const [draftState] = useState(() => {
+    const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
+    landingDrafts.set(siblingSourceId, state);
+    return state;
+  });
+  const landingDraft = draftState.draft;
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -2406,29 +2412,27 @@ function NewChatLandingContent({
   // strip them so the prefill machine (fill-empty-only) can seed. Read once
   // per mount; only the lazy state initializers below consume it.
   const restoredDraft: LandingDraft | null =
-    (landingDraft?.siblingSourceId ?? null) !== siblingSourceId
-      ? null
-      : landingDraft === null || landingDraft.project === projectParam
-        ? landingDraft
-        : {
-            ...landingDraft,
-            pickedAgentId: null,
-            pickedHarness: null,
-            selectedHostId: null,
-            sandboxSelected: false,
-            sandboxProvider: null,
-            sandboxProfile: null,
-            // The repo inputs compose the managed create's workspace string, so
-            // they are location state too — keeping them would clone another
-            // project's repository into this project's sandbox.
-            sandboxRepoSelections: [],
-            workspace: "",
-            branchName: "",
-            // The branch may be the worktree-default's auto-seed, generated for
-            // the other visit's workspace — drop the marker with it so the
-            // seed/retract machinery starts clean for this visit.
-            autoSeededBranch: "",
-          };
+    landingDraft === null || landingDraft.project === projectParam
+      ? landingDraft
+      : {
+          ...landingDraft,
+          pickedAgentId: null,
+          pickedHarness: null,
+          selectedHostId: null,
+          sandboxSelected: false,
+          sandboxProvider: null,
+          sandboxProfile: null,
+          // The repo inputs compose the managed create's workspace string, so
+          // they are location state too — keeping them would clone another
+          // project's repository into this project's sandbox.
+          sandboxRepoSelections: [],
+          workspace: "",
+          branchName: "",
+          // The branch may be the worktree-default's auto-seed, generated for
+          // the other visit's workspace — drop the marker with it so the
+          // seed/retract machinery starts clean for this visit.
+          autoSeededBranch: "",
+        };
 
   const [message, setMessage] = useState<string>(() => {
     if (handoff !== null) return handoff.text;
@@ -2828,7 +2832,6 @@ function NewChatLandingContent({
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
-    siblingSourceId,
     mcpRegistryServices,
     project: projectParam,
     message,
@@ -2863,12 +2866,12 @@ function NewChatLandingContent({
     return () => {
       onScreenRef.current = false;
       if (!submittedRef.current) {
-        writeLandingDraft(draftRef.current);
-      } else if (submittedDraftRevisionRef.current === landingDraftRevision) {
-        writeLandingDraft(null);
+        writeLandingDraft(draftState, draftRef.current);
+      } else if (submittedDraftRevisionRef.current === draftState.revision) {
+        writeLandingDraft(draftState, null);
       }
     };
-  }, []);
+  }, [draftState]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const { addRecentHarness } = useRecentHarnesses();
@@ -5722,7 +5725,7 @@ function NewChatLandingContent({
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
     } else {
-      writeLandingDraft(returnedDraft);
+      writeLandingDraft(draftState, returnedDraft);
     }
   }
 
@@ -5817,7 +5820,7 @@ function NewChatLandingContent({
         if (needsDbcert) return;
       }
       // Spend the draft only once provisioning starts, after the laptop credential check.
-      submittedDraftRevisionRef.current = landingDraftRevision;
+      submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
@@ -6359,8 +6362,8 @@ function NewChatLandingContent({
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
-      if (submittedDraftRevisionRef.current === landingDraftRevision) {
-        writeLandingDraft(null);
+      if (submittedDraftRevisionRef.current === draftState.revision) {
+        writeLandingDraft(draftState, null);
       }
 
       // `localConv` is set only when a real agent id was resolved up front.

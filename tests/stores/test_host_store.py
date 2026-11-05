@@ -2289,8 +2289,14 @@ def test_recovery_fences_expired_attempts_and_connected_hosts(
         host.host_id, "second", finished=True, workspace="/recovered", sandbox_id="winner"
     )
     assert not host_store.claim_managed_recovery(host, "late-sibling")
+    assert not host_store.update_managed_recovery(host.host_id, "second")
+    assert not host_store.update_managed_recovery(host.host_id, "second", finished=True)
     assert host_store.managed_recovery_result(host.host_id) == ("/recovered", "winner")
     assert host_store.claim_managed_recovery(replacement, "next-recovery")
+    assert host_store.update_managed_recovery(host.host_id, "next-recovery", finished=True)
+    assert not host_store.update_managed_recovery(host.host_id, "next-recovery")
+    with pytest.raises(ValueError, match="failed or expired"):
+        host_store.managed_recovery_result(host.host_id)
 
 
 @pytest.mark.asyncio

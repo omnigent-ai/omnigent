@@ -1239,13 +1239,13 @@ class HostStore:
             if host is None or host.deleted_at is not None or lease is None:
                 return False
             value = json.loads(lease.value)
-            if value.get("token") != token:
+            # A canceled heartbeat's database write can finish after completion.
+            if value.get("token") != token or value.get("expires", 0) == 0:
                 return False
-            value.update(
-                expires=0 if finished else now_epoch() + _MANAGED_RECOVERY_LEASE_S,
-                workspace=workspace,
-                sandbox_id=sandbox_id,
-            )
+            if finished:
+                value.update(expires=0, workspace=workspace, sandbox_id=sandbox_id)
+            else:
+                value["expires"] = now_epoch() + _MANAGED_RECOVERY_LEASE_S
             lease.value = json.dumps(value)
             return True
 
