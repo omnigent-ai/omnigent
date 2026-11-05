@@ -2,8 +2,13 @@
 
 Revision `f9b3e6c2a401`, following `c7cd88f24c1c`, adds nullable
 `comments.anchor_metadata`. It stores compressed provider-specific coordinates
-with a 16,383-byte stored limit. Existing rows remain NULL. There is no default,
+with a database-enforced 16,383-byte stored limit. Existing rows remain NULL. There is no default,
 backfill, index, or application consumer in this change.
+
+The table metadata also includes this column and its CHECK without an ORM
+property. Fresh CockroachDB databases bootstrap from table metadata and stamp
+the current migration head; omitting it would silently create an incomplete
+schema. Ordinary ORM comment queries still omit the column in this release.
 
 ## Deployment order
 
@@ -37,5 +42,8 @@ production removal requires the staged deprecation procedure in
 `uv run --no-sync pytest tests/db/test_migration_comment_anchor_metadata.py
 tests/db/test_migration_connections.py` verifies the migration chain has one
 head, preserves existing comments, accepts old writers, round-trips compressed
-anchors, and preserves comment bodies on downgrade. These tests run on SQLite;
-the deployment migration benchmarks validate other configured database engines.
+anchors, rejects raw and reflected writes of 16,384 bytes, and preserves comment
+bodies on downgrade. SQLite/D1 use a byte-length CHECK in ADD COLUMN; PostgreSQL,
+CockroachDB, and MySQL use an octet-length CHECK. The lifecycle runs on SQLite;
+DDL tests cover all five dialect names. Deployment CI exercises the migration on
+the other configured database engines.

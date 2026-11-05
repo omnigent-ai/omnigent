@@ -652,6 +652,23 @@ def _on_sqlite_family(
     return dialect.name in ("sqlite", "cloudflare_d1")
 
 
+def _on_non_sqlite_family(
+    ddl: BaseDDLElement,
+    target: SchemaItem | str,
+    bind: Connection | None,
+    tables: list[Table] | None = None,
+    state: Any | None = None,
+    *,
+    dialect: Dialect,
+    compiler: DDLCompiler | None = None,
+    checkfirst: bool = False,
+) -> bool:
+    """Use the native octet-length expression outside SQLite and D1."""
+    return not _on_sqlite_family(
+        ddl, target, bind, tables, state, dialect=dialect, compiler=compiler, checkfirst=checkfirst
+    )
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.
@@ -1189,7 +1206,17 @@ class SqlComment(OmnigentBase):
         CompressedText(max_stored_bytes=16_383), nullable=True
     )
 
-    __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
+    __table_args__ = (
+        CheckConstraint("status IN (1, 2)", name="ck_comments_status"),
+        CheckConstraint(
+            "anchor_metadata IS NULL OR length(CAST(anchor_metadata AS BLOB)) <= 16383",
+            name="ck_comments_anchor_metadata_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "anchor_metadata IS NULL OR octet_length(anchor_metadata) <= 16383",
+            name="ck_comments_anchor_metadata_bytes",
+        ).ddl_if(callable_=_on_non_sqlite_family),
+    )
 
 
 def policy_name_cksum(name: str) -> bytes:
