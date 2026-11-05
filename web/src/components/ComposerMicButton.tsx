@@ -544,6 +544,8 @@ export const ComposerMicButton = ({
         disabled={disabled}
         onClick={toggle}
         aria-pressed={isListening}
+        // While listening, Escape cancels dictation before page-wide shortcuts see it.
+        data-escape-owner={isListening ? "" : undefined}
         aria-busy={connecting}
         aria-label={a11yLabel}
         data-composer-action="microphone"
