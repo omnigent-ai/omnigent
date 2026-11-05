@@ -346,6 +346,34 @@ describe("a streaming Mermaid fence", () => {
     expect(container.querySelector('svg[id^="mermaid-"]')).toHaveTextContent("Alpha");
   }, 15_000);
 
+  it("draws an unclosed fence once the text stops streaming", async () => {
+    const { container, rerender } = render(<MessageResponse isStreaming>{open}</MessageResponse>);
+    rerender(<MessageResponse>{open}</MessageResponse>);
+
+    await waitFor(
+      () => expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull(),
+      {
+        timeout: 10_000,
+      },
+    );
+    expect(container.querySelector('svg[id^="mermaid-"]')).toHaveTextContent("Alpha");
+  }, 15_000);
+
+  it("replaces the source of a streamed fence that can't draw with the error card", async () => {
+    const invalid = "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: once; twice\n";
+    const { container, rerender } = render(
+      <MessageResponse isStreaming>{invalid}</MessageResponse>,
+    );
+    rerender(<MessageResponse isStreaming>{`${invalid}    A=>B: again\n\`\`\``}</MessageResponse>);
+
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    await waitFor(() =>
+      expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull(),
+    );
+    expect(card).toBeVisible();
+    expect(container.querySelector(".chat-mermaid")).not.toHaveClass("invisible");
+  }, 15_000);
+
   it("draws a fence that never streamed without showing its source", () => {
     const { container } = render(<MessageResponse>{closed}</MessageResponse>);
 
@@ -362,6 +390,7 @@ describe("a streaming Mermaid fence", () => {
     ["a fence-like line with text after it", "```mermaid\nA\n```not-a-closer", true],
     ["a closer with trailing spaces", "```\nA\n```  \r", false],
     ["a fence indented four spaces", "    ```\nA", false],
+    ["a tab-indented fence-like line inside a fence", "```mermaid\nA\n\t```", true],
     ["prose", "No code here.", false],
   ])("hasOpenCodeFence: %s", (_case, text, isOpen) => {
     expect(hasOpenCodeFence(text)).toBe(isOpen);

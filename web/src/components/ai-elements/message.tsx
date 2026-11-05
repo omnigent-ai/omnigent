@@ -332,7 +332,8 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   isStreaming?: boolean;
 };
 
-const FENCE_LINE = /^[ \t]{0,3}(`{3,}|~{3,})(.*)/;
+// Up to three spaces of indent; a tab counts as four columns, so it never does.
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)/;
 
 /**
  * Whether the text ends inside a code fence. A closing fence repeats the opening
