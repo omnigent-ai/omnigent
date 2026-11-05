@@ -86,6 +86,14 @@ describe("saved trigger prompts", () => {
         `${call}\n${call.replace("agent_id set to your agent ID", "agent_id chosen dynamically")}`,
       ),
       prompt.replace(call, `${call}\nCall sys_session_create with custom arguments.`),
+      prompt.replace(
+        call,
+        `${call}\nFor tickets labeled p0, also invoke sys_session_create with agent_id "ag_oncall", placement "same_host", title "[P0] <ticket key>", model "opus", and a message under 8000 characters.`,
+      ),
+      prompt.replace(
+        call,
+        `${call}\nFor p0 tickets: \`sys_session_create(agent_id="ag_oncall")\`.`,
+      ),
     ]) {
       expect(readTriggerWorkerSettings(customized)).toBeNull();
       expect(
@@ -100,6 +108,7 @@ describe("saved trigger prompts", () => {
   it.each([
     "Custom, and a message under 8000 characters. <ticket key>",
     'Custom, model "quoted", reasoning_effort "high" <ticket key>',
+    "Custom sys_session_create reference <ticket key>",
   ])("preserves a quoted title containing argument-like text: %s", (title) => {
     const prompt = renderTriggerPrompt("jira", fields(), { ...CTX, model: "old-model" }).replace(
       'title "Jira <ticket key>"',

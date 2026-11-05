@@ -374,11 +374,14 @@ function workerSettingsMatch(prompt: string) {
   const parts = splitTriggerPrompt(prompt);
   if (parts.systemPrompt === null) return null;
   const manager = parts.systemPrompt.split(SESSION_POSTING_INSTRUCTIONS)[0];
-  // A second customized call cannot be safely configured through one set of fields.
-  if ([...manager.matchAll(/\bcall\s+`?sys_session_create\b/gi)].length !== 1) return null;
   const matches = [...manager.matchAll(WORKER_SETTINGS_PATTERN)];
   if (matches.length !== 1) return null;
   const match = matches[0];
+  // Only the generated call and its result references have unambiguous settings.
+  const otherInstructions = manager
+    .replace(match[0], "")
+    .replace(/\bthat\s+`?sys_session_create`?\s+returned\b/gi, "");
+  if (/\bsys_session_create\b/i.test(otherInstructions)) return null;
   try {
     const settings: TriggerWorkerSettings = {
       agentId: match[1] === "set to your agent ID" ? null : JSON.parse(match[1]),
