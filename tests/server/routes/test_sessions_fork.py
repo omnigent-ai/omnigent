@@ -751,7 +751,10 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
 
 @pytest.mark.asyncio
 async def test_only_the_owner_starts_and_lists_side_chats(
-    auth_client: httpx.AsyncClient, client: httpx.AsyncClient, db_uri: str
+    auth_client: httpx.AsyncClient,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Editors, readers and admins of a shared parent can't start side chats or see the owner's."""
     owner, editor, reader = "owner@example.com", "editor@example.com", "reader@example.com"
@@ -848,6 +851,28 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         headers=headers[editor],
     )
     assert uploaded.status_code == 201, uploaded.text
+
+    def unexpected_attachment_read(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("ordinary messages must not read attachments during the side-chat check")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "omnigent.server.routes.sessions.routes_events._resolve_message_content",
+            unexpected_attachment_read,
+        )
+        for content in (
+            [
+                {"type": "input_text", "text": "Read this file"},
+                {"type": "input_file", "file_id": uploaded.json()["id"]},
+            ],
+            [{"type": "input_image", "file_id": uploaded.json()["id"]}],
+        ):
+            ordinary = await auth_client.post(
+                f"/v1/sessions/{parent.id}/events",
+                json={"type": "message", "data": {"role": "user", "content": content}},
+                headers=headers[editor],
+            )
+            assert ordinary.status_code == 202, ordinary.text
     for block_type in ("input_file", "input_image"):
         referenced = await auth_client.post(
             f"/v1/sessions/{parent.id}/events",

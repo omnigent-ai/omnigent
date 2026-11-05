@@ -189,11 +189,27 @@ def test_side_chats_page_by_parent_in_id_order(tmp_path: Path) -> None:
     store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
     store.set_labels(codex.id, {"omnigent.closed": "true"})
 
-    first = store.list_side_chat_ids(parent.id, limit=2)
-    rest = store.list_side_chat_ids(parent.id, after=first[-1], limit=2)
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        first = store.list_side_chat_ids(parent.id, limit=2)
+        rest = store.list_side_chat_ids(parent.id, after=first[-1], limit=2)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
 
     side_chats = [*generic, codex]
     assert first + rest == sorted(side_chat.id for side_chat in side_chats)
+    assert len(queries) == 2
+    with store._engine.connect() as conn:
+        for statement, parameters in queries:
+            plan = str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+            assert "ix_conversation_metadata_side_chat_parent_id" in plan, plan
+            assert "TEMP B-TREE" not in plan, plan
 
 
 def test_fork_lists_a_side_chat_and_marks_what_it_copied(

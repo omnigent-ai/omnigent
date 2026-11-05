@@ -4375,8 +4375,6 @@ async def _create_and_publish_codex_child(
     thread_id: str,
     labels: dict[str, str],
     conversation_store: ConversationStore,
-    *,
-    lists_side_chat: bool = False,
 ) -> str:
     """
     Create a new Codex child Conversation row and publish ``session.created``.
@@ -4388,8 +4386,6 @@ async def _create_and_publish_codex_child(
     :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
     :param labels: Labels to stamp on the new child row.
     :param conversation_store: Store used to create the child row.
-    :param lists_side_chat: Whether a ``/side`` child records its parent, so it
-        lists on the owner's devices.
     :returns: New child conversation id, e.g. ``"conv_child456"``.
     """
     # Stable title so the (parent, title) unique index prevents race-condition
@@ -4412,7 +4408,7 @@ async def _create_and_publish_codex_child(
             ),
             reasoning_effort=parent_conv.reasoning_effort if side_chat else None,
             # Lists the /side fork in its parent's Workspace rail on every device.
-            side_chat_parent_id=parent_conv.id if side_chat and lists_side_chat else None,
+            side_chat_parent_id=parent_conv.id if side_chat else None,
         )
     except NameAlreadyExistsError:
         # A concurrent POST (or a retry that arrived before set_labels ran)

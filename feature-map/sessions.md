@@ -42,8 +42,8 @@ the header menu), and each place is a separate entry point.
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
   message or Resume. Only the session's owner can start side chats. A side
-  chat started on one device is available from **Browse side chats** on the
-  owner's other devices. Opening and closing tabs stays local.
+  chat started on one device appears as an existing side-chat tab on the
+  owner's other devices. Selection and closing tabs stay local.
 - `side-chat-settings`: choose a supported model or effort in the side-chat composer;
   selections apply to that chat's next turn independently of its parent, in the
   desktop panel and mobile drawer. Generic side chats allow selection before or
@@ -497,10 +497,11 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
-On another device, choose **Browse side chats** in the Workspace toolbar or
-mobile drawer, then select a chat to open it. The picker fetches 20 at a time;
-**Next 20** loads another page. Existing local tabs keep their order. Side chats
-created before server discovery was added remain local to their original browser.
+On another device, open the same parent: saved side chats appear in the existing
+Workspace tab strip or mobile Side chats drawer. Discovery fetches up to 20 chats
+without changing the active panel or tab. Tabs closed on this device stay closed
+after reload; other devices keep their tabs. Side chats created before server
+discovery was added remain local to their original browser.
 In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
 in a visible workspace rail. With no closable visible tab it returns to the
 new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are
@@ -909,7 +910,7 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`side-chat-lifecycle`, another device:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_follows_the_user_to_another_device`
   starts a side chat in the desktop rail, opens it from a phone-sized browser
-  context with its own storage using **Browse side chats**, sends a follow-up,
+  context with its own storage using the automatically restored tab, sends a follow-up,
   closes it there, and checks that only the phone tab stays closed after reload.
 - **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
