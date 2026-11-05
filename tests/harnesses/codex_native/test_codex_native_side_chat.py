@@ -93,6 +93,10 @@ def test_side_chat_question_extracts_question() -> None:
     assert side_chat.side_chat_question_from_content("/side and as a string?") == (
         "and as a string?"
     )
+    # Any text block, at any length: the reader the owner check relies on.
+    assert side_chat.side_chat_question_from_content(
+        [{"type": "input_text", "text": "/side " + " " * 4000 + "why?"}]
+    ) == (" " * 4000 + "why?")
 
 
 def test_side_chat_question_preserves_first_line_indentation() -> None:

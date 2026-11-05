@@ -48,9 +48,15 @@ async def test_close_side_chat_preserves_shared_runner_and_transcript(
         ],
     )
     requests: list[tuple[str, str]] = []
+    closed_before_stop: list[bool] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
         requests.append((request.method, request.url.path))
+        if request.method == "POST":
+            saved = store.get_conversation(side.id)
+            closed_before_stop.append(
+                SIDE_CHAT_CLOSED_LABEL_KEY in (saved.labels if saved else {})
+            )
         return httpx.Response(204)
 
     host_stop = AsyncMock(return_value=True)
@@ -77,6 +83,9 @@ async def test_close_side_chat_preserves_shared_runner_and_transcript(
             # A closed tab is recorded for the user's other devices, without sealing.
             assert (SIDE_CHAT_CLOSED_LABEL_KEY in saved.labels) == (close_tab and row is side)
             assert CLOSED_LABEL_KEY not in saved.labels
+        # Recorded before the stop reaches the runner, so another device never
+        # drains a queued follow-up into the chat on the stop's idle edge.
+        assert closed_before_stop[:1] == [close_tab]
 
         response = await client.post(
             f"/v1/sessions/{parent.id}/events", json={"type": "stop_session"}
@@ -174,3 +183,26 @@ async def test_closing_an_ended_codex_side_chat_tab_drops_it_everywhere(
     assert response.status_code == 202, response.text
     saved = store.get_conversation(side.id)
     assert saved is not None and saved.labels.get(SIDE_CHAT_CLOSED_LABEL_KEY) == "1"
+
+
+async def test_a_message_reopens_a_closed_side_chat_tab(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Sending to a side chat whose tab was closed brings the tab back on every device."""
+    store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    SqlAlchemyAgentStore(db_uri).create(agent_id, name="test", bundle_location="test:///bundle")
+    side = store.create_conversation(
+        agent_id=agent_id, labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_CLOSED_LABEL_KEY: "1"}
+    )
+
+    await client.post(
+        f"/v1/sessions/{side.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "one more"}]},
+        },
+    )
+
+    saved = store.get_conversation(side.id)
+    assert saved is not None and SIDE_CHAT_CLOSED_LABEL_KEY not in saved.labels

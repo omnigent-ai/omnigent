@@ -1267,6 +1267,12 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        if body.type == "message" and SIDE_CHAT_CLOSED_LABEL_KEY in (conv.labels or {}):
+            # Using a side chat whose tab was closed brings the tab back everywhere,
+            # so a follow-up queued on another device never runs out of sight.
+            await asyncio.to_thread(
+                conversation_store.delete_label, session_id, SIDE_CHAT_CLOSED_LABEL_KEY
+            )
         if (
             body.type == "message"
             and isinstance(request, Request)
@@ -2008,6 +2014,20 @@ def register_events_routes(
                 )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
+            # Mark the tab closed before the stop settles the side chat, so no
+            # other device drains queued work into it on the stop's idle edge.
+            # The side chat stays writable; a later message reopens the tab.
+            closing_tab = bool(tab_closed) and bool((conv.labels or {}).get(SIDE_CHAT_LABEL_KEY))
+            if closing_tab:
+                await asyncio.to_thread(conversation_store.set_labels, session_id, tab_closed)
+
+            async def keep_tab_open() -> None:
+                """A stop that fails leaves the tab open everywhere."""
+                if closing_tab:
+                    await asyncio.to_thread(
+                        conversation_store.delete_label, session_id, SIDE_CHAT_CLOSED_LABEL_KEY
+                    )
+
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -2024,6 +2044,7 @@ def register_events_routes(
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
+                await keep_tab_open()
                 raise
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
@@ -2044,6 +2065,7 @@ def register_events_routes(
                     )
                     cleanup_resp.raise_for_status()
                 except (httpx.HTTPError, ConnectionError) as exc:
+                    await keep_tab_open()
                     raise OmnigentError(
                         "Couldn't release the side chat's resources. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -2079,6 +2101,7 @@ def register_events_routes(
                         else None
                     )
                     if runner_status not in {"dead", "unknown"}:
+                        await keep_tab_open()
                         raise OmnigentError(
                             "Couldn't confirm the session's runner stopped. Please try again.",
                             code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -2124,9 +2147,6 @@ def register_events_routes(
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
-            if tab_closed and (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY):
-                # The side chat stays writable; only its tab closes everywhere.
-                await asyncio.to_thread(conversation_store.set_labels, session_id, tab_closed)
             # The stop itself is non-sticky: nothing seals the session. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
