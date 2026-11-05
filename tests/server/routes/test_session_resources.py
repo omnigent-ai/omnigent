@@ -11624,6 +11624,8 @@ def _encoded_spilled_content(content: object) -> bytes:
         "wrong_content",
         "reprepared_replay",
         "settled_stable_attempt_replaced",
+        "append_failure_after_cancel",
+        "append_failure_after_replacement_completed",
     ],
 )
 async def test_spilled_receipt_preserves_exact_queue_ownership(
@@ -11671,6 +11673,8 @@ async def test_spilled_receipt_preserves_exact_queue_ownership(
             "restored",
             "restored_resent",
             "settled_stable_attempt_replaced",
+            "append_failure_after_cancel",
+            "append_failure_after_replacement_completed",
         }
         else None
     )
@@ -11775,6 +11779,51 @@ async def test_spilled_receipt_preserves_exact_queue_ownership(
         assert _encoded_spilled_content(
             store.appended_items[0].data.content
         ) == _encoded_spilled_content(original)
+        return
+    if scenario in {"append_failure_after_cancel", "append_failure_after_replacement_completed"}:
+        from omnigent.server.routes._sessions.orchestration import _settle_undelivered_native_input
+
+        original_append = store.append
+        calls = 0
+
+        def retire_before_failure(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                return original_append(*args, **kwargs)
+            pending_inputs.resolve(
+                session_id, owned_id, delivery_attempt_id=owned_identity["delivery_attempt_id"]
+            )
+            if scenario == "append_failure_after_replacement_completed":
+                pending_inputs.record(
+                    session_id, original, stable_id=stable_id, created_by="owner@example.test"
+                )
+                replacement_identity = pending_inputs.delivery_attributes_for(session_id, owned_id)
+                assert (
+                    replacement_identity["delivery_attempt_id"]
+                    != owned_identity["delivery_attempt_id"]
+                )
+                asyncio.run(
+                    _settle_undelivered_native_input(
+                        store,
+                        session_id,
+                        "replacement_response",
+                        replacement_identity,
+                    )
+                )
+                assert pending_inputs.pending_id_for_stable_id(session_id, stable_id) is None
+            raise RuntimeError("retired append failure")
+
+        monkeypatch.setattr(store, "append", retire_before_failure)
+        with pytest.raises(RuntimeError, match="retired append failure"):
+            await persist(body)
+        assert pending_inputs.pending_ids(session_id) == [older_id]
+        assert pending_inputs.pending_id_for_stable_id(session_id, stable_id) is None
+        if scenario == "append_failure_after_replacement_completed":
+            assert len(store.appended_items) == 1
+            assert store.appended_items[0].response_id == "replacement_response"
+        else:
+            assert store.appended_items == []
         return
     if scenario == "append_failure":
         original_append = store.append
@@ -11898,3 +11947,147 @@ async def test_spilled_receipt_preserves_exact_queue_ownership(
         }
     observation["assertions"] = actual
     assert actual == expected, observation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("startup_placeholder", [False, True])
+@pytest.mark.parametrize("stage", ["queued", "settled"])
+@pytest.mark.parametrize("reuse", ["retry", "edited", "other_author"])
+async def test_codex_browser_stable_id_survives_exact_receipt_settlement(
+    monkeypatch: pytest.MonkeyPatch, stage: str, reuse: str, startup_placeholder: bool
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import (
+        _dispatch_session_event_to_runner,
+        _persist_external_conversation_item,
+    )
+
+    monkeypatch.setattr(pending_inputs, "_pending", {})
+    store = _ConversationStore()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    runner = _FakeRunnerClient()
+    stable_id = "c" * 32
+    original = [
+        {"type": "input_text", "text": "résumé\r\n" * 100},
+        {"type": "input_text", "text": "tail"},
+    ]
+    older = pending_inputs.record(session_id, [{"type": "input_text", "text": "older"}])
+
+    async def send(content, author="owner@example.test"):
+        return await _dispatch_session_event_to_runner(
+            session_id,
+            conv,
+            SessionEventInput(
+                type="message",
+                data={
+                    "role": "user",
+                    "content": content,
+                    "stable_id": stable_id,
+                },
+            ),
+            store,
+            runner,
+            agent_name="codex-native-ui",
+            created_by=author,
+            file_store=None,
+            artifact_store=None,
+        )
+
+    async def settle(result, content, letter):
+        identity = {
+            key: value
+            for key, value in pending_inputs.delivery_attributes_for(
+                session_id, result.pending_id
+            ).items()
+            if key in {"pending_id", "delivery_attempt_id", "input_stable_id"}
+        }
+        return await _persist_external_conversation_item(
+            session_id,
+            conv,
+            SessionEventInput(
+                type="external_native_input_receipt",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": content},
+                    "native_input_receipt": {
+                        "version": 1,
+                        "identity": identity,
+                        "receipt_id": "omnigent-paste-" + letter * 32 + "-" + letter * 64,
+                    },
+                },
+            ),
+            store,
+        )
+
+    def deliveries():
+        return [body for path, body in runner.post_json_calls if path.endswith("/events")]
+
+    if startup_placeholder:
+        from omnigent.entities import MessageData
+        from omnigent.entities.conversation import StartupInputOptions
+        from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
+
+        store.persisted_by_stable_id[stable_id] = ConversationItem(
+            id=stable_id,
+            type="message",
+            response_id=PENDING_INPUT_RESPONSE_ID,
+            created_at=0,
+            created_by="owner@example.test",
+            status="incomplete",
+            data=MessageData(
+                role="user",
+                content=original,
+                user_authored=True,
+                startup_options=StartupInputOptions(background_titles_enabled=True),
+            ),
+        )
+        with pytest.raises(OmnigentError) as caught:
+            await send(original, "other@example.test")
+        assert caught.value.code == ErrorCode.CONFLICT
+        assert deliveries() == []
+    initial = await send(original)
+    original_identity = pending_inputs.delivery_attributes_for(session_id, initial.pending_id)
+    if stage == "settled":
+        await settle(initial, original, "a")
+        assert store.get_item(session_id, stable_id) is not None
+        assert store.get_item(session_id, stable_id).data.content == original
+    if reuse == "other_author":
+        with pytest.raises(OmnigentError) as caught:
+            await send(original, "other@example.test")
+        assert caught.value.code == ErrorCode.CONFLICT
+        assert len(deliveries()) == 1
+        return
+    content = (
+        [*original[:-1], {"type": "input_text", "text": "edited tail"}]
+        if reuse == "edited"
+        else original
+    )
+    repeated = await send(content)
+    if reuse == "retry":
+        assert len(deliveries()) == 1
+        assert repeated.pending_id == (initial.pending_id if stage == "queued" else None)
+        assert repeated.item_id == (
+            None if stage == "queued" else store.get_item(session_id, stable_id).id
+        )
+        if stage == "queued":
+            await settle(initial, original, "a")
+        assert pending_inputs.pending_ids(session_id) == [older]
+        return
+    assert len(deliveries()) == 2
+    assert repeated.pending_id != initial.pending_id
+    edited_identity = pending_inputs.delivery_attributes_for(session_id, repeated.pending_id)
+    assert edited_identity["delivery_attempt_id"] != original_identity["delivery_attempt_id"]
+    assert edited_identity["input_stable_id"] != stable_id
+    if stage == "queued":
+        await settle(initial, original, "a")
+    edited_id = await settle(repeated, content, "b")
+    assert store.get_item(session_id, stable_id).data.content == original
+    assert store.get_item(session_id, edited_id).data.content == content
+    assert len(store.appended_items) == 2
+    again = await send(content)
+    assert again.item_id == edited_id and again.pending_id is None
+    assert len(deliveries()) == 2
+    assert pending_inputs.pending_ids(session_id) == [older]

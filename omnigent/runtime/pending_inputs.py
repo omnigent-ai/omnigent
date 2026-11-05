@@ -251,6 +251,7 @@ class DrainedInput:
     lifecycle_response_id: str | None = None
     uncertain: bool = False
     restored: bool = False
+    strict_restore: bool = False
 
 
 @dataclass
@@ -512,6 +513,14 @@ def delivery_attributes_for(conversation_id: str, pending_id: str) -> dict[str, 
     return delivery_attributes(snapshot) if snapshot is not None else {}
 
 
+def peek(conversation_id: str, pending_id: str) -> DrainedInput | None:
+    """Copy one pending input without changing its hold or queue position."""
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return _drained_input(entry) if entry is not None else None
+
+
 def mark_delivery_stage(
     conversation_id: str,
     pending_id: str,
@@ -712,7 +721,7 @@ def resolve_delivery_attempt(
             entries.pop(pending_id)
             if not entries:
                 _pending.pop(conversation_id, None)
-        return _drained_input(entry)
+        return replace(_drained_input(entry), strict_restore=hold)
 
 
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
@@ -838,8 +847,9 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
     An entry drained with ``hold=True`` never left the queue, so it is
     simply unheld in place, keeping its slot and order. One that is gone
     (drained without ``hold``, or evicted by the TTL meanwhile) returns to
-    the FRONT, since it was the oldest when drained. Compensation never
-    evicts: a queue that refilled meanwhile may exceed the cap by the
+    the FRONT, since it was the oldest when drained. Identity-linked held
+    snapshots cannot recreate missing slots retired while persistence waited.
+    Compensation never evicts: a queue that refilled meanwhile may exceed the cap by the
     restored entries until the next :func:`record` trims unheld ones.
     A reconstructed entry keeps its uncertainty so a later mirror cannot
     declare a possibly recorded message undelivered.
@@ -870,7 +880,10 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         entries = _pending.get(conversation_id, {})
         current = entries.get(drained.pending_id)
         if current is not None:
-            current.held = False
+            if current.delivery_attempt_id == drained.delivery_attempt_id:
+                current.held = False
+            return
+        if drained.strict_restore:
             return
         _pending[conversation_id] = {drained.pending_id: entry, **entries}
 
@@ -890,7 +903,9 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
         entries = _pending.get(conversation_id)
         if entries is None:
             return
-        entries.pop(drained.pending_id, None)
+        current = entries.get(drained.pending_id)
+        if current is not None and current.delivery_attempt_id == drained.delivery_attempt_id:
+            entries.pop(drained.pending_id)
         if not entries:
             _pending.pop(conversation_id, None)
 

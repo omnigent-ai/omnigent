@@ -662,8 +662,9 @@ async def test_accepts_followups_before_provisioning_and_delivers_in_order(
     assert env.conv_store.list_pending_inputs(session_id) == []
 
 
+@pytest.mark.parametrize("exact_receipt", [False, True])
 async def test_native_mirror_retry_does_not_consume_next_identical_input(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, exact_receipt: bool
 ) -> None:
     env = startup_env
     session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
@@ -674,16 +675,36 @@ async def test_native_mirror_retry_does_not_consume_next_identical_input(
     forwarded: list[dict[str, Any]] = []
     runner = _stub_runner(monkeypatch, forwarded)
 
+    receipt_contexts = {}
+
     async def echo(source: str):
+        receipt_metadata = {}
+        if exact_receipt:
+            if source not in receipt_contexts:
+                message = [event for event in forwarded if event.get("type") == "message"][-1]
+                receipt_contexts[source] = message["native_input_receipt"]
+            receipt_metadata = {
+                "native_input_receipt": {
+                    "version": 1,
+                    "identity": receipt_contexts[source]["identity"],
+                    "receipt_id": "omnigent-paste-"
+                    + ("a" if source == "native-first" else "b") * 32
+                    + "-"
+                    + "c" * 64,
+                }
+            }
         result = await env.client.post(
             f"/v1/sessions/{session_id}/events",
             json={
-                "type": "external_conversation_item",
+                "type": "external_native_input_receipt"
+                if exact_receipt
+                else "external_conversation_item",
                 "data": {
                     "item_type": "message",
                     "item_data": _INPUT["data"],
                     "response_id": source,
                     "source_id": source,
+                    **receipt_metadata,
                 },
             },
         )

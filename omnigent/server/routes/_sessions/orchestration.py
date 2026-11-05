@@ -418,6 +418,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
+    PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
@@ -3105,7 +3106,16 @@ async def _persist_external_conversation_item_unlocked(
         # as undelivered. Items that never touch the queue skip the lookup; their
         # retries are absorbed by the idempotent append below.
         existing = await asyncio.to_thread(conversation_store.get_item, session_id, item.stable_id)
-        if existing is not None:
+        if existing is not None and existing.response_id != PENDING_INPUT_RESPONSE_ID:
+            if body.type == NATIVE_INPUT_RECEIPT_EVENT and (
+                not isinstance(existing.data, MessageData)
+                or not isinstance(item.data, MessageData)
+                or existing.data.content != item.data.content
+            ):
+                raise OmnigentError(
+                    "Native input receipt differs from its persisted input",
+                    code=ErrorCode.CONFLICT,
+                )
             return existing.id
     if drains_pending_inputs and STARTUP_LABEL in conv.labels:
         await restore_pending_inputs(conversation_store, session_id)
@@ -3409,7 +3419,8 @@ def _new_external_conversation_item(
         logical_input_id = receipt["identity"]["pending_id"]
         return item.model_copy(
             update={
-                "stable_id": uuid.uuid5(
+                "stable_id": receipt["identity"].get("input_stable_id")
+                or uuid.uuid5(
                     uuid.NAMESPACE_URL,
                     f"omnigent-native-input-receipt:{session_id}:{logical_input_id}",
                 ).hex,
@@ -3638,8 +3649,14 @@ async def _settle_undelivered_native_input(
         if not isinstance(input_stable_id, str):
             return
         pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
+    if not isinstance(pending_id, str) or pending_inputs.peek(session_id, pending_id) is None:
+        if not isinstance(input_stable_id, str):
+            return
+        saved = await asyncio.to_thread(conversation_store.get_item, session_id, input_stable_id)
+        if saved is None or saved.response_id != PENDING_INPUT_RESPONSE_ID:
+            return
+        await restore_pending_inputs(conversation_store, session_id)
         if pending_id is None:
-            await restore_pending_inputs(conversation_store, session_id)
             pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
     if not isinstance(pending_id, str):
         return
@@ -8152,6 +8169,77 @@ def _codex_side_chat_runner_error(resp: httpx.Response) -> OmnigentError:
     )
 
 
+async def _record_codex_native_input(
+    session_id: str,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    created_by: str | None,
+    stable_id: str,
+    background_titles_enabled: bool,
+) -> tuple[str | None, str | None, str, bool]:
+    """Register a browser send once, preserving edited drafts under a fresh identity."""
+    item = _build_new_item(body, generate_task_id(), created_by=created_by, adopt_stable_id=True)
+    try:
+        payload = json.dumps(
+            item.data.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (ValueError, TypeError, UnicodeEncodeError) as exc:
+        raise OmnigentError("Invalid native input content", code=ErrorCode.INVALID_INPUT) from exc
+    variant_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"omnigent-native-edited-input:{session_id}:{stable_id}:{hashlib.sha256(payload).hexdigest()}",
+    ).hex
+    async with _native_mirror_lock(session_id):
+        for input_id in (stable_id, variant_id):
+            candidate = item.model_copy(update={"stable_id": input_id})
+            persisted = await asyncio.to_thread(conversation_store.get_item, session_id, input_id)
+            if persisted is not None:
+                comparison = persisted
+                if persisted.response_id == PENDING_INPUT_RESPONSE_ID and isinstance(
+                    persisted.data, MessageData
+                ):
+                    comparison = persisted.model_copy(
+                        update={
+                            "data": persisted.data.model_copy(update={"startup_options": None}),
+                        }
+                    )
+                if not _stable_id_reuse_is_exact_retry(comparison, candidate):
+                    continue
+                if persisted.response_id != PENDING_INPUT_RESPONSE_ID:
+                    return None, persisted.id, input_id, False
+            pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_id)
+            pending = pending_inputs.peek(session_id, pending_id) if pending_id else None
+            if pending is not None:
+                queued = ConversationItem(
+                    id=pending.pending_id,
+                    type="message",
+                    response_id=PENDING_INPUT_RESPONSE_ID,
+                    created_at=0,
+                    status="incomplete",
+                    created_by=pending.created_by,
+                    data=MessageData(role="user", content=pending.content, user_authored=True),
+                )
+                if _stable_id_reuse_is_exact_retry(queued, candidate):
+                    return pending.pending_id, None, input_id, False
+                continue
+            assert isinstance(candidate.data, MessageData)
+            pending_id = pending_inputs.record(
+                session_id,
+                candidate.data.content,
+                created_by=created_by,
+                stable_id=input_id,
+                background_titles_enabled=background_titles_enabled,
+            )
+            return pending_id, None, input_id, True
+    raise OmnigentError(
+        "Native input identity already names different content", code=ErrorCode.CONFLICT
+    )
+
+
 async def _dispatch_session_event_to_runner_impl(
     session_id: str,
     conv: Conversation,
@@ -8346,7 +8434,12 @@ async def _dispatch_session_event_to_runner_impl(
         queues_message = (
             isinstance(content, list) and bool(content) and not opens_side_chat and not is_btw
         )
-        if queues_message and web_stable_id is not None:
+        codex_stable_input = (
+            queues_message
+            and web_stable_id is not None
+            and _native_pane_harness(conv) == "codex-native"
+        )
+        if queues_message and web_stable_id is not None and not codex_stable_input:
             repeated_pending_id = pending_inputs.pending_id_for_stable_id(
                 session_id, web_stable_id
             )
@@ -8373,17 +8466,38 @@ async def _dispatch_session_event_to_runner_impl(
             conversation_store, session_id
         ):
             return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
-        pending_id: str | None = (
-            pending_inputs.record(
+        if codex_stable_input:
+            assert web_stable_id is not None
+            (
+                pending_id,
+                persisted_id,
+                delivery_stable_id,
+                should_forward,
+            ) = await _record_codex_native_input(
                 session_id,
-                content,
-                created_by=created_by,
-                stable_id=web_stable_id,
-                background_titles_enabled=background_titles_enabled,
+                body,
+                conversation_store,
+                created_by,
+                web_stable_id,
+                background_titles_enabled,
             )
-            if queues_message
-            else None
-        )
+            if not should_forward:
+                return _SessionEventDispatchResult(item_id=persisted_id, pending_id=pending_id)
+            if delivery_stable_id != web_stable_id:
+                body = body.model_copy(
+                    update={"data": {**body.data, "stable_id": delivery_stable_id}}
+                )
+        else:
+            pending_id = None
+            if queues_message:
+                assert isinstance(content, list)
+                pending_id = pending_inputs.record(
+                    session_id,
+                    content,
+                    created_by=created_by,
+                    stable_id=web_stable_id,
+                    background_titles_enabled=background_titles_enabled,
+                )
         input_delivery = (
             pending_inputs.delivery_attributes_for(session_id, pending_id)
             if pending_id is not None
@@ -8554,7 +8668,12 @@ async def _dispatch_session_event_to_runner_impl(
             raise
         finally:
             if not forwarded and pending_id is not None:
-                pending_inputs.resolve(session_id, pending_id)
+                attempt = input_delivery.get("delivery_attempt_id")
+                pending_inputs.resolve(
+                    session_id,
+                    pending_id,
+                    delivery_attempt_id=attempt if isinstance(attempt, str) else None,
+                )
         # Emit the routing chip AFTER forwarding the message to the
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.

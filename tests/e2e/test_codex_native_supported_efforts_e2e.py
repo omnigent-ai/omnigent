@@ -242,6 +242,22 @@ def test_oversized_input_survives_real_codex_transport(
         assert len(user_matches) == 1
         assert len([item for item in items if item.get("role") == "user"]) == 1
         assert snapshot["pending_inputs"] == []
+        assert user_matches[0]["id"] == stable_id
+        retried = _json(
+            rig.api.post(
+                f"/v1/sessions/{session.id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "stable_id": stable_id,
+                        "content": original_content,
+                    },
+                },
+            )
+        )
+        assert retried["item_id"] == stable_id
+        assert _json(rig.api.get(f"/v1/sessions/{session.id}"))["pending_inputs"] == []
         if not supports_spill_receipts:
             assert len(refusals) == 1
             assert user_matches[0]["id"] == stable_id
