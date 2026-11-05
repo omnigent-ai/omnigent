@@ -81,6 +81,11 @@ describe("saved trigger prompts", () => {
       "A handwritten automation.",
       prompt.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
       prompt.replace(call, `${call}\n${call}`),
+      prompt.replace(
+        call,
+        `${call}\n${call.replace("agent_id set to your agent ID", "agent_id chosen dynamically")}`,
+      ),
+      prompt.replace(call, `${call}\nCall sys_session_create with custom arguments.`),
     ]) {
       expect(readTriggerWorkerSettings(customized)).toBeNull();
       expect(
@@ -90,6 +95,27 @@ describe("saved trigger prompts", () => {
     // The worker's task can quote an API call without changing manager configuration.
     const quoted = renderTriggerPrompt("jira", fields({ instructions: call }), CTX);
     expect(readTriggerWorkerSettings(quoted)).toEqual({ agentId: null, model: "", effort: "" });
+  });
+
+  it.each([
+    "Custom, and a message under 8000 characters. <ticket key>",
+    'Custom, model "quoted", reasoning_effort "high" <ticket key>',
+  ])("preserves a quoted title containing argument-like text: %s", (title) => {
+    const prompt = renderTriggerPrompt("jira", fields(), { ...CTX, model: "old-model" }).replace(
+      'title "Jira <ticket key>"',
+      `title ${JSON.stringify(title)}`,
+    );
+    expect(readTriggerWorkerSettings(prompt)).toEqual({
+      agentId: null,
+      model: "old-model",
+      effort: "",
+    });
+    const settings = { agentId: null, model: "new-model", effort: "high" };
+    const updated = updateTriggerWorkerSettings(prompt, settings);
+    expect(updated).toBe(
+      prompt.replace('model "old-model"', 'model "new-model", reasoning_effort "high"'),
+    );
+    expect(readTriggerWorkerSettings(updated!)).toEqual(settings);
   });
 
   it.each(TRIGGER_SOURCES)("separates %s instructions and preserves the saved prompt", (source) => {

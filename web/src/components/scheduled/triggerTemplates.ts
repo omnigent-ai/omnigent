@@ -363,7 +363,7 @@ export interface TriggerWorkerSettings {
 const QUOTED_WORKER_VALUE = String.raw`"(?:[^"\\]|\\.)*"`;
 const WORKER_SETTINGS_PATTERN = new RegExp(
   `call sys_session_create with agent_id (set to your agent ID|${QUOTED_WORKER_VALUE}), ` +
-    `(placement "(?:same_host|managed)", title [^\\n]+?)` +
+    `(placement "(?:same_host|managed)", title ${QUOTED_WORKER_VALUE})` +
     `(?:, model (${QUOTED_WORKER_VALUE}))?` +
     `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
     `, and a message under 8000 characters\\.`,
@@ -374,11 +374,11 @@ function workerSettingsMatch(prompt: string) {
   const parts = splitTriggerPrompt(prompt);
   if (parts.systemPrompt === null) return null;
   const manager = parts.systemPrompt.split(SESSION_POSTING_INSTRUCTIONS)[0];
+  // A second customized call cannot be safely configured through one set of fields.
+  if ([...manager.matchAll(/\bcall\s+`?sys_session_create\b/gi)].length !== 1) return null;
   const matches = [...manager.matchAll(WORKER_SETTINGS_PATTERN)];
   if (matches.length !== 1) return null;
   const match = matches[0];
-  // Unknown argument edits must stay under the author's control.
-  if (match[2].includes(", model ") || match[2].includes(", reasoning_effort ")) return null;
   try {
     const settings: TriggerWorkerSettings = {
       agentId: match[1] === "set to your agent ID" ? null : JSON.parse(match[1]),

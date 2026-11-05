@@ -2968,6 +2968,65 @@ describe("editing template prompts", () => {
     });
   });
 
+  it.each([true, false])(
+    "validates the worker preview when the poller is unsupported (worker ready: %s)",
+    async (workerReady) => {
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockImplementation(
+        (_provider, _harness, agentId) =>
+          ({
+            data: {
+              models: [],
+              configured: false,
+              status: agentId === "ag_claude_native" && workerReady ? "ready" : "unsupported",
+              error: "This harness is unavailable in the sandbox.",
+            },
+          }) as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>,
+      );
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            features: { automations_v2: true },
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            sandbox_provider_capabilities: { modal: { default_models: true } },
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              prompt: original.replace('placement "same_host"', 'placement "managed"'),
+              executionTarget: "managed_sandbox",
+              sessionMode: "continue",
+              sessionId: "poller",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      fireEvent.keyDown(screen.getByTestId("task-worker-agent-trigger"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "Claude Code" }));
+      const submit = screen.getByTestId("create-scheduled-task-submit");
+      if (workerReady) {
+        expect(submit).toBeEnabled();
+        fireEvent.click(submit);
+        await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+        const input = updateMutateAsync.mock.calls[0][0].input;
+        expect(readTriggerWorkerSettings(input.prompt)?.agentId).toBe("ag_claude_native");
+        expect(input).not.toHaveProperty("agentId");
+        expect(input).not.toHaveProperty("sessionId");
+      } else {
+        expect(submit).toBeDisabled();
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "This harness is unavailable in the sandbox.",
+        );
+        fireEvent.click(submit);
+        expect(updateMutateAsync).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("keeps a hand-written heading editable for unrelated changes", async () => {
     const prompt = "Write a training document.\n\nInstructions for each session:\n";
     render(

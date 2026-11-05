@@ -588,7 +588,7 @@ export function CreateScheduledTaskDialog({
   }
 
   async function handleSubmit() {
-    if (curationPending || harnessSettings.blockedReason) return;
+    if (!canSubmit) return;
     if (!editingTask && effectiveAgentId === null) return;
     setError(null);
     setSubmitting(true);
