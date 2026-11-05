@@ -25,6 +25,7 @@ import type {
   ModelUsage,
   NativeModelOption,
   NestedSessionItem,
+  PendingInput,
   SandboxStatus,
   Session,
   SessionEventInput,
@@ -219,11 +220,12 @@ interface SessionResponseWire {
    * client that posted then navigated away / rebound re-hydrates the
    * optimistic bubble. Empty for non-native sessions.
    */
-  pending_inputs?: {
-    pending_id: string;
-    content: MessageContentBlock[];
-    created_by?: string;
-  }[];
+  pending_inputs?: PendingInputWire[];
+  /**
+   * Saved startup messages that were never delivered, same shape as
+   * ``pending_inputs``. Absent on servers that predate it.
+   */
+  failed_inputs?: PendingInputWire[];
   /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
    * authenticated user holds on this session. Optional on the wire
@@ -317,6 +319,20 @@ function usageByModelFromWire(
   return out;
 }
 
+interface PendingInputWire {
+  pending_id: string;
+  content: MessageContentBlock[];
+  created_by?: string;
+}
+
+function pendingInputsFromWire(wire: PendingInputWire[] | undefined): PendingInput[] {
+  return (wire ?? []).map((p) => ({
+    pendingId: p.pending_id,
+    content: p.content,
+    ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
+  }));
+}
+
 function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
   // attach) can pin to the replica holding that host's runner tunnel; a
@@ -359,11 +375,8 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
     pendingElicitations: wire.pending_elicitations ?? [],
-    pendingInputs: (wire.pending_inputs ?? []).map((p) => ({
-      pendingId: p.pending_id,
-      content: p.content,
-      ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
-    })),
+    pendingInputs: pendingInputsFromWire(wire.pending_inputs),
+    failedInputs: pendingInputsFromWire(wire.failed_inputs),
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,

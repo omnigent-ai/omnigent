@@ -6,11 +6,13 @@ import {
   describeLinearFilter,
   describeSlackFilter,
   isTriggerPrompt,
+  readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
   splitTriggerPrompt,
   splitJqlOrderBy,
   triggerFieldsComplete,
+  updateTriggerWorkerSettings,
   TRIGGER_SOURCES,
   type TriggerCondition,
   type TriggerFields,
@@ -39,6 +41,92 @@ function fields(overrides: Partial<TriggerFields> = {}): TriggerFields {
 const JQL = 'project = "ES" AND labels = "omnigent"';
 
 describe("saved trigger prompts", () => {
+  it.each(TRIGGER_SOURCES)(
+    "edits %s worker settings without changing authored instructions",
+    (source) => {
+      const original = renderTriggerPrompt(source, fields(), {
+        ...CTX,
+        model: "old-model",
+        effort: "high",
+      }).replace("Each run:", "Keep this custom instruction.\n\nEach run:");
+      expect(readTriggerWorkerSettings(original)).toEqual({
+        agentId: null,
+        model: "old-model",
+        effort: "high",
+      });
+      const settings = { agentId: "worker-agent", model: 'model-with-"quotes"', effort: "low" };
+      const updated = updateTriggerWorkerSettings(original, settings)!;
+      expect(readTriggerWorkerSettings(updated)).toEqual(settings);
+      expect(updated).toContain('agent_id "worker-agent", placement "same_host"');
+      expect(updated).toContain('model "model-with-\\"quotes\\"", reasoning_effort "low"');
+      expect(updated).toContain("Keep this custom instruction.");
+      expect(splitTriggerPrompt(updated).userPrompt).toBe(splitTriggerPrompt(original).userPrompt);
+      expect(
+        updateTriggerWorkerSettings(updated, { agentId: null, model: "old-model", effort: "high" }),
+      ).toBe(original);
+      const defaults = updateTriggerWorkerSettings(updated, {
+        agentId: null,
+        model: "",
+        effort: "",
+      })!;
+      expect(readTriggerWorkerSettings(defaults)).toEqual({ agentId: null, model: "", effort: "" });
+      expect(defaults).not.toContain('reasoning_effort "low"');
+    },
+  );
+
+  it("leaves customized or ambiguous worker calls unchanged", () => {
+    const prompt = renderTriggerPrompt("jira", fields(), CTX);
+    const call = prompt.match(/call sys_session_create with [^\n]+?8000 characters\./)![0];
+    for (const customized of [
+      "A handwritten automation.",
+      prompt.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
+      prompt.replace(call, `${call}\n${call}`),
+      prompt.replace(
+        call,
+        `${call}\n${call.replace("agent_id set to your agent ID", "agent_id chosen dynamically")}`,
+      ),
+      prompt.replace(call, `${call}\nCall sys_session_create with custom arguments.`),
+      prompt.replace(
+        call,
+        `${call}\nFor tickets labeled p0, also invoke sys_session_create with agent_id "ag_oncall", placement "same_host", title "[P0] <ticket key>", model "opus", and a message under 8000 characters.`,
+      ),
+      prompt.replace(
+        call,
+        `${call}\nFor p0 tickets: \`sys_session_create(agent_id="ag_oncall")\`.`,
+      ),
+    ]) {
+      expect(readTriggerWorkerSettings(customized)).toBeNull();
+      expect(
+        updateTriggerWorkerSettings(customized, { agentId: null, model: "", effort: "" }),
+      ).toBeNull();
+    }
+    // The worker's task can quote an API call without changing manager configuration.
+    const quoted = renderTriggerPrompt("jira", fields({ instructions: call }), CTX);
+    expect(readTriggerWorkerSettings(quoted)).toEqual({ agentId: null, model: "", effort: "" });
+  });
+
+  it.each([
+    "Custom, and a message under 8000 characters. <ticket key>",
+    'Custom, model "quoted", reasoning_effort "high" <ticket key>',
+    "Custom sys_session_create reference <ticket key>",
+  ])("preserves a quoted title containing argument-like text: %s", (title) => {
+    const prompt = renderTriggerPrompt("jira", fields(), { ...CTX, model: "old-model" }).replace(
+      'title "Jira <ticket key>"',
+      `title ${JSON.stringify(title)}`,
+    );
+    expect(readTriggerWorkerSettings(prompt)).toEqual({
+      agentId: null,
+      model: "old-model",
+      effort: "",
+    });
+    const settings = { agentId: null, model: "new-model", effort: "high" };
+    const updated = updateTriggerWorkerSettings(prompt, settings);
+    expect(updated).toBe(
+      prompt.replace('model "old-model"', 'model "new-model", reasoning_effort "high"'),
+    );
+    expect(readTriggerWorkerSettings(updated!)).toEqual(settings);
+  });
+
   it.each(TRIGGER_SOURCES)("separates %s instructions and preserves the saved prompt", (source) => {
     const original = renderTriggerPrompt(source, fields(), CTX);
     const parts = splitTriggerPrompt(original);
@@ -135,6 +223,10 @@ describe("triggerFieldsComplete", () => {
   it.each<[string, Partial<TriggerFields>, boolean]>([
     ["scope and instructions, no conditions", { conditions: [] }, true],
     ["blank scope", { scope: "  " }, false],
+    ["equals matches one scope", { scopeOperator: "is", scope: "ES" }, true],
+    ["equals rejects lists", { scopeOperator: "is", scope: "ES, OPS" }, false],
+    ["in accepts one scope", { scopeOperator: "in", scope: "ES" }, true],
+    ["in accepts multiple scopes", { scopeOperator: "in", scope: "ES, OPS" }, true],
     // Commas alone parse to no entries, which would drop GitHub's repo filter.
     ["comma-only scope", { scope: " , ," }, false],
     ["a condition with no value", { conditions: [{ ...LABEL_OMNIGENT, value: " " }] }, false],
@@ -163,6 +255,12 @@ describe("splitJqlOrderBy", () => {
 });
 
 describe("compileJiraJql", () => {
+  it.each(["is", "in"] as const)("compiles an explicit %s scope operator", (scopeOperator) => {
+    expect(compileJiraJql(fields({ scopeOperator, scope: "ES", conditions: [] }))).toBe(
+      scopeOperator === "is" ? 'project = "ES"' : 'project in ("ES")',
+    );
+  });
+
   const jql = (scope: string, ...conditions: TriggerCondition[]) =>
     compileJiraJql(fields({ scope, conditions }));
 
@@ -327,8 +425,18 @@ describe("isTriggerPrompt", () => {
 });
 
 describe("renderTriggerPrompt", () => {
+  it("covers a four-hour polling interval on the first run", () => {
+    const prompt = renderTriggerPrompt("jira", fields(), {
+      ...CTX,
+      pollingIntervalMinutes: 240,
+    });
+    expect(prompt).toContain("On the first run, use 240 minutes ago and nothing pending.");
+    expect(prompt).toContain("Then search from 5 minutes before the check time");
+  });
+
   it("renders the Jira manager prompt with the JQL, placement, dedupe title and link", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
+    expect(prompt).toContain("On the first run, use one hour ago and nothing pending.");
 
     // Only creation fires: an older ticket that's edited or starts matching later doesn't.
     expect(prompt).toContain(
@@ -622,6 +730,29 @@ describe("renderTriggerPrompt", () => {
     expect(prompt).toContain(
       `-f q='repo:acme/app is:issue label:"won'\\''t fix" created:>=<that time>' -f sort=created`,
     );
+  });
+
+  it("checks repository access in both the GitHub manager and worker instructions", () => {
+    const prompt = renderTriggerPrompt(
+      "github",
+      fields({ event: "issue", scope: "acme/app" }),
+      CTX,
+    );
+    const parts = splitTriggerPrompt(prompt);
+    expect(parts.userPrompt).toBe(fields().instructions);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+    const [manager, worker] = prompt.split("Instructions for each session:\n");
+    for (const instructions of [manager, worker]) {
+      expect(instructions).toContain("gh auth status --hostname github.com");
+      expect(instructions).toContain("gh auth token --hostname github.com --user <account>");
+      expect(instructions).toContain("scope its token to each gh command with GH_TOKEN");
+      expect(instructions).toContain("without printing or recording it");
+      expect(instructions).toContain("Do not use gh auth switch");
+      expect(instructions).toContain(
+        "If no configured account has access, report the blocker without attempting to grant access",
+      );
+      expect(instructions).toContain("do not treat an access failure as no matches");
+    }
   });
 
   it("builds the GitHub search from the repository, event and conditions", () => {

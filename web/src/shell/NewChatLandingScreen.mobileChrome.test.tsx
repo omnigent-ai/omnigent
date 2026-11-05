@@ -171,6 +171,7 @@ describe("NewChatLandingScreen keyboard behaviour", () => {
 
     expect(document.activeElement).not.toBe(screen.getByTestId("new-chat-landing-input"));
     const header = screen.getByTestId("mobile-header-controls-slot");
+    expect(header).toHaveClass("no-drag", "pointer-events-auto");
     const host = screen.getByTestId("new-chat-landing-host-chip");
     const harness = await screen.findByTestId("new-chat-landing-agent-select");
     const composer = screen.getByTestId("new-chat-landing-composer");

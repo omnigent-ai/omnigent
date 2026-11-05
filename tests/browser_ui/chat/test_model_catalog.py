@@ -513,6 +513,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
         page.get_by_role("menuitem", name="Side chat", exact=True).click()
 
     picker = page.get_by_role("button", name="Side chat model and effort")
+    if mobile:
+        page.get_by_test_id("side-chat-input").focus()
     picker.click()
     page.get_by_test_id("side-chat-model-edit").click()
     page.get_by_role("menuitemcheckbox", name="Opus", exact=True).click()
@@ -549,6 +551,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
     )
     expect(picker).to_contain_text("Opus")
     expect(page.get_by_test_id("composer-config-gear")).to_contain_text("Sonnet")
+    if mobile:
+        page.get_by_test_id("side-chat-input").focus()
     picker.click()
     page.get_by_test_id("side-chat-model-edit").click()
     expect(page.get_by_role("menuitemcheckbox", name="Opus", exact=True)).to_have_attribute(

@@ -507,6 +507,7 @@
   .composer-add-menu [role="menuitem"].mobile-touch-target {
     @apply h-7 rounded-md px-2 py-[3px] text-ui leading-4;
     min-height: 28px;
+    @apply mobile-touch-target;
   }
 
   .composer-add-menu [role="menuitem"] svg {
@@ -777,6 +778,12 @@
 .composer-queued-surface {
   background-color: var(--composer-header-bg);
   background-image: none;
+}
+
+@media (width < 48rem) {
+  .composer-queued-surface {
+    --icon-container-default: 20px;
+  }
 }
 
 .composer-subagent-surface {
@@ -2310,19 +2317,9 @@ html[data-electron-mac] .breadcrumb-folder {
   animation: shimmer-sweep var(--shimmer-duration, 2s) linear infinite;
 }
 
-/* Otto working indicator: gentle bob + periodic blink (see OttoIcon.tsx).
+/* Otto working indicator: periodic blink (see OttoIcon.tsx).
  * Opt-in via .otto-working so the mascot can also render static. The global
- * reduced-motion gate below freezes both animations. */
-@keyframes otto-bob {
-  0%,
-  100% {
-    transform: translateY(5%);
-  }
-  50% {
-    transform: translateY(-5%);
-  }
-}
-
+ * reduced-motion gate below freezes the blink. */
 @keyframes otto-blink {
   0%,
   88%,
@@ -2333,10 +2330,6 @@ html[data-electron-mac] .breadcrumb-folder {
   92% {
     transform: scaleY(0.1);
   }
-}
-
-.otto-working {
-  animation: otto-bob 1.6s ease-in-out infinite;
 }
 
 .otto-working .otto-eye {

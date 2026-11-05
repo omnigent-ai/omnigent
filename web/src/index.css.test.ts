@@ -1061,30 +1061,24 @@ describe("index.css shadow tokens", () => {
   });
 });
 
-/* Regression test for the "mobile sidebar is see-through" bug.
- * Below md the sidebar overlays the chat, so both canvas rules are followed
- * by an opaque fill. */
-describe("index.css mobile sidebar opacity", () => {
+describe("index.css mobile sidebar transparency", () => {
   const mobileRule = cssSource.match(
-    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background-color[^}]*\}/,
+    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background:\s*transparent[^}]*\}/,
   )?.[0];
 
-  it("keeps an opaque fill for the mobile sidebar overlay", () => {
-    expect(mobileRule, "the mobile sidebar background-color rule is gone").toBeDefined();
-    expect(mobileRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+  it("keeps the drawer canvas transparent over its shared glass layer", () => {
+    expect(mobileRule).toBeDefined();
+    expect(mobileRule).toMatch(/background:\s*transparent !important/);
   });
 
-  it("declares it after both shared canvas rules so it wins the cascade", () => {
+  it("overrides the shared canvas after both theme rules", () => {
     const lightPalette = indexCssSource.indexOf(":root:not(.dark) .conversations-sidebar {");
     const darkPalette = indexCssSource.indexOf(".dark .omnigent-native-sidebar-surface,");
-    const mobile = cssSource.indexOf(mobileRule!);
+    const mobile = indexCssSource.indexOf(mobileRule!);
     expect(lightPalette).toBeGreaterThan(-1);
     expect(darkPalette).toBeGreaterThan(-1);
     expect(mobile).toBeGreaterThan(lightPalette);
     expect(mobile).toBeGreaterThan(darkPalette);
-    expect(mobileRule).toContain(":root:not([data-theme]) .conversations-sidebar");
-    expect(mobileRule).toContain(":root[data-theme] .conversations-sidebar");
-    expect(mobileRule).not.toContain(":not(.dark)");
     expect(generatedPaletteCssSource).not.toContain(".conversations-sidebar {");
   });
 });

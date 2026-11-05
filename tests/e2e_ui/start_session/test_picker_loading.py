@@ -53,6 +53,7 @@ async def _expect_pending(
         await expect(picker).to_be_enabled()
         await expect(picker).to_have_attribute("aria-busy", "true")
         await expect(loading).to_have_count(0)
+    await page.get_by_test_id("new-chat-landing-input").focus()
     permissions_loading = page.get_by_role("status", name="Loading permissions")
     permissions = page.get_by_test_id("new-chat-landing-permission-chip")
     if cached_label is None:

@@ -1545,12 +1545,8 @@ async def _drive_managed_repository_workspace_bar(
                 "aria-label", f"Sandbox repositories: {repo_name}"
             )
             repository_label = repository.locator("[data-workspace-collapse-label]")
-            if viewport_width == 390:
-                await expect(controls).to_have_attribute("data-labels", "collapsed")
-                await expect(repository_label).to_be_hidden()
-            else:
-                await expect(controls).not_to_have_attribute("data-labels", "collapsed")
-                await expect(repository_label).to_be_visible()
+            await expect(controls).not_to_have_attribute("data-labels", "collapsed")
+            await expect(repository_label).to_be_visible()
 
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")

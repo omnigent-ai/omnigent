@@ -31,7 +31,7 @@ export function MobileHeaderControlsSlot({ sessionId }: { sessionId: string | nu
       ref={registerTarget}
       data-session-id={sessionId}
       data-testid="mobile-header-controls-slot"
-      className="flex items-center empty:hidden max-md:gap-2"
+      className="no-drag pointer-events-auto flex items-center empty:hidden max-md:gap-2"
     />
   );
 }
