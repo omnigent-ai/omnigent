@@ -13365,6 +13365,20 @@ _WRAPPED_BTW_PANE = "\n".join(
 )
 
 
+_AGENT_PICKER_PANE = (
+    _composer_pane()
+    + "\n"
+    + "\n".join(
+        [
+            "  ↑/↓ to select",
+            "❯ ● main",
+            "  ◯ review-team:correctness  4m 0s",
+            "  ◯ review-team:performance  2m 26s",
+        ]
+    )
+)
+
+
 @pytest.mark.parametrize(
     ("occupied_pane", "after_preflight"),
     [
@@ -13379,6 +13393,8 @@ _WRAPPED_BTW_PANE = "\n".join(
         (_TASK_DETAILS_PANE, True),
         (_WRAPPED_BTW_PANE, False),
         (_WRAPPED_BTW_PANE, True),
+        (_AGENT_PICKER_PANE, False),
+        (_AGENT_PICKER_PANE, True),
     ],
     ids=[
         "reverse-search",
@@ -13392,6 +13408,8 @@ _WRAPPED_BTW_PANE = "\n".join(
         "task-details-after-preflight",
         "wrapped-quick-answer",
         "wrapped-quick-answer-after-preflight",
+        "agent-picker",
+        "agent-picker-after-preflight",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -13655,11 +13673,14 @@ def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
 
 
 @pytest.mark.parametrize("timeout_s", [0.0, 0.2, 5.0])
+@pytest.mark.parametrize(
+    "occupied_pane", [_TASK_DETAILS_PANE, _AGENT_PICKER_PANE], ids=["task-panel", "agent-picker"]
+)
 def test_wait_for_claude_prompt_ready_preserves_a_panel_that_will_not_close(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout_s: float
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout_s: float, occupied_pane: str
 ) -> None:
     """An ignored Escape preserves the terminal and cannot renew readiness's budget."""
-    sends = _fake_tmux(monkeypatch, [_TASK_DETAILS_PANE])
+    sends = _fake_tmux(monkeypatch, [occupied_pane])
     clock = _VirtualClock()
     monkeypatch.setattr(claude_native_bridge, "time", clock)
     expected_error = (
@@ -13713,6 +13734,7 @@ def test_wait_for_claude_prompt_ready_ignores_a_single_dialog_frame(
         _INLINE_REVERSE_SEARCH_PANE,
         _INLINE_REVERSE_SEARCH_NO_MATCH_PANE,
         _INLINE_REVERSE_SEARCH_WRAPPED_PANE,
+        _AGENT_PICKER_PANE,
     ],
     ids=[
         "shell-mode",
@@ -13720,6 +13742,7 @@ def test_wait_for_claude_prompt_ready_ignores_a_single_dialog_frame(
         "inline-reverse-search",
         "inline-reverse-search-no-match",
         "inline-reverse-search-wrapped",
+        "agent-picker",
     ],
 )
 def test_an_occupied_pane_never_reads_as_a_mounted_input_box(occupied_pane: str) -> None:
@@ -13775,6 +13798,21 @@ def test_search_chrome_in_the_transcript_does_not_read_as_occupying() -> None:
             "  ? for shortcuts",
         ]
     )
+    assert _occupying_surface(pane) is None
+    assert _claude_prompt_rendered(pane) is True
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _AGENT_PICKER_PANE + "\n" + _composer_pane(),
+        _composer_pane("↑/↓ to select\n❯ ● main\n  ◯ review-team:correctness"),
+        _composer_pane() + "\n  ↑/↓ to select\n❯ Other choice\n  Another choice",
+    ],
+    ids=["transcript-echo", "draft-text", "other-selection"],
+)
+def test_agent_picker_text_outside_its_footer_does_not_occupy_the_composer(pane: str) -> None:
+    """Navigation text in conversation content must not cause an Escape."""
     assert _occupying_surface(pane) is None
     assert _claude_prompt_rendered(pane) is True
 
@@ -13992,8 +14030,8 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
 
 @pytest.mark.parametrize(
     "occupied_pane",
-    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE],
-    ids=["search", "wrapped-quick-answer"],
+    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE, _AGENT_PICKER_PANE],
+    ids=["search", "wrapped-quick-answer", "agent-picker"],
 )
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
@@ -14566,9 +14604,15 @@ def test_inject_slash_command_sizes_the_dismissal_window_to_its_cap(
     assert clock.monotonic() <= 1.0 + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 4
 
 
+@pytest.mark.parametrize(
+    "transient_pane",
+    ["● Working on it", _AGENT_PICKER_PANE],
+    ids=["missing-composer", "agent-picker"],
+)
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    transient_pane: str,
 ) -> None:
     """
     A surface must be seen twice before an Escape is spent on it.
@@ -14583,7 +14627,7 @@ def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
     sends = _fake_tmux(
         monkeypatch,
         # One composer-less frame, then the live input box again.
-        ["● Working on it", _IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+        [transient_pane, _IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")

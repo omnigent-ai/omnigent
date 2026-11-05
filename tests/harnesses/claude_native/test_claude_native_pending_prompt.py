@@ -102,8 +102,13 @@ def test_decision_text_above_a_ready_composer_does_not_block_delivery(
     assert not bridge.has_pending_user_prompt(native_bridge)
 
 
+@pytest.mark.parametrize(
+    "pane",
+    ["Settings panel\nEscape to close", _COMPOSER + "\n↑/↓ to select\n❯ ● main\n◯ teammate"],
+    ids=["settings-panel", "agent-picker"],
+)
 def test_hook_that_parks_between_overlay_captures_prevents_escape(
-    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
     captures = 0
     sent = []
@@ -113,7 +118,7 @@ def test_hook_that_parks_between_overlay_captures_prevents_escape(
         captures += 1
         if captures == 2:
             _park_hook(native_bridge)
-        return "Settings panel\nEscape to close"
+        return pane
 
     monkeypatch.setattr(bridge, "_capture_pane", capture)
     monkeypatch.setattr(bridge, "_run_tmux", lambda *args: sent.append(args))

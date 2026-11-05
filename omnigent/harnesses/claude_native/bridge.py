@@ -464,6 +464,7 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 _OVERLAY_SURFACE = "an overlay"
 # What :func:`_occupying_surface` reports when the box is in ``!`` shell mode.
 _SHELL_MODE_SURFACE = "shell mode"
+_AGENT_PICKER_SURFACE = "the agent picker"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
 # has scrolled the box's glyph row out of view.
 _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
@@ -6678,6 +6679,8 @@ def _occupying_surface(pane: str) -> str | None:
         return None
     if _history_search_footer_shown(pane):
         return "the prompt-history search"
+    if _agent_picker_footer_shown(pane):
+        return _AGENT_PICKER_SURFACE
     row = _composer_row(pane)
     if row is None:
         box = _composer_box(pane)
@@ -6994,7 +6997,21 @@ def _claude_prompt_rendered(pane: str) -> bool:
     row = _composer_row(pane)
     if row is None or not row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return False
-    return not _history_search_footer_shown(pane)
+    return not (_history_search_footer_shown(pane) or _agent_picker_footer_shown(pane))
+
+
+def _agent_picker_footer_shown(pane: str) -> bool:
+    """Recognize Claude's navigation picker below the composer's closing rule."""
+    lines = [line.strip() for line in pane.splitlines() if line.strip()]
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    if last_rule is None:
+        return False
+    footer = lines[last_rule + 1 :]
+    return (
+        "↑/↓ to select" in footer
+        and any(re.fullmatch(r"(?:❯\s*)?[●◯○]\s+main", line) for line in footer)
+        and any(re.match(r"❯\s+[●◯○]\s+", line) for line in footer)
+    )
 
 
 def _history_search_footer_shown(pane: str) -> bool:
@@ -7375,8 +7392,13 @@ def _wait_for_claude_prompt_ready(
         if (
             bridge_dir is not None
             and remaining > 0
-            and _occupying_surface(pane) == _OVERLAY_SURFACE
-            and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+            and (
+                _occupying_surface(pane) == _AGENT_PICKER_SURFACE
+                or (
+                    _occupying_surface(pane) == _OVERLAY_SURFACE
+                    and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+                )
+            )
             and _terminal_dialog_headline(pane) is None
             and not _escape_quits_claude(pane)
         ):
