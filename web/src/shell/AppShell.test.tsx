@@ -2204,6 +2204,35 @@ describe("Sidebar across the md breakpoint", () => {
       });
   }
 
+  it("leaves the session without closing a selected file in a responsive-hidden rail", () => {
+    const resize = mockViewportWidth(1280);
+    let requestCloseTab: (() => void) | undefined;
+    const closeWindow = vi.fn();
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      setCloseTabSupported: vi.fn(),
+      onCloseTabRequest: (callback: () => void) => {
+        requestCloseTab = callback;
+        return () => {
+          requestCloseTab = undefined;
+        };
+      },
+      closeWindow,
+    });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc?file=README.md");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+
+    resize(740);
+    act(() => requestCloseTab?.());
+    expect(screen.getByText("home", { exact: true })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_abc").openFiles).toContain("README.md");
+    expect(closeWindow).not.toHaveBeenCalled();
+  });
+
   it("closes an open sidebar when the window narrows and reopens it on widening", () => {
     const resize = mockViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);

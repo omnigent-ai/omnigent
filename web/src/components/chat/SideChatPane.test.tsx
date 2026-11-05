@@ -166,6 +166,39 @@ describe("side-chat working indicator", () => {
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
   });
 
+  it.each([
+    { name: "after a reply", blocks: true },
+    { name: "with no visible bubbles", blocks: false },
+  ])("shows and announces the child's background tasks $name", ({ blocks }) => {
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        sessionStatus: "idle",
+        backgroundTaskCount: 2,
+        blocks: blocks
+          ? itemsToBlocks([
+              {
+                id: "started",
+                response_id: "turn_started",
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: "Started the build in the background." }],
+              },
+            ])
+          : [],
+      }),
+    );
+
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveTextContent(
+      "2 background tasks running",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("2 background tasks running");
+
+    act(() => conversationRegistry.acquire(childId).setState({ backgroundTaskCount: 0 }));
+    expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
+  });
+
   it("updates the working label from the child's own blocked state", () => {
     renderPane(<SideChatPane childId={childId} />);
 

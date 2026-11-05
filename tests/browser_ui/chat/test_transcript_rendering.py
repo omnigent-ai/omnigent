@@ -39,6 +39,33 @@ _INVALID_MERMAID = (
     "    Note over A,B: proceed once; do not call Save\n"
     "    A=>B: again\n```"
 )
+_LONG_LABEL_MERMAID = """\
+```mermaid
+flowchart LR
+  subgraph nonprod["Dev / staging account"]
+    G["dev-aws-…-general1-vector-aggregator-role"]
+    S["us-west-2-vector-aggregator-role (SMK)"]
+  end
+  subgraph audit["aws-audit (prod)"]
+    W["MeterletK8sSecflowLogsWriterDev"]
+    R["MeterletK8sSecflowLogsWriterDev-us-west-2"]
+  end
+  G -- AssumeRole --> W
+  S -- AssumeRole --> R
+  W -. "matches carve-out: no alert" .-> OK(("✓"))
+  R -. "target ARN not in carve-out: alert" .-> SOC(("SA ticket"))
+```"""
+# Text of every Mermaid label whose laid-out lines spill outside its foreignObject box.
+_CLIPPED_MERMAID_LABELS = """svg => [...svg.querySelectorAll('foreignObject')].flatMap(label => {
+    const box = label.getBoundingClientRect();
+    const range = document.createRange();
+    range.selectNodeContents(label);
+    const clipped = [...range.getClientRects()].some(line => line.width && line.height && (
+        line.left < box.left - 1 || line.right > box.right + 1
+        || line.top < box.top - 1 || line.bottom > box.bottom + 1
+    ));
+    return clipped ? [label.textContent.trim()] : [];
+})"""
 _POINTER_CONTEXTS = [
     pytest.param(
         True,
@@ -76,7 +103,7 @@ def test_message_font_size_survives_rotation_and_reload(
     saved_size: int | None,
     touch: bool,
 ) -> None:
-    """Built message CSS keeps touch prose stable while interface defaults follow layout."""
+    """Built message CSS follows the interface size through rotation and reload."""
     chat = chat_session_contract
     chat.set_items(
         [
@@ -111,15 +138,11 @@ def test_message_font_size_survives_rotation_and_reload(
             if reload:
                 page.reload()
             assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
-            interface_px = saved_size if saved_size is not None else (14 if width < 768 else 13)
-            message_px = (
-                (saved_size if saved_size is not None else 14) + 2
-                if touch or width < 768
-                else interface_px
-            )
+            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 13)
+            message_px = interface_px
             for element in prose:
                 expect(element).to_have_css("font-size", f"{message_px}px")
-            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.6:g}px")
+            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.8:g}px")
             for selector in ('[data-streamdown="inline-code"]', _CODE_BODY):
                 expect(assistant.locator(selector)).to_have_css(
                     "font-size", f"{message_px * 0.875:g}px"
@@ -136,7 +159,7 @@ def test_message_font_size_survives_rotation_and_reload(
 def test_large_message_fallback_keeps_message_font_size(
     page: Page, chat_session_contract: ChatSessionContract, touch: bool
 ) -> None:
-    """Assistant and expanded user fallbacks retain touch sizing and desktop defaults."""
+    """Message fallbacks follow the mobile body tier and desktop caption tier."""
     text = "Long prose. " * 5_000 + "VISIBLE_FALLBACK_TAIL"
     chat = chat_session_contract
     chat.set_items(
@@ -155,7 +178,8 @@ def test_large_message_fallback_keeps_message_font_size(
         for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
             fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
             expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
-            expect(fallback).to_have_css("font-size", "16px" if touch else "11.7px")
+            expected_px = (15 if width < 768 else 13) if touch else 12
+            expect(fallback).to_have_css("font-size", f"{expected_px}px")
 
 
 @pytest.mark.only_browser("chromium")
@@ -183,16 +207,13 @@ def test_custom_browser_font_default_matches_rendered_sizes_and_settings(
         assert not page.evaluate("matchMedia('(min-width: 48rem)').matches")
         assert not page.evaluate("matchMedia('(pointer: coarse)').matches")
         for selector in ('[data-role="user"] p', '[data-testid="assistant-text-section"] p'):
-            expect(page.locator(selector)).to_have_css("font-size", "16px")
+            expect(page.locator(selector)).to_have_css("font-size", "15px")
         expect(page.get_by_role("textbox", name="Message the agent", exact=True)).to_have_css(
-            "font-size", "14px"
+            "font-size", "15px"
         )
         page.goto(f"{chat.contract.base_url}/settings/appearance")
-        expect(page.get_by_test_id("ui-font-size-input")).to_have_value("14")
-        expect(page.get_by_test_id("ui-font-size-input")).to_have_css("font-size", "14px")
-        expect(
-            page.get_by_role("group", name="Interface font size", exact=True)
-        ).to_have_accessible_description("Interface 14px · Messages 16px")
+        expect(page.get_by_test_id("ui-font-size-input")).to_have_value("15")
+        expect(page.get_by_test_id("ui-font-size-input")).to_have_css("font-size", "15px")
         assert page.evaluate("localStorage.getItem('omnigent:ui-font-size')") is None
     finally:
         try:
@@ -315,17 +336,17 @@ def test_mermaid_fence_loads_its_chunk_and_renders_svg(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """The built SPA serves Mermaid's lazy chunk and renders a real diagram."""
+    """The built SPA serves Mermaid's lazy chunk and renders every label inside its box."""
     chat = chat_session_contract
-    _seed_assistant_message(
-        chat,
-        "```mermaid\nflowchart LR\n  A[Client] --> B[Server]\n```",
-    )
+    _seed_assistant_message(chat, _LONG_LABEL_MERMAID)
     page.goto(chat.url)
 
     block = page.locator('[data-streamdown="mermaid-block"]').first
     expect(block).to_be_visible(timeout=20_000)
-    expect(block.locator("svg[aria-roledescription]")).to_be_visible(timeout=20_000)
+    diagram = block.locator("svg[aria-roledescription]")
+    expect(diagram).to_be_visible(timeout=20_000)
+    page.evaluate("() => document.fonts.ready")
+    assert diagram.evaluate(_CLIPPED_MERMAID_LABELS) == []
 
 
 @pytest.mark.parametrize("diagram", ["semicolons", "separators", "invalid"])
@@ -1101,3 +1122,26 @@ def test_failed_edit_rows_show_their_error(
     expect(body.locator('[data-language="diff"]')).to_contain_text("+DEBUG = True")
     declined.click()
     expect(body.get_by_test_id("tool-error-box")).not_to_be_visible()
+
+
+def test_automation_context_is_hidden_from_transcript(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    from omnigent.server.scheduled.fire import UNATTENDED_RUN_NOTE
+
+    chat = chat_session_contract
+    chat.set_items(
+        [
+            message_item(
+                "automation-task",
+                "user",
+                f"Summarize **today's changes**.\n\n{UNATTENDED_RUN_NOTE}",
+                response_id="automation-turn",
+            )
+        ]
+    )
+    page.goto(chat.url)
+    user = page.locator('[data-role="user"]')
+    expect(user).to_contain_text("Summarize today's changes.")
+    expect(user).not_to_contain_text("no one is watching")
+    expect(user).not_to_contain_text("omnigent-automation-context")

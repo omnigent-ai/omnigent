@@ -3842,8 +3842,9 @@ async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> No
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
+    params = {"head_sha": "a" * 40, "base_sha": "b" * 40}
     resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes", params=params
     )
 
     assert resp.status_code == 200
@@ -3851,6 +3852,7 @@ async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> No
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes",
     ) in fake_runner.calls
+    assert params in fake_runner.get_params
 
 
 @pytest.mark.asyncio

@@ -880,6 +880,20 @@ server (see below), Connect, and you're in.
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
 
+### Close Tab shortcut
+
+Cmd/Ctrl+W closes the selected visible workspace tab in an ordinary conversation.
+File tabs confirm unsaved edits before closing; terminal and side-chat tabs use
+their existing close behavior. With no closable visible tab, it returns to the
+new-session page. Outside a conversation, including grid workspaces, it closes
+the window. Grid panels do not participate in this shortcut yet.
+Cmd/Ctrl+Shift+W always requests window closure.
+
+The web app and shell must both support the Close Tab bridge; older combinations
+keep the window-close behavior. Verify on each supported desktop OS with focus
+inside an embedded browser: Cmd/Ctrl+W must close only its tab, and
+Cmd/Ctrl+Shift+W must close the window.
+
 ### Test desktop updates
 
 To override the current version used by development update checks, launch the
