@@ -13,6 +13,7 @@ import string
 import time
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy import make_url
 from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
@@ -741,6 +742,36 @@ class TestSqlSessionPermission:
 
 
 class TestSqlComment:
+    def test_model_schema_bounds_anchor_bytes(self) -> None:
+        engine = sa.create_engine("sqlite://")
+        try:
+            SqlComment.__table__.create(engine)
+            with engine.begin() as connection:
+                connection.execute(
+                    SqlComment.__table__.insert().values(
+                        id="cccccccccccccccccccccccccccccc01",
+                        conversation_id="a9930027fd3e2e979e65844f7af7bf88",
+                        path="main.py",
+                        start_index=0,
+                        end_index=0,
+                        body="Review",
+                        status=encode_comment_status("draft"),
+                        created_at=0,
+                        updated_at=0,
+                    )
+                )
+                connection.execute(
+                    sa.text("UPDATE comments SET anchor_metadata = :value"),
+                    {"value": b"x" * 16_383},
+                )
+            with pytest.raises(IntegrityError), engine.begin() as connection:
+                connection.execute(
+                    sa.text("UPDATE comments SET anchor_metadata = :value"),
+                    {"value": b"x" * 16_384},
+                )
+        finally:
+            engine.dispose()
+
     def test_persist_and_read(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
