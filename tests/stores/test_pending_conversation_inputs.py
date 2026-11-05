@@ -410,7 +410,9 @@ def test_unsubmitted_claim_rollback_discards_input_when_stop_won(db_uri):
     assert store.list_pending_inputs(session.id) == []
 
 
-@pytest.mark.parametrize("successor", [None, "idle", "running", "waiting", "failed", "rebound"])
+@pytest.mark.parametrize(
+    "successor", [None, "idle", "running", "waiting", "failed", "rebound", "cancelled"]
+)
 def test_startup_failure_only_changes_the_original_idle_runner(db_uri, successor):
     store = SqlAlchemyConversationStore(db_uri)
     session = store.create_conversation()
@@ -419,10 +421,17 @@ def test_startup_failure_only_changes_the_original_idle_runner(db_uri, successor
     if successor == "rebound":
         store.replace_runner_id(session.id, uuid4().hex)
     elif successor is not None:
-        store.set_session_live_status(session.id, successor)
+        store.set_session_live_status(
+            session.id, "idle" if successor == "cancelled" else successor
+        )
     before = store.get_conversation(session.id)
     expected = successor in (None, "idle")
-    assert store.fail_session_startup(session.id, runner_id) is expected
+    assert (
+        store.fail_session_startup(
+            session.id, runner_id, cancelled=lambda: successor == "cancelled"
+        )
+        is expected
+    )
     after = store.get_conversation(session.id)
     assert after.runner_id == before.runner_id
     assert after.live_status == ("failed" if expected else before.live_status)

@@ -1334,6 +1334,7 @@ async def test_retained_startup_rebind_during_submission_claim_sends_nothing(
     ("race", "boundary"),
     [
         ("replacement", "failure_cas"),
+        ("retention", "failure_cas"),
         ("same_running", "failure_cas"),
         ("same_waiting", "failure_cas"),
         ("receipt", "failure_cas"),
@@ -1357,9 +1358,10 @@ async def test_retained_startup_failure_preserves_newer_outcomes(
     entry = _bind(env, session_id)
     original_runner, replacement_runner = uuid4().hex, uuid4().hex
     env.conv_store.replace_runner_id(session_id, original_runner)
-    env.conv_store.claim_pending_input_runner(
-        session_id, entry.id, runner_id=original_runner, deadline=time.time() + 120
-    )
+    if race != "retention":
+        env.conv_store.claim_pending_input_runner(
+            session_id, entry.id, runner_id=original_runner, deadline=time.time() + 120
+        )
     env.conv_store.set_session_live_status(session_id, "idle")
     sessions._session_status_cache[session_id] = "idle"
     transition, append = env.conv_store.transition_pending_input, env.conv_store.append
@@ -1379,6 +1381,13 @@ async def test_retained_startup_failure_preserves_newer_outcomes(
         injected = True
         if race == "replacement":
             env.conv_store.replace_runner_id(session_id, replacement_runner)
+        elif race == "retention":
+            assert (
+                env.conv_store.claim_pending_input_runner(
+                    session_id, entry.id, runner_id=original_runner, deadline=time.time() + 120
+                )
+                is not None
+            )
         elif race == "receipt":
             append(
                 session_id,
@@ -1434,6 +1443,13 @@ async def test_retained_startup_failure_preserves_newer_outcomes(
         assert not [
             item for item in env.conv_store.list_items(session_id).data if item.type == "error"
         ]
+
+    if race == "retention":
+        [pending] = env.conv_store.list_pending_inputs(session_id)
+        assert (
+            pending.status == "in_progress"
+            and pending.data.startup_options.runner_wait is not None
+        )
 
 
 async def test_retained_startup_connection_outlives_its_connect_deadline(
@@ -1491,3 +1507,71 @@ async def test_retained_startup_connection_outlives_its_connect_deadline(
         ]
     finally:
         await runner.aclose()
+
+
+@pytest.mark.parametrize("repeat_cancel", [False, True])
+async def test_stop_retires_a_dispatched_startup_failure_write(
+    startup_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    repeat_cancel: bool,
+) -> None:
+    import threading
+    import time
+
+    from omnigent.server.routes import sessions
+    from tests._helpers.polling import poll_until_async
+
+    env = startup_env
+    session_id = await _create(env)
+    entry = _bind(env, session_id)
+    runner_id = uuid4().hex
+    env.conv_store.replace_runner_id(session_id, runner_id)
+    env.conv_store.claim_pending_input_runner(
+        session_id, entry.id, runner_id=runner_id, deadline=time.time() + 120
+    )
+    env.conv_store.set_session_live_status(session_id, "idle")
+    sessions._session_status_cache[session_id] = "idle"
+    entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+    failure_write = env.conv_store.fail_session_startup
+    cancellation: list[Any] = []
+
+    def blocked_write(*args: Any, **kwargs: Any) -> bool:
+        cancellation.append(kwargs.get("cancelled"))
+        entered.set()
+        try:
+            assert release.wait(5)
+            return failure_write(*args, **kwargs)
+        finally:
+            drained.set()
+
+    monkeypatch.setattr(env.conv_store, "fail_session_startup", blocked_write)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._evaluate_input_policy",
+        AsyncMock(side_effect=RuntimeError("synthetic policy refusal")),
+    )
+    startup = env.app.state.startup_inputs
+    delivery = asyncio.create_task(startup._deliver(env.app, session_id, entry))
+    stop = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        stop = asyncio.create_task(startup.cancel(session_id))
+        await poll_until_async(
+            lambda: (
+                stop.done()
+                or (bool(cancellation) and cancellation[0] is not None and cancellation[0]())
+            ),
+            timeout_s=3,
+        )
+        if repeat_cancel:
+            delivery.cancel()
+        release.set()
+        await asyncio.wait_for(stop, 3)
+        assert await asyncio.to_thread(drained.wait, 3)
+        assert env.conv_store.get_conversation(session_id).live_status == "idle"
+        assert env.conv_store.list_pending_inputs(session_id) == []
+    finally:
+        release.set()
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+        if stop is not None:
+            await asyncio.gather(stop, return_exceptions=True)

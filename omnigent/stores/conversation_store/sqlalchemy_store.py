@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
@@ -116,6 +116,7 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    PendingRunnerWaitCheck,
     ProfileHostBinding,
     SessionActivity,
     SessionConnectivity,
@@ -2320,7 +2321,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         expected: str,
         status: str | None,
-        expected_runner_wait: StartupRunnerWait | None = None,
+        expected_runner_wait: StartupRunnerWait
+        | PendingRunnerWaitCheck
+        | None = PendingRunnerWaitCheck.UNCHECKED,
         rollback: bool = False,
     ) -> bool:
         if rollback and (expected != "incomplete" or status != "in_progress"):
@@ -2329,14 +2332,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         if original is None or original.status != encode_item_status(expected):
             return False
         encoded = original.data
-        needs_payload_check = expected_runner_wait is not None
+        needs_payload_check = expected_runner_wait is not PendingRunnerWaitCheck.UNCHECKED
         if needs_payload_check or (expected == "failed" and status == "in_progress"):
             [decoded] = self._decode_item_data_batch([original.data])
             data = _to_item(original, decoded).data
             if not isinstance(data, (MessageData, SlashCommandData)):
                 return False
             options = data.startup_options or StartupInputOptions()
-            if expected_runner_wait is not None and options.runner_wait != expected_runner_wait:
+            if needs_payload_check and options.runner_wait != expected_runner_wait:
                 return False
             if (
                 expected == "failed"
@@ -4262,28 +4265,28 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_session_live_status", write)
 
-    def fail_session_startup(self, conversation_id: str, runner_id: str) -> bool:
-        """Fail an idle/unset session only while its retained runner still owns it."""
+    def fail_session_startup(
+        self, conversation_id: str, runner_id: str, *, cancelled: Callable[[], bool] | None = None
+    ) -> bool:
+        """Fail only the retained idle runner while its failure write is still authorized."""
 
         def write(session: Session) -> bool:
-            result = cast(
-                _RowCountResult,
-                session.execute(
-                    update(SqlConversationMetadata)
-                    .where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.id == conversation_id,
-                        SqlConversationMetadata.runner_id == runner_id,
-                        or_(
-                            SqlConversationMetadata.live_status.is_(None),
-                            SqlConversationMetadata.live_status
-                            == encode_session_live_status("idle"),
-                        ),
-                    )
-                    .values(live_status=encode_session_live_status("failed"))
-                ),
+            query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
             )
-            return result.rowcount > 0
+            if self._meta_supports_for_update:
+                query = query.with_for_update()
+            meta = session.scalar(query)
+            if (
+                (cancelled is not None and cancelled())
+                or meta is None
+                or meta.runner_id != runner_id
+                or meta.live_status not in (None, encode_session_live_status("idle"))
+            ):
+                return False
+            meta.live_status = encode_session_live_status("failed")
+            return True
 
         return run_write_transaction(self._session_immediate, "fail_session_startup", write)
 

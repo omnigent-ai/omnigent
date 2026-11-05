@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import threading
 import time
 import weakref
 from collections.abc import Callable, Coroutine
@@ -43,6 +44,7 @@ from omnigent.stores.conversation_store import (
     STARTUP_LABEL,
     ConversationNotFoundError,
     ConversationStore,
+    PendingRunnerWaitCheck,
 )
 from omnigent.stores.host_store import host_is_live
 
@@ -753,7 +755,9 @@ class ManagedStartupInputs:
         failure_id: str,
         message: str,
         *,
-        expected_runner_wait: StartupRunnerWait | None = None,
+        expected_runner_wait: StartupRunnerWait
+        | PendingRunnerWaitCheck
+        | None = PendingRunnerWaitCheck.UNCHECKED,
         require_failed_input: bool = True,
     ) -> None:
         """Record a startup failure in the transcript and the session's status."""
@@ -779,12 +783,11 @@ class ManagedStartupInputs:
                 current is not None
                 and current.response_id == PENDING_INPUT_RESPONSE_ID
                 and current.status == "failed"
-                and options is not None
-                and options.runner_wait == expected_runner_wait
+                and (options.runner_wait if options else None) == expected_runner_wait
             )
 
         if (
-            expected_runner_wait is not None
+            expected_runner_wait is not PendingRunnerWaitCheck.UNCHECKED
             and require_failed_input
             and not await still_failed_input()
         ):
@@ -806,16 +809,41 @@ class ManagedStartupInputs:
                 )
             ],
         )
-        if expected_runner_wait is not None:
+        if expected_runner_wait is None:
+            # This refusal owns an input but has no evidence authorizing a runtime status change.
+            return
+        if isinstance(expected_runner_wait, StartupRunnerWait):
             if (
                 (require_failed_input and not await still_failed_input())
                 or _session_status_cache.get(session_id) in {"running", "waiting"}
                 or _session_active_response_cache.get(session_id) is not None
             ):
                 return
-            if not await asyncio.to_thread(
-                self.conversations.fail_session_startup, session_id, expected_runner_wait.runner_id
-            ):
+            abandoned = threading.Event()
+            settlement = asyncio.create_task(
+                asyncio.to_thread(
+                    self.conversations.fail_session_startup,
+                    session_id,
+                    expected_runner_wait.runner_id,
+                    cancelled=abandoned.is_set,
+                )
+            )
+            try:
+                applied = await asyncio.shield(settlement)
+            except asyncio.CancelledError:
+                abandoned.set()
+                # Stop must retire and drain a thread that may already be waiting on a DB lock.
+                while not settlement.done():
+                    try:
+                        await asyncio.shield(settlement)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:  # noqa: BLE001 -- preserve Stop cancellation after cleanup
+                        break
+                raise
+            finally:
+                abandoned.set()
+            if not applied:
                 return
             current = await asyncio.to_thread(self.conversations.get_conversation, session_id)
             if (
@@ -832,7 +860,7 @@ class ManagedStartupInputs:
             session_id,
             "failed",
             failure_origin="startup_input_failed",
-            persist_live_status=expected_runner_wait is None,
+            persist_live_status=expected_runner_wait is PendingRunnerWaitCheck.UNCHECKED,
         )
 
     async def shutdown(self) -> None:
