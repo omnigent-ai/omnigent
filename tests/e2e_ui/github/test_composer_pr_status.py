@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e_ui.conftest import stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO
@@ -87,6 +87,7 @@ def test_composer_pr_status_preview(
     if not touch:
         indicator.hover()
         expect(preview).to_be_visible()
+        _open_previewed_pull_request(page, preview, "acme/app #44", pull_requests[3]["url"])
         page.mouse.move(0, 0, steps=10)
         expect(preview).to_be_hidden()
 
@@ -95,11 +96,15 @@ def test_composer_pr_status_preview(
     composer.press("Shift+Tab")
     expect(indicator).to_be_focused()
     expect(preview).to_be_visible()
-    preview_id = preview.get_attribute("id")
-    assert preview_id
-    expect(indicator).to_have_attribute("aria-describedby", preview_id)
+    description_id = indicator.get_attribute("aria-describedby")
+    assert description_id
+    expect(page.locator(f'[id="{description_id}"]')).to_have_attribute("role", "tooltip")
+    expect(indicator).to_have_accessible_description(
+        re.compile(r"acme/app #44, Merge conflicts, Resolve composer layout\. acme/app #43")
+    )
     rows = preview.get_by_role("listitem")
     expect(rows).to_have_count(4)
+    expect(preview.get_by_role("link", name=re.compile(r"in a new tab$"))).to_have_count(4)
     assert rows.evaluate_all("rows => rows.map(row => row.dataset.prStatus)") == [
         "conflict",
         "ready",
@@ -114,7 +119,8 @@ def test_composer_pr_status_preview(
     ):
         expect(row).to_contain_text(title)
         expect(row.get_by_text(label, exact=True)).to_be_visible()
-        expect(row.locator("svg")).to_have_count(1)
+        expect(row.locator(":scope > svg")).to_have_count(1)
+        expect(row.get_by_role("link")).to_have_attribute("target", "_blank")
     box = preview.bounding_box()
     assert box and box["x"] >= 16 and box["x"] + box["width"] <= viewport_width - 16
     page.screenshot(path=tmp_path / "composer-pr-preview.png", animations="disabled")
@@ -140,3 +146,23 @@ def test_composer_pr_status_preview(
         indicator.hover()
         expect(preview).to_be_visible()
         page.screenshot(path=tmp_path / "composer-pr-panel-preview.png", animations="disabled")
+
+
+def _open_previewed_pull_request(page: Page, preview: Locator, identity: str, pr_url: str) -> None:
+    """Move from the PR chip into its preview and open one PR in a new tab."""
+    page.context.route(
+        pr_url,
+        lambda route: route.fulfill(content_type="text/html", body=f"<h1>{identity}</h1>"),
+    )
+    open_link = preview.get_by_role("link", name=f"Open {identity} in a new tab")
+    open_link.hover()
+    expect(preview).to_be_visible()
+    with page.context.expect_page() as popup_info:
+        open_link.click()
+    popup = popup_info.value
+    expect(popup).to_have_url(pr_url)
+    expect(popup.get_by_role("heading", name=identity)).to_be_visible()
+    popup.close()
+    # The link opens the PR without also opening the Pull Requests tab.
+    expect(preview).to_be_visible()
+    expect(page.get_by_role("list", name="Pull requests", exact=True)).to_have_count(0)

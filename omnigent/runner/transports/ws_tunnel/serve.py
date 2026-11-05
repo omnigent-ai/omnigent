@@ -1372,8 +1372,8 @@ async def _serve_tunnel_once(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
                             )
-                            # Only the idle watchdog sets shutdown_event; tell the
-                            # server this exit attests no active work.
+                            # Only idle exits (idle watchdog, or a hung-up host's
+                            # finished work) set shutdown_event: attest no active work.
                             await ws.close(code=1000, reason=RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)
                             break
                         try:

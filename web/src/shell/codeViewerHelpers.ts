@@ -529,7 +529,7 @@ function scriptEnd(html: string, from: number): number {
  * anything still open at end of input swallows the rest, as in the parser. The
  * scan only moves forward because artifact text is processed on the host page.
  */
-function startTagEnd(html: string, tag: "head" | "html"): number {
+export function startTagEnd(html: string, tag: "head" | "html"): number {
   for (let i = html.indexOf("<"); i !== -1; i = html.indexOf("<", i)) {
     if (html.startsWith("<!--", i)) {
       // An empty comment may close abruptly (`<!-->`, `<!--->`); otherwise `-->` or `--!>` ends it.

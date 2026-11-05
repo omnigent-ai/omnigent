@@ -267,6 +267,12 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => Promise<{ ok: boolean; error?: string }>;
   /** Clear native key interception when the recent-session gesture was declined. */
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
+  /** Subscribe to the shell's Close Tab (CmdOrCtrl+W); returns an unsubscribe. */
+  onCloseTabRequest?: (callback: () => void) => () => void;
+  /** Opt in to handling Close Tab; without it the shell closes the window. */
+  setCloseTabSupported?: (supported: boolean) => void;
+  /** Close this window. */
+  closeWindow?: () => void;
   /**
    * Inspect the local Google Chrome profiles for cookies in the site tree the
    * conversation's view is on. Metadata only (profile + per-scope counts): no
@@ -662,6 +668,43 @@ export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
     await electron.browserCancelRecentSessionSwitch();
   } catch (err) {
     console.warn("[nativeBridge] browser recent-session cancellation failed:", err);
+  }
+}
+
+/**
+ * Subscribe to the desktop shell's Close Tab (CmdOrCtrl+W). Subscribing also
+ * tells the shell this page handles it; unsubscribing hands it back, so the
+ * shell's plain window close applies again. A no-op off-shell and on shells
+ * that predate the bridge, which keep closing the window themselves.
+ */
+export function onCloseTabRequest(callback: () => void): () => void {
+  const electron = electronApi();
+  if (!electron?.onCloseTabRequest || !electron.setCloseTabSupported) return () => {};
+  let unsubscribe: (() => void) | undefined;
+  try {
+    unsubscribe = electron.onCloseTabRequest(callback);
+    electron.setCloseTabSupported(true);
+    const off = unsubscribe;
+    return () => {
+      try {
+        electron.setCloseTabSupported?.(false);
+      } finally {
+        off();
+      }
+    };
+  } catch (err) {
+    unsubscribe?.();
+    console.warn("[nativeBridge] close-tab subscription failed:", err);
+    return () => {};
+  }
+}
+
+/** Ask the desktop shell to close this window. A no-op outside Electron. */
+export function closeNativeWindow(): void {
+  try {
+    electronApi()?.closeWindow?.();
+  } catch (err) {
+    console.warn("[nativeBridge] close window failed:", err);
   }
 }
 

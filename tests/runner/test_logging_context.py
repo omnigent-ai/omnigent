@@ -6,7 +6,9 @@ import httpx
 import pytest
 
 from omnigent import debug_logging as dl
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.runner import create_runner_app
+from omnigent.scheduled_context import add_scheduled_run_header, scheduled_run_scope
 from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.helpers import NullServerClient
 
@@ -26,22 +28,44 @@ async def test_runner_request_overrides_primary_and_logs_failed_init(
         logging.getLogger("omnigent.runner.test").info("child probe")
         return {"id": session_id}
 
+    scheduled = ScheduledRunLogContext(
+        task_id="task",
+        run_id="run",
+        task_workspace_id=7,
+        scheduled_at=1000,
+        trigger_key="schedule:1000",
+        target="connected_host",
+        session_mode="continue",
+    )
     with capture_debug_rows("runner") as rows:
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://runner",
+            event_hooks={"request": [add_scheduled_run_header]},
         ) as client:
-            response = await client.post(
-                "/v1/sessions", json={"session_id": "child", "agent_id": agent_id}
-            )
+            with scheduled_run_scope(scheduled):
+                response = await client.post(
+                    "/v1/sessions", json={"session_id": "child", "agent_id": agent_id}
+                )
             assert response.status_code == 501
             probe_response = await client.get("/v1/sessions/child/logging-probe")
             assert probe_response.status_code == 200
         logging.getLogger("omnigent.runner.test").info("process probe")
     failure = next(row for row in rows if row["event_name"] == "runner_session_init_failed")
     assert failure["session_id"] == "child"
+    assert failure["attributes"]["run_id"] == "run"
+    assert failure["attributes"]["task_id"] == "task"
     assert failure["attributes"]["runner_id"] == "runner_parent"
     assert failure["attributes"]["status_code"] == "501"
     assert failure["attributes"]["error_code"] == "not_implemented"
     assert next(row for row in rows if row["message"] == "child probe")["session_id"] == "child"
     assert next(row for row in rows if row["message"] == "process probe")["session_id"] == "parent"
     assert not any(row["event_name"] == "runner_session_initialized" for row in rows)
+
+    assert (
+        "run_id" not in next(row for row in rows if row["message"] == "child probe")["attributes"]
+    )
+    assert (
+        "run_id"
+        not in next(row for row in rows if row["message"] == "process probe")["attributes"]
+    )
