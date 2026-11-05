@@ -23017,21 +23017,55 @@ describe("a send cut off by a reload", () => {
   });
 
   it.each([
-    { holding: "another file", file: new File(["notes"], "notes.txt"), named: true },
-    { holding: "the file itself", file: new File(["png"], "chart.png"), named: false },
+    {
+      holding: "another file",
+      attached: [["chart.png"]],
+      file: new File(["notes"], "notes.txt"),
+      notice: "Attach chart.png again before you resend.",
+    },
+    {
+      holding: "the file itself",
+      attached: [["chart.png"]],
+      file: new File(["png"], "chart.png"),
+      notice: null,
+    },
+    {
+      holding: "one file for two of that name",
+      attached: [["image.png", "image.png"]],
+      file: new File(["png"], "image.png"),
+      notice: "Attach image.png and image.png again before you resend.",
+    },
+    {
+      holding: "the file a later input needs",
+      attached: [["chart.png", "photo.png"], ["chart.png"]],
+      file: new File(["png"], "chart.png"),
+      notice: "Attach chart.png and photo.png again before you resend.",
+    },
   ])(
     "names a reload's failed startup file on Retry unless the draft holds it, holding $holding",
-    async ({ file, named }) => {
+    async ({ attached, file, notice }) => {
       onTestFinished(clearSessionDrafts);
       seedSession("conv_reload", []);
       failManagedLaunch("conv_reload", "saved on server");
-      const [input] = sessionFailedInputs.get("conv_reload")!;
-      input!.content.push({ type: "input_image", file_id: "file_chart", filename: "chart.png" });
+      const inputs = sessionFailedInputs.get("conv_reload")!;
+      if (attached.length > 1)
+        inputs.push({
+          pending_id: "pending_second",
+          content: [{ type: "input_text", text: "and this" }],
+        });
+      for (const [index, filenames] of attached.entries())
+        for (const filename of filenames)
+          inputs[index]!.content.push({
+            type: "input_image",
+            file_id: `file_${filename}`,
+            filename,
+          });
+      const text = attached.length > 1 ? "saved on server\n\nand this" : "saved on server";
       // A reload keeps the draft's text and ids, not its files.
       setSessionDraft("conv_reload", {
-        text: "saved on server",
+        text,
         files: [],
-        ...composerHoldsFirstInput,
+        startupInputIds: inputs.map((input) => input.pending_id),
       });
       let readFails = true;
       fetchMock.mockImplementation((request, init) =>
@@ -23048,16 +23082,14 @@ describe("a send cut off by a reload", () => {
           expect.objectContaining({ code: STARTUP_INPUT_LOOKUP_FAILED_CODE }),
         ]),
       );
-      // The file attached before Retry stands in only for an attachment of its name.
+      // The file attached before Retry stands in for one attachment of its name.
       setSessionDraft("conv_reload", { ...getSessionDraft("conv_reload")!, files: [file] });
       readFails = false;
       await retryFailedStartupLookup("conv_reload");
       expect(useChatStore.getState().failedSendDraft).toBeNull();
-      expect(getSessionDraft("conv_reload")?.text).toBe("saved on server");
+      expect(getSessionDraft("conv_reload")?.text).toBe(text);
       expect(notices()).toEqual(
-        named
-          ? [expect.objectContaining({ message: "Attach chart.png again before you resend." })]
-          : [],
+        notice === null ? [] : [expect.objectContaining({ message: notice })],
       );
     },
   );

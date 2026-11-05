@@ -8288,24 +8288,25 @@ function startupInputText(input: PendingInput): string {
     .join("\n");
 }
 
-/** Those of `ids` whose input has an attachment no file in `files` shares a name with. */
+/** Those of `ids` whose input has an attachment that no file left in `files` shares a name with. */
 function missingFilesIn(
   inputs: readonly PendingInput[],
   ids: readonly string[],
   files: readonly File[] = [],
 ): string[] {
-  const names = new Set(files.map(attachmentFilename));
-  return ids.filter((id) =>
-    inputs.some(
-      (input) =>
-        input.pendingId === id &&
-        input.content.some(
-          (block) =>
-            (block.type === "input_image" || block.type === "input_file") &&
-            (block.filename === undefined || !names.has(block.filename)),
-        ),
-    ),
-  );
+  // Each file stands in for one attachment; an input still missing one takes none.
+  let unmatched = files.map(attachmentFilename);
+  return [...new Set(ids)].filter((id) => {
+    const left = [...unmatched];
+    for (const block of inputs.find((input) => input.pendingId === id)?.content ?? []) {
+      if (block.type !== "input_image" && block.type !== "input_file") continue;
+      const at = block.filename === undefined ? -1 : left.indexOf(block.filename);
+      if (at === -1) return true;
+      left.splice(at, 1);
+    }
+    unmatched = left;
+    return false;
+  });
 }
 
 /** A notice naming the failed startup inputs' attachments, or `null` without any. */
