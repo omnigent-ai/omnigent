@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -15,6 +17,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.harnesses.claude_native.bridge import managed_mcp_relay_entry
 from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
 from tests._helpers.live_server import reserve_port
@@ -328,3 +331,128 @@ def test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session(
                 )
             except AssertionError:
                 pytest.fail("the session never reached the MCP server signed in after it started")
+
+
+def _deployable_managed_mcp_path() -> Path:
+    """The platform's real managed-mcp.json, which the CLI reads from no other place."""
+    if os.environ.get("OMNIGENT_TEST_CLAUDE_MANAGED_MCP") != "1":
+        pytest.skip(
+            "deploys a machine-wide managed-mcp.json; set OMNIGENT_TEST_CLAUDE_MANAGED_MCP=1"
+        )
+    # Spelled out: the suite's autouse fixture empties the managed chain in this process.
+    managed_dir = (
+        "/Library/Application Support/ClaudeCode"
+        if sys.platform == "darwin"
+        else "/etc/claude-code"
+    )
+    path = Path(managed_dir) / "managed-mcp.json"
+    if os.path.exists(path):
+        pytest.skip(f"{path} already exists")
+    if not os.access(path.parent, os.W_OK):
+        pytest.skip(f"{path.parent} is not writable")
+    return path
+
+
+@pytest.mark.timeout(900)
+def test_claude_sdk_session_under_managed_mcp_config_keeps_omnigent_tools(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
+    if shutil.which("claude") is None:
+        pytest.skip("needs the claude CLI")
+    managed = _deployable_managed_mcp_path()
+    uid = uuid.uuid4().hex[:6]
+    first, second = f"TURNONE-{uid}", f"TURNTWO-{uid}"
+    # Claude Code would refuse to start had the session passed --mcp-config, and a
+    # reply that needs the Omnigent tool proves the relay entry delivered it.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"tool_calls": [{"call_id": f"info-{uid}", "name": _SESSION_TOOL, "arguments": "{}"}]},
+            *[{"text": "ack one"}] * 4,
+        ],
+        key=first,
+        match=first,
+        required_tools=[_SESSION_TOOL],
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"tool_calls": [{"call_id": f"read-{uid}", "name": _NOTE_TOOL, "arguments": "{}"}]},
+            *[{"text": "turn two finished"}] * 4,
+        ],
+        key=second,
+        match=second,
+        required_tools=[_SESSION_TOOL],
+    )
+    home = tmp_path / "host" / "home"
+    (home / ".omnigent").mkdir(parents=True)
+    # Claude Code loads no user server while the managed file exists, so /mcp hides it.
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"personal": {"type": "http", "url": "https://p.test/mcp"}}})
+    )
+    with _SignInGate() as gate, contextlib.ExitStack() as cleanup:
+        managed.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "omnigent": managed_mcp_relay_entry(),
+                        _USER_SERVER: {"type": "http", "url": gate.url},
+                    }
+                }
+            )
+        )
+        cleanup.callback(managed.unlink)
+        _write_auth_status(home, _USER_SERVER, "sign_in_required")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        with (
+            httpx.Client(base_url=live_server, timeout=30) as client,
+            isolated_host(
+                tmp_path / "host",
+                live_server,
+                env=_HOST_ENV,
+                config=_host_config(mock_llm_server_url),
+                ready=lambda started: started.wait_online(client, timeout=120),
+            ) as host,
+            _claude_sdk_session(
+                client, mock_llm_server_url, f"sdk-managed-{uid}", host.host_id, workspace
+            ) as session_id,
+        ):
+            page = request.getfixturevalue("page")
+            _skip_imports_review(page, host.host_id)
+            page.goto(f"{live_server}/c/{session_id}")
+            _send(page, f"Say ack. {first}")
+            _wait_reply(page, "ack one")
+            items = client.get(f"/v1/sessions/{session_id}/items").json()
+            assert f'"session_id": "{session_id}"' in json.dumps(
+                [item for item in items["data"] if item.get("type") == "function_call_output"]
+            ).replace('\\"', '"')
+
+            page.get_by_label("Message the agent").fill("/mcp")
+            menu = page.get_by_test_id("mcp-server-menu")
+            row = menu.get_by_test_id(f"mcp-server-row-{_USER_SERVER}")
+            expect(row).to_contain_text("Sign-in required", timeout=15_000)
+            expect(menu.get_by_test_id("mcp-server-row-personal")).to_have_count(0)
+            expect(menu.get_by_test_id("mcp-server-row-omnigent")).to_have_count(0)
+
+            poll_until(lambda: gate.rejected, timeout_s=30)
+            gate.signed_in = True
+            _write_auth_status(home, _USER_SERVER, "connected")
+            expect(row).to_contain_text("Connected", timeout=20_000)
+            page.get_by_label("Message the agent").fill("")
+
+            _send(page, f"Read the note. {second}")
+            _wait_reply(page, "turn two finished")
+            try:
+                poll_until(
+                    lambda: (
+                        _NOTE_TEXT
+                        in json.dumps(client.get(f"/v1/sessions/{session_id}/items").json())
+                    ),
+                    timeout_s=15,
+                )
+            except AssertionError:
+                pytest.fail("the managed session never reached the server signed in mid-session")
