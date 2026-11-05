@@ -16,6 +16,7 @@ import {
   listScheduledTaskRuns,
   listScheduledTasks,
   listAutomationFailures,
+  runScheduledTaskNow,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -61,6 +62,20 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   setOmnigentHostConfig({});
+});
+
+describe("runScheduledTaskNow", () => {
+  it.each([
+    [{ triggered: true, id: "st_1", run_id: "run_1" }, "run_1"],
+    [{ triggered: true, id: "st_1" }, null],
+  ])("returns the run ID when the server provides one: %j", async (body, expected) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(body, { status: 202 }));
+    expect(await runScheduledTaskNow("st_1")).toBe(expected);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/scheduled-tasks/st_1/run",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
 });
 
 describe("listScheduledTasks", () => {

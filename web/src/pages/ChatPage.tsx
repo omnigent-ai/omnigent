@@ -55,6 +55,7 @@ import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdow
 import { useAppName } from "@/lib/branding";
 import { hasPendingOwnElicitation } from "@/lib/blocks";
 import { cn } from "@/lib/utils";
+import { isInlineRenameFocused } from "@/lib/inlineRename";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import {
   serverSwitcherHiddenForSurface,
@@ -157,7 +158,7 @@ export {
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
-  KeepBottomOnViewportResize,
+  KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
   SessionSharedContext,
@@ -205,7 +206,12 @@ import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
-import { isBrandHarness, useHostMcpServers, type HostMcpServer } from "@/hooks/useHarnessInventory";
+import {
+  INVENTORY_HARNESS_IDS,
+  isBrandHarness,
+  useHostMcpServers,
+  type HostMcpServer,
+} from "@/hooks/useHarnessInventory";
 import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import {
   getSessionHost,
@@ -2558,14 +2564,35 @@ function ComposerImpl(
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
   const mcpPanelRequested = composerSessionId !== null && value.trim() === "/mcp";
-  const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
-  const hostMcpHarness =
-    nativeMcpHarness !== undefined && isBrandHarness(nativeMcpHarness) ? nativeMcpHarness : null;
   const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
     composerSessionId === null ? null : getSessionHost(composerSessionId),
   );
   const hostMcpRoutingId =
     sessionRoutingHostId(composerSession?.hostId, composerSession?.labels) ?? inheritedHostId;
+  const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
+  // claude-sdk runs the Claude Code CLI, so on a host its /mcp lists the host's Claude servers.
+  const sdkHostMcpKey = hostMcpRoutingId !== null ? "claude" : undefined;
+  const hostMcpKey = sessionHarness === "claude-sdk" ? sdkHostMcpKey : nativeMcpHarness;
+  const hostMcpHarness = hostMcpKey !== undefined && isBrandHarness(hostMcpKey) ? hostMcpKey : null;
+  const { data: sessionAgent, isError: sessionAgentFailed } = useSessionAgent(composerSessionId);
+  // A claude-sdk session run without setting sources (`skills: none`) loads only managed
+  // servers; until the session's agent arrives, or if its request fails, list only those.
+  const hostUserServersLoaded =
+    sessionHarness !== "claude-sdk" ||
+    (!sessionAgentFailed &&
+      sessionAgent !== undefined &&
+      sessionAgent.loads_user_settings !== false);
+  let sdkAgentStatus: string | undefined;
+  if (sessionHarness === "claude-sdk" && sessionAgentFailed) {
+    sdkAgentStatus = "Couldn’t load this session’s agent, so only managed MCP servers are shown.";
+  } else if (sessionHarness === "claude-sdk" && sessionAgent === undefined) {
+    sdkAgentStatus = "Loading this session’s agent; only managed MCP servers are shown so far.";
+  }
+  const isSessionHostServer = useCallback(
+    (server: HostMcpServer) =>
+      server.harness === hostMcpHarness && (server.managed === true || hostUserServersLoaded),
+    [hostMcpHarness, hostUserServersLoaded],
+  );
   // Poll while a host server awaits sign-in: the user completes it elsewhere.
   const hostMcpQuery = useHostMcpServers(
     hostMcpRoutingId,
@@ -2573,12 +2600,11 @@ function ComposerImpl(
     useCallback(
       (servers: HostMcpServer[] | undefined) =>
         servers?.some(
-          (server) =>
-            server.harness === hostMcpHarness && server.auth_status === "sign_in_required",
+          (server) => isSessionHostServer(server) && server.auth_status === "sign_in_required",
         )
           ? HOST_MCP_SIGN_IN_POLL_MS
           : false,
-      [hostMcpHarness],
+      [isSessionHostServer],
     ),
   );
   const hostMcpStatus =
@@ -2590,9 +2616,12 @@ function ComposerImpl(
           ? "Loading MCP servers…"
           : hostMcpQuery.isError
             ? "Couldn’t load MCP servers from this session’s host."
-            : undefined;
+            : sdkAgentStatus;
+  const mcpSettingsHarness = nativeMcpHarness
+    ? sessionHarness
+    : hostMcpHarness && INVENTORY_HARNESS_IDS[hostMcpHarness];
   const mcpSettingsHref =
-    `/settings/harnesses${nativeMcpHarness ? `/${sessionHarness}` : ""}` +
+    `/settings/harnesses${mcpSettingsHarness ? `/${mcpSettingsHarness}` : ""}` +
     (hostMcpRoutingId ? `?host=${encodeURIComponent(hostMcpRoutingId)}` : "");
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
@@ -2817,7 +2846,8 @@ function ComposerImpl(
     // this to settle rather than mistaking that for "the user is typing".
     setSettledConversationId(conversationId ?? null);
     draftConversationIdRef.current = conversationId ?? null;
-    if (!isMobileRef.current) textareaRef.current?.focus();
+    // The store binds a clicked session a moment later; keep focus in a rename started meanwhile.
+    if (!isMobileRef.current && !isInlineRenameFocused()) textareaRef.current?.focus();
 
     return () => {
       if (!conversationId || !dirtyRef.current) return;
@@ -3421,30 +3451,28 @@ function ComposerImpl(
       .join(" ") || undefined;
   const mcpServers = useMemo(() => {
     const byName = new Map<string, McpServerRow>(
-      (hostMcpQuery.data ?? [])
-        .filter((server) => server.harness === hostMcpHarness)
-        .map((server) => [
-          server.name,
-          {
-            name: server.name,
-            description:
-              [server.plugin && `${server.plugin} plugin`, server.url_host]
-                .filter(Boolean)
-                .join(" · ") || undefined,
-            connection:
-              server.auth_status === "connected"
-                ? "connected"
-                : server.auth_status === "sign_in_required"
-                  ? "sign-in-required"
-                  : undefined,
-            // No URL means the state is still worth showing, with nothing to click.
-            // The scheme is enforced host-side and again at the frame decoder; this
-            // is the last gate before it becomes an href.
-            signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
-              ? { kind: "url", url: server.sign_in_url! }
-              : undefined,
-          },
-        ]),
+      (hostMcpQuery.data ?? []).filter(isSessionHostServer).map((server) => [
+        server.name,
+        {
+          name: server.name,
+          description:
+            [server.plugin && `${server.plugin} plugin`, server.url_host]
+              .filter(Boolean)
+              .join(" · ") || undefined,
+          connection:
+            server.auth_status === "connected"
+              ? "connected"
+              : server.auth_status === "sign_in_required"
+                ? "sign-in-required"
+                : undefined,
+          // No URL means the state is still worth showing, with nothing to click.
+          // The scheme is enforced host-side and again at the frame decoder; this
+          // is the last gate before it becomes an href.
+          signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
+            ? { kind: "url", url: server.sign_in_url! }
+            : undefined,
+        },
+      ]),
     );
     const catalogLoaded = !registryCatalog.loading && !registryCatalog.error;
     for (const server of selectedAgent?.mcp_servers ?? []) {
@@ -3476,7 +3504,7 @@ function ComposerImpl(
     return [...byName.values()];
   }, [
     hasRegistryServers,
-    hostMcpHarness,
+    isSessionHostServer,
     hostMcpQuery.data,
     registryCatalog.error,
     registryCatalog.loading,

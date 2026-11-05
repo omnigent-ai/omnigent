@@ -15,6 +15,27 @@ to customize.
   filter with no search; searches and Active/Paused filters hide the preview.
 - `create`: a gallery item or suggested automation opens integration setup;
   New automation opens a blank form.
+- `link-posting`: a checkbox below the trigger controls posting the session link
+  back to Jira, Slack, GitHub, or Linear. Sessions start whether it is checked or not.
+- `prompt-editing`: the detail page and edit dialog show Your prompt first. System
+  prompt starts collapsed, expands into a read-only preview, and requires Edit
+  system prompt to change it. Done editing system prompt returns to the read-only
+  preview without collapsing. Posting instructions for each session stay in the
+  worker instructions when their text changes. Saving preserves both parts;
+  reopening collapses and locks the system prompt again. Edit as prompt during creation uses the same
+  separation. Unrecognized or ambiguous prompt formats remain fully editable
+  as a single Prompt field. For a reused trigger session, **Edit worker instructions**
+  opens and focuses System prompt, or focuses the full Prompt when customization
+  prevents splitting. Clicking it again refocuses an already-open editor. Edits that remove the template signature or add
+  ambiguous section headings show a notice before saving as a single prompt.
+  Your prompt must contain text; clearing it shows a required-field message.
+  Explicitly clearing only the posting-rule body in System prompt is supported
+  and preserves the separate prompts when saved and reopened.
+  The detail page also keeps the system prompt collapsed by default, with a
+  bounded read-only preview when expanded; use Edit automation to change it.
+- `default-project`: new automations select Omnigent Automation. Saving reuses or
+  creates that project; canceling creates nothing. The project picker can choose
+  another project or remove the default. Editing preserves the saved project.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
   browsing again; saved paths and sandbox setup are preserved. When the default
@@ -29,7 +50,12 @@ to customize.
   when on, each new session starts in a fresh worktree from HEAD, and continuing
   runs reuse that session's worktree. Editing can turn it off again.
 - `harness-settings`: model, effort, and permission controls follow the selected
-  harness. Codex and Devin efforts follow the selected model; Pi exposes thinking
+  harness. The selector shares New Session's deployment restrictions, order,
+  and default agent; editing preserves a saved agent outside that list. Harness
+  selection, Advanced settings, and saving wait for deployment configuration,
+  including during the boot fallback. Sandbox choices do not inherit a connected
+  host's readiness badges.
+  Codex and Devin efforts follow the selected model; Pi exposes thinking
   levels. Connected hosts and sandboxes supply their own catalogs. Default keeps
   agent settings, and switching harnesses clears incompatible overrides. Catalogs
   are cached per server, user, target, and harness for reopening while offline.
@@ -38,11 +64,19 @@ to customize.
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
   failures still allow Default.
-- `capabilities`: Jira, Slack, and GitHub templates require session continuity
+- `schedule`: the shared modal supports ten-minute connected-host schedules in
+  either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
+- `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
-- `responsive`: gallery items have icons, descriptions, hourly polling summaries,
-  access requirements, pointer cursors, and keyboard focus indicators. Desktop
-  uses two columns; narrow screens use one.
+- `tools-note`: the form says which tools the agent needs where the task runs,
+  except on an Arclet sandbox, which already has them. Neither the template form
+  nor editing a task saved from one shows the Session choice; templates always
+  keep one session, and editing keeps only the reset to a new session.
+- `responsive`: gallery items have icons, descriptions, access requirements,
+  pointer cursors, and keyboard focus indicators; cadence is chosen in the form.
+  Host occupies a full row above Schedule. Project and Workspace (or Repository)
+  share a row on desktop and stack on narrow screens. Gallery cards use two
+  columns on desktop and one on narrow screens.
 
 ## How to get to it (user POV)
 
@@ -51,6 +85,8 @@ to customize.
 - **Your automations:** select a suggestion beneath the saved automations or
   empty-state message, with All selected and the search cleared.
 - **Creation modal:** click New automation on either tab to start from scratch.
+  With `automations_v2` on a server supporting sub-hour schedules, use Custom schedule → Minutes
+  for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
   preserve a continued session when the repository is unchanged or a legacy
@@ -65,11 +101,24 @@ to customize.
 
 Preconditions: enable session orchestration and scheduled-task session modes.
 Use the isolated environment and dismiss the first-visit introduction. The
-creation round-trip test supplies its own isolated host. No agent turn is needed.
+creation round-trip test supplies its own feature-enabled server and isolated
+host; run it with plain pytest and `--ui-skip-build` after building the SPA.
+No agent turn is needed.
+Minute-schedule checks use the server’s advertised sub-hour capability and `automations_v2`.
 
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`
   covers the preview and Templates tab with reload. It creates
   a Jira automation and cross-checks the hourly schedule and prompt through REST.
+  It edits the user prompt through the row menu and the system prompt through
+  the detail page, checks persistence through REST, and reopens the editor. The
+  preview entry runs at mobile width; the Templates entry runs at desktop width.
+- `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
+  covers new-session host creation, nine-minute rejection, reopening, and switching
+  to continuation while preserving ten minutes. In either edit entry point, also
+  select a sandbox with Continue in the same session: ten minutes is valid;
+  selecting New session each run blocks saving until the interval reaches sixty.
+  Repeat through the row menu and detail page. Without sub-hour support, the
+  editor keeps the hourly minimum and displays saved minute rules without rewriting them.
 - `web/src/pages/TasksPage.test.tsx` covers populated and empty lists, search and
   filter preservation, deep links with an embedded mount prefix, load failures,
   capability gating, and both creation buttons' paths.
@@ -78,15 +127,26 @@ creation round-trip test supplies its own isolated host. No agent turn is needed
   saved workspace, and sandbox creation with offline connected hosts. It also
   covers repository/default selections, legacy edits, target switching, and
   continued-session setting locks, plus Random worktree on/off in the shared modal.
+  Prompt coverage includes expansion before explicit editing, preserving the
+  system prompt on user-only edits, discarding canceled edits, and Edit as prompt.
 - `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
   uses its own built-SPA browser contract, with a synthetic provider catalog,
   to cover repository creation, replacement, clearing, and reopening on desktop
-  and mobile. It does not verify actual sandbox execution.
+  and mobile, plus deployment-curated harness choices in create and edit.
+  It does not verify actual sandbox execution.
 - In the creation modal, choose a connected host and Git repository, enable
   Random worktree, save, and reopen Edit to confirm it stayed enabled. Run twice
   with New session each run and check that the sessions have distinct worktree
   paths. Disable the option and run again: the new session uses the selected
   directory. With Continue in the same session, later runs reuse its worktree.
+- In any integration template, fill in the scope and session instructions, then
+  expand Preview prompt. Toggle the link checkbox below the trigger and check
+  that only the comment or reply step changes; sessions still start either way.
+  Hover, focus, or tap the warning icon beside Instructions for each session to
+  read the integration requirement;
+  Escape dismisses it without closing the modal. The source and link-posting
+  warnings stay visible in yellow below the instructions. The run limit and posting
+  attribution share one note below the instructions.
 - Manually repeat the three creation entry points at a narrow viewport, use
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the

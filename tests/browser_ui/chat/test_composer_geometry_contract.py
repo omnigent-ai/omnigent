@@ -242,6 +242,22 @@ def test_content_and_action_controls_follow_shared_inset_lines(
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])
+def test_long_draft_keeps_submit_visible_above_phone_keyboard(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    surface: str,
+) -> None:
+    """A capped draft scrolls inside the input while Send stays on screen."""
+    # The iOS shell sizes the app to the area above the docked keyboard.
+    viewport = {"width": 390, "height": 420}
+    _surface(page, chat_session_contract, surface, viewport)
+    _input(page, surface).fill("Lorem ipsum dolor sit amet " * 60)
+    submit = box(_submit(page, surface))
+    assert submit["y"] >= -TOLERANCE
+    assert submit["y"] + submit["height"] <= viewport["height"] + TOLERANCE
+
+
+@pytest.mark.parametrize("surface", ["landing", "live"])
 def test_label_collapse_preserves_submit_geometry(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -1179,6 +1195,7 @@ def test_composer_growth_reflows_without_covering_output(
         assert touch["settledScrollTop"] < touch["initialScrollTop"], touch
         assert "pointercancel" in touch["events"] and "scroll" in touch["events"], touch
         assert touch["events"].index("pointercancel") < touch["events"].index("scroll"), touch
+        assert touch["events"][-1] == "scrollend", touch
         touch_settled = settled_geometry(page)
         assert touch_settled["distanceFromBottom"] == pytest.approx(
             touch["settledDistance"], abs=8

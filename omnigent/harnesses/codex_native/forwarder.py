@@ -79,7 +79,11 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
-from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.native._native_supersession import (
+    clear_replacement_create_body,
+    post_clear_supersession,
+    unfiled_clear_replacement_body,
+)
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -297,6 +301,11 @@ _CODEX_RATE_LIMIT_ERROR = re.compile(r"(?<![\w-])429(?![\w-])|too many requests|
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
+_CODEX_OUTPUT_LIMIT_ERROR = "Incomplete response returned, reason: max_output_tokens"
+_CODEX_OUTPUT_LIMIT_HINT = (
+    "The model reached its response length limit. Ask it to continue or split "
+    "the request into smaller parts."
+)
 # Budget/quota exhaustion from the AI gateway: the gateway returns HTTP 403 +
 # PERMISSION_DENIED for these, which looks like auth to the generic checks —
 # it isn't. Re-authenticating cannot resolve a spending limit.
@@ -2739,13 +2748,10 @@ async def _create_thread_replacement_session(
     if CODEX_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
 
-    create_resp = await client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "labels": labels,
-        },
-    )
+    create_body = clear_replacement_create_body(old, agent_id=agent_id, labels=labels)
+    create_resp = await client.post("/v1/sessions", json=create_body)
+    if (unfiled_body := unfiled_clear_replacement_body(create_body, create_resp)) is not None:
+        create_resp = await client.post("/v1/sessions", json=unfiled_body)
     create_resp.raise_for_status()
     created = create_resp.json()
     new_session_id = created.get("id")
@@ -7494,6 +7500,8 @@ async def _post_turn_status_edge(
         if edge.error.is_auth:
             reauth_required = True
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
+        elif output == _CODEX_OUTPUT_LIMIT_ERROR:
+            output = f"{output}\n\n{_CODEX_OUTPUT_LIMIT_HINT}"
     await _post_status(
         client,
         session_id,

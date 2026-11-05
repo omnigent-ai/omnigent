@@ -48,7 +48,7 @@ import {
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
-  KeepBottomOnViewportResize,
+  KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
   WorkingIndicator,
@@ -155,6 +155,7 @@ function TranscriptImpl({
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const sandboxFailed = useChatStore((s) => s.sandboxStatus?.stage === "failed");
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
@@ -351,7 +352,8 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handler);
   }, [nav]);
 
-  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  const showWorkingIndicator =
+    !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   const arcaWarning = useArcaShutdownBanner();
   const showArcaBanner = arcaWarning.showForHost(hostId);
   const hasPinnedBanner = display.hasTasks || showArcaBanner;
@@ -385,14 +387,14 @@ function TranscriptImpl({
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
-            <KeepBottomOnViewportResize />
+            <KeepBottomOnResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader
               scrollElement={scroller?.el ?? null}
               rowCount={display.streamBubbles.length}
             />
             {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
-              sandboxLaunching ? (
+              sandboxLaunching || sandboxFailed ? (
                 <RunnerStartingIndicator variant="hero" />
               ) : (
                 <ConversationEmptyState>
@@ -441,7 +443,7 @@ function TranscriptImpl({
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
                 {showWorkingIndicator && <WorkingIndicator />}
-                {/* Managed-sandbox stage cue; only when Working is absent. */}
+                {/* Managed-sandbox launch status; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the
                 round settles (failures stay in host logs, not the chat). */}

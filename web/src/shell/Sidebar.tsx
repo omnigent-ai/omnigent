@@ -195,6 +195,7 @@ import { useActiveRootSessionId } from "@/hooks/useSession";
 import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { SidebarEditRow } from "./SidebarEditRow";
+import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -312,7 +313,6 @@ import {
 } from "./sidebarStyles";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
-import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 import {
   CompactShortcutKeys,
@@ -1056,8 +1056,9 @@ function SidebarImpl({
           tabIndex={effectiveOpen ? 0 : -1}
           aria-hidden={!effectiveOpen}
           className={cn(
-            "fixed inset-0 z-[45] bg-black/25 transition-opacity duration-200 ease-out md:hidden",
-            effectiveOpen ? "opacity-100" : "pointer-events-none opacity-0",
+            "fixed inset-0 z-[45] bg-black/25 transition-[opacity,visibility] duration-200 ease-out md:hidden",
+            // invisible: the macOS shell makes any rendered button a no-drag title-bar region.
+            effectiveOpen ? "opacity-100" : "pointer-events-none invisible opacity-0",
           )}
           style={dragging ? { opacity: liveDragProgress, transition: "none" } : undefined}
         />
@@ -3497,7 +3498,8 @@ function SectionHeader({
           />
         </span>
       ) : null}
-      <span className="min-w-0 truncate">{title}</span>
+      {/* Project folder names sit heavier than their session rows. */}
+      <span className={cn("min-w-0 truncate", icon && "font-medium")}>{title}</span>
       {/* Trailing chevron, rotating on expand. Headers without a leading icon
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}
@@ -5257,10 +5259,22 @@ function ConversationRowImpl({
   // double-click (an updated_at bump slides another row under the cursor),
   // and only a row that saw both clicks may enter rename.
   const recentClickTimesRef = useRef<number[]>([]);
+  // The rename shortcut edits this row, like its Rename menu item, while the
+  // row is on screen; otherwise the header title takes the edit.
+  const canRenameInline = isOwner && !isProvisionalRow && !selectionMode;
+  useEffect(() => {
+    if (!canRenameInline) return;
+    return registerSidebarRename(conversation.id, () => {
+      const row = rowRef.current;
+      if (!row?.isConnected || isInClosedSidebar(row)) return false;
+      if (!isEditing) setIsEditing(true);
+      return true;
+    });
+  }, [canRenameInline, conversation.id, isEditing]);
 
   if (isEditing) {
     return (
-      <li>
+      <li ref={rowRef}>
         <SidebarEditRow
           // Prefer the just-committed name so a rename reopened before the
           // prop catches up starts from what the row shows.
@@ -5697,10 +5711,7 @@ function ConversationRowImpl({
               (archive outranks pin), so there's no pin action even on hover. */}
               {!isArchived && (
                 <Tooltip disableHoverableContent>
-                  <TooltipContent>
-                    <TooltipArrow />
-                    {pinTooltip}
-                  </TooltipContent>
+                  <TooltipContent>{pinTooltip}</TooltipContent>
                   <TooltipTrigger asChild>
                     <Button
                       type="button"
@@ -5750,10 +5761,7 @@ function ConversationRowImpl({
               with an explanation. */}
               {isOwner && (
                 <Tooltip disableHoverableContent>
-                  <TooltipContent>
-                    <TooltipArrow />
-                    {isArchived ? "Unarchive" : "Archive"}
-                  </TooltipContent>
+                  <TooltipContent>{isArchived ? "Unarchive" : "Archive"}</TooltipContent>
                   <TooltipTrigger asChild>
                     <Button
                       type="button"

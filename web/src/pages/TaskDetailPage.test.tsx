@@ -14,6 +14,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskDetailPage } from "./TaskDetailPage";
+import {
+  emptyTriggerFields,
+  renderTriggerPrompt,
+  splitTriggerPrompt,
+} from "@/components/scheduled/triggerTemplates";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as hooks from "@/hooks/useScheduledTasks";
 import {
@@ -222,6 +227,30 @@ function renderPage() {
 }
 
 describe("header, prompt, configuration", () => {
+  it("shows the user prompt first and keeps generated instructions collapsed and read-only", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      { ...emptyTriggerFields("slack"), scope: "abc", instructions: "Summarize new messages." },
+      { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
+    );
+    setTask(task({ prompt }));
+    renderPage();
+    expect(screen.getByRole("heading", { name: "Your prompt" })).toBeVisible();
+    expect(screen.getByTestId("task-detail-prompt").textContent).toBe("Summarize new messages.");
+    const toggle = screen.getByRole("button", { name: "System prompt" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(screen.getByTestId("task-detail-system-prompt").textContent).toBe(
+      splitTriggerPrompt(prompt).systemPrompt,
+    );
+    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-detail-prompt")).toBeVisible();
+  });
+
   it("collapses and reopens configuration while keeping run history visible", () => {
     setTask(task({ modelOverride: "opus" }));
     setRuns([run({ sessionCostUsd: 1.23 })]);
@@ -247,6 +276,7 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-prompt")).toHaveTextContent(
       "Triage the inbox and summarize.",
     );
+    expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
     expect(screen.getByTestId("task-detail-schedule").textContent).toContain("Weekdays at 8:00 AM");
     expect(screen.getByTestId("task-detail-agent")).toHaveTextContent("Polly");
     // Null hostId → resolve-at-fire label, not blank.
@@ -411,14 +441,38 @@ describe("loading / not-found states", () => {
 });
 
 describe("header actions", () => {
-  it("Run now shows 'Run started' toast on success", () => {
-    runNowMutate.mockImplementation(
-      (_id: string, opts?: { onSuccess?: () => void; onError?: () => void }) => opts?.onSuccess?.(),
+  it.each([{ isLoading: true }, { cached: true }, { isError: true }])(
+    "can trigger before history is ready without highlighting old history: %j",
+    (state) => {
+      setTask(task());
+      setRuns([], state);
+      runNowMutate.mockImplementation(
+        (_id: string, opts?: { onSuccess?: (runId: string) => void }) => opts?.onSuccess?.("new"),
+      );
+      const { rerender, container } = renderPage();
+      const button = screen.getByTestId("task-detail-run-now");
+      expect(button).not.toBeDisabled();
+      fireEvent.click(button);
+      expect(runNowMutate).toHaveBeenCalledOnce();
+
+      const oldRun = run({ id: "old" });
+      setRuns([oldRun]);
+      rerender(pageTree());
+      expect(container.querySelector(".animate-message-highlight")).toBeNull();
+    },
+  );
+
+  it("confirms Run now on an older server without highlighting a guessed row", () => {
+    runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: (runId: null) => void }) =>
+      opts?.onSuccess?.(null),
     );
     setTask(task());
-    renderPage();
+    const { rerender, container } = renderPage();
     fireEvent.click(screen.getByTestId("task-detail-run-now"));
-    expect(showToast).toHaveBeenCalledWith("Run started");
+    expect(showToast).toHaveBeenCalledWith("Run triggered, it will start shortly");
+    setRuns([run({ id: "unknown" })]);
+    rerender(pageTree());
+    expect(container.querySelector(".animate-message-highlight")).toBeNull();
   });
 
   it("Run now shows error toast on a generic (non-409) failure", () => {
@@ -540,6 +594,106 @@ describe("header actions", () => {
       vi.useRealTimers();
     }
   });
+
+  it.each([
+    { conversationId: null, delay: 0 },
+    { conversationId: "c_new", delay: 30_000 },
+  ])(
+    "briefly highlights a new run with $conversationId after $delay ms",
+    ({ conversationId, delay }) => {
+      vi.useFakeTimers();
+      try {
+        const oldRun = run({ id: "run_old", conversationId: null });
+        setTask(task());
+        setRuns([oldRun]);
+        runNowMutate.mockImplementation(
+          (_id: string, opts?: { onSuccess?: (runId: string) => void }) =>
+            opts?.onSuccess?.("run_new"),
+        );
+        const { rerender, container } = renderPage();
+        const highlighted = () =>
+          container.querySelectorAll<HTMLElement>(".animate-message-highlight");
+        expect(highlighted()).toHaveLength(0);
+        fireEvent.click(screen.getByTestId("task-detail-run-now"));
+        act(() => vi.advanceTimersByTime(delay));
+        expect(highlighted()).toHaveLength(0);
+
+        const newRun = run({ id: "run_new", status: "running", conversationId });
+        const unrelatedRun = run({ id: "scheduled_elsewhere" });
+        setRuns([unrelatedRun, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(0);
+        setRuns([unrelatedRun, newRun, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(1);
+        expect(screen.getAllByTestId("task-detail-run")[1]).toBe(highlighted()[0]);
+        expect(highlighted()[0]).toHaveStyle({ animationDuration: "3000ms" });
+        const highlightedRow = highlighted()[0];
+
+        act(() => vi.advanceTimersByTime(1_500));
+        setRuns([{ ...newRun, status: "succeeded", conversationId: "c_new" }, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(1);
+        expect(highlighted()[0]).toBe(highlightedRow);
+        expect(within(highlightedRow).getByTestId("run-open")).toHaveAttribute("href", "/c/c_new");
+        act(() => vi.advanceTimersByTime(1_500));
+        expect(highlighted()).toHaveLength(0);
+        setRuns([{ ...newRun, status: "succeeded" }, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(0);
+
+        // Opening a different task must not carry over the pending highlight.
+        if (delay === 0) {
+          fireEvent.click(screen.getByTestId("task-detail-run-now"));
+          routeParams = { taskId: "st_2" };
+          setTask(task({ id: "st_2" }));
+          setRuns([run({ id: "other_task_run" })]);
+          rerender(pageTree());
+          expect(highlighted()).toHaveLength(0);
+          routeParams = { taskId: "st_1" };
+          setTask(task());
+          setRuns([newRun]);
+          rerender(pageTree());
+          expect(highlighted()).toHaveLength(0);
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["expired", "failed retry"])(
+    "does not highlight even a matching run after %s tracking",
+    (reason) => {
+      vi.useFakeTimers();
+      try {
+        setTask(task());
+        setRuns([]);
+        runNowMutate.mockImplementation(
+          (_id: string, opts?: { onSuccess?: (runId: string) => void }) =>
+            opts?.onSuccess?.("run_new"),
+        );
+        const { rerender, container } = renderPage();
+        const button = screen.getByTestId("task-detail-run-now");
+        fireEvent.click(button);
+        act(() => vi.advanceTimersByTime(reason === "expired" ? 120_000 : 30_000));
+        if (reason === "failed retry") {
+          runNowMutate.mockImplementation(
+            (_id: string, opts?: { onError?: (error: Error) => void }) =>
+              opts?.onError?.(new Error("failed")),
+          );
+          fireEvent.click(button);
+          expect(runNowMutate).toHaveBeenCalledTimes(2);
+          expect(showToast).toHaveBeenCalledWith("Couldn't start the run");
+        }
+        setRuns([run({ id: "run_new" })]);
+        rerender(pageTree());
+        expect(container.querySelector(".animate-message-highlight")).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("toggling the Switch off pauses an active task (update to paused)", () => {
     setTask(task({ state: "active" }));

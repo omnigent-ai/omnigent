@@ -27,6 +27,9 @@ import { commonTimezones, dateInTimezone, endOfDayInTimezone } from "@/lib/timez
 import { describeSchedule } from "@/lib/scheduleText";
 import {
   buildRRule,
+  MAX_MINUTE_INTERVAL,
+  minimumScheduleInterval,
+  MIN_SUBHOUR_MINUTE_INTERVAL,
   formatUntil,
   parseUntil,
   validateSchedule,
@@ -75,6 +78,9 @@ const choiceClass = "h-8 w-auto min-w-0 text-ui";
 export function ScheduleFields({
   model,
   anchoredScheduling,
+  sessionMode = "new",
+  executionTarget,
+  subhourSupported = false,
   onChange,
   timezone,
   onTimezoneChange,
@@ -85,6 +91,9 @@ export function ScheduleFields({
 }: {
   model: ScheduleModel;
   anchoredScheduling: boolean;
+  sessionMode?: "new" | "continue";
+  executionTarget?: "connected_host" | "managed_sandbox";
+  subhourSupported?: boolean;
   onChange: (next: ScheduleModel) => void;
   timezone: string;
   onTimezoneChange: (timezone: string) => void;
@@ -93,6 +102,9 @@ export function ScheduleFields({
   recurrenceUnsupported?: boolean;
   allowPastEnd?: boolean;
 }) {
+  const minuteSchedulesSupported =
+    minimumScheduleInterval("minutely", sessionMode, subhourSupported, executionTarget) ===
+    MIN_SUBHOUR_MINUTE_INTERVAL;
   const [customOpen, setCustomOpen] = useState(false);
   const [draft, setDraft] = useState(model);
   const [timezoneOpen, setTimezoneOpen] = useState(false);
@@ -121,10 +133,18 @@ export function ScheduleFields({
     dateInput.timezone === timezone
       ? dateInput
       : null;
-  const error = activeDateInput?.error ?? validateSchedule(model, { allowPastEnd });
+  const error =
+    activeDateInput?.error ??
+    validateSchedule(model, { allowPastEnd, sessionMode, subhourSupported, executionTarget });
   const recurrence = { ...model, end: undefined };
-  const recurrenceError = validateSchedule(recurrence);
-  const draftError = validateSchedule({ ...draft, end: undefined });
+  const recurrenceError = validateSchedule(recurrence, {
+    sessionMode: "continue",
+    subhourSupported: true,
+  });
+  const draftError = validateSchedule(
+    { ...draft, end: undefined },
+    { sessionMode, subhourSupported, executionTarget },
+  );
   const until = model.end?.type === "until" ? parseUntil(model.end.until) : null;
 
   function changeCustomOpen(open: boolean) {
@@ -245,8 +265,13 @@ export function ScheduleFields({
                     id="custom-interval"
                     data-testid="custom-interval"
                     type="number"
-                    min={1}
-                    max={366}
+                    min={minimumScheduleInterval(
+                      draft.customFreq,
+                      sessionMode,
+                      subhourSupported,
+                      executionTarget,
+                    )}
+                    max={draft.customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366}
                     step={1}
                     value={Number.isFinite(draft.interval) ? draft.interval : ""}
                     className="w-24"
@@ -261,9 +286,31 @@ export function ScheduleFields({
                     label="Repeat unit"
                     testId="custom-freq-trigger"
                     value={draft.customFreq}
-                    options={FREQUENCIES}
+                    options={[
+                      ...(minuteSchedulesSupported || draft.customFreq === "minutely"
+                        ? [
+                            {
+                              value: "minutely",
+                              label: "Minutes",
+                              disabled: !minuteSchedulesSupported,
+                            },
+                          ]
+                        : []),
+                      ...FREQUENCIES,
+                    ]}
                     onChange={(value) => {
                       const next = { ...draft, customFreq: value as CustomFreq };
+                      if (value === "minutely") {
+                        const minimum = minimumScheduleInterval(
+                          next.customFreq,
+                          sessionMode,
+                          subhourSupported,
+                          executionTarget,
+                        );
+                        next.interval = Math.max(minimum, next.interval || minimum);
+                      } else if (draft.customFreq === "minutely") {
+                        next.interval = 1;
+                      }
                       if (value === "hourly" && !Number.isInteger(next.minute)) next.minute = 0;
                       setDraft(next);
                     }}
@@ -325,26 +372,28 @@ export function ScheduleFields({
                   </p>
                 </div>
               )}
-              <div className="flex flex-col gap-2">
-                <Label>
-                  {draft.customFreq === "hourly"
-                    ? "At minute"
-                    : `Time (${timezone.replaceAll("_", " ")})`}
-                </Label>
-                {draft.customFreq === "hourly" ? (
-                  <MinuteChoice
-                    model={draft}
-                    onChange={setDraft}
-                    onOpenChange={handleNestedOpenChange}
-                  />
-                ) : (
-                  <ScheduleTimePicker
-                    model={draft}
-                    onChange={setDraft}
-                    onSelectOpenChange={handleNestedOpenChange}
-                  />
-                )}
-              </div>
+              {draft.customFreq !== "minutely" && (
+                <div className="flex flex-col gap-2">
+                  <Label>
+                    {draft.customFreq === "hourly"
+                      ? "At minute"
+                      : `Time (${timezone.replaceAll("_", " ")})`}
+                  </Label>
+                  {draft.customFreq === "hourly" ? (
+                    <MinuteChoice
+                      model={draft}
+                      onChange={setDraft}
+                      onOpenChange={handleNestedOpenChange}
+                    />
+                  ) : (
+                    <ScheduleTimePicker
+                      model={draft}
+                      onChange={setDraft}
+                      onSelectOpenChange={handleNestedOpenChange}
+                    />
+                  )}
+                </div>
+              )}
               {draftError && (
                 <p className="text-sm text-destructive" role="alert">
                   {draftError}
@@ -407,6 +456,7 @@ export function ScheduleFields({
       <div className="flex flex-wrap items-center gap-2">
         <div className="min-w-0 max-w-full">
           <Popover
+            modal
             open={timezoneOpen}
             onOpenChange={(open) => {
               setTimezoneOpen(open);
@@ -416,7 +466,7 @@ export function ScheduleFields({
             <PopoverTrigger asChild>
               <Button
                 variant="outline"
-                className="h-8 max-w-full min-w-0 justify-between gap-2 px-2.5 font-normal"
+                className="h-8 max-w-full min-w-0 justify-between gap-2 border-input bg-transparent px-2.5 font-normal"
                 role="combobox"
                 aria-label="Timezone"
                 aria-expanded={timezoneOpen}
@@ -426,7 +476,10 @@ export function ScheduleFields({
                 <ChevronDownIcon className="size-3.5 shrink-0" />
               </Button>
             </PopoverTrigger>
-            <PopoverContent align="start" className="w-[min(22rem,calc(100vw-2rem))] p-0">
+            <PopoverContent
+              align="start"
+              className="menu-surface w-[min(22rem,calc(100vw-2rem))] p-0"
+            >
               <Command label="Search timezones">
                 <CommandInput placeholder="Search timezones…" aria-label="Search timezones" />
                 <CommandList>
