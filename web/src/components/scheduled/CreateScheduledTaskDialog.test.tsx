@@ -3782,16 +3782,19 @@ describe("editing template prompts", () => {
     );
   });
 
-  it("requires expansion and Edit, saves both prompts, and resets on reopening", async () => {
-    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
-    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+  it("requires expansion and Edit and preserves empty-system validation across collapse", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ prompt: original })}
+      />,
+      { expandAdvanced: false },
+    );
     const toggle = screen.getByRole("button", { name: "System prompt" });
     fireEvent.click(toggle);
     expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    const systemPrompt =
-      splitTriggerPrompt(original).systemPrompt!.replace('project = "ENG"', 'project = "OPS"') +
-      "\n";
     fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
       target: { value: "  \n" },
     });
@@ -3803,10 +3806,26 @@ describe("editing template prompts", () => {
     fireEvent.click(toggle);
     fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
     fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
-      target: { value: systemPrompt },
+      target: { value: splitTriggerPrompt(original).systemPrompt },
     });
     expect(screen.queryByText(/System prompt can't be empty/)).not.toBeInTheDocument();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+  });
+
+  it("saves both prompts and reopens with the system editor collapsed", async () => {
+    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />, {
+      expandAdvanced: false,
+    });
+    const toggle = screen.getByRole("button", { name: "System prompt" });
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    const systemPrompt =
+      splitTriggerPrompt(original).systemPrompt!.replace('project = "ENG"', 'project = "OPS"') +
+      "\n";
+    fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
+      target: { value: systemPrompt },
+    });
     fireEvent.change(screen.getByLabelText("Your prompt"), { target: { value: "Fix it." } });
     fireEvent.click(toggle);
     fireEvent.click(toggle);
@@ -3828,21 +3847,31 @@ describe("editing template prompts", () => {
     fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
     expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(systemPrompt);
+  });
+
+  it("discards unsaved system edits when cancelled and reopened", () => {
+    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />, {
+      expandAdvanced: false,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
     fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
       target: { value: "Unsaved edit" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(props.onOpenChange).toHaveBeenLastCalledWith(false);
-    expect(updateMutateAsync).toHaveBeenCalledTimes(1);
+    expect(updateMutateAsync).not.toHaveBeenCalled();
     rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-    rerender(
-      <CreateScheduledTaskDialog open {...props} editingTask={scheduledTask({ prompt: saved })} />,
-    );
-    expect(screen.getByLabelText("Your prompt")).toHaveValue("Fix it.");
+    rerender(<CreateScheduledTaskDialog open {...props} />);
+    expect(screen.getByLabelText("Your prompt")).toHaveValue("Triage the ticket.");
     fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
     expect(screen.queryByText("Unsaved edit")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(systemPrompt);
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(
+      splitTriggerPrompt(original).systemPrompt,
+    );
   });
 });
 
