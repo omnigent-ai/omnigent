@@ -1,4 +1,5 @@
-import { createComment } from "./useComments";
+import { createComment, type Comment } from "./useComments";
+import { requestLocalReviewContext } from "@/lib/localReviewContext";
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
@@ -1530,7 +1531,10 @@ export function usePullRequestReviewThreadComposer(
       anchor: ReviewThreadAnchor;
       key: string[];
       local: boolean;
-    }): Promise<{ thread: ReviewThread | null }> =>
+    }): Promise<{
+      thread: ReviewThread | null;
+      comment?: Comment;
+    }> =>
       target.local
         ? createComment(target.conversationId, {
             path: target.anchor.path,
@@ -1545,7 +1549,7 @@ export function usePullRequestReviewThreadComposer(
               head_sha: target.anchor.head_sha,
               base_sha: target.anchor.base_sha,
             },
-          }).then(() => ({ thread: null }))
+          }).then((comment) => ({ thread: null, comment }))
         : fetchPullRequestEditResource<{ thread: ReviewThread }>(
             target.conversationId,
             "review-threads",
@@ -1553,7 +1557,7 @@ export function usePullRequestReviewThreadComposer(
               body: { pr_url: target.prUrl, body: target.body, anchor: target.anchor },
             },
           ),
-    onSuccess: async ({ thread }, target) => {
+    onSuccess: async ({ thread, comment }, target) => {
       if (target.local) {
         queryClient.setQueryData(target.key, {
           body: "",
@@ -1562,6 +1566,7 @@ export function usePullRequestReviewThreadComposer(
           destination: "local",
         });
         void queryClient.invalidateQueries({ queryKey: ["comments", target.conversationId] });
+        if (comment) requestLocalReviewContext(comment);
         return;
       }
       if (!thread) return;

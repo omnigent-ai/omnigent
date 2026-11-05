@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { requestLocalReviewContext } from "@/lib/localReviewContext";
 import { useDeleteComment, useUpdateComment, type Comment } from "@/hooks/useComments";
 
 export function LocalReviewComment({
@@ -23,6 +24,8 @@ export function LocalReviewComment({
   const anchor = comment.anchor_metadata!;
   return (
     <section
+      data-local-review-comment={comment.id}
+      tabIndex={-1}
       aria-label="Local review comment"
       className="pull-request-comment-surface my-2 rounded-md border p-3 text-ui text-foreground font-sans [white-space:normal]"
     >
@@ -42,7 +45,7 @@ export function LocalReviewComment({
         <MessageResponse>{comment.body}</MessageResponse>
       )}
       {own && (
-        <div className="mt-2 flex gap-2">
+        <div className="mt-2 flex flex-wrap gap-2">
           {editing ? (
             <>
               <Button
@@ -68,6 +71,15 @@ export function LocalReviewComment({
             </>
           ) : (
             <>
+              {comment.status === "draft" && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => requestLocalReviewContext(comment)}
+                >
+                  Attach to agent
+                </Button>
+              )}
               <Button
                 size="sm"
                 variant="ghost"

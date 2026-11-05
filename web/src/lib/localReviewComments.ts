@@ -3,6 +3,31 @@ import type { ReviewThreadAnchor } from "./pullRequestReviewThreads";
 
 export type LocalReviewAnchor = Omit<ReviewThreadAnchor, "path"> & { pr_url: string };
 
+/** Validate persisted draft context before using its coordinates or body. */
+export function isLocalReviewComment(value: unknown): value is Comment {
+  if (!value || typeof value !== "object") return false;
+  const comment = value as Partial<Comment>;
+  const anchor = comment.anchor_metadata;
+  return (
+    typeof comment.id === "string" &&
+    typeof comment.conversation_id === "string" &&
+    typeof comment.path === "string" &&
+    typeof comment.body === "string" &&
+    comment.status === "draft" &&
+    !!anchor &&
+    typeof anchor.pr_url === "string" &&
+    (anchor.side === "LEFT" || anchor.side === "RIGHT") &&
+    Number.isInteger(anchor.line) &&
+    anchor.line > 0 &&
+    (anchor.start_line == null ||
+      (Number.isInteger(anchor.start_line) &&
+        anchor.start_line > 0 &&
+        anchor.start_line <= anchor.line)) &&
+    typeof anchor.head_sha === "string" &&
+    typeof anchor.base_sha === "string"
+  );
+}
+
 /** Include snapshots as well as IDs so native agents need no comment-fetch tool. */
 export function formatLocalReviewComments(comments: Comment[]): string {
   return [

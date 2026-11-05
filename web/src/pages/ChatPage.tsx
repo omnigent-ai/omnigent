@@ -1,4 +1,9 @@
-import { useComposerInsertion, consumeComposerInsertion } from "@/lib/composerInsertions";
+import {
+  clearLocalReviewContexts,
+  removeLocalReviewContext,
+  usePendingLocalReviewContexts,
+} from "@/lib/localReviewContext";
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -283,6 +288,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { ComposerLocalReviewChips } from "@/components/composer/ComposerLocalReviewChips";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import {
   SMART_ROUTING_ARMS,
@@ -2698,6 +2704,7 @@ function ComposerImpl(
   // tabs and coming back restores the draft. The shared draft store also lets
   // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
+  const localReviewComments = usePendingLocalReviewContexts(conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
@@ -3070,18 +3077,6 @@ function ComposerImpl(
     });
   }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
 
-  const composerInsertion = useComposerInsertion(conversationId);
-  useEffect(() => {
-    if (!conversationId || settledConversationId !== conversationId || !composerInsertion) return;
-    if (!fullText.includes(composerInsertion)) {
-      dirtyRef.current = true;
-      editText(null, (text) => [text, composerInsertion].filter(Boolean).join("\n\n"));
-      focusText(null);
-    }
-    consumeComposerInsertion(conversationId);
-    tailTextareaRef.current?.focus();
-  }, [conversationId, settledConversationId, composerInsertion, fullText, editText, focusText]);
-
   const terminalPending = useChatStore((s) => s.terminalPending);
   const hostOnline = useSessionHostOnline(composerSessionId ?? undefined);
   const {
@@ -3306,7 +3301,7 @@ function ComposerImpl(
     draft.quotes.length === 0 && findMentionTokens(draft.text, mentionTokens).length > 0;
   const mirrorActive = composerIsCommand || mentionTokensShown;
   useComposerMirrorAlignment(backdropRef, tailTextareaRef, mirrorActive);
-  const hasDraft = fullText.trim().length > 0 || files.length > 0 || hasMentions;
+  const hasDraft = fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
   const showInterruptButton =
     isWorking &&
     (!hasDraft ||
@@ -4026,7 +4021,7 @@ function ComposerImpl(
     const trimmed = fullText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
-      (!trimmed && files.length === 0 && !hasMentions) ||
+      (!trimmed && files.length === 0 && !hasMentions && localReviewComments.length === 0) ||
       disabled ||
       sendDisabledReason !== null ||
       hasPendingElicitation
@@ -4071,7 +4066,7 @@ function ComposerImpl(
       draft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
       files.length === 0 &&
-      !hasMentions
+      !hasMentions && localReviewComments.length === 0
     ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
@@ -4155,6 +4150,7 @@ function ComposerImpl(
     // the harness's "[Attached: <path>]" wording (the vendor reads the on-disk
     // path; no upload), sessions as "[Session: …]". A tagged session also adds
     // one tool hint at the end.
+    const reviewPreamble = localReviewComments.length > 0 ? `${formatLocalReviewComments(localReviewComments)}\n\n` : "";
     const tagsSessions = liveMentions.some((m) => m.marker.startsWith("[Session: "));
     const expand = (text: string) => expandMentionTokens(text, liveMentions);
     // Sending while a prior response is streaming is fine — the
@@ -4168,18 +4164,19 @@ function ComposerImpl(
       const outgoing = {
         ...draft,
         text: withSessionMentionHint(expand(draft.text), tagsSessions),
-        quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
+        quotes: draft.quotes.map((quote, index) => ({ ...quote, before: (index === 0 ? reviewPreamble : "") + expand(quote.before) })),
       };
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
       const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
-      onSend(withSessionMentionHint(expand(message), tagsSessions), sendFiles);
+      onSend(reviewPreamble + withSessionMentionHint(expand(message), tagsSessions), sendFiles);
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
     setMentionedItems([]);
     setMentionedSessions([]);
+    if (conversationId) clearLocalReviewContexts(conversationId);
     setMention(null);
   };
 
@@ -4217,7 +4214,7 @@ function ComposerImpl(
   };
 
   // An empty composer with no attachments or @-mentions; ↑ recalls from the queue here.
-  const composerEmptyForRecall = fullText === "" && files.length === 0 && !hasMentions;
+  const composerEmptyForRecall = fullText === "" && files.length === 0 && !hasMentions && localReviewComments.length === 0;
   // The queued row ↑ recalls: the queue tail, only while the composer takes input and
   // is empty and quote-free.
   const arrowUpRecallQueueId =
@@ -4663,6 +4660,10 @@ function ComposerImpl(
               {attachmentError !== null && (
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
+              <ComposerLocalReviewChips
+                comments={localReviewComments}
+                onRemove={(id) => conversationId && removeLocalReviewContext(conversationId, id)}
+              />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>
