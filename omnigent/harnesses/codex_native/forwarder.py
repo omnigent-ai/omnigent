@@ -1913,7 +1913,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     started=chunk.reasoning_started,
                 )
-            except Exception:  # noqa: BLE001 - keep the forwarder alive.
+            except Exception:
                 _logger.warning("Codex forwarder reasoning delta flush failed", exc_info=True)
             return
         if chunk.tool_call_id is not None:
@@ -1924,7 +1924,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     call_id=chunk.tool_call_id,
                 )
-            except Exception:  # noqa: BLE001 - keep the forwarder alive.
+            except Exception:
                 _logger.warning("Codex forwarder tool-output delta flush failed", exc_info=True)
             return
         index: int | None = None
@@ -1942,7 +1942,7 @@ class _OutputTextDeltaCoalescer:
                 index=index,
                 final=final,
             )
-        except Exception:  # noqa: BLE001 - keep the forwarder alive.
+        except Exception:
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
@@ -2279,7 +2279,7 @@ class _CodexElicitationTaskTracker:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - keep the forwarder alive.
+        except Exception:
             _logger.warning(
                 "Codex forwarder elicitation hook task failed: method=%s",
                 event.get("method"),
@@ -2549,7 +2549,7 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
-                except Exception:  # noqa: BLE001 - keep the mirror alive.
+                except Exception:
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         except BaseException as exc:
             stream_error = exc
@@ -2637,7 +2637,7 @@ async def _drive_side_chat_requests(
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")
-                    except Exception:  # noqa: BLE001 - isolate each request failure.
+                    except Exception:
                         _logger.warning(
                             "Codex /side fork failed for %s", request.path, exc_info=True
                         )
@@ -2648,7 +2648,7 @@ async def _drive_side_chat_requests(
                     # done, and a failed one has surfaced a notice — keeping it
                     # would retry the same failure forever.
                     side_chat.discard_side_chat_request(request.path)
-        except Exception:  # noqa: BLE001 - keep the drain loop alive.
+        except Exception:
             _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)
 
@@ -2687,7 +2687,7 @@ async def _post_side_chat_failed_notice(
             response_id=marker,
             source_id=marker,
         )
-    except Exception:  # noqa: BLE001 - the notice is best-effort.
+    except Exception:
         _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
 
 
@@ -2989,7 +2989,7 @@ async def _subscribe_until_ready(
                 except asyncio.CancelledError:
                     raise
                 # App-server error envelopes are surfaced as RuntimeError.
-                except Exception as exc:  # noqa: BLE001 - surface the original error.
+                except Exception as exc:
                     if not _is_thread_not_ready_error(exc):
                         _logger.warning(
                             "failed to subscribe to Codex thread %s", thread_id, exc_info=True
@@ -4194,7 +4194,7 @@ async def _maybe_fail_turn_on_certificate_failure(
             await codex_client.request(
                 "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
             )
-        except Exception:  # noqa: BLE001 - surface the failure either way.
+        except Exception:
             _logger.warning(
                 "Codex turn interrupt after a certificate failure failed", exc_info=True
             )
@@ -4888,7 +4888,7 @@ async def _maybe_handle_turn_event(
                     compaction_model = await asyncio.to_thread(
                         _failed_compaction_model, bridge_dir, selected_model
                     )
-                except Exception:  # noqa: BLE001 - post the failure undiagnosed.
+                except Exception:
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
             await _post_turn_status_edge(
                 client,
@@ -4993,7 +4993,7 @@ async def _maybe_handle_turn_event(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception as exc:  # noqa: BLE001 - compaction is best-effort.
+            except Exception as exc:
                 _logger.warning(
                     "Failed to persist codex compaction item for %s: %s",
                     session_id,
@@ -6607,7 +6607,7 @@ async def _handle_completed_item_inner(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception as exc:  # noqa: BLE001 - compaction is best-effort.
+            except Exception as exc:
                 _logger.warning(
                     "Failed to persist codex compaction item for %s: %s",
                     session_id,
@@ -7540,7 +7540,7 @@ async def _ensure_user_message_posted(
         response = await codex_client.request("thread/resume", {"threadId": thread_id})
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 - degrade to the existing resume behavior.
+    except Exception:
         _logger.warning(
             "Codex forwarder could not resume to recover user message: thread=%s turn=%s",
             thread_id,
@@ -8690,7 +8690,7 @@ async def _persist_codex_compaction_item(
             rollout = _latest_thread_rollout(state) if state is not None else None
             if rollout is not None:
                 compacted = _read_compacted_history(rollout)
-        except Exception:  # noqa: BLE001 - diagnostics are best-effort.
+        except Exception:
             _logger.debug(
                 "Failed to read codex rollout for compaction persist",
                 exc_info=True,
@@ -9290,7 +9290,7 @@ async def _replay_dead_letters_before_resume(
             max_records=_REPLAY_MAX_RECORDS,
             deadline_seconds=_REPLAY_DEADLINE_SECONDS,
         )
-    except Exception:  # noqa: BLE001 - replay must not block resume.
+    except Exception:
         _logger.warning("Codex dead-letter replay before resume failed", exc_info=True)
 
 
