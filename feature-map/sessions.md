@@ -772,11 +772,12 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
   seeds an error item directly into the spawned server's database.
 - **`reconnect`, offline-host cause (own environment):**
-  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_preserves_failed_turn_and_retry`
+  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_refuses_input_and_keeps_reconnect_action`
   creates Claude/Codex native-wrapper sessions on a real disposable host, stops
-  the host and its runners, and checks the API failure and browser details.
-  It covers missing and stale runner bindings, reload persistence, and retry
-  without duplicate transcript input. Repeat with `--device='iPhone 13'` for
+  the host and its runners, and checks that both client retry contracts refuse
+  without transcript input, failed status, or pending work. It covers missing
+  and stale runner bindings, reload, the host menu's Reconnect action, and a
+  refused retry with no extra items. Repeat with `--device='iPhone 13'` for
   the mobile entry point; keep browser evidence outside the checkout.
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
