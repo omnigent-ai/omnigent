@@ -180,10 +180,8 @@ function applyItemsToCache(
     const backfillKey = ["conversation-backfill", item.id];
     const row = queryClient.getQueryData<Conversation | null>(backfillKey);
     if (row && (row.archived ?? false) !== item.archived) {
-      queryClient.setQueryData<Conversation | null>(backfillKey, {
-        ...row,
-        archived: item.archived,
-      });
+      const patchedRow: Conversation = { ...row, archived: item.archived };
+      queryClient.setQueryData<Conversation | null>(backfillKey, patchedRow);
     }
   }
   return {
