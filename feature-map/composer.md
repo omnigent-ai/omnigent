@@ -197,6 +197,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   sends once the host reconnects; no failed turn is recorded.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
   and always-steer preference, keeping their element screenshots.
+- `pi-commands`: existing native Pi sessions discover extension commands, prompt
+  templates, and `/skill:name` commands from the running Pi process. Chat sends
+  invoke Pi's command expansion. Unavailable and empty catalogs are distinct;
+  terminal-only built-ins and new-session previews remain separate.
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
@@ -747,6 +751,19 @@ Other connection providers alone do not enable the managed MCP picker.
   Repeat in a fresh session with Always steer on: both entry points send while
   busy and the pointer popup says "Sent to agent." If older messages are already
   queued, new pointer instructions must join them even with Always steer on.
+- **`pi-commands`, existing native Pi session:** load an extension command, prompt
+  template, and skill in Pi. Compare the Terminal `/` menu with Chat after its
+  catalog refresh; skills must retain `/skill:`. Send the extension command from
+  Chat and verify its handler runs rather than receiving an assistant reply.
+  Remove a resource, `/reload` in Terminal, and check the next Chat catalog refresh.
+  Component coverage is in `tests/host/test_skills.py` and
+  `tests/harnesses/pi_native/test_pi_native_extension.py`. The own-process native
+  happy path is
+  `tests/e2e/test_pi_native_send_now_steer_e2e.py::test_native_pi_discovers_and_dispatches_chat_commands`;
+  it uses the real Pi CLI without inference, not a browser/server round trip.
+  Desktop and mobile Chat share the host catalog; neither browser surface has
+  a Pi-specific end-to-end menu assertion. New-session previews have no resident
+  Pi catalog and are outside this runtime-only change.
 - **`pi-compact`:** in a Pi session, start a long turn, type `/comp`, press Tab,
   then Enter. With Always steer off, confirm `/compact` queues; use Send now to
   interrupt and compact. With Always steer on and an empty queue, Enter should

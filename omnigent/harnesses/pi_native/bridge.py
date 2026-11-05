@@ -63,6 +63,8 @@ _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
 _INBOX_DIR = "inbox"
 # Written by the extension once ``session_start`` has armed the inbox poller.
 _INPUT_READY_FILE = "input_ready"
+_COMMAND_CATALOG_FILE = "commands.json"
+_MAX_COMMAND_CATALOG_BYTES = 1024 * 1024
 _SESSIONS_DIR = "sessions"
 _ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
@@ -81,6 +83,44 @@ def bridge_dir_for_session_id(session_id: str) -> Path:
     """
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
     return _BRIDGE_ROOT / digest
+
+
+def read_command_catalog(session_id: str) -> list[dict[str, str]] | None:
+    """Read the resident Pi's command metadata; ``None`` means unavailable.
+
+    Never infer commands from host directories: Pi owns resource loading,
+    project trust, filters, and name collisions. Paths and instruction bodies
+    are deliberately excluded from the menu catalog.
+    """
+    path = bridge_dir_for_session_id(session_id) / _COMMAND_CATALOG_FILE
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(_MAX_COMMAND_CATALOG_BYTES + 1)
+        if len(raw) > _MAX_COMMAND_CATALOG_BYTES:
+            return None
+        payload = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("commands"), list):
+        return None
+    commands: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for command in payload["commands"]:
+        if not isinstance(command, dict):
+            return None
+        name, description = command.get("name"), command.get("description", "")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name.startswith("/")
+            or any(character.isspace() or ord(character) < 32 for character in name)
+            or not isinstance(description, str)
+        ):
+            return None
+        if name not in seen:
+            commands.append({"name": name, "description": description})
+            seen.add(name)
+    return commands
 
 
 def prepare_bridge_dir(session_id: str) -> Path:
@@ -157,6 +197,9 @@ def clear_inbox(bridge_dir: Path) -> None:
     :param bridge_dir: The session's prepared bridge directory.
     :returns: None.
     """
+    # A relaunched Pi must publish its own catalog, not advertise the old process's.
+    with contextlib.suppress(FileNotFoundError):
+        (bridge_dir / _COMMAND_CATALOG_FILE).unlink()
     inbox = bridge_dir / _INBOX_DIR
     if not inbox.is_dir():
         return
