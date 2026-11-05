@@ -15,19 +15,24 @@ provider* (pointed at the mock), which only happens if the fallback fired.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
 
+from omnigent.onboarding import providers as catalog_providers
 from tests.e2e.conftest import (
     configure_mock_llm,
     find_free_port,
+    get_mock_requests,
     reset_mock_llm,
     set_fallback_mock_llm,
     wait_for_server,
@@ -36,6 +41,7 @@ from tests.e2e.conftest import (
 _REPO = Path(__file__).resolve().parents[2]
 _SERVER_BOOT_TIMEOUT_SEC = 30.0
 _RUN_TIMEOUT_SEC = 120.0
+_FALLBACK_CATALOG_MODEL = "gpt-fallback-probe"
 
 # Strip every ambient credential so the ONLY openai-family credential the runner
 # can find is the configured-but-not-default provider — forcing the fallback.
@@ -162,6 +168,26 @@ def _fallback_run_env(mock_llm_server_url: str, config_home: Path) -> dict[str, 
         encoding="utf-8",
     )
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    env["XDG_CACHE_HOME"] = str(config_home / ".cache")
+    env["LOCALAPPDATA"] = str(config_home / "AppData" / "Local")
+    with (
+        patch.object(Path, "home", return_value=config_home),
+        patch.dict(
+            os.environ,
+            {name: env[name] for name in ("XDG_CACHE_HOME", "LOCALAPPDATA")},
+        ),
+    ):
+        catalog_providers._write_disk_catalog(
+            catalog_providers._DiskCatalogEntry(
+                catalog={
+                    "schema_version": 1,
+                    "models": {_FALLBACK_CATALOG_MODEL: {"mode": "chat"}},
+                },
+                source_url=catalog_providers._catalog_source_url("openai"),
+                fetched_at=time.time(),
+            ),
+            "openai",
+        )
     return env
 
 
@@ -240,3 +266,9 @@ def test_runner_fallback_credentials_head_with_nondefault_provider(
     assert "pong from the fallback-credentialed head" in result.stdout, (
         f"expected the mock reply in the run output.\nSTDOUT:\n{result.stdout[-3000:]}"
     )
+
+    probe_requests = [
+        body for body in get_mock_requests(mock_llm_server_url) if token in json.dumps(body)
+    ]
+    assert probe_requests, "the fallback probe must reach the configured mock provider"
+    assert {body.get("model") for body in probe_requests} == {_FALLBACK_CATALOG_MODEL}
