@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
+from omnigent.entities.session_objective import SessionObjective
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -59,6 +60,8 @@ from omnigent.server.scheduled.harness_settings import (
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
+from omnigent.server.session_objectives import objective_to_response
+from omnigent.server.session_objectives import open_store as open_objective_store
 from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -66,6 +69,9 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import AutomationFailure, ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+
+# How many of a run's newest objectives its history entry shows.
+RUN_OBJECTIVES_SHOWN = 5
 
 # Execution targets a task may run on. ``connected_host`` pins/resolves the
 # owner's own machine; ``managed_sandbox`` provisions a FRESH server-managed
@@ -254,6 +260,7 @@ def _run_to_response(
     viewer_last_seen: int | None = None,
     viewer_unread: bool | None = None,
     session_cost_usd: float | None = None,
+    objectives: tuple[list[SessionObjective], bool] | None = None,
     conversation_pending_approvals: int = 0,
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
@@ -277,8 +284,11 @@ def _run_to_response(
         so the frontend never needs a separate session fetch.
     :param session_cost_usd: Current cumulative session cost, or ``None`` when
         unreported. Runs continuing the same session share this total.
+    :param objectives: The newest objectives the agent recorded during the run,
+        in order, and whether it recorded more; ``None`` when it recorded none.
     :param conversation_pending_approvals: Current session approval/question count.
     """
+    shown, more = objectives or ([], False)
     return {
         "id": run.id,
         "scheduled_task_id": run.scheduled_task_id,
@@ -293,6 +303,8 @@ def _run_to_response(
         "viewer_last_seen": viewer_last_seen,
         "viewer_unread": viewer_unread,
         "session_cost_usd": session_cost_usd,
+        "objectives": [objective_to_response(objective) for objective in shown],
+        "more_objectives": more,
         "conversation_pending_approvals": conversation_pending_approvals,
     }
 
@@ -805,7 +817,10 @@ def create_scheduled_tasks_router(
         Cursor-paginated so history is never silently truncated: pass ``limit``
         (1-1000, default 100) and ``after`` (a prior page's ``next_cursor``).
         The response is ``{"runs": [...], "next_cursor": <id or null>}``; a
-        ``null`` cursor marks the last page.
+        ``null`` cursor marks the last page. Each run lists the newest
+        objectives its agent recorded during the run (``objectives``, at most
+        :data:`RUN_OBJECTIVES_SHOWN`), with ``more_objectives`` set when there
+        are more; the session's full list is ``GET /v1/sessions/{id}/objectives``.
 
         Lazy-on-read backstop: before listing, force-fail any of this task's
         runs still ``running`` past the 6h max age (``incomplete``). Completion
@@ -829,6 +844,16 @@ def create_scheduled_tasks_router(
         # Runs without a conversation_id (skipped/failed) contribute null fields.
         conv_ids = [r.conversation_id for r in runs if r.conversation_id is not None]
         sessions = conversation_store.get_session_activity(conv_ids) if conv_ids else {}
+        objective_store = open_objective_store(conversation_store)
+        # Only a run that reached a session can have objectives.
+        run_objectives = (
+            objective_store.list_run_objectives(
+                [r.id for r in runs if r.conversation_id is not None],
+                limit_per_run=RUN_OBJECTIVES_SHOWN,
+            )
+            if objective_store is not None and conv_ids
+            else {}
+        )
         live_counts = pending_elicitations.counts_for(list(sessions))
         # Only runner-bound sessions need the persisted cross-replica mirror.
         pending_counts = {
@@ -864,11 +889,12 @@ def create_scheduled_tasks_router(
                         viewer_last_seen=last_seen,
                         viewer_unread=explicit_unread,
                         session_cost_usd=session.total_cost_usd,
+                        objectives=run_objectives.get(r.id),
                         conversation_pending_approvals=pending_approvals,
                     )
                 )
             else:
-                run_rows.append(_run_to_response(r))
+                run_rows.append(_run_to_response(r, objectives=run_objectives.get(r.id)))
         return {
             "runs": run_rows,
             "next_cursor": next_cursor,

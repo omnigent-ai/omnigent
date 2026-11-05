@@ -988,9 +988,13 @@ tool_groups:
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  objectives: true        # sys_record_objective / sys_record_outcome
 ```
 
-Every group defaults to `true`, so omitting the block changes nothing. Values
+Every group but `objectives` defaults to `true`, so omitting the block changes
+nothing. `objectives` is unset by default: the runner turns it on only in
+sessions an automation serves (see [Session objectives](session-objectives.md));
+`true` or `false` applies to every session of the agent. Values
 must be booleans and group names must match exactly; a typo fails the load
 rather than silently leaving the group registered. Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt. The block

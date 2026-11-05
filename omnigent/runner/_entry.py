@@ -1441,6 +1441,7 @@ def _load_agent_spec_bundle(
     spec_cache_root: Path, resp: httpx.Response, agent_id: str, session_id: str
 ) -> ResolvedSpec:
     """Hash, load and publish a validated bundle while its cache lock is held."""
+    from omnigent.automation_session import AUTOMATION_SESSION_HEADER, with_automation_tools
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
@@ -1473,6 +1474,9 @@ def _load_agent_spec_bundle(
             staging.rename(dest)
         spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
+    spec = with_automation_tools(
+        spec, automation=resp.headers.get(AUTOMATION_SESSION_HEADER) == "1"
+    )
     _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
 

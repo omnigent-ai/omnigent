@@ -472,6 +472,25 @@ async def test_registry_child_preserves_interactive_launch_args(
     assert persisted == [launch_args, launch_args]
 
 
+@pytest.mark.parametrize(
+    "label", ["omnigent.scheduled_task_origin", "omnigent.scheduled_task_run", None]
+)
+async def test_the_bundle_marks_a_session_an_automation_serves(client, label):
+    """The runner turns the objective tools on from this mark; the bundle is unchanged."""
+    from omnigent.automation_session import AUTOMATION_SESSION_HEADER
+    from omnigent.runtime import get_conversation_store
+
+    session = await create_test_session(client, name="automation-mark")
+    url = f"/v1/sessions/{session['id']}/agent/contents"
+    before = await client.get(url)
+    if label is not None:
+        get_conversation_store().set_labels(session["id"], {label: "0" * 32})
+    after = await client.get(url)
+    assert after.content == before.content
+    assert AUTOMATION_SESSION_HEADER not in before.headers
+    assert after.headers.get(AUTOMATION_SESSION_HEADER) == ("1" if label else None)
+
+
 async def test_selection_is_session_scoped_and_forks_follow_the_agent(client, launch_registry):
     source = await create_test_session(client, name="selection-source")
     sibling = await client.post("/v1/sessions", json={"agent_id": source["agent_id"]})

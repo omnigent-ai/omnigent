@@ -16,6 +16,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.automation_session import AUTOMATION_SESSION_HEADER, serves_automation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
@@ -264,6 +265,8 @@ def register_agent_routes(
                     if key.startswith(MCP_SELECTION_PREFIX)
                 }
             )
+        if serves_automation(conv.labels):
+            selection_headers[AUTOMATION_SESSION_HEADER] = "1"
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",

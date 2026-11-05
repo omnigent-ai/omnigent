@@ -142,6 +142,8 @@ function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
     firedAt: 1_700_000_000,
     finishedAt: 1_700_000_102,
     errorCode: null,
+    objectives: [],
+    moreObjectives: false,
     conversationUpdatedAt: 1_700_000_500,
     conversationStatus: "idle",
     viewerLastSeen: null,
@@ -796,8 +798,10 @@ describe("run history", () => {
     const row = screen.getByTestId("task-detail-run");
     expect(row).toHaveAttribute("data-run-status", "succeeded");
     expect(within(row).getByTestId("run-duration")).toHaveTextContent("1m 42s");
-    // A success has nothing to explain below the timestamp.
+    // A success has nothing to explain below the timestamp, and a run that
+    // recorded no objectives shows none.
     expect(within(row).queryByTestId("run-failure")).toBeNull();
+    expect(within(row).queryByTestId("run-objectives")).toBeNull();
     // Read success → a muted grey dot (left column), not the blue unread one.
     await waitFor(() => expect(row).toHaveAttribute("data-run-unread", "false"));
     const dot = within(row).getByTestId("run-status-dot");
@@ -810,6 +814,51 @@ describe("run history", () => {
     expect(link).toHaveAttribute("href", "/c/c_9");
     expect(link.className).toContain("cursor-pointer");
     expect(link).toHaveAccessibleName(/^Completed/);
+  });
+
+  it("shows each objective's outcome like a status message, and says whether it was reached", () => {
+    const outcome = (success: boolean, emoji: string, text: string) => ({
+      success,
+      emoji,
+      text,
+      recordedAt: 1_700_000_090,
+    });
+    setTask(task());
+    setRuns([
+      run({
+        conversationId: "c_9",
+        objectives: [
+          {
+            id: "o1",
+            objective: "Open PRs for the flaky tests",
+            createdAt: 1_700_000_010,
+            outcome: outcome(true, "🚀", "Opened 2 PRs"),
+          },
+          {
+            id: "o2",
+            objective: "Get CI green",
+            createdAt: 1_700_000_020,
+            outcome: outcome(false, "🚧", "Blocked: CI is down"),
+          },
+          { id: "o3", objective: "Update the changelog", createdAt: 1_700_000_030, outcome: null },
+        ],
+        moreObjectives: true,
+      }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    const [reached, missed, pending] = within(row).getAllByTestId("run-objective");
+    expect(reached).toHaveAttribute("data-run-outcome", "success");
+    expect(reached).toHaveTextContent("🚀Goal reached: Opened 2 PRs");
+    expect(reached).toHaveAttribute("title", "Open PRs for the flaky tests");
+    // A missed goal stands out and is announced, since the emoji may not say so.
+    expect(missed).toHaveAttribute("data-run-outcome", "failure");
+    expect(missed.className).toContain("text-amber-700");
+    expect(missed).toHaveTextContent("Goal not reached: Blocked: CI is down");
+    // Until an outcome is recorded, the objective itself shows, muted.
+    expect(pending).toHaveAttribute("data-run-outcome", "none");
+    expect(pending).toHaveTextContent("No outcome yet: Update the changelog");
+    expect(within(row).getByTestId("run-objectives-more")).toHaveTextContent("More in the session");
   });
 
   it("renders an unread dot (brand-accent) with an 'Unread' tooltip for an unread success", async () => {

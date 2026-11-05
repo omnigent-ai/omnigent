@@ -47,6 +47,11 @@ if TYPE_CHECKING:
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
+# Largest stored objective or outcome envelope in ``session_objectives``. The
+# plaintext variant of the longest one is under 1,300 bytes; the rest leaves
+# room for an encrypted variant's overhead.
+SESSION_OBJECTIVE_PAYLOAD_MAX_BYTES = 2048
+
 
 class Uuid16(TypeDecorator[str]):
     """A uuid stored as 16 raw bytes, presented to Python as bare 32-char hex.
@@ -1765,5 +1770,102 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
             "status",
             "id",
+        ),
+    )
+
+
+class SqlSessionObjective(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_objectives`` table.
+
+    What a session's agent set out to do, and how it says each attempt went.
+    An agent records an objective, then an outcome for it; a session holds
+    any number of them in order. Rows are deleted with their session.
+
+    :param conversation_id: The session the objective belongs to (relates to
+        ``conversations.id``; no DB foreign key, Rule R032).
+    :param id: UUID of the objective, stored as 16 raw bytes.
+    :param created_at: Unix epoch microseconds when the objective was recorded.
+        Orders a session's objectives, with ``id`` breaking ties.
+    :param scheduled_task_run_id: The automation run the session was serving
+        when the objective was recorded (relates to ``scheduled_task_runs.id``;
+        no DB foreign key); ``None`` outside automation runs.
+    :param objective_payload: The objective's text in an envelope private to
+        the objective store, at most
+        :data:`SESSION_OBJECTIVE_PAYLOAD_MAX_BYTES` bytes; ``None`` when the
+        agent recorded an outcome without stating an objective.
+    :param outcome_success: Whether the agent says it reached the objective;
+        ``None`` until it records an outcome.
+    :param outcome_payload: The outcome's emoji and text in the same kind of
+        envelope; ``None`` until an outcome is recorded.
+    :param outcome_recorded_at: Unix epoch microseconds of the latest outcome;
+        ``None`` until one is recorded.
+    """
+
+    __tablename__ = "session_objectives"
+
+    # A new table takes no database defaults; writes always name the workspace.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    # conversation_id leads id so a session's objectives stay contiguous for
+    # the per-session reads and the delete that runs with the session's.
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    scheduled_task_run_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # The agent's words can repeat task content, so they are opaque to the
+    # database: storage-private envelopes that the store encodes and decodes.
+    objective_payload: Mapped[bytes | None] = mapped_column(
+        LargeBinary(SESSION_OBJECTIVE_PAYLOAD_MAX_BYTES), nullable=True
+    )
+    outcome_success: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    outcome_payload: Mapped[bytes | None] = mapped_column(
+        LargeBinary(SESSION_OBJECTIVE_PAYLOAD_MAX_BYTES), nullable=True
+    )
+    outcome_recorded_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        # Declared lengths are not enforced on every engine; length() of a
+        # binary value counts bytes on SQLite, MySQL, PostgreSQL and CockroachDB.
+        CheckConstraint(
+            "objective_payload IS NULL OR length(objective_payload) <= "
+            f"{SESSION_OBJECTIVE_PAYLOAD_MAX_BYTES}",
+            name="ck_session_objectives_objective_payload_size",
+        ),
+        CheckConstraint(
+            "outcome_payload IS NULL OR length(outcome_payload) <= "
+            f"{SESSION_OBJECTIVE_PAYLOAD_MAX_BYTES}",
+            name="ck_session_objectives_outcome_payload_size",
+        ),
+        # An outcome is recorded whole: its success, words and time together.
+        CheckConstraint(
+            "(outcome_success IS NULL AND outcome_payload IS NULL "
+            "AND outcome_recorded_at IS NULL) OR (outcome_success IS NOT NULL "
+            "AND outcome_payload IS NOT NULL AND outcome_recorded_at IS NOT NULL)",
+            name="ck_session_objectives_outcome_complete",
+        ),
+        # A session's objectives in order: listing pages forward, and finding
+        # the latest one reads backward.
+        Index(
+            "ix_session_objectives_conversation_created",
+            "workspace_id",
+            "conversation_id",
+            "created_at",
+            "id",
+        ),
+        # An automation run's objectives in order, for its run history entry
+        # and for finding the run's latest objective. conversation_id completes
+        # the primary key, so every entry is unique.
+        Index(
+            "ix_session_objectives_run_created",
+            "workspace_id",
+            "scheduled_task_run_id",
+            "created_at",
+            "id",
+            "conversation_id",
         ),
     )

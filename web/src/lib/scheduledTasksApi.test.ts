@@ -149,7 +149,9 @@ describe("listScheduledTaskRuns", () => {
       firedAt: 1_700_000_005,
       finishedAt: 1_700_000_050,
       errorCode: null,
-      // An older server sends no session read state.
+      // An older server sends no session read state and no objectives.
+      objectives: [],
+      moreObjectives: false,
       conversationUpdatedAt: null,
       conversationStatus: null,
       viewerLastSeen: null,
@@ -177,6 +179,30 @@ describe("listScheduledTaskRuns", () => {
             viewer_last_seen: 1_700_000_055,
             viewer_unread: false,
             session_cost_usd: 0,
+            objectives: [
+              {
+                id: "o1",
+                session_id: "conv_1",
+                objective: "Get CI green",
+                created_at: 1_700_000_010,
+                scheduled_task_run_id: "run_1",
+                outcome: {
+                  success: false,
+                  emoji: "🚧",
+                  text: "Blocked",
+                  recorded_at: 1_700_000_040,
+                },
+              },
+              {
+                id: "o2",
+                session_id: "conv_1",
+                objective: null,
+                created_at: 1_700_000_020,
+                scheduled_task_run_id: "run_1",
+                outcome: null,
+              },
+            ],
+            more_objectives: true,
             conversation_pending_approvals: 2,
           },
         ],
@@ -189,6 +215,16 @@ describe("listScheduledTaskRuns", () => {
       viewerLastSeen: 1_700_000_055,
       viewerUnread: false,
       sessionCostUsd: 0,
+      objectives: [
+        {
+          id: "o1",
+          objective: "Get CI green",
+          createdAt: 1_700_000_010,
+          outcome: { success: false, emoji: "🚧", text: "Blocked", recordedAt: 1_700_000_040 },
+        },
+        { id: "o2", objective: null, createdAt: 1_700_000_020, outcome: null },
+      ],
+      moreObjectives: true,
       conversationPendingApprovals: 2,
     });
   });

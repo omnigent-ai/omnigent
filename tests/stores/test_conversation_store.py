@@ -97,6 +97,94 @@ def test_fork_drops_import_provenance_labels(
     assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
 
 
+@pytest.mark.parametrize("value", ["new", None])
+def test_replace_label_if_changes_only_the_expected_value(
+    conversation_store: SqlAlchemyConversationStore, value: str | None
+) -> None:
+    """A writer undoing its own label never overwrites a later writer's."""
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(source.id, {"k": "mine"})
+
+    assert not conversation_store.replace_label_if(source.id, "k", expected="theirs", value=value)
+    assert conversation_store.get_conversation(source.id).labels["k"] == "mine"
+    assert conversation_store.replace_label_if(source.id, "k", expected="mine", value=value)
+    assert conversation_store.get_conversation(source.id).labels.get("k") == value
+    assert not conversation_store.replace_label_if(source.id, "absent", expected="x", value="y")
+
+
+def test_replace_label_if_can_require_the_label_to_be_absent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``expected=None`` sets a label only if no writer has set it yet."""
+    source = conversation_store.create_conversation()
+
+    assert conversation_store.replace_label_if(source.id, "k", expected=None, value="first")
+    assert not conversation_store.replace_label_if(source.id, "k", expected=None, value="second")
+    assert conversation_store.get_conversation(source.id).labels["k"] == "first"
+    with pytest.raises(ValueError, match="expected value or a new value"):
+        conversation_store.replace_label_if(source.id, "other", expected=None, value=None)
+
+
+def test_swap_label_returns_the_value_it_replaced(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The previous value comes from the write itself, even when another writer gets in first."""
+    source = conversation_store.create_conversation()
+    assert conversation_store.swap_label(source.id, "k", "a") is None
+    assert conversation_store.swap_label(source.id, "k", "b") == "a"
+
+    read = conversation_store.get_conversation
+    reads = 0
+
+    def read_then_lose_the_race(conversation_id: str) -> Any:
+        nonlocal reads
+        reads += 1
+        conversation = read(conversation_id)
+        if reads == 1:
+            conversation_store.set_labels(conversation_id, {"k": "c"})
+        return conversation
+
+    monkeypatch.setattr(conversation_store, "get_conversation", read_then_lose_the_race)
+
+    assert conversation_store.swap_label(source.id, "k", "d") == "c"
+    assert (reads, read(source.id).labels["k"]) == (2, "d")
+
+
+def test_swap_label_gives_up_on_a_label_that_keeps_changing(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = conversation_store.create_conversation()
+    read = conversation_store.get_conversation
+    writes = iter(range(100))
+
+    def read_then_lose_the_race(conversation_id: str) -> Any:
+        conversation = read(conversation_id)
+        conversation_store.set_labels(conversation_id, {"k": f"other-{next(writes)}"})
+        return conversation
+
+    monkeypatch.setattr(conversation_store, "get_conversation", read_then_lose_the_race)
+
+    with pytest.raises(RuntimeError, match="kept changing"):
+        conversation_store.swap_label(source.id, "k", "mine")
+    assert read(source.id).labels["k"].startswith("other-")
+
+
+def test_fork_drops_the_automation_run_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork serves no automation run, so what its agent records is not the run's."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id, {SCHEDULED_TASK_RUN_LABEL_KEY: "0123456789abcdef0123456789abcdef"}
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert SCHEDULED_TASK_RUN_LABEL_KEY not in fork.labels
+
+
 def test_fork_drops_sandbox_repo_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

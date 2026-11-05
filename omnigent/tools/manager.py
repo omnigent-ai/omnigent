@@ -30,6 +30,8 @@ from omnigent.tools.builtins import (
     SysCancelAsyncTool,
     SysListModelsTool,
     SysReadInboxTool,
+    SysRecordObjectiveTool,
+    SysRecordOutcomeTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
@@ -190,6 +192,7 @@ class ToolManager:
         self._register_comment_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
+        self._register_objective_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -227,6 +230,13 @@ class ToolManager:
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
         ):
+            self._tools[tool.name()] = tool
+
+    def _register_objective_tools(self) -> None:
+        """Register the objective tools only when explicitly enabled on the resolved spec."""
+        if self._spec.tool_groups.objectives is not True:
+            return
+        for tool in (SysRecordObjectiveTool(), SysRecordOutcomeTool()):
             self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:

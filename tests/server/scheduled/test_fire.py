@@ -18,6 +18,7 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -300,6 +301,10 @@ class FakeConversationStore:
 
     def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
         self.label_writes[conversation_id] = dict(labels)
+
+    def swap_label(self, conversation_id: str, key: str, value: str) -> str | None:
+        self.set_labels(conversation_id, {key: value})
+        return None
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
@@ -3148,6 +3153,67 @@ async def test_continue_records_the_run_once_the_prompt_is_delivered() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("continued", [False, True])
+async def test_a_legacy_fire_names_its_run_on_the_session_before_sending(continued: bool) -> None:
+    """Legacy timers write the run row only after dispatch, so its ID is chosen first.
+
+    A new session is created with the label; a continued one gets it just before
+    the prompt goes in. Either way it names the row the fire then writes.
+    """
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    if continued:
+        conv_store: Any = _ExistingConversationStore(_continued_session())
+        store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+    else:
+        conv_store = FakeConversationStore()
+        store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    at_dispatch: list[tuple[str | None, int]] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        at_dispatch.append((conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY), len(store.runs)))
+
+    await build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)(
+        0, "task_1"
+    )
+    await _drain()
+
+    [run] = store.runs
+    assert at_dispatch == [(run["run_id"], 0)]
+    if continued:
+        assert conv_store.label_writes["conv_prev"] == {
+            SCHEDULED_TASK_RUN_LABEL_KEY: run["run_id"]
+        }
+    else:
+        assert conv_store.created[0]["labels"][SCHEDULED_TASK_RUN_LABEL_KEY] == run["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_continued_session_that_cannot_be_stamped_records_a_failed_run() -> None:
+    """Without the label, what the agent records could land on another run, so nothing is sent."""
+    conv_store = _ExistingConversationStore(_continued_session())
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    def _fail(conversation_id: str, key: str, value: str) -> str | None:
+        raise RuntimeError("database unavailable")
+
+    conv_store.swap_label = _fail  # type: ignore[method-assign]
+    launched: list[str] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv.id)
+
+    await build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)(
+        0, "task_1"
+    )
+    await _drain()
+
+    assert launched == []
+    [run] = store.runs
+    assert (run["status"], run["error_code"]) == ("failed", "launch_failed")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("live_status", ["running", "waiting"])
 async def test_continue_sends_while_an_earlier_turn_is_still_going(live_status: str) -> None:
     """The prompt joins the busy session; the earlier run is left to its own turn end."""
@@ -3423,6 +3489,117 @@ async def test_continue_dispatch_failure_records_a_failed_run() -> None:
     assert [(run["status"], run["error_code"], run["conversation_id"]) for run in store.runs] == [
         ("failed", "launch_failed", "conv_prev")
     ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "before_send",
+        "while_sending",
+        "after_a_later_stamp",
+        "after_an_earlier_stamp",
+        "cancelled_before_send",
+        "cancelled_while_stamping",
+    ],
+)
+async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
+    monkeypatch: pytest.MonkeyPatch, db_uri: str, failure: str
+) -> None:
+    """A prompt that never went in gives attribution back to the run still working.
+
+    Run A is still working in the session when run B's dispatch fails. If B's
+    prompt was never sent, what A records afterwards must land on A, so the
+    label goes back to A, also when B's fire is cancelled. Once sending began
+    the prompt may have gone in, so B keeps it. Another run C's stamp is never
+    lost: not one written after B's, nor one written after B checked the session
+    but before B's stamp.
+    """
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.session_objective_store import SessionObjectiveStore
+
+    real = SqlAlchemyConversationStore(db_uri)
+    session_id = real.create_conversation().id
+    run_a, run_c = "a" * 32, "c" * 32
+    real.set_labels(session_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_a})
+    objectives = SessionObjectiveStore(db_uri)
+    earlier = objectives.record_objective(session_id, "Triage", scheduled_task_run_id=run_a)
+    stamp_entered, stamp_released = threading.Event(), threading.Event()
+
+    class _Conversations(_ExistingConversationStore):
+        """The continued session's checks read the fake; its labels live in the database."""
+
+        def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+            conv = super().get_conversation(conversation_id)
+            if conv is not None:
+                conv.labels = dict(real.get_conversation(conversation_id).labels)
+            return conv
+
+        def swap_label(self, conversation_id: str, key: str, value: str) -> str | None:
+            if failure == "after_an_earlier_stamp":
+                real.set_labels(conversation_id, {key: run_c})
+            elif failure == "cancelled_while_stamping":
+                stamp_entered.set()
+                assert stamp_released.wait(10)
+            return real.swap_label(conversation_id, key, value)
+
+        def replace_label_if(self, conversation_id: str, key: str, **kwargs: Any) -> bool:
+            return real.replace_label_if(conversation_id, key, **kwargs)
+
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(session_mode="continue", session_id=session_id)}
+    )
+    sent: list[str] = []
+
+    async def _runner_start(conv_id: str, *args: Any) -> None:
+        if failure == "after_a_later_stamp":
+            real.set_labels(conv_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_c})
+        if failure == "cancelled_before_send":
+            raise asyncio.CancelledError
+        if failure != "while_sending":
+            raise RuntimeError("runner never came up")
+
+    async def _runner_send(conv_id: str, *args: Any, **kwargs: Any) -> Any:
+        sent.append(conv_id)
+        raise RuntimeError("the runner dropped the connection")
+
+    import omnigent.server.routes.sessions as sessions_routes
+
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_session_initialized", _runner_start)
+    monkeypatch.setattr(sessions_routes, "_dispatch_session_event_to_runner", _runner_send)
+    deps = _deps(store, conversation_store=_Conversations(_continued_session(id=session_id)))
+
+    async def _launch(conv: Any, task: Any) -> None:
+        await fire_mod._send_prompt(deps, conv, object(), task)
+
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    if failure == "cancelled_while_stamping":
+        assert await asyncio.to_thread(stamp_entered.wait, 10)
+        for fire in fire_mod._PENDING_FIRES:
+            fire.cancel()
+        await asyncio.sleep(0)
+        stamp_released.set()
+    await _drain()
+
+    run_b = store.runs[0]["run_id"] if store.runs else None
+    if failure.startswith("cancelled"):
+        assert store.runs == []
+    else:
+        assert [(run["status"], run["error_code"]) for run in store.runs] == [
+            ("failed", "launch_failed")
+        ]
+    label = real.get_conversation(session_id).labels[SCHEDULED_TASK_RUN_LABEL_KEY]
+    assert label == {
+        "while_sending": run_b,
+        "after_a_later_stamp": run_c,
+        "after_an_earlier_stamp": run_c,
+    }.get(failure, run_a)
+    assert sent == ([session_id] if failure == "while_sending" else [])
+    # A, still working, records its outcome the way the objectives API does.
+    resolved = objectives.record_outcome(
+        session_id, success=True, emoji="✅", text="Triaged", scheduled_task_run_id=label
+    )
+    assert (resolved.id == earlier.id) is (label == run_a)
 
 
 @pytest.mark.parametrize(

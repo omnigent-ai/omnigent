@@ -3332,3 +3332,47 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     )
     assert retry.status_code == 400, retry.text
     assert "Minimum interval is 60 minutes" in retry.text
+
+
+async def test_run_history_lists_each_runs_objectives(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A continued session's runs each show what was recorded during them, newest last."""
+    from omnigent.stores.session_objective_store import SessionObjectiveStore
+
+    monkeypatch.setattr(scheduled_tasks_routes, "RUN_OBJECTIVES_SHOWN", 2)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    session = SqlAlchemyConversationStore(db_uri).create_conversation()
+    first_run, second_run, skipped = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
+    _seed_run(db_uri, task_id, first_run, scheduled_at=1000, conversation_id=session.id)
+    _seed_run(db_uri, task_id, second_run, scheduled_at=2000, conversation_id=session.id)
+    _seed_run(db_uri, task_id, skipped, scheduled_at=3000, status="skipped", conversation_id=None)
+    objectives = SessionObjectiveStore(db_uri)
+    objectives.record_objective(session.id, "Triage", scheduled_task_run_id=first_run)
+    objectives.record_outcome(
+        session.id, success=True, emoji="✅", text="Triaged 3", scheduled_task_run_id=first_run
+    )
+    for goal in ("One", "Two", "Three"):
+        objectives.record_objective(session.id, goal, scheduled_task_run_id=second_run)
+    objectives.record_outcome(
+        session.id, success=False, emoji="🧯", text="API down", scheduled_task_run_id=second_run
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+
+    assert resp.status_code == 200, resp.text
+    by_id = {run["id"]: run for run in resp.json()["runs"]}
+    assert [(o["objective"], o["outcome"]["text"]) for o in by_id[first_run]["objectives"]] == [
+        ("Triage", "Triaged 3")
+    ]
+    assert by_id[first_run]["more_objectives"] is False
+    second = by_id[second_run]
+    assert [o["objective"] for o in second["objectives"]] == ["Two", "Three"]
+    assert second["objectives"][-1]["outcome"]["success"] is False
+    assert second["objectives"][0]["outcome"] is None
+    assert second["more_objectives"] is True
+    assert (by_id[skipped]["objectives"], by_id[skipped]["more_objectives"]) == ([], False)

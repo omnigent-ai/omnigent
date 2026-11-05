@@ -441,6 +441,29 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
+# Priority 5l.2: Session objectives — the runner proxies the server's
+# /v1/sessions/{id}/objectives endpoints for the calling session only.
+_OBJECTIVE_TOOLS = frozenset({"sys_record_objective", "sys_record_outcome"})
+# What a server answers for a path it has no route for, unlike a route's own
+# 404: FastAPI's default body, or the web UI catch-all's generic error.
+_UNROUTED_NOT_FOUND_BODIES = (
+    {"detail": "Not Found"},
+    {"error": {"code": "not_found", "message": "Not found"}},
+)
+
+
+def _is_unrouted(resp: httpx.Response) -> bool:
+    """Whether *resp* says the server has no such route, so it predates the endpoint."""
+    if resp.status_code == 405:
+        return True
+    if resp.status_code != 404:
+        return False
+    try:
+        return resp.json() in _UNROUTED_NOT_FOUND_BODIES
+    except ValueError:
+        return False
+
+
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -494,6 +517,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _OBJECTIVE_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -904,6 +928,7 @@ _ALL_LOCAL_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _OBJECTIVE_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -4880,6 +4905,74 @@ async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> s
     raise ValueError(f"could not create project {trimmed!r}: {created.text[:200]}")
 
 
+async def _execute_objective_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+) -> str:
+    """Send ``sys_record_objective`` or ``sys_record_outcome`` for the calling session.
+
+    The session is always the caller's own, so the model cannot record for
+    another session. The server validates the values and attributes them to the
+    automation run the session serves, if any.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} needs the calling session"})
+    try:
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    path = f"/v1/sessions/{conversation_id}/objectives"
+    headers = {ORCHESTRATION_SOURCE_HEADER: conversation_id}
+    if tool_name == "sys_record_objective":
+        objective = args.get("objective")
+        if not isinstance(objective, str):
+            return json.dumps({"error": f"{tool_name}: objective must be a string"})
+        resp = await server_client.post(
+            path, json={"objective": objective}, headers=headers, timeout=30.0
+        )
+    else:
+        success, emoji, text = args.get("success"), args.get("emoji"), args.get("text")
+        if not isinstance(success, bool):
+            return json.dumps({"error": f"{tool_name}: success must be true or false"})
+        if not isinstance(emoji, str) or not isinstance(text, str):
+            return json.dumps({"error": f"{tool_name}: emoji and text must be strings"})
+        body: _JsonObject = {"success": success, "emoji": emoji, "text": text}
+        objective_id = args.get("objective_id")
+        if objective_id is not None:
+            if not isinstance(objective_id, str):
+                return json.dumps({"error": f"{tool_name}: objective_id must be a string"})
+            body["objective_id"] = objective_id
+        resp = await server_client.put(f"{path}/outcome", json=body, headers=headers, timeout=30.0)
+    if _is_unrouted(resp):
+        # An older server has no objectives routes.
+        return json.dumps(
+            {"error": f"{tool_name}: this Omnigent server does not record objectives"}
+        )
+    if resp.status_code >= 400:
+        reason = (
+            "invalid arguments"
+            if resp.status_code == 422
+            else (f"server returned {resp.status_code}")
+        )
+        return json.dumps({"error": f"{tool_name}: {reason}", "details": resp.text[:500]})
+    recorded = resp.json()
+    return json.dumps(
+        {
+            "recorded": True,
+            "objective_id": recorded.get("id"),
+            "objective": recorded.get("objective"),
+            "outcome": recorded.get("outcome"),
+        }
+    )
+
+
 async def _execute_scheduled_task_tool(
     tool_name: str,
     arguments: str,
@@ -7179,6 +7272,13 @@ async def execute_tool(
             )
         elif tool_name in _SCHEDULED_TASK_TOOLS:
             output = await _execute_scheduled_task_tool(
+                tool_name,
+                arguments,
+                server_client=server_client,
+                conversation_id=conversation_id,
+            )
+        elif tool_name in _OBJECTIVE_TOOLS:
+            output = await _execute_objective_tool(
                 tool_name,
                 arguments,
                 server_client=server_client,

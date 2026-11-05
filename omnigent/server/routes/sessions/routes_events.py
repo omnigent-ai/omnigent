@@ -23,6 +23,7 @@ from fastapi.routing import APIRoute
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
+from omnigent.automation_session import session_agent_revision
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import (
@@ -55,7 +56,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
-from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
+from omnigent.mcp_selection import selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.launch_failure import (
@@ -3735,7 +3736,7 @@ def register_events_routes(
             native_shell_authorized=native_shell_authorized,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
-            agent_revision=mcp_selection_revision(_agent.bundle_location, conv.labels)
+            agent_revision=session_agent_revision(_agent.bundle_location, conv.labels)
             if _agent
             else None,
             background_titles_enabled=background_session_titles_enabled(request.headers),

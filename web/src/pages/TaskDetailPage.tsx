@@ -63,7 +63,7 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
-import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
+import type { ScheduledTaskRun, SessionObjective } from "@/lib/scheduledTasksApi";
 import { cn } from "@/lib/utils";
 
 const RUN_HIGHLIGHT_DURATION_MS = 3_000;
@@ -627,8 +627,10 @@ function useRunUnread(run: ScheduledTaskRun): boolean {
  * - LEADING: a single status icon chosen by priority (see `RunStatusIcon`) —
  *   failed triangle > skipped circle-slash > succeeded-unread blue dot >
  *   succeeded-read grey dot — each with an explanatory tooltip.
- * - BODY: the fire timestamp, the duration (muted), and — for skipped/failed —
- *   the stage the fire stopped at and why, derived from `errorCode`.
+ * - BODY: the fire timestamp, the duration (muted), the objectives the agent
+ *   recorded during the run with their outcomes (emoji + a few words, like a
+ *   status message), and — for skipped/failed — the stage the fire stopped at
+ *   and why, derived from `errorCode`.
  *
  * When the run produced a conversation the ENTIRE row is the click target
  * (a real `<Link>`: keyboard-focusable, Enter/Space activate natively) that
@@ -685,6 +687,9 @@ function RunRow({
             Session needs approval · Open to review
           </span>
         )}
+        {run.objectives.length > 0 && (
+          <RunObjectives objectives={run.objectives} more={run.moreObjectives} />
+        )}
         {failure && (
           <span className="text-xs text-muted-foreground" data-testid="run-failure">
             {failure.stage && (
@@ -702,7 +707,7 @@ function RunRow({
 
   const commonClassName = cn(
     "flex gap-3 rounded-lg px-2 py-2",
-    failure ? "items-start" : "items-center",
+    failure || run.objectives.length > 0 ? "items-start" : "items-center",
   );
 
   // Keep the animation on the stable row when a queued run gains a session link.
@@ -729,6 +734,58 @@ function RunRow({
         <div className={commonClassName}>{body}</div>
       )}
     </li>
+  );
+}
+
+/**
+ * What the agent recorded during a run: each objective's outcome as its emoji
+ * and a few words, like a status message, or the objective itself, muted,
+ * until an outcome is recorded. Whether a goal was reached is announced to
+ * screen readers, since the emoji alone may not say so.
+ */
+function RunObjectives({ objectives, more }: { objectives: SessionObjective[]; more: boolean }) {
+  return (
+    <span className="mt-0.5 flex min-w-0 flex-col gap-0.5" data-testid="run-objectives">
+      {objectives.map((objective) => (
+        <RunObjective key={objective.id} objective={objective} />
+      ))}
+      {more && (
+        <span className="text-xs text-muted-foreground" data-testid="run-objectives-more">
+          More in the session
+        </span>
+      )}
+    </span>
+  );
+}
+
+function RunObjective({ objective }: { objective: SessionObjective }) {
+  const { outcome } = objective;
+  if (!outcome) {
+    return (
+      <span
+        className="min-w-0 truncate text-sm text-muted-foreground"
+        data-testid="run-objective"
+        data-run-outcome="none"
+      >
+        <span className="sr-only">No outcome yet: </span>
+        {objective.objective}
+      </span>
+    );
+  }
+  return (
+    <span
+      className={cn(
+        "flex min-w-0 items-baseline gap-1.5 text-sm",
+        outcome.success ? "text-foreground" : "text-amber-700 dark:text-amber-400",
+      )}
+      data-testid="run-objective"
+      data-run-outcome={outcome.success ? "success" : "failure"}
+      title={objective.objective ?? undefined}
+    >
+      <span aria-hidden>{outcome.emoji}</span>
+      <span className="sr-only">{outcome.success ? "Goal reached: " : "Goal not reached: "}</span>
+      <span className="min-w-0 truncate">{outcome.text}</span>
+    </span>
   );
 }
 

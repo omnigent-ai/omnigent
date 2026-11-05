@@ -879,17 +879,22 @@ class ToolGroupsConfig:
     """
     Which framework-owned tool groups an agent advertises.
 
-    Every group defaults to ``True``: the groups register on every agent
-    unless the spec opts out under a top-level ``tool_groups:`` block (a
-    mapping of group name to boolean). Trimming a group the agent cannot
-    use keeps the advertised tool payload under a strict provider's byte
-    limit and stops a small model from picking an irrelevant tool.
+    Every group but ``objectives`` defaults to ``True``: those groups
+    register on every agent unless the spec opts out under a top-level
+    ``tool_groups:`` block (a mapping of group name to boolean). Trimming a
+    group the agent cannot use keeps the advertised tool payload under a
+    strict provider's byte limit and stops a small model from picking an
+    irrelevant tool.
 
     :param browser: The ``browser_*`` embedded-browser tools (5).
     :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4).
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    :param objectives: ``sys_record_objective`` and ``sys_record_outcome``.
+        ``None`` (the default) leaves the choice to the session: the runner
+        turns the group on in sessions an automation serves and off
+        elsewhere. ``True`` or ``False`` in the spec applies everywhere.
     """
 
     browser: bool = True
@@ -897,6 +902,7 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
+    objectives: bool | None = None
 
 
 @dataclass

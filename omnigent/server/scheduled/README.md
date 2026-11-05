@@ -339,6 +339,35 @@ stateDiagram-v2
   still `running` after 6 hours is failed as `incomplete` when the task's runs are
   read.
 
+### Objectives a run records
+
+The agent reports whether it reached a run's goal with the objective tools
+(see `docs/session-objectives.md`). Attribution to the run is durable and
+independent of the fire's progress:
+
+- The fire knows the run's ID before it sends the prompt: a claimed run's, or
+  for legacy timers one chosen when the recorder is made and used for the row
+  written at the end.
+- A new session is created with the `omnigent.scheduled_task_run` label set to
+  that ID. A continued session gets the label written just before dispatch
+  with `ConversationStore.swap_label`, a compare-and-swap that returns the
+  value it replaced; if the write fails, the run fails with `launch_failed` and
+  nothing is sent.
+- A continued dispatch that fails or is cancelled before `_send_prompt` reaches
+  its send stage sent nothing, so the label goes back to the value the stamp
+  replaced (an earlier run may still be working there). A conditional write
+  (`ConversationStore.replace_label_if`) restores it only while it still names
+  the failed run. The restore is shielded and first waits for an outstanding
+  stamp write, so a cancelled fire still restores it. Once sending began, the
+  prompt may have gone in, and the label stays.
+- What the agent records reads the label from the session, so it goes to the
+  run that sent the latest prompt on any replica, also after a restart, even
+  though a continued run's row names its session only once the prompt is
+  delivered (recovery depends on that).
+- The label also marks the session as one an automation serves, which turns
+  on the objective tools, and is part of the session's agent revision, so a
+  session an automation starts continuing gets them with the first prompt.
+
 ### When the server stops partway
 
 Recovery starts within about one lease plus one poll after renewals stop

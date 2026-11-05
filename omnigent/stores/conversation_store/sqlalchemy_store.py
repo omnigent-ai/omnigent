@@ -27,6 +27,7 @@ from sqlalchemy import (
     tuple_,
     update,
 )
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.selectable import Subquery
@@ -46,6 +47,7 @@ from omnigent.db.db_models import (
     SqlHost,
     SqlPolicy,
     SqlProject,
+    SqlSessionObjective,
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
@@ -891,6 +893,12 @@ def _ranked_latest_message_items(conversation_ids: list[str]) -> Subquery:
     )
 
 
+# Deleting a session subtree removes its objectives in transactions of at most
+# this many rows, reading at most this many sessions' objectives at a time.
+_OBJECTIVE_DELETE_BATCH = 500
+_OBJECTIVE_DELETE_SESSIONS = 100
+
+
 class SqlAlchemyConversationStore(ConversationStore):
     """
     SQLAlchemy-backed implementation of :class:`ConversationStore`.
@@ -918,7 +926,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         super().__init__(storage_location, conversation_storage_location)
         # Omnigent DB: agents, hosts, policies, files, user_daily_costs,
-        # session_permissions, comments, omnigent_conversation_metadata.
+        # session_permissions, comments, session_objectives,
+        # omnigent_conversation_metadata.
         self._engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
             self._engine,
@@ -3019,6 +3028,60 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         reject_profile_labels({key: ""})
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
+
+    def replace_label_if(
+        self,
+        conversation_id: str,
+        key: str,
+        *,
+        expected: str | None,
+        value: str | None,
+    ) -> bool:
+        """Change one label in a single conditional write. See base class for contract."""
+        from sqlalchemy.exc import IntegrityError
+
+        reject_profile_labels({key: ""})
+        if expected is None:
+            if value is None:
+                raise ValueError("replace_label_if needs an expected value or a new value")
+
+            def insert_absent(session: Session) -> None:
+                session.execute(
+                    insert(SqlConversationLabel).values(
+                        conversation_id=conversation_id,
+                        key=key,
+                        value=value,
+                        updated_at=now_epoch(),
+                    )
+                )
+
+            try:
+                run_write_transaction(
+                    self._conv_session_immediate, "replace_label_if", insert_absent
+                )
+            except IntegrityError:
+                # Another writer set the label first.
+                return False
+            return True
+        match = (
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id == conversation_id,
+            SqlConversationLabel.key == key,
+            SqlConversationLabel.value == expected,
+        )
+
+        def write(session: Session) -> bool:
+            statement = (
+                delete(SqlConversationLabel).where(*match)
+                if value is None
+                else update(SqlConversationLabel)
+                .where(*match)
+                .values(value=value, updated_at=now_epoch())
+            )
+            result = cast("CursorResult[Any]", session.execute(statement))
+            return result.rowcount > 0
+
+        return run_write_transaction(self._conv_session_immediate, "replace_label_if", write)
 
     def list_conversations(
         self,
@@ -6215,7 +6278,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         Collects the full subtree of conversation IDs (the target plus
         all direct/indirect children), then deletes their items, labels,
-        comments, policies, and session-permission rows before deleting
+        comments, objectives, policies, and session-permission rows before deleting
         the conversation rows themselves (children before parent).
 
         :param conversation_id: Unique conversation identifier,
@@ -6314,5 +6377,44 @@ class SqlAlchemyConversationStore(ConversationStore):
             "delete_conversation_metadata",
             delete_metadata,
         )
+        self._delete_session_objectives(subtree_ids)
 
         return True
+
+    def _delete_session_objectives(self, conversation_ids: list[str]) -> None:
+        """Delete the sessions' objectives in bounded batches, one transaction each.
+
+        A subtree can hold many sessions, each with many objectives, so no
+        single transaction deletes more than :data:`_OBJECTIVE_DELETE_BATCH` rows.
+        """
+        for start in range(0, len(conversation_ids), _OBJECTIVE_DELETE_SESSIONS):
+            chunk = conversation_ids[start : start + _OBJECTIVE_DELETE_SESSIONS]
+            while self._delete_objective_batch(chunk) == _OBJECTIVE_DELETE_BATCH:
+                pass
+
+    def _delete_objective_batch(self, conversation_ids: list[str]) -> int:
+        """Delete up to one batch of the sessions' objectives; return how many went."""
+
+        def write(session: Session) -> int:
+            keys = session.execute(
+                select(SqlSessionObjective.conversation_id, SqlSessionObjective.id)
+                .where(
+                    SqlSessionObjective.workspace_id == current_workspace_id(),
+                    SqlSessionObjective.conversation_id.in_(conversation_ids),
+                )
+                .limit(_OBJECTIVE_DELETE_BATCH)
+            ).all()
+            by_session: dict[str, list[str]] = {}
+            for conversation_id, objective_id in keys:
+                by_session.setdefault(conversation_id, []).append(objective_id)
+            for conversation_id, objective_ids in by_session.items():
+                session.execute(
+                    delete(SqlSessionObjective).where(
+                        SqlSessionObjective.workspace_id == current_workspace_id(),
+                        SqlSessionObjective.conversation_id == conversation_id,
+                        SqlSessionObjective.id.in_(objective_ids),
+                    )
+                )
+            return len(keys)
+
+        return run_write_transaction(self._session_immediate, "delete_session_objectives", write)

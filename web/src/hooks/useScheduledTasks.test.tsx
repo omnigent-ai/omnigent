@@ -77,6 +77,8 @@ const RUN: api.ScheduledTaskRun = {
   firedAt: 1_700_000_000,
   finishedAt: null,
   errorCode: null,
+  objectives: [],
+  moreObjectives: false,
   conversationUpdatedAt: 1_700_000_500,
   conversationStatus: "running",
   viewerLastSeen: null,

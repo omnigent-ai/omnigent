@@ -458,6 +458,44 @@ async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
     assert store.get(claimed.task.id).session_id == _CONV_ID
 
 
+async def test_a_continued_fire_names_its_run_on_the_session_before_sending(store) -> None:
+    """What the agent records about this firing goes to its run, on any replica.
+
+    The session names the claimed run before the prompt goes in. That label is
+    stored with the session, so a report that arrives after a restart, or on a
+    replica that never saw the fire, still lands on this run rather than on the
+    earlier run, which the session's run row does not name until delivery.
+    """
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    conversations = _ExistingConversationStore(
+        _FakeConversation(
+            id=_CONV_ID,
+            agent_id=_AGENT_ID,
+            host_id=_HOST_ID,
+            workspace="/repo",
+            labels={SCHEDULED_TASK_RUN_LABEL_KEY: "e" * 32},
+        )
+    )
+    at_dispatch: list[tuple[str | None, str | None]] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        at_dispatch.append(
+            (
+                conversations.label_writes.get(_CONV_ID, {}).get(SCHEDULED_TASK_RUN_LABEL_KEY),
+                conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY),
+            )
+        )
+
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=dispatch
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    assert at_dispatch == [(claimed.lease.run.id, claimed.lease.run.id)]
+
+
 async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> None:
     claimed = _claim(store, session_mode="continue")
     conversations = _ConversationStore()
