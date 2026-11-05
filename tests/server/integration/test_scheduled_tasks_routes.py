@@ -772,6 +772,106 @@ async def test_create_persists_permission_mode(
         assert changed.json()["permission_mode"] == "read-only"
 
 
+def _mcp_registry(app: FastAPI) -> None:
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+
+    app.state.mcp_registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id=name,
+                    title=name,
+                    url="https://example.test/mcp",
+                    auth="none",
+                    tools=["read_ticket"],
+                    allowed_users=[] if name == "restricted" else None,
+                )
+                for name in ("github", "linear", "restricted")
+            ]
+        ),
+        None,
+    )
+
+
+async def test_mcp_services_round_trip_on_create_and_update(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient
+) -> None:
+    _mcp_registry(auth_app)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(mcp_services=["github", "github", "linear"]),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["mcp_services"] == ["github", "linear"]
+    task_url = f"/v1/scheduled-tasks/{created.json()['id']}"
+
+    renamed = await auth_client.patch(task_url, json={"name": "renamed"}, headers=_headers())
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["mcp_services"] == ["github", "linear"]
+    replaced = await auth_client.patch(
+        task_url, json={"mcp_services": ["linear"]}, headers=_headers()
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.json()["mcp_services"] == ["linear"]
+    cleared = await auth_client.patch(task_url, json={"mcp_services": []}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["mcp_services"] == []
+
+
+@pytest.mark.parametrize(
+    ("service", "status"), [("missing", 403), ("restricted", 403), ("../bad", 400)]
+)
+async def test_mcp_services_the_owner_cannot_use_are_rejected(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, service: str, status: int
+) -> None:
+    _mcp_registry(auth_app)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(mcp_services=[service]), headers=_headers()
+    )
+    assert created.status_code == status, created.text
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert listed.json()["scheduled_tasks"] == []
+
+    saved = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(mcp_services=["github"]), headers=_headers()
+    )
+    task_url = f"/v1/scheduled-tasks/{saved.json()['id']}"
+    patched = await auth_client.patch(
+        task_url, json={"mcp_services": [service]}, headers=_headers()
+    )
+    assert patched.status_code == status, patched.text
+    kept = await auth_client.get(task_url, headers=_headers())
+    assert kept.json()["mcp_services"] == ["github"]
+
+
+async def test_mcp_services_use_the_deployment_selection(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient
+) -> None:
+    checked: list[tuple[tuple[str, ...], str | None]] = []
+
+    class _Selection:
+        def validate(self, request, services, *, spec, user_id):
+            checked.append((tuple(services), user_id))
+            return tuple(services)
+
+        def session_labels(self, services):
+            return {}
+
+        def selected_services(self, labels):
+            return ()
+
+    auth_app.state.session_mcp_selection = _Selection()
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(mcp_services=["system.ai.github"]),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["mcp_services"] == ["system.ai.github"]
+    assert checked == [(("system.ai.github",), "alice@example.com")]
+
+
 @pytest.mark.parametrize("operation", ["create", "update"])
 async def test_permission_save_requires_resolved_harness(
     auth_client: httpx.AsyncClient,

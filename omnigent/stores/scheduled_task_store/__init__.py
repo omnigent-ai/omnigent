@@ -8,6 +8,7 @@ table and its ``scheduled_task_runs`` history table.
 from __future__ import annotations
 
 import builtins
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -17,6 +18,23 @@ from omnigent.entities import ScheduledTask, ScheduledTaskRun
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
 # Distinct from None, which means "set the column to NULL."
 _UNSET: Any = object()
+
+
+# Width of the ``scheduled_tasks.mcp_services`` column.
+MCP_SERVICES_MAX_STORED_CHARS = 2048
+
+
+def encode_mcp_services(services: tuple[str, ...]) -> str | None:
+    """Serialize a task's MCP services for its column; empty stores NULL."""
+    return json.dumps(list(services)) if services else None
+
+
+def decode_mcp_services(raw: str | None) -> tuple[str, ...]:
+    """Read a task's MCP services column back; NULL is no selection."""
+    if not raw:
+        return ()
+    return tuple(json.loads(raw))
+
 
 # How :meth:`ScheduledTaskStore.adopt_session` resolved: the task now continues
 # the session, another session got there first, or the task changed under the run.
@@ -68,6 +86,7 @@ class ScheduledTaskStore(ABC):
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
+        mcp_services: tuple[str, ...] = (),
         max_cost_usd: float | None = None,
         session_mode: str = "new",
         session_id: str | None = None,
@@ -95,6 +114,7 @@ class ScheduledTaskStore(ABC):
         :param reasoning_effort: Optional reasoning-effort hint.
         :param permission_mode: Optional native-harness permission mode
             (Claude Code), e.g. ``"acceptEdits"``.
+        :param mcp_services: MCP service names every fired session starts with.
         :param max_cost_usd: Optional per-firing cost budget in USD.
         :param session_mode: ``"new"`` (default) starts a new session per
             firing; ``"continue"`` sends each firing's prompt into one session.
@@ -189,6 +209,7 @@ class ScheduledTaskStore(ABC):
         model_override: str | None = _UNSET,
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
+        mcp_services: tuple[str, ...] | None = None,
         max_cost_usd: float | None = _UNSET,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
@@ -215,7 +236,8 @@ class ScheduledTaskStore(ABC):
         binding or nulling out a deleted last-run conversation.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
-        leaves it unchanged.
+        leaves it unchanged. ``mcp_services`` replaces the task's MCP services
+        (an empty tuple clears them); ``None`` leaves them unchanged.
 
         Passing ``agent_id`` rebinds the task to a different agent, which
         switches the harness its future firings run. The fire path reads
