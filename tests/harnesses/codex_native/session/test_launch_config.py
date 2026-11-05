@@ -204,6 +204,8 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
+                "--model",
+                "catalog-databricks-openai-default",
                 *_AUTO_REVIEW_ARGS,
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -257,6 +259,106 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("codex_args", "config_overrides", "expected_model"),
+    [
+        ((), ('model="gpt-5.6-luna"',), "gpt-5.6-luna"),
+        ((), ("model='gpt-5.6-luna'",), "gpt-5.6-luna"),
+        ((), ("model=gpt-5.6-luna",), "gpt-5.6-luna"),
+        ((), ('model="gpt-5.6-sol"', 'model="gpt-5.6-luna"'), "gpt-5.6-luna"),
+        ((), ('model_provider="omnigent"',), None),
+        ((), ('model=""',), None),
+        (("--model", "gpt-user"), ('model="gpt-5.6-luna"',), None),
+        (("--model=gpt-user",), ('model="gpt-5.6-luna"',), None),
+        (("-m", "gpt-user"), ('model="gpt-5.6-luna"',), None),
+        (("-mgpt-user",), ('model="gpt-5.6-luna"',), None),
+        (("-c", 'model="gpt-user"'), ('model="gpt-5.6-luna"',), None),
+        (('-cmodel="gpt-user"',), ('model="gpt-5.6-luna"',), None),
+        (('-c=model="gpt-user"',), ('model="gpt-5.6-luna"',), None),
+        (('--config=model="gpt-user"',), ('model="gpt-5.6-luna"',), None),
+        (('--config=model_provider="omnigent"',), ('model="gpt-5.6-luna"',), "gpt-5.6-luna"),
+        (("--image", "-m.png"), ('model="gpt-5.6-luna"',), "gpt-5.6-luna"),
+    ],
+)
+def test_build_codex_remote_args_fresh_thread_selects_the_override_model(
+    codex_args: tuple[str, ...],
+    config_overrides: tuple[str, ...],
+    expected_model: str | None,
+) -> None:
+    """A fresh thread passes the override model as ``--model`` unless caller args choose one."""
+
+    def remote_args(overrides: tuple[str, ...]) -> list[str]:
+        return codex_native_app_server.build_codex_remote_args(
+            codex_args=codex_args,
+            thread_id=None,
+            remote_url="ws://127.0.0.1:9876",
+            config_overrides=overrides,
+        )
+
+    override_args = [token for override in config_overrides for token in ("-c", override)]
+    model_args = ["--model", expected_model] if expected_model else []
+    assert remote_args(config_overrides) == [*override_args, *model_args, *remote_args(())]
+
+
+@pytest.mark.parametrize(
+    ("thread_id", "codex_cli_version"),
+    [(None, None), ("thread_abc123", None), ("thread_abc123", (0, 150, 0))],
+)
+@pytest.mark.parametrize(
+    ("base_args", "model_args"),
+    [
+        ((), ["--model", "gpt-5.6-luna"]),
+        (("-c", 'model_reasoning_summary="auto"'), ["--model", "gpt-5.6-luna"]),
+        (("-c", 'model="gpt-configured"'), ["--model", "gpt-5.6-luna"]),
+        (("--model", "gpt-configured"), []),
+        (("-m", "gpt-configured"), []),
+        (("--", "--model", "gpt-configured"), []),
+        (("--",), ["--model", "gpt-5.6-luna"]),
+        (("-m", "wrapper", "--"), ["--model", "gpt-5.6-luna"]),
+        (("-m", "wrapper", "--", "-m", "gpt-configured"), []),
+    ],
+)
+def test_build_codex_remote_args_leads_with_base_args(
+    base_args: tuple[str, ...],
+    model_args: list[str],
+    thread_id: str | None,
+    codex_cli_version: tuple[int, int, int] | None,
+) -> None:
+    """Base args lead unchanged; only their ``--model`` suppresses ours (Codex rejects repeats)."""
+    remote_url, override = "ws://127.0.0.1:9876", 'model="gpt-5.6-luna"'
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=thread_id,
+        remote_url=remote_url,
+        config_overrides=(override,),
+        codex_cli_version=codex_cli_version,
+        base_args=base_args,
+    )
+    if thread_id is None:
+        assert args == [
+            *base_args,
+            "-c",
+            override,
+            *model_args,
+            *_AUTO_REVIEW_ARGS,
+            "--remote",
+            remote_url,
+        ]
+    else:
+        # Pre-0.154 resume keeps permission flags rather than relying on preload.
+        permission_args = _AUTO_REVIEW_ARGS if codex_cli_version else []
+        assert args == [
+            *base_args,
+            "-c",
+            override,
+            *permission_args,
+            "resume",
+            "--remote",
+            remote_url,
+            thread_id,
+        ]
 
 
 # Pre- and post-0.154 remote resume keep or strip permission flags differently;
