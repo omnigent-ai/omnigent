@@ -5,7 +5,7 @@ Earlier rows reveal on hover; the final message row stays fully visible.
 This drives the full browser → SPA → server stack: send a message, wait for
 the mock-LLM reply, and assert for both the user and the assistant bubble that
 
-  - the timestamp rides inside the existing 24px action row (no new row),
+  - the timestamp shares the compact action row (no new row),
   - it matches a locale time format (``h:MM AM`` style),
   - the earlier user row is transparent at rest, while the final assistant
     row rests at full opacity,
@@ -109,8 +109,8 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     # At rest on a desktop viewport the row is fully transparent — the
     # timestamp must not permanently occupy visual space.
     expect(user_row).to_have_css("opacity", "0")
-    # The row exists at the design's 24px height even while hidden.
-    assert round(user_row.bounding_box()["height"]) == 24
+    # The compact user footer reserves its 20px height while hidden.
+    assert round(user_row.bounding_box()["height"]) == 20
 
     user_bubble.hover()
     expect(user_row).to_have_css("opacity", "1")
