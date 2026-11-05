@@ -154,6 +154,8 @@ Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversat
 
 `ScheduledTaskRun` also declares `scheduled` and `starting` statuses. The default scheduler creates runs at dispatch with status `running`. With `automations_v2` enabled, Run now records `scheduled` until a server claims the request. The persistent scheduler then records `starting` while it prepares a run, and `running` once the prompt is sent, or saved with its sandbox's host bound. A continued session's run goes straight to `succeeded` once its prompt is delivered.
 
+Run history shows **Session needs approval · Open to review** when the linked session has a pending permission request or question. Open the run to review it. This is current session state, including when several runs reuse that session; it is not a historical per-run outcome. Permission enforcement and approval timeouts are unchanged.
+
 ## Lifecycle
 
 Clients see tasks as `active` or `paused`. Deleted tasks are hidden immediately; their database rows may remain until unfinished claimed runs complete or are reconciled. `PATCH /v1/scheduled-tasks/{id}` changes supported mutable fields and can move a task between `active` and `paused`; it cannot set `deleted` (use `DELETE`). Omitting a field normally leaves it unchanged. Moving a task to a different `agent_id` clears `model_override`, `reasoning_effort`, and `permission_mode` unless the same request resends them, because a harness switch invalidates the settings stored beside the agent -- so re-pin an automation's execution controls in the request that switches its agent, or it fires the new agent on defaults. `max_cost_usd` is not agent-bound and survives the switch. Sending `permission_mode: null` clears the permission override, and `max_cost_usd: null` clears the cost cap. `project_id` moves future runs to another project, and `project_id: null` stops filing them into one; sessions from earlier runs stay where they are. An explicit `null` for `workspace` or `host_id` is rejected -- the rejection is on the presence of the key, so it applies even to a task where that field is currently unset; there is no direct null-based way to clear either one.
@@ -175,8 +177,6 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 | `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
 
 A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `session_mode`, `session_id`, `workspace`, `host_id`, `execution_target`, `project_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
-
-Run history shows **Session needs approval · Open to review** when the linked session has a pending permission request or question. Open the run to review it. This is current session state, including when several runs reuse that session; it is not a historical per-run outcome. Permission enforcement and approval timeouts are unchanged.
 
 ## Current limits
 
