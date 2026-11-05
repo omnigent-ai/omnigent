@@ -278,6 +278,9 @@ class ServerInfoResponse(BaseModel):
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    # Scheduled Codex permissions accept ``ask-for-approval`` / ``approve-for-me``;
+    # older servers reject them.
+    scheduled_task_codex_reviewer_modes: bool = True
     scheduled_task_sandbox_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.

@@ -246,6 +246,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
           ...SERVER_INFO_OFFLINE_FALLBACK,
           features: { automations_v2: true },
           scheduled_task_harness_settings: true,
+          scheduled_task_codex_reviewer_modes: true,
           scheduled_task_worktrees: true,
         }}
       >
@@ -514,9 +515,8 @@ describe("agent picker readiness (needs-setup badges)", () => {
     fireEvent.click(submit);
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].agentId).toBe("ag_codex");
-    // A new automation starts unattended-safe; model and effort keep the agent's defaults.
-    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("approve-for-me");
-    for (const override of ["modelOverride", "reasoningEffort"]) {
+    // This server doesn't advertise the Codex reviewer modes, so nothing is prefilled.
+    for (const override of ["permissionMode", "modelOverride", "reasoningEffort"]) {
       expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty(override);
     }
 
@@ -3865,6 +3865,64 @@ describe("automation harness settings", () => {
     expect(!!screen.queryByTestId("task-effort-trigger")).toBe(effort);
     expect(!!screen.queryByTestId("task-permission-trigger")).toBe(permission);
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
+  });
+
+  it("starts a new Codex automation on Approve for me", async () => {
+    mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
+    );
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Approve for me");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("approve-for-me");
+  });
+
+  it("saves no Codex override when the user picks Default", async () => {
+    mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
+    );
+    await choose("permission", "Default");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
+  });
+
+  it("hides and never prefills the Codex reviewer modes on an older server", async () => {
+    mockHarness("codex-native");
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_harness_settings: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    const offered = (await screen.findAllByRole("option")).map((option) => option.textContent);
+    expect(offered).toContain("Full Access");
+    expect(offered).not.toContain("Ask for approval");
+    expect(offered).not.toContain("Approve for me");
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
+  });
+
+  it("keeps an existing Codex automation with no saved mode on Default", async () => {
+    const agent = mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: agent.id, permissionMode: null, hostId: "host_1" })}
+      />,
+    );
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBeNull();
   });
 
   it("creates Codex settings and resets an effort the next model cannot support", async () => {

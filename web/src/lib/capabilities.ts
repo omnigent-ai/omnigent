@@ -281,6 +281,8 @@ export interface ServerInfo {
   scheduled_task_inbox?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
+  /** Scheduled Codex permissions accept Ask for approval / Approve for me. */
+  scheduled_task_codex_reviewer_modes?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
   /**
@@ -600,6 +602,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
+          scheduled_task_codex_reviewer_modes: data.scheduled_task_codex_reviewer_modes === true,
           branding: parseBranding(data.branding),
           picker: parsePicker(data.picker),
         };
