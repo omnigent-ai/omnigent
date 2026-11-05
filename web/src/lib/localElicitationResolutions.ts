@@ -199,7 +199,8 @@ export function observeSessionPendingCounts(
  *
  * @param rows - Session rows carrying the server's pending counts.
  * @param held - The current holds, from `useLocalElicitationResolutions`.
- * @returns The same rows, with `pending_elicitations_count` lowered where held.
+ * @returns The same rows, with `pending_elicitations_count` lowered where held,
+ *   and the terminal block cleared where that leaves no counted prompt.
  */
 export function applyLocalElicitationResolutions(
   rows: Conversation[],
@@ -216,7 +217,12 @@ export function applyLocalElicitationResolutions(
     const effective = Math.max(0, count - (session.answers - countedOut));
     if (effective === count) return row;
     changed = true;
-    return { ...row, pending_elicitations_count: effective };
+    // Answering the last counted prompt normally ends the terminal block it parked on.
+    return {
+      ...row,
+      pending_elicitations_count: effective,
+      blocked_on: effective === 0 ? undefined : row.blocked_on,
+    };
   });
   return changed ? adjusted : rows;
 }

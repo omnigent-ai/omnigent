@@ -25,6 +25,16 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(badge).toHaveTextContent("Needs response");
   });
 
+  it("names the terminal prompt when no web card exists", () => {
+    renderBadge({ kind: "awaiting", count: 0, terminalReason: "permission prompt" });
+    const badge = screen.getByTestId("session-state-badge");
+    expect(badge).toHaveTextContent("Needs response");
+    expect(badge).toHaveAttribute(
+      "aria-label",
+      "Waiting for you in the agent's terminal (permission prompt)",
+    );
+  });
+
   it("uses singular wording when only one prompt is pending", () => {
     renderBadge({ kind: "awaiting", count: 1 });
     expect(screen.getByTestId("session-state-badge")).toHaveAttribute(

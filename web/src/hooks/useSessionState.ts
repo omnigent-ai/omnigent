@@ -1,5 +1,6 @@
 // Per-row state derivation for the sidebar badge.
-// Priority: awaiting > running > disconnected > error > background shells > no badge.
+// Priority: awaiting (web prompts, then terminal prompts) > running > disconnected
+// > error > background shells > no badge.
 //
 // Liveness (runner / host reachability) is no longer a sidebar state:
 // it surfaces in the open-session view (see `useSessionLiveness`), so the
@@ -13,7 +14,8 @@ import type { Conversation } from "@/hooks/useConversations";
 import type { LatestSessionError } from "@/lib/sessionError";
 
 export type SessionState =
-  | { kind: "awaiting"; count: number }
+  // `terminalReason`: no web card; the agent is parked on a prompt in its terminal.
+  | { kind: "awaiting"; count: number; terminalReason?: string }
   // `background`: the turn ended but a background shell is still running.
   | { kind: "running"; background?: true }
   | { kind: "error" }
@@ -27,13 +29,19 @@ export type SessionState =
 
 export function getSessionState(
   conversation:
-    | Pick<Conversation, "status" | "pending_elicitations_count" | "background_work_running">
+    | Pick<
+        Conversation,
+        "status" | "pending_elicitations_count" | "background_work_running" | "blocked_on"
+      >
     | undefined
     | null,
   latestError: LatestSessionError | null = null,
 ): SessionState | null {
   const pending = conversation?.pending_elicitations_count ?? 0;
   if (pending > 0) return { kind: "awaiting", count: pending };
+  if (conversation?.status === "running" && conversation.blocked_on) {
+    return { kind: "awaiting", count: 0, terminalReason: conversation.blocked_on };
+  }
   if (conversation?.status === "running") return { kind: "running" };
   if (latestError === "disconnected") return { kind: "disconnected" };
   const failed = conversation?.status === "failed" || latestError === "error";

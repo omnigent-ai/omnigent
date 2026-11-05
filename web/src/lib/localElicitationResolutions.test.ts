@@ -87,6 +87,26 @@ describe("local elicitation resolutions", () => {
     expect([...currentResolutions().answeredElicitationIds]).toEqual(["elicit_b"]);
   });
 
+  it("clears the terminal block only when a held answer clears the last counted prompt", () => {
+    observeSessionPendingCounts([row("sess_1", 1), row("sess_2", 1)]);
+    beginLocalElicitationResolution("elicit_a", ["sess_1"], { nativeDelivery: false });
+    beginLocalElicitationResolution("elicit_b", ["sess_2"], { nativeDelivery: false });
+    const parked = {
+      ...row("sess_1", 1),
+      status: "running" as const,
+      blocked_on: "permission prompt",
+    };
+    // The server already counts this answer out; the terminal is parked on something else.
+    const reparked = { ...row("sess_2", 0), status: "running" as const, blocked_on: "dialog open" };
+    const [held, untouched] = applyLocalElicitationResolutions(
+      [parked, reparked],
+      currentResolutions(),
+    );
+    expect(held.pending_elicitations_count).toBe(0);
+    expect(held.blocked_on).toBeUndefined();
+    expect(untouched).toBe(reparked);
+  });
+
   it("never shows a negative count", () => {
     observeSessionPendingCounts([row("sess_1", 1)]);
     beginLocalElicitationResolution("elicit_a", ["sess_1"], { nativeDelivery: false });

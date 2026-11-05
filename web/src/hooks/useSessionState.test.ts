@@ -4,7 +4,7 @@ import type { Conversation } from "@/hooks/useConversations";
 
 type SessionFields = Pick<
   Conversation,
-  "status" | "pending_elicitations_count" | "background_work_running"
+  "status" | "pending_elicitations_count" | "background_work_running" | "blocked_on"
 >;
 
 function conv(partial: Partial<SessionFields>): SessionFields {
@@ -35,6 +35,21 @@ describe("getSessionState — priority composition", () => {
 
   it("returns null when nothing is happening", () => {
     expect(getSessionState(conv({ status: "idle" }))).toBeNull();
+  });
+
+  it("shows a turn parked on a terminal prompt as awaiting, after web prompts", () => {
+    expect(getSessionState(conv({ status: "running", blocked_on: "dialog open" }))).toEqual({
+      kind: "awaiting",
+      count: 0,
+      terminalReason: "dialog open",
+    });
+    expect(
+      getSessionState(
+        conv({ status: "running", blocked_on: "permission prompt", pending_elicitations_count: 1 }),
+      ),
+    ).toEqual({ kind: "awaiting", count: 1 });
+    // A reason left on a session that is no longer running is not a prompt.
+    expect(getSessionState(conv({ status: "idle", blocked_on: "dialog open" }))).toBeNull();
   });
 
   it("shows an ended turn with a running background shell as working", () => {
