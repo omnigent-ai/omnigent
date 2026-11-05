@@ -240,6 +240,6 @@ describe("MembersPage under OIDC (read-only)", () => {
     expect(screen.queryByRole("button", { name: /Invite member/ })).toBeNull();
     expect(within(bobRow).queryByRole("button", { name: /Reset/ })).toBeNull();
     expect(within(bobRow).queryByRole("button", { name: /Remove/ })).toBeNull();
-    expect(screen.getByText(/provisioned automatically on first sign-in/)).toBeInTheDocument();
+    expect(screen.getByText(/added on first sign-in/)).toBeInTheDocument();
   });
 });

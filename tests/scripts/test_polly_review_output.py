@@ -22,6 +22,8 @@ _QUOTED_REVIEW = f"## Blocking issues\nDo not strip inline `{_MARKER}` text.\n"
     ("raw", "expected"),
     [
         pytest.param(f"{_MARKER}\n{_REVIEW}", _REVIEW, id="single-review"),
+        pytest.param(_REVIEW.rstrip(), _REVIEW.rstrip(), id="no-final-newline"),
+        pytest.param("## Review\n" + "é" * 40000, "## Review\n" + "é" * 40000, id="large-review"),
         pytest.param(
             f"{_MARKER}\n## Blocking issues\nPartial draft\n{_MARKER}\n{_REVIEW}",
             _REVIEW,
@@ -78,10 +80,9 @@ def test_review_output_preserves_final_review(tmp_path: Path, raw: str, expected
         return
     assert result.returncode == 0, result.stdout + result.stderr
     assert review.read_text() == expected
-    header, payload = github_output.read_text().split("\n", 1)
-    assert header.startswith("review_text<<")
-    delimiter = header.removeprefix("review_text<<")
-    assert payload == f"{expected}{delimiter}\n"
+    assert github_output.read_text() == "review_ready=true\n"
+    publish = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "publish")
+    assert publish["if"] == "steps.polly.outputs.review_ready == 'true'"
 
 
 @pytest.mark.parametrize(
@@ -268,10 +269,7 @@ def test_review_diagnostics_retain_raw_stdout(
         assert "timed out or was killed" in (diagnostics / "polly-stderr.log").read_text()
         return
     assert result.returncode == 0, result.stdout + result.stderr
-    header, payload = (tmp_path / "github_output").read_text().split("\n", 1)
-    delimiter = header.removeprefix("review_text<<")
-    assert payload == f"{review}{delimiter}\n"
-    env["REVIEW_TEXT"] = payload.removesuffix(f"{delimiter}\n")
+    assert (tmp_path / "github_output").read_text() == "review_ready=true\n"
     result = run_step("Scan review output for secrets before posting")
     if failure_step == "secret-scan":
         assert result.returncode != 0

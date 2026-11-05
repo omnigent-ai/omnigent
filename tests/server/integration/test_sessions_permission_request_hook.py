@@ -256,6 +256,7 @@ async def test_permission_request_hook_preserves_native_verdict(
         "permission_directories",
         "ask_user_question",
         "exit_plan_mode",
+        "file_edit",
     ):
         assert extra not in params
     verdict = await _post_approval(
@@ -1773,6 +1774,62 @@ async def test_permission_request_hook_surfaces_exit_plan_mode_input(
     }
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        (
+            "Edit",
+            {
+                "file_path": "/tmp/cwd/app.py",
+                "old_string": "x = 1\n" * 400,
+                "new_string": "x = 2\n" * 400,
+                "replace_all": False,
+            },
+        ),
+        ("Write", {"file_path": "/tmp/cwd/notes.md", "content": "line\n" * 400}),
+        (
+            "MultiEdit",
+            {
+                "file_path": "/tmp/cwd/app.py",
+                "edits": [{"old_string": "a", "new_string": "b"}],
+            },
+        ),
+    ],
+)
+async def test_permission_request_hook_surfaces_file_edit_input(
+    client: httpx.AsyncClient,
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> None:
+    """Edit-tool prompts carry the full tool call, live and through the approval link."""
+    agent = await create_test_agent(client, "test-permission-file-edit")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name=tool_name)
+    payload["tool_input"] = tool_input
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    params = event["params"]
+    file_edit = {"tool_name": tool_name, "tool_input": tool_input}
+    assert params["file_edit"] == file_edit, params
+    pending = await client.get(f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}")
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["file_edit"] == file_edit
+
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+
+
 async def test_permission_request_hook_exit_plan_mode_auto_accept_round_trip(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1915,6 +1972,7 @@ async def test_permission_request_hook_omits_structured_extras_for_other_tools(
     params = event["params"]
     assert "ask_user_question" not in params, params
     assert "exit_plan_mode" not in params, params
+    assert "file_edit" not in params, params
 
     verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
     assert verdict.status_code == 202

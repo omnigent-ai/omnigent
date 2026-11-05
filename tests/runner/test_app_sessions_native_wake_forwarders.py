@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -1019,6 +1020,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         No-op thread preload.
@@ -1349,6 +1351,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1403,19 +1406,39 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
 
-async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        {"code": -32600, "message": "no rollout found for thread id {thread_id}"},
+        {
+            "code": -32600,
+            "message": "This chat uses openai, but your current provider is Databricks.",
+            "data": {
+                "type": "modelProviderMismatch",
+                "modelProvider": "openai",
+                "currentModelProvider": "Databricks",
+            },
+        },
+    ],
+    ids=["missing_rollout", "managed_provider_mismatch"],
+)
+async def test_auto_create_codex_terminal_retries_refused_resume_on_same_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    refusal: dict[str, Any],
 ) -> None:
     """
-    A resume that briefly finds no rollout retries and keeps the thread.
+    A resume Codex refuses once retries and keeps the thread.
 
     Codex can answer ``no rollout found`` for a rollout the runner just wrote
-    until it indexes the file; one retry must resume the same thread, with no
-    reset notice and no fresh-thread discovery.
+    until it indexes the file. Codex 0.166+ also refuses a thread recorded under
+    a provider other than its effective one, which a managed config can force.
+    Either way the same thread must resume, with no reset notice and no
+    fresh-thread discovery.
 
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param refusal: JSON-RPC error Codex returns for the first resume.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
     import omnigent.runner.native.orchestration as orchestration_mod
@@ -1517,30 +1540,33 @@ async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
         async def close(self) -> None:
             """:returns: None."""
 
-    preloads: list[str] = []
+    resumes: list[dict[str, Any]] = []
 
-    async def _late_rollout_preload(
-        transport: str,
-        loaded_thread_id: str,
-        *,
-        terminal_launch_args: list[str] | None = None,
-        retain_client: bool = False,
-        cwd: Path | None = None,
-        model_provider: str | None = None,
-    ) -> None:
-        """
-        Report the rollout missing on the first resume only.
+    class _RefuseFirstResumeClient:
+        """Preload client whose first ``thread/resume`` Codex refuses."""
 
-        :param transport: App-server transport URL (ignored).
-        :param loaded_thread_id: Thread id passed to ``thread/resume``.
-        :raises CodexAppServerResponseError: On the first call.
-        """
-        del transport, terminal_launch_args
-        preloads.append(loaded_thread_id)
-        if len(preloads) == 1:
-            raise codex_app_mod.CodexAppServerResponseError(
-                {"code": -32600, "message": f"no rollout found for thread id {loaded_thread_id}"}
-            )
+        async def connect(self) -> None:
+            """:returns: None."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """
+            Refuse the first resume with the parametrized error.
+
+            :param method: JSON-RPC method, always ``"thread/resume"``.
+            :param params: Resume params.
+            :returns: Empty resume result after the first call.
+            :raises CodexAppServerResponseError: On the first call.
+            """
+            assert method == "thread/resume"
+            resumes.append(params)
+            if len(resumes) == 1:
+                raise codex_app_mod.CodexAppServerResponseError(
+                    {**refusal, "message": refusal["message"].format(thread_id=thread_id)}
+                )
+            return {"result": {}}
+
+        async def close(self) -> None:
+            """:returns: None."""
 
     runs: list[_ForwarderRun] = []
 
@@ -1586,7 +1612,9 @@ async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
         _fake_build_codex_native_server,
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
-    monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _late_rollout_preload)
+    monkeypatch.setattr(
+        codex_app_mod, "client_for_transport", lambda *_args, **_kwargs: _RefuseFirstResumeClient()
+    )
     monkeypatch.setattr(
         runner_app_mod, "_codex_forward_known_thread", _parking_forward_known_thread
     )
@@ -1610,7 +1638,17 @@ async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
         )
         await asyncio.sleep(0)
 
-        assert preloads == [thread_id, thread_id]
+        assert [resume["threadId"] for resume in resumes] == [thread_id, thread_id]
+        current_provider = refusal.get("data", {}).get("currentModelProvider")
+        if current_provider is None:
+            assert resumes[1] == resumes[0]
+        else:
+            assert resumes[1] == {**resumes[0], "modelProvider": current_provider}
+            (rollout,) = codex_native_bridge.codex_home_for_bridge_dir(
+                codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+            ).glob(f"sessions/**/rollout-*-{thread_id}.jsonl")
+            session_meta = json.loads(rollout.read_text().splitlines()[0])["payload"]
+            assert session_meta["model_provider"] == current_provider
         assert posted == [], "a resume that succeeds on retry must not post a reset notice"
         assert launched_args and thread_id in launched_args[0]
         assert len(runs) == 1 and runs[0].cancelled is False
@@ -1794,6 +1832,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         Refuse the resume with the parametrized error payload.
