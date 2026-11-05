@@ -2428,6 +2428,34 @@ describe("chatStore — switchTo", () => {
     });
   });
 
+  it("keeps a live status that arrives while the bind snapshot is in flight", async () => {
+    // A turn starting during page load must not read as idle: a send then would
+    // not count as steering the running turn.
+    seedSession("conv_race");
+    const normalFetch = fetchMock.getMockImplementation()!;
+    let answerSnapshot: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.split("?")[0] === "/v1/sessions/conv_race" && (init?.method ?? "GET") === "GET") {
+        return new Promise<Response>((resolve) => {
+          answerSnapshot = () => resolve(normalFetch(input, init) as Response);
+        });
+      }
+      return normalFetch(input, init);
+    });
+
+    const bind = useChatStore.getState().switchTo("conv_race");
+    await vi.waitFor(() => expect(answerSnapshot).not.toBeNull());
+    handleSessionEvent(
+      { type: "session_status", conversationId: "conv_race", status: "running" },
+      "conv_race",
+    );
+    answerSnapshot!();
+    await bind;
+
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+  });
+
   it("opens the session SSE stream during bind", async () => {
     seedSession("conv_abc");
 

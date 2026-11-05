@@ -5279,7 +5279,11 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
-        sessionStatus: session.status,
+        // A live status edge during the fetch is newer than this snapshot.
+        sessionStatus:
+          state.sessionStatus !== stateBeforeFetch.sessionStatus
+            ? state.sessionStatus
+            : session.status,
         // Mid-turn first open: the snapshot carries the in-flight turn's
         // `activeResponseId`, and the turn-start `running` edge that would
         // have opened the streaming lifecycle is long gone from the SSE
