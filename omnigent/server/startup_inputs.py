@@ -7,7 +7,7 @@ import contextlib
 import logging
 import re
 import weakref
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -209,35 +209,42 @@ class ManagedStartupInputs:
                 )
         return saved[0]
 
-    async def record_launch_failure(self, session_id: str, reason: str) -> None:
+    async def record_launch_failure(
+        self, session_id: str, reason: str | Callable[[], Awaitable[str]]
+    ) -> str:
         """
         Mark a failed create launch on the session, for replicas without its tracker.
 
         No sandbox is left to deliver the saved inputs, so they are failed and
-        the transcript says why.
+        the transcript says why. A deferred reason is resolved only after queued
+        inputs are failed, so diagnostic I/O cannot race their delivery. Returns
+        the resolved reason for callers recording the same failure elsewhere.
         """
-        if await asyncio.to_thread(self.conversations.get_conversation, session_id) is None:
-            return
-        with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(
-                self.conversations.set_labels, session_id, {STARTUP_LABEL: "failed"}
-            )
         undelivered = False
-        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
-            if item.status == "in_progress":
-                undelivered |= await asyncio.to_thread(
-                    self.conversations.transition_pending_input,
-                    session_id,
-                    item.id,
-                    expected="in_progress",
-                    status="failed",
+        if await asyncio.to_thread(self.conversations.get_conversation, session_id) is not None:
+            with contextlib.suppress(ConversationNotFoundError):
+                await asyncio.to_thread(
+                    self.conversations.set_labels, session_id, {STARTUP_LABEL: "failed"}
                 )
+            for item in await asyncio.to_thread(
+                self.conversations.list_pending_inputs, session_id
+            ):
+                if item.status == "in_progress":
+                    undelivered |= await asyncio.to_thread(
+                        self.conversations.transition_pending_input,
+                        session_id,
+                        item.id,
+                        expected="in_progress",
+                        status="failed",
+                    )
+        reason = await reason() if callable(reason) else reason
         if undelivered:
             await self._report_failure(
                 session_id,
                 "launch_failed",
                 f"The message could not be delivered: {reason[:1000]}",
             )
+        return reason
 
     async def accepts(self, conv: Conversation, app: Any) -> bool:
         """Whether a new message must wait behind the session's startup."""
