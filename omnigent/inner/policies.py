@@ -671,8 +671,3 @@ def _extract_json_object(text: str) -> PolicyResponsePayload:
             return parsed
 
     raise ValueError(f"policy response is not valid JSON: {text!r}")
-
-
-def _bind_session_recursive(policy: Policy, session: _PolicySession) -> None:
-    """Bind a session to a policy."""
-    policy._session = session

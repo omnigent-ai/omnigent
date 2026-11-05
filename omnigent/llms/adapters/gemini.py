@@ -35,17 +35,6 @@ _GENERATION_CONFIG_KEYS = {
     "presence_penalty": "presencePenalty",
 }
 
-_GENERATION_CONFIG_NAMES = {
-    "temperature",
-    "stopSequences",
-    "candidateCount",
-    "maxOutputTokens",
-    "topK",
-    "topP",
-    "frequencyPenalty",
-    "presencePenalty",
-}
-
 
 class GeminiAdapter(BaseAdapter):
     """

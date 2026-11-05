@@ -109,17 +109,6 @@ _SERVER_READY_INITIAL_POLL_SECONDS = 0.05
 _SERVER_READY_BACKOFF_POLL_SECONDS = 0.1
 _SERVER_READY_FAST_POLL_WINDOW_SECONDS = 1.0
 
-# Remote ``--server`` runners are disposable subprocesses created for
-# the CLI session. A one-second grace gives SIGTERM enough time to
-# flush runner logs and unregister without noticeably slowing CLI exit.
-# Grace period before the CLI escalates SIGTERM → SIGKILL on the
-# runner subprocess. Must be long enough for the runner's shutdown
-# chain to complete: cancel async tasks → app.router.shutdown() →
-# _stop_pm() → _terminal_registry.shutdown() → tmux kill-server
-# per session → pm.shutdown() → SIGTERM each harness. 1 s was too
-# short — the runner was SIGKILL'd before tmux sessions were reaped,
-# leaving zombie codex/claude processes.
-_REMOTE_RUNNER_STOP_GRACE_SECONDS = 8.0
 
 # How many of the NEWEST transcript items ``_persisted_turn_text``
 # fetches when reconciling a headless ``-p`` turn against the durable

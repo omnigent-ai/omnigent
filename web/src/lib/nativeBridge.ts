@@ -958,11 +958,6 @@ export function setNativeServerSwitcherHidden(hidden: boolean): void {
   }
 }
 
-/** @deprecated Use setNativeServerSwitcherHidden. */
-export function setNativeSidebarOpen(open: boolean): void {
-  setNativeServerSwitcherHidden(open);
-}
-
 /**
  * Push the Chat/Terminal bar state to the iOS shell. The switcher now lives in
  * the web header (ViewModeToggle) on every shell, so the SPA only ever pushes

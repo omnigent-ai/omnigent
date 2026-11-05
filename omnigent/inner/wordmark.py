@@ -87,16 +87,6 @@ WORDMARK_LINES: tuple[str, ...] = _build_wordmark(_WORDMARK_TEXT)
 _WORDMARK_ROW_FOR_OTTO_ROW = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4}
 
 
-def wordmark_lines() -> list[str]:
-    """
-    Return the wordmark on its own (no mascot), as plain text rows.
-
-    :returns: The wordmark rows, e.g. for embedding in a doc or a bash
-        banner.
-    """
-    return list(WORDMARK_LINES)
-
-
 def lockup_lines() -> list[str]:
     """
     Return the Otto + wordmark lockup as plain text rows (no color).

@@ -512,49 +512,6 @@ function withRecentlyCreated(
   return { ...page, data: [...inject, ...page.data], first_id: inject[0].id };
 }
 
-/**
- * Fetch a single session as a sidebar-shaped ``Conversation`` object.
- *
- * Used to backfill pinned sessions that fall outside the paginated
- * window. Returns ``null`` on 404 (session deleted) so the caller
- * can silently drop stale pins.
- */
-export async function fetchConversationById(id: string): Promise<Conversation | null> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`);
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const wire = await res.json();
-  // Seed the session→host map on this pin-backfill path too, not just the list
-  // seed / `sessionFromWire`: a pinned session outside the paginated window can
-  // enter client state only through here, and terminal-attach / session-scoped
-  // requests key their slice off this map — so record the host before returning
-  // the row, or those requests fall back to the modal and can miss the replica.
-  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
-  setSessionParent(wire.id, wire.parent_session_id, wire.labels);
-  return {
-    id: wire.id,
-    object: "conversation",
-    title: wire.title ?? null,
-    created_at: wire.created_at,
-    updated_at: wire.updated_at ?? wire.created_at,
-    labels: wire.labels ?? {},
-    permission_level: wire.permission_level ?? null,
-    owner: wire.owner ?? null,
-    runner_id: wire.runner_id ?? null,
-    host_id: wire.host_id ?? null,
-    workspace: wire.workspace ?? null,
-    agent_id: wire.agent_id,
-    agent_name: wire.agent_name ?? null,
-    harness: wire.harness ?? null,
-    pending_elicitations_count: wire.pending_elicitations_count ?? 0,
-    status: wire.status ?? "idle",
-    runner_online: wire.runner_online ?? undefined,
-    host_online: wire.host_online ?? undefined,
-    git_branch: wire.git_branch ?? null,
-    archived: wire.archived ?? false,
-  };
-}
-
 export async function fetchConversationsPage({
   after,
   searchQuery,

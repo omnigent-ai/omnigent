@@ -19,7 +19,6 @@ import io
 import logging
 import os
 import pathlib
-import shlex
 import sys
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
@@ -595,33 +594,6 @@ def _extract_file_paths(text: str) -> list[PendingAttachment]:
         attachments.append(PendingAttachment(path=str(p), is_image=is_image))
 
     return attachments
-
-
-def _strip_file_paths(text: str, attachments: list[PendingAttachment]) -> str:
-    """
-    Remove detected file paths from the input text.
-
-    After extracting attachments, the raw pasted paths (possibly
-    shell-escaped) should not appear in the message sent to the LLM.
-    Returns the remaining text, stripped.
-
-    :param text: The raw input line.
-    :param attachments: Detected attachments with resolved paths.
-    :returns: The text with file path tokens removed.
-    """
-    resolved_paths = {a.path for a in attachments}
-    try:
-        tokens = shlex.split(text)
-    except ValueError:
-        tokens = text.split()
-    remaining = []
-    for token in tokens:
-        cleaned = token.strip("'\"")
-        p = pathlib.Path(os.path.expanduser(cleaned)).resolve()
-        if str(p) in resolved_paths:
-            continue
-        remaining.append(token)
-    return " ".join(remaining).strip()
 
 
 def _display_width(text: str) -> int:

@@ -267,34 +267,6 @@ def _resolve_session_owner_cached(
     return owner
 
 
-def _load_user_daily_cost(
-    conversation_id: str,
-    conversation_store: ConversationStore,
-) -> list[DailyCostState]:
-    """
-    Read the session owner's per-UTC-day cost rollup as the engine seed.
-
-    Returns a single-element list containing today's cost state, formatted
-    consistently with period cost loading so both daily and period policies
-    can consume the same ``user_daily_cost`` context field.
-
-    :param conversation_id: The session, e.g. ``"conv_abc123"``.
-    :param conversation_store: Store for the owner + daily-cost lookups.
-    :returns: Single-element list with today's cost state, or empty list
-        in single-user mode.
-    """
-    from omnigent.db.utils import now_epoch, utc_day
-
-    owner = _resolve_session_owner_cached(conversation_id, conversation_store)
-    if owner is None:
-        return []
-
-    today = utc_day(now_epoch())
-    # Use list_daily_cost_states to get today's record in the same format
-    # as period budgets, so both can consume the same context field
-    return conversation_store.list_daily_cost_states(owner, today)
-
-
 def _utc_day(epoch: int) -> str:
     """Return the UTC calendar day for an epoch timestamp as ``"YYYY-MM-DD"``.
 
@@ -304,54 +276,6 @@ def _utc_day(epoch: int) -> str:
     from datetime import datetime
 
     return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%d")
-
-
-def _utc_week(epoch: int) -> str:
-    """Return the UTC ISO week for an epoch timestamp as ``"YYYY-Www"``.
-
-    :param epoch: Unix epoch seconds.
-    :returns: UTC ISO week string, e.g. ``"2026-W34"``.
-    """
-    from datetime import datetime
-
-    dt = datetime.fromtimestamp(epoch, tz=UTC)
-    year, week, _ = dt.isocalendar()
-    return f"{year}-W{week:02d}"
-
-
-def _utc_month(epoch: int) -> str:
-    """Return the UTC calendar month for an epoch timestamp as ``"YYYY-MM"``.
-
-    :param epoch: Unix epoch seconds.
-    :returns: UTC month string, e.g. ``"2026-08"``.
-    """
-    from datetime import datetime
-
-    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m")
-
-
-def _utc_quarter(epoch: int) -> str:
-    """Return the UTC calendar quarter for an epoch timestamp as ``"YYYY-Qq"``.
-
-    :param epoch: Unix epoch seconds.
-    :returns: UTC quarter string, e.g. ``"2026-Q3"``.
-    """
-    from datetime import datetime
-
-    dt = datetime.fromtimestamp(epoch, tz=UTC)
-    quarter = (dt.month - 1) // 3 + 1
-    return f"{dt.year}-Q{quarter}"
-
-
-def _utc_year(epoch: int) -> str:
-    """Return the UTC calendar year for an epoch timestamp as ``"YYYY"``.
-
-    :param epoch: Unix epoch seconds.
-    :returns: UTC year string, e.g. ``"2026"``.
-    """
-    from datetime import datetime
-
-    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y")
 
 
 def _load_user_period_cost(

@@ -112,7 +112,6 @@ export const AUTO_PERMISSION_MODE = {
   label: "Default",
   description: "The picked harness keeps its own configured permissions",
 } as const;
-export const AUTO_PERMISSION_MODE_OPTIONS = [AUTO_PERMISSION_MODE] as const;
 
 // Cursor execution modes. "default" sends no flags; other values map to CLI
 // args passed via terminal_launch_args. Keep in sync with `cursor-agent --help`.

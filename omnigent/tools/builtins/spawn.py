@@ -1170,43 +1170,6 @@ def _truncate(
 # ── 13a: sys_session_get_history / sys_session_close ─────────
 
 
-def _find_open_child_by_title(
-    *,
-    parent_conversation_id: str,
-    sa_agent: str,
-    sa_title: str,
-    conv_store: ConversationStore,
-) -> Conversation | None:
-    """
-    Look up an open named child conversation by ``(agent, title)``.
-
-    Closed children are excluded by the bare ``"<agent>:<title>"``
-    title match: ``sys_session_close`` rewrites the stored title to
-    include the legacy closed suffix so the original composite title
-    no longer matches. Returns ``None`` when no open child matches.
-
-    :param parent_conversation_id: The parent's conversation id, e.g.
-        ``"conv_abc123"``.
-    :param sa_agent: The sub-agent type (e.g. ``"researcher"``) — the
-        ``agent`` argument on the LLM-facing surface.
-    :param sa_title: The session title (e.g. ``"auth-flow"``) — the
-        ``title`` argument on the LLM-facing surface.
-    :param conv_store: Conversation store the lookup runs against.
-    :returns: The matching :class:`Conversation` or ``None``.
-    """
-    composite = f"{sa_agent}:{sa_title}"
-    children = conv_store.list_conversations(
-        kind="sub_agent",
-        parent_conversation_id=parent_conversation_id,
-        title=composite,
-        limit=1,
-    )
-    return next(
-        (c for c in children.data if not is_session_closed(c.labels, c.title)),
-        None,
-    )
-
-
 @dataclass
 class _SessionResolution:
     """

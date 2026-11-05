@@ -55,10 +55,6 @@ _logger = logging.getLogger(__name__)
 
 _ENV_MODEL = "HARNESS_KIMI_MODEL"
 _ENV_CWD = "HARNESS_KIMI_CWD"
-_ENV_BIN = "OMNIGENT_KIMI_PATH"
-# Deprecated alias — read via resolve_harness_path() which warns on use.
-# Remove this constant and the HARNESS_KIMI_PATH read in v0.8.0.
-_LEGACY_ENV_BIN = "HARNESS_KIMI_PATH"
 _ENV_PLAN = "HARNESS_KIMI_PLAN"
 _ENV_CONTINUE_LAST = "HARNESS_KIMI_CONTINUE_LAST"
 _ENV_SKILLS_DIRS = "HARNESS_KIMI_SKILLS_DIRS"

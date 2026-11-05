@@ -29,9 +29,6 @@ import { prepareHtmlPreviewDoc, startTagEnd } from "./codeViewerHelpers";
 import { type HtmlPreviewZoomAction, isHtmlPreviewZoomAction } from "./htmlPreviewZoom";
 import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
-/** Protocol version — bump on any breaking change to the message shapes. */
-export const BRIDGE_VERSION = 1;
-
 /** Tag stamped on every message so we ignore unrelated postMessage traffic. */
 export const BRIDGE_SOURCE = "omni-html-comment";
 

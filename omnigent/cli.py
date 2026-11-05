@@ -2510,16 +2510,6 @@ def _is_removed_ad_hoc_invocation(argv: list[str]) -> bool:
     return True
 
 
-def _runner_loopback_host(host: str) -> str:
-    """Return a loopback-safe host for local runner callbacks.
-
-    :param host: Server bind host, e.g. ``"0.0.0.0"``.
-    :returns: Hostname the local runner can call back, e.g.
-        ``"127.0.0.1"``.
-    """
-    return "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
-
-
 _HOST_PID_PATH = data_dir() / "host.pid"
 
 
@@ -4531,27 +4521,6 @@ def _stop_cli_runner_process(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-
-
-def _adopt_cli_runner_process(proc: subprocess.Popen[bytes]) -> None:
-    """Detach a runner from this CLI so it keeps running after CLI exit.
-
-    Sends :data:`RUNNER_ADOPT_SIGNAL` (SIGUSR1, when available) so the
-    runner cancels its parent-pid watchdog and survives the launching
-    CLI's exit. Used when the user detaches from tmux: Claude and the
-    runner stay alive and the web UI stays connected. A no-op if the
-    runner has already exited, or if the platform has no adopt signal.
-
-    :param proc: Runner subprocess handle to adopt.
-    :returns: None.
-    """
-    from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
-
-    if RUNNER_ADOPT_SIGNAL is None:
-        return
-    if proc.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            proc.send_signal(RUNNER_ADOPT_SIGNAL)
 
 
 @contextlib.contextmanager
@@ -7907,7 +7876,6 @@ _HARNESS_CHOICES_HELP = (
     "'cursor', 'kimi', "
     "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
 )
-_HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
     f"Harness to use: {_HARNESS_CHOICES_HELP}. Without AGENT, launches that harness directly."
 )
@@ -13774,22 +13742,6 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
     click.echo(
         f"Logged in{who}. Commands targeting {display} now mint workspace tokens automatically."
     )
-
-
-def _login_and_mint_workspace_token(workspace_host: str, org_id: str | None = None) -> str:
-    """Run the browser login for a workspace and mint a bearer from it.
-
-    :param workspace_host: The workspace host, e.g.
-        ``"https://example.databricks.com"``.
-    :param org_id: The ``?o=`` workspace selector (see
-        :func:`_org_id_from_url`); passed to the browser login so the
-        minted grant is bound to the workspace.
-    :returns: A fresh bearer token for the workspace.
-    :raises click.ClickException: When the Databricks CLI binary is
-        missing, the login exits non-zero, or no token resolves after
-        a successful login.
-    """
-    return _login_and_mint_workspace_auth_info(workspace_host, org_id).token
 
 
 def _login_and_mint_workspace_auth_info(

@@ -39,9 +39,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     enabled_connections: mocks.enabledConnections,
   }),
 }));
-// Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
-// (not the accounts-only `/auth/me` useMe hook), so the Admin group appears
-// under OIDC too.
+// The `/v1/me` admin gate also covers OIDC users.
 vi.mock("@/hooks/useIsAdmin", () => ({
   useIsAdmin: () => mocks.isAdmin,
 }));

@@ -2357,26 +2357,6 @@ def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
     return payload if isinstance(payload, dict) else {}
 
 
-def update_permission_hook_auth_headers(
-    bridge_dir: Path,
-    headers: dict[str, str],
-) -> bool:
-    """Atomically replace the permission hook's server auth headers.
-
-    :param bridge_dir: Native Claude bridge directory.
-    :param headers: Fresh server request headers.
-    :returns: ``True`` when the hook config existed and was updated.
-    """
-    path = bridge_dir / _PERMISSION_HOOK_FILE
-    payload = _read_json_file(path)
-    if not payload:
-        return False
-    payload["ap_auth_headers"] = dict(headers)
-    payload["updated_at"] = time.time()
-    _write_json_file(path, payload)
-    return True
-
-
 def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) -> _JsonObject:
     """
     Build the Claude Code MCP config for the Omnigent bridge server.
@@ -3295,22 +3275,6 @@ def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
     if isinstance(raw_current, str) and raw_current:
         seen.add(raw_current)
     return seen
-
-
-def count_transcript_lines(transcript_path: Path) -> int:
-    """
-    Count JSONL records currently present in a Claude transcript.
-
-    :param transcript_path: Claude transcript path, e.g.
-        ``"/home/user/.claude/projects/x/session.jsonl"``.
-    :returns: Number of newline-delimited records. Missing files
-        count as zero.
-    """
-    try:
-        with transcript_path.open("r", encoding="utf-8") as handle:
-            return sum(1 for _line in handle)
-    except FileNotFoundError:
-        return 0
 
 
 def transcript_has_recent_local_command(
@@ -9334,30 +9298,6 @@ def read_permission_mode(bridge_dir: Path) -> str | None:
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return None
     return _permission_mode_from_pane(_capture_pane(socket_path, tmux_target))
-
-
-def read_btw_overlay(bridge_dir: Path) -> BtwOverlay | None:
-    """
-    Read a completed ``/btw`` side-chat overlay from the Claude pane.
-
-    Non-blocking, best-effort, and strictly read-only — it captures the
-    pane but never sends keystrokes, so it cannot race the executor's
-    message injections (the forwarder and executor run in separate
-    processes with no shared pane-write lock). Returns ``None`` when the
-    terminal isn't up, no settled overlay is shown, or nothing parses.
-
-    :param bridge_dir: Bridge directory path, e.g.
-        ``/tmp/omnigent/claude-native/<digest>``.
-    :returns: The parsed overlay, or ``None``.
-    """
-    payload = _read_json_file(bridge_dir / _TMUX_FILE)
-    if not isinstance(payload, dict):
-        return None
-    socket_path = payload.get("socket_path")
-    tmux_target = payload.get("tmux_target")
-    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
-        return None
-    return _btw_overlay_from_pane(_capture_pane(socket_path, tmux_target))
 
 
 def read_pane_signals(bridge_dir: Path) -> PaneSignals:

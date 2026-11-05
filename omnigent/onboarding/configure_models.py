@@ -110,16 +110,6 @@ _FAMILY_LABEL: dict[str, str] = {
     PI_SURFACE: "Pi",
 }
 
-# The concrete harness ids each surface powers, shown as a dim annotation
-# beside the harness header in ``configure harness`` so the brand label
-# ("Claude") is honest about which harnesses it covers.
-_FAMILY_HARNESS_IDS: dict[str, str] = {
-    ANTHROPIC_FAMILY: "claude-sdk, native-claude",
-    OPENAI_FAMILY: "codex, native-codex, openai-agents",
-    GEMINI_FAMILY: "antigravity-native (agy)",
-    PI_SURFACE: "pi",
-}
-
 
 def family_label(family: str) -> str:
     """Return the harness brand label for a surface.
@@ -132,16 +122,6 @@ def family_label(family: str) -> str:
         for pi; the family name itself for any other value.
     """
     return _FAMILY_LABEL.get(family, family)
-
-
-def family_harness_ids(family: str) -> str:
-    """Return the dim harness-id annotation for a surface.
-
-    :param family: ``"anthropic"``, ``"openai"``, or ``"pi"``.
-    :returns: A comma-separated harness-id string, e.g.
-        ``"claude-sdk, native-claude"``; empty for an unknown surface.
-    """
-    return _FAMILY_HARNESS_IDS.get(family, "")
 
 
 # Default endpoint base URL per family for a ``key`` provider (a direct

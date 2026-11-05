@@ -128,15 +128,6 @@ def _recent_unique_sessions_with_recency(
     return [(session_id, newest_by_id[session_id]) for session_id in ordered[:limit]]
 
 
-def _recent_unique_session_ids(
-    candidates: list[tuple[Path, str]],
-    *,
-    limit: int,
-) -> tuple[str, ...]:
-    """Return unique session ids ordered from newest transcript to oldest."""
-    return tuple(sid for sid, _ in _recent_unique_sessions_with_recency(candidates, limit=limit))
-
-
 def _pi_session_id_from_path(path: Path) -> str | None:
     """Read a safe native session id from a Pi transcript header."""
     try:

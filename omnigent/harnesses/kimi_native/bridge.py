@@ -568,22 +568,9 @@ def approval_prompt_visible(bridge_dir: Path) -> bool:
     return _parse_pane(pane).menu_visible
 
 
-def _trust_prompt_visible(pane: str) -> bool:
-    return _parse_pane(pane).trust_visible
-
-
-def _input_box_line(pane: str) -> str | None:
-    """Return the first framed line carrying a Kimi input marker."""
-    return _parse_pane(pane).input_line
-
-
 def _kimi_tui_ready(pane: str) -> bool:
     """Return whether both the Kimi input row and context footer are visible."""
     return _parse_pane(pane).ready
-
-
-def _input_box_content(pane: str) -> str | None:
-    return _parse_pane(pane).editor_content
 
 
 def _draft_in_input_box(pane: str, needle: str) -> bool:

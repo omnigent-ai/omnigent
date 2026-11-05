@@ -1,12 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 
-// Mode-agnostic admin gate, sourced from the `/v1/me` identity probe
-// (the shared `users.is_admin` column). Unlike `useMe`, which reads the
-// accounts-only `/auth/me` endpoint, this works in EVERY auth mode —
-// header, accounts, AND OIDC/SSO — so admin chrome (the Members /
-// Policies settings sections) can surface under OIDC where `/auth/me`
-// doesn't exist.
+// The `/v1/me` identity probe reads `users.is_admin` in every auth mode,
+// including OIDC/SSO, to gate the Members and Policies settings sections.
 const QUERY_KEY = ["identity-is-admin"];
 
 /**

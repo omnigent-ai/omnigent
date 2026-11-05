@@ -24,7 +24,6 @@ import type {
   BackgroundTaskInfo,
   ModelUsage,
   NativeModelOption,
-  NestedSessionItem,
   SandboxStatus,
   Session,
   SessionEventInput,
@@ -1439,30 +1438,6 @@ export async function exportSessionTranscript(sessionId: string): Promise<string
  * is then the reader's scroll, not a background fetch.
  */
 export const INITIAL_WINDOW_ITEMS = 100;
-
-/**
- * Flatten a `GET /v1/sessions/{id}` item into the flat
- * `ConversationItem` shape used by `itemsToBlocks`.
- *
- * The sessions snapshot serializes items as
- * `{id, type, status, response_id, created_at, data: {...}}` (Pydantic
- * model), while `GET /v1/conversations/{id}/items` flattens via
- * `to_api_dict()` to `{id, type, status, response_id, ...fields}`.
- * `itemsToBlocks` expects the flat shape. Spread `data` up to the top
- * level on flat items; pass through items that already look flat.
- *
- * Follow-up: align the server to use `to_api_dict()` in the session
- * snapshot route — once that lands, this helper is dead code.
- */
-export function flattenSessionItem(item: SessionItem): ConversationItem {
-  if (!isNestedSessionItem(item)) return item;
-  const { data, ...rest } = item;
-  return { ...rest, ...data } as ConversationItem;
-}
-
-function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
-  return "data" in item && typeof (item as NestedSessionItem).data === "object";
-}
 
 /** The server's ErrorCode.HOST_OFFLINE: a held send whose host is offline. */
 export const HOST_OFFLINE_CODE = "host_offline";
