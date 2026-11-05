@@ -42,8 +42,8 @@ the header menu), and each place is a separate entry point.
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
   message or Resume. Only the session's owner can start side chats. A side
-  chat started on one device appears on the owner's other devices, and closing
-  it closes it everywhere.
+  chat started on one device appears on the owner's other devices. Closing it
+  closes idle tabs elsewhere; tabs with queued or running work stay open.
 - `side-chat-settings`: choose a supported model or effort in the side-chat composer;
   selections apply to that chat's next turn independently of its parent, in the
   desktop panel and mobile drawer. Generic side chats allow selection before or
@@ -503,11 +503,12 @@ keeps running. Covered by `tests/e2e_ui/agents/test_subagent_side_panel.py`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
-Closing the side chat discards the follow-ups queued on that device and closes
-its tab on the owner's other devices. A follow-up queued on another device still
-sends, and like any message the server accepts for a closed generic side chat,
+Closing the side chat discards the follow-ups queued on that device. Other
+devices keep the tab while they have queued or running work; an idle tab closes
+on the next refresh. A follow-up queued on another device still sends, and like
+any message the server accepts for a closed generic side chat,
 including one sent from its direct `/c/<child_id>` URL, it brings the tab back
-everywhere; a sealed Codex side chat refuses it and stays closed. A chat-only
+everywhere; a sealed Codex side chat still refuses further input. A chat-only
 side chat can also send messages from its direct URL without choosing a
 workspace. The side-chat composer opens the same `/` menu
 affordance as the main composer but with a narrower set — `/help` and the

@@ -10,6 +10,8 @@ import {
 import { newPendingSideChatId } from "@/lib/sideChat";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 import { isTempConvId } from "@/lib/tempConversationId";
+import { useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 interface SideChatTabsState {
   /** Open side-chat child conversation ids, in open order. */
@@ -135,7 +137,7 @@ export function useSideChats(conversationId: string) {
   );
 
   const queryClient = useQueryClient();
-  const { data: serverSideChats } = useQuery({
+  const { data: serverSideChats, dataUpdatedAt } = useQuery({
     queryKey: sideChatsQueryKey(conversationId),
     queryFn: () => fetchSideChats(conversationId),
     enabled: !isTempConvId(conversationId),
@@ -145,7 +147,17 @@ export function useSideChats(conversationId: string) {
   });
   useEffect(() => {
     if (!serverSideChats) return;
-    const { open, closed } = serverSideChats;
+    const { open } = serverSideChats;
+    // A remote close must leave this device's queued or sending work reachable.
+    const queued = useChatStore.getState().queuedMessages;
+    const closed = serverSideChats.closed.filter((id) => {
+      const live = conversationRegistry.peek(id)?.getState();
+      return (
+        !queued.some((message) => message.conversationId === id) &&
+        live?.status !== "streaming" &&
+        live?.sessionStatus !== "running"
+      );
+    });
     const syncedTabs = (tabs: string[]): string[] => {
       // A tab the list doesn't name (pending, just created, or an older side chat) stays.
       const kept = tabs.filter((id) => !closed.includes(id));
@@ -164,7 +176,7 @@ export function useSideChats(conversationId: string) {
         tabs.length === latest.tabs.length && tabs.every((id, index) => id === latest.tabs[index]);
       return same && selected === latest.selected ? latest : { ...latest, tabs, selected };
     });
-  }, [serverSideChats, conversationId, update]);
+  }, [serverSideChats, dataUpdatedAt, conversationId, update]);
 
   /** Select a side-chat tab, or clear the selection (null). */
   const select = useCallback(

@@ -3,17 +3,23 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { PropsWithChildren } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
+import type * as IdentityModule from "@/lib/identity";
 import {
   readSessionWorkspaceState,
   SESSION_WORKSPACE_STATE_KEY,
   writeSessionWorkspaceState,
 } from "@/lib/sessionWorkspaceState";
 import { subagentTabId } from "@/lib/subagentTabs";
+import { useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { useSideChats } from "./useSideChats";
 
 type SideChatsHook = ReturnType<typeof useSideChats>;
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  authenticatedFetch: vi.fn(),
+}));
 
 let queryClient: QueryClient;
 function wrapper({ children }: PropsWithChildren) {
@@ -48,6 +54,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  useChatStore.setState({ queuedMessages: [] });
+  conversationRegistry.clear();
   vi.restoreAllMocks();
   localStorage.clear();
 });
@@ -365,6 +373,43 @@ describe("side-chat tabs when storage writes fail", () => {
 });
 
 describe("side chats opened on another device", () => {
+  it.each(["queued", "sending", "running"])(
+    "keeps a remotely closed tab and its selection while work is %s here",
+    async (work) => {
+      writeSessionWorkspaceState("session-a", {
+        openSideChats: ["conv_busy", "conv_idle"],
+        selectedSideChatId: "conv_busy",
+      });
+      const queued = { queueId: "followup", conversationId: "conv_busy", text: "Check tests" };
+      if (work === "queued") useChatStore.setState({ queuedMessages: [queued] });
+      const entry = conversationRegistry.acquire("conv_busy");
+      entry.setState({
+        status: work === "sending" ? "streaming" : "idle",
+        sessionStatus: work === "running" ? "running" : "idle",
+      });
+      serverSideChats([
+        { id: "conv_busy", created_at: 1, closed: true },
+        { id: "conv_idle", created_at: 2, closed: true },
+      ]);
+
+      const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
+
+      await waitFor(() => expect(result.current.tabs).toEqual(["conv_busy"]));
+      expect(result.current.selected).toBe("conv_busy");
+      expect(useChatStore.getState().queuedMessages).toEqual(work === "queued" ? [queued] : []);
+      expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(["conv_busy"]);
+
+      // A fresh list can apply the close once this device's work has settled.
+      act(() => {
+        useChatStore.setState({ queuedMessages: [] });
+        entry.setState({ status: "idle", sessionStatus: "idle" });
+      });
+      await act(() => queryClient.invalidateQueries());
+      await waitFor(() => expect(result.current.tabs).toEqual([]));
+      expect(result.current.selected).toBeNull();
+    },
+  );
+
   it("are added in creation order, and ones closed there are dropped", async () => {
     writeSessionWorkspaceState("session-a", {
       openSideChats: ["conv_closed", "conv_local", "pending:draft"],
