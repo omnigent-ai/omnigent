@@ -174,7 +174,7 @@ _SPILL_UNSUPPORTED_FAILURE = CodexStartupFailure(
     "this message was not sent.",
     code=_INPUT_TOO_LARGE_CODE,
     remediation="Upgrade Codex to 0.154.0 or later and restart this native session after "
-    "current work finishes, or attach the text as a file.",
+    "current work finishes.",
 )
 _SPILL_SERVER_UNSUPPORTED_FAILURE = CodexStartupFailure(
     message="This Omnigent server cannot preserve a large native input safely; "

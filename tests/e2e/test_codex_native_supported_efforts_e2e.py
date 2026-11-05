@@ -268,7 +268,7 @@ def test_oversized_input_survives_real_codex_transport(
             assert (
                 refusals[0]["remediation"]
                 == "Upgrade Codex to 0.154.0 or later and restart this native session after "
-                "current work finishes, or attach the text as a file."
+                "current work finishes."
             )
             assert state.active_turn_id is None
             with pytest.raises(
