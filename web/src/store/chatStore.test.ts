@@ -4196,6 +4196,45 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     },
   );
 
+  it("names a denied resend's missing attachment in one notice once its input comes back", async () => {
+    onTestFinished(clearSessionDrafts);
+    seedSession("conv_real");
+    sessionLabels.set("conv_real", { "omnigent.startup": "failed" });
+    sessionFailedInputs.set("conv_real", [
+      {
+        pending_id: "pending_first",
+        content: [
+          { type: "input_text", text: "explain this chart" },
+          { type: "input_image", file_id: "file_chart", filename: "chart.png" },
+        ],
+      },
+    ]);
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    expect(takeFailedSendDraft("conv_real", false, true)?.text).toBe("explain this chart");
+    setSessionDraft("conv_real", { text: "", files: [] });
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_real/events") && init?.method === "POST")
+        return mockResponse({ queued: false, denied: true });
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore
+      .getState()
+      .send("explain this chart", "agent_xyz", undefined, composerHoldsFirstInput);
+    await settle();
+
+    const { blocks, failedSendDraft } = useChatStore.getState();
+    expect(failedSendDraft).toMatchObject({ text: "explain this chart", files: [] });
+    const notices = blocks.filter(
+      (block) => block.type === "error" && block.code === "startup_attachments_not_restored",
+    );
+    expect(notices).toEqual([
+      expect.objectContaining({ message: "Attach chart.png again before you resend." }),
+    ]);
+    expect(blocks.at(-1)).toBe(notices[0]);
+  });
+
   it.each([
     { outcome: "denied", resend: "resend", command: false, refused: false, via: "send" },
     {

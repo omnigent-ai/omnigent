@@ -8080,7 +8080,17 @@ function returnFailedStartupInputs(
         !state.replacedStartupInputs.includes(input.pendingId) &&
         (adoptedWithoutFiles.has(input.pendingId) || startupInputText(input).trim() === "");
   const attachments = startupAttachmentsNotice(failedInputs.filter(lacksFiles));
-  const kept = state.blocks.filter((block) => !isStartupLookupNotice(block));
+  // A re-read naming the same files, e.g. after a denied resend, moves that notice to the end.
+  const kept = state.blocks.filter(
+    (block) =>
+      !isStartupLookupNotice(block) &&
+      !(
+        attachments &&
+        block.type === "error" &&
+        block.code === attachments.code &&
+        block.message === attachments.message
+      ),
+  );
   const blocks = attachments ? [...kept, attachments] : kept;
   const waiting = handedBackDraft(
     state.failedSendDraft,
