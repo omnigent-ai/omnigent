@@ -27,6 +27,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from tests._helpers.stdio_jsonrpc import read_json_line, stop_process, write_json_line
 
 
 class _SDKClient:
@@ -3911,13 +3912,11 @@ def _serve_mcp_round_trip(entry: dict[str, object], env: dict[str, str], tool: s
     try:
         # serve-mcp cancels in-flight calls when stdin closes, so keep it open until done.
         for request in requests:
-            process.stdin.write(json.dumps(request) + "\n")
-            process.stdin.flush()
+            write_json_line(process.stdin, request)
             while not replies or replies[-1].get("id") != request["id"]:
-                replies.append(json.loads(process.stdout.readline()))
+                replies.append(read_json_line(process.stdout, timeout_s=30))
     finally:
-        process.stdin.close()
-        process.wait(timeout=30)
+        stop_process(process)
     return replies
 
 
