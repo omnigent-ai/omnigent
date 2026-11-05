@@ -17,7 +17,21 @@ from omnigent.harnesses.codex_native.app_server import (
 
 # Spell out expected approvals; deriving them from the production constant
 # would hide an unintended expansion of the approved tool surface.
-_PLAIN_TOOL_APPROVALS = {"sys_session_rename": {"approval_mode": "approve"}}
+_PLAIN_TOOL_APPROVALS = {
+    tool: {"approval_mode": "approve"}
+    for tool in (
+        "sys_session_rename",
+        "sys_session_create",
+        "sys_session_send",
+        "sys_session_message",
+        "sys_session_list",
+        "sys_session_get_info",
+        "sys_session_get_history",
+        "sys_session_close",
+        "sys_agent_list",
+        "sys_read_inbox",
+    )
+}
 
 
 _CWD = "/home/user/repo"

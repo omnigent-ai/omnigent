@@ -28,13 +28,8 @@ from tests.harnesses.codex_native.app_server._support import (
     _test_app_server,
 )
 
-_ROUTED_TOOL_APPROVALS = {
-    "sys_session_rename": {"approval_mode": "approve"},
-    "sys_session_create": {"approval_mode": "approve"},
-    "sys_agent_list": {"approval_mode": "approve"},
-    "sys_session_send": {"approval_mode": "approve"},
-    "sys_read_inbox": {"approval_mode": "approve"},
-}
+# Every routed-redirect tool is already pre-approved for plain sessions.
+_ROUTED_TOOL_APPROVALS = _PLAIN_TOOL_APPROVALS
 
 
 def test_the_framework_tool_approvals_are_scoped_to_the_session_class() -> None:
@@ -51,10 +46,11 @@ def test_the_framework_tool_approvals_are_scoped_to_the_session_class() -> None:
 # codex-native session boots on. A plain session must be indistinguishable from
 # a pre-Smart-Routing one: codex's bundled model catalog (no ``codex debug
 # models`` probe), no ``spawn_agent`` routing gate in hooks.json, and only the
-# one framework tool approval.
+# framework tool approvals.
 #
 # Every Smart Routing session — pinned harness or auto — adds the extended
-# catalog, the spawn gate and the routed-spawn approvals, because on this arm
+# catalog and the spawn gate (its routed-spawn approvals are already in the
+# framework set), because on this arm
 # the spawn tools are neither gated nor pre-approved without them and the spawn
 # simply stalls on a prompt nobody is watching. The home is therefore the same
 # shape for pinned and auto; what separates them is the cross-family framing in

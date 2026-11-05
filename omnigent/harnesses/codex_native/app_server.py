@@ -303,19 +303,28 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
     return ".".join(str(part) for part in version)
 
 
-#: Omnigent tools the framework calls on every session's behalf, pre-approved
-#: so codex never raises an interactive prompt for them. The rename keeps a
-#: session's title current, which the framework does unprompted on any session.
-_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = ("sys_session_rename",)
+#: Omnigent tools pre-approved in every codex session, so codex never raises its
+#: own prompt for them: the title rename the framework does unprompted, and the
+#: session-orchestration tools, which Omnigent's policies already gate and which
+#: Claude Code's default mode runs without asking. Sharing, shell/file, policy
+#: and automation tools keep codex's normal approval.
+_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
+    "sys_session_rename",
+    "sys_session_create",
+    "sys_session_send",
+    "sys_session_message",
+    "sys_session_list",
+    "sys_session_get_info",
+    "sys_session_get_history",
+    "sys_session_close",
+    "sys_agent_list",
+    "sys_read_inbox",
+)
 
-#: Additionally pre-approved for an auto-harness Smart Routing session, whose
-#: spawns the router may move onto the counterpart harness family: these four
-#: carry out that cross-harness redirect end to end — discover the agent, start
-#: the routed child, deliver the task, collect its result. Without the last one
-#: the redirect stalls on an approval prompt nobody is watching. A plain or
-#: pinned session can never receive a redirect, so it gets none of them and its
-#: approval surface stays a plain codex session's. Mirrors the claude-native
-#: ``_ROUTED_SPAWN_ALLOWED_TOOLS`` gate.
+#: The cross-harness redirect toolkit an auto-harness Smart Routing session needs
+#: end to end — discover the agent, start the routed child, deliver the task,
+#: collect its result. Mirrors the claude-native ``_ROUTED_SPAWN_ALLOWED_TOOLS``
+#: gate; every codex session already pre-approves these.
 _ROUTED_SPAWN_APPROVED_TOOLS: tuple[str, ...] = (
     "sys_session_create",
     "sys_agent_list",
@@ -334,7 +343,7 @@ def framework_approved_tools(*, routed_spawns: bool) -> tuple[str, ...]:
     """
     if not routed_spawns:
         return _FRAMEWORK_APPROVED_TOOLS
-    return (*_FRAMEWORK_APPROVED_TOOLS, *_ROUTED_SPAWN_APPROVED_TOOLS)
+    return tuple(dict.fromkeys((*_FRAMEWORK_APPROVED_TOOLS, *_ROUTED_SPAWN_APPROVED_TOOLS)))
 
 
 def _codex_mcp_server_config_section(
