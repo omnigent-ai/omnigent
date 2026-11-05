@@ -162,7 +162,7 @@ export function CanvasWorkspace({
         >
           {/* Keep navigation available while the board is loading. */}
           {onOpenSidebar && (
-            <div className="chat-header pointer-events-none absolute inset-x-0 top-0 z-30 flex h-14 items-center px-2 md:h-12 md:px-4">
+            <div className="chat-header pointer-events-none absolute inset-x-0 top-0 z-30 flex h-[76px] items-center px-4 py-4 md:h-12 md:py-0">
               <SidebarOpenButton componentId="canvas.open_sidebar" onOpenSidebar={onOpenSidebar} />
             </div>
           )}

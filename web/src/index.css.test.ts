@@ -47,6 +47,14 @@ const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 // every rule-extraction below so the block grammar lives in one place.
 const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 
+describe("shared glass fallback", () => {
+  it("uses the solid theme surface only when both backdrop filters are unsupported", () => {
+    expect(indexCssSource).toMatch(
+      /@supports not \(\(backdrop-filter: blur\(1px\)\) or \(-webkit-backdrop-filter: blur\(1px\)\)\)\s*\{\s*\.omni-glass-surface\s*\{\s*--omni-glass-background: var\(--card-solid\);/,
+    );
+  });
+});
+
 describe("composer picker single highlight", () => {
   const rules = cssBlocks
     .map(([block]) => block)
@@ -845,7 +853,7 @@ describe("index.css sidebar canvas", () => {
   });
 
   it("uses the shared inset shadow with a dark-only right border", () => {
-    const shadow = "inset -8px 0 12px -8px rgb(0 0 0 / 5%)";
+    const shadow = "inset -4px 0 6px -4px rgb(0 0 0 / 5%)";
     expect(lightEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(lightEdgeRule).toContain("border-right: none");
@@ -879,9 +887,8 @@ describe("index.css composer and menu surfaces", () => {
 /* Regression test for the "inline <code> renders at 9.75px" bug.
  *
  * code/kbd/samp/pre carry preflight's `font-size: 1em`, so they inherit their
- * parent's step. Anchoring the title ratios to the raw 13px preference instead
- * of a 16px-equivalent shrank every step ~19%, dragging the <code> under them
- * down to 9.75px.
+ * parent's step. Anchoring title ratios to the raw body preference instead of
+ * a 16px-equivalent shrinks every step, including nested code.
  */
 describe("index.css desktop typography ramp", () => {
   const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
@@ -943,8 +950,8 @@ describe("index.css body text tokens", () => {
     expect(mobileMap).toContain("--text-base: var(--mobile-ui-font-size)");
   });
 
-  /* Contract: mobile gets its own unset default, while a saved Appearance
-   * value applies directly instead of being silently rescaled. */
+  /* Contract: a saved Appearance value applies directly on mobile instead of
+   * being silently rescaled. */
   describe("mobile branch consumes the font-size preference", () => {
     it("uses the mobile default and aliases the effective body size to the preference", () => {
       expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
@@ -954,7 +961,7 @@ describe("index.css body text tokens", () => {
     });
 
     it("keeps the desktop and mobile defaults distinct", () => {
-      expect(UI_FONT_SIZE_DEFAULT).toBe(13);
+      expect(UI_FONT_SIZE_DEFAULT).toBe(14);
       expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(15);
     });
 
@@ -1053,30 +1060,24 @@ describe("index.css shadow tokens", () => {
   });
 });
 
-/* Regression test for the "mobile sidebar is see-through" bug.
- * Below md the sidebar overlays the chat, so both canvas rules are followed
- * by an opaque fill. */
-describe("index.css mobile sidebar opacity", () => {
+describe("index.css mobile sidebar transparency", () => {
   const mobileRule = cssSource.match(
-    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background-color[^}]*\}/,
+    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background:\s*transparent[^}]*\}/,
   )?.[0];
 
-  it("keeps an opaque fill for the mobile sidebar overlay", () => {
-    expect(mobileRule, "the mobile sidebar background-color rule is gone").toBeDefined();
-    expect(mobileRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+  it("keeps the drawer canvas transparent over its shared glass layer", () => {
+    expect(mobileRule).toBeDefined();
+    expect(mobileRule).toMatch(/background:\s*transparent !important/);
   });
 
-  it("declares it after both shared canvas rules so it wins the cascade", () => {
+  it("overrides the shared canvas after both theme rules", () => {
     const lightPalette = indexCssSource.indexOf(":root:not(.dark) .conversations-sidebar {");
     const darkPalette = indexCssSource.indexOf(".dark .omnigent-native-sidebar-surface,");
-    const mobile = cssSource.indexOf(mobileRule!);
+    const mobile = indexCssSource.indexOf(mobileRule!);
     expect(lightPalette).toBeGreaterThan(-1);
     expect(darkPalette).toBeGreaterThan(-1);
     expect(mobile).toBeGreaterThan(lightPalette);
     expect(mobile).toBeGreaterThan(darkPalette);
-    expect(mobileRule).toContain(":root:not([data-theme]) .conversations-sidebar");
-    expect(mobileRule).toContain(":root[data-theme] .conversations-sidebar");
-    expect(mobileRule).not.toContain(":not(.dark)");
     expect(generatedPaletteCssSource).not.toContain(".conversations-sidebar {");
   });
 });

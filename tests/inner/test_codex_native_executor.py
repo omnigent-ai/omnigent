@@ -184,6 +184,43 @@ def _collect_turn_events(
     return asyncio.run(run())
 
 
+@pytest.mark.asyncio
+async def test_side_command_attachment_is_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "/side explain this"},
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                    ],
+                }
+            ],
+            [],
+            "",
+        )
+    ]
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "attachments" in error.message
+    assert error.undelivered is True
+    assert error.preserve_session is True
+    assert _FakeCodexNativeClient.requests == []
+    assert codex_native_executor.side_chat.peek_side_chat_requests(tmp_path) == []
+
+
 @pytest.fixture
 def draining_client(monkeypatch: pytest.MonkeyPatch):
     # The external RPC peer is scripted; the executor and bridge files stay real.
