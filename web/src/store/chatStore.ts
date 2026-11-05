@@ -5219,6 +5219,10 @@ async function bindStream(
           : null;
       return {
         ...effectiveBindingPatch,
+        // A failure re-read that landed during the fetch is newer than this snapshot.
+        ...(state.failedInputs !== stateBeforeFetch.failedInputs
+          ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
+          : {}),
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
         ...(unsentDraft !== null && state.failedSendDraft === null
@@ -8756,12 +8760,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_consumed": {
       applyToConversation({ startupPending: false });
-      // A retry from another client delivered an undelivered message. Clear it now
-      // when the receipt names it (native ones do), and re-read either way: that
-      // read also supersedes one in flight from before the delivery.
+      // A retry from another client may have delivered an undelivered message: clear
+      // it now when the receipt names it (native ones do), and re-read either way,
+      // superseding any failure read still in flight from before the delivery.
       if (
         sourceConversationId &&
-        (setterForState(sourceConversationId)?.failedInputs.length ?? 0) > 0
+        ((setterForState(sourceConversationId)?.failedInputs.length ?? 0) > 0 ||
+          startupReads.has(sourceConversationId))
       ) {
         const deliveredId = event.clearedPendingId;
         if (deliveredId) {

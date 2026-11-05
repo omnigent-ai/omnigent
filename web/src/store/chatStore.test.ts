@@ -2427,6 +2427,65 @@ describe("chatStore — switchTo", () => {
     });
   });
 
+  it("keeps undelivered messages a failure re-read found while the bind snapshot was out", async () => {
+    // The bind's snapshot predates the launch failure; both failure re-reads
+    // land first.
+    seedSession("conv_bind_failed");
+    const lost = { type: "input_text" as const, text: "Summarize the open PRs" };
+    const normalFetch = fetchMock.getMockImplementation()!;
+    let answerBind: (() => void) | null = null;
+    let snapshotGets = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_bind_failed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotGets += 1;
+        if (snapshotGets === 1) {
+          return new Promise<Response>((resolve) => {
+            answerBind = () => resolve(normalFetch(input, init) as Response);
+          });
+        }
+        return Promise.resolve(
+          mockResponse({
+            id: "conv_bind_failed",
+            agent_id: "agent_xyz",
+            status: "failed",
+            created_at: 0,
+            items: [],
+            labels: { "omnigent.startup": "failed" },
+            pending_elicitations: [],
+            pending_inputs: [],
+            failed_inputs: [{ pending_id: "pending_first", content: [lost] }],
+          }),
+        );
+      }
+      return normalFetch(input, init);
+    });
+
+    const bind = useChatStore.getState().switchTo("conv_bind_failed");
+    await vi.waitFor(() => expect(answerBind).not.toBeNull());
+    for (let report = 0; report < 2; report += 1) {
+      handleSessionEvent(
+        {
+          type: "session_sandbox_status",
+          conversationId: "conv_bind_failed",
+          stage: "failed",
+          error: "managed host did not come online",
+        },
+        "conv_bind_failed",
+      );
+    }
+    await vi.waitFor(() => expect(useChatStore.getState().failedInputs).toHaveLength(1));
+    answerBind!();
+    await bind;
+
+    expect(useChatStore.getState().failedInputs).toEqual([
+      { pendingId: "pending_first", content: [lost] },
+    ]);
+  });
+
   it("keeps a live status that arrives while the bind snapshot is in flight", async () => {
     // A turn starting during page load must not read as idle: a send then would
     // not count as steering the running turn.
@@ -7940,31 +7999,38 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
           clearedPendingId,
         });
 
-      it("keeps a message another client delivered from coming back with an older read", async () => {
-        const beforeDelivery = deferred();
-        const afterDelivery = deferred();
-        fetchMock
-          .mockImplementationOnce(() => beforeDelivery.response)
-          .mockImplementationOnce(() => afterDelivery.response);
-        useChatStore.setState({
-          failedInputs: [{ pendingId: "pending_first", content: [lost] }],
-          pendingUserMessages: [],
-        });
+      it.each([
+        ["already showing", true],
+        ["not yet shown", false],
+      ])(
+        "keeps a message another client delivered from coming back (failure %s)",
+        async (_case, shown) => {
+          const beforeDelivery = deferred();
+          const afterDelivery = deferred();
+          fetchMock
+            .mockImplementationOnce(() => beforeDelivery.response)
+            .mockImplementationOnce(() => afterDelivery.response);
+          useChatStore.setState({
+            failedInputs: shown ? [{ pendingId: "pending_first", content: [lost] }] : [],
+            pendingUserMessages: [],
+          });
 
-        failLaunch();
-        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-        deliver("pending_first");
-        expect(useChatStore.getState().failedInputs).toEqual([]);
-        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-        beforeDelivery.answer(snapshot("failed", [], [failedEntry]));
-        await tick();
-        expect(useChatStore.getState().failedInputs).toEqual([]);
-        afterDelivery.answer(snapshot("ready", [], []));
-        await tick();
-        await tick();
+          // A failure read is out when the delivery's receipt arrives.
+          failLaunch();
+          await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+          deliver("pending_first");
+          expect(useChatStore.getState().failedInputs).toEqual([]);
+          await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+          beforeDelivery.answer(snapshot("failed", [], [failedEntry]));
+          await tick();
+          expect(useChatStore.getState().failedInputs).toEqual([]);
+          afterDelivery.answer(snapshot("ready", [], []));
+          await tick();
+          await tick();
 
-        expect(useChatStore.getState().failedInputs).toEqual([]);
-      });
+          expect(useChatStore.getState().failedInputs).toEqual([]);
+        },
+      );
 
       it("clears a delivered message whose receipt doesn't name it", async () => {
         // A non-native delivery's receipt carries no pending id.
