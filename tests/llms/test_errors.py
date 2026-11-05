@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.llms.errors import detect_request_size_overflow, is_request_size_rejection
 
 # Enough repeated request fields that a backtracking parser takes many seconds;
 # the linear scanner needs milliseconds. The budget is deliberately generous so
@@ -23,6 +23,17 @@ def test_detect_request_size_overflow_matches_databricks_rejection() -> None:
     assert result is not None
     assert result.request_bytes == 33967957
     assert result.limit_bytes == 33554432
+
+
+def test_is_request_size_rejection_accepts_limit_only_wording() -> None:
+    """The gateway's wording that states the cap without byte fields is a rejection."""
+    assert is_request_size_rejection(
+        "The request size exceeds the maximum allowed limit of 33554432 bytes."
+    )
+
+
+def test_is_request_size_rejection_ignores_unrelated_text() -> None:
+    assert not is_request_size_rejection("Rate limit exceeded; retry later.")
 
 
 def test_detect_request_size_overflow_phrase_without_sizes_is_none() -> None:

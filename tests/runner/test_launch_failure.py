@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import ErrorCategory
+from omnigent.llms.errors import REQUEST_SIZE_OVERFLOW_GUIDANCE
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_native_turn_error,
@@ -15,6 +16,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_model_rejection,
     diagnose_codex_provider_auth_failure,
     diagnose_model_unavailable,
+    turn_error_display_message,
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
@@ -355,6 +357,33 @@ def test_content_length_text_without_sizes_stays_generic() -> None:
 @pytest.mark.parametrize("code", ["codex_reauth_required", "workspace_missing"])
 def test_content_length_text_does_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, _CONTENT_LENGTH_REJECTION) == code
+
+
+_REQUEST_SIZE_LIMIT_REJECTION = (
+    '{"error_code":"BAD_REQUEST","message":"The request size exceeds the maximum '
+    'allowed limit of 33554432 bytes. Please reduce the request size and try again."}'
+)
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+def test_classifies_request_size_limit_wording_as_context_overflow(code: str) -> None:
+    assert classify_native_turn_error(code, _REQUEST_SIZE_LIMIT_REJECTION) == (
+        "context_length_exceeded"
+    )
+
+
+def test_request_size_rejection_displays_the_remedy_not_the_raw_body() -> None:
+    assert (
+        turn_error_display_message("context_length_exceeded", _REQUEST_SIZE_LIMIT_REJECTION)
+        == REQUEST_SIZE_OVERFLOW_GUIDANCE
+    )
+    assert "Compact the conversation" in REQUEST_SIZE_OVERFLOW_GUIDANCE
+    assert "start a new session" in REQUEST_SIZE_OVERFLOW_GUIDANCE
+
+
+def test_other_turn_error_text_is_displayed_unchanged() -> None:
+    message = "Codex ran into a model rejection."
+    assert turn_error_display_message("codex_turn_error", message) == message
 
 
 @pytest.mark.parametrize(
