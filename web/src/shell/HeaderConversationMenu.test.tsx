@@ -255,6 +255,13 @@ describe("HeaderConversationMenu", () => {
     fireEvent(window, altGraph);
     expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
 
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+    screen.getByRole("dialog").querySelector("input")!.focus();
+    fireEvent(window, addAgentKey());
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
     const accepted = addAgentKey();
     fireEvent(window, accepted);
     expect(accepted.defaultPrevented).toBe(true);

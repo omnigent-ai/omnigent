@@ -314,6 +314,16 @@ async def _drive(rig: ManagedReplicas) -> None:
                     if await project_header.get_attribute("aria-expanded") == "false":
                         await project_header.click()
                     project_section = project_header.locator("xpath=ancestor::section[1]")
+                    member_selector = f'li[data-sidebar-session-id="{fresh_id}"]'
+                    member_row = project_section.locator(member_selector)
+                    await member_row.hover()
+                    await member_row.get_by_role("button", name="Pin conversation").click()
+                    await expect(page.locator(member_selector)).to_have_count(2)
+                    await expect(member_row).to_have_attribute("data-sibling-session", "true")
+                    await page.screenshot(path=str(evidence / "project-personal-pin.png"))
+                    await member_row.hover()
+                    await member_row.get_by_role("button", name="Unpin conversation").click()
+                    await expect(page.locator(member_selector)).to_have_count(1)
                     for pinned in (True, False):
                         representative = page.locator(
                             f'li[data-sidebar-session-id="{sibling_id}"]'

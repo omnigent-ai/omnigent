@@ -1642,7 +1642,7 @@ function ProjectFolder({
           (c) =>
             (c.archived === true) === archived &&
             sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
-            (archived || (!c.family?.pinned && !pinnedSet.has(c.id))),
+            (archived || (!c.family?.pinned && (c.family != null || !pinnedSet.has(c.id)))),
         ),
         activeOverride,
         frozenSortKeys,
@@ -5492,13 +5492,13 @@ function ConversationRowImpl({
       label,
       project: currentProject,
       isPinned,
-      canManage: isOwner,
+      canManage: isOwner && !familyIndented,
       canMoveProject: !isIndentedSibling(conversation),
       reorderGroup: canReorder ? reorderGroup : undefined,
       reorderIndex,
     },
     disabled:
-      familyIndented ||
+      (familyIndented && !gridsEnabled) ||
       (!isOwner && !gridsEnabled) ||
       selectionMode ||
       isArchived ||

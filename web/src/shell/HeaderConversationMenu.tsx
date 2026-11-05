@@ -75,7 +75,7 @@ import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
-import { hasCommandModifier } from "@/lib/hotkeys";
+import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
@@ -195,6 +195,8 @@ export function HeaderConversationMenu({
       }
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
+      if (isFocusInDialogOrMenu() || document.activeElement?.closest(".xterm, .monaco-editor"))
+        return;
       event.preventDefault();
       event.stopPropagation();
       navigate(addAgentPath);

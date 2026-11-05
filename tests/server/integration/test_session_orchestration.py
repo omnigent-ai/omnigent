@@ -349,7 +349,7 @@ async def test_side_chat_inherits_sharing_for_new_controls(
     assert (await _send(auth_client, manager, target)).get("queued") is True
 
 
-@pytest.mark.parametrize("source_link", ["missing", "cycle"])
+@pytest.mark.parametrize("source_link", ["missing", "cycle", "absent"])
 async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, source_link):
     source, target, captured = peers
     response = await auth_client.post(
@@ -359,15 +359,24 @@ async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, 
     side = response.json()
     _bind_runner(db_uri, side["id"])
     store = SqlAlchemyConversationStore(db_uri)
-    store.set_labels(
-        side["id"],
-        {SIDE_CHAT_SOURCE_LABEL_KEY: side["id"] if source_link == "cycle" else uuid4().hex},
-    )
+    if source_link == "absent":
+        store.delete_label(side["id"], SIDE_CHAT_SOURCE_LABEL_KEY)
+    else:
+        store.set_labels(
+            side["id"],
+            {SIDE_CHAT_SOURCE_LABEL_KEY: side["id"] if source_link == "cycle" else uuid4().hex},
+        )
     captured.clear()
     assert (
         "Session is not owned or available" in (await _send(auth_client, side, target))["detail"]
     )
     assert not captured.get("posts")
+
+    nested = await auth_client.post(
+        "/v1/sessions", json={"agent_id": source["agent_id"], "sibling_source_id": side["id"]}
+    )
+    assert nested.status_code == 403, nested.text
+    assert store.get_conversation(side["id"]).family_id is None
 
 
 @pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
@@ -1262,7 +1271,7 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     from omnigent.server.sharing_settings import DefaultPublicSessions
     from tests.server.integration.test_sessions_permissions import build_agent_bundle
 
-    source, _, _ = peers
+    source, target, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
     invalid = await auth_client.patch(
         f"/v1/sessions/{source['id']}", json={"project_id": "", "family_pinned": True}
@@ -1274,6 +1283,10 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     permissions.grant("reader", source["id"], LEVEL_READ)
     auth_app.state.default_public_sessions = lambda: DefaultPublicSessions.ALL
     metadata = {"sibling_source_id": source["id"], "title": "Private sibling"}
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+        lambda: max(source["created_at"], target["created_at"]) + 1,
+    )
     if bundled:
         response = await auth_client.post(
             "/v1/sessions",
@@ -1311,7 +1324,10 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
         params={"limit": 1, "search_query": "Private sibling", "expand_families": True},
     )
     assert [row["id"] for row in expanded.json()["data"]] == [sibling_id]
-    expanded = await auth_client.get("/v1/sessions", params={"limit": 1, "expand_families": True})
+    expanded = await auth_client.get(
+        "/v1/sessions",
+        params={"limit": 1, "agent_id": sibling.agent_id, "expand_families": True},
+    )
     assert {row["id"] for row in expanded.json()["data"]} == {source["id"], sibling_id}
     pinned = await auth_client.patch(
         f"/v1/sessions/{sibling_id}", json={"labels": {"omnigent.pinned": "1"}}
@@ -1447,6 +1463,15 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
         snapshot = (await auth_client.get(f"/v1/sessions/{session_id}")).json()
         assert snapshot["family"]["pinned_at"] == "1" * 256
     store.set_conversation_project(source["id"], "a" * 32)
+    refused = await auth_client.patch(
+        f"/v1/sessions/{source['id']}",
+        json={"project_id": "", "labels": {"omni_project": "Stray"}, "title": "Rejected"},
+    )
+    assert refused.status_code == 400, refused.text
+    for member in store.get_session_family(source["id"]):
+        assert member.project_id == "a" * 32
+        assert member.labels.get("omni_project") != "Stray"
+    assert store.get_conversation(source["id"]).title == "Pinned family"
     refused = await auth_client.patch(f"/v1/sessions/{sibling_id}", json={"project_id": ""})
     assert refused.status_code == 409, refused.text
     removed = await auth_client.patch(

@@ -9971,6 +9971,58 @@ def test_failed_family_membership_preserves_source_pin(
     assert not store.list_conversations(pinned=True, pinned_owner="alice").data
 
 
+@pytest.mark.parametrize("split_database", [False, True])
+def test_failed_family_project_move_preserves_legacy_membership(
+    tmp_path, monkeypatch, split_database
+):
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    source = store.create_conversation(labels={"omni_project": "Original"})
+    sibling = store.create_conversation()
+    store.add_new_sibling(source.id, sibling.id, user_id="alice")
+    original = store._session_immediate
+
+    @contextmanager
+    def fail_project_commit(operation):
+        with original(operation) as session:
+            yield session
+            if operation == "move_session_family":
+                raise RuntimeError("metadata commit failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store,
+            "_session_immediate",
+            MagicMock(side_effect=fail_project_commit, engine=original.engine),
+        )
+        with pytest.raises(RuntimeError, match="metadata commit failed"):
+            store.set_conversation_project(source.id, "a" * 32)
+    for member in store.get_session_family(source.id):
+        assert member.project_id is None
+        assert member.labels["omni_project"] == "Original"
+    if split_database:
+
+        def fail_cleanup(_connection, _cursor, statement, _parameters, _context, _many):
+            if statement.startswith("DELETE FROM conversation_labels"):
+                raise RuntimeError("label cleanup failed")
+
+        event.listen(store._conv_engine, "before_cursor_execute", fail_cleanup)
+        try:
+            with pytest.raises(RuntimeError, match="label cleanup failed"):
+                store.set_conversation_project(source.id, "a" * 32)
+        finally:
+            event.remove(store._conv_engine, "before_cursor_execute", fail_cleanup)
+        for member in store.get_session_family(source.id):
+            assert member.project_id == "a" * 32
+            assert member.labels["omni_project"] == "Original"
+    assert store.set_conversation_project(source.id, "a" * 32)
+    for member in store.get_session_family(source.id):
+        assert member.project_id == "a" * 32
+        assert "omni_project" not in member.labels
+
+
 def test_generic_label_writes_cannot_change_family_pins(conversation_store) -> None:
     from omnigent.errors import OmnigentError
 

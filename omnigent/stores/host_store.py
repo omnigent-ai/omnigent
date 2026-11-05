@@ -55,6 +55,9 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
 
+# Recovery renews every 20 seconds; tolerate three missed renewals.
+_MANAGED_RECOVERY_LEASE_S = 60
+
 
 class _HostOwnershipError(IntegrityError):
     """An ownership refusal, not a retryable insert conflict."""
@@ -1203,7 +1206,9 @@ class HostStore:
                 if value.get("workspace") and value.get("sandbox_id") == row.sandbox_id:
                     return False
                 raise ValueError("Sandbox changed before recovery; retry with its current state")
-            value = json.dumps({"token": token, "expires": now_epoch() + 300})
+            value = json.dumps(
+                {"token": token, "expires": now_epoch() + _MANAGED_RECOVERY_LEASE_S}
+            )
             if lease is None:
                 session.add(
                     SqlPreference(workspace_id=key[0], user_id=key[1], key=key[2], value=value)
@@ -1237,7 +1242,7 @@ class HostStore:
             if value.get("token") != token:
                 return False
             value.update(
-                expires=0 if finished else now_epoch() + 300,
+                expires=0 if finished else now_epoch() + _MANAGED_RECOVERY_LEASE_S,
                 workspace=workspace,
                 sandbox_id=sandbox_id,
             )

@@ -3214,7 +3214,9 @@ def register_core_routes(
             )
             family_pin_value = str(int(time.time() * 1000)) if body.family_pinned else ""
         labels_to_set = dict(body.labels or {})
-        if PROJECT_LABEL_KEY in labels_to_set and not set_project:
+        if PROJECT_LABEL_KEY in labels_to_set and (
+            not set_project or labels_to_set[PROJECT_LABEL_KEY]
+        ):
             project_source = await asyncio.to_thread(
                 conversation_store.get_conversation, session_id
             )

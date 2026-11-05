@@ -2230,7 +2230,11 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
 
 
-def test_recovery_fences_expired_attempts_and_connected_hosts(host_store: HostStore) -> None:
+def test_recovery_fences_expired_attempts_and_connected_hosts(
+    host_store: HostStore, monkeypatch
+) -> None:
+    started_at = now_epoch()
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: started_at)
     host = host_store.register_managed_host(
         host_id=uuid.uuid4().hex,
         name="shared",
@@ -2244,7 +2248,11 @@ def test_recovery_fences_expired_attempts_and_connected_hosts(host_store: HostSt
         host_store.managed_recovery_result(host.host_id)
     assert host_store.claim_managed_recovery(host, "first")
     assert not host_store.claim_managed_recovery(host, "second")
-    host_store.update_managed_recovery(host.host_id, "first", finished=True)
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: started_at + 30)
+    assert host_store.update_managed_recovery(host.host_id, "first")
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: started_at + 61)
+    assert host_store.managed_recovery_result(host.host_id) is None
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: started_at + 91)
     with pytest.raises(ValueError, match="failed or expired"):
         host_store.managed_recovery_result(host.host_id)
     assert host_store.claim_managed_recovery(host, "second")
@@ -2289,6 +2297,9 @@ def test_recovery_fences_expired_attempts_and_connected_hosts(host_store: HostSt
 async def test_deleted_automation_session_retains_reusable_sandbox(
     db_uri: str, monkeypatch
 ) -> None:
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationMetadata
     from omnigent.server.scheduled.schedule import continued_sandbox_host_id
     from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
@@ -2329,7 +2340,38 @@ async def test_deleted_automation_session_retains_reusable_sandbox(
         conversations.create_conversation(
             parent_conversation_id=session.id, host_id=host_id, workspace="/work"
         )
-    assert await conversations.delete_conversation(session.id)
+    engine = get_or_create_engine(db_uri)
+    concurrent = []
+
+    def delete_after_snapshot(connection, cursor, statement, parameters, context, executemany):
+        if (
+            "SELECT DISTINCT omnigent_conversation_metadata.host_id" in statement
+            and not concurrent
+        ):
+            concurrent.append(True)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert executor.submit(
+                    lambda: asyncio.run(conversations.delete_conversation(other.id))
+                ).result(timeout=10)
+
+    if engine.dialect.name == "mysql":
+        other = conversations.create_conversation(
+            host_id=host_id,
+            workspace="/work",
+            labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
+        )
+        event.listen(engine, "after_cursor_execute", delete_after_snapshot)
+    try:
+        assert await conversations.delete_conversation(session.id)
+    finally:
+        if engine.dialect.name == "mysql":
+            event.remove(engine, "after_cursor_execute", delete_after_snapshot)
+    with engine.connect() as connection:
+        assert not connection.execute(
+            select(SqlConversationMetadata.id).where(SqlConversationMetadata.host_id == host_id)
+        ).all()
+    if engine.dialect.name == "mysql":
+        assert concurrent == [True]
     assert host_store.delete_host(host_id, keep_if_bound=True) is None
     assert host_store.get_host(host_id) is not None
     tasks.delete(task.id)

@@ -5562,7 +5562,9 @@ function NewChatLandingContent({
     // Persist the explicit pick even when it matches the current selection, so
     // clicking the auto-selected host still records it as the sticky default
     // for the next visit.
-    writeLastHostChoice(hostId);
+    if (!hosts?.find((host) => host.host_id === hostId)?.sandbox_provider) {
+      writeLastHostChoice(hostId);
+    }
     // Re-selecting the current host is a no-op. Clearing the workspace here
     // would empty the field for good: the seeding effect's deps (host id,
     // recents, derived home) are all unchanged on a same-host pick, so it

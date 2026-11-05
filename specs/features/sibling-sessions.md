@@ -131,7 +131,8 @@ Explicit whole-host deletion retains its separate semantics. Failed launch
 rollback clears only its own binding/generation. Retained automation hosts also
 keep a task ownership reference after their run session is removed.
 
-Recovery uses a renewable per-host preference lease across replicas. Only the
+Recovery uses a per-host preference lease renewed every 20 seconds and expiring
+after 60 seconds without renewal. Only the
 lease holder provisions a replacement; waiters consume the same result. Expired
 attempts cannot replace the winner. Failed recovery detaches a generation only
 if its credential, heartbeat and offline status still match; a late successful

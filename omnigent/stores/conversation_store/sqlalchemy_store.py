@@ -2055,6 +2055,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             return False
         family_id = source.family_id or source.id
 
+        def clear_legacy_labels(labels_session: Session, ids: list[str]) -> None:
+            labels_session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(ids),
+                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                )
+            )
+
         def write(session: Session) -> bool:
             self._lock_session_family(session, family_id)
             ids = self._family_member_ids(session, family_id)
@@ -2063,13 +2072,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     self._require_family_representative(
                         labels_session, ids, conversation_id, family_id
                     )
-                    labels_session.execute(
-                        delete(SqlConversationLabel).where(
-                            SqlConversationLabel.workspace_id == current_workspace_id(),
-                            SqlConversationLabel.conversation_id.in_(ids),
-                            SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                        )
-                    )
+                    if self._conv_engine is self._engine:
+                        clear_legacy_labels(labels_session, ids)
                 else:
                     ids = [conversation_id]
             result = session.execute(
@@ -2082,7 +2086,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return cast(_RowCountResult, result).rowcount > 0
 
-        return run_write_transaction(self._session_immediate, "move_session_family", write)
+        changed = run_write_transaction(self._session_immediate, "move_session_family", write)
+        if changed and self._conv_engine is not self._engine:
+            # Commit filing before deleting the only legacy copy in another database.
+            def clear_labels(session: Session) -> None:
+                self._lock_session_family(session, family_id)
+                ids = self._family_member_ids(session, family_id)
+                if ids:
+                    with self._profile_label_session(session) as labels_session:
+                        clear_legacy_labels(labels_session, ids)
+
+            run_write_transaction(
+                self._session_immediate, "clear_family_project_labels", clear_labels
+            )
+        return changed
 
     def increment_session_usage(
         self,
@@ -6716,14 +6733,23 @@ class SqlAlchemyConversationStore(ConversationStore):
             for host in hosts:
                 task_id = retained_tasks.get(host.host_id)
                 if task_id is not None:
-                    session.merge(
-                        SqlPreference(
-                            workspace_id=current_workspace_id(),
-                            user_id="__host_lifecycle__",
-                            key="retained_sandbox:" + host.host_id,
-                            value=task_id,
-                        )
+                    key = (
+                        current_workspace_id(),
+                        "__host_lifecycle__",
+                        "retained_sandbox:" + host.host_id,
                     )
+                    marker = session.get(SqlPreference, key, with_for_update=True)
+                    if marker is None:
+                        session.add(
+                            SqlPreference(
+                                workspace_id=key[0],
+                                user_id=key[1],
+                                key=key[2],
+                                value=task_id,
+                            )
+                        )
+                    else:
+                        marker.value = task_id
             session.flush()
             for host in hosts:
                 delete_unused_host_in_session(session, host)

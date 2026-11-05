@@ -4389,11 +4389,12 @@ async def _register_and_start_host(
                 raise
         elif keep_host_on_failure:
             # A late connection or a replacement generation owns its credential.
-            detached = await asyncio.to_thread(
+            current = await asyncio.to_thread(host_store.get_host, host_id)
+            detached = current is not None and await asyncio.to_thread(
                 host_store.detach_stale_managed_sandbox,
                 host_id,
                 sandbox_id=sandbox_id,
-                expected_updated_at=record.updated_at,
+                expected_updated_at=current.updated_at,
                 expected_token=token,
             )
             if detached and await _terminate_sandbox_best_effort(

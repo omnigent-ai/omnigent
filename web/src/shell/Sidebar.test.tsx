@@ -2059,14 +2059,20 @@ describe("Sidebar sections", () => {
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
 
-  it("keeps the family chevron inside the representative session surface", () => {
+  it.each([false, true])("keeps family context beside personal pins (project: %s)", (inProject) => {
     const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    if (inProject) projectsMock.push("Customer X");
+    const projectLabels: Record<string, string> = inProject ? { omni_project: "Customer X" } : {};
     mockConversations([
-      conv("conv_parent", "Claude Code", { family }),
-      conv("conv_sibling", "Codex", { family, labels: { "omnigent.pinned": "1" } }),
+      conv("conv_parent", "Claude Code", { family, labels: projectLabels }),
+      conv("conv_sibling", "Codex", {
+        family,
+        labels: { ...projectLabels, "omnigent.pinned": "1" },
+      }),
     ]);
     seedPins(["conv_sibling"]);
     const { refresh } = renderSidebar();
+    if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
 
     const link = screen.getByText("conv_parent").closest("a")!;
     const surface = link.parentElement!;
@@ -2084,10 +2090,13 @@ describe("Sidebar sections", () => {
 
     const setFamilyPinned = (pinned: boolean) => {
       mockConversations([
-        conv("conv_parent", "Claude Code", { family: { ...family, pinned } }),
+        conv("conv_parent", "Claude Code", {
+          family: { ...family, pinned },
+          labels: projectLabels,
+        }),
         conv("conv_sibling", "Codex", {
           family: { ...family, pinned },
-          labels: { "omnigent.pinned": "1" },
+          labels: { ...projectLabels, "omnigent.pinned": "1" },
         }),
       ]);
       seedPins(pinned ? ["conv_parent", "conv_sibling"] : ["conv_sibling"]);

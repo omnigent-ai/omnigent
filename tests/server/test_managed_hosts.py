@@ -3335,7 +3335,10 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
 
 
-async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:
+@pytest.mark.parametrize("connected_then_failed", [False, True])
+async def test_relaunch_failure_keeps_host_row_and_revokes_token(
+    db_uri: str, monkeypatch, connected_then_failed: bool
+) -> None:
     """
     A FAILED relaunch must not delete the durable host row — deleting
     it would null the session's host binding (FK SET NULL) and make
@@ -3345,14 +3348,22 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     row.
     """
     host_store = HostStore(db_uri)
+    fail_launch = False
 
     def _register(invocation: HostStartInvocation) -> None:
         """Simulate the sandbox host connecting over the tunnel."""
+        if fail_launch:
+            monkeypatch.setattr(
+                "omnigent.stores.host_store.now_epoch", lambda: gen1.updated_at + 1
+            )
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
         )
+        if fail_launch:
+            host_store.set_offline(invocation.host_id)
+            raise RuntimeError("Host disconnected during startup")
 
     fake = FakeSandboxLauncher(on_host_start=_register)
     config = _injected_config(fake)
@@ -3360,7 +3371,8 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     gen1 = host_store.get_host(first.host_id)
     assert gen1 is not None
 
-    fake.fail_on_host_start = True
+    fail_launch = True
+    fake.fail_on_host_start = not connected_then_failed
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
 
@@ -3372,15 +3384,8 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     # tests, which delete it), so the session binding stays relaunchable.
     host = host_store.get_host(first.host_id)
     assert host is not None
-    # No credential of ANY generation is live: gen 1's was replaced by
-    # the re-arm, and the re-armed token was revoked by the failure
-    # cleanup (revoke_launch_token — covered directly in the host-store
-    # suite). Gen 1's raw token is the only one observable here (the
-    # failed start never executed), so assert on it.
-    assert (
-        host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
-        is None
-    )
+    for invocation in fake.host_starts:
+        assert host_store.resolve_launch_token(invocation.host_id, invocation.token) is None
 
 
 @pytest.mark.parametrize("during_provision", [False, True])

@@ -49,7 +49,11 @@ import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
-import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import {
+  readLastHostChoice,
+  writeLastHostChoice,
+  SANDBOX_HOST_CHOICE,
+} from "@/lib/hostPreferences";
 import {
   readProjectLaunchDefaults,
   writeProjectLaunchDefaults,
@@ -622,6 +626,30 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
 });
 
 describe("NewChatLandingScreen nested agent creation", () => {
+  it("keeps the ordinary host preference when explicitly selecting the source sandbox", async () => {
+    const regular = host({ host_id: "regular", name: "Regular host" });
+    const sandbox = host({ sandbox_provider: "modal" });
+    vi.mocked(useHosts).mockImplementation(
+      (options) =>
+        ({
+          data: options?.sourceHostId ? [regular, sandbox] : [regular],
+        }) as ReturnType<typeof useHosts>,
+    );
+    writeLastHostChoice("regular");
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ regular: [RECENT_WORKSPACE] }));
+    searchParams = new URLSearchParams("sibling=source");
+    renderLanding({ sibling_sessions: true });
+    await screen.findByRole("heading", { name: "Add nested agent" });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(await screen.findByTestId("new-chat-landing-host-host_1"));
+    expect(readLastHostChoice()).toBe("regular");
+    cleanup();
+    resetLandingDraft();
+    searchParams = new URLSearchParams();
+    renderLanding({ sibling_sessions: true });
+    expect(await submitAndReadBody()).toMatchObject({ host_id: "regular" });
+  });
+
   it("waits for the source, resets on source changes, and refuses an unavailable host", async () => {
     const source = SOURCE_SESSION;
     let resolveSource!: (session: typeof source) => void;
