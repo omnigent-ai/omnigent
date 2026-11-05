@@ -4417,9 +4417,8 @@ describe("buildBubbles — anonymous blocks join the surrounding turn", () => {
         (item): item is Extract<RenderItem, { kind: "text" }> =>
           item.kind === "text" && item.text === "Two names.",
       );
-    expect(answer([user, empty, call, chunk, more])).toMatchObject({
-      streamKey: answer([user, empty, call, chunk])!.streamKey,
-    });
+    expect(answer([user, empty, call, chunk])).toMatchObject({ streamKey: "text#1" });
+    expect(answer([user, empty, call, chunk, more])).toMatchObject({ streamKey: "text#1" });
   });
 });
 

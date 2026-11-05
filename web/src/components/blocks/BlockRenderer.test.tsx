@@ -394,10 +394,27 @@ describe("BlockRenderer dispatch", () => {
     expect(container.querySelector("em")).toBeNull();
   });
 
+  it("keeps a settled streamed reply's markdown as it rendered while streaming", () => {
+    // Streaming mode closes unclosed syntax; a streamed reply keeps that once it settles.
+    const { container } = render(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            { kind: "text", itemId: "t1", text: "*settled", final: true, streamKey: "text#0" },
+          ]}
+          sessionStatus="idle"
+        />
+      </FileViewerContext.Provider>,
+    );
+
+    expect(container.querySelector("em")).toHaveTextContent("settled");
+  });
+
   it.each([
     ["at the top level", "[docs]: https://example.com/docs"],
     ["in a blockquote", "> [docs]: https://example.com/docs"],
     ["in a blockquote inside a list item", "10. q\n\n    > [docs]: https://example.com/docs"],
+    ["after CR line endings", "Notes.\r\r[docs]: https://example.com/docs"],
   ])("resolves a settled streamed reply's reference link defined %s", (_where, definition) => {
     // Streamed text stays in streaming mode, which renders each block alone, so a
     // reply with a link definition in another block settles into static mode.
@@ -433,6 +450,8 @@ describe("BlockRenderer dispatch", () => {
     ["a blockquote in a list item's continuation", "See [x][a].\n\n10. q\n\n    > [a]: /url", true],
     ["a label split across lines", "See [foo bar][].\n\n[foo\nbar]: /url", true],
     ["a label split across blockquote lines", "> [foo\n> bar]: /url", true],
+    ["a split label whose first line ends in a backslash", "[foo\\\nbar]: /url", true],
+    ["CR line endings", "See [docs][].\r\r[docs]: /docs", true],
     // Code isn't parsed: matching there only keeps the static rendering.
     ["a definition-like line in code", "```ini\n[docs]: x\n```", true],
     ["an unescaped bracket in the label", "[foo[bar]: text", false],
@@ -449,6 +468,7 @@ describe("BlockRenderer dispatch", () => {
     expect(mayDefineReferenceLink("[" + "a".repeat(64_000))).toBe(false);
     expect(mayDefineReferenceLink("[a\n".repeat(20_000))).toBe(false);
     expect(mayDefineReferenceLink(" ".repeat(64_000) + "x")).toBe(false);
+    expect(mayDefineReferenceLink("[" + "\\".repeat(64_000) + "]")).toBe(false);
     expect(performance.now() - started).toBeLessThan(250);
   });
 

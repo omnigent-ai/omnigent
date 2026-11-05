@@ -1021,9 +1021,11 @@ function renderItem(
 
 // Any indent: a list item's continuation lines carry its content indent.
 const REFERENCE_DEFINITION = /^\s*\[(?!\^)(?:[^[\]\\]|\\.)+\]:/;
-// A label opened on this line and still open at its end, then the rest of one.
-const LABEL_OPEN = /^\s*\[(?!\^)((?:[^[\]\\]|\\.)*)$/;
-const LABEL_REST = /^((?:[^[\]\\]|\\.)*)(\]:)?/;
+// A label opened on this line and still open at its end (where a backslash may end
+// it), then the rest of one.
+const LABEL_OPEN = /^\s*\[(?!\^)((?:[^[\]\\]|\\.)*\\?)$/;
+const LABEL_REST = /^((?:[^[\]\\]|\\.)*\\?)(\]:)?/;
+const LINE_ENDING = /\r\n?|\n/;
 const MAX_LABEL_LENGTH = 999;
 // Blockquote and list markers at any indent, so nested containers are read too.
 const CONTAINER_PREFIX = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)]))+/;
@@ -1037,7 +1039,7 @@ const CONTAINER_PREFIX = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)]))+/;
 export function mayDefineReferenceLink(text: string): boolean {
   // Length of a label left open by earlier lines, or -1.
   let openLabel = -1;
-  for (const line of text.split("\n")) {
+  for (const line of text.split(LINE_ENDING)) {
     const content = line.replace(CONTAINER_PREFIX, "");
     if (openLabel >= 0) {
       // A label continues over non-blank lines of label characters, up to 999 of them.
