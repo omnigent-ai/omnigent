@@ -2697,7 +2697,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       restoredSendDraftUnchanged(restoredDraft, retryId, text, files, opts?.replyDraft)
         ? retryId
         : null;
-    if (reusableRetryId !== null) resentUnderOwnId.add(reusableRetryId);
     // An untouched retry of a send the server refused goes out under the id of
     // an item the transcript already holds, so that item cannot prove THIS
     // attempt was delivered: the refusal stands until a live acknowledgement.
@@ -2746,6 +2745,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // Callers with their own failure handling take the message back, e.g. the queue.
         opts.onError("This session is still starting. Try again once it has started.");
       } else if (target !== null) {
+        if (reusableRetryId !== null) resentUnderOwnId.add(reusableRetryId);
         // Queue it behind the held message, in the session it was meant for.
         queueSeq += 1;
         const queuedFor = target === get().conversationId ? get() : setterForState(target);
@@ -2772,6 +2772,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       return;
     }
+    if (reusableRetryId !== null) resentUnderOwnId.add(reusableRetryId);
     if (opensSideChat) {
       useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
     }

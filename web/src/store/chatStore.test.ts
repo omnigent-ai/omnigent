@@ -22821,6 +22821,43 @@ describe("a send cut off by a reload", () => {
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
+  it("doesn't hand back a reload's unanswered compact once its rejected resend is cleared", async () => {
+    onTestFinished(clearSessionDrafts);
+    seedSession("conv_reload", []);
+    failManagedLaunch("conv_reload", "/compact");
+    sessionFailedInputs.get("conv_reload")![0]!.item_id = "stable_reload";
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      text: "/compact",
+      authorId: "user_a",
+    });
+    let answer: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      const response = defaultFetchHandler(input, init);
+      if (String(input) === "/v1/sessions/conv_reload/failed-inputs" && answer === undefined)
+        return new Promise<Response>((resolve) => {
+          answer = () => resolve(response);
+        });
+      return response;
+    });
+    await useChatStore.getState().switchTo("conv_reload");
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    expect(takeFailedSendDraft("conv_reload", false, true)?.text).toBe("/compact");
+    setSessionDraft("conv_reload", { text: "/compact", files: [], sentAs: ["stable_reload"] });
+    const { sessionHarness, status } = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native", status: "streaming" });
+    await useChatStore.getState().send("/compact", "agent_xyz");
+    useChatStore.setState({ sessionHarness, status });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/events"))).toBe(false);
+    setSessionDraft("conv_reload", { text: "", files: [] });
+
+    answer!();
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().returnedStartupInputs).toEqual(["pending_first"]),
+    );
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
   it("hands an unanswered send back to the composer on the next load", async () => {
     // The server held the POST for a sandbox wake and the tab reloaded meanwhile.
     seedSession("conv_reload", []);
