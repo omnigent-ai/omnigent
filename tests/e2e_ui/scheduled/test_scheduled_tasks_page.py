@@ -627,6 +627,10 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, automations_v2_se
     expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
 
     page.get_by_test_id("task-timezone-trigger").click()
+    zones = page.get_by_role("listbox")
+    zones.hover()
+    page.mouse.wheel(0, 400)
+    page.wait_for_function("document.querySelector('[cmdk-list]').scrollTop > 0")
     page.get_by_placeholder("Search timezones…").fill("Singapore")
     page.get_by_role("option", name="Asia/Singapore", exact=True).click()
     expect(page.get_by_test_id("task-timezone-trigger")).to_contain_text("Asia/Singapore")
@@ -1083,6 +1087,10 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == name)
     assert created["session_mode"] == "continue", created
+    projects = httpx.get(f"{live_server}/v1/projects", timeout=10).json()["data"]
+    automation_projects = [p for p in projects if p["name"] == "Omnigent Automation"]
+    assert len(automation_projects) == 1
+    assert created["project_id"] == automation_projects[0]["id"]
     assert created["rrule"].startswith(
         "FREQ=MINUTELY;INTERVAL=10" if trigger_ui else "FREQ=HOURLY"
     ), created

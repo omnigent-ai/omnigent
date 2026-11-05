@@ -156,11 +156,11 @@ describe("UserBubble system messages", () => {
         ],
       }),
     );
-    // A real bubble with both screenshots — not the blank pill the stolen
-    // file blocks used to leave behind.
+    // The attachment slots stay in a real bubble while their file URLs load.
     expect(screen.getByTestId("message-bubble")).toBeInTheDocument();
-    expect(screen.getByAltText("shot1.png")).toBeInTheDocument();
-    expect(screen.getByAltText("shot2.png")).toBeInTheDocument();
+    expect(screen.getByTestId("user-image-attachments").children).toHaveLength(2);
+    expect(screen.getByRole("status", { name: "Loading image: shot1.png" })).toHaveClass("size-20");
+    expect(screen.getByRole("status", { name: "Loading image: shot2.png" })).toHaveClass("size-20");
     // Upload markers are stripped from the text, and an empty text renders
     // nothing rather than an empty markdown block.
     expect(screen.queryByText(/\[Attached:/)).toBeNull();
@@ -188,6 +188,60 @@ describe("UserBubble image attachments", () => {
     expect(screen.getByText("look at this")).toBeInTheDocument();
   });
 
+  it("keeps multiple images above the text bubble in one wrapping row", () => {
+    renderBubble(
+      userBubble("compare these", {
+        content: [
+          { type: "input_text", text: "compare these" },
+          ...Array.from({ length: 4 }, (_, index) => ({
+            type: "input_image" as const,
+            image_url: INLINE_PNG,
+            filename: `shot-${index + 1}.png`,
+          })),
+        ],
+      }),
+    );
+
+    const row = screen.getByTestId("user-image-attachments");
+    const content = screen.getByTestId("user-message-content");
+    expect(row).toHaveClass("flex-wrap", "justify-end");
+    expect(row.querySelectorAll("img")).toHaveLength(4);
+    expect(content).toHaveTextContent("compare these");
+    expect(content).not.toContainElement(row);
+    expect(row.parentElement).toBe(content.parentElement);
+  });
+
+  it("shows images without an empty gray bubble when the message has no text", () => {
+    renderBubble(
+      userBubble("", {
+        content: [{ type: "input_image", image_url: INLINE_PNG, filename: "only-shot.png" }],
+      }),
+    );
+
+    expect(screen.getByRole("button", { name: "Zoom image: only-shot.png" })).toBeInTheDocument();
+    expect(screen.getByTestId("user-image-attachments")).toBeInTheDocument();
+    expect(screen.queryByTestId("user-message-content")).toBeNull();
+  });
+
+  it("keeps file chips and text in the bubble below image attachments", () => {
+    renderBubble(
+      userBubble("read these", {
+        content: [
+          { type: "input_image", image_url: INLINE_PNG, filename: "shot.png" },
+          { type: "input_file", file_id: "file_1", filename: "notes.pdf" },
+          { type: "input_text", text: "read these" },
+        ],
+      }),
+    );
+
+    const row = screen.getByTestId("user-image-attachments");
+    const content = screen.getByTestId("user-message-content");
+    expect(row).toContainElement(screen.getByRole("img", { name: "shot.png" }));
+    expect(content).toHaveTextContent("notes.pdf");
+    expect(content).toHaveTextContent("read these");
+    expect(content).not.toContainElement(row);
+  });
+
   it("keeps the rest of the message readable when an image block is malformed", () => {
     // The non-fatal fallback: one unusable attachment costs its own preview,
     // never the surrounding transcript.
@@ -198,10 +252,10 @@ describe("UserBubble image attachments", () => {
     );
 
     expect(screen.getByText("still readable")).toBeInTheDocument();
-    expect(screen.getByText("Unavailable image")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Unavailable image" })).toHaveClass("size-20");
   });
 
-  it("still shows a chip while an upload is in flight", () => {
+  it("reserves a thumbnail slot while an upload is in flight", () => {
     renderBubble(
       userBubble("uploading", {
         content: [
@@ -212,6 +266,9 @@ describe("UserBubble image attachments", () => {
     );
 
     expect(screen.getByText("shot.png")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Uploading image: shot.png" })).toHaveClass(
+      "size-20",
+    );
     expect(screen.queryByAltText("shot.png")).toBeNull();
   });
 });
