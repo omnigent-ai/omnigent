@@ -2902,3 +2902,52 @@ async def test_start_process_guard_deleted_process_cwd_relative_cwd() -> None:
     msg = error_events[0].message
     assert "deleted" in msg, f"expected 'deleted' in: {msg!r}"
     assert "/workspace/project" in msg, f"expected path in: {msg!r}"
+
+
+@pytest.mark.parametrize("fresh_session", [False, True], ids=["warm", "history-replay"])
+@pytest.mark.parametrize(
+    ("tail", "expected_id"),
+    [
+        (
+            {"type": "message", "role": "user", "id": "msg_current", "content": "current"},
+            "msg_current",
+        ),
+        (
+            {"type": "message", "role": "user", "id": "msg_external", "content": "external"},
+            "msg_external",
+        ),
+        ({"type": "message", "role": "user", "content": "Your runner was interrupted"}, None),
+        ({"type": "function_call", "name": "read", "call_id": "call_1", "arguments": "{}"}, None),
+        ({"type": "function_call_output", "call_id": "call_1", "output": "done"}, None),
+    ],
+    ids=["current", "history-resume", "synthetic-recovery", "tool-resume", "tool-result-resume"],
+)
+async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expected_id) -> None:
+    """History filtering and replay must never select an older user's identity."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "assistant", "content": "old reply"},
+            tail,
+        ]
+    )
+    executor = AcpExecutor(AcpAgentConfig(command="unused", omnigent_mcp=False))
+    executor._proc = Mock(returncode=None)
+    executor._initialized = True
+    executor._session_id = "acp-session"
+    executor._system_prompt_sent = not fresh_session
+    prompts = []
+
+    async def send(message):
+        prompts.append(message)
+        executor._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = send
+    events = [event async for event in executor.run_turn(messages, [], "system")]
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert len(prompts) == 1
+    assert prompts[0]["params"]["_meta"] == {"ai.omnigent/inputItemId": expected_id}
+    if fresh_session and tail.get("role") == "user":
+        assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]

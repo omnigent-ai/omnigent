@@ -220,6 +220,7 @@ def build_session_history(
                         "type": "message",
                         "role": item.get("role", "user"),
                         "content": item.get("content", []),
+                        "id": item.get("id"),
                     }
                 )
             elif item_type == "function_call":

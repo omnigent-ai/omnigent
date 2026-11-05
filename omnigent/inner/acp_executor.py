@@ -1833,6 +1833,9 @@ class AcpExecutor(Executor):
         ``session/request_permission`` mid-turn, until the final response
         (``stopReason``) arrives — then yields ``TurnComplete`` with usage.
 
+        Every prompt carries ``_meta["ai.omnigent/inputItemId"]``: the persisted
+        user item delivered by this turn, or null for synthetic/tool recovery.
+
         ``tools`` (Omnigent's builtin tool schemas) are captured for the Omnigent
         MCP relay set up at ``session/new`` — the agent still runs its OWN tools.
         When ``omnigent_mcp`` is ``False`` the relay is disabled, so the schemas
@@ -1886,11 +1889,16 @@ class AcpExecutor(Executor):
         user_text = ""
         image_blocks: list[_AcpJsonObject] = []
         latest_user_idx: int | None = None
+        input_item_id: str | None = None
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
             role = msg.get("role", "") if isinstance(msg, dict) else ""
             if role == "user":
                 latest_user_idx = idx
+                if idx == len(messages) - 1:
+                    candidate_id = msg.get("input_item_id")
+                    if isinstance(candidate_id, str):
+                        input_item_id = candidate_id
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
                 if isinstance(content, str):
                     user_text = content
@@ -1940,7 +1948,11 @@ class AcpExecutor(Executor):
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "method": _AGENT_METHOD_SESSION_PROMPT,
-                "params": {"sessionId": session_id, "prompt": prompt_blocks},
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": prompt_blocks,
+                    "_meta": {"ai.omnigent/inputItemId": input_item_id},
+                },
             }
         )
 

@@ -4864,6 +4864,7 @@ def create_runner_app(
                         "type": "message",
                         "role": next_body.get("role", "user"),
                         "content": next_body.get("content", []),
+                        "id": next_body.get("persisted_item_id"),
                     }
                 )
             else:
@@ -4877,6 +4878,7 @@ def create_runner_app(
                             "type": "message",
                             "role": body.get("role", "user"),
                             "content": body.get("content", []),
+                            "id": body.get("persisted_item_id"),
                         }
                     )
                 next_body = all_bodies[-1]
@@ -7314,6 +7316,7 @@ def create_runner_app(
                     "type": "message",
                     "role": message_body.get("role", "user"),
                     "content": message_body.get("content", []),
+                    "id": message_body.get("persisted_item_id"),
                 }
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
