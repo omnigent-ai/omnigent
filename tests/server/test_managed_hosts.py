@@ -2894,8 +2894,9 @@ async def test_launch_host_start_failure_terminates_and_deletes_host(db_uri: str
     assert host_store.list_hosts(_OWNER) == []
 
 
+@pytest.mark.parametrize("relaunch", [False, True])
 async def test_cancelled_launch_releases_provider_recovery_hint(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, relaunch: bool
 ) -> None:
     from omnigent.server.routes._sessions.helpers import _provision_managed_sandbox
 
@@ -2912,6 +2913,17 @@ async def test_cancelled_launch_releases_provider_recovery_hint(
         fake, "host_online_failure_hint", lambda sandbox_id: f"Inspect logs for {sandbox_id}"
     )
     host_store = HostStore(db_uri)
+    existing = None
+    if relaunch:
+        existing = host_store.register_managed_host(
+            host_id=uuid.uuid4().hex,
+            name="durable-host",
+            user_id=_OWNER,
+            token="old-token",
+            token_expires_at=now_epoch() + 3600,
+            provider=fake.provider,
+            sandbox_id="old-sandbox",
+        )
     launch = asyncio.create_task(
         _provision_managed_sandbox(
             session_id="conv-hint",
@@ -2920,7 +2932,7 @@ async def test_cancelled_launch_releases_provider_recovery_hint(
             repos=(),
             tracker=tracker,
             host_store=host_store,
-            relaunch_host=None,
+            relaunch_host=existing,
         )
     )
     try:
@@ -2935,7 +2947,7 @@ async def test_cancelled_launch_releases_provider_recovery_hint(
     # Cancellation leaves the sandbox for its caller's cleanup.
     [host] = host_store.list_hosts(_OWNER)
     await terminate_managed_host(host, host_store, _injected_config(fake))
-    assert fake.terminated == ["sb-fake-1"]
+    assert fake.terminated == (["old-sandbox"] if relaunch else []) + ["sb-fake-1"]
     assert host_store.list_hosts(_OWNER) == []
 
 

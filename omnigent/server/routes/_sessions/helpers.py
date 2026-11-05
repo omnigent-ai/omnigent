@@ -6832,6 +6832,7 @@ async def _provision_managed_sandbox(
                 agent_name=agent_name,
                 on_stage=_on_stage,
                 slice_key_enabled=relaunch_slice_key_enabled,
+                launch_state=tracker.get(session_id),
             )
         return await launch_managed_host(
             config=sandbox_config,

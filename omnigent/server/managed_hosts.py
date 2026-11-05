@@ -184,7 +184,8 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
@@ -3828,6 +3829,22 @@ async def _select_launch_profile(
         raise HTTPException(status_code=422, detail="Choose a sandbox profile for this provider")
 
 
+@contextmanager
+def _provider_recovery_hint(
+    launch_state: ManagedLaunch | None, launcher: SandboxHostLauncher, sandbox_id: str
+) -> Iterator[None]:
+    """Keep provider guidance available only while its host is registering."""
+    if launch_state is not None:
+        launch_state.host_online_failure_hint = partial(
+            launcher.host_online_failure_hint, sandbox_id
+        )
+    try:
+        yield
+    finally:
+        if launch_state is not None:
+            launch_state.host_online_failure_hint = None
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3911,11 +3928,7 @@ async def launch_managed_host(
             status_code=502,
             detail=f"managed sandbox launch failed: {exc.message}",
         ) from exc
-    if launch_state is not None:
-        launch_state.host_online_failure_hint = partial(
-            launcher.host_online_failure_hint, sandbox_id
-        )
-    try:
+    with _provider_recovery_hint(launch_state, launcher, sandbox_id):
         workspace = await _register_and_start_host(
             launcher=launcher,
             config=entry,
@@ -3930,9 +3943,6 @@ async def launch_managed_host(
             slice_key_enabled=slice_key_enabled,
             owner_credentials=config.owner_credentials,
         )
-    finally:
-        if launch_state is not None:
-            launch_state.host_online_failure_hint = None
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
 
@@ -3945,6 +3955,7 @@ async def relaunch_managed_host(
     agent_name: str | None = None,
     on_stage: SandboxStageObserver | None = None,
     slice_key_enabled: bool = False,
+    launch_state: ManagedLaunch | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a NEW sandbox generation for an existing managed host.
@@ -3979,6 +3990,7 @@ async def relaunch_managed_host(
         ``None`` disables progress reporting.
     :param slice_key_enabled: Whether the host routes by its own id, as at its
         first launch (see :func:`host_slice_key_enabled`).
+    :param launch_state: In-flight state retaining provider guidance during registration.
     :returns: The (unchanged) host id + fresh in-sandbox workspace.
     :raises HTTPException: 400 when the host's recorded provider no
         longer matches the configured launcher; 502 when
@@ -4020,20 +4032,21 @@ async def relaunch_managed_host(
             detail=f"managed sandbox relaunch failed: {exc.message}",
         ) from exc
     try:
-        workspace = await _register_and_start_host(
-            launcher=launcher,
-            config=entry,
-            host_store=host_store,
-            host_id=host.host_id,
-            host_name=host.name,
-            owner=host.user_id,
-            sandbox_id=sandbox_id,
-            repos=repos,
-            agent_name=agent_name,
-            on_stage=on_stage,
-            keep_host_on_failure=True,
-            slice_key_enabled=slice_key_enabled,
-        )
+        with _provider_recovery_hint(launch_state, launcher, sandbox_id):
+            workspace = await _register_and_start_host(
+                launcher=launcher,
+                config=entry,
+                host_store=host_store,
+                host_id=host.host_id,
+                host_name=host.name,
+                owner=host.user_id,
+                sandbox_id=sandbox_id,
+                repos=repos,
+                agent_name=agent_name,
+                on_stage=on_stage,
+                keep_host_on_failure=True,
+                slice_key_enabled=slice_key_enabled,
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=409,
