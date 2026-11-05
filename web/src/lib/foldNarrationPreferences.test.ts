@@ -7,7 +7,7 @@ import {
   writeFoldAssistantNarration,
 } from "./foldNarrationPreferences";
 
-// Fold narration's key and boolean mapping; shared storage behavior is tested with the factory.
+// Covers fold narration's key and boolean mapping; storedChoicePreference.test.ts covers shared storage.
 afterEach(() => {
   localStorage.clear();
 });

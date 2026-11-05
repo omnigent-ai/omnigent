@@ -2725,34 +2725,24 @@ describe("Sidebar project Show more", () => {
     ]);
   });
 
-  it("lists the configured number of sessions per Show more click", () => {
-    projectsMock.push("Customer X");
-    mockConversations(filedSessions(8));
-    renderSidebar();
-    toggleFolder();
-    expect(folderRowIds()).toEqual(filedIds(PROJECT_FOLDER_PAGE_SIZE));
-
-    // A new count applies to the open folder without a reload.
-    act(() => writeProjectFolderPageSize(3));
-    expect(folderRowIds()).toEqual(filedIds(3));
-    fireEvent.click(screen.getByTestId("project-show-more"));
-    expect(folderRowIds()).toEqual(filedIds(6));
-    fireEvent.click(screen.getByTestId("project-show-more"));
-    expect(folderRowIds()).toEqual(filedIds(8));
-    expect(screen.queryByTestId("project-show-more")).toBeNull();
-  });
-
-  it("lists five more sessions per click until none remain", () => {
+  it("lists the configured number of sessions per Show more click until none remain", () => {
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
     renderSidebar();
     toggleFolder();
 
-    expect(folderRowIds()).toEqual(filedIds(5));
+    expect(folderRowIds()).toEqual(filedIds(PROJECT_FOLDER_PAGE_SIZE));
     // The hand cursor, like the session rows' links.
     expect(screen.getByTestId("project-show-more")).toHaveClass("cursor-pointer");
     fireEvent.click(screen.getByTestId("project-show-more"));
     expect(folderRowIds()).toEqual(filedIds(10));
+
+    // A new count applies to the open folder without a reload, starting from one page.
+    act(() => writeProjectFolderPageSize(3));
+    expect(folderRowIds()).toEqual(filedIds(3));
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(filedIds(6));
+    fireEvent.click(screen.getByTestId("project-show-more"));
     fireEvent.click(screen.getByTestId("project-show-more"));
     expect(folderRowIds()).toEqual(filedIds(12));
     expect(screen.queryByTestId("project-show-more")).toBeNull();

@@ -13,7 +13,7 @@ import {
 
 const LEGACY_STORAGE_KEY = "omnigent:project-folder-pagination";
 
-// These keys, the page-size parser and migration; shared storage behavior is tested with the factory.
+// Covers these keys, the page-size parser and migration; storedChoicePreference.test.ts covers shared storage.
 afterEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
