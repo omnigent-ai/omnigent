@@ -129,7 +129,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
   const actionWidthRef = useRef<HTMLDivElement>(null);
   const leadingRef = useRef<HTMLDivElement>(null);
   const trailingRef = useRef<HTMLDivElement>(null);
-  useCollapsedComposerLabels(actionRowRef, actionWidthRef, leadingRef, trailingRef);
+  useCollapsedComposerLabels(actionRowRef, actionWidthRef, leadingRef, trailingRef, isMobile);
   return (
     <div
       ref={ref}
@@ -217,6 +217,7 @@ function useCollapsedComposerLabels(
   widthRef: RefObject<HTMLDivElement | null>,
   leadingRef: RefObject<HTMLDivElement | null>,
   trailingRef: RefObject<HTMLDivElement | null>,
+  isMobile: boolean,
 ) {
   useLayoutEffect(() => {
     const row = rowRef.current;
@@ -248,7 +249,7 @@ function useCollapsedComposerLabels(
       resizeObserver.disconnect();
       mutationObserver.disconnect();
     };
-  }, [rowRef, widthRef, leadingRef, trailingRef]);
+  }, [rowRef, widthRef, leadingRef, trailingRef, isMobile]);
 }
 
 /**

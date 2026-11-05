@@ -1,6 +1,6 @@
 import { createRef, useState, type FormEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ChatComposer,
@@ -557,6 +557,42 @@ describe("ChatComposer label collapse", () => {
     expect(row).toHaveAttribute("data-labels", "collapsed");
     layout.rowWidth = 180 + 150 + COMPOSER_LABELS_MIN_GAP_PX + ROW_PADDING;
     fireResize();
+    expect(row).not.toHaveAttribute("data-labels");
+  });
+
+  it("re-measures after crossing the mobile breakpoint without a row resize", () => {
+    let mobile = false;
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("matchMedia", () => ({
+      matches: mobile,
+      addEventListener: (_event: string, listener: () => void) => listeners.add(listener),
+      removeEventListener: (_event: string, listener: () => void) => listeners.delete(listener),
+    }));
+    const { row, layout } = renderMeasuredComposer({
+      leading: <span>Manual</span>,
+      trailing: <span>Sonnet</span>,
+    });
+    layout.rowWidth = 300;
+    let naturalWidth = 80;
+    for (const id of ["leading", "trailing"]) {
+      Object.defineProperty(screen.getByTestId(id), "scrollWidth", {
+        configurable: true,
+        get: () => naturalWidth,
+      });
+    }
+    fireResize();
+    expect(row).not.toHaveAttribute("data-labels");
+    act(() => {
+      naturalWidth = 200;
+      mobile = true;
+      listeners.forEach((listener) => listener());
+    });
+    expect(row).toHaveAttribute("data-labels", "collapsed");
+    act(() => {
+      naturalWidth = 80;
+      mobile = false;
+      listeners.forEach((listener) => listener());
+    });
     expect(row).not.toHaveAttribute("data-labels");
   });
 

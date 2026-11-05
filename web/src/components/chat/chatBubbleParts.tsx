@@ -895,7 +895,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const ts = formatBubbleTimestamp(bubble.createdAtS);
   const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
   const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
-    useMessageActionVisibility(awaitingAgent && !text, awaitingAgent && !text);
+    useMessageActionVisibility(awaitingAgent, awaitingAgent && !text);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
