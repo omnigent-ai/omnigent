@@ -263,22 +263,15 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 MANAGED_HOST_ONLINE_TIMEOUT_S = 120
 _ONLINE_POLL_INTERVAL_S = 1.0
 
-# Launch-token lifetime for the YAML modal path: Modal's 24h sandbox
-# cap plus an hour of slack, so a live sandbox can always
-# re-authenticate its tunnel across reconnects, while a token leaked
-# from a long-dead sandbox cannot. Scoped to the token, not the host:
-# the host row is durable, and a relaunch mints a fresh token + expiry.
-# Deployments injecting their own launcher choose their own TTL on
-# ManagedSandboxConfig.
+# Provider defaults; sandbox.token_ttl_s can override these windows.
+# Authenticated hosts renew halfway through their TTL.
+# Tokens expire after the last renewal; resume/relaunch rotates the token.
+
+# Modal's 24h sandbox cap plus an hour of slack.
 MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 
-# Launch-token lifetime for the YAML daytona path. Daytona sandboxes
-# have no platform lifetime cap (idle auto-stop is disabled at
-# provision), so the bound is policy, not platform: 7 days keeps a
-# long-lived sandbox re-authenticating across tunnel reconnects while
-# still expiring tokens of sandboxes nobody deleted. A relaunch (or a
-# session past 7 days going through the dead-host relaunch path) mints
-# a fresh token.
+# Daytona has no platform lifetime cap. Seven days bounds disconnected
+# credentials while authenticated heartbeats keep active sandboxes usable.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The blaxel launch-token TTL is NOT a constant: Blaxel reaps a sandbox at its
@@ -363,7 +356,8 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # silently truncated at the 256-char label-value cap, losing repos on relaunch.
 # Per-session state: a fork never inherits them (the store drops the whole
 # ``<base>.`` family, and the fork's own launch re-stamps whatever it resolves),
-# while an in-place agent switch keeps them — the sandbox is unchanged.
+# while an in-place agent switch or a continuation in the same sandbox (claude-sdk
+# ``/clear``) keeps them — the sandbox is unchanged.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 
 # Server-owned routing id from a managed create's or fork's ``host_id``:
@@ -683,10 +677,10 @@ class ManagedSandboxConfig:
         (launchers may cache provider handles internally). May raise
         ``HTTPException`` to report an unusable backend — the YAML
         path uses this for providers without managed support.
-    :param token_ttl_s: Launch-token lifetime in seconds, e.g.
-        ``90000`` (25h) for Modal. Must comfortably exceed the
-        provider's maximum sandbox lifetime so a live sandbox can
-        always re-authenticate its tunnel across reconnects.
+    :param token_ttl_s: Launch-token validity window in seconds, e.g.
+        ``90000`` (25h) for Modal. Authenticated hosts renew halfway through
+        this window, allowing long-lived sandboxes to reconnect after an
+        outage. Tokens expire after the last renewal plus this window.
     :param managed_launch_supported: Whether ``launcher_factory`` can
         actually serve a managed launch. The YAML path sets this from
         :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
@@ -1481,7 +1475,8 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxDeployment | None:
 
     Takes either a scalar ``provider:`` (one provider) or a ``providers:``
     list (several, offered side by side), never both. ``server_url`` /
-    ``host_config`` stay top-level and apply to every entry::
+    ``host_config`` stay top-level and apply to every entry. ``token_ttl_s``
+    overrides provider defaults and can also be set per entry::
 
         sandbox:
           server_url: https://omnigent.example.com
@@ -1960,6 +1955,18 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         # Never consulted (the factory rejects before any token is
         # minted); the conservative modal TTL keeps the field total.
         token_ttl_s = MODAL_MANAGED_TOKEN_TTL_S
+    configured_token_ttl_s = raw.get("token_ttl_s")
+    if configured_token_ttl_s is not None:
+        if (
+            not isinstance(configured_token_ttl_s, int)
+            or isinstance(configured_token_ttl_s, bool)
+            or not 300 <= configured_token_ttl_s <= 365 * 24 * 3600
+        ):
+            raise ValueError(
+                "server config 'sandbox.token_ttl_s' must be an integer from "
+                "300 to 31536000 seconds (5 minutes to 365 days), or null for the provider default"
+            )
+        token_ttl_s = configured_token_ttl_s
     return ManagedSandboxConfig(
         server_url=server_url.strip().rstrip("/"),
         launcher_factory=launcher_factory,
@@ -4640,6 +4647,34 @@ async def terminate_managed_host(
                     tombstone.host_id,
                     sandbox_id=sandbox_id,
                 )
+
+
+async def release_session_managed_host(
+    host_id: str,
+    host_store: HostStore,
+    config: ManagedSandboxDeployment | None,
+    *,
+    capture_logs: bool = False,
+) -> None:
+    """
+    Tear down a gone session's managed sandbox unless another session uses it.
+
+    For a session row that was just deleted: a host with no sandbox provider
+    (e.g. a laptop) is never touched, and a managed host another session is
+    still bound to (e.g. a ``/clear`` continuation) is kept.
+
+    :param host_id: The deleted session's host.
+    :param host_store: Store holding the host row.
+    :param config: The deployment's sandbox config, or ``None`` (the row is
+        still deleted and its token revoked).
+    :param capture_logs: Log the sandbox's log tails before terminating.
+    """
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or host.sandbox_provider is None:
+        return
+    await terminate_managed_host(
+        host, host_store, config, keep_if_bound=True, capture_logs=capture_logs
+    )
 
 
 async def _log_sandbox_logs_best_effort(

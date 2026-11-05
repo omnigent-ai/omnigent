@@ -138,7 +138,7 @@ def test_message_font_size_survives_rotation_and_reload(
             if reload:
                 page.reload()
             assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
-            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 13)
+            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 14)
             message_px = interface_px
             for element in prose:
                 expect(element).to_have_css("font-size", f"{message_px}px")
@@ -178,7 +178,7 @@ def test_large_message_fallback_keeps_message_font_size(
         for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
             fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
             expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
-            expected_px = (15 if width < 768 else 13) if touch else 12
+            expected_px = (15 if width < 768 else 14) if touch else 13
             expect(fallback).to_have_css("font-size", f"{expected_px}px")
 
 
@@ -729,6 +729,68 @@ def test_worked_fold_forms_without_jolting_the_answer(
         f"the answer moved past where it settled ({before:.1f} -> {rest:.1f}): "
         f"{[round(top, 1) for top in tops]}"
     )
+
+
+def test_streamed_reply_stays_mounted_as_its_turn_commits_and_ends(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A streamed reply keeps its elements, and the reader's selection, through its turn.
+
+    The relay commits the tool call that closed the text, then stamps the text's id,
+    and the turn ends and folds its trace. None of these may rebuild the reply's markdown.
+    """
+    chat = chat_session_contract
+    response_id = "mounted-reply"
+    text = "I'll read the file first. The names are stored one per line."
+    user = message_item("mounted-reply-user", "user", "Read the file.", response_id=response_id)
+    first = message_item("mounted-reply-text", "assistant", text, response_id=response_id)
+    call, output = tool_call_items(
+        "call-mounted-reply",
+        "shell",
+        {"command": "cat names.txt"},
+        "ada\n",
+        response_id=response_id,
+    )
+    chat.set_items([user])
+    chat.update_session(status="running")
+    open_live(page, chat)
+    chat.emit_busy(response_id)
+    chat.emit(
+        {
+            "event": "response.created",
+            "data": {"id": response_id, "status": "in_progress", "output": []},
+        }
+    )
+    # The stream holds back a trailing partial word, so match the words already shown.
+    chat.emit({"event": "response.output_text.delta", "data": {"delta": text}})
+    first_paragraph = page.locator('[role="log"] p', has_text="stored one per")
+    expect(first_paragraph).to_be_visible(timeout=10_000)
+    first_paragraph.evaluate("(p) => { window.__first = p; getSelection().selectAllChildren(p); }")
+
+    for item in (call, first, output):
+        chat.emit({"event": "response.output_item.done", "data": {"item": item}})
+    answer = "Done. There are two names in the file."
+    chat.emit({"event": "response.output_text.delta", "data": {"delta": answer}})
+    last_paragraph = page.locator('[role="log"] p', has_text="two names in")
+    expect(last_paragraph).to_be_visible(timeout=10_000)
+    last_paragraph.evaluate("(p) => { window.__last = p; }")
+    chat.emit(
+        {
+            "event": "response.completed",
+            "data": {"id": response_id, "status": "completed", "output": []},
+        }
+    )
+    chat.emit_idle(response_id)
+    expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=10_000)
+    expect(page.get_by_test_id("turn-worked-fold")).to_have_count(1, timeout=15_000)
+    expect(page.locator(".turn-fold-content")).to_be_hidden(timeout=15_000)
+
+    assert first_paragraph.evaluate("(p) => p === window.__first"), "the first message was rebuilt"
+    assert last_paragraph.evaluate("(p) => p === window.__last"), "the answer was rebuilt"
+    assert page.evaluate(
+        "() => !getSelection().isCollapsed && getSelection().containsNode(window.__first, true)"
+    ), "the reader's selection was cleared"
 
 
 _ISSUE_TITLE = "Claude mod replaces tmux paste for native turns"

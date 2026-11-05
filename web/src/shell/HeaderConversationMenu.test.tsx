@@ -489,26 +489,33 @@ describe("HeaderConversationMenu", () => {
     // The mobile chat header shows no title of its own (the native shells hide
     // the breadcrumb), so the menu itself has to name the session.
     mocks.isMobile = true;
-    renderMenu();
+    renderMenu({ workingDirectory: "/Users/ajay/projects/omni" });
     openMenu();
     const label = screen.getByText("Quarterly planning");
     expect(label.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
+    const directory = screen.getByLabelText("Working directory: /Users/ajay/projects/omni");
+    expect(directory).toHaveTextContent("omni");
+    expect(directory.querySelector("svg")).toHaveClass("lucide-folder");
+    expect(directory.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("header-move-to-project"));
     expect(screen.queryByText("Quarterly planning")).toBeNull();
+    expect(screen.queryByText("omni")).toBeNull();
   });
 
   it("omits the title header on desktop, where the breadcrumb already shows it", () => {
-    renderMenu();
+    renderMenu({ workingDirectory: "/Users/ajay/projects/omni" });
     openMenu();
 
     expect(screen.queryByText("Quarterly planning")).toBeNull();
+    expect(screen.queryByText("omni")).toBeNull();
   });
 
   it("sizes the trigger and rows for touch on mobile only", () => {
     const view = renderMenu();
     const desktopTrigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(desktopTrigger.querySelector("svg")).toHaveClass("size-3.5");
+    expect(desktopTrigger.querySelector(".glass-surface")).toBeNull();
     openMenu();
     expect(screen.getByRole("menuitem", { name: "Pin" })).not.toHaveClass("py-2");
 
@@ -519,6 +526,7 @@ describe("HeaderConversationMenu", () => {
     // 44px tap-target floor on phones, matching the sibling header controls.
     expect(mobileTrigger).toHaveClass("max-md:size-11");
     expect(mobileTrigger.querySelector("svg")).toHaveClass("size-5");
+    expect(mobileTrigger.querySelector(".glass-surface")).not.toBeNull();
     openMenu();
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveClass("gap-2.5", "px-2.5", "py-2");
   });
@@ -601,11 +609,11 @@ describe("HeaderConversationMenu", () => {
     expect(document.body.style.pointerEvents).toBe("none");
   });
 
-  it("keeps the trigger flat while retaining a legible mobile menu surface", () => {
+  it("keeps the trigger circular while retaining a legible mobile menu surface", () => {
     mocks.isMobile = true;
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
-    expect(trigger).not.toHaveClass("max-md:rounded-full");
+    expect(trigger).toHaveClass("rounded-full");
 
     openMenu();
     expect(screen.getByRole("menu")).toHaveClass(
