@@ -1254,6 +1254,25 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it("keeps a skill and the draft's startup inputs when the session can't take it yet", () => {
+    onTestFinished(clearSessionDrafts);
+    setSessionDraft("conv_test", {
+      text: "saved on server",
+      files: [],
+      startupInputIds: ["pending_first"],
+    });
+    const onSendSlashCommand = vi.fn(() => false);
+    render(<Composer {...composerProps({ onSend: vi.fn(), onSendSlashCommand })} />);
+    fireEvent.change(textarea(), { target: { value: "/deslop fix the bug" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith("deslop", "fix the bug", [
+      "pending_first",
+    ]);
+    expect(textarea().value).toBe("/deslop fix the bug");
+    expect(getSessionDraft("conv_test")?.startupInputIds).toEqual(["pending_first"]);
+  });
+
   it("keeps a skill in the composer while an offline Arca reconnects, then sends it", () => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();

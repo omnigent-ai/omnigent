@@ -1071,16 +1071,16 @@ export function ChatPage() {
 
   const onSendSlashCommand = useCallback(
     (name: string, args: string, startupInputIds?: string[]) => {
-      if (!agentId) return;
-      // Slash commands aren't replayed (an edge), but still route an unbound
-      // coding clone to the directory picker so it isn't a dead end.
+      if (!agentId) return false;
+      // Slash commands aren't replayed, so the composer keeps one the session can't
+      // take yet; an unbound coding clone still opens the directory picker.
       if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
         setResumeDirDialogOpen(true);
-        return;
+        return false;
       }
       if (urlConvId && isUnreachable) {
         void reconnect();
-        return;
+        return false;
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
         startupInputIds,
@@ -1088,6 +1088,7 @@ export function ChatPage() {
           navigate(`/c/${newId}`, { replace: true });
         },
       });
+      return true;
     },
     [
       agentId,
@@ -1739,7 +1740,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
       onSendSlashCommand && !isNativeWrapper
         ? (name: string, args: string, startupInputIds?: string[]) => {
             setSendScrollNonce((n) => n + 1);
-            onSendSlashCommand(name, args, startupInputIds);
+            return onSendSlashCommand(name, args, startupInputIds);
           }
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
@@ -2020,9 +2021,10 @@ interface ComposerProps {
    * a known session skill, `submit()` routes through this; otherwise the
    * command falls through to `onSend` as plaintext. Undefined for
    * native-terminal sessions, which always send `/skill` as plaintext so
-   * the vendor TUI loads the skill itself.
+   * the vendor TUI loads the skill itself. Returns false when the session
+   * can't take the command yet, and the composer keeps it.
    */
-  onSendSlashCommand?: (name: string, args: string, startupInputIds?: string[]) => void;
+  onSendSlashCommand?: (name: string, args: string, startupInputIds?: string[]) => boolean;
   onStop: () => void;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
@@ -3710,7 +3712,9 @@ function ComposerImpl(
       const arg = parts[1] ?? "";
       const sendSkill = (match: { command: string; args: string }) => {
         appendEntry(trimmed);
-        onSendSlashCommand?.(match.command.slice(1), match.args, ...startupInputsArg);
+        // A command the session can't take yet stays, with the startup inputs its draft holds.
+        if (onSendSlashCommand?.(match.command.slice(1), match.args, ...startupInputsArg) === false)
+          return;
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
