@@ -8,23 +8,11 @@ from __future__ import annotations
 
 import uuid
 
-import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.polling import poll_until
-
-
-def _set_session(base_url: str, session_id: str, **fields: object) -> None:
-    """PATCH session fields such as ``title`` or ``archived``."""
-    response = httpx.patch(f"{base_url}/v1/sessions/{session_id}", json=fields, timeout=10.0)
-    response.raise_for_status()
-
-
-def _archived_on_server(base_url: str, session_id: str) -> bool:
-    response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
-    response.raise_for_status()
-    return bool(response.json()["archived"])
+from tests.e2e_ui.sessions._sidebar_helpers import patch_session, session_archived
 
 
 def _sidebar(page: Page) -> Locator:
@@ -60,8 +48,8 @@ def test_archived_session_opened_from_search_shows_unarchive_in_sidebar(
     """Opening an archived search result reveals its sidebar Unarchive control."""
     base_url, session_id = seeded_session
     title = f"Quarterly report draft {uuid.uuid4().hex[:6]}"
-    _set_session(base_url, session_id, title=title)
-    _set_session(base_url, session_id, archived=True)
+    patch_session(base_url, session_id, title=title)
+    patch_session(base_url, session_id, archived=True)
 
     page: Page = request.getfixturevalue("page")
     page.set_viewport_size({"width": 1280, "height": 800})
@@ -80,7 +68,7 @@ def test_archived_session_opened_from_search_shows_unarchive_in_sidebar(
     unarchive.click()
 
     # The row's Unarchive PATCH has committed.
-    poll_until(lambda: not _archived_on_server(base_url, session_id), timeout_s=15.0)
+    poll_until(lambda: not session_archived(base_url, session_id), timeout_s=15.0)
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
     row.hover()
     expect(row.get_by_role("button", name="Archive conversation")).to_be_visible()

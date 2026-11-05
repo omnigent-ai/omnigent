@@ -2668,22 +2668,22 @@ function ConversationList({
   // selection (or its project) changes — not on every background list refetch,
   // which would re-open a folder the user just collapsed.
   const activeProjectName = useMemo(() => {
-    if (!activeId) return null;
-    const active = allConversations.find((c) => c.id === activeId);
+    if (!resolvedActiveId) return null;
+    const active = allConversations.find((c) => c.id === resolvedActiveId);
     // Live views list an archived session outside its folder.
     if (!active || (active.archived === true && activeTab !== "archived")) return null;
     return projects.find((p) => sessionBelongsToProject(active, p, viewerId))?.name ?? null;
-  }, [activeId, allConversations, activeTab, projects, viewerId]);
+  }, [resolvedActiveId, allConversations, activeTab, projects, viewerId]);
   // Auto-expand the project folder holding the selected session, so navigating
   // to a filed session reveals it instead of leaving it hidden in a collapsed
   // folder. Skipped for pinned sessions: they're already reachable from the
   // Pinned section, so forcing their project open would undo a manual collapse
   // every time the user clicks the pinned row.
   useEffect(() => {
-    if (!activeId || !activeProjectName) return;
-    if (pinnedSet.has(activeId)) return;
+    if (!resolvedActiveId || !activeProjectName) return;
+    if (pinnedSet.has(resolvedActiveId)) return;
     expandProject(activeProjectName);
-  }, [activeId, activeProjectName, pinnedSet, expandProject]);
+  }, [resolvedActiveId, activeProjectName, pinnedSet, expandProject]);
 
   // Visible rows in render order (collapsed sections excluded) for the ⌘[ / ⌘]
   // session hotkey. Titles must match the <ConversationSection> props below.

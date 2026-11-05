@@ -975,8 +975,8 @@ function restoreArchiveLists(queryClient: QueryClient, snapshot: ArchiveListsSna
 }
 
 /**
- * Record a committed archive flip on fetched open-session rows. A first fetch
- * still in flight may have been served before the write, so refetch once it lands.
+ * Record a committed archive flip on fetched open-session rows. A fetch still in
+ * flight may have been served before the write, so replace it with a fresh one.
  *
  * @param queryClient - The app QueryClient.
  * @param ids - Sessions whose archive flag the server confirmed.
@@ -994,7 +994,11 @@ function settleOpenSessionRowsArchived(
       const settledRow: Conversation = { ...row, archived };
       queryClient.setQueryData<Conversation | null>(key, settledRow);
     }
-    if (queryClient.isFetching({ queryKey: key }) > 0) {
+    if (queryClient.isFetching({ queryKey: key }) === 0) continue;
+    if (row !== undefined) {
+      void queryClient.invalidateQueries({ queryKey: key });
+    } else {
+      // A first fetch can't be cancelled and a refetch would only join it.
       void queryClient
         .refetchQueries({ queryKey: key })
         .then(() => queryClient.invalidateQueries({ queryKey: key }));

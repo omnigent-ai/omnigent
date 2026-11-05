@@ -1,7 +1,7 @@
 // The open session's sidebar row, for when no loaded list page holds it.
 
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import { authenticatedFetch } from "@/lib/identity";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -41,7 +41,10 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     agent_id: wire.agent_id,
     agent_name: wire.agent_name ?? null,
     harness: wire.harness ?? null,
-    pending_elicitations_count: wire.pending_elicitations_count ?? 0,
+    // The detail response lists the outstanding prompts instead of counting them.
+    pending_elicitations_count: Array.isArray(wire.pending_elicitations)
+      ? wire.pending_elicitations.length
+      : 0,
     status: wire.status ?? "idle",
     runner_online: wire.runner_online ?? undefined,
     host_online: wire.host_online ?? undefined,
@@ -66,8 +69,9 @@ export function rememberOpenSessionRow(queryClient: QueryClient, row: Conversati
 /**
  * The open session's row, read live from a sidebar list cache (another scope,
  * the Archived view, a project folder), else the row ``rememberOpenSessionRow``
- * kept from palette search results, else fetched. Rename, pin, move, archive and status changes patch that
- * ``["conversation-backfill", id]`` copy.
+ * kept from palette search results, else fetched. A list row found here is also
+ * copied to ``["conversation-backfill", id]`` so a later fetch keeps its owner;
+ * rename, pin, move, archive and status changes patch that copy.
  *
  * @param id - Top-level session to reveal, or ``null`` to disable.
  * @returns The row, or ``null`` while loading, when the session is gone, or
@@ -89,6 +93,13 @@ export function useOpenSessionRow(id: string | null): Conversation | null {
   const listRow = useSyncExternalStore(subscribe, () =>
     id === null ? undefined : findCachedListRow(queryClient, id),
   );
+  // Keep the list row, marked stale, so a fetch after that list drops it still knows the owner.
+  useEffect(() => {
+    if (!listRow) return;
+    const key = ["conversation-backfill", listRow.id];
+    if (queryClient.getQueryData(key) === listRow) return;
+    queryClient.setQueryData<Conversation | null>(key, listRow, { updatedAt: 0 });
+  }, [queryClient, listRow]);
   const { data } = useQuery({
     queryKey: ["conversation-backfill", id],
     enabled: id !== null && listRow === undefined,
@@ -97,7 +108,7 @@ export function useOpenSessionRow(id: string | null): Conversation | null {
     retry: 2,
     queryFn: async () => {
       const fetched = await fetchConversationById(id as string);
-      // The detail response has no owner, so keep the one a remembered list row gave.
+      // The detail response has no owner, so keep the one a list row gave.
       const knownOwner = queryClient.getQueryData<Conversation | null>([
         "conversation-backfill",
         id,

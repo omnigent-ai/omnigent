@@ -84,6 +84,7 @@ describe("fetchConversationById", () => {
         parent_session_id: "conv_parent",
         host_id: "host_1",
         status: "idle",
+        pending_elicitations: [{ type: "elicitation" }, { type: "elicitation" }],
       }),
     );
 
@@ -102,6 +103,7 @@ describe("fetchConversationById", () => {
       host_id: "host_1",
       owner: null,
       permission_level: null,
+      pending_elicitations_count: 2,
     });
     // Session-scoped requests route through these maps before any list row loads.
     expect(getSessionParent("conv_old")).toBe("conv_parent");
@@ -196,6 +198,27 @@ describe("useOpenSessionRow", () => {
     await act(() => queryClient.invalidateQueries({ queryKey: ["conversation-backfill"] }));
 
     await waitFor(() => expect(result.current?.archived).toBe(false));
+    expect(result.current?.owner).toBe("teammate");
+  });
+
+  it("keeps a shared row's owner when its list drops the row and it is fetched", async () => {
+    const queryClient = newQueryClient();
+    const sharedRow = conversation("conv_shared", {
+      owner: "teammate",
+      permission_level: 1,
+      archived: true,
+    });
+    queryClient.setQueryData(SHARED_LIST_KEY, listPages([sharedRow]));
+    const { result } = renderOpenSessionRow(queryClient, "conv_shared");
+    await waitFor(() => expect(result.current).toEqual(sharedRow));
+
+    fetchMock.mockResolvedValue(
+      mockResponse({ id: "conv_shared", created_at: 1, permission_level: 1, archived: false }),
+    );
+    act(() => queryClient.setQueryData(SHARED_LIST_KEY, listPages([])));
+
+    await waitFor(() => expect(result.current?.archived).toBe(false));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(result.current?.owner).toBe("teammate");
   });
 

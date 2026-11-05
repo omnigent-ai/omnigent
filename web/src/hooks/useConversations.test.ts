@@ -3695,25 +3695,29 @@ describe("useArchiveConversation", () => {
     expect(queryClient.getQueryState(openRowKey)).toBeUndefined();
   });
 
-  it.each([
-    {
-      hook: "useArchiveConversation",
-      useArchive: () => {
-        const archive = useArchiveConversation();
-        return { archiveA: () => archive.mutate({ id: "conv_a", archived: true }), archive };
+  it.each(
+    [true, false].flatMap((archived) => [
+      {
+        hook: "useArchiveConversation",
+        archived,
+        useArchive: () => {
+          const archive = useArchiveConversation();
+          return { archiveA: () => archive.mutate({ id: "conv_a", archived }), archive };
+        },
       },
-    },
-    {
-      hook: "useBulkArchiveConversations",
-      useArchive: () => {
-        const archive = useBulkArchiveConversations();
-        return { archiveA: () => archive.mutate({ ids: ["conv_a"], archived: true }), archive };
+      {
+        hook: "useBulkArchiveConversations",
+        archived,
+        useArchive: () => {
+          const archive = useBulkArchiveConversations();
+          return { archiveA: () => archive.mutate({ ids: ["conv_a"], archived }), archive };
+        },
       },
-    },
-  ])(
-    "$hook refetches an open-session row whose first fetch predates the archive",
-    async ({ useArchive }) => {
-      fetchMock.mockResolvedValue(mockResponse({ id: "conv_a", archived: true }));
+    ]),
+  )(
+    "$hook (archived: $archived) refetches an open-session row whose first fetch predates it",
+    async ({ archived, useArchive }) => {
+      fetchMock.mockResolvedValue(mockResponse({ id: "conv_a", archived }));
       const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
       let settleFirstFetch = (_row: Conversation) => {};
       const fetchRow = vi
@@ -3724,7 +3728,7 @@ describe("useArchiveConversation", () => {
               settleFirstFetch = resolve;
             }),
         )
-        .mockResolvedValueOnce(conversation({ id: "conv_a", archived: true }));
+        .mockResolvedValueOnce(conversation({ id: "conv_a", archived }));
       const wrapper = ({ children }: { children: ReactNode }) =>
         createElement(QueryClientProvider, { client: queryClient }, children);
       const { result } = renderHook(
@@ -3738,9 +3742,9 @@ describe("useArchiveConversation", () => {
 
       result.current.archiveA();
       await waitFor(() => expect(result.current.archive.isSuccess).toBe(true));
-      settleFirstFetch(conversation({ id: "conv_a", archived: false }));
+      settleFirstFetch(conversation({ id: "conv_a", archived: !archived }));
 
-      await waitFor(() => expect(result.current.openRow.data?.archived).toBe(true));
+      await waitFor(() => expect(result.current.openRow.data?.archived).toBe(archived));
       expect(fetchRow).toHaveBeenCalledTimes(2);
     },
   );

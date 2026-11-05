@@ -52,7 +52,8 @@ function renderOpenSession(
   {
     config = sidebarConfig,
     sharedWithMore,
-  }: { config?: SidebarConfig; sharedWithMore?: Conversation[] } = {},
+    childId,
+  }: { config?: SidebarConfig; sharedWithMore?: Conversation[]; childId?: string } = {},
 ) {
   vi.mocked(useConversations).mockImplementation((...args) =>
     sharedWithMore && args[4] === "shared"
@@ -64,12 +65,15 @@ function renderOpenSession(
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   // A top-level session: the root walk resolves to the open session itself.
   queryClient.setQueryData(["session", openId], { id: openId, parentSessionId: null });
+  // A child route resolves to the open session as its root.
+  if (childId)
+    queryClient.setQueryData(["session", childId], { id: childId, parentSessionId: openId });
   if (pickedRow) rememberOpenSessionRow(queryClient, pickedRow);
   return render(
     <QueryClientProvider client={queryClient}>
       <SidebarDataProvider config={config}>
         <TooltipProvider>
-          <MemoryRouter initialEntries={[`/c/${openId}`]}>
+          <MemoryRouter initialEntries={[`/c/${childId ?? openId}`]}>
             <Routes>
               <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
             </Routes>
@@ -172,22 +176,28 @@ describe("Sidebar open session reveal", () => {
     expect(screen.queryByRole("button", { name: "Unarchive conversation" })).toBeNull();
   });
 
-  it("opens the folder of an older session filed only by project id", async () => {
-    mocks.projects = [{ id: "proj_1", name: "Customer X" }];
-    const older = conversation("conv_older", {
-      title: "Older filed work",
-      owner: "me",
-      project_id: "proj_1",
-    });
-    renderOpenSession("conv_older", LOADED, older);
+  it.each([
+    { route: "its own route", childId: undefined },
+    { route: "a child route", childId: "conv_child" },
+  ])(
+    "opens the folder of an older session filed only by project id, on $route",
+    async ({ childId }) => {
+      mocks.projects = [{ id: "proj_1", name: "Customer X" }];
+      const older = conversation("conv_older", {
+        title: "Older filed work",
+        owner: "me",
+        project_id: "proj_1",
+      });
+      renderOpenSession("conv_older", LOADED, older, { childId });
 
-    const row = await findOpenRow(/Older filed work/);
-    expect(screen.getByRole("button", { name: /^Customer X/ })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
-    expect(screen.getByText("Customer X").closest("section")).toContainElement(row);
-  });
+      const row = await findOpenRow(/Older filed work/);
+      expect(screen.getByRole("button", { name: /^Customer X/ })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      expect(screen.getByText("Customer X").closest("section")).toContainElement(row);
+    },
+  );
 
   it("lists an archived open session that a loaded page already carries", async () => {
     const archived = conversation("conv_archived", {

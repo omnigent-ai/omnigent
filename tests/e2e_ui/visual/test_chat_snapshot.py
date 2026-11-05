@@ -21,15 +21,16 @@ items page; see ``web/src/store/chatStore.ts``):
   online, so neither the "Working…" shimmer nor an offline/connecting indicator
   appears.
 * the session *list* is stubbed empty (exactly like the landing), so the sidebar
-  lists only the open session, from its detail stub. The
-  ``/v1/sessions/updates`` watch-set stays empty, so the real (empty) updates
-  socket pushes nothing and no relative "x min ago" row timestamp can drift the
-  capture. The captured value is the conversation surface, not the sidebar list.
+  lists only the open session, from its detail stub. The clock is pinned to a
+  fixed "now" two hours past that session's ``updated_at``, so its relative
+  time pill always reads "2h". The captured value is the conversation surface,
+  not the sidebar list.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -131,13 +132,16 @@ _MODEL_OPTIONS = [
     },
     {"id": "haiku", "model": "system.ai.claude-haiku-4-5", "displayName": "Haiku 4.5"},
 ]
+# The session's timestamps, and a fixed "now" two hours later for its sidebar row.
+_UPDATED_AT_S = 1704067200
+_NOW = datetime.fromtimestamp(_UPDATED_AT_S + 2 * 3600, tz=UTC)
 _SESSION_BODY = {
     "id": _SESSION_ID,
     "agent_id": _AGENT_ID,
     "agent_name": _AGENT_NAME,
     "status": "idle",
-    "created_at": 1704067200,
-    "updated_at": 1704067200,
+    "created_at": _UPDATED_AT_S,
+    "updated_at": _UPDATED_AT_S,
     # claude-native wrapper: drives the composer gear + model/effort label.
     "labels": {"omnigent.wrapper": "claude-code-native-ui"},
     "harness": "claude",
@@ -206,6 +210,7 @@ def test_chat_conversation_matches_baseline(
         lambda r: r.fulfill(status=200, content_type="text/event-stream", body=_DONE_SSE),
     )
 
+    page.clock.set_fixed_time(_NOW)
     page.goto(f"{live_server}/c/{_SESSION_ID}")
 
     # Bubbles paint only after the bind hydrates (the "Loading conversation…"
