@@ -103,11 +103,7 @@ def test_fork_drops_sandbox_repo_label(
     sandbox would get the source's repo re-cloned into it on the first
     relaunch; the host id routes requests to the source's host, while the fork
     launches its own. The fork's own launch re-stamps whatever it resolves."""
-    from omnigent.server.managed_hosts import (
-        MANAGED_PROVIDER_LABEL_KEY,
-        MANAGED_REPO_LABEL_KEY,
-        REQUESTED_HOST_ID_LABEL_KEY,
-    )
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY
 
     source = conversation_store.create_conversation()
     conversation_store.set_labels(
@@ -115,7 +111,6 @@ def test_fork_drops_sandbox_repo_label(
         {
             MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main",
             REQUESTED_HOST_ID_LABEL_KEY: "0123456789abcdef0123456789abcdef",
-            MANAGED_PROVIDER_LABEL_KEY: "modal",
             "kept": "yes",
         },
     )
@@ -125,7 +120,6 @@ def test_fork_drops_sandbox_repo_label(
     assert fork.labels["kept"] == "yes"
     assert MANAGED_REPO_LABEL_KEY not in fork.labels
     assert REQUESTED_HOST_ID_LABEL_KEY not in fork.labels
-    assert MANAGED_PROVIDER_LABEL_KEY not in fork.labels
 
 
 def test_fork_drops_per_repo_sandbox_labels(
@@ -6524,16 +6518,11 @@ def test_fork_only_dropped_label_keys_match_sandbox_repo_constant() -> None:
     the first relaunch. Importing the real constant here makes that rename
     fail loudly at test time.
     """
-    from omnigent.server.managed_hosts import (
-        MANAGED_PROVIDER_LABEL_KEY,
-        MANAGED_REPO_LABEL_KEY,
-        REQUESTED_HOST_ID_LABEL_KEY,
-    )
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY
     from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
 
     assert MANAGED_REPO_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
     assert REQUESTED_HOST_ID_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
-    assert MANAGED_PROVIDER_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
 
 
 def test_fork_conversation_copies_reasoning_effort(

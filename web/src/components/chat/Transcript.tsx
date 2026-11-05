@@ -22,7 +22,7 @@ import {
   createBubbleCache,
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
-import { sendableQueuedHead, useChatStore, withoutFailedInputs } from "@/store/chatStore";
+import { sendableQueuedHead, useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
@@ -53,18 +53,15 @@ import {
   ScrollToBottomOnSend,
   WorkingIndicator,
   bubbleKey,
-  buildPendingBubbles,
-  buildUndeliveredBubbles,
   collectPendingElicitations,
   computeIsWorking,
   extractUserText,
   isSystemBubble,
-  mergePendingBubbles,
-  placeUndeliveredBubbles,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
+  withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
@@ -161,14 +158,12 @@ function TranscriptImpl({
       ),
       subagentRoutingOverride,
     );
-    const self = getCurrentAuthorId();
-    const withUndelivered = placeUndeliveredBubbles(
+    return withUncommittedUserBubbles(
       committed,
-      buildUndeliveredBubbles(failedInputs, self),
+      pendingUserMessages,
+      failedInputs,
+      getCurrentAuthorId(),
     );
-    const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
-    if (pending.length === 0) return withUndelivered;
-    return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, self));
   }, [
     blocks,
     activeResponse,

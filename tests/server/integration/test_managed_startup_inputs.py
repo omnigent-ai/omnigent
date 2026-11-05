@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 import logging
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -18,23 +18,16 @@ import pytest_asyncio
 from fastapi import FastAPI
 from starlette.datastructures import Headers
 
-from omnigent.db.db_models import current_workspace_id
-from omnigent.entities.conversation import Conversation, ErrorData
+from omnigent.entities.conversation import ErrorData
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
-from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.managed_hosts import (
-    MANAGED_PROVIDER_LABEL_KEY,
-    REQUESTED_HOST_ID_LABEL_KEY,
-    parse_sandbox_config,
-)
+from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.scheduled.telemetry import scheduled_run_scope
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.startup_inputs import (
@@ -45,7 +38,6 @@ from omnigent.server.startup_inputs import (
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
@@ -980,162 +972,6 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     assert (
         await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
     )
-
-
-@pytest.mark.parametrize("scheduled", [False, True], ids=["interactive", "continue-automation"])
-async def test_retry_after_unbound_launch_failure_provisions_again(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, scheduled: bool
-) -> None:
-    env = startup_env
-    launches: list[dict[str, Any]] = []
-    tasks: list[asyncio.Task[Any]] = []
-
-    async def record_launch(**options: Any) -> None:
-        launches.append(options)
-        task = asyncio.current_task()
-        assert task is not None
-        tasks.append(task)
-        await asyncio.Future()
-
-    monkeypatch.setattr(routes_core, "_run_managed_launch", record_launch)
-    startup = env.app.state.startup_inputs
-    events = f"/v1/sessions/{(session_id := await _create(env, sandbox_provider='modal'))}/events"
-    try:
-        # The host never came online, so the launch failed before binding one. A
-        # continue automation's session asked for its task's host id.
-        task_id = str(uuid4())
-        failed_host_id = (
-            continued_sandbox_host_id(task_id, current_workspace_id())
-            if scheduled
-            else uuid4().hex
-        )
-        env.conv_store.set_labels(
-            session_id,
-            {
-                REQUESTED_HOST_ID_LABEL_KEY: failed_host_id,
-                **({SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id} if scheduled else {}),
-            },
-        )
-        env.app.state.managed_launches.fail(session_id, "managed host did not come online")
-        await startup.record_launch_failure(session_id, "managed host did not come online")
-        retried = await env.client.post(events, json={"type": "retry_session"})
-        assert retried.status_code == 202, retried.text
-        assert retried.json() == {"queued": True, "recovery": "sandbox_relaunched"}
-        # A second click while that launch runs doesn't start another one.
-        assert (await env.client.post(events, json={"type": "retry_session"})).status_code == 202
-        [first, second] = launches
-        assert (second["provider"], second["agent_id"]) == ("modal", first["agent_id"])
-        assert second["owner"] == first["owner"]
-        conv = env.conv_store.get_conversation(session_id)
-        assert conv is not None and conv.labels[STARTUP_LABEL] == "pending"
-        assert conv.labels[MANAGED_PROVIDER_LABEL_KEY] == "modal"
-        assert second["host_id"] == conv.labels[REQUESTED_HOST_ID_LABEL_KEY]
-        # The automation's later runs check its task's host id; any other new host
-        # gets its own id to route by, while the failed one stays reserved.
-        assert (second["host_id"] == failed_host_id) is scheduled
-        snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
-        assert snapshot["failed_inputs"] == []
-        assert [entry["content"] for entry in snapshot["pending_inputs"]] == [
-            _INPUT["data"]["content"]
-        ]
-        # If the new launch fails too, the message is undelivered again.
-        env.app.state.managed_launches.fail(session_id, "still offline")
-        await startup.record_launch_failure(session_id, "still offline")
-        snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
-        assert [entry["content"] for entry in snapshot["failed_inputs"]] == [
-            _INPUT["data"]["content"]
-        ]
-    finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def _failed_launch_with_followup(env: _Env) -> Conversation:
-    """A session whose launch failed with its first input and a follow-up saved."""
-    session_id = await _create(env, sandbox_provider="modal")
-    followup = {
-        "type": "message",
-        "data": {"role": "user", "content": [{"type": "input_text", "text": "and then"}]},
-    }
-    saved = await env.client.post(f"/v1/sessions/{session_id}/events", json=followup)
-    assert saved.status_code == 202, saved.text
-    env.app.state.managed_launches.fail(session_id, "managed host did not come online")
-    await env.app.state.startup_inputs.record_launch_failure(session_id, "host offline")
-    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == [
-        "failed",
-        "failed",
-    ]
-    conv = env.conv_store.get_conversation(session_id)
-    assert conv is not None
-    return conv
-
-
-def _replica(
-    env: _Env, schedule_launch: Callable[..., Coroutine[Any, Any, None]]
-) -> tuple[ManagedStartupInputs, Any]:
-    """Its own service and launch tracker over the shared store, as on another replica."""
-    service = ManagedStartupInputs(env.conv_store, env.app.state.host_registry)
-    service.schedule_launch = schedule_launch
-    state = Mock(managed_launches=type(env.app.state.managed_launches)())
-    return service, Mock(app=Mock(state=state))
-
-
-async def test_concurrent_retries_on_two_replicas_provision_once(startup_env: _Env) -> None:
-    env = startup_env
-    conv = await _failed_launch_with_followup(env)
-    launched: list[str] = []
-
-    async def schedule_launch(_request: Any, *, session_id: str, **_: Any) -> None:
-        launched.append(session_id)
-
-    (first, first_request), (second, second_request) = (
-        _replica(env, schedule_launch),
-        _replica(env, schedule_launch),
-    )
-    # The first retry pauses once it has requeued one input, so the second reads
-    # the session halfway through.
-    paused, resume = asyncio.Event(), asyncio.Event()
-    requeue = first._requeue
-
-    async def requeue_then_pause(session_id: str, item_id: str) -> bool:
-        moved = await requeue(session_id, item_id)
-        if not paused.is_set():
-            paused.set()
-            await resume.wait()
-        return moved
-
-    first._requeue = requeue_then_pause  # type: ignore[method-assign]
-    first_retry = asyncio.create_task(first.relaunch_failed_start(first_request, conv, None))
-    await paused.wait()
-    second_claim = await second.relaunch_failed_start(second_request, conv, None)
-    resume.set()
-
-    assert [await first_retry, second_claim] == [True, True], "both requests answer queued"
-    assert launched == [conv.id], "only the request that requeued the first input provisions"
-    assert [item.status for item in env.conv_store.list_pending_inputs(conv.id)] == [
-        "in_progress",
-        "in_progress",
-    ]
-
-
-async def test_relaunch_that_cannot_be_scheduled_fails_its_inputs_again(
-    startup_env: _Env,
-) -> None:
-    env = startup_env
-    conv = await _failed_launch_with_followup(env)
-
-    async def provider_gone(_request: Any, **_: Any) -> None:
-        raise OmnigentError(
-            "sandbox provider 'modal' is not configured", code=ErrorCode.INVALID_INPUT
-        )
-
-    service, request = _replica(env, provider_gone)
-    with pytest.raises(OmnigentError, match="not configured"):
-        await service.relaunch_failed_start(request, conv, None)
-
-    snapshot = (await env.client.get(f"/v1/sessions/{conv.id}")).json()
-    assert len(snapshot["failed_inputs"]) == 2 and snapshot["pending_inputs"] == []
 
 
 async def _session_count(env: _Env) -> int:

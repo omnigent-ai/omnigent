@@ -1450,9 +1450,6 @@ def register_events_routes(
             )
         if body.type == _RETRY_SESSION_TYPE:
             startup = getattr(request.app.state, "startup_inputs", None)
-            # A first launch that failed before binding a host has no runner to recover.
-            if startup is not None and await startup.relaunch_failed_start(request, conv, user_id):
-                return {"queued": True, "recovery": "sandbox_relaunched"}
             result = await _retry_session_single_flight(
                 request=cast("Request", request),
                 session_id=session_id,

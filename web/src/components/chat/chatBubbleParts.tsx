@@ -70,7 +70,7 @@ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
-import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
@@ -277,6 +277,30 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
   const notice = committed.findIndex(isStartupFailureBubble);
   if (notice === -1) return [...committed, ...undelivered];
   return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
+}
+
+/**
+ * Add a conversation's uncommitted user messages to its committed bubbles: the
+ * undelivered startup messages, and the optimistic sends they don't replace.
+ *
+ * @param committed - Bubbles built from the transcript.
+ * @param pendingUserMessages - The conversation's optimistic sends.
+ * @param failedInputs - The snapshot's undelivered startup messages.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function withUncommittedUserBubbles(
+  committed: Bubble[],
+  pendingUserMessages: PendingUserMessage[],
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  const withUndelivered = placeUndeliveredBubbles(
+    committed,
+    buildUndeliveredBubbles(failedInputs, selfAuthor),
+  );
+  const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
+  if (pending.length === 0) return withUndelivered;
+  return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, selfAuthor));
 }
 
 // A committed bubble that exists ONLY to render one or more

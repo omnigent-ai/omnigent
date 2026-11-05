@@ -81,7 +81,6 @@ import {
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
-  retrySession,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -1987,7 +1986,6 @@ export function initChatStore(client: QueryClient): void {
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
   startupReads.clear();
-  deliveredStartupInputs.clear();
   queryClient = client;
   unsubscribeSettingsMutations = client.getMutationCache().subscribe((event) => {
     if (event.type !== "updated" || !["success", "error"].includes(event.action.type)) return;
@@ -4839,25 +4837,8 @@ function startupInputsPatch(
       session.labels?.["omnigent.startup"] === "pending" ||
       (session.labels?.["omnigent.startup"] === "ready" &&
         (session.pendingInputs ?? []).length > 0),
-    failedInputs: withoutDeliveredInputs(session.id, session.failedInputs),
+    failedInputs: session.failedInputs ?? [],
   };
-}
-
-// Startup inputs this page saw delivered, per conversation. A delivered input never
-// becomes undelivered again, so a snapshot read before its receipt can't restore it.
-const deliveredStartupInputs = new Map<string, Set<string>>();
-
-/** Note a delivered startup input, e.g. from its `session_input_consumed` receipt. */
-function noteStartupInputDelivered(id: string, pendingId: string): void {
-  const delivered = deliveredStartupInputs.get(id) ?? new Set<string>();
-  delivered.add(pendingId);
-  deliveredStartupInputs.set(id, delivered);
-}
-
-/** A snapshot's startup inputs, less those this page saw delivered. */
-function withoutDeliveredInputs(id: string, inputs: PendingInput[] | undefined): PendingInput[] {
-  const delivered = deliveredStartupInputs.get(id);
-  return (inputs ?? []).filter((input) => !delivered?.has(input.pendingId));
 }
 
 /**
@@ -4929,32 +4910,23 @@ async function refreshSessionBinding(id: string): Promise<void> {
   setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch));
 }
 
-/** A pending bubble for a message the snapshot says the server holds. */
-function pendingBubbleFromSnapshot(input: PendingInput): PendingUserMessage {
-  return {
-    tempId: input.pendingId,
-    content: input.content,
-    ...(input.createdBy !== undefined ? { author: input.createdBy } : {}),
-  };
-}
-
 // The newest startup re-read per conversation. Read numbers are never reused, so
 // an older read that lands later can't pass for the newest.
 let startupReadCount = 0;
 const startupReads = new Map<string, number>();
 
 /**
- * Re-read a session's saved startup messages after its launch failed or was retried.
+ * Re-read a session after its sandbox launch failed, so the messages it never
+ * delivered show as undelivered instead of vanishing with their bubbles.
  *
  * A launch can report "failed" before the server has marked its saved inputs
  * failed, then again once it has; each report starts a fresh read rather than
  * joining one in flight, and only the newest applies. The snapshot also ends
  * the startup state a failed launch leaves behind.
  *
- * @param id - Conversation/session id to re-read.
- * @param showQueued - Also show the messages the server queued again as sending.
+ * @param id - Conversation/session id whose launch failed.
  */
-async function refreshStartupInputs(id: string, showQueued = false): Promise<void> {
+async function refreshAfterFailedLaunch(id: string): Promise<void> {
   startupReadCount += 1;
   const read = startupReadCount;
   startupReads.set(id, read);
@@ -4969,41 +4941,15 @@ async function refreshStartupInputs(id: string, showQueued = false): Promise<voi
   if (session === null) return;
   const fresh = session;
   queryClient?.setQueryData(["session", id], fresh);
-  // A snapshot listing an input already delivered predates that receipt.
-  const listed = [...(fresh.pendingInputs ?? []), ...(fresh.failedInputs ?? [])];
-  const predatesDelivery = withoutDeliveredInputs(id, listed).length < listed.length;
   setterFor(id)((s) => {
-    const { startupPending, failedInputs } = startupInputsPatch(fresh);
-    const pending = withoutFailedInputs(s.pendingUserMessages, failedInputs);
-    const shown = new Set(pending.flatMap((message) => [message.tempId, message.pendingId]));
-    const queued = showQueued
-      ? withoutDeliveredInputs(id, fresh.pendingInputs).filter(
-          (input) => !shown.has(input.pendingId),
-        )
-      : [];
+    const startup = startupInputsPatch(fresh);
     // Only the startup fields: live events stay newer than this read for the
-    // rest, e.g. a "failed" launch stage a replica without the launch doesn't know,
-    // or a delivery that ended the startup the snapshot still shows.
+    // rest, e.g. a "failed" launch stage a replica without the launch doesn't know.
     return {
-      ...(predatesDelivery ? {} : { startupPending }),
-      failedInputs,
-      pendingUserMessages: [...pending, ...queued.map(pendingBubbleFromSnapshot)],
+      ...startup,
+      pendingUserMessages: withoutFailedInputs(s.pendingUserMessages, startup.failedInputs),
     };
   });
-}
-
-/**
- * Retry a session whose saved startup messages were never delivered.
- *
- * The server queues them again, starting a new sandbox when the first launch
- * failed before binding a host; the session is then re-read so they show as sending.
- *
- * @param id - The session to retry.
- * @throws ApiError when the server refuses the retry.
- */
-export async function retryFailedStartup(id: string): Promise<void> {
-  await retrySession(id);
-  await refreshStartupInputs(id, true);
 }
 
 /**
@@ -5209,11 +5155,16 @@ async function bindStream(
       // ``pending_inputs`` twin: the server entry carries the durable
       // pending id, so the eventual consumed event clears it precisely —
       // keeping both would double-render and strand one of them.
+      const toPending = (p: PendingInput): PendingUserMessage => ({
+        tempId: p.pendingId,
+        content: p.content,
+        ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
+      });
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
         candidatePending = state.pendingUserMessages;
       } else {
-        const serverPending = (session.pendingInputs ?? []).map(pendingBubbleFromSnapshot);
+        const serverPending = (session.pendingInputs ?? []).map(toPending);
         // One-to-one consumption so two identical queued sends still match
         // pairwise. Content (not text) equality so image-only messages
         // correlate too.
@@ -5552,7 +5503,7 @@ function reconnectStatusPatch(
     // message on `waitForInitialDispatch` until its deadline.
     ...snapshotModelPatch(session, s),
     // A launch that failed during the gap still shows what it never delivered.
-    failedInputs: withoutDeliveredInputs(session.id, session.failedInputs),
+    failedInputs: session.failedInputs ?? [],
   };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
@@ -8290,14 +8241,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.stage === "action_required" ? s.sandboxActionDismissed : null,
             },
       );
-      if (event.stage === "failed") void refreshStartupInputs(event.conversationId);
-      // A relaunch, maybe from another tab: its undelivered messages are sending again.
-      if (
-        event.stage === "provisioning" &&
-        (setterForState(event.conversationId)?.failedInputs.length ?? 0) > 0
-      ) {
-        void refreshStartupInputs(event.conversationId, true);
-      }
+      if (event.stage === "failed") void refreshAfterFailedLaunch(event.conversationId);
       // The sandbox host is bound before its runner starts; refetch the binding and a
       // host list cached before that host registered, so the composer can name it.
       if (event.stage === "connecting" || event.stage === "ready") {
@@ -8813,8 +8757,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation({ startupPending: false });
       const deliveredId = event.clearedPendingId;
       if (deliveredId) {
-        // Delivered, maybe by another tab's retry, so it is no longer undelivered here.
-        if (sourceConversationId) noteStartupInputDelivered(sourceConversationId, deliveredId);
+        // Delivered by a retry from another client, so it is no longer undelivered.
         applyToConversation((s) =>
           s.failedInputs.some((input) => input.pendingId === deliveredId)
             ? { failedInputs: s.failedInputs.filter((input) => input.pendingId !== deliveredId) }

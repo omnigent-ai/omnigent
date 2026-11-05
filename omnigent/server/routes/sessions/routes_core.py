@@ -432,7 +432,6 @@ def register_core_routes(
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
-    register_managed_launch: Callable[..., None] | None = None,
 ) -> None:
     """Register the core session routes on router."""
 
@@ -574,7 +573,6 @@ def register_core_routes(
             )
         from omnigent.server.auth import RESERVED_USER_LOCAL
         from omnigent.server.managed_hosts import (
-            MANAGED_PROVIDER_LABEL_KEY,
             REQUESTED_HOST_ID_LABEL_KEY,
             managed_repo_labels,
             parse_repo_workspace,
@@ -614,8 +612,6 @@ def register_core_routes(
         managed_labels: dict[str, str] = {}
         if requested_host_id is not None:
             managed_labels[REQUESTED_HOST_ID_LABEL_KEY] = requested_host_id
-        if sandbox_provider is not None:
-            managed_labels[MANAGED_PROVIDER_LABEL_KEY] = sandbox_provider
         if workspaces:
             # The session row's workspace is overwritten with the CLONED path at
             # bind time; record the raw request value(s) so a sandbox relaunch
@@ -670,10 +666,6 @@ def register_core_routes(
             tracker=managed_launches,
             startup=getattr(request.app.state, "startup_inputs", None),
         )
-
-    if register_managed_launch is not None:
-        # A retry after a failed first launch provisions through the same path.
-        register_managed_launch(_schedule_managed_launch)
 
     async def _check_requested_host_id(
         request: Request, requested_host_id: str, user_id: str | None

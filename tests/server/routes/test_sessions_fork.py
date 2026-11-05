@@ -27,7 +27,6 @@ from omnigent.entities import (
 from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
-    MANAGED_PROVIDER_LABEL_KEY,
     MANAGED_REPO_LABEL_KEY,
     REQUESTED_HOST_ID_LABEL_KEY,
     ManagedLaunchTracker,
@@ -1969,8 +1968,7 @@ async def test_fork_managed_schedules_sandbox_launch(
     assert launch["provider"] == "modal"
     # No repository on either side, so the clone gets an empty sandbox.
     assert launch["repos"] == []
-    # The clone records its own provider, so a retry provisions the same one.
-    assert conv_store.label_writes == [(body["id"], {MANAGED_PROVIDER_LABEL_KEY: "modal"})]
+    assert conv_store.label_writes == []
 
 
 class _HostIdentityStore:

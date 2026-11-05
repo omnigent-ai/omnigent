@@ -118,14 +118,10 @@ async def _drive(rig: ManagedReplicas, model_url: str, agent_name: str) -> None:
 
 
 @pytest.mark.timeout(240)
-def test_failed_launch_keeps_the_message_for_a_new_session_or_a_retry(
-    managed_replicas: ManagedReplicas, mock_llm_server_url: str
+def test_failed_launch_hands_the_message_and_attachment_to_a_new_session(
+    managed_replicas: ManagedReplicas,
 ) -> None:
     """A launch that never comes online leaves the first message recoverable."""
-    reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(
-        mock_llm_server_url, [{"text": _REPLY, "stream": True}], key="routing_probe", match=_PROMPT
-    )
     run_in_fresh_loop(_drive_failed_launch(managed_replicas))
 
 
@@ -166,24 +162,6 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
             await expect(page.get_by_test_id("new-chat-landing-input")).to_have_value(_PROMPT)
             await expect(page.get_by_role("button", name="Remove context.txt")).to_be_visible()
             await page.screenshot(path=str(rig.logs / "new-session-prefilled.png"))
-
-            # Back in the failed session, a retry launches a new sandbox that delivers it.
-            await page.go_back()
-            # Either replica may run the retried launch; let both provision.
-            for replica in (rig.a, rig.b):
-                (await client.post(f"{replica}/__test/provision/succeed")).raise_for_status()
-                (await client.post(f"{replica}/__test/provision/release")).raise_for_status()
-            await page.get_by_role("button", name="Relaunch sandbox").click()
-            await expect(page.get_by_test_id("message-undelivered")).to_have_count(0)
-            reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
-            await expect(reply.filter(has_text=_REPLY)).to_have_count(1, timeout=120_000)
-            await expect(prompt).to_have_count(1)
-            session_id = page.url.rsplit("/", 1)[-1]
-            snapshot = (await client.get(f"{rig.ingress}/v1/sessions/{session_id}")).json()
-            assert len(_persisted_messages(snapshot, "user", _PROMPT)) == 1
-            await page.screenshot(path=str(rig.logs / "retried.png"))
         finally:
-            for replica in (rig.a, rig.b):
-                await client.post(f"{replica}/__test/provision/release")
-                await client.post(f"{replica}/__test/host/stop", timeout=20)
+            await client.post(f"{rig.a}/__test/provision/release")
             await browser.close()

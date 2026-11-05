@@ -164,11 +164,6 @@ def replica_app(
         launcher.fail_provision = True
         return {"failing": True}
 
-    @control.post("/provision/succeed")
-    async def succeed_provision() -> dict[str, bool]:
-        launcher.fail_provision = False
-        return {"failing": False}
-
     @control.post("/host/stop")
     async def stop_host() -> dict[str, bool]:
         launcher.gate.set()

@@ -6,9 +6,6 @@ import { PENDING_FILE_PREFIX, type MessageContentBlock } from "@/lib/blocks";
 import { downloadSessionFile } from "@/lib/filesApi";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import { useNavigate } from "@/lib/routing";
-import { retryFailedStartup } from "@/store/chatStore";
-
-const LINK_CLASS = "h-auto px-1 text-[11px] text-destructive underline underline-offset-2";
 
 /**
  * Download a message's uploaded attachments so a new session can send them again.
@@ -56,21 +53,6 @@ export function UndeliveredMessageNotice({
 }) {
   const navigate = useNavigate();
   const [starting, setStarting] = useState(false);
-  const [retrying, setRetrying] = useState(false);
-
-  async function tryAgain() {
-    if (sessionId === null) return;
-    setRetrying(true);
-    try {
-      await retryFailedStartup(sessionId);
-    } catch (error) {
-      showToast(
-        error instanceof Error ? error.message : "Couldn't relaunch the sandbox. Try again later.",
-      );
-    } finally {
-      setRetrying(false);
-    }
-  }
 
   async function startNewSession() {
     setStarting(true);
@@ -91,18 +73,8 @@ export function UndeliveredMessageNotice({
       <Button
         variant="link"
         size="xs"
-        className={LINK_CLASS}
-        disabled={retrying || starting || sessionId === null}
-        onClick={() => void tryAgain()}
-      >
-        Relaunch sandbox
-      </Button>
-      <span aria-hidden>·</span>
-      <Button
-        variant="link"
-        size="xs"
-        className={LINK_CLASS}
-        disabled={retrying || starting}
+        className="h-auto px-1 text-[11px] text-destructive underline underline-offset-2"
+        disabled={starting}
         onClick={() => void startNewSession()}
       >
         Copy message to new session

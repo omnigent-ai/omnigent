@@ -203,7 +203,9 @@ menu → **Open in grid** and choose the pane and direction. Each pane has its o
 transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
-screen; drafts and terminal connections survive view changes.
+screen; drafts and terminal connections survive view changes. A managed session
+whose sandbox never started shows its saved first message as **Not delivered**
+in its cell too, with **Copy message to new session**.
 Render failures in one chat or terminal show **Try again** in that view while
 cell controls, the other view and neighboring sessions stay usable. Clear the
 fault and retry to recover.
