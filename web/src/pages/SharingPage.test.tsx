@@ -121,9 +121,7 @@ describe("SharingPage", () => {
     renderPage();
     await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
 
-    expect(screen.getByText(/Control whether users on this server can share sessions/)).toHaveClass(
-      "max-md:hidden",
-    );
+    expect(screen.getByText(/Control sharing server-wide/)).toHaveClass("max-md:hidden");
     for (const testId of ["settings-group-sharing-mode", "settings-group-public-sharing"]) {
       expect(screen.getByTestId(testId).lastElementChild).toHaveClass(
         "rounded-xl",
@@ -133,14 +131,14 @@ describe("SharingPage", () => {
       );
     }
 
-    expect(screen.getByText(/Allow sharing a session with anyone who has the link/)).toHaveClass(
+    expect(screen.getByText(/Anyone with the link can access after signing in/)).toHaveClass(
       "max-md:hidden",
     );
     const help = screen.getByRole("button", { name: "About Public access" });
     expect(help).toHaveClass("md:hidden");
     fireEvent.click(help);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      /Allow sharing a session with anyone who has the link/,
+      /Anyone with the link can access after signing in/,
     );
   });
 
@@ -150,8 +148,7 @@ describe("SharingPage", () => {
     renderPage();
 
     const trigger = await screen.findByRole("combobox", { name: "Session sharing mode" });
-    const description =
-      "New shares are capped at read (view) access. Edit and manage grants are rejected.";
+    const description = "New shares allow Read access only; Edit and Manage grants are rejected.";
     expect(trigger).toHaveTextContent(/^Read only$/);
     expect(trigger).toHaveAccessibleDescription(description);
     expect(screen.getByText(description)).toBeVisible();
@@ -165,14 +162,14 @@ describe("SharingPage", () => {
     for (const [label, optionDescription] of [
       [
         "On",
-        "Anyone with manage access can share a session at any level (read, edit, or manage) and toggle public / workspace read.",
+        "Users with manage access can share at read, edit, or manage level and enable public or workspace read access.",
       ],
       ["Read only", description],
       [
         "Read only (restricted)",
-        "Read-only, and sessions whose working directory is a home directory or the filesystem root cannot be shared at all — not even read.",
+        "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
       ],
-      ["Off", "Sharing is disabled. No new grants can be created and the Share control is hidden."],
+      ["Off", "Block new shares and hide the Share control."],
     ]) {
       const option = screen.getByRole("option", { name: label });
       expect(option).toHaveAccessibleDescription(optionDescription);
@@ -203,7 +200,7 @@ describe("SharingPage", () => {
     );
     expect(trigger).toHaveTextContent(/^Read only \(restricted\)$/);
     expect(trigger).toHaveAccessibleDescription(
-      "Read-only, and sessions whose working directory is a home directory or the filesystem root cannot be shared at all — not even read.",
+      "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
     );
   });
 
@@ -243,7 +240,7 @@ describe("SharingPage", () => {
     expect(screen.getByText("Save failed")).toBeInTheDocument();
     expect(trigger).toHaveTextContent(/^On$/);
     expect(trigger).toHaveAccessibleDescription(
-      "Anyone with manage access can share a session at any level (read, edit, or manage) and toggle public / workspace read.",
+      "Users with manage access can share at read, edit, or manage level and enable public or workspace read access.",
     );
   });
 
@@ -329,7 +326,7 @@ describe("SharingPage", () => {
       expect(radios.map((r) => r.value)).toEqual(["sandbox", "all"]);
       expect(radios.find((r) => r.value === "sandbox")!.checked).toBe(true);
       expect(screen.getByRole("radio", { name: "Managed hosts only" })).toBeChecked();
-      expect(screen.getByText(/Sessions on local hosts start private/)).toBeInTheDocument();
+      expect(screen.getByText(/Local sessions start private/)).toBeInTheDocument();
     });
 
     it("hides scope while off and enables managed hosts only by default", async () => {

@@ -53,6 +53,7 @@ from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
+    HARNESS_TMUX_UNAVAILABLE,
     HARNESS_VERSION_TOO_LOW,
 )
 from omnigent.harnesses.claude_native import PEER_MESSAGE_WAKE_KIND, PEER_MESSAGE_WAKE_TEXT
@@ -440,6 +441,7 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
 
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
@@ -10761,10 +10763,17 @@ def _native_subagent_wrapper_labels(
 
 
 # Host readiness values that mean the native CLI cannot launch. A routed
-# session landing on a missing or unauthenticated binary would fail to open its
-# terminal, so those harnesses are never offered to Smart Routing.
+# session landing on a missing or unauthenticated binary, or on a host without a
+# usable tmux, would fail to open its terminal, so those harnesses are never
+# offered to Smart Routing.
 _NATIVE_UNAVAILABLE_READINESS: frozenset[object] = frozenset(
-    {False, HARNESS_BINARY_MISSING, HARNESS_NEEDS_AUTH, HARNESS_VERSION_TOO_LOW}
+    {
+        False,
+        HARNESS_BINARY_MISSING,
+        HARNESS_NEEDS_AUTH,
+        HARNESS_VERSION_TOO_LOW,
+        HARNESS_TMUX_UNAVAILABLE,
+    }
 )
 
 
@@ -10790,6 +10799,24 @@ def _installed_native_harnesses(host: Host | None) -> list[str]:
         for harness in AUTO_NATIVE_ROUTING_HARNESSES
         if harness in readiness and readiness[harness] not in _NATIVE_UNAVAILABLE_READINESS
     ]
+
+
+def _no_native_candidate_error(host: Host | None) -> str:
+    """Explain why *host* offers Smart Routing no native candidate.
+
+    :param host: The session's target host, or ``None``.
+    :returns: The tmux remedy when an installed CLI is blocked only by tmux,
+        else the generic "no native CLI" message.
+    """
+    from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
+
+    readiness = (getattr(host, "configured_harnesses", None) if host is not None else None) or {}
+    if any(readiness.get(h) == HARNESS_TMUX_UNAVAILABLE for h in AUTO_NATIVE_ROUTING_HARNESSES):
+        return (
+            f"Native CLIs on this host need tmux {MIN_TMUX_VERSION_HINT} or newer. "
+            "Install or upgrade tmux on the host, then check the harness again."
+        )
+    return "No native CLI is installed on this host."
 
 
 def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -> list[str]:
@@ -11406,7 +11433,7 @@ async def _resolve_native_smart_routing(
     backed = not ungatewayed
     installed = _installed_native_harnesses(host)
     if not installed:
-        return None, None, None, "No native CLI is installed on this host."
+        return None, None, None, _no_native_candidate_error(host)
 
     # Choosing BETWEEN native panes belongs to the workspace router: its menu is
     # what ranks two CLIs against one task, and the pick is baked into the
@@ -12556,6 +12583,8 @@ async def _child_session_summaries_from_conversations(
     children: list[Conversation],
     parent_session_id: str,
     conv_store: ConversationStore,
+    *,
+    parent_ids: Mapping[str, str] | None = None,
 ) -> list[ChildSessionSummary]:
     """
     Build child summaries with one batched message-preview lookup.
@@ -12571,6 +12600,9 @@ async def _child_session_summaries_from_conversations(
         ``list_conversations(kind="sub_agent")``.
     :param parent_session_id: Parent session id, e.g. ``"conv_parent987"``.
     :param conv_store: Conversation store used for the batched message read.
+    :param parent_ids: Parent id per child id, for children of different
+        parents (a whole subtree); a child missing from it gets
+        *parent_session_id*.
     :returns: One :class:`ChildSessionSummary` per input child, preserving
         input order.
     """
@@ -12589,7 +12621,7 @@ async def _child_session_summaries_from_conversations(
     return [
         _child_session_summary_from_conversation(
             child,
-            parent_session_id,
+            (parent_ids or {}).get(child.id, parent_session_id),
             previews.get(child.id),
         )
         for child in children

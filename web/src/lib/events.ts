@@ -16,6 +16,7 @@ import type {
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
+  FileEditRequest,
   ModelUsage,
   RememberScope,
   Response,
@@ -234,6 +235,8 @@ export interface ElicitationRequest {
    * Optional/null for any other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Producer-supplied extra (codex-native command approvals only):
    * structured command details that let the UI render the approval

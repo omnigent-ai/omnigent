@@ -187,6 +187,7 @@ def resolve_status_file(
     :param expected_session_id: Claude session uuid from the bridge, or
         ``None`` before the first hook reports it.
     :param config_dir: Explicit Claude config dir override (tests).
+    :param on_replay: Optional callback for an unchanged status reasserted by resync.
     :param now: Monotonic-independent wall clock override (tests); uses
         :func:`time.time` when ``None``.
     :returns: The resolved file path, or ``None`` when no confident match
@@ -443,8 +444,10 @@ class SessionStatusPoller:
         session_id_getter: Callable[[], str | None],
         config_dir: Path | None = None,
         omnigent_session_id: str | None = None,
+        on_replay: Callable[[str, str | None], None] | None = None,
     ) -> None:
         self._on_status = on_status
+        self._on_replay = on_replay or on_status
         self._pane_pid_getter = pane_pid_getter
         # Claude's own session uuid, resolved lazily from the bridge.
         self._session_id_getter = session_id_getter
@@ -458,8 +461,14 @@ class SessionStatusPoller:
         self._last_mtime: float | None = None
         self._last_edge: tuple[str, str | None] | None = None
         self._last_status: SessionStatus | None = None
+        self._observation_version = 0
         self._resync_lock = threading.Lock()
         self._resync_requested = False
+
+    @property
+    def observation_version(self) -> int:
+        """Advance on native state changes or retirement, including unpublished states."""
+        return self._observation_version
 
     @property
     def active(self) -> bool:
@@ -483,14 +492,13 @@ class SessionStatusPoller:
             self._resync_requested = False
         if requested:
             self._last_mtime = None
-            self._last_edge = None
         if self._exhausted:
             return
         if self._path is None:
             self._try_resolve()
             if self._path is None or self._exhausted:
                 return
-        self._read_and_publish()
+        self._read_and_publish(reassert=requested)
 
     def _try_resolve(self) -> None:
         """Attempt one resolution, retiring to the PTY watcher on timeout."""
@@ -538,12 +546,13 @@ class SessionStatusPoller:
             extra={"session_id": self._omnigent_session_id},
         )
         self._exhausted = True
+        self._observation_version += 1
 
     def resync(self) -> None:
         """Request that the watcher re-assert the file on its next tick.
 
         The file changes only when Claude's status changes. A server recycle
-        or forwarded idle edge must re-arm the watcher so it reports the current
+        or forwarded status edge must re-arm the watcher so it reports the current
         value again. A request during an in-flight read stays pending for the
         following tick instead of being overwritten by that read.
 
@@ -570,7 +579,7 @@ class SessionStatusPoller:
             return None
         return status.blocked_on
 
-    def _read_and_publish(self) -> None:
+    def _read_and_publish(self, *, reassert: bool = False) -> None:
         """Read the resolved file and fire the callback on a status change."""
         assert self._path is not None
         try:
@@ -579,6 +588,7 @@ class SessionStatusPoller:
             # File vanished (clean exit unlinks it, or a crash). Exit
             # detection rides the PTY watcher, so just stop polling.
             self._exhausted = True
+            self._observation_version += 1
             return
         if self._last_mtime is not None and mtime == self._last_mtime:
             return
@@ -591,12 +601,18 @@ class SessionStatusPoller:
             # detail whose vocabulary can grow. We are now blind to this
             # transition, so drop the dedup baseline: the next readable
             # status must publish rather than be swallowed as a duplicate.
+            if self._last_status is not None:
+                self._observation_version += 1
             self._last_status = None
             self._last_edge = None
             return
+        if status != self._last_status:
+            self._observation_version += 1
         self._last_status = status
         edge = (status.runner_status, status.blocked_on)
         if edge == self._last_edge:
+            if reassert:
+                self._on_replay(status.runner_status, status.blocked_on)
             return
         self._last_edge = edge
         self._on_status(status.runner_status, status.blocked_on)

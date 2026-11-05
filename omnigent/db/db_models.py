@@ -679,6 +679,9 @@ class SqlConversationMetadata(OmnigentBase):
     # kept under 16,384 stored bytes by SessionPullRequestStore; NULL = none
     # reported. Deferred so whole-row reads (e.g. the session list) skip it.
     pull_requests: Mapped[str | None] = mapped_column(CompressedText, nullable=True, deferred=True)
+    # The session whose Workspace rail lists this side chat; NULL = not a side chat.
+    # No DB FK (Rule R032).
+    side_chat_parent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -691,6 +694,13 @@ class SqlConversationMetadata(OmnigentBase):
         Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
+        # Lists a session's side chats on any device, in id order.
+        Index(
+            "ix_conversation_metadata_side_chat_parent_id",
+            "workspace_id",
+            "side_chat_parent_id",
+            "id",
+        ),
     )
 
 

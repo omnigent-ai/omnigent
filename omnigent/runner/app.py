@@ -499,6 +499,12 @@ _SESSION_STREAM_HEARTBEAT_S = 15.0
 # that died on its own leaves the harness parked on a readiness wait, so the
 # wait is bounded and the stream failure is then attributed to the exit.
 _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
+# A pane Omnigent closed itself (a delivery timeout) has its turn's own error
+# on the way; releasing the harness before it lands severs the stream carrying
+# it, so the wait is longer. The pane is already gone, so nothing else waits.
+_EXPECTED_CLOSE_RELEASE_GRACE_S = 15.0
+# Display names for the terminals whose exits the runner describes to people.
+_TERMINAL_DISPLAY_NAMES = {"claude": "Claude Code"}
 
 # Banner printed by Claude Code on a voluntary /exit or /quit (exit 0).
 # The pane activity from printing it can flip the idle memo back to "running"
@@ -1838,6 +1844,7 @@ def create_runner_app(
                 ),
             }
             if failure_detail:
+                from omnigent.harnesses.claude_native.bridge import program_status_turn_error
                 from omnigent.harnesses.claude_native.failure_telemetry import (
                     claude_failure_context,
                 )
@@ -1852,7 +1859,8 @@ def create_runner_app(
                 context = normalize_failure_context(raw_context)
                 detail = context.get("native_error_message")
                 if isinstance(detail, str):
-                    event["error"] = {"code": "native_turn_error", "message": detail}
+                    code, message = program_status_turn_error(detail)
+                    event["error"] = {"code": code, "message": message}
                     event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
@@ -1916,6 +1924,26 @@ def create_runner_app(
                 ]
             )
         return "\n".join(parts)
+
+    def _build_delivery_timeout_error(event: TerminalExitEvent) -> dict[str, str]:
+        """Build the failure for a pane the delivery timeout closed.
+
+        Stands in for the turn's own readiness error when releasing the harness
+        severs its stream first. The executor reports that error as a
+        ``RuntimeError``; the same code keeps both readings of one failure
+        together.
+
+        :param event: The exit of the pane Omnigent closed.
+        """
+        terminal = _TERMINAL_DISPLAY_NAMES.get(event.terminal_name, event.terminal_name)
+        message = (
+            f"{terminal} terminal did not become ready before the message delivery timed "
+            "out, so Omnigent closed it and the message was not delivered. Relaunch the "
+            "terminal to continue this conversation."
+        )
+        if event.last_output:
+            message = f"{message}\n\nLast captured terminal output:\n{event.last_output}"
+        return {"code": "RuntimeError", "message": message}
 
     def _build_required_terminal_error(
         event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
@@ -1982,7 +2010,9 @@ def create_runner_app(
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
         return message
 
-    def _release_required_terminal_session(session_id: str) -> None:
+    def _release_required_terminal_session(
+        session_id: str, *, grace_s: float = _TERMINAL_EXIT_RELEASE_GRACE_S
+    ) -> None:
         if process_manager is None:
             return
 
@@ -1990,7 +2020,7 @@ def create_runner_app(
             # Let a live turn stream converge first (bounded): the harness's own
             # failure event may already be on the wire, and releasing now would
             # sever the stream carrying it.
-            deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
+            deadline = time.monotonic() + grace_s
             while session_id in _live_response_id and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
             try:
@@ -2036,7 +2066,12 @@ def create_runner_app(
                 event.session_id,
                 extra={"session_id": event.session_id},
             )
-            _release_required_terminal_session(event.session_id)
+            # Should the release still sever the stream before that error lands,
+            # the drop reports this closed pane and its output, not the transport.
+            _required_terminal_exit_errors[event.session_id] = _build_delivery_timeout_error(event)
+            _release_required_terminal_session(
+                event.session_id, grace_s=_EXPECTED_CLOSE_RELEASE_GRACE_S
+            )
             return
 
         # A required terminal exit ends the session. Tear down any registered
@@ -5041,12 +5076,16 @@ def create_runner_app(
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        confirmed_completion: bool = False,
+        confirmed_cancellation: bool = False,
     ) -> _SubagentDeliveryAck:
         ack = mark_subagent_work_terminal(
             child_session_id,
             status=status,
             output=output,
             only_if_work_id=only_if_work_id,
+            confirmed_completion=confirmed_completion,
+            confirmed_cancellation=confirmed_cancellation,
         )
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
@@ -7351,8 +7390,6 @@ def create_runner_app(
                 if turn_outcome in ("completed", "cancelled", "failed"):
                     recovered_entry = await _ensure_subagent_work_entry(conversation_id)
                     terminal_status = turn_outcome
-                    if turn_outcome == "cancelled" and recovered_entry is not None:
-                        recovered_entry.cancellation_confirmed = True
                 elif (
                     status == "idle"
                     and recovered_entry is not None
@@ -7415,6 +7452,8 @@ def create_runner_app(
                     conversation_id,
                     status=terminal_status,
                     output=output if output is not None else "",
+                    confirmed_completion=terminal_status == "completed",
+                    confirmed_cancellation=terminal_status == "cancelled",
                 )
             elif ambiguous_idle:
                 # This harness's forwarder marks genuine turn completions
@@ -7449,10 +7488,14 @@ def create_runner_app(
                     )
                 elif status == "idle":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                    # Only a confirmed turn-end (``turn_completed``) may correct an
+                    # optimistic grace-timer cancellation; a legacy harness's bare
+                    # idle is unconfirmed and must not overturn it.
                     delivery_ack = _mark_subagent_terminal_and_wake(
                         conversation_id,
                         status="completed",
                         output=output if output is not None else "",
+                        confirmed_completion=turn_completed is True,
                     )
                 elif status == "failed":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
