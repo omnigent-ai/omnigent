@@ -678,8 +678,11 @@ Other connection providers alone do not enable the managed MCP picker.
   to **Connected** and expects the next turn to use the server. It writes the
   platform's real managed file, so it runs only with
   `OMNIGENT_TEST_CLAUDE_MANAGED_MCP=1` on a disposable machine or container
-  where that directory is writable. Without the entry, expect the session to
-  start without Omnigent tools and the runner log to name the missing entry.
+  where that directory is writable. Its `bwrap` variant gives the agent a
+  `linux_bwrap` sandbox and also needs Bubblewrap on Linux; in a container, run
+  it privileged so bwrap can mount `/proc`. Without the entry, expect the
+  session to start without Omnigent tools and the runner log to name the
+  missing entry.
   Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
   row labels, the Sign in / Signing in… / error renderings and the Settings
   link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the
