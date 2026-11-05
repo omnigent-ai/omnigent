@@ -22,9 +22,10 @@ test LOC; fewer lines alone do not establish adequate coverage.
 
 - Add a unit test for non-trivial functions, methods, and exported APIs. Add
   coverage when changed behavior needs it.
-- For behavior changes, run only directly relevant tests before submitting.
-  Follow the proportional-verification rules below for styling changes.
-  Document unrelated pre-existing failures in the PR description.
+- Standalone local tests are optional, not a prerequisite for every commit or
+  push. When a behavior change needs an additional local check, use only the
+  smallest directly relevant non-browser test. Follow the proportional rules
+  below for styling changes and document unrelated failures in the PR.
 
 ## Stay focused and keep verification proportional
 
@@ -40,6 +41,9 @@ test LOC; fewer lines alone do not establish adequate coverage.
   implementation has already been validated.
 - Follow explicit requests to stop or skip checks immediately. Required commit
   and push hooks still run when committing or pushing; never bypass them.
+- During authorized PR fixes, commit and push each completed fix promptly after
+  the required hooks pass. Do not hold fixes locally while waiting for other CI
+  results or run extra local tests solely as a prerequisite to pushing.
 
 ## Dependency changes
 
@@ -61,9 +65,9 @@ share the clone's `.git`, so one install covers them all.
 - Never pass `--no-verify`. A hook failure is a finding to fix, not a gate to
   skip; the push hook will fail on the same commits anyway.
 - Files written through shell heredocs or scripts are unformatted until a hook
-  or `just lint` touches them. Before pushing web changes, run
-  `cd web && pnpm exec prettier --check .` and read its exit code; do not judge
-  hook output by grepping it.
+  or `just lint` touches them. Let the required formatting hooks validate them;
+  a duplicate standalone Prettier run is not required before pushing. If a
+  manual check is needed, read its exit code rather than grepping hook output.
 - To check by hand, `just lint` runs the hooks over staged files and
   `just lint-all` over the whole tree. Fix what they report, re-stage, commit.
 
@@ -93,14 +97,18 @@ Use `just` for common tasks; run `just --list` for grouped recipes.
   resolved database URI before reporting that the development servers are ready.
 - Automated tests retain their isolated databases.
 
-### Local code verification only
+### No proactive browser-based verification
 
-- Verify changes with local code tests, type checks, and linters only.
-- Do not perform browser verification, including manual browser interaction,
-  Playwright/browser E2E runs, screenshots, or recordings, unless the user
-  explicitly requests browser verification for the current task.
-- Use unit, component, or non-browser integration tests for changed behavior.
-  This preference takes precedence over browser-drive guidance in feature maps.
+- Do not run browser-based verification: no manual browser interaction,
+  Playwright or other browser E2E runs, browser screenshots, or recordings.
+  Only an explicit user request for browser verification in the current task
+  authorizes an exception. This prohibition takes precedence over browser-drive
+  guidance in feature maps and other repository documentation.
+- Standalone local tests, type checks, builds, and linters are optional. Prefer
+  required Git hooks and GitHub CI; use a focused non-browser local check only
+  when it is needed to diagnose or validate the requested change.
+- Reading CI logs and artifacts or updating existing browser-test source does
+  not authorize launching a local browser or rerunning browser tests locally.
 
 ## Pull requests
 
