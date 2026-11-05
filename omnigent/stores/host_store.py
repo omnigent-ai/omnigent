@@ -701,8 +701,8 @@ class HostStore:
             ``"host_a1b2c3d4..."``.
         :param managed_token: Credential accepted when this tunnel connected.
             Guards against renewing a revoked or replaced sandbox generation.
-        :param token_ttl_s: Provider's reconnect window in seconds. ``None``
-            keeps the existing expiry, e.g. when its provider was removed.
+        :param token_ttl_s: Provider's validity window when renewal is due.
+            ``None`` persists only liveness, keeping the existing expiry.
         """
         if token_ttl_s is not None and (managed_token is None or token_ttl_s <= 0):
             raise ValueError("token renewal requires a managed token and a positive TTL")
@@ -719,10 +719,6 @@ class HostStore:
                 .values(updated_at=updated_at)
             )
             if managed_token is not None:
-                row = session.get(SqlHost, (current_workspace_id(), host_id))
-                if row is None:
-                    return
-                require_active_account(session, row.user_id, generation=row.account_generation)
                 statement = statement.where(
                     SqlHost.token_hash == hash_host_launch_token(managed_token),
                     SqlHost.token_expires_at.is_not(None),
@@ -735,6 +731,10 @@ class HostStore:
                     ),
                 )
                 if token_ttl_s is not None:
+                    row = session.get(SqlHost, (current_workspace_id(), host_id))
+                    if row is None:
+                        return
+                    require_active_account(session, row.user_id, generation=row.account_generation)
                     expires_at = updated_at + token_ttl_s
                     statement = statement.values(
                         token_expires_at=case(

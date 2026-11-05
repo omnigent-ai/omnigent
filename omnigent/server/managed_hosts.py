@@ -263,8 +263,8 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 MANAGED_HOST_ONLINE_TIMEOUT_S = 120
 _ONLINE_POLL_INTERVAL_S = 1.0
 
-# Authenticated heartbeats renew these validity windows. Disconnected hosts
-# expire after their last renewal; resume/relaunch rotates the token.
+# Authenticated hosts renew these windows halfway through their TTL.
+# Tokens expire after the last renewal; resume/relaunch rotates the token.
 
 # Modal's 24h sandbox cap plus an hour of slack. Embedding deployments
 # choose their own window through ManagedSandboxConfig.
@@ -678,9 +678,9 @@ class ManagedSandboxConfig:
         ``HTTPException`` to report an unusable backend — the YAML
         path uses this for providers without managed support.
     :param token_ttl_s: Launch-token validity window in seconds, e.g.
-        ``90000`` (25h) for Modal. Authenticated host heartbeats renew this
-        window, allowing long-lived sandboxes to reconnect after an outage.
-        Disconnected hosts expire after the last renewal plus this window.
+        ``90000`` (25h) for Modal. Authenticated hosts renew halfway through
+        this window, allowing long-lived sandboxes to reconnect after an
+        outage. Tokens expire after the last renewal plus this window.
     :param managed_launch_supported: Whether ``launcher_factory`` can
         actually serve a managed launch. The YAML path sets this from
         :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers

@@ -55,6 +55,7 @@ from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 from tests.server.helpers import FakeSandboxLauncher
 
@@ -1655,6 +1656,55 @@ async def test_managed_token_authenticates_as_record_owner(
     assert host.sandbox_id == "sb-tunnel-1"
 
 
+async def test_managed_heartbeat_renews_only_when_due_and_retries_failure(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Routine heartbeats skip renewal, and a failed renewal remains due."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    clock = 100.0
+    monkeypatch.setattr(tunnel_mod, "monotonic", lambda: clock)
+    requested = asyncio.Event()
+    completed: asyncio.Queue[tuple[str | None, int | None]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    store = HostStore(db_uri)
+    fail = False
+
+    def heartbeat(host_id: str, *, managed_token: str | None, token_ttl_s: int | None) -> None:
+        assert host_id == _HOST_ID
+        try:
+            if fail:
+                raise RuntimeError("temporary renewal failure")
+        finally:
+            loop.call_soon_threadsafe(completed.put_nowait, (managed_token, token_ttl_s))
+
+    monkeypatch.setattr(store, "heartbeat", heartbeat)
+    task = asyncio.create_task(
+        tunnel_mod._heartbeat_loop(
+            requested, host_id=_HOST_ID, host_store=store, managed_token="token", token_ttl_s=600
+        )
+    )
+    try:
+        for clock, fail, expected_ttl in [
+            (100, False, 600),
+            (100, False, None),
+            (399, False, None),
+            (400, True, 600),
+            (400, False, 600),
+            (699, False, None),
+            (700, False, 600),
+        ]:
+            requested.set()
+            assert await asyncio.wait_for(completed.get(), timeout=budget(1.0)) == (
+                "token",
+                expected_ttl,
+            )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 @pytest.mark.parametrize("provider", [None, "modal", "daytona"])
 async def test_managed_heartbeat_renews_token_for_reconnect(
     db_uri: str,
@@ -1667,6 +1717,8 @@ async def test_managed_heartbeat_renews_token_for_reconnect(
 
     monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    elapsed = 0.0
+    monkeypatch.setattr(tunnel_mod, "monotonic", lambda: elapsed)
     token_ttl_s = 600
     config = ManagedSandboxConfig(
         server_url="https://managed-test.example.com",
@@ -1702,8 +1754,14 @@ async def test_managed_heartbeat_renews_token_for_reconnect(
     try:
         # Advance past every expiry the initial connection could have issued.
         renewed_at = now_epoch() + 7 * 24 * 3600
+        elapsed += 7 * 24 * 3600
         monkeypatch.setattr(store_mod, "now_epoch", lambda: renewed_at)
         await _wait_updated_at_at_least(store, _HOST_ID, renewed_at)
+        if should_renew:
+            await poll_until_async(
+                lambda: store.resolve_launch_token(_HOST_ID, token) is not None,
+                timeout_s=budget(1.0),
+            )
         assert (store.resolve_launch_token(_HOST_ID, token) is not None) == should_renew
         with Session(get_or_create_engine(db_uri)) as session:
             row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()

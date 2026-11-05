@@ -599,7 +599,22 @@ def test_managed_heartbeat_renews_connected_host_token(
     if expires_in < 40:
         assert host_store.resolve_launch_token(host_id, "launch-token") is None
 
-    host_store.heartbeat(host_id, managed_token="launch-token", token_ttl_s=token_ttl_s)
+    statements: list[str] = []
+
+    def record_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    engine = get_or_create_engine(db_uri)
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        host_store.heartbeat(host_id, managed_token="launch-token", token_ttl_s=token_ttl_s)
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+    if token_ttl_s is None:
+        operations = [statement.split()[0] for statement in statements]
+        assert [operation for operation in operations if operation not in {"PRAGMA", "BEGIN"}] == [
+            "UPDATE"
+        ]
 
     expected_expiry = started_at + expires_in
     if token_ttl_s is not None:
@@ -689,7 +704,8 @@ def test_managed_heartbeat_cannot_restore_stale_authority(
             host_store.heartbeat(host_id, managed_token="old-token", token_ttl_s=7200)
     else:
         with workspace_scope(workspace_id + 1 if change == "workspace" else workspace_id):
-            host_store.heartbeat(host_id, managed_token="old-token", token_ttl_s=7200)
+            for token_ttl_s in (None, 7200):
+                host_store.heartbeat(host_id, managed_token="old-token", token_ttl_s=token_ttl_s)
 
     with Session(engine) as session:
         row = session.get(SqlHost, (workspace_id, host_id))

@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from time import monotonic
 from typing import TYPE_CHECKING, Any
 
 import anyio
@@ -1313,13 +1314,16 @@ async def _heartbeat_loop(
     managed_token: str | None = None,
     token_ttl_s: int | None = None,
 ) -> None:
-    """Serialize host-liveness writes independently of socket pings."""
+    """Persist liveness off the ping loop; renew tokens halfway through their TTL."""
     failure_count = 0
     last_failure_log_at = 0.0
+    next_token_renewal_at = 0.0
     while True:
         await requested.wait()
         requested.clear()
         started_at = time.monotonic()
+        renewal_started_at = monotonic()
+        renewal_ttl_s = token_ttl_s if renewal_started_at >= next_token_renewal_at else None
         try:
             # A late managed heartbeat must still match its live credential.
             if managed_token is not None:
@@ -1327,7 +1331,7 @@ async def _heartbeat_loop(
                     host_store.heartbeat,
                     host_id,
                     managed_token=managed_token,
-                    token_ttl_s=token_ttl_s,
+                    token_ttl_s=renewal_ttl_s,
                 )
             else:
                 await asyncio.to_thread(host_store.heartbeat, host_id)
@@ -1360,6 +1364,8 @@ async def _heartbeat_loop(
                 last_failure_log_at = now
             continue
 
+        if renewal_ttl_s is not None:
+            next_token_renewal_at = renewal_started_at + renewal_ttl_s / 2
         if failure_count:
             _logger.info(
                 "Host %s heartbeat persistence recovered after %d failure(s)",
