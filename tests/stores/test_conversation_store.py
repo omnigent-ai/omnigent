@@ -4802,6 +4802,28 @@ def test_update_conversation_share_workspace_files_round_trips(
     assert conversation_store.get_conversation(conv_id).share_workspace_files is False
 
 
+@pytest.mark.parametrize("continue_source", [True, False])
+def test_only_a_continuation_keeps_the_shared_workspace_files(
+    conversation_store: SqlAlchemyConversationStore, continue_source: bool
+) -> None:
+    """A continuation of a session sharing its files shares them too; a fork starts unshared.
+
+    The continuation carries on the same chat in the same workspace and is
+    shared exactly as its source, so the owner's opt-in carries over. An
+    ordinary fork is a new session the owner has not shared files for.
+    """
+    source = conversation_store.create_conversation(host_id=uuid.uuid4().hex, workspace="/work")
+    conversation_store.update_conversation(source.id, share_workspace_files=True)
+
+    fork = conversation_store.fork_conversation(
+        source.id, copy_items=False, continue_source=continue_source
+    )
+
+    forked = conversation_store.get_conversation(fork.id)
+    assert forked is not None
+    assert forked.share_workspace_files is continue_source
+
+
 def test_set_host_id_no_workspace_fails_when_row_has_none(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

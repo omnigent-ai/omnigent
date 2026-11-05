@@ -5478,8 +5478,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             both cutoffs.
         :param continue_source: Also copy the source's workspace and branch,
             its host (in the same write that creates the fork, holding the
-            host row lock; a deleted host is not copied) and its routing
-            switches, for a same-owner continuation of the source's work.
+            host row lock; a deleted host is not copied), its routing
+            switches and its workspace-file sharing, for a same-owner
+            continuation of the source's work.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -5624,10 +5625,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "harness_override": (
                         source_overrides["harness_override"] if copy_model_settings else None
                     ),
+                    # A continuation is the same chat in the same workspace, shared
+                    # exactly as its source, so the file-sharing opt-in carries over.
                     **(
                         {
                             key: source_overrides[key]
-                            for key in ("cost_control_mode_override", "subagent_routing_override")
+                            for key in (
+                                "cost_control_mode_override",
+                                "subagent_routing_override",
+                                "share_workspace_files",
+                            )
                         }
                         if continue_source
                         else {}

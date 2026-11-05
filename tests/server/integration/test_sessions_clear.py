@@ -1241,6 +1241,50 @@ async def test_claude_sdk_clear_continuation_keeps_the_original_sharing(
     )
 
 
+@pytest.mark.parametrize("files_shared", [True, False])
+async def test_claude_sdk_clear_continuation_keeps_the_original_file_sharing(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    auth_live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    files_shared: bool,
+) -> None:
+    """A reader sees the continuation's workspace files exactly when they saw the original's."""
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    # File reads reach the same live runner.
+    monkeypatch.setattr(
+        sessions_module,
+        "_get_runner_client_for_resource_access",
+        sessions_module._get_runner_client,
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(auth_client, store, user=_OWNER)
+    owner, reader = {"X-Forwarded-Email": _OWNER}, {"X-Forwarded-Email": _READER}
+    shared = await auth_client.put(
+        f"/v1/sessions/{source_id}/permissions",
+        json={"user_id": _READER, "level": LEVEL_READ},
+        headers=owner,
+    )
+    assert shared.status_code < 300, shared.text
+    if files_shared:
+        opened_files = await auth_client.patch(
+            f"/v1/sessions/{source_id}", json={"share_workspace_files": True}, headers=owner
+        )
+        assert opened_files.status_code == 200, opened_files.text
+    changes = "/v1/sessions/{}/resources/environments/default/changes"
+    expected = 200 if files_shared else 403
+    original = await auth_client.get(changes.format(source_id), headers=reader)
+    assert original.status_code == expected, original.text
+
+    cleared = await auth_client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}, headers=owner
+    )
+
+    assert cleared.status_code == 202, cleared.text
+    continued = await auth_client.get(changes.format(cleared.json()["session_id"]), headers=reader)
+    assert continued.status_code == expected, continued.text
+
+
 @pytest.mark.parametrize(
     ("clear_status", "placement", "status", "message"),
     [
