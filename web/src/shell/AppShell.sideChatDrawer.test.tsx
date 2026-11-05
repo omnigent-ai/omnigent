@@ -255,7 +255,7 @@ describe("phone menu for a viewer who can't start side chats", () => {
   const initialStoreState = useChatStore.getState();
   beforeEach(() => {
     useChatStore.setState({ ...initialStoreState, sessionHarness: "openai-agents" });
-    // An editor's own side chat from before side chats became owner-only.
+    // An editor has a side-chat tab open but cannot create another.
     const session: Session = {
       id: "conv_ws",
       agentId: "agent",

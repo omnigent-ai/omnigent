@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { MessagesSquareIcon } from "lucide-react";
 import { useState } from "react";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
@@ -41,9 +41,11 @@ export function SideChatPicker({
       return response.json();
     },
     enabled: open,
+    placeholderData: keepPreviousData,
     retry: false,
   });
 
+  const emptyLabel = isError ? "Could not load side chats" : "No saved side chats";
   return (
     <DropdownMenu
       open={open}
@@ -74,16 +76,11 @@ export function SideChatPicker({
           </DropdownMenuItem>
         ))}
         {(!data?.data.length || isError) && (
-          <DropdownMenuItem disabled>
-            {isFetching
-              ? "Loading…"
-              : isError
-                ? "Could not load side chats"
-                : "No saved side chats"}
-          </DropdownMenuItem>
+          <DropdownMenuItem disabled>{isFetching ? "Loading…" : emptyLabel}</DropdownMenuItem>
         )}
         {data?.has_more && data.last_id && (
           <DropdownMenuItem
+            disabled={isFetching}
             onSelect={(event) => {
               event.preventDefault();
               setAfter(data.last_id);

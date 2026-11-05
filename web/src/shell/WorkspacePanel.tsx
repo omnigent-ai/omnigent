@@ -1228,7 +1228,7 @@ function WorkspacePanelImpl({
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
-  const sideChatPicker = canStartSideChat && !pending && (
+  const sideChatPicker = supportsSideChat(sideChatHarness, canStartSideChat) && !pending && (
     <SideChatPicker
       key={conversationId}
       conversationId={conversationId}

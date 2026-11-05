@@ -107,8 +107,8 @@ export function useCanStartSideChat(
   sessionId: string | null | undefined,
   permissionLevel: number | null,
 ): boolean {
-  const { session } = useSession(sessionId);
-  return session?.sideChatAllowed ?? isOwnerLevel(permissionLevel);
+  const { session, isLoading } = useSession(sessionId);
+  return session?.sideChatAllowed ?? (!isLoading && isOwnerLevel(permissionLevel));
 }
 
 export type { Permission };

@@ -181,7 +181,11 @@ export function SideChatPane({
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
-  const { session, isLoading: sessionLoading } = useSession(pending ? null : childId);
+  const {
+    session,
+    isLoading: sessionLoading,
+    error: sessionError,
+  } = useSession(pending ? null : childId);
   const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
   const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   useLayoutEffect(() => {
@@ -231,7 +235,12 @@ export function SideChatPane({
   // Until the snapshot says which rule applies, show nothing and capture nothing.
   const awaitingRule = filterHistory && !pending && sessionLoading;
   const useLocalBoundary =
-    filterHistory && !pending && !sessionLoading && copiedIdPrefix === undefined;
+    filterHistory &&
+    !pending &&
+    !sessionLoading &&
+    !sessionError &&
+    session !== null &&
+    copiedIdPrefix === undefined;
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
@@ -241,32 +250,37 @@ export function SideChatPane({
     // `undefined` until this browser's stored boundary has been read.
     ids: Set<string> | null | undefined;
     loadSeen: boolean;
+    loadedIds: Set<string> | null;
   } | null>(null);
   if (boundaryRef.current === null || boundaryRef.current.childId !== childId) {
-    boundaryRef.current = { childId, ids: undefined, loadSeen: false };
+    boundaryRef.current = { childId, ids: undefined, loadSeen: false, loadedIds: null };
   }
   if (useLocalBoundary && boundaryRef.current.ids === undefined) {
     boundaryRef.current.ids = readInheritedBoundary(childId);
   }
   if (loadingConversation) boundaryRef.current.loadSeen = true;
-  // Capture once, when the fork's load has actually completed — even if it is
-  // EMPTY (a parent with no history), so the side chat's first message isn't
-  // mistaken for inherited history and hidden. Snapshot the inherited item ids
-  // and persist so later mounts/reloads hide the same set, not new turns.
+  // Snapshot at hydration, before a slow metadata lookup can include new turns.
   if (
-    boundaryRef.current.ids === null &&
-    useLocalBoundary &&
+    filterHistory &&
+    !pending &&
+    boundaryRef.current.loadedIds === null &&
     boundaryRef.current.loadSeen &&
     !loadingConversation &&
     conversationLoadError === null
   ) {
-    const ids = new Set(
+    boundaryRef.current.loadedIds = new Set(
       blocks
         .map((b) => (b as CopiedBlock).ctx?.itemId)
         .filter((id): id is string => typeof id === "string"),
     );
-    boundaryRef.current.ids = ids;
-    writeInheritedBoundary(childId, ids);
+  }
+  if (
+    useLocalBoundary &&
+    boundaryRef.current.ids === null &&
+    boundaryRef.current.loadedIds !== null
+  ) {
+    boundaryRef.current.ids = boundaryRef.current.loadedIds;
+    writeInheritedBoundary(childId, boundaryRef.current.ids);
   }
   const inherited = boundaryRef.current.ids ?? null;
   const visibleBlocks = useMemo(() => {

@@ -698,6 +698,8 @@ def test_side_chat_follows_the_user_to_another_device(
         phone.reload()
         phone.get_by_role("button", name="Conversation actions").click()
         phone.get_by_role("menuitem", name="Side chats").click()
+        expect(drawer).to_be_visible()
+        expect(drawer.get_by_role("button", name="Browse side chats")).to_be_visible()
         expect(drawer.get_by_role("tab", name="Side chat 1", exact=True)).to_have_count(0)
 
     page.reload()

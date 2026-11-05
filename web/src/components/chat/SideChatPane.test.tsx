@@ -40,11 +40,15 @@ const mockSession = vi.hoisted(() => ({
 }));
 // A conversation id whose snapshot the mock should report as still loading.
 const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
+const failedSession = vi.hoisted(() => ({ id: null as string | null }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id?: string | null) => ({
-    session: { ...mockSession.snapshot, labels: mockSession.labels },
+    session:
+      id && id === failedSession.id
+        ? null
+        : { ...mockSession.snapshot, labels: mockSession.labels },
     isLoading: id != null && id === loadingSession.id,
-    error: null,
+    error: id && id === failedSession.id ? new Error("Snapshot unavailable") : null,
   }),
 }));
 vi.mock("@/hooks/useWorkingLabelTick", () => ({ useWorkingLabelTick: () => 0 }));
@@ -78,6 +82,7 @@ beforeEach(() => {
   mockSession.labels = {};
   mockSession.snapshot = {};
   loadingSession.id = null;
+  failedSession.id = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
   sendSlashCommand.mockReset().mockResolvedValue(undefined);
@@ -1447,6 +1452,40 @@ describe("history a side chat copied from its parent", () => {
     expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
     expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
   });
+
+  it.each([false, true])(
+    "does not hide a new turn when a delayed snapshot settles (failed: %s)",
+    (failed) => {
+      loadingSession.id = childId;
+      const entry = conversationRegistry.acquire(childId);
+      entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+      const { rerender } = renderPane(<SideChatPane childId={childId} />);
+      const copied = userItem(`${childId.slice(0, 12)}copy`, "resp_copy", "Copied reply");
+      act(() => entry.setState({ loadingConversation: false, blocks: itemsToBlocks([copied]) }));
+      act(() =>
+        entry.setState({
+          blocks: itemsToBlocks([
+            copied,
+            userItem("item_side", "resp_side", "A new side-chat turn"),
+          ]),
+        }),
+      );
+      loadingSession.id = null;
+      failedSession.id = failed ? childId : null;
+      rerender(<SideChatPane childId={childId} />);
+
+      expect(screen.getByText("A new side-chat turn")).toBeInTheDocument();
+      const saved = localStorage.getItem(`omnigent.sideChatInherited:${childId}`);
+      expect(saved === null ? null : JSON.parse(saved)).toEqual(failed ? null : [copied.id]);
+      if (failed) {
+        failedSession.id = null;
+        listSideChat();
+        rerender(<SideChatPane childId={childId} />);
+        expect(screen.queryByText("Copied reply")).toBeNull();
+        expect(screen.getByText("A new side-chat turn")).toBeInTheDocument();
+      }
+    },
+  );
 
   it("leaves a listed Codex side chat's own transcript alone", () => {
     listSideChat();

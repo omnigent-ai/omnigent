@@ -1117,7 +1117,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     try {
       const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "sidechat" });
 
-      fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+      fireEvent.pointerDown(await screen.findByRole("button", { name: "Open new" }), { button: 0 });
       fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
 
       const pendingId = screen.getByTestId("side-chat-pane-stub").firstChild?.textContent ?? "";
@@ -1563,7 +1563,7 @@ describe("WorkspacePanel mobile side chats", () => {
       await waitFor(() =>
         expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
       );
-      // Closing a tab says so, so the user's other devices drop it too.
+      // Closing a tab stops its session.
       expect(stop.mock.calls).toEqual([["conv_side_b"], ["conv_side_b"]]);
       expect(queuedAtStop).toEqual([[], []]);
       expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBeUndefined();

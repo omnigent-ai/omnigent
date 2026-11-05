@@ -24,6 +24,10 @@ function renderPicker() {
 }
 
 it("fetches 20 at a time on demand and opens only the selected side chat", async () => {
+  let finishPage!: (response: Response) => void;
+  const nextPage = new Promise<Response>((resolve) => {
+    finishPage = resolve;
+  });
   vi.mocked(authenticatedFetch)
     .mockResolvedValueOnce(
       new Response(
@@ -34,15 +38,7 @@ it("fetches 20 at a time on demand and opens only the selected side chat", async
         }),
       ),
     )
-    .mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({
-          data: [{ id: "two", title: "Second question", created_at: 200 }],
-          has_more: false,
-          last_id: "two",
-        }),
-      ),
-    );
+    .mockReturnValueOnce(nextPage);
   const onOpen = renderPicker();
   expect(authenticatedFetch).not.toHaveBeenCalled();
   const user = userEvent.setup();
@@ -51,6 +47,20 @@ it("fetches 20 at a time on demand and opens only the selected side chat", async
   expect(authenticatedFetch).toHaveBeenCalledWith("/v1/sessions/parent/side_chats?limit=20");
   expect(onOpen).not.toHaveBeenCalled();
   await user.click(screen.getByRole("menuitem", { name: "Next 20" }));
+  expect(screen.getByText("First question")).toBeInTheDocument();
+  expect(screen.getByRole("menuitem", { name: "Next 20" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  finishPage(
+    new Response(
+      JSON.stringify({
+        data: [{ id: "two", title: "Second question", created_at: 200 }],
+        has_more: false,
+        last_id: "two",
+      }),
+    ),
+  );
   await user.click(await screen.findByText("Second question"));
   expect(authenticatedFetch).toHaveBeenLastCalledWith(
     "/v1/sessions/parent/side_chats?limit=20&after=one",

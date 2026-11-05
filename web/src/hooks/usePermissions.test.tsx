@@ -135,6 +135,10 @@ describe("useCanEdit — safe defaults", () => {
 });
 
 describe("useCanStartSideChat", () => {
+  it.each([null, 4])("waits for the server before offering creation (level: %s)", (level) => {
+    setHooks({ session: null, sessionLoading: true });
+    expect(renderHook(() => useCanStartSideChat("conv_1", level)).result.current).toBe(false);
+  });
   it("follows the server, even against an admin's owner level", () => {
     setHooks({ session: { ...makeSession(4), sideChatAllowed: false } });
     expect(renderHook(() => useCanStartSideChat("conv_1", 4)).result.current).toBe(false);

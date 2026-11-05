@@ -131,6 +131,9 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
         match=remote_question.split(":")[0],
         required_tools=[],
     )
+    set_fallback_mock_llm(
+        mock_llm_server_url, remote_question.split(":")[0], "Answered on the other device."
+    )
     with user_page(browser, headers={}, **browser_context_args) as remote:
         remote.goto(f"{base_url}/c/{session_id}")
         _ensure_chat_view(remote)
@@ -152,6 +155,7 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     expect(settings).to_be_visible(timeout=30_000)
     settings.click()
     page.get_by_test_id("side-chat-model-edit").click()
+    page.get_by_placeholder("Search models…").fill("gpt-6-sol")
     option = page.locator('[data-model-id$="gpt-6-sol"]')
     selected_model = option.get_attribute("data-model-id")
     assert selected_model and selected_model != first_requests[0]["model"]
