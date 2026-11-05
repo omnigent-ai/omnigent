@@ -209,6 +209,7 @@ import { MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { useFileContent } from "@/hooks/useFileContent";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
@@ -272,6 +273,8 @@ interface RenderProps {
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  /** Esc closes through `onClose` too, as a workspace file tab does. */
+  escapeCloses?: boolean;
 }
 
 /**
@@ -296,6 +299,7 @@ function viewerTree({
   onCloseTab,
   sort,
   onNavigateTo,
+  escapeCloses = false,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -314,7 +318,7 @@ function viewerTree({
           conversationId="conv_1"
           path={path}
           onClose={onClose}
-          onCloseTab={onCloseTab}
+          onCloseTab={onCloseTab ?? (escapeCloses ? onClose : undefined)}
           sort={sort}
           onNavigateTo={onNavigateTo}
         />
@@ -1534,6 +1538,97 @@ describe("classifyAndRemapComments", () => {
 // full-screen overlay (non-frameless). On desktop the viewer is embedded in
 // the tabbed Files rail (frameless), where tabs own open/close, so the back
 // button is hidden there.
+
+describe("FileViewer Escape ownership", () => {
+  it("marks itself as owning Escape while Escape would close its tab", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(
+      <>
+        {viewerTree({ open: true, escapeCloses: true, syncUrl: false })}
+        <button type="button">Chat</button>
+      </>,
+    );
+    const viewer = screen.getByTestId("file-viewer");
+    expect(viewer).toHaveAttribute("data-escape-owner");
+
+    // Working in the chat leaves Escape to the chat.
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Chat" }));
+    expect(viewer).not.toHaveAttribute("data-escape-owner");
+    fireEvent.mouseDown(viewer);
+    expect(viewer).toHaveAttribute("data-escape-owner");
+
+    // With Find open, Escape closes Find first, so the viewer still owns it.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    // The menu took focus; the app's Find bar takes it back into the viewer.
+    fireEvent.mouseDown(viewer);
+    expect(viewer).toHaveAttribute("data-escape-owner");
+  });
+
+  it("leaves Escape to an open Find bar over a pending question", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onClose = vi.fn();
+    const onReject = vi.fn();
+    render(
+      <>
+        {viewerTree({ open: true, escapeCloses: true, syncUrl: false, onClose })}
+        <AskUserQuestionForm
+          elicitationId="elic_find"
+          questions={[
+            { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+          ]}
+          onSubmit={vi.fn()}
+          onReject={onReject}
+          keyboardActive
+        />
+      </>,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    // Focus leaves the search box for the file's text, still inside the viewer.
+    const viewer = screen.getByTestId("file-viewer");
+    fireEvent.mouseDown(screen.getByTestId("code-viewer"));
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(viewer).toHaveAttribute("data-escape-owner");
+    expect(onReject).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "leaves Escape to a question typed into after the viewer (syncUrl=%s)",
+    (syncUrl) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      const onClose = vi.fn();
+      const onReject = vi.fn();
+      render(
+        <>
+          {viewerTree({ open: true, escapeCloses: true, syncUrl, onClose })}
+          <AskUserQuestionForm
+            elicitationId="elic_viewer"
+            questions={[
+              { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+            ]}
+            onSubmit={vi.fn()}
+            onReject={onReject}
+            keyboardActive
+          />
+        </>,
+      );
+      const custom = screen.getByTestId("ask-user-question-custom-input");
+      fireEvent.focusIn(custom);
+      custom.focus();
+      fireEvent.keyDown(custom, { key: "Escape" });
+      expect(onReject).toHaveBeenCalledOnce();
+      expect(onClose).not.toHaveBeenCalled();
+    },
+  );
+
+  it("doesn't own Escape when Escape doesn't close it", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(viewerTree({ open: true }));
+    expect(screen.getByTestId("file-viewer")).not.toHaveAttribute("data-escape-owner");
+  });
+});
 
 describe("FileViewer header close affordance", () => {
   it.each([false, true])("invokes onClose for a mobile overlay (frameless=%s)", (frameless) => {

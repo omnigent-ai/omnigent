@@ -389,7 +389,8 @@ export function SideChatPane({
 
   return (
     <ConversationScopeContext.Provider value={childId}>
-      <div className="side-chat-backdrop flex h-full min-h-0 flex-col">
+      {/* Keys pressed in here belong to the side chat, not the parent's question. */}
+      <div className="side-chat-backdrop flex h-full min-h-0 flex-col" data-side-chat-pane="">
         <div
           ref={transcriptRef}
           className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
@@ -1043,6 +1044,7 @@ function SideChatComposer({
       )}
       <ChatComposer
         hasContent={!pending && files.length > 0}
+        data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         input={{
           ref: tailTextareaRef,

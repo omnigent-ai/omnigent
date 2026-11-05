@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vite
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { DictationSessionEvents } from "@/lib/dictation";
+import { AskUserQuestionForm } from "./blocks/AskUserQuestionForm";
 import { ComposerMicButton } from "./ComposerMicButton";
 
 // Controllable DictationSession stand-in for the server-mode tests. The
@@ -310,6 +311,34 @@ describe("ComposerMicButton", () => {
 
     expect(onTranscript).not.toHaveBeenCalled();
   });
+
+  it.each(["Enter", "Escape"])(
+    "keeps %s for dictation over a question that mounted first",
+    (keyName) => {
+      const onSubmit = vi.fn();
+      const onReject = vi.fn();
+      render(
+        <AskUserQuestionForm
+          elicitationId="elic_mic"
+          questions={[
+            { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+          ]}
+          onSubmit={onSubmit}
+          onReject={onReject}
+          keyboardActive
+        />,
+      );
+      render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={vi.fn()} />);
+      fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+      act(() => handlers.start?.({}));
+
+      fireEvent.keyDown(document.body, { key: keyName });
+
+      expect(stopSpy).toHaveBeenCalledTimes(1);
+      expect(onSubmit).not.toHaveBeenCalled();
+      expect(onReject).not.toHaveBeenCalled();
+    },
+  );
 
   it("does not intercept Enter/Esc when not listening", () => {
     const onVoiceDiscard = vi.fn();
