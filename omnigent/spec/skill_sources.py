@@ -855,7 +855,7 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     enabled = {key for key, on in enablement.items() if on}
     install_paths = _plugin_install_paths(ctx, enabled) if enabled else {}
     for key, launch_path in _claude_launch_plugin_paths(ctx).items():
-        # The launch reads settings from home, so this workspace's disables apply here.
+        # The probe runs from home and misses workspace settings, so re-apply their disables.
         if enablement.get(key, True):
             install_paths.setdefault(key, launch_path)
     out: list[SkillSpec] = []

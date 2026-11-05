@@ -467,6 +467,7 @@ async def test_session_skills_cached_per_session(
     The merged skills are cached per session: a second ``POST /skills/resolve``
     reuses the cache and does not re-run spec resolution / the host-skill
     filesystem walk. A missing name reuses it too unless a launch was still loading.
+    A list built with a warning expires sooner, so a later request walks again.
     """
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -484,17 +485,27 @@ async def test_session_skills_cached_per_session(
         return resolve_session_skills(spec, roots, *args, **kwargs)
 
     monkeypatch.setattr("omnigent.runner.app.resolve_session_skills", counted_walk)
+    runner_now = [time.monotonic()]
+    monkeypatch.setattr(
+        "omnigent.runner.app.time",
+        SimpleNamespace(monotonic=lambda: runner_now[0], time=time.time),
+    )
 
     async for c in _client(app):
         first = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
         second = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
         missing = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "unknown"})
+        cached_walks = len(walks)
+        runner_now[0] += runner_app._INCOMPLETE_SESSION_SKILLS_CACHE_TTL_SECONDS
+        expired = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
 
     assert first.status_code == 200
     assert second.status_code == 200
     assert missing.status_code == 404, missing.text
+    assert expired.status_code == 200
     # The first request populates the per-session cache; the later ones, even the miss, hit it.
-    assert len(walks) == 1, walks
+    assert cached_walks == 1, walks
+    assert len(walks) == (1 if source_warning is None else 2), walks
     assert resolver_calls == ["ag_x"]
 
 
@@ -780,7 +791,7 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
         )
         late = await c.post(late_url, json=review)
 
-    # A failed launch's list is reused briefly, then rebuilt when the launch is asked again.
+    # A failed launch is asked again once its backoff and its list's short expiry have passed.
     async for c in _client(app):
         runner_now = [time.monotonic()]
         monkeypatch.setattr(
@@ -790,11 +801,6 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
         fail.touch()
         configure_claude_launch(config_home, launches, script, args=("--", "failing"))
         failed = await c.post(failed_url, json=review)
-        backing_off = await c.post(failed_url, json=review)
-        later = home / ".claude" / "skills" / "later" / "SKILL.md"
-        later.parent.mkdir()
-        later.write_text(_skill_md("later", "Installed after the list was cached."))
-        reused = await c.post(failed_url, json=review)
         fail.unlink()
         now[0] += plugin_discovery.FAILED_LAUNCH_BACKOFF_S
         runner_now[0] += runner_app._INCOMPLETE_SESSION_SKILLS_CACHE_TTL_SECONDS
@@ -808,9 +814,6 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
     assert stalled.status_code == 404, stalled.text
     assert late.status_code == 200, late.text
     assert failed.status_code == 404, failed.text
-    assert backing_off.status_code == 404, backing_off.text
-    assert reused.status_code == 404, reused.text
-    assert reused.json()["available"] == ["local"]
     assert retried.status_code == 200, retried.text
     assert len(launches.read_text().splitlines()) == 4
 

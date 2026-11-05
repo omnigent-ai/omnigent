@@ -5,6 +5,7 @@ from pathlib import Path
 
 from omnigent.host.plugins import MAX_PLUGIN_NAME, _plugin_skills, _text
 from omnigent.spec.skill_sources import (
+    CLAUDE_LAUNCH_PLUGINS_LOADING,
     _plugin_install_paths,
     resolve_harness_skills,
     skill_source_context_from_env,
@@ -18,9 +19,14 @@ def read_skill_content(
 ) -> dict[str, str | bool]:
     ctx = skill_source_context_from_env(roots=(Path.home(),), harness=harness)
     if source_id is None:
-        # Only a skill not listed yet waits for a configured Claude launch to report.
-        skills = resolve_harness_skills(replace(ctx, wait_for_launch_plugins=False), harness)
-        if harness == "claude-native" and all(skill.name != name for skill in skills):
+        # Only a skill not listed while a configured Claude launch is loading waits for it.
+        problems: list[str] = []
+        skills = resolve_harness_skills(
+            replace(ctx, warnings=problems, wait_for_launch_plugins=False), harness
+        )
+        if CLAUDE_LAUNCH_PLUGINS_LOADING in problems and all(
+            skill.name != name for skill in skills
+        ):
             skills = resolve_harness_skills(ctx, harness)
     else:
         if harness != "claude-native":
