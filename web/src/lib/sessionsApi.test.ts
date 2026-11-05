@@ -1546,15 +1546,29 @@ describe("listFailedInputs", () => {
     expect(fetchMock).toHaveBeenCalledTimes(pages);
   });
 
-  it("rejects when the server has no failed-inputs route", async () => {
+  it.each([
+    { failure: "the server has no failed-inputs route", pagesRead: 0, status: 404 },
+    { failure: "a later page can't be read", pagesRead: 1, status: 503 },
+  ])("rejects when $failure", async ({ pagesRead, status }) => {
+    if (pagesRead > 0)
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          data: [
+            {
+              pending_id: "pending_1",
+              content: [{ type: "input_text", text: "first" }],
+              position: 1,
+            },
+          ],
+          next_cursor: "a1",
+        }),
+      );
     fetchMock.mockResolvedValueOnce(
-      mockJsonResponse(
-        { detail: "Not Found" },
-        { ok: false, status: 404, statusText: "Not Found" },
-      ),
+      mockJsonResponse({ detail: "Unavailable" }, { ok: false, status, statusText: "Unavailable" }),
     );
 
-    await expect(listFailedInputs("conv_abc")).rejects.toMatchObject({ status: 404 });
+    await expect(listFailedInputs("conv_abc")).rejects.toMatchObject({ status });
+    expect(fetchMock).toHaveBeenCalledTimes(pagesRead + 1);
   });
 });
 

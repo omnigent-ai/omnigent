@@ -108,6 +108,23 @@ describe("session drafts", () => {
     expect(reloaded.getDroppedDraftSends("conversation")).toEqual([]);
   });
 
+  it("keeps a files-only draft's startup inputs in memory but not across a reload", async () => {
+    const { addSessionDraftStartupInputs, getSessionDraft } = await import("./sessionDrafts");
+    const file = new File(["data"], "chart.png", { type: "image/png" });
+    addSessionDraftStartupInputs("conversation", "", ["pending_first"], [file]);
+    expect(getSessionDraft("conversation")).toEqual({
+      text: "",
+      files: [file],
+      startupInputIds: ["pending_first"],
+    });
+    expect(sessionStorage.getItem(key)).toBeNull();
+
+    // Storage keeps only drafts with text, so a reload offers the input again.
+    vi.resetModules();
+    const reloaded = await import("./sessionDrafts");
+    expect(reloaded.getSessionDraft("conversation")).toBeUndefined();
+  });
+
   it("replaces the startup inputs and sends a draft holds without changing its text", async () => {
     const {
       getDroppedDraftSends,
