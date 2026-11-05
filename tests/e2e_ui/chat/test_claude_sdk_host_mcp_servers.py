@@ -75,9 +75,14 @@ def _write_auth_status(home: Path, name: str, status: str) -> None:
 
 @contextlib.contextmanager
 def _claude_sdk_session(
-    client: httpx.Client, mock_url: str, name: str, host_id: str, workspace: Path
+    client: httpx.Client,
+    mock_url: str,
+    name: str,
+    host_id: str,
+    workspace: Path,
+    sandbox: str | None = None,
 ) -> Iterator[str]:
-    """Create a claude-sdk session on the host and delete it afterwards."""
+    """Create a claude-sdk session on the host, its CLI in ``sandbox`` if given."""
     yaml_text = (
         f"name: {name}\n"
         "prompt: You are a terse assistant.\n"
@@ -90,6 +95,15 @@ def _claude_sdk_session(
         "    api_key: mock-key\n"
         f"    base_url: {mock_url}\n"
     )
+    if sandbox is not None:
+        yaml_text += (
+            "os_env:\n"
+            "  type: caller_process\n"
+            "  cwd: .\n"
+            "  sandbox:\n"
+            f"    type: {sandbox}\n"
+            "    allow_network: true\n"
+        )
     created = post_session_bundle(
         client.post,
         "/v1/sessions",
@@ -271,6 +285,7 @@ def _hosted_session_page(
     name: str,
     *,
     command: list[str] | None = None,
+    sandbox: str | None = None,
 ) -> Iterator[tuple[httpx.Client, str, Page]]:
     """Open a claude-sdk session on an isolated host rooted at ``tmp_path / "host"``."""
     workspace = tmp_path / "workspace"
@@ -285,7 +300,9 @@ def _hosted_session_page(
             command=command,
             ready=lambda started: started.wait_online(client, timeout=120),
         ) as host,
-        _claude_sdk_session(client, mock_url, name, host.host_id, workspace) as session_id,
+        _claude_sdk_session(
+            client, mock_url, name, host.host_id, workspace, sandbox
+        ) as session_id,
     ):
         page = request.getfixturevalue("page")
         _skip_imports_review(page, host.host_id)
@@ -482,14 +499,20 @@ def _deployable_managed_mcp_path() -> Path:
 
 
 @pytest.mark.timeout(900)
+# Under bubblewrap the CLI has a private /tmp and a fixed /etc, so the relay bridge
+# and the managed config reach it only through its own launcher's grants.
+@pytest.mark.parametrize("sandbox", [None, "linux_bwrap"], ids=["unsandboxed", "bwrap"])
 def test_claude_sdk_session_under_managed_mcp_config_keeps_omnigent_tools(
     request: pytest.FixtureRequest,
     live_server: str,
     mock_llm_server_url: str,
     tmp_path: Path,
+    sandbox: str | None,
 ) -> None:
     if shutil.which("claude") is None:
         pytest.skip("needs the claude CLI")
+    if sandbox == "linux_bwrap" and (sys.platform != "linux" or not shutil.which("bwrap")):
+        pytest.skip("needs bubblewrap on Linux")
     managed = _deployable_managed_mcp_path()
     uid = uuid.uuid4().hex[:6]
     # Claude Code would refuse to start had the session passed --mcp-config, and a
@@ -522,7 +545,12 @@ def test_claude_sdk_session_under_managed_mcp_config_keeps_omnigent_tools(
         cleanup.callback(managed.unlink)
         _write_auth_status(home, _USER_SERVER, "sign_in_required")
         with _hosted_session_page(
-            request, live_server, mock_llm_server_url, tmp_path, f"sdk-managed-{uid}"
+            request,
+            live_server,
+            mock_llm_server_url,
+            tmp_path,
+            f"sdk-managed-{uid}",
+            sandbox=sandbox,
         ) as (client, session_id, page):
             _send(page, f"Say ack. {first}")
             _wait_reply(page, "ack one")
