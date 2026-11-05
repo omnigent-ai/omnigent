@@ -6564,6 +6564,7 @@ async def test_claude_native_overlapping_retries_persist_nothing_extra() -> None
         in_flight = pending_inputs.record(sid, [{"type": "input_text", "text": "continue"}])
         again = pending_inputs.record(sid, [{"type": "input_text", "text": "yes"}])
         second = asyncio.create_task(persist())
+        # custom-lint: disable-next=sleep-then-assert -- cover several busy rechecks
         await asyncio.sleep(0.05)
         assert not second.done(), "the retry must wait for the first attempt"
         store.release_first_append.set()
@@ -8677,6 +8678,241 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         assert attrs["reason_code"] == "databricks_sign_in_pending"
         assert attrs["lifecycle_response_id"] == "resp_fail"
     finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.fixture
+def _expiring_watch(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Make a queued input stale immediately and re-check a busy session quickly."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(pending_inputs, "_TTL_S", -1.0)
+    monkeypatch.setattr(pending_inputs, "TTL_S", -1.0)
+    monkeypatch.setattr(orchestration, "_UNRECORDED_INPUT_RECHECK_S", 0.01)
+    yield
+
+
+@pytest.mark.asyncio
+async def test_unmirrored_web_input_is_recorded_as_undelivered_once_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    _expiring_watch: None,
+) -> None:
+    """A web message the agent never mirrors is surfaced as undelivered, not dropped.
+
+    Without the watch the entry was evicted at the TTL with no card, so the
+    message vanished. The idle session now gets the same undelivered pair a
+    later mirror would have produced, and the message can be sent again.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import (
+        _expire_unrecorded_native_input,
+    )
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    monkeypatch.setattr(store, "list_pending_inputs", lambda _session_id: [], raising=False)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.live_status = "idle"
+    pending_id = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "deploy after the tests"}],
+        created_by="a@example.com",
+        stable_id="5e1c3a7f9b2d4e6a8c0f1b3d5e7a9c2f",
+    )
+    pending_inputs.watch_expiry(sid, pending_id)
+
+    try:
+        await _expire_unrecorded_native_input(store, conv, sid, pending_id)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        user_item, error_item = store.appended_items
+        assert user_item.data.content == [{"type": "input_text", "text": "deploy after the tests"}]
+        assert user_item.created_by == "a@example.com"
+        assert error_item.data.code == "native_prompt_not_recorded"
+        assert "never recorded this message in its transcript, so" in error_item.data.message
+        assert not pending_inputs.is_queued(sid, pending_id)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_busy_session_defers_the_undelivered_record_until_it_is_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    _expiring_watch: None,
+) -> None:
+    """A message still queued behind a running turn can be mirrored at its next tool call.
+
+    While the session is running the watch waits, so the late mirror still
+    settles the message normally. Only an idle session with the entry still
+    queued gets the undelivered record.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.common import _session_status_cache
+    from omnigent.server.routes._sessions.orchestration import (
+        _expire_unrecorded_native_input,
+    )
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    monkeypatch.setattr(store, "list_pending_inputs", lambda _session_id: [], raising=False)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_id = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "after the build"}], created_by="a@example.com"
+    )
+    pending_inputs.watch_expiry(sid, pending_id)
+    _session_status_cache[sid] = "running"
+
+    try:
+        watch = asyncio.create_task(
+            _expire_unrecorded_native_input(store, conv, sid, pending_id)  # type: ignore[arg-type]
+        )
+        # custom-lint: disable-next=sleep-then-assert -- cover several unknown-status rechecks
+        await asyncio.sleep(0.05)
+        assert store.appended_items == []
+        assert pending_inputs.is_queued(sid, pending_id)
+
+        _session_status_cache[sid] = "idle"
+        await asyncio.wait_for(watch, timeout=5)
+
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        assert not pending_inputs.is_queued(sid, pending_id)
+    finally:
+        _session_status_cache.pop(sid, None)
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_input_mirrored_before_expiry_ends_the_watch_without_a_record(
+    monkeypatch: pytest.MonkeyPatch,
+    _expiring_watch: None,
+) -> None:
+    """A message the agent did record is settled by its mirror, never reported undelivered."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    monkeypatch.setattr(store, "list_pending_inputs", lambda _session_id: [], raising=False)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_id = pending_inputs.record(sid, [{"type": "input_text", "text": "recorded"}])
+    orchestration._watch_unrecorded_native_input(store, conv, sid, pending_id)
+    watch = orchestration._detached_expiry_tasks[sid][pending_id]
+    assert pending_inputs.resolve_matching_text(sid, "recorded").matched is not None
+
+    try:
+        await asyncio.wait_for(
+            watch,
+            timeout=5,
+        )
+        assert store.appended_items == []
+        assert sid not in orchestration._detached_expiry_tasks
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_expiry_retries_a_failed_append_without_losing_the_watch(
+    monkeypatch: pytest.MonkeyPatch,
+    _expiring_watch: None,
+) -> None:
+    """A transient append failure leaves the same watched input for the retry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import (
+        _expire_unrecorded_native_input,
+    )
+
+    pending_inputs.reset_for_tests()
+    store = _FailOnceStore()
+    monkeypatch.setattr(store, "list_pending_inputs", lambda _session_id: [], raising=False)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.live_status = "idle"
+    pending_id = pending_inputs.record(sid, [{"type": "input_text", "text": "retry me"}])
+    pending_inputs.watch_expiry(sid, pending_id)
+
+    try:
+        await _expire_unrecorded_native_input(store, conv, sid, pending_id)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        assert not pending_inputs.is_queued(sid, pending_id)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_unknown_status_defers_expiry_until_idle_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+    _expiring_watch: None,
+) -> None:
+    """A missing local status is not evidence that another replica is idle."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import (
+        _expire_unrecorded_native_input,
+    )
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    monkeypatch.setattr(store, "list_pending_inputs", lambda _session_id: [], raising=False)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_id = pending_inputs.record(sid, [{"type": "input_text", "text": "wait for status"}])
+    pending_inputs.watch_expiry(sid, pending_id)
+
+    try:
+        watch = asyncio.create_task(
+            _expire_unrecorded_native_input(store, conv, sid, pending_id)  # type: ignore[arg-type]
+        )
+        # custom-lint: disable-next=sleep-then-assert -- cover several unknown-status rechecks
+        await asyncio.sleep(0.05)
+        assert store.appended_items == []
+        assert pending_inputs.is_queued(sid, pending_id)
+
+        conv.live_status = "idle"
+        await asyncio.wait_for(watch, timeout=5)
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relinquish_cancels_the_old_replicas_expiry_watch(
+    monkeypatch: pytest.MonkeyPatch,
+    _expiring_watch: None,
+) -> None:
+    """A handoff cannot let the old replica append a false undelivered pair."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    monkeypatch.setattr(store, "list_pending_inputs", lambda _session_id: [], raising=False)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.live_status = "running"
+    pending_id = pending_inputs.record(sid, [{"type": "input_text", "text": "handoff"}])
+    orchestration._watch_unrecorded_native_input(store, conv, sid, pending_id)
+    watch = orchestration._detached_expiry_tasks[sid][pending_id]
+
+    try:
+        orchestration._relinquish_session_live_state(sid)
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(watch, timeout=5)
+
+        assert store.appended_items == []
+        assert pending_inputs.is_queued(sid, pending_id)
+        assert sid not in orchestration._detached_expiry_tasks
+    finally:
+        orchestration._cancel_unrecorded_expiry_tasks(sid)
         pending_inputs.reset_for_tests()
 
 

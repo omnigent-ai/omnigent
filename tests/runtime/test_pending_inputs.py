@@ -180,6 +180,132 @@ def test_lifecycle_without_client_id_requires_its_exact_delivery_attempt(
     )
 
 
+def test_watched_entry_stays_matchable_after_the_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A watched entry is not dropped by the TTL, so a late mirror still drains it.
+
+    A busy session can record the message at a later tool boundary, after the
+    TTL has passed. Dropping it at the TTL would make that mirror unmatched.
+    """
+    conversation = "conv_watched"
+    clock = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock[0])
+    pending_id = pending_inputs.record(conversation, [{"type": "input_text", "text": "late"}])
+    pending_inputs.record(conversation, [{"type": "input_text", "text": "unwatched"}])
+    assert pending_inputs.watch_expiry(conversation, pending_id) is True
+
+    clock[0] += pending_inputs._TTL_S + 60
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conversation)] == [
+        pending_id
+    ]
+    matched = pending_inputs.resolve_matching_text(conversation, "late")
+    assert matched.matched is not None
+    assert matched.matched.pending_id == pending_id
+
+
+def test_expire_pending_input_returns_a_stale_watched_entry_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = "conv_expire"
+    clock = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock[0])
+    pending_id = pending_inputs.record(
+        conversation,
+        [{"type": "input_text", "text": "never mirrored"}],
+        created_by="a@example.com",
+    )
+    pending_inputs.watch_expiry(conversation, pending_id)
+
+    assert pending_inputs.expire_pending_input(conversation, pending_id) is None
+    assert pending_inputs.is_queued(conversation, pending_id)
+
+    clock[0] += pending_inputs._TTL_S + 1
+    drained = pending_inputs.expire_pending_input(conversation, pending_id)
+
+    assert drained is not None
+    assert drained.pending_id == pending_id
+    assert drained.created_by == "a@example.com"
+    assert pending_inputs.is_queued(conversation, pending_id)
+    assert pending_inputs.expire_pending_input(conversation, pending_id) is None
+    pending_inputs.release(conversation, drained)
+    assert pending_inputs.expire_pending_input(conversation, pending_id) is None
+    assert not pending_inputs.is_queued(conversation, pending_id)
+
+
+@pytest.mark.parametrize("settled_quietly", ["interrupted", "uncertain"])
+def test_expire_pending_input_drops_quietly_when_the_entry_was_settled_otherwise(
+    settled_quietly: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupted or positionally drained entry is never reported as undelivered."""
+    conversation = "conv_quiet"
+    clock = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock[0])
+    pending_id = pending_inputs.record(conversation, [{"type": "input_text", "text": "maybe"}])
+    pending_inputs.watch_expiry(conversation, pending_id)
+    if settled_quietly == "interrupted":
+        pending_inputs.mark_interrupted(conversation, [pending_id])
+    else:
+        pending_inputs.mark_uncertain(conversation)
+
+    clock[0] += pending_inputs._TTL_S + 1
+
+    assert pending_inputs.expire_pending_input(conversation, pending_id) is None
+    assert not pending_inputs.is_queued(conversation, pending_id)
+
+
+def test_expire_pending_input_drops_a_slash_command_quietly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slash command Claude runs itself is never recorded as an undelivered message."""
+    conversation = "conv_slash"
+    clock = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock[0])
+    pending_id = pending_inputs.record(conversation, [{"type": "input_text", "text": "/model"}])
+    pending_inputs.watch_expiry(conversation, pending_id)
+
+    clock[0] += pending_inputs._TTL_S + 1
+
+    assert pending_inputs.expire_pending_input(conversation, pending_id) is None
+    assert not pending_inputs.is_queued(conversation, pending_id)
+
+
+@pytest.mark.parametrize("text", ["!git status", "exit"])
+def test_expire_pending_input_drops_a_claude_command_quietly(
+    monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    """Claude's own shell and exit commands do not become undelivered prompts."""
+    conversation = "conv_claude_command"
+    clock = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock[0])
+    pending_id = pending_inputs.record(conversation, [{"type": "input_text", "text": text}])
+    pending_inputs.watch_expiry(conversation, pending_id)
+    clock[0] += pending_inputs._TTL_S + 1
+
+    assert (
+        pending_inputs.expire_pending_input(conversation, pending_id, claude_commands=True) is None
+    )
+    assert not pending_inputs.is_queued(conversation, pending_id)
+
+
+def test_expire_pending_input_keeps_claude_commands_for_other_harnesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-Claude harness does not inherit Claude's shell-command exclusion."""
+    conversation = "conv_other_harness"
+    clock = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock[0])
+    pending_id = pending_inputs.record(
+        conversation, [{"type": "input_text", "text": "!git status"}]
+    )
+    pending_inputs.watch_expiry(conversation, pending_id)
+    clock[0] += pending_inputs._TTL_S + 1
+
+    drained = pending_inputs.expire_pending_input(conversation, pending_id)
+    assert drained is not None
+    pending_inputs.release(conversation, drained)
+
+
 @pytest.fixture(autouse=True)
 def _clean_pending_inputs_index() -> Iterator[None]:
     """
