@@ -399,10 +399,88 @@ export function isSessionArchiving(id: string): boolean {
   return archivingSessions.has(id);
 }
 
+// A rename paints its title in place, but the search-indexed list keeps
+// serving the old title for a while; list rows still carrying a title the
+// rename replaced get the new one back until the reindex window passes.
+interface PendingRename {
+  title: string | null;
+  replaced: Set<string | null>;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+const pendingRenames = new Map<string, PendingRename>();
+
+function markSessionRenaming(
+  id: string,
+  title: string,
+  replaced: (string | null | undefined)[],
+): PendingRename {
+  const earlier = pendingRenames.get(id);
+  if (earlier?.timer !== undefined) clearTimeout(earlier.timer);
+  const entry: PendingRename = { title, replaced: new Set(earlier?.replaced) };
+  for (const value of replaced) if (value !== undefined) entry.replaced.add(value);
+  entry.replaced.delete(title);
+  pendingRenames.set(id, entry);
+  return entry;
+}
+
+function unmarkSessionRenaming(id: string, entry?: PendingRename): void {
+  const live = pendingRenames.get(id);
+  if (live === undefined || (entry !== undefined && live !== entry)) return;
+  if (live.timer !== undefined) clearTimeout(live.timer);
+  pendingRenames.delete(id);
+}
+
+function expireSessionRenaming(id: string, entry: PendingRename, title: string | null): void {
+  if (pendingRenames.get(id) !== entry) return;
+  entry.title = title;
+  entry.replaced.delete(title);
+  entry.timer = setTimeout(() => unmarkSessionRenaming(id, entry), DELETED_TOMBSTONE_MS);
+}
+
+function withPendingRenameTitles(
+  data: ConversationsInfiniteData | undefined,
+): ConversationsInfiniteData | undefined {
+  if (!data || pendingRenames.size === 0) return data;
+  let changed = false;
+  const pages = data.pages.map((page) => {
+    let pageChanged = false;
+    const rows = page.data.map((row) => {
+      const pending = pendingRenames.get(row.id);
+      if (!pending?.replaced.has(row.title ?? null)) return row;
+      pageChanged = true;
+      return { ...row, title: pending.title };
+    });
+    if (!pageChanged) return page;
+    changed = true;
+    return { ...page, data: rows };
+  });
+  return changed ? { ...data, pages } : data;
+}
+
+/**
+ * Keep pending renames in every session-list cache, whichever write (a list
+ * refetch, a stream frame, another mutation's rollback) brings an old title back.
+ *
+ * @returns The cache unsubscribe.
+ */
+export function keepPendingRenamesInLists(queryClient: QueryClient): () => void {
+  return queryClient.getQueryCache().subscribe((event) => {
+    if (pendingRenames.size === 0 || event.type !== "updated") return;
+    if (event.action.type !== "success") return;
+    const key = event.query.queryKey;
+    if (key[0] !== "conversations" && key[0] !== "project-sessions") return;
+    const data = event.query.state.data as ConversationsInfiniteData | undefined;
+    const next = withPendingRenameTitles(data);
+    if (next !== data) queryClient.setQueryData(key, next);
+  });
+}
+
 /** Wipe module-level tombstones between tests. */
 export function clearSessionTombstones(): void {
   unmarkSessionsDeleting();
   unmarkSessionsArchiving();
+  for (const id of [...pendingRenames.keys()]) unmarkSessionRenaming(id);
 }
 
 /**
@@ -877,7 +955,9 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
  * and loses — the sidebar would keep the old name until the next
  * reconciliation. List membership and ordering converge later via the
  * `WS /v1/sessions/updates` stream and the low-rate reconciliation
- * polls. Callers (the sidebar row) trigger this on blur / Enter in
+ * polls; for a minute after the rename, `keepPendingRenamesInLists`
+ * repaints the new title over any of those reads that still list the
+ * old one. Callers (the sidebar row) trigger this on blur / Enter in
  * the inline-edit input.
  */
 export function useRenameConversation() {
@@ -924,8 +1004,9 @@ export function useRenameConversation() {
         backfill: queryClient.getQueryData<Conversation | null>(["conversation-backfill", id])
           ?.title,
       };
+      const pending = markSessionRenaming(id, title, Object.values(previous));
       overlayTitle(id, title);
-      return previous;
+      return { ...previous, pending };
     },
     onError: (err, { id, title }, previous) => {
       // Restore the first title we managed to snapshot. A snapshotted null
@@ -937,6 +1018,11 @@ export function useRenameConversation() {
           : previous?.session !== undefined
             ? previous.session
             : previous?.backfill;
+      if (previous) {
+        // The restored title can be an earlier rename the list still lags behind.
+        if (restored === undefined) unmarkSessionRenaming(id, previous.pending);
+        else expireSessionRenaming(id, previous.pending, restored);
+      }
       if (restored !== undefined) overlayTitle(id, restored);
       // The inline editor has unmounted by the time the PATCH settles, so
       // (like a failed delete) the toast is the only failure signal — without
@@ -944,7 +1030,8 @@ export function useRenameConversation() {
       // and carry the server's reason so the user knows what to change.
       showToast(renameFailedToast(title, err), { duration: 0 });
     },
-    onSuccess: (updated) => {
+    onSuccess: (updated, _variables, context) => {
+      if (context) expireSessionRenaming(updated.id, context.pending, updated.title);
       // The PATCH bumps server `updated_at`, which the unseen tracker
       // would otherwise read as new messages even though the user
       // initiated this themselves. Anchor the seen-baseline to the

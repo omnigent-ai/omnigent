@@ -25,6 +25,7 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import {
   isSessionArchiving,
   isSessionDeleting,
+  keepPendingRenamesInLists,
   markRecentlyCreated,
 } from "@/hooks/useConversations";
 import {
@@ -269,6 +270,8 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     pushWatched();
   }, [pushWatched, activeId, sidebarIds]);
+
+  useEffect(() => keepPendingRenamesInLists(queryClient), [queryClient]);
 
   // Freeze the fallback slice key (the modal host over all seen sessions) once
   // the session list first loads, then start the updates socket — which keys

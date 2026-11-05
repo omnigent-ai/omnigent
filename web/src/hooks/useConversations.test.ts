@@ -41,6 +41,7 @@ import {
   fetchPinnedConversations,
   usePinnedConversations,
   clearSessionTombstones,
+  keepPendingRenamesInLists,
   markRecentlyCreated,
   clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
@@ -1449,9 +1450,11 @@ describe("useRenameConversation cache patching", () => {
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const rendered = renderHook(() => useRenameConversation(), { wrapper });
+    const stopGuard = keepPendingRenamesInLists(queryClient);
 
     rendered.result.current.mutate({ id: "conv_x", title: "New name" });
     await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+    stopGuard();
 
     // A failed rename must not leave the optimistic title stranded in the
     // cache — the row reverts to what it showed before.
@@ -1459,6 +1462,42 @@ describe("useRenameConversation cache patching", () => {
     expect(data!.pages[0].data.find((c) => c.id === "conv_x")!.title).toBe("Old name");
     const backfill = queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_x"]);
     expect(backfill!.title).toBe("Old name");
+  });
+
+  it("keeps a renamed title over list writes that still carry the old one", async () => {
+    vi.useFakeTimers();
+    const { queryClient, rendered } = seedAndRename();
+    const stopGuard = keepPendingRenamesInLists(queryClient);
+    const folderKey = ["project-sessions", "Sprint 42", "updated_at", false];
+    const write = (key: unknown[], title: string) =>
+      queryClient.setQueryData(key, infinitePage([conversation({ id: "conv_x", title })]));
+    const titleIn = (key: unknown[]) =>
+      queryClient.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0].title;
+    try {
+      await act(() => rendered.result.current.mutateAsync({ id: "conv_x", title: "New name" }));
+      fetchMock.mockResolvedValueOnce(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
+      await act(() =>
+        rendered.result.current
+          .mutateAsync({ id: "conv_x", title: "Newer name" })
+          .catch(() => undefined),
+      );
+      expect(titleIn(["conversations", "", false])).toBe("New name");
+
+      write(["conversations", "", false], "Old name");
+      write(folderKey, "Old name");
+      expect(titleIn(["conversations", "", false])).toBe("New name");
+      expect(titleIn(folderKey)).toBe("New name");
+      // A title set elsewhere is newer than the rename, not a lagging read.
+      write(["conversations", "", false], "Renamed elsewhere");
+      expect(titleIn(["conversations", "", false])).toBe("Renamed elsewhere");
+
+      act(() => vi.advanceTimersByTime(60_000));
+      write(["conversations", "", false], "Old name");
+      expect(titleIn(["conversations", "", false])).toBe("Old name");
+    } finally {
+      stopGuard();
+      vi.useRealTimers();
+    }
   });
 
   function renameAgainstFailure(response: Response) {

@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearSessionTombstones,
   useArchiveConversation,
+  useRenameConversation,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
@@ -553,6 +554,66 @@ describe("SessionUpdatesProvider list invalidation", () => {
       expect(listInvalidations(invalidate)).toHaveLength(firstRound);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("keeps a rename when the next reconcile still lists the old title", async () => {
+    // A hosted session list keeps serving the previous title for a while after a rename.
+    vi.useFakeTimers();
+    const laggingList: ConversationsInfiniteData = {
+      pages: [
+        {
+          data: [{ ...conv("conv_a"), title: "Old name" }, conv("conv_b")],
+          first_id: "conv_a",
+          last_id: "conv_b",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    };
+    const renamed = { ...conv("conv_a"), title: "New name", updated_at: 20 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => renamed }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const stopList = new QueryObserver(client, {
+      queryKey: ["conversations", "", false],
+      queryFn: async () => laggingList,
+      initialData: laggingList,
+      staleTime: Infinity,
+    }).subscribe(() => {});
+    try {
+      renderProvider(client, ["/"]);
+      const handler = frameHandler();
+      const rename = renderHook(() => useRenameConversation(), {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(65_000);
+      });
+
+      await act(async () => {
+        await rename.result.current.mutateAsync({ id: "conv_a", title: "New name" });
+      });
+      const titleOf = () =>
+        client
+          .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+          ?.pages[0].data.find((row) => row.id === "conv_a")?.title;
+      expect(titleOf()).toBe("New name");
+      act(() => handler({ type: "changed", items: [renamed] }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+
+      expect(titleOf()).toBe("New name");
+    } finally {
+      stopList();
+      client.clear();
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
     }
   });
 
