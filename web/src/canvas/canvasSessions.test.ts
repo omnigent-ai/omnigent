@@ -262,6 +262,16 @@ describe("applyLiveRows", () => {
     ]);
   });
 
+  it("applies a background-count-only change with the same timestamp and status", () => {
+    resolveViewer();
+    const row = (count: number) =>
+      session("a", 5, { status: "idle", background_task_count: count });
+    const busy = applyLiveRows([row(0)], new Map([["a", row(2)]]));
+    expect(busy.map((r) => r.background_task_count)).toEqual([2]);
+    const done = applyLiveRows(busy, new Map([["a", row(0)]]));
+    expect(done.map((r) => r.background_task_count)).toEqual([0]);
+  });
+
   it("returns an equal list when nothing renders differently", () => {
     const rows = [session("a", 5)];
     expect(applyLiveRows(rows, new Map([["a", session("a", 5)]]))).toEqual(rows);

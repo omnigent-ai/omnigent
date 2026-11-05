@@ -5085,21 +5085,9 @@ def _publish_status(
             _session_active_response_cache[session_id] = response_id
     else:
         _session_active_response_cache.pop(session_id, None)
-    # Keep the background-shell tally sticky alongside the status (see the
-    # cache's declaration). A ``Stop`` hook reports an authoritative count
-    # (``None`` is never sent by it), zero included: the cache keeps an
-    # explicit ``0`` so a finished shell drops the indicator and the list knows
-    # this replica's count beats a lagging row. ``None`` means "no information" (the
-    # trailing PTY-activity ``idle`` carries none) and must NOT wipe the
-    # count the Stop hook just published. A new ``running`` turn does NOT clear
-    # it either — background shells outlive turn boundaries, so the tally
-    # persists across the turn (the composer pill stays lit alongside the
-    # working shimmer) until the next authoritative count. A failure zeroes
-    # it: a dead session may never post another count to drop a stale tally.
-    # The per-shell detail rides in lockstep with the count: they arrive on the
-    # same Stop edge, so an authoritative count owns both caches (a positive
-    # count stores the detail — possibly empty when a runner sent count-only —
-    # and a ``0`` / failure clears it). ``None`` leaves both untouched.
+    # A Stop hook's count (zero included) owns both caches; ``None`` (PTY idle)
+    # leaves them. Shells outlive turns, so ``running`` keeps the tally, and a
+    # failure zeroes it because a dead session never reports again.
     reported_count = background_task_count
     if reported_count is None and status == "failed":
         reported_count = 0
