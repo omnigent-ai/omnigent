@@ -27,10 +27,10 @@ to customize.
   worker instructions when their text changes. Saving preserves both parts;
   reopening collapses and locks the system prompt again. Edit as prompt during creation uses the same
   separation. Unrecognized or ambiguous prompt formats remain fully editable
-  as a single Prompt field. For a recognized trigger creation call, **Harness for matching sessions**, Model,
+  as a single Instructions field in the modal (Prompt on the detail page). For a recognized trigger creation call, **Harness for matching sessions**, Model,
   and Effort update future worker instructions without rebinding the polling session.
   Existing worker sessions retain their settings. Customized or ambiguous creation calls
-  keep **Edit worker instructions**, which opens System prompt or the full Prompt. Clicking it again refocuses an already-open editor. Edits that remove the template signature or add
+  keep **Edit worker instructions**, which opens System prompt or the full Instructions field in the modal. Clicking it again refocuses an already-open editor. Edits that remove the template signature or add
   ambiguous section headings show a notice before saving as a single prompt.
   Your prompt must contain text; clearing it shows a required-field message.
   Explicitly clearing only the posting-rule body in System prompt is supported
@@ -77,11 +77,22 @@ to customize.
   controls hidden, including while customizing the system prompt. Unsupported
   polling offers an explicit Use server default action without exposing schedule
   fields or changing session mode.
-  Edit as prompt → New session each run restores the
+  Edit as prompt → turn **Start each run in a new session** on to restore the
   scheduling controls, even when the prompt retains its template signature.
   Replacing the template’s opening sentence also restores regular scheduling
   controls after saving and reopening.
-- `schedule`: the shared modal supports ten-minute connected-host schedules in
+- `schedule`: Repeat → Interval exposes the minute interval directly in the Time row,
+  with no timezone selector. Minute schedules preserve their timezone internally and
+  expose it beside the end date only when Ends is On date.
+  Interval is the first option and needs no popup or Apply step.
+  Hourly schedules accept a typed minute from 0 to 59 directly in the Time row.
+  Weekly schedules have a separate On row for their weekday selector.
+  Custom schedule expands inline into Repeats, Every, On (for weekly/monthly/yearly),
+  Month (yearly), and Start time rows. Changes apply to the form immediately;
+  saving the automation persists them, and cancelling discards them.
+  The initial interval respects the server, target, and session-mode minimum.
+  Custom schedule remains available for other recurrence patterns.
+  The shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
 - `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
@@ -91,10 +102,18 @@ to customize.
   keep one session, and editing keeps only the reset to a new session.
 - `responsive`: gallery items have icons, descriptions, access requirements,
   pointer cursors, and keyboard focus indicators. Continued trigger cadence is
-  fixed; other tasks expose schedule controls.
-  Host occupies a full row above Schedule. Project and Workspace (or Repository)
-  share a row on desktop and stack on narrow screens. Gallery cards use two
-  columns on desktop and one on narrow screens.
+  fixed; other tasks expose schedule controls. The modal opens with Instructions
+  focused and Name visible above it. Run on and session mode precede Repeat and
+  Time because both determine the minimum interval. Time and timezone are separate
+  controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
+  opens its searchable dropdown. Custom schedules use the same typed time input.
+  Advanced starts collapsed and contains Workspace or
+  Repository, Project, agent settings, and Ends. Name remains required and editable
+  without opening Advanced; changing instructions preserves it. Configured overrides
+  are summarized beside Advanced, and invalid
+  settings reveal their controls. Escape closes the active selector or folder browser
+  without discarding the automation draft. The footer stays visible while the form scrolls.
+  Gallery cards use two columns on desktop and one on narrow screens.
 
 ## How to get to it (user POV)
 
@@ -103,7 +122,9 @@ to customize.
 - **Your automations:** select a suggestion beneath the saved automations or
   empty-state message, with All selected and the search cleared.
 - **Creation modal:** click New automation on either tab to start from scratch.
-  With `automations_v2` on a server supporting sub-hour schedules, use Custom schedule → Minutes
+  Choose Run on and session mode above Repeat. Expand Advanced to change agent
+  settings or an ending. With `automations_v2` on a server supporting sub-hour
+  schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
@@ -137,8 +158,8 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
   covers new-session host creation, nine-minute rejection, reopening, and switching
   to continuation while preserving ten minutes. In either edit entry point, also
-  select a sandbox with Continue in the same session: ten minutes is valid;
-  selecting New session each run blocks saving until the interval reaches sixty.
+  select a sandbox and turn **Start each run in a new session** off: ten minutes is valid;
+  turning it on blocks saving until the interval reaches sixty.
   Repeat through the row menu and detail page. Without sub-hour support, the
   editor keeps the hourly minimum and displays saved minute rules without rewriting them.
 - `web/src/pages/TasksPage.test.tsx` covers populated and empty lists, search and
@@ -158,9 +179,9 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   It does not verify actual sandbox execution.
 - In the creation modal, choose a connected host and Git repository, enable
   Random worktree, save, and reopen Edit to confirm it stayed enabled. Run twice
-  with New session each run and check that the sessions have distinct worktree
-  paths. Disable the option and run again: the new session uses the selected
-  directory. With Continue in the same session, later runs reuse its worktree.
+  with **Start each run in a new session** on and check that the sessions have distinct
+  worktree paths. Disable the option and run again: the new session uses the selected
+  directory. With **Start each run in a new session** off, later runs reuse its worktree.
 - In any integration template, fill in the scope and session instructions, then
   expand Preview prompt. Toggle the link checkbox below the trigger and check
   that only the comment or reply step changes; sessions still start either way.
@@ -173,7 +194,7 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
   gallery remains directly clickable.
-- In create and edit setup, select Claude Code, Codex, Pi, and a permission-only
+- In create and edit setup, expand Advanced, then select Claude Code, Codex, Pi, and a permission-only
   harness such as Cursor. Check that only supported settings appear, model changes
   clear unsupported effort choices, and saved selections survive reopening. Repeat
   with a sandbox and an offline connected host; saved overrides remain readable.

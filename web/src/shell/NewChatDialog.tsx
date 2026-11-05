@@ -1198,6 +1198,7 @@ export function AgentHarnessPicker({
   sandboxSelected,
   allowCreateCustomAgent = true,
   onOpenChange,
+  open: controlledOpen,
   dropdownModal = false,
   contentClassName,
   contentAlign = "end",
@@ -1254,6 +1255,9 @@ export function AgentHarnessPicker({
   // `triggerLabelClassName`).
   /** Notified when the picker dropdown opens/closes. */
   onOpenChange?: (open: boolean) => void;
+  /** Controlled visibility; pair with onOpenChange and update open when it fires.
+   * Omit open to let the picker manage its own visibility. */
+  open?: boolean;
   /** Whether the dropdown blocks outside interaction. Defaults false so composer clicks reach their target. */
   dropdownModal?: boolean;
   /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
@@ -1309,7 +1313,15 @@ export function AgentHarnessPicker({
   entriesFailed?: boolean;
 }) {
   // Controlled so picking a row can close the menu.
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = controlledOpen ?? internalOpen;
+  const changeOpen = useCallback(
+    (next: boolean) => {
+      setInternalOpen(next);
+      onOpenChange?.(next);
+    },
+    [onOpenChange],
+  );
   // Tracks the last-applied openNonce so the imperative-open effect (below,
   // after the drill-in state it drives) skips the initial value.
   const appliedOpenNonce = useRef(0);
@@ -1422,6 +1434,8 @@ export function AgentHarnessPicker({
     if (!open) {
       setMenuPage(null);
       setConfigAgentId(null);
+      pendingConfigAgentId.current = null;
+      setFocusConfigAgentId(null);
     }
   }, [open]);
 
@@ -1447,8 +1461,8 @@ export function AgentHarnessPicker({
         pendingConfigAgentId.current = effectiveAgentId;
       }
     }
-    setOpen(true);
-  }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open]);
+    changeOpen(true);
+  }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open, changeOpen]);
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
@@ -1620,13 +1634,19 @@ export function AgentHarnessPicker({
         .map((agent) => agent.id),
     [visibleCuratedEntries, readyHarnessEntries, harnessEntries],
   );
-  // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
-  const prefetchedOpenNonce = useRef(0);
+  const prefetchedOpenNonce = useRef<number | null>(null);
   useEffect(() => {
-    if (!openNonce || openNonce === prefetchedOpenNonce.current) return;
+    if (!open) {
+      prefetchedOpenNonce.current = null;
+      return;
+    }
+    if (prefetchedOpenNonce.current === openNonce) return;
     prefetchedOpenNonce.current = openNonce;
+    for (const agent of [...harnessEntries, ...agentEntries]) {
+      void prefetchAvailableAgentDetails(agent, queryClient);
+    }
     onPrefetchEntries?.(prefetchIds);
-  }, [openNonce, onPrefetchEntries, prefetchIds]);
+  }, [open, openNonce, harnessEntries, agentEntries, queryClient, onPrefetchEntries, prefetchIds]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
@@ -1740,22 +1760,7 @@ export function AgentHarnessPicker({
       cyclePreview={cyclePreview}
       onDismissCyclePreview={onDismissCyclePreview}
       open={open}
-      onOpenChange={(next) => {
-        if (!next) {
-          pendingConfigAgentId.current = null;
-          setFocusConfigAgentId(null);
-        }
-        setOpen(next);
-        onOpenChange?.(next);
-        if (next) {
-          // Prefetch harness/description/skills for all session-discovered
-          // agents so the list is stable before the user reads it.
-          for (const agent of [...harnessEntries, ...agentEntries]) {
-            void prefetchAvailableAgentDetails(agent, queryClient);
-          }
-          onPrefetchEntries?.(prefetchIds);
-        }
-      }}
+      onOpenChange={changeOpen}
       trigger={{
         disabled: disabledLabel !== undefined || previewOnly || (!hasAgents && !curated),
         "aria-busy": loading || undefined,
@@ -1898,7 +1903,6 @@ export function AgentHarnessPicker({
                 onSelect={() => {
                   if (!autoHarnessAvailable) return;
                   onSelectAutoHarness?.();
-                  setOpen(false);
                 }}
                 className="mobile-touch-target group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
               >
