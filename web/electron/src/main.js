@@ -336,11 +336,8 @@ function databricksInternalFeaturesEnabled() {
 }
 
 /**
- * The Arca connect console: a shell-owned modal that asks consent by showing
- * the exact command, then streams its live output (replaces the bare native
- * dialog — same trust model, full transparency). The flow also de-duplicates:
- * a repeat connect while one is in flight re-focuses the existing console and
- * shares its outcome, so a refreshed SPA can always get back to it.
+ * Shell-owned modal consent starts a background Arca connect; a non-modal
+ * output window offers replay, Hide, and Stop. A repeat connect re-attaches.
  */
 const arcaIdentities = createArcaIdentityStore();
 
@@ -5121,36 +5118,38 @@ function registerIpc() {
     return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
 
-  // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
-  // the window's server as a host, by running `isaac omni host --background`
-  // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,
-  // the MDM flag re-checked HERE (the renderer is not trusted to have checked
-  // it), and user consent in the shell-owned connect console — which shows
-  // the exact command and streams its live output (arca_connect_window.js).
-  // A connect already in flight is re-surfaced (console focused, outcome
-  // shared), never refused; the runner itself enforces CONNECT_TIMEOUT_MS so
-  // a wedged command always settles. No local process outlives the connect:
-  // the enrolled host keeps its own outbound tunnel from the Arca box.
-  ipcMain.handle("omnigent:arca-connect", async (event) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("arca-connect is only available to a connected server page");
-    }
+  // Both Arca IPCs share this gate so neither can skip the MDM flag or the
+  // Databricks-managed server check; the renderer is not trusted to have checked.
+  const arcaConnectTarget = (event) => {
     if (!databricksInternalFeaturesEnabled()) {
-      return { ok: false, error: "Arca support is not enabled on this machine." };
+      return { error: "Arca support is not enabled on this machine." };
     }
     const serverUrl = senderServerUrl(event);
-    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    if (!serverUrl) return { error: "this window is not connected to a server" };
     // Same scope as get-desktop-features, re-checked here: an Arca box may
     // only be enrolled against a Databricks-managed server.
     if (!isDatabricksManagedServerUrl(serverUrl)) {
-      return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
+      return { error: "Arca hosts can only connect to Databricks-managed servers." };
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const arcaServerUrl = windowArcaServerUrl(win);
     // It can come from a settings label, so it passes the same gate.
     if (!isDatabricksManagedServerUrl(arcaServerUrl)) {
-      return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
+      return { error: "Arca hosts can only connect to Databricks-managed servers." };
     }
+    return { win, arcaServerUrl };
+  };
+
+  // SPA → `isaac omni host --background` on Arca after consent in the shell's
+  // console (arca_connect_window.js); a connect in flight is re-surfaced, never refused.
+  ipcMain.handle("omnigent:arca-connect", async (event, options) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("arca-connect is only available to a connected server page");
+    }
+    const target = arcaConnectTarget(event);
+    if (target.error) return { ok: false, error: target.error };
+    const { win, arcaServerUrl } = target;
+    const runOptions = { inlineProgress: options?.inlineProgress === true };
     // An auto-connect already running shares its outcome instead of racing a
     // second `arca ssh`.
     const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);
@@ -5162,7 +5161,7 @@ function registerIpc() {
         isPinnedOriginSender(event) &&
         !win.isDestroyed()
       ) {
-        return arcaConnectFlow.run(win, arcaServerUrl);
+        return arcaConnectFlow.run(win, arcaServerUrl, runOptions);
       }
       return status.state === "online"
         ? { ok: true, alreadyRunning: status.alreadyRunning === true, identity: status.identity }
@@ -5173,7 +5172,17 @@ function registerIpc() {
             authError: status.errorKind === "omni-auth",
           };
     }
-    return arcaConnectFlow.run(win, arcaServerUrl);
+    return arcaConnectFlow.run(win, arcaServerUrl, runOptions);
+  });
+
+  // SPA → re-surface this server's in-flight connect (consent sheet or output); never starts one.
+  ipcMain.handle("omnigent:arca-connect-output", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("arca-connect-output is only available to a connected server page");
+    }
+    const target = arcaConnectTarget(event);
+    if (target.error) return false;
+    return arcaConnectFlow.showOutput(target.win, target.arcaServerUrl);
   });
 
   let arcaExtendInFlight = false;

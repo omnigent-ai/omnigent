@@ -3,6 +3,7 @@ import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
 import { onRunnerHealthPolled, refreshRunnerHealth } from "@/hooks/useRunnerHealth";
+import { openArcaConnectOutput } from "@/lib/arcaConnectOutput";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -10,6 +11,7 @@ import {
   getHostIdentity,
   isElectronShell,
   supportsArcaConnect,
+  supportsArcaConnectOutput,
 } from "@/lib/nativeBridge";
 import { retrySession } from "@/lib/sessionsApi";
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
@@ -30,7 +32,9 @@ function launchKey(launch: SandboxStatus | null): string {
 /**
  * Reconnect this desktop's host directly; use the dialog for fallback and retry.
  * A resumable sandbox host is woken by the server instead, with its progress
- * shown by the composer's host status dot rather than a toast.
+ * shown by the composer's host status dot rather than a toast. An Arca connect
+ * also spins that dot; on shells that run it in the background after consent,
+ * its toast offers the live output.
  */
 export function useSessionReconnect({
   sessionId,
@@ -50,6 +54,7 @@ export function useSessionReconnect({
 }) {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
+  const [arcaConnecting, setArcaConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [canReconnectThisMachine, setCanReconnectThisMachine] = useState(false);
   const [canReconnectArca, setCanReconnectArca] = useState(false);
@@ -77,6 +82,7 @@ export function useSessionReconnect({
     setCanReconnectThisMachine(false);
     setCanReconnectArca(false);
     setReconnecting(false);
+    setArcaConnecting(false);
     setSandboxWake(null);
     return () => {
       if (inFlight.current?.progressToast !== undefined) {
@@ -99,10 +105,22 @@ export function useSessionReconnect({
     // A failed attempt opens the dialog, which needs the Arca action for its retry.
     setCanReconnectArca(true);
     setReconnecting(true);
+    setArcaConnecting(true);
     setError(null);
     try {
-      operation.progressToast = toast.loading("Reconnecting Arca…");
-      const result = await connectArcaHost();
+      operation.progressToast = supportsArcaConnectOutput()
+        ? toast.loading("Reconnecting Arca…", {
+            action: {
+              label: "Show output",
+              onClick: (event) => {
+                // Keep the progress toast; the output opens in its own window.
+                event.preventDefault();
+                void openArcaConnectOutput();
+              },
+            },
+          })
+        : toast.loading("Reconnecting Arca…");
+      const result = await connectArcaHost({ inlineProgress: true });
       if (inFlight.current !== operation) return;
       if (!result.ok) {
         if (!result.canceled && !result.shownInConsole) {
@@ -135,6 +153,7 @@ export function useSessionReconnect({
         if (operation.progressToast !== undefined) toast.dismiss(operation.progressToast);
         inFlight.current = null;
         setReconnecting(false);
+        setArcaConnecting(false);
       }
     }
   }, [hostId, runsArcaConnect]);
@@ -279,6 +298,11 @@ export function useSessionReconnect({
     reconnectsArca: runsArcaConnect(),
     /** A sandbox wake is running or its host has not yet been seen online. */
     sandboxStarting: sandboxWake !== null,
+    /** The desktop's Arca connect for this session's host is running. */
+    arcaConnecting,
+    /** Opens the running Arca connect's output; absent when the shell can't show it. */
+    showArcaOutput:
+      arcaConnecting && supportsArcaConnectOutput() ? openArcaConnectOutput : undefined,
     dialogOpen,
     setDialogOpen,
     localReconnect: canReconnectThisMachine

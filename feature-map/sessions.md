@@ -106,7 +106,8 @@ the header menu), and each place is a separate entry point.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app reconnects a local host
   itself, and starts an Arca host recognized by its saved ID or CLI-seeded name
-  from the same action (the desktop's Arca console still asks before running).
+  from the same action (the desktop's Arca consent sheet still asks before
+  running; the connect then runs in the background with its output on request).
   A failed attempt opens the dialog for retry; so does an Arca connect after
   which the server still lists the session's host offline (usually because Arca
   came back as a different host), with **Switch host** to move the session.
@@ -387,8 +388,12 @@ sandbox-profile picker and source-profile default for participating providers.
 The dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
 when a local session is stranded). In the desktop app, **Reconnect host** acts
-directly for this machine or a recognized Arca host; Arca's connect console
-asks for confirmation before running, and a failed attempt opens the dialog,
+directly for this machine or a recognized Arca host; Arca's consent sheet
+asks for confirmation before running. The connect then runs in the background:
+the chat stays usable, the composer's host dot spins, and both the
+**Reconnecting Arca…** toast and the host menu offer **Show output** (**Show
+connection output** in the menu) to open its live output in a separate window.
+A failed attempt opens the dialog,
 whose **Reconnect Arca** action retries. Success is reported only once the
 server lists the session's own host online; otherwise the dialog says the host
 is still offline and points to **Switch host** in case Arca came back as a
@@ -903,13 +908,15 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,
   `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_reconnects_arca_from_current_chat`,
+  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_arca_reconnect_runs_in_background_with_output_on_request`,
   `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_arca_reconnect_failure_offers_retry`,
   `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_send_reconnects_offline_arca_then_sends`
   drive the real SPA and server with an injected desktop bridge and offline host
   responses. The Arca journeys cover a remembered host and a CLI-seeded host
-  with no saved ID; they check one-action start, progress, failure and retry,
-  and a message that waits for the host, not live SSH or the desktop's consent
-  console.
+  with no saved ID; they check one-action start, progress, a usable chat with
+  Show output during the connect, failure and retry, and a message that waits
+  for the host, not live SSH or the desktop's consent sheet and output window
+  (see `desktop-arca-connect` in [login and host auth](./login-and-host-auth.md)).
 - **`reconnect`, asleep sandbox:**
   `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_wakes_asleep_sandbox_in_status_dot`
   drives the real SPA and server with the session patched to an asleep Arclet

@@ -309,6 +309,7 @@ import {
 } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+import { openArcaConnectOutput } from "@/lib/arcaConnectOutput";
 import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -319,6 +320,7 @@ import {
   hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
+  supportsArcaConnectOutput,
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import { SshConnectForm, useSshConnectAvailable } from "./SshConnectForm";
@@ -2502,6 +2504,12 @@ export function NewChatLandingScreen() {
   const [arcaEnabled, setArcaEnabled] = useState(false);
   const [arcaPreviewRecovery, setArcaPreviewRecovery] = useState(false);
   const [connectingArca, setConnectingArca] = useState(false);
+  // The shell's connect is running; after it, the host may still be registering.
+  const [arcaBridgeRunning, setArcaBridgeRunning] = useState(false);
+  // Arca stays the intended target until the connect ends or the user picks another.
+  const [arcaTargetPending, setArcaTargetPending] = useState(false);
+  // Bumped by every host or sandbox pick, so a slow connect can't override a newer one.
+  const hostChoiceRef = useRef(0);
   const [arcaError, setArcaError] = useState<string | null>(null);
   // Mirrors pendingConnectRef for the Arca row: connect after the menu closes.
   const pendingArcaConnectRef = useRef(false);
@@ -5200,6 +5208,7 @@ export function NewChatLandingScreen() {
         message: pickerSelectionError ?? sandboxCatalogError ?? sandboxProfileError,
       };
     }
+    if (arcaTargetPending) return { field: "other", message: "Waiting for Arca to connect…" };
     if (sandboxSelected) {
       if (sandboxRepoOverCap) {
         return {
@@ -5281,25 +5290,28 @@ export function NewChatLandingScreen() {
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
+  function landingHostLabel(): string {
+    if (connectingThisMachine) return "Connecting…";
+    if (arcaTargetPending) return "Connecting to Arca…";
+    if (sandboxSelected) return selectedSandboxLabel;
+    return selectedHostDisplayName ?? "No host selected";
+  }
   // The Arca row is remembered by host ID, never inferred from its machine hostname.
   // A recovery-capable desktop restores preview identity on demand. Older
   // shells keep Run on Arca visible because reconnecting is their only recovery.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
   const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
   const showArcaOption = arcaEnabled && (!arcaPreviewRecovery || !arcaHostOnline);
-  const hostLabel = connectingThisMachine
-    ? "Connecting…"
-    : connectingArca
-      ? "Connecting to Arca…"
-      : sandboxSelected
-        ? selectedSandboxLabel
-        : (selectedHostDisplayName ?? "No host selected");
+  const hostLabel = landingHostLabel();
+  // Once the user picks another host, the remaining host poll is no longer theirs.
+  const showArcaProgress =
+    connectingArca && (arcaBridgeRunning || arcaTargetPending) && supportsArcaConnectOutput();
   const hostTooltipRows =
-    connectingThisMachine || connectingArca
+    connectingThisMachine || arcaTargetPending
       ? [
           {
             label: "Host",
-            value: connectingArca ? "Arca" : localMachineLabel(navigator.userAgent),
+            value: connectingThisMachine ? localMachineLabel(navigator.userAgent) : "Arca",
           },
           { label: "Status", value: "Connecting…" },
         ]
@@ -5423,6 +5435,8 @@ export function NewChatLandingScreen() {
   };
 
   function selectHost(hostId: string) {
+    hostChoiceRef.current += 1;
+    setArcaTargetPending(false);
     // Persist the explicit pick even when it matches the current selection, so
     // clicking the auto-selected host still records it as the sticky default
     // for the next visit.
@@ -5444,6 +5458,8 @@ export function NewChatLandingScreen() {
   }
 
   function selectSandbox(provider: string | null = null) {
+    hostChoiceRef.current += 1;
+    setArcaTargetPending(false);
     if (provider !== sandboxProvider) setSandboxProfile(null);
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
@@ -5505,18 +5521,28 @@ export function NewChatLandingScreen() {
   async function connectArca() {
     if (connectingArca) return;
     setConnectingArca(true);
+    setArcaBridgeRunning(true);
+    setArcaTargetPending(true);
+    const choiceAtStart = hostChoiceRef.current;
+    // A host or sandbox the user picked during the connect wins over Arca.
+    const choiceMoved = () => hostChoiceRef.current !== choiceAtStart;
+    const selectArcaHost = (hostId: string) => {
+      if (!choiceMoved()) selectHost(hostId);
+    };
     setArcaError(null);
     const onlineBefore = new Set(
       allHosts.filter((h) => h.status === "online").map((h) => h.host_id),
     );
     try {
-      const res = await connectArcaHost();
+      const res = await connectArcaHost({ inlineProgress: true }).finally(() =>
+        setArcaBridgeRunning(false),
+      );
       if (!res.ok) {
         // Deliberate dismissals are not failures, and failures the connect
         // console already displayed must not be echoed as a second error —
         // this strip is only for gate failures with no other surface (e.g.
         // the feature being unavailable to this window).
-        if (!res.canceled && !res.shownInConsole) {
+        if (!res.canceled && !res.shownInConsole && !choiceMoved()) {
           setArcaError(res.error ?? "Couldn't connect to Arca.");
         }
         return;
@@ -5524,7 +5550,7 @@ export function NewChatLandingScreen() {
       if (res.identity) {
         writeArcaHostId(res.identity.hostId);
         await queryClient.invalidateQueries({ queryKey: ["hosts"] });
-        selectHost(res.identity.hostId);
+        selectArcaHost(res.identity.hostId);
         return;
       }
       // The box's daemon was already connected — its host has been in the
@@ -5539,6 +5565,8 @@ export function NewChatLandingScreen() {
       // Sequential by design: each poll must see the previous one's result.
       /* oxlint-disable no-await-in-loop */
       const deadline = Date.now() + 30_000;
+      // Polling continues after the user picks another host so the Arca row
+      // is still tagged; only the selection and the soft-fail are skipped.
       while (Date.now() < deadline) {
         const hostList = await queryClient.fetchQuery({
           queryKey: ["hosts", { includeSandbox: false }],
@@ -5549,7 +5577,7 @@ export function NewChatLandingScreen() {
         if (fresh) {
           // Remember which host is the Arca box so the picker can tag it.
           writeArcaHostId(fresh.host_id);
-          selectHost(fresh.host_id);
+          selectArcaHost(fresh.host_id);
           return;
         }
         await new Promise((resolve) => {
@@ -5557,6 +5585,7 @@ export function NewChatLandingScreen() {
         });
       }
       /* oxlint-enable no-await-in-loop */
+      if (choiceMoved()) return;
       // The daemon started but its registration hasn't landed — soft-fail so
       // the user knows to look at the host list rather than re-running.
       setArcaError(
@@ -5564,6 +5593,7 @@ export function NewChatLandingScreen() {
       );
     } finally {
       setConnectingArca(false);
+      setArcaTargetPending(false);
     }
   }
 
@@ -7595,6 +7625,32 @@ export function NewChatLandingScreen() {
               >
                 Try again
               </button>
+            </p>
+          )}
+
+          {/* Shells that connect in the background after consent leave the
+              page usable, so its progress and output live here. */}
+          {showArcaProgress && (
+            <p
+              className="flex flex-wrap items-center gap-x-1.5 text-sm text-muted-foreground"
+              role="status"
+              data-testid="new-chat-landing-arca-progress"
+            >
+              {arcaBridgeRunning ? (
+                <>
+                  <span>Connecting to Arca… A cold instance can take a few minutes to start.</span>
+                  <button
+                    type="button"
+                    className="underline underline-offset-2 hover:no-underline"
+                    onClick={() => void openArcaConnectOutput()}
+                    data-testid="new-chat-landing-arca-show-output"
+                  >
+                    Show output
+                  </button>
+                </>
+              ) : (
+                <span>Arca started. Waiting for its host to come online…</span>
+              )}
             </p>
           )}
 

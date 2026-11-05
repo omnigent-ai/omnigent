@@ -99,13 +99,16 @@ export function HostBadge({
   sessionId,
   onReconnect,
   starting = false,
+  onShowStartOutput,
   appearance = "status",
   readOnly = false,
 }: {
   sessionId: string;
   onReconnect?: () => void;
-  /** The session's sandbox is being woken; the composer dot spins until it is online. */
+  /** This tab is waking the sandbox or connecting Arca; the composer dot spins until online. */
   starting?: boolean;
+  /** Opens the live output of the start this tab is running, shown in the composer menu. */
+  onShowStartOutput?: () => void;
   appearance?: "status" | "composer";
   readOnly?: boolean;
 }) {
@@ -237,6 +240,11 @@ export function HostBadge({
             {reconnectable && (
               <DropdownMenuItem disabled={readOnly} onSelect={onReconnect}>
                 Reconnect host
+              </DropdownMenuItem>
+            )}
+            {localWakeRunning && onShowStartOutput && (
+              <DropdownMenuItem onSelect={onShowStartOutput}>
+                Show connection output
               </DropdownMenuItem>
             )}
             {!readOnly && (canSwitch || switchHostDisabledReason) && (

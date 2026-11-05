@@ -844,6 +844,43 @@ describe("HostBadge during a sandbox launch", () => {
     },
   );
 
+  it("offers the connection output of an Arca connect running in the background", async () => {
+    const user = userEvent.setup();
+    const showOutput = vi.fn();
+    useHostsMock.mockReturnValue({ data: [host({ name: "isaac-arca", status: "offline" })] });
+    useSessionMock.mockReturnValue({ session: { hostId: "host_a1b2" } });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const { rerender } = render(
+      <HostBadge
+        sessionId="conv_1"
+        appearance="composer"
+        onReconnect={vi.fn()}
+        starting
+        onShowStartOutput={showOutput}
+      />,
+    );
+    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "starting");
+    await user.click(screen.getByTestId("composer-host-select"));
+    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("menuitem", { name: "Show connection output" }));
+    expect(showOutput).toHaveBeenCalledOnce();
+
+    // Without a running start (or a shell that can show it) the item is absent.
+    rerender(
+      <HostBadge
+        sessionId="conv_1"
+        appearance="composer"
+        onReconnect={vi.fn()}
+        onShowStartOutput={showOutput}
+      />,
+    );
+    await user.click(screen.getByTestId("composer-host-select"));
+    expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("menuitem", { name: "Show connection output" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("doesn't spin a dot for a wake when no host is bound", () => {
     useSessionMock.mockReturnValue({ session: { hostId: null } });
     render(<HostBadge sessionId="conv_1" appearance="composer" starting />);

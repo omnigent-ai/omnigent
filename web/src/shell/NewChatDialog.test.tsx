@@ -145,6 +145,8 @@ import {
   getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
+  showArcaConnectOutput,
+  supportsArcaConnectOutput,
 } from "@/lib/nativeBridge";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readHarnessOptions } from "@/lib/modePreferences";
@@ -249,6 +251,8 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   controlHost: vi.fn(async () => ({ ok: false })),
   getDesktopFeatures: vi.fn(async () => null),
   connectArcaHost: vi.fn(async () => ({ ok: false })),
+  supportsArcaConnectOutput: vi.fn(() => false),
+  showArcaConnectOutput: vi.fn(async () => false),
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
@@ -3680,7 +3684,8 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
       arcaPreviewRecovery: true,
     });
     vi.mocked(connectArcaHost).mockClear();
-    vi.mocked(fetchHosts).mockClear();
+    // Tests override the host list; start each one from the empty default.
+    vi.mocked(fetchHosts).mockReset().mockResolvedValue([]);
   });
   afterEach(() => {
     cleanup();
@@ -3771,6 +3776,183 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     );
     expect(connectArcaHost).toHaveBeenCalledTimes(1);
     expect(fetchHosts).not.toHaveBeenCalled();
+  });
+
+  it("shows a background Arca connect's progress inline with its output on request", async () => {
+    vi.mocked(supportsArcaConnectOutput).mockReturnValue(true);
+    let finishConnect!: (result: Awaited<ReturnType<typeof connectArcaHost>>) => void;
+    vi.mocked(connectArcaHost).mockReturnValue(
+      new Promise((resolve) => {
+        finishConnect = resolve;
+      }),
+    );
+    try {
+      renderLanding();
+      await openHostMenu();
+      fireEvent.click(await screen.findByText("Run on Arca"));
+      const progress = await screen.findByTestId("new-chat-landing-arca-progress");
+      expect(progress).toHaveTextContent(/Connecting to Arca… A cold instance can take a few/);
+      expect(connectArcaHost).toHaveBeenCalledWith({ inlineProgress: true });
+      fireEvent.click(screen.getByTestId("new-chat-landing-arca-show-output"));
+      expect(showArcaConnectOutput).toHaveBeenCalledOnce();
+
+      finishConnect({ ok: false, canceled: true });
+      await waitFor(() =>
+        expect(screen.queryByTestId("new-chat-landing-arca-progress")).toBeNull(),
+      );
+    } finally {
+      vi.mocked(supportsArcaConnectOutput).mockReturnValue(false);
+    }
+  });
+
+  it("leaves progress to an older shell's own console", async () => {
+    let finishConnect!: (result: Awaited<ReturnType<typeof connectArcaHost>>) => void;
+    vi.mocked(connectArcaHost).mockReturnValue(
+      new Promise((resolve) => {
+        finishConnect = resolve;
+      }),
+    );
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByText("Run on Arca"));
+    await waitFor(() => expect(connectArcaHost).toHaveBeenCalledOnce());
+    expect(screen.queryByTestId("new-chat-landing-arca-progress")).toBeNull();
+    await act(async () => {
+      finishConnect({ ok: false, canceled: true });
+    });
+  });
+
+  /** Start Run on Arca with a connect the test finishes; the first host starts selected. */
+  async function startPendingArcaConnect(hosts: Host[] = [host("online")]) {
+    mockHosts(hosts);
+    let finishConnect!: (result: Awaited<ReturnType<typeof connectArcaHost>>) => void;
+    vi.mocked(connectArcaHost).mockReturnValue(
+      new Promise((resolve) => {
+        finishConnect = resolve;
+      }),
+    );
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Draft while Arca starts" },
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    await openHostMenu();
+    fireEvent.click(await screen.findByText("Run on Arca"));
+    await waitFor(() => expect(connectArcaHost).toHaveBeenCalledOnce());
+    return {
+      finish: (result: Awaited<ReturnType<typeof connectArcaHost>>) => finishConnect(result),
+    };
+  }
+
+  it("holds Send while Arca is the pending target instead of using the previous host", async () => {
+    const connect = await startPendingArcaConnect();
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    expect(chip).toHaveAccessibleName(/Connecting to Arca/);
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Draft while Arca starts");
+
+    await act(async () => {
+      connect.finish({ ok: false, canceled: true });
+    });
+    expect(chip).toHaveAccessibleName(/This machine/);
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+  });
+
+  it.each([
+    {
+      completion: "with the host's identity",
+      result: {
+        ok: true,
+        identity: { serverUrl: "https://server.databricks.com/omnigent", hostId: "arca-1" },
+      },
+      taggedArcaHost: "arca-1",
+    },
+    // Without an identity the landing polls for the new host and still tags it.
+    { completion: "through host polling", result: { ok: true }, taggedArcaHost: "arca-1" },
+  ])(
+    "keeps a host picked during the connect when it finishes $completion",
+    async ({ result, taggedArcaHost }) => {
+      const hosts = [host("online"), host("online", 2)];
+      vi.mocked(fetchHosts).mockResolvedValue([
+        ...hosts,
+        { host_id: "arca-1", name: "arca-box", owner: "me", status: "online" },
+      ]);
+      const connect = await startPendingArcaConnect(hosts);
+      await openHostMenu();
+      fireEvent.click(await screen.findByTestId("new-chat-landing-host-host_2"));
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/),
+      );
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_2");
+
+      await act(async () => {
+        connect.finish(result);
+      });
+      await waitFor(() =>
+        expect(screen.queryByTestId("new-chat-landing-arca-progress")).toBeNull(),
+      );
+      expect(localStorage.getItem("omnigent:arca-host-id")).toBe(taggedArcaHost);
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_2");
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/);
+      expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
+    },
+  );
+
+  it("hides the Arca progress once another host is picked during the host poll", async () => {
+    vi.mocked(supportsArcaConnectOutput).mockReturnValue(true);
+    vi.mocked(fetchHosts).mockReturnValue(new Promise(() => {}));
+    try {
+      const hosts = [host("online"), host("online", 2)];
+      const connect = await startPendingArcaConnect(hosts);
+      await act(async () => {
+        connect.finish({ ok: true });
+      });
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-arca-progress")).toHaveTextContent(
+          "Arca started. Waiting for its host to come online…",
+        ),
+      );
+      await openHostMenu();
+      fireEvent.click(await screen.findByTestId("new-chat-landing-host-host_2"));
+      await waitFor(() =>
+        expect(screen.queryByTestId("new-chat-landing-arca-progress")).toBeNull(),
+      );
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/);
+    } finally {
+      vi.mocked(supportsArcaConnectOutput).mockReturnValue(false);
+    }
+  });
+
+  it("drops Show output once the connect finished while its host registers", async () => {
+    vi.mocked(supportsArcaConnectOutput).mockReturnValue(true);
+    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
+    let finishPoll!: (hosts: Host[]) => void;
+    vi.mocked(fetchHosts).mockReturnValue(
+      new Promise((resolve) => {
+        finishPoll = resolve;
+      }),
+    );
+    try {
+      renderLanding();
+      await openHostMenu();
+      fireEvent.click(await screen.findByText("Run on Arca"));
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-arca-progress")).toHaveTextContent(
+          "Arca started. Waiting for its host to come online…",
+        ),
+      );
+      expect(screen.queryByTestId("new-chat-landing-arca-show-output")).toBeNull();
+
+      finishPoll([{ host_id: "arca-1", name: "arca-box", owner: "me", status: "online" }]);
+      await waitFor(() =>
+        expect(screen.queryByTestId("new-chat-landing-arca-progress")).toBeNull(),
+      );
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1");
+    } finally {
+      vi.mocked(supportsArcaConnectOutput).mockReturnValue(false);
+    }
   });
 
   it("keeps reconnect usable after a console failure without changing host selection", async () => {

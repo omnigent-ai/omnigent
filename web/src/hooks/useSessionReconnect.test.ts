@@ -12,7 +12,9 @@ import {
   controlHost,
   getHostIdentity,
   isElectronShell,
+  showArcaConnectOutput,
   supportsArcaConnect,
+  supportsArcaConnectOutput,
 } from "@/lib/nativeBridge";
 import type { ArcaConnectResult, HostActionResult, HostIdentity } from "@/lib/nativeBridge";
 import { retrySession } from "@/lib/sessionsApi";
@@ -43,7 +45,9 @@ vi.mock("@/lib/nativeBridge", () => ({
   controlHost: vi.fn(),
   getHostIdentity: vi.fn(),
   isElectronShell: vi.fn(),
+  showArcaConnectOutput: vi.fn(),
   supportsArcaConnect: vi.fn(),
+  supportsArcaConnectOutput: vi.fn(),
 }));
 vi.mock("@/lib/sessionsApi", () => ({ retrySession: vi.fn() }));
 vi.mock("sonner", () => ({
@@ -95,6 +99,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(isElectronShell).mockReturnValue(true);
   vi.mocked(supportsArcaConnect).mockReturnValue(true);
+  vi.mocked(supportsArcaConnectOutput).mockReturnValue(false);
+  vi.mocked(showArcaConnectOutput).mockResolvedValue(true);
   vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: true, hostId: "this-mac" });
   vi.mocked(controlHost).mockResolvedValue({ ok: true });
   vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
@@ -193,6 +199,9 @@ describe("useSessionReconnect", () => {
     expect(toast.success).not.toHaveBeenCalled();
     expect(getHostIdentity).not.toHaveBeenCalled();
     expect(controlHost).not.toHaveBeenCalled();
+    expect(result.current.arcaConnecting).toBe(true);
+    // An older shell keeps its console open itself, so there is no output to offer.
+    expect(result.current.showArcaOutput).toBeUndefined();
 
     await act(async () => {
       pending.resolve({ ok: true });
@@ -200,8 +209,53 @@ describe("useSessionReconnect", () => {
     });
     expect(result.current.dialogOpen).toBe(false);
     expect(result.current.arcaReconnect?.reconnecting).toBe(false);
+    expect(result.current.arcaConnecting).toBe(false);
     expect(toast.success).toHaveBeenCalledWith("Arca is back online.");
     expect(toast.dismiss).toHaveBeenCalledWith("progress");
+  });
+
+  it("offers the background Arca connect's output while it runs", async () => {
+    writeArcaHostId("arca-host");
+    vi.mocked(supportsArcaConnectOutput).mockReturnValue(true);
+    const pending = deferred<ArcaConnectResult>();
+    vi.mocked(connectArcaHost).mockReturnValue(pending.promise);
+    const { result, rerender } = renderHook(() =>
+      useSessionReconnect({ ...localSession, hostId: "arca-host" }),
+    );
+    expect(result.current.showArcaOutput).toBeUndefined();
+
+    let reconnect!: Promise<void>;
+    await act(async () => {
+      reconnect = result.current.reconnect();
+    });
+    expect(result.current.arcaConnecting).toBe(true);
+    expect(connectArcaHost).toHaveBeenCalledWith({ inlineProgress: true });
+    // A stable callback keeps memoized consumers from re-rendering during the connect.
+    const showArcaOutput = result.current.showArcaOutput;
+    rerender();
+    expect(result.current.showArcaOutput).toBe(showArcaOutput);
+    expect(toast.loading).toHaveBeenCalledWith(
+      "Reconnecting Arca…",
+      expect.objectContaining({ action: expect.objectContaining({ label: "Show output" }) }),
+    );
+    const options = vi.mocked(toast.loading).mock.calls[0][1] as unknown as {
+      action: { onClick: (event: { preventDefault: () => void }) => void };
+    };
+    const preventDefault = vi.fn();
+    options.action.onClick({ preventDefault });
+    // The progress toast stays up while the output window opens.
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(showArcaConnectOutput).toHaveBeenCalledOnce();
+
+    result.current.showArcaOutput?.();
+    expect(showArcaConnectOutput).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      pending.resolve({ ok: true });
+      await reconnect;
+    });
+    expect(result.current.arcaConnecting).toBe(false);
+    expect(result.current.showArcaOutput).toBeUndefined();
   });
 
   it("reports an Arca host that was already running as already online", async () => {
@@ -466,8 +520,10 @@ describe("useSessionReconnect", () => {
     await act(async () => {
       reconnect = result.current.reconnect();
     });
+    expect(result.current.arcaConnecting).toBe(true);
     rerender({ ...localSession, sessionId: "other-session", hostId: "other-host" });
     expect(toast.dismiss).toHaveBeenCalledWith("progress");
+    expect(result.current.arcaConnecting).toBe(false);
 
     await act(async () => {
       pending.resolve({ ok: false, error: "Old failure" });

@@ -11,6 +11,12 @@ const terminalEl = document.getElementById("terminal");
 const statusEl = document.getElementById("status");
 const confirmBtn = document.getElementById("confirm");
 const cancelBtn = document.getElementById("cancel");
+const hideBtn = document.getElementById("hide");
+const trustNoticeEl = document.getElementById("trust-notice");
+const backgroundNoticeEl = document.getElementById("background-notice");
+
+// "consent" asks before anything runs; "output" follows a confirmed run.
+let view = "consent";
 
 let resizeFrame = null;
 function resizeToContent() {
@@ -26,27 +32,47 @@ function resizeToContent() {
 
 void document.fonts?.ready.then(resizeToContent).catch(() => {});
 
-window.arcaConnect.onInit(({ serverUrl, command, reason }) => {
+window.arcaConnect.onInit(({ serverUrl, command, reason, view: initView }) => {
   // textContent only: the server URL is remote-influenced data.
   serverEl.textContent = serverUrl;
   commandEl.textContent = command;
+  view = initView === "output" ? "output" : "consent";
+  document.body.dataset.view = view;
   const reconnect = reason === "preview-reconnect";
-  titleEl.textContent = reconnect
-    ? "Reconnect Arca for this preview?"
-    : "Connect your Arca instance?";
-  introEl.textContent = reconnect
-    ? "To load this preview, run the command below over "
-    : "This runs the command below over ";
-  confirmBtn.textContent = reconnect ? "Reconnect" : "Connect";
+  if (view === "output") {
+    titleEl.textContent = reconnect ? "Reconnecting Arca" : "Connecting your Arca instance";
+    introEl.textContent = "Running the command below over ";
+    trustNoticeEl.hidden = true;
+    backgroundNoticeEl.hidden = false;
+    confirmBtn.hidden = true;
+    hideBtn.hidden = false;
+    cancelBtn.textContent = "Stop connecting";
+  } else {
+    titleEl.textContent = reconnect
+      ? "Reconnect Arca for this preview?"
+      : "Connect your Arca instance?";
+    introEl.textContent = reconnect
+      ? "To load this preview, run the command below over "
+      : "This runs the command below over ";
+    confirmBtn.textContent = reconnect ? "Reconnect" : "Connect";
+  }
   resizeToContent();
 });
 
 confirmBtn.addEventListener("click", () => {
   window.arcaConnect.confirm();
 });
-// Cancel doubles as Close after the run; the main process treats both as
-// "close the window" and settles accordingly.
+// Cancel declines consent, and Close dismisses a finished run; both just close
+// the window. In the output view of a running connect it stops the command.
 cancelBtn.addEventListener("click", () => {
+  if (view === "output" && document.body.dataset.phase === "running") {
+    window.arcaConnect.stop();
+  } else {
+    window.arcaConnect.cancel();
+  }
+});
+// Hide closes the output window; the connection keeps running.
+hideBtn.addEventListener("click", () => {
   window.arcaConnect.cancel();
 });
 
@@ -57,10 +83,8 @@ window.arcaConnect.onStarted(({ login, command }) => {
   resizeToContent();
   // Mount the terminal now that its container has real dimensions.
   requestAnimationFrame(() => ensureTerminal());
-  // The button itself carries the progress: spinner + "Connecting…".
-  confirmBtn.disabled = true;
-  confirmBtn.classList.add("loading");
-  confirmBtn.textContent = login ? "Signing in…" : "Connecting…";
+  // Only the output view receives started; it has no Connect button.
+  confirmBtn.hidden = true;
   statusEl.dataset.kind = "";
   statusEl.textContent = login
     ? "Complete sign-in in your browser. If no browser opened, check that Arca Companion is running. Credentials stay on the Arca instance."
@@ -99,8 +123,9 @@ window.arcaConnect.onOutput((text) => {
 window.arcaConnect.onDone(({ ok, error }) => {
   statusEl.dataset.kind = ok ? "ok" : "error";
   statusEl.textContent = ok ? "Connected. The Arca host should appear online shortly." : error;
-  confirmBtn.classList.remove("loading");
+  document.body.dataset.phase = "done";
   confirmBtn.hidden = true;
+  hideBtn.hidden = true;
   cancelBtn.textContent = "Close";
   resizeToContent();
 });

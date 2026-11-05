@@ -181,10 +181,23 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
   /**
    * Connect the user's Arca instance (Databricks-internal) to the window's
-   * server as a host, via `arca ssh`. Native consent is asked in the main
-   * process. Resolves a `{ ok, error?, authError? }` result.
+   * server as a host, via `arca ssh`. Consent is asked in a shell-owned
+   * console, and the run then continues in the background. Resolves a
+   * `{ ok, error?, authError?, canceled? }` result once it settles. A page that
+   * shows the progress itself passes `{ inlineProgress: true }`.
+   * @param {{ inlineProgress?: boolean }} [options]
    */
-  connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  connectArcaHost: (options) =>
+    ipcRenderer.invoke("omnigent:arca-connect", {
+      inlineProgress: options?.inlineProgress === true,
+    }),
+  /**
+   * Show the live output of this window's in-flight Arca connect in a
+   * non-blocking shell window. Resolves false when there is no output to show,
+   * including during an automatic connect, which has none. Its presence also marks that a confirmed connect can run in the
+   * background, so the page can show the progress itself.
+   */
+  showArcaConnectOutput: () => ipcRenderer.invoke("omnigent:arca-connect-output"),
   // Windows' built-in ssh can't share one connection, so it gets this later.
   ...(process.platform === "win32"
     ? {}

@@ -194,6 +194,7 @@ function loadNavigationHarness({
     dbcertSyncs: 0,
     dbcertPreflights: 0,
     arcaConsentRuns: [],
+    arcaOutputRequests: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
     arcaLogins: [],
@@ -680,17 +681,28 @@ function loadNavigationHarness({
   };
 
   if (arcaConsentResult !== undefined) {
+    const serversInFlight = [];
     localRequires["./arca_connect_window"] = {
       createArcaConnectFlow: (deps) => ({
         run: async (_parentWin, consentServerUrl, options) => {
           calls.arcaConsentRuns.push({ serverUrl: consentServerUrl, options });
-          const consent =
-            typeof arcaConsentResult === "function"
-              ? await arcaConsentResult(consentServerUrl, options)
-              : arcaConsentResult;
-          if (consent?.ok !== true) return consent;
-          const connect = deps.startConnect(consentServerUrl, () => {});
-          return { ...(await connect.promise), shownInConsole: true };
+          serversInFlight.push(consentServerUrl);
+          try {
+            const consent =
+              typeof arcaConsentResult === "function"
+                ? await arcaConsentResult(consentServerUrl, options)
+                : arcaConsentResult;
+            if (consent?.ok !== true) return consent;
+            const connect = deps.startConnect(consentServerUrl, () => {});
+            return { ...(await connect.promise), shownInConsole: true };
+          } finally {
+            serversInFlight.splice(serversInFlight.indexOf(consentServerUrl), 1);
+          }
+        },
+        // Like the real flow, only a run in flight for this server has output to show.
+        showOutput: (_parentWin, outputServerUrl) => {
+          calls.arcaOutputRequests.push(outputServerUrl);
+          return serversInFlight.includes(outputServerUrl);
         },
       }),
     };
@@ -1130,6 +1142,78 @@ describe("Arca auto-connect wiring", () => {
     assert.deepEqual(h.calls.arcaSetups, []);
   });
 
+  it("runs a page-started connect with inline progress and shows its output on request", async (t) => {
+    let approve;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      internalFeatures: true,
+      arcaPath,
+      arcaConsentResult: () =>
+        new Promise((resolve) => {
+          approve = resolve;
+        }),
+      arcaResult: { ok: true },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: workspace } };
+    const showOutput = h.ipc.get("omnigent:arca-connect-output");
+    const pending = h.ipc.get("omnigent:arca-connect")(event, { inlineProgress: true });
+    await until(() => approve !== undefined, "Arca consent");
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+    assert.equal(h.calls.arcaConsentRuns[0].serverUrl, workspace);
+    assert.equal(h.calls.arcaConsentRuns[0].options.inlineProgress, true);
+    assert.equal(await showOutput(event), true);
+    await assert.rejects(
+      showOutput({ sender: h.webContents, senderFrame: { url: "https://evil.example/" } }),
+      /only available to a connected server page/,
+    );
+    assert.deepEqual(h.calls.arcaOutputRequests, [workspace]);
+
+    approve({ ok: true });
+    assert.equal((await pending).ok, true);
+    assert.equal(await showOutput(event), false);
+  });
+
+  // The flow's own tests cover the output opening on consent without the opt-in.
+  it("passes inlineProgress only when the page sends exactly true", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      internalFeatures: true,
+      arcaPath,
+      arcaConsentResult: { ok: true },
+      arcaResult: { ok: true },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: workspace } };
+    await h.ipc.get("omnigent:arca-connect")(event);
+    await h.ipc.get("omnigent:arca-connect")(event, { inlineProgress: "yes" });
+    assert.deepEqual(
+      h.calls.arcaConsentRuns.map(({ options }) => options.inlineProgress),
+      [false, false],
+    );
+  });
+
+  it("has no connect output to show without Arca support", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath,
+      arcaConsentResult: { ok: true },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const shown = await h.ipc.get("omnigent:arca-connect-output")({
+      sender: h.webContents,
+      senderFrame: { url: workspace },
+    });
+    assert.equal(shown, false);
+    assert.deepEqual(h.calls.arcaOutputRequests, []);
+  });
+
   for (const errorKind of ["omni-auth", "timeout"]) {
     it(`preserves existing connect recovery for a passive ${errorKind} without onboarding setup`, async (t) => {
       let finishPassive;
@@ -1153,10 +1237,10 @@ describe("Arca auto-connect wiring", () => {
       await h.api.loadServerUrl(h.win, workspace);
       await until(() => h.calls.arcaConnects.length === 1, "passive Arca connection");
 
-      const requested = h.ipc.get("omnigent:arca-connect")({
-        sender: h.webContents,
-        senderFrame: { url: workspace },
-      });
+      const requested = h.ipc.get("omnigent:arca-connect")(
+        { sender: h.webContents, senderFrame: { url: workspace } },
+        { inlineProgress: true },
+      );
       assert.deepEqual(h.calls.arcaConsentRuns, []);
       assert.deepEqual(h.calls.arcaSetups, []);
       finishPassive({ ok: false, errorKind, error: "Browser sign-in did not complete." });
@@ -1164,8 +1248,11 @@ describe("Arca auto-connect wiring", () => {
       const recovered = errorKind === "omni-auth";
       assert.equal((await requested).ok, recovered);
       assert.deepEqual(
-        h.calls.arcaConsentRuns,
-        recovered ? [{ serverUrl: workspace, options: undefined }] : [],
+        h.calls.arcaConsentRuns.map(({ serverUrl, options }) => [
+          serverUrl,
+          options.inlineProgress,
+        ]),
+        recovered ? [[workspace, true]] : [],
       );
       assert.deepEqual(h.calls.arcaSetups, []);
       assert.deepEqual(h.calls.arcaConnects, recovered ? [workspace, workspace] : [workspace]);

@@ -37,6 +37,9 @@ backend — no real provider creds.
   with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
   connect, silent renewal, relaunch, and sign-out, and asserts the app window
   never loads the IdP.
+- `desktop_arca_connect_background.e2e.js` — **Run on Arca** with a scripted
+  `arca` fixture: modal consent, then a background connect with the app
+  window enabled, Show output, Hide, Stop connecting, and a failure.
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.

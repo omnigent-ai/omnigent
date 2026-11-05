@@ -18,11 +18,13 @@ function on(channel, callback) {
 contextBridge.exposeInMainWorld("arcaConnect", {
   /** The user confirmed — run the command. Accepted only from this window. */
   confirm: () => ipcRenderer.send("arca-connect:confirm"),
-  /** Cancel / close the console (kills a mid-run command). */
+  /** Close this window: declines consent, or hides a run's output without stopping it. */
   cancel: () => ipcRenderer.send("arca-connect:cancel"),
+  /** Stop the running command. */
+  stop: () => ipcRenderer.send("arca-connect:stop"),
   /** Resize the shell-owned window to the rendered page, within main-owned bounds. */
   resizeToContent: (size) => ipcRenderer.send("arca-connect:resize", size),
-  /** `{ serverUrl, command }` once the flow is ready. */
+  /** `{ serverUrl, command, reason, view }` once the flow is ready. */
   onInit: (callback) => on("arca-connect:init", callback),
   /** `{ login, command }` when a command was spawned. */
   onStarted: (callback) => on("arca-connect:started", callback),

@@ -1,10 +1,7 @@
 <!doctype html>
 <!--
-  Arca connect console — a SHELL-OWNED modal page (see src/arca_connect_window.js
-  for the trust model). Shows the exact command that will run on the user's Arca
-  instance, then streams its live output into the terminal pane below, so
-  enrollment is fully transparent. All dynamic values are set via textContent —
-  never innerHTML — since the server URL is remote-influenced data.
+  Shell-owned Arca consent and output page; trust model in src/arca_connect_window.js.
+  Set dynamic values via textContent only: the server URL is remote-influenced.
 -->
 <html lang="en">
   <head>
@@ -155,43 +152,26 @@
         border-color: var(--accent);
         color: #fff;
       }
+      [hidden] {
+        display: none !important;
+      }
       button:disabled {
         opacity: 0.5;
         cursor: default;
-      }
-      /* Inline spinner for the (still disabled) Connect button while the
-         command runs. Flex centering keeps the ring optically middle-aligned
-         with the label at any font metrics. */
-      button.loading {
-        display: inline-flex;
-        align-items: center;
-        gap: 7px;
-        opacity: 0.85;
-      }
-      button.loading::before {
-        content: "";
-        flex: none;
-        width: 10px;
-        height: 10px;
-        border: 2px solid rgb(255 255 255 / 40%);
-        border-top-color: #fff;
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
       }
     </style>
   </head>
   <body data-phase="asking">
     <h1 id="title">Connect your Arca instance?</h1>
     <p>
-      <span id="intro">This runs the command below over </span><span id="server">…</span>. While
-      connected as a runner, that server can execute agent code and commands on the Arca instance on
-      its behalf. If the instance isn't signed in to that server, sign-in opens in your browser
-      first. Only confirm for servers you trust.
+      <span id="intro">This runs the command below over </span><span id="server">…</span>.
+      <span id="trust-notice"
+        >While connected as a runner, that server can execute agent code and commands on the Arca
+        instance on its behalf. If the instance isn't signed in to that server, sign-in opens in
+        your browser first. Only confirm for servers you trust.</span
+      ><span id="background-notice" hidden
+        >You can keep working while it runs. Hiding this window doesn't stop the connection.</span
+      >
     </p>
     <div id="console">
       <div id="command">…</div>
@@ -200,6 +180,7 @@
     <div id="status"></div>
     <footer>
       <button id="cancel" type="button">Cancel</button>
+      <button id="hide" type="button" class="primary" hidden>Hide</button>
       <button id="confirm" type="button" class="primary">Connect</button>
     </footer>
     <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>

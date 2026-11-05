@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyMacElectronShellAttribute,
   checkDbcert,
+  connectArcaHost,
   getServerPicker,
   hasDbcertPreflightBridge,
   isAndroidShell,
@@ -20,7 +21,9 @@ import {
   setNativeServerSwitcherHidden,
   setThemeSource,
   supportsNativeServerPicker,
+  showArcaConnectOutput,
   supportsArcaConnect,
+  supportsArcaConnectOutput,
   supportsBrowser,
   switchServer,
 } from "./nativeBridge";
@@ -210,6 +213,51 @@ describe("supportsArcaConnect", () => {
       window as unknown as { omnigentDesktop: Record<string, unknown> }
     ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
     expect(supportsArcaConnect()).toBe(true);
+  });
+
+  it("passes the page's progress opt-in to the shell", async () => {
+    setElectron(true);
+    const connect = vi.fn(() => Promise.resolve({ ok: true }));
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.connectArcaHost = connect;
+    expect(await connectArcaHost({ inlineProgress: true })).toEqual({ ok: true });
+    expect(connect).toHaveBeenCalledWith({ inlineProgress: true });
+  });
+});
+
+describe("showArcaConnectOutput", () => {
+  it("is supported only when the desktop shell offers it", () => {
+    setElectron(true);
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
+    // A shell whose console blocks the whole run has the connect but not this.
+    expect(supportsArcaConnectOutput()).toBe(false);
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.showArcaConnectOutput = () => Promise.resolve(true);
+    expect(supportsArcaConnectOutput()).toBe(true);
+  });
+
+  it("resolves the shell's answer and false when it is missing or fails", async () => {
+    setElectron(false);
+    expect(await showArcaConnectOutput()).toBe(false);
+    setElectron(true);
+    expect(await showArcaConnectOutput()).toBe(false);
+    const desktop = (window as unknown as { omnigentDesktop: Record<string, unknown> })
+      .omnigentDesktop;
+    desktop.showArcaConnectOutput = vi.fn(() => Promise.resolve(true));
+    expect(await showArcaConnectOutput()).toBe(true);
+    desktop.showArcaConnectOutput = () => Promise.resolve(false);
+    expect(await showArcaConnectOutput()).toBe(false);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      desktop.showArcaConnectOutput = () => Promise.reject(new Error("ipc gone"));
+      expect(await showArcaConnectOutput()).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
