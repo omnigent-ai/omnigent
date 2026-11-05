@@ -223,6 +223,8 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     # No outstanding elicitations → 0 (the index is empty for a freshly
     # seeded child that never published an elicitation_request).
     assert row["pending_elicitations_count"] == 0
+    # Set only by ``?descendants=true``; clients use it to tell the modes apart.
+    assert row["depth"] is None
 
 
 async def test_child_sessions_surfaces_durable_failure_error(
@@ -2843,16 +2845,45 @@ async def test_child_sessions_descendants_ignores_other_trees(
     assert [row["id"] for row in resp.json()["data"]] == [mine.id]
 
 
-async def test_child_sessions_without_descendants_leaves_depth_unset(
+async def test_child_sessions_descendants_hides_archived_branches_like_a_walk(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """The default one-level listing has no ``depth``, which is how clients
-    tell a server that ignored ``descendants=true`` apart from one that
-    honoured it."""
+    """An archived sub-agent and everything below it are left out, as a
+    per-level walk (which lists unarchived children only) leaves them out."""
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    ids = _seed_tree(conv_store, session["id"])
+    conv_store.update_conversation(ids["a1"], archived=True)
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/child_sessions", params={"descendants": "true"}
+    )
+    rows = [(row["id"], row["parent_session_id"]) for row in resp.json()["data"]]
+
+    assert sorted(rows) == sorted(await _walk_levels(client, session["id"], 3))
+    assert {ids["a1"], ids["a2"]}.isdisjoint(row_id for row_id, _ in rows)
+
+
+async def test_child_sessions_descendants_cursor_fails_once_the_tree_outgrows_one_read(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tree that grows past the read cap between pages makes the cursor
+    stale rather than reading it as a one-level cursor, so clients restart."""
+    from omnigent.server.routes.sessions import routes_items
+
     session = await _create_parent_session(client)
     _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+    url = f"/v1/sessions/{session['id']}/child_sessions"
+    first = (await client.get(url, params={"descendants": "true", "limit": 2})).json()
+    assert first["has_more"] is True
 
-    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    monkeypatch.setattr(routes_items, "_SPAWN_TREE_READ_CAP", 2)
+    resp = await client.get(
+        url, params={"descendants": "true", "limit": 2, "after": first["last_id"]}
+    )
 
-    assert [row["depth"] for row in resp.json()["data"]] == [None, None]
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "stale_cursor"

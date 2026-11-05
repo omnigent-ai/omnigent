@@ -252,23 +252,34 @@ def register_items_routes(
         :returns: The page with ``depth`` set, or ``None`` when the spawn tree
             is too big for one read, in which case the caller answers with
             the one-level listing a server without ``descendants`` gives.
-        :raises StaleCursorError: If *after* is not a row of the subtree.
+        :raises StaleCursorError: If *after* is not a row of the subtree, or
+            the tree outgrew one read since the page it came from.
         """
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
+            # The tree's root row plus up to the cap of sub-agents.
             limit=_SPAWN_TREE_READ_CAP + 1,
-            kind="sub_agent",
+            # No kind or archived filter: neither is in the
+            # (workspace_id, root_conversation_id, id) index, so filtering in
+            # SQL would examine rows past the limit. Both are applied below.
+            kind=None,
+            include_archived=True,
             root_conversation_id=parent.root_conversation_id or parent.id,
             order="asc",
-            # Index order, so the read examines at most the cap; siblings
+            # Index order, so the read examines at most the limit; siblings
             # are ordered newest-first below.
             sort_by="id",
         )
-        if page.has_more or len(page.data) > _SPAWN_TREE_READ_CAP:
+        if page.has_more:
+            if after is not None:
+                # The tree outgrew one read since the first page: this cursor
+                # cannot continue, so the client restarts.
+                raise StaleCursorError(after)
             return None
         children_of: dict[str, list[Conversation]] = {}
         for row in page.data:
-            if row.parent_conversation_id:
+            # An archived sub-agent hides its subtree, as in a per-level walk.
+            if row.parent_conversation_id and not row.archived:
                 children_of.setdefault(row.parent_conversation_id, []).append(row)
         for siblings in children_of.values():
             siblings.sort(key=lambda c: (c.created_at, c.id), reverse=True)

@@ -36,7 +36,13 @@ from omnigent.server.schemas import ServerStreamEvent
 
 from ._agent_catalog import AgentCatalogEntry, RegisteredAgent, RegisteredAgentCatalog
 from ._child_status import child_summary_busy
-from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
+from ._errors import (
+    OmnigentError,
+    StaleCursorError,
+    raise_for_status,
+    require_json_object,
+    response_body,
+)
 from ._timeouts import _HOST_LAUNCH_READ_TIMEOUT_S, _SSE_TIMEOUT
 from ._types import PaginatedList
 
@@ -1533,10 +1539,11 @@ async def _descendant_rows(
     :param sessions: Namespace whose :meth:`~SessionsNamespace.child_sessions` is read.
     :param session_id: Root parent session identifier.
     :param max_depth: Levels to return.
-    :returns: ``(rows, None)`` when the server returned the subtree, or
-        ``(None, page)`` when it answered with one level instead (a
-        server without the flag, or a tree too big for it), so the caller
-        walks levels starting from *page*.
+    :returns: ``(rows, None)`` when the server returned the subtree;
+        ``(None, page)`` when it answered with one level instead (a server
+        without the flag, or a tree too big for it), so the caller walks
+        levels starting from *page*; or ``(None, None)`` when a later page
+        could not continue, so the caller walks from scratch.
     """
     page = await sessions.child_sessions(
         session_id, limit=_DESCENDANTS_LIMIT, descendants=True, max_depth=max_depth
@@ -1545,12 +1552,21 @@ async def _descendant_rows(
     if any(row.get("depth") is None for row in rows):
         return None, page
     while page.has_more and page.last_id:
-        page = await sessions.child_sessions(
-            session_id,
-            limit=_DESCENDANTS_LIMIT,
-            after=page.last_id,
-            descendants=True,
-            max_depth=max_depth,
-        )
-        rows.extend(row for row in page.data if isinstance(row, dict))
+        try:
+            page = await sessions.child_sessions(
+                session_id,
+                limit=_DESCENDANTS_LIMIT,
+                after=page.last_id,
+                descendants=True,
+                max_depth=max_depth,
+            )
+        except StaleCursorError:
+            # The tree changed past what one read covers; restart the walk.
+            return None, None
+        more = [row for row in page.data if isinstance(row, dict)]
+        # A continuation is never empty or depth-less; either means this page
+        # is not part of the same subtree, so the pages cannot be stitched.
+        if not more or any(row.get("depth") is None for row in more):
+            return None, None
+        rows.extend(more)
     return rows, None

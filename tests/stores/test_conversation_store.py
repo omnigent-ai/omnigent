@@ -9335,3 +9335,48 @@ def test_list_conversations_sort_by_id_pages_a_spawn_tree_in_id_order(
     assert first.has_more is True
     assert [c.id for c in rest.data] == expected[2:]
     assert rest.has_more is False
+
+
+def test_spawn_tree_read_examines_rows_through_the_root_index(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The descendants read (no kind or archived filter, ``sort_by="id"``)
+    is served in index order with no sort step, so ``limit`` bounds the rows
+    examined even when the tree holds many archived sub-agents."""
+    from sqlalchemy import event
+
+    root = conversation_store.create_conversation()
+    for i in range(30):
+        child = conversation_store.create_conversation(
+            kind="sub_agent", parent_conversation_id=root.id
+        )
+        if i % 2:
+            conversation_store.update_conversation(child.id, archived=True)
+    engine = conversation_store._conv_engine
+    statements: list[tuple[str, Any]] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, params: Any, *_: Any) -> None:
+        if "root_conversation_id" in statement and "ORDER BY" in statement:
+            statements.append((statement, params))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        page = conversation_store.list_conversations(
+            limit=5,
+            kind=None,
+            include_archived=True,
+            root_conversation_id=root.id,
+            order="asc",
+            sort_by="id",
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert len(page.data) == 5 and page.has_more
+    statement, params = statements[-1]
+    with engine.connect() as conn:
+        plan = " ".join(
+            str(row[-1]) for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, params)
+        )
+    assert "ix_conversations_root_conversation_id" in plan
+    assert "TEMP B-TREE" not in plan

@@ -1364,11 +1364,20 @@ async def test_child_sessions_tree_uses_one_request_when_the_server_returns_desc
 
 
 @pytest.mark.asyncio
-async def test_child_sessions_tree_reuses_the_first_page_on_an_older_server() -> None:
-    """An older server ignores the flag; its answer is the first level, so the
-    fallback walk costs no more requests than before."""
+@pytest.mark.parametrize("depth_field", ["omitted", "null"])
+async def test_child_sessions_tree_reuses_a_one_level_answer(depth_field: str) -> None:
+    """A one-level answer, whether from an older server (no ``depth`` key) or
+    from a server declining a tree too big for one read (``depth: null``),
+    becomes the walk's first level, so it costs no more requests than before."""
+
+    def one_level(parent: str, params: httpx.QueryParams) -> dict[str, Any]:
+        rows = _DEEP_TREE.get(parent, [])
+        return {"data": rows if depth_field == "omitted" else [{**r, "depth": None} for r in rows]}
+
     requests: list[httpx.Request] = []
-    ns, client = _make_namespace(_counting_tree_handler(_DEEP_TREE, requests))
+    ns, client = _make_namespace(
+        _counting_tree_handler(_DEEP_TREE, requests, descendants=one_level)
+    )
     try:
         nodes = await ns.child_sessions_tree("root")
     finally:
@@ -1407,21 +1416,45 @@ async def test_child_sessions_tree_follows_descendant_pages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_sessions_tree_walks_when_the_server_answers_one_level() -> None:
-    """A spawn tree too big for one read gets a one-level answer (no ``depth``),
-    like an older server's; it becomes the walk's first level."""
+@pytest.mark.parametrize("later_page", ["stale_cursor", "one_level", "empty_one_level"])
+async def test_child_sessions_tree_restarts_the_walk_when_a_later_page_cannot_continue(
+    later_page: str,
+) -> None:
+    """If the tree outgrows one read between pages, the pages already read are
+    dropped and the tree is walked from scratch, never stitched together."""
     requests: list[httpx.Request] = []
-    handler = _counting_tree_handler(
-        _DEEP_TREE, requests, descendants=lambda parent, params: {"data": _DEEP_TREE[parent]}
-    )
+    per_level = _tree_handler(_DEEP_TREE)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        params = request.url.params
+        if params.get("descendants") != "true":
+            return per_level(request)
+        if "after" not in params:
+            return httpx.Response(
+                200, json=_descendants_body(_DEEP_TREE, "root", params, page_size=2)
+            )
+        if later_page == "stale_cursor":
+            return httpx.Response(
+                400, json={"error": {"message": "stale", "code": "stale_cursor"}}
+            )
+        rows = [] if later_page == "empty_one_level" else _DEEP_TREE["root"]
+        return httpx.Response(200, json={"data": rows})
+
     ns, client = _make_namespace(handler)
     try:
         nodes = await ns.child_sessions_tree("root")
     finally:
         await client.aclose()
 
-    assert [n["id"] for n in nodes] == ["a", "b", "a1", "a1x"]
-    assert [r.url.path.split("/")[-2] for r in requests] == ["root", "a", "b", "a1"]
+    assert [(n["id"], n["parent_id"]) for n in nodes] == [
+        ("a", "root"),
+        ("b", "root"),
+        ("a1", "a"),
+        ("a1x", "a1"),
+    ]
+    walk = [r for r in requests if "descendants" not in r.url.params]
+    assert [r.url.path.split("/")[-2] for r in walk] == ["root", "a", "b", "a1"]
 
 
 _WIDE_TREE = {
