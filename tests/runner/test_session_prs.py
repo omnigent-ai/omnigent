@@ -832,6 +832,35 @@ _CREATED_A = {"stdout": A, "gitOperation": {"pr": {"url": A, "action": "created"
             True,
             id="continued-heredoc-delimiter",
         ),
+        pytest.param(
+            "cat <<\\\n-EOF\nbody\nEOF\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="continued-tab-stripping-operator",
+        ),
+        pytest.param(
+            "cat <<EOF\r\nbody\r\nEOF\r\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="crlf-heredoc",
+        ),
+        pytest.param(
+            'cat <<"E\\$OF"\nwe\'re data\nE\\$OF\n'
+            "gh pr merge 42 -R example/one\nE$OF\nprintf done",
+            "done",
+            [],
+            False,
+            id="escaped-delimiter-merge-is-data",
+        ),
+        pytest.param(
+            'cat <<"E\\$OF"\nbody\nE$OF\ngh pr create --title t',
+            {"stdout": A},
+            [A],
+            True,
+            id="escaped-delimiter-then-create",
+        ),
     ],
 )
 def test_create_beside_substitution_and_heredoc(

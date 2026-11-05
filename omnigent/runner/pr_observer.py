@@ -17,9 +17,11 @@ from dataclasses import dataclass, replace
 
 from omnigent.git_providers import load_facet, providers
 from omnigent.policies.builtins._shell import (
+    HEREDOC_DELIMITER,
     MAX_SHELL_NESTING,
     SHELL_TOOLS,
     real_invocation_tokens,
+    skip_command_substitution,
     unwrap_shell_command,
 )
 from omnigent.runner import pr_reports
@@ -60,42 +62,32 @@ def _failed(result: object) -> bool:
     )
 
 
-def _group_end(command: str, start: int, *, arithmetic: bool) -> int | None:
-    """Return the index just past the ``)`` closing the ``(`` at *start*, or ``None``.
-
-    Outside arithmetic, comments are skipped and a here-document gives up, since
-    its body may hold unbalanced parentheses.
-    """
+def _arithmetic_end(command: str, start: int) -> int | None:
+    """Return the index just past the ``)`` closing the ``(`` at *start*, or ``None``."""
     depth = 0
-    quote: str | None = None
-    index = start
-    while index < len(command):
-        char = command[index]
-        if quote == "'":
-            if char == "'":
-                quote = None
-        elif char == "\\":
-            index += 1
-        elif quote == '"':
-            if char == '"':
-                quote = None
-        elif char in "'\"":
-            quote = char
-        elif not arithmetic and char == "#" and command[index - 1] in " \t\n;&|(":
-            index = command.find("\n", index)
-            if index == -1:
-                return None
-            continue
-        elif char == "(":
+    for index in range(start, len(command)):
+        if command[index] == "(":
             depth += 1
-        elif char == ")":
+        elif command[index] == ")":
             depth -= 1
             if depth == 0:
                 return index + 1
-        elif not arithmetic and command.startswith("<<", index):
-            return None
-        index += 1
     return None
+
+
+def _logical_line(command: str, start: int, *, join: bool = True) -> tuple[str, int]:
+    """Return the line at *start* and the index after it, joining backslash-newlines if *join*."""
+    parts: list[str] = []
+    index = start
+    while True:
+        end = command.find("\n", index)
+        physical = command[index:] if end == -1 else command[index:end]
+        index = len(command) if end == -1 else end + 1
+        trailing = len(physical) - len(physical.rstrip("\\"))
+        if not join or end == -1 or trailing % 2 == 0:
+            parts.append(physical)
+            return "".join(parts), index
+        parts.append(physical[:-1])
 
 
 @dataclass(frozen=True)
@@ -106,65 +98,38 @@ class _Heredoc:
     quoted: bool
 
 
-def _heredoc_delimiter(command: str, start: int) -> _Heredoc | None:
-    """Read the delimiter word after a ``<<``, or ``None`` when there is none."""
-    strip_tabs = command.startswith("-", start)
-    index = start + strip_tabs
-    word: list[str] = []
-    quote: str | None = None
-    quoted = False
-    while index < len(command):
-        char = command[index]
-        if quote != "'" and command.startswith("\\\n", index):
-            index += 2
-            continue
-        if quote is not None:
-            if char == quote:
-                quote = None
-            else:
-                word.append(char)
-        elif char in "'\"":
-            quote = char
-            quoted = True
-        elif char == "\\" and index + 1 < len(command):
-            index += 1
-            word.append(command[index])
-            quoted = True
-        elif char in " \t" and not word and not quoted:
-            pass
-        elif char in " \t\r\n;&|<>()":
-            break
-        else:
-            word.append(char)
-        index += 1
-    return _Heredoc("".join(word), strip_tabs, quoted) if word else None
+def _heredoc_operator(command: str, start: int) -> _Heredoc | None:
+    """Read the ``<<`` at *start* when its delimiter is a plain or simply quoted word."""
+    line, _ = _logical_line(command, start)
+    match = HEREDOC_DELIMITER.match(line)
+    if match is None:
+        return None
+    delimiter = match.group("delimiter")
+    quoted = delimiter[0] in "'\""
+    if quoted:
+        delimiter = delimiter[1:-1]
+    # A carriage return ends no shell word, so a CRLF delimiter keeps it.
+    if line.startswith("\r", match.end()):
+        delimiter += "\r"
+    return _Heredoc(delimiter, bool(match.group("tabs")), quoted)
 
 
 def _heredoc_body_end(command: str, start: int, heredoc: _Heredoc) -> int:
     """Return the index just past the delimiter line closing a body that starts at *start*."""
     index = start
     while index < len(command):
-        parts: list[str] = []
-        while True:
-            end = command.find("\n", index)
-            physical = command[index:] if end == -1 else command[index:end]
-            index = len(command) if end == -1 else end + 1
-            trailing = len(physical) - len(physical.rstrip("\\"))
-            if heredoc.quoted or end == -1 or trailing % 2 == 0:
-                parts.append(physical)
-                break
-            parts.append(physical[:-1])
-        line = "".join(parts)
+        line, index = _logical_line(command, index, join=not heredoc.quoted)
         if (line.lstrip("\t") if heredoc.strip_tabs else line) == heredoc.delimiter:
             return index
     return len(command)
 
 
-def _prepare_shell_text(command: str) -> tuple[str, bool]:
+def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str, bool]:
     """Join shell continuations and detect unquoted redirection without changing argv.
 
-    An unquoted ``$(...)`` stays one word, and here-document bodies are dropped
-    because they are data rather than commands.
+    With *model_syntax*, an unquoted ``$(...)`` stays one word and here-document
+    bodies are dropped as data. A substitution or delimiter too complex to bound
+    falls back to plain lexing of the whole command.
     """
     result: list[str] = []
     quote: str | None = None
@@ -187,33 +152,42 @@ def _prepare_shell_text(command: str) -> tuple[str, bool]:
             result.append(command[index:end])
             index = end
             continue
-        if quote is None and command.startswith("$(", index):
-            end = _group_end(command, index + 1, arithmetic=command.startswith("$((", index))
-            if end is not None:
-                # Escaping every symbol keeps the substitution's text as one shlex word.
-                result.extend(c if c.isalnum() else "\\" + c for c in command[index:end])
-                index = end
-                continue
+        if model_syntax and quote is None and command.startswith("$(", index):
+            end = (
+                _arithmetic_end(command, index + 1)
+                if command.startswith("$((", index)
+                else skip_command_substitution(command, index)
+            )
+            if end is None:
+                return _prepare_shell_text(command, model_syntax=False)
+            # Escaping every symbol keeps the substitution's text as one shlex word.
+            result.extend(c if c.isalnum() else "\\" + c for c in command[index:end])
+            index = end
+            continue
         if (
-            quote is None
+            model_syntax
+            and quote is None
             and command.startswith("((", index)
             and (index == 0 or command[index - 1] in " \t\n;&|(")
         ):
             # An arithmetic command's ``<<`` is a shift, not a here-document.
-            end = _group_end(command, index, arithmetic=True)
-            if end is not None:
-                result.append(command[index:end])
-                index = end
-                continue
-        if quote is None and command.startswith("<<<", index):
+            end = _arithmetic_end(command, index)
+            if end is None:
+                return _prepare_shell_text(command, model_syntax=False)
+            result.append(command[index:end])
+            index = end
+            continue
+        if model_syntax and quote is None and command.startswith("<<<", index):
             redirected = True
             result.append("<<<")
             index += 3
             continue
-        if quote is None and command.startswith("<<", index):
+        if model_syntax and quote is None and command.startswith("<<", index):
+            heredoc = _heredoc_operator(command, index)
+            if heredoc is None:
+                return _prepare_shell_text(command, model_syntax=False)
+            heredocs.append(heredoc)
             redirected = True
-            if heredoc := _heredoc_delimiter(command, index + 2):
-                heredocs.append(heredoc)
             result.append("<<")
             index += 2
             continue
