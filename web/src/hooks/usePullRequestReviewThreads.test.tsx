@@ -5,8 +5,13 @@ import type { PropsWithChildren } from "react";
 import { appendReviewReply, type ReviewThreadsPage } from "@/lib/pullRequestReviewThreads";
 import { usePullRequestReviewThreads } from "./usePullRequestReviewThreads";
 import { usePullRequestReviewThreadComposer } from "./usePullRequests";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
+import type { Comment } from "./useComments";
 
 afterEach(() => {
+  clearLocalReviewContexts("session");
   cleanup();
   vi.unstubAllGlobals();
   vi.useRealTimers();
@@ -264,3 +269,134 @@ it("fetches on opening Diff, polls only while active, and removes deleted commen
   expect(fetch).toHaveBeenCalledTimes(count + 1);
   client.clear();
 });
+
+it("retains the local destination and settles a save after navigating away", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  let respond!: (response: Response) => void;
+  const fetch = vi.fn(
+    () =>
+      new Promise<Response>((resolve) => {
+        respond = resolve;
+      }),
+  );
+  vi.stubGlobal("fetch", fetch);
+  const wrapper = ({ children }: PropsWithChildren) => (
+    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: true }}>
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    </CapabilitiesProvider>
+  );
+  const { result, rerender } = renderHook(
+    ({ url }) => usePullRequestReviewThreadComposer("session", url, "app.py", "head", "base"),
+    { wrapper, initialProps: { url: "pr" } },
+  );
+  act(() => result.current.setDestination("local"));
+  act(() => result.current.selectLines({ side: "LEFT", line: 9, start_line: 7 }));
+  act(() => result.current.setBody("Keep this check"));
+  rerender({ url: "other" });
+  rerender({ url: "pr" });
+  expect(result.current.draft.destination).toBe("local");
+  act(() => result.current.post());
+  await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+  expect(fetch).toHaveBeenCalledWith(
+    "/v1/sessions/session/comments",
+    expect.objectContaining({ method: "POST" }),
+  );
+  rerender({ url: "other" });
+  act(() => result.current.setBody("Other PR draft"));
+  await waitFor(() => expect(result.current.draft.body).toBe("Other PR draft"));
+  await act(async () => respond(Response.json(savedLocalComment)));
+  expect(result.current.draft.body).toBe("Other PR draft");
+  rerender({ url: "pr" });
+  await waitFor(() => expect(result.current.draft.pending).toBe(false));
+  expect(result.current.draft.body).toBe("");
+  expect(result.current.draft.destination).toBe("local");
+  const contexts = renderHook(() => usePendingLocalReviewContexts("session"));
+  expect(contexts.result.current).toEqual([savedLocalComment]);
+});
+
+const savedLocalComment: Comment = {
+  id: "saved",
+  conversation_id: "session",
+  path: "app.py",
+  body: "Keep this check",
+  start_index: 0,
+  end_index: 0,
+  status: "draft",
+  created_at: 0,
+  updated_at: 0,
+  created_by: null,
+  anchor_content: null,
+  anchor_metadata: {
+    pr_url: "pr",
+    side: "LEFT",
+    line: 9,
+    start_line: 7,
+    head_sha: "head",
+    base_sha: "base",
+  },
+};
+
+it.each(["unsupported", "create failure", "legacy", "changed anchor", "cleanup failure"])(
+  "preserves local feedback and coordinates after %s",
+  async (failure) => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (failure === "create failure") throw new TypeError("Network error");
+      if (init?.method === "DELETE")
+        return new Response(null, { status: failure === "cleanup failure" ? 500 : 204 });
+      return Response.json({
+        ...savedLocalComment,
+        anchor_metadata:
+          failure === "changed anchor" ? { ...savedLocalComment.anchor_metadata, line: 10 } : null,
+      });
+    });
+    vi.stubGlobal("fetch", fetch);
+    const wrapper = ({ children }: PropsWithChildren) => (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: failure !== "unsupported" }}
+      >
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      </CapabilitiesProvider>
+    );
+    const { result } = renderHook(
+      () => usePullRequestReviewThreadComposer("session", "pr", "app.py", "head", "base"),
+      { wrapper },
+    );
+    act(() => result.current.setDestination("local"));
+    act(() => result.current.selectLines({ side: "LEFT", line: 9, start_line: 7 }));
+    act(() => result.current.setBody(savedLocalComment.body));
+    act(() => result.current.post());
+    await waitFor(() => expect(result.current.draft.error).toBeTruthy());
+    expect(result.current.draft).toMatchObject({
+      body: savedLocalComment.body,
+      pending: false,
+      destination: "local",
+      anchor: {
+        path: "app.py",
+        side: "LEFT",
+        line: 9,
+        start_line: 7,
+        head_sha: "head",
+        base_sha: "base",
+      },
+    });
+    const contexts = renderHook(() => usePendingLocalReviewContexts("session"));
+    expect(contexts.result.current).toEqual([]);
+    if (failure === "unsupported") {
+      expect(fetch).not.toHaveBeenCalled();
+      expect(result.current.draft.error).toContain("require a newer server");
+    } else if (failure === "create failure") {
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(result.current.draft.error).toContain("Network error");
+    } else {
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenLastCalledWith(
+        "/v1/sessions/session/comments/saved",
+        expect.objectContaining({ method: "DELETE" }),
+      );
+      expect(result.current.draft.error).toContain(
+        failure === "cleanup failure" ? "may remain in Files" : "Update the server before retrying",
+      );
+    }
+  },
+);

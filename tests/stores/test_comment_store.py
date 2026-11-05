@@ -11,7 +11,9 @@ SQLite file and tears it down automatically.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import event
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.entities.comment import CommentsFingerprint
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 
@@ -152,6 +154,51 @@ def test_list_for_conversation_returns_all_comments(store: SqlAlchemyCommentStor
     )
     bodies = {c.body for c in all_comments}
     assert bodies == {"First", "Second"}
+
+
+def test_comment_pages_use_session_primary_key(store: SqlAlchemyCommentStore) -> None:
+    """Pages stay scoped and seek past deleted cursors without sorting or scanning history."""
+    conversation_id = "e4607e40f7b85bc408d00d2e11aec4d2"
+    comments = sorted(
+        [store.add(conversation_id, "a.py", str(index), 0, 1) for index in range(5)],
+        key=lambda comment: comment.id,
+    )
+    other_session = "6a9338d893871f06de26f91e33256762"
+    store.add(other_session, "a.py", "other session", 0, 1)
+    with workspace_scope(42):
+        other_workspace = store.add(conversation_id, "a.py", "other workspace", 0, 1)
+        assert store.list_page(conversation_id) == ([other_workspace], None)
+    assert store.list_page("0" * 32) == ([], None)
+    page, cursor = store.list_page(conversation_id, limit=2)
+    assert page == comments[:2]
+    assert cursor == comments[1].id
+    store.delete(cursor, conversation_id)
+
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        page, cursor = store.list_page(conversation_id, limit=2, after_id=cursor)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert page == comments[2:4]
+    assert cursor == comments[3].id
+    assert store.list_page(conversation_id, limit=2, after_id=cursor) == (comments[4:], None)
+    assert store.list_page(conversation_id, after_id=comments[-1].id) == ([], None)
+    assert len(queries) == 1
+    statement, parameters = queries[0]
+    with store._engine.connect() as connection:
+        assert len(connection.exec_driver_sql(statement, parameters).all()) == 3
+        if store._engine.dialect.name == "sqlite":
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            assert "workspace_id=? AND conversation_id=? AND id>?" in plan
+            assert "SCAN" not in plan and "TEMP B-TREE" not in plan
 
 
 def test_list_for_conversation_with_path_filter(store: SqlAlchemyCommentStore) -> None:
@@ -855,3 +902,26 @@ def test_get_comments_fingerprints_reflects_delete_of_older_comment(
     # the newest) — the count drop is what makes the fingerprint move.
     # This is the reason the fingerprint carries a count at all.
     assert after == CommentsFingerprint(count=1, last_updated_at=2_000 * _US)
+
+
+def test_pr_anchor_persists_through_comment_lifecycle(store: SqlAlchemyCommentStore) -> None:
+    """PR context is immutable across edits, status changes and store reloads."""
+    from omnigent.entities.comment import PullRequestCommentAnchor
+
+    anchor = PullRequestCommentAnchor(
+        "https://github.com/acme/app/pull/1", "LEFT", 9, 7, "a" * 40, "b" * 40
+    )
+    session_id = "4e92b5a0c0ee6db3f874f9c4a3f855a5"
+    comment = store.add(session_id, "old.py", "Fix deleted code", 0, 0, anchor_metadata=anchor)
+    loaded = store.get(comment.id, session_id)
+    assert loaded is not None
+    assert loaded.anchor_metadata == anchor
+    store.update_comment(comment.id, session_id, body="Updated", status="addressed")
+    restored = store.list_for_conversation(session_id)[0]
+    assert restored.anchor_metadata == anchor
+    assert restored.body == "Updated"
+    assert restored.status == "addressed"
+    assert store.get(comment.id, "0" * 32) is None
+    deleted = store.delete(comment.id, session_id)
+    assert deleted is not None
+    assert deleted.anchor_metadata == anchor

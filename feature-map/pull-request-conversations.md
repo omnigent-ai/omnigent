@@ -1,7 +1,8 @@
 # Pull request conversations
 
 Read, reply to and start GitHub review conversations beside the code in a pull
-request's Changes subtab. Top-level comments, commits and force pushes appear
+request's Changes subtab. Save local session comments alongside them and attach
+them as context for the agent in chat. Top-level comments, commits and force pushes appear
 together in Comments.
 
 ## Sub-features
@@ -28,6 +29,11 @@ together in Comments.
   unresolved navigation and original context for unplaceable conversations.
   Conversations on files hidden by the path filter are hidden with their file.
   Navigating to one clears the filter and shows **Filter cleared to show <file>**.
+- `local-review`: Save session-only comments on either diff side, with pencil and
+  trash actions in the comment header. Submitting an **Agent** comment attaches a context chip
+  to the session composer while preserving existing text and attachments. Hover
+  previews the comment; clicking reveals it in Changes. The full snapshots are
+  sent only when the user submits their chat message.
 - `file-controls`: The sidebar **Filter changed files** input (on narrow screens a
   toolbar button opens it above the list; hiding it clears the filter). Escape
   clears it, and **Clear filter** restores the list. Each file header has a
@@ -102,6 +108,21 @@ render exception in the panel and open it through each entry above. Confirm
 chat, Workspace tabs or mobile Close still work; clear the fault and choose
 **Try again**. Also navigate to another session and confirm recovery.
 
+For local review, use any of the four entry points above, select a diff line,
+choose **Agent**, and submit comments on two files. Confirm two context chips
+appear beside the existing chat draft without changing its text or attachments.
+Hover each chip to preview the body and click it to reveal the comment in
+Changes. Send the chat message and confirm both comment snapshots reach the
+agent. Switch PRs and sessions to check isolation. After a new commit, verify
+earlier comments retain their old line references. Repeat in split and unified
+layouts and on mobile.
+
+The four browser variants also save local comments on both diff sides,
+cross-check session storage through the REST API, attach both comments to
+an existing chat draft, and reveal a comment from its chip. Provider write
+counts remain unchanged. Component tests cover send serialization, edits,
+removal, session isolation and draft persistence across reloads.
+
 For a live check, use a disposable GitHub PR with current, old-side, resolved
 and outdated threads. Open Changes, compare both layouts to GitHub, focus the
 reply input and type a draft. Cancel, reopen and confirm the text survives.
@@ -125,11 +146,16 @@ outdated thread and confirm the suggestion uses its labeled original context.
   Timeline-only reads may be cached for 30 seconds; comments still refresh normally.
 - Session file comments addressed to the agent and PR top-level comments are
   separate features. Review replies publish immediately, without a draft review.
+- Local review comments reuse session comment storage, with immutable PR
+  coordinates in `anchor_metadata` separate from Files character offsets. They
+  persist across reloads and are never posted to GitHub. Only explicitly attached
+  comments enter the chat message; Files comments are not included automatically.
+  Chips persist with the session draft; removing one deletes the saved comment.
 - Older history refreshes on demand; a first-page poll does not refresh every page.
 - Hidden-context and outdated conversations use an explicit original snippet;
   they are never attached to an unrelated current line.
 - Canvas requires its release feature. Mobile uses the drawer instead of Workspace.
-- Drafts survive navigation in this app instance, but not a browser reload.
+- Unsubmitted inline comment drafts survive navigation but not a browser reload.
 - New ranges must stay within one displayed diff hunk and on one side. A changed
   base/head revision preserves the draft but requires selecting its lines again.
 - New conversations publish immediately as a submitted comment review. They do

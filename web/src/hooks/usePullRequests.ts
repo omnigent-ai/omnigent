@@ -1,3 +1,6 @@
+import { createComment, type Comment } from "./useComments";
+import { requestLocalReviewContext } from "@/lib/localReviewContext";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
@@ -1204,6 +1207,7 @@ export interface PullRequestCommentDraft {
   pending: boolean;
   error: string | null;
   anchor?: ReviewThreadAnchor;
+  destination?: "github" | "local";
 }
 
 function usePullRequestCommentDraft(key: readonly string[]) {
@@ -1334,6 +1338,8 @@ export function usePullRequestReviewThreadComposer(
   headSha: string,
   baseSha: string,
 ) {
+  const serverInfo = useServerInfo();
+  const localSupported = serverInfo !== "loading" && serverInfo.comment_anchor_metadata === true;
   const queryClient = useQueryClient();
   const key = ["github-new-review-thread", conversationId, prUrl, path];
   const { draft, updateDraft } = usePullRequestCommentDraft(key);
@@ -1347,15 +1353,46 @@ export function usePullRequestReviewThreadComposer(
       body: string;
       anchor: ReviewThreadAnchor;
       key: string[];
-    }) =>
-      fetchPullRequestEditResource<{ thread: ReviewThread }>(
-        target.conversationId,
-        "review-threads",
-        {
-          body: { pr_url: target.prUrl, body: target.body, anchor: target.anchor },
-        },
-      ),
-    onSuccess: async ({ thread }, target) => {
+      local: boolean;
+    }): Promise<{
+      thread: ReviewThread | null;
+      comment?: Comment;
+    }> =>
+      target.local
+        ? createComment(target.conversationId, {
+            path: target.anchor.path,
+            body: target.body,
+            start_index: 0,
+            end_index: 0,
+            anchor_metadata: {
+              pr_url: target.prUrl,
+              side: target.anchor.side,
+              line: target.anchor.line,
+              start_line: target.anchor.start_line,
+              head_sha: target.anchor.head_sha,
+              base_sha: target.anchor.base_sha,
+            },
+          }).then((comment) => ({ thread: null, comment }))
+        : fetchPullRequestEditResource<{ thread: ReviewThread }>(
+            target.conversationId,
+            "review-threads",
+            {
+              body: { pr_url: target.prUrl, body: target.body, anchor: target.anchor },
+            },
+          ),
+    onSuccess: async ({ thread, comment }, target) => {
+      if (target.local) {
+        queryClient.setQueryData(target.key, {
+          body: "",
+          pending: false,
+          error: null,
+          destination: "local",
+        });
+        void queryClient.invalidateQueries({ queryKey: ["comments", target.conversationId] });
+        if (comment) requestLocalReviewContext(comment);
+        return;
+      }
+      if (!thread) return;
       await queryClient.cancelQueries({
         queryKey: ["github-review-threads", target.conversationId, target.prUrl],
       });
@@ -1376,16 +1413,27 @@ export function usePullRequestReviewThreadComposer(
         queryKey: ["github-review-threads", target.conversationId, target.prUrl],
       });
     },
-    onError: (error: Error, target) =>
+    onError: (error: Error, target) => {
+      if (target.local)
+        void queryClient.invalidateQueries({ queryKey: ["comments", target.conversationId] });
       queryClient.setQueryData<PullRequestCommentDraft>(
         target.key,
-        (current) => current && { ...current, pending: false, error: commentPostingError(error) },
-      ),
+        (current) =>
+          current && {
+            ...current,
+            pending: false,
+            error: target.local ? error.message : commentPostingError(error),
+          },
+      );
+    },
   });
   return {
     draft,
     stale,
     setBody: (body: string) => updateDraft({ body, error: null }),
+    setDestination: (destination: "github" | "local") => {
+      if (!draft.pending) updateDraft({ destination, error: null });
+    },
     selectLines: (lines: Pick<ReviewThreadAnchor, "side" | "line" | "start_line">) => {
       if (!draft.pending)
         updateDraft({
@@ -1409,8 +1457,19 @@ export function usePullRequestReviewThreadComposer(
         updateDraft({ error: "The pull request changed. Reselect the lines before posting." });
         return;
       }
+      if (current.destination === "local" && !localSupported) {
+        updateDraft({ error: "Agent comments require a newer server. Your draft is saved." });
+        return;
+      }
       updateDraft({ pending: true, error: null });
-      mutation.mutate({ conversationId, prUrl, body: current.body, anchor: current.anchor, key });
+      mutation.mutate({
+        conversationId,
+        prUrl,
+        body: current.body,
+        anchor: current.anchor,
+        key,
+        local: current.destination === "local",
+      });
     },
   };
 }

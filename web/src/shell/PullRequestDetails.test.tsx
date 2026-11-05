@@ -768,8 +768,8 @@ it.each([
     const client = new QueryClient({ defaultOptions: { mutations: { retry: 3 } } });
     const composer = mountCommentComposer(client);
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "Please check this" } });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Post comment" })).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "Post comment" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
     await waitFor(() => expect(edits).toHaveLength(1));
     await act(async () => {
       if (status === null) edits[0].reject(new TypeError(message));
@@ -798,12 +798,12 @@ it.each([
 it("blocks blank and oversized comments and previews Markdown", async () => {
   const { edits } = stubFetch();
   mountCommentComposer(new QueryClient());
-  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
   fireEvent.change(screen.getByRole("textbox"), { target: { value: " \n" } });
-  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
   fireEvent.change(screen.getByRole("textbox"), { target: { value: "x".repeat(65537) } });
   expect(await screen.findByRole("alert")).toHaveTextContent("65536");
-  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
   const draft = `**Ready for review**\n![Screenshot](${ASSET_URL})`;
   fireEvent.change(screen.getByRole("textbox"), { target: { value: draft } });
   await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(draft));
@@ -819,10 +819,10 @@ it("accepts a comment at the Unicode code-point limit and blocks the next charac
   const body = "😀".repeat(65536);
   fireEvent.change(screen.getByRole("textbox"), { target: { value: body + "😀" } });
   expect(await screen.findByRole("alert")).toHaveTextContent("65536");
-  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
   fireEvent.change(screen.getByRole("textbox"), { target: { value: body } });
-  await waitFor(() => expect(screen.getByRole("button", { name: "Post comment" })).toBeEnabled());
-  fireEvent.click(screen.getByRole("button", { name: "Post comment" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Submit" }));
   await waitFor(() => expect(edits).toHaveLength(1));
   expect(edits[0].body).toEqual({ pr_url: PR_URL, body });
   await act(async () => edits[0].respond(json({ detail: "Rejected by test" }, 400)));

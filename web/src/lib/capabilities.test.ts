@@ -424,6 +424,15 @@ describe("custom agents settings capability", () => {
   );
 
   it.each([undefined, false, "true", true])(
+    "requires explicit support for PR comment anchors: %s",
+    async (supported) => {
+      expect((await probe({ comment_anchor_metadata: supported })).comment_anchor_metadata).toBe(
+        supported === true,
+      );
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
     "requires a boolean install capability: %s",
     async (install) => {
       const parsed = await probe({

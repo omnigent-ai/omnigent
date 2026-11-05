@@ -268,6 +268,8 @@ export interface ServerInfo {
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
   session_pull_requests?: boolean;
+  /** Session comments preserve PR revision and line anchors; absent on older servers. */
+  comment_anchor_metadata?: boolean;
   /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
@@ -419,6 +421,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
+  comment_anchor_metadata: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -587,6 +590,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
           session_pull_requests: data.session_pull_requests === true,
+          comment_anchor_metadata: data.comment_anchor_metadata === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,

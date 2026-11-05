@@ -41,6 +41,53 @@ describe("session drafts", () => {
     expect(reloaded.getSessionDraft("another")).toBeUndefined();
   });
 
+  it("restores comment-only drafts after reload and discards invalid or cross-session context", async () => {
+    const comment = {
+      id: "review",
+      conversation_id: "conversation",
+      path: "file.ts",
+      body: "Check this",
+      status: "draft",
+      start_index: 0,
+      end_index: 0,
+      created_at: 1,
+      updated_at: 1,
+      created_by: null,
+      anchor_content: null,
+      anchor_metadata: {
+        pr_url: "https://github.com/acme/app/pull/1",
+        side: "LEFT",
+        line: 12,
+        start_line: null,
+        head_sha: "a".repeat(40),
+        base_sha: "b".repeat(40),
+      },
+    };
+    sessionStorage.setItem(
+      key,
+      JSON.stringify({
+        conversation: {
+          text: "",
+          reviewComments: [
+            comment,
+            null,
+            { ...comment, conversation_id: "other" },
+            { ...comment, anchor_metadata: {} },
+          ],
+        },
+      }),
+    );
+    const drafts = await import("./sessionDrafts");
+    expect(drafts.hasSessionDraft("conversation")).toBe(true);
+    expect(drafts.getSessionDraft("conversation")?.reviewComments).toEqual([comment]);
+    drafts.setSessionDraft("conversation", { text: "", files: [] });
+    vi.resetModules();
+    const reloaded = await import("./sessionDrafts");
+    expect(reloaded.getSessionDraft("conversation")?.reviewComments).toEqual([comment]);
+    reloaded.clearSessionDrafts();
+    expect(sessionStorage.getItem(key)).toBeNull();
+  });
+
   it("preserves fallback text when stored metadata is invalid or unsupported", async () => {
     const text = "> authored\ncontinued\n";
     sessionStorage.setItem(

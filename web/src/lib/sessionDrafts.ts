@@ -1,8 +1,11 @@
 import { useSyncExternalStore } from "react";
 import { readComposerDraft, type ComposerDraft } from "./replyDraft";
+import type { Comment } from "@/hooks/useComments";
+import { isLocalReviewComment } from "./localReviewComments";
 
 export interface SessionDraft extends ComposerDraft {
   files: File[];
+  reviewComments?: Comment[];
 }
 
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
@@ -19,7 +22,21 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
     const drafts = new Map<string, SessionDraft>();
     for (const [id, entry] of Object.entries(entries)) {
       const draft = readComposerDraft(entry);
-      if (draft?.text) drafts.set(id, { ...draft, files: [] });
+      const rawComments =
+        entry && typeof entry === "object" && "reviewComments" in entry
+          ? entry.reviewComments
+          : undefined;
+      const reviewComments = Array.isArray(rawComments)
+        ? rawComments.filter(
+            (comment) => isLocalReviewComment(comment) && comment.conversation_id === id,
+          )
+        : [];
+      if (draft && (draft.text || reviewComments.length))
+        drafts.set(id, {
+          ...draft,
+          files: [],
+          ...(reviewComments.length ? { reviewComments } : {}),
+        });
     }
     return drafts;
   } catch {
@@ -30,12 +47,17 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
 function saveDraftsToStorage(): void {
   if (typeof window === "undefined") return;
   try {
-    const entries: Record<string, string | ComposerDraft> = {};
+    const entries: Record<string, string | (ComposerDraft & { reviewComments?: Comment[] })> = {};
     for (const [id, draft] of sessionDrafts) {
-      if (draft.text)
-        entries[id] = draft.replyDraft
-          ? { text: draft.text, replyDraft: draft.replyDraft }
-          : draft.text;
+      if (draft.text || draft.reviewComments?.length)
+        entries[id] =
+          draft.replyDraft || draft.reviewComments?.length
+            ? {
+                text: draft.text,
+                replyDraft: draft.replyDraft,
+                reviewComments: draft.reviewComments,
+              }
+            : draft.text;
     }
     if (Object.keys(entries).length === 0) {
       window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);
@@ -64,10 +86,11 @@ export function getSessionDraft(conversationId: string): SessionDraft | undefine
 
 export function setSessionDraft(conversationId: string, draft: SessionDraft): void {
   if (retiredDraftIds.has(conversationId)) return;
-  if (draft.text === "" && draft.files.length === 0) {
+  const reviewComments = draft.reviewComments ?? sessionDrafts.get(conversationId)?.reviewComments;
+  if (draft.text === "" && draft.files.length === 0 && !reviewComments?.length) {
     sessionDrafts.delete(conversationId);
   } else {
-    sessionDrafts.set(conversationId, draft);
+    sessionDrafts.set(conversationId, { ...draft, ...(reviewComments ? { reviewComments } : {}) });
   }
   saveDraftsToStorage();
   notifyListeners();
@@ -117,7 +140,22 @@ export function promoteSessionDraft(
 
 export function hasSessionDraft(conversationId: string): boolean {
   const draft = sessionDrafts.get(conversationId);
-  return draft !== undefined && (draft.text.trim() !== "" || draft.files.length > 0);
+  return (
+    draft !== undefined &&
+    (draft.text.trim() !== "" || draft.files.length > 0 || !!draft.reviewComments?.length)
+  );
+}
+
+const NO_REVIEW_COMMENTS: Comment[] = [];
+
+export function useSessionReviewComments(conversationId: string | null): Comment[] {
+  return useSyncExternalStore(
+    subscribe,
+    () =>
+      (conversationId ? sessionDrafts.get(conversationId)?.reviewComments : undefined) ??
+      NO_REVIEW_COMMENTS,
+    () => NO_REVIEW_COMMENTS,
+  );
 }
 
 export function useHasSessionDraft(conversationId: string): boolean {

@@ -23,6 +23,9 @@ import { Button } from "@/components/ui/button";
 import { TabsContent } from "@/components/ui/tabs";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useComments } from "@/hooks/useComments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import type { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -37,6 +40,7 @@ import {
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { consumeLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import { PULL_REQUEST_DIFF_THEME, type ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { useViewedFiles, type PullRequestIdentity } from "@/lib/pullRequestViewed";
 import { cn } from "@/lib/utils";
@@ -53,6 +57,7 @@ import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestPathFilter } from "./PullRequestPathFilter";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { PullRequestViewedProgress, PullRequestViewedToggle } from "./PullRequestViewedControls";
+import { LocalReviewComment } from "./LocalReviewComment";
 import {
   buildSearchCorpus,
   filterChangedPaths,
@@ -445,8 +450,78 @@ export function PullRequestChangesTab({
   const headSha = pr.head_sha;
   const baseSha = pr.base_sha;
   const mobile = useIsMobileViewport();
+  const serverInfo = useServerInfo();
+  const sessionComments = useComments(selected ? conversationId : undefined);
+  const selectedPrUrl = data.selected_pr_url ?? pr.url;
+  const localComments = useMemo(
+    () =>
+      (sessionComments.data ?? []).filter(
+        (comment) => comment.anchor_metadata?.pr_url === selectedPrUrl,
+      ),
+    [sessionComments.data, selectedPrUrl],
+  );
+  useEffect(() => {
+    if (selected) markCommentsSeen(localComments.map((comment) => comment.id));
+  }, [selected, localComments]);
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
-  const { revealedPaths, reveal, clearReveal, find } = view;
+  const { revealedPaths, reveal, clearReveal, find, setPathFilter, setHideViewed } = view;
+  const navigationTarget = useLocalReviewNavigation(conversationId);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (
+      !selected ||
+      !navigationTarget ||
+      changes.isLoading ||
+      changes.isFetching ||
+      prDiff.isLoading ||
+      prDiff.isFetching ||
+      sessionComments.isFetching ||
+      !sessionComments.isSuccess ||
+      navigationTarget.anchor_metadata?.pr_url !== selectedPrUrl
+    )
+      return;
+    if (!localComments.some((comment) => comment.id === navigationTarget.id)) {
+      toast.error("This review comment is no longer available.");
+      consumeLocalReviewNavigation(conversationId);
+      return;
+    }
+    setPathFilter("");
+    setHideViewed(false);
+    reveal(navigationTarget.path);
+    // Tabs can mount their content after this effect; diff slots also settle asynchronously.
+    let frame = 0;
+    const focusComment = () => {
+      const element = scrollRef.current?.querySelector<HTMLElement>(
+        `[data-local-review-comment="${CSS.escape(navigationTarget.id)}"]`,
+      );
+      if (element?.getClientRects().length) {
+        element.focus({ preventScroll: true });
+        if ((element.getRootNode() as Document | ShadowRoot).activeElement === element) {
+          element.scrollIntoView({ block: "center" });
+          consumeLocalReviewNavigation(conversationId);
+          return;
+        }
+      }
+      frame = requestAnimationFrame(focusComment);
+    };
+    frame = requestAnimationFrame(focusComment);
+    return () => cancelAnimationFrame(frame);
+  }, [
+    changes.isLoading,
+    changes.isFetching,
+    prDiff.isLoading,
+    prDiff.isFetching,
+    conversationId,
+    navigationTarget,
+    reveal,
+    selected,
+    selectedPrUrl,
+    setHideViewed,
+    setPathFilter,
+    localComments,
+    sessionComments.isSuccess,
+    sessionComments.isFetching,
+  ]);
   // The filter input shows in the sidebar; while the sidebar is collapsed it opens inline.
   const [filterOpen, setFilterOpen] = useState(false);
   // The revision the displayed list reports. Open uses only this pinned revision, so a newer
@@ -681,7 +756,6 @@ export function PullRequestChangesTab({
 
   // The stacked diff scrolls as one; the sidebar highlights the file at the top
   // of the viewport and jumps to a file on click.
-  const scrollRef = useRef<HTMLDivElement>(null);
   const sectionEls = useRef<Map<string, HTMLElement>>(new Map());
   const [activePath, setActivePath] = useState<string | null>(null);
 
@@ -933,8 +1007,8 @@ export function PullRequestChangesTab({
       pr.base_sha === prDiff.data?.base_sha &&
       reviews.page
     ),
-    headSha: pr.head_sha,
-    baseSha: pr.base_sha,
+    headSha: prDiff.data?.head_sha,
+    baseSha: prDiff.data?.base_sha,
     loadComments: reviews.loadComments,
     loadingComments: reviews.loadingComments,
   };
@@ -1206,7 +1280,11 @@ export function PullRequestChangesTab({
                 registerRef={registerRef}
                 collapsed={collapsedPaths.has(file.path)}
                 forceExpanded={revealedPaths.has(file.path)}
-                forceMount={pendingReveal?.path === file.path || activeFilePath === file.path}
+                forceMount={
+                  pendingReveal?.path === file.path ||
+                  activeFilePath === file.path ||
+                  navigationTarget?.path === file.path
+                }
                 bypassLargeDiffGate={!!highlight && activeFilePath === file.path}
                 highlight={activeFilePath === file.path ? highlight : null}
                 onToggleCollapsed={() => toggleOne(file.path)}
@@ -1225,6 +1303,12 @@ export function PullRequestChangesTab({
                 threads={threadsByFile.get(file.path) ?? []}
                 threadContext={threadContext}
                 matchingRevision={matchingRevision}
+                localComments={localComments.filter((comment) => comment.path === file.path)}
+                canCommentLocally={
+                  serverInfo !== "loading" &&
+                  serverInfo.comment_anchor_metadata === true &&
+                  !!(canEdit && prDiff.data?.head_sha && prDiff.data?.base_sha)
+                }
               />
             ))
           )}
@@ -1239,8 +1323,28 @@ export function PullRequestChangesTab({
               ))}
             </div>
           )}
+          {localComments
+            .filter((comment) => !canShowFiles || !files.some((file) => file.path === comment.path))
+            .map((comment) => (
+              <div key={comment.id} className="px-3">
+                <p className="text-xs">{comment.path}</p>
+                <LocalReviewComment comment={comment} canEdit={canEdit} outdated />
+              </div>
+            ))}
         </div>
       </div>
+      {sessionComments.isError && (
+        <p role="alert" className="p-3 text-ui">
+          Local comments could not be loaded.{" "}
+          <button
+            type="button"
+            className="underline"
+            onClick={() => void sessionComments.refetch()}
+          >
+            Retry
+          </button>
+        </p>
+      )}
     </TabsContent>
   );
 }

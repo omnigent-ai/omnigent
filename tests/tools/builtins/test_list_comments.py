@@ -105,6 +105,12 @@ class _InMemoryCommentStore(CommentStore):
         ]
         return sorted(results, key=lambda c: c.created_at)
 
+    def list_page(
+        self, conversation_id: str, *, limit: int = 100, after_id: str | None = None
+    ) -> tuple[list[Comment], str | None]:
+        """The legacy tool does not use paginated reads."""
+        raise NotImplementedError
+
     def update_comment(
         self,
         comment_id: str,

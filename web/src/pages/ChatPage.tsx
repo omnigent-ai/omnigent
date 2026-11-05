@@ -1,3 +1,5 @@
+import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
@@ -238,6 +240,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { ComposerLocalReviewChips } from "@/components/composer/ComposerLocalReviewChips";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import {
   SMART_ROUTING_ARMS,
@@ -2528,6 +2531,7 @@ function ComposerImpl(
   // tabs and coming back restores the draft. The shared draft store also lets
   // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
+  const localReviewComments = usePendingLocalReviewContexts(conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
@@ -3062,7 +3066,11 @@ function ComposerImpl(
   });
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
-  const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
+  const hasDraft =
+    fullText.trim().length > 0 ||
+    files.length > 0 ||
+    mentionedItems.length > 0 ||
+    localReviewComments.length > 0;
   const showInterruptButton =
     isWorking &&
     (!hasDraft ||
@@ -3646,7 +3654,10 @@ function ComposerImpl(
     const trimmed = fullText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
-      (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
+      (!trimmed &&
+        files.length === 0 &&
+        mentionedItems.length === 0 &&
+        localReviewComments.length === 0) ||
       disabled ||
       sendDisabledReason !== null ||
       hasPendingElicitation
@@ -3691,7 +3702,8 @@ function ComposerImpl(
       draft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
       files.length === 0 &&
-      mentionedItems.length === 0
+      mentionedItems.length === 0 &&
+      localReviewComments.length === 0
     ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
@@ -3778,6 +3790,8 @@ function ComposerImpl(
     // agent knows to open the directory. The native vendor reads the on-disk
     // workspace file/folder from this marker; no upload happens.
     const mentionPreamble = buildMentionPreamble(mentionedItems, sessionHarness);
+    const reviewPreamble =
+      localReviewComments.length > 0 ? `${formatLocalReviewComments(localReviewComments)}\n\n` : "";
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
@@ -3789,18 +3803,21 @@ function ComposerImpl(
       const outgoing = {
         ...draft,
         quotes: draft.quotes.map((quote, index) =>
-          index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
+          index === 0
+            ? { ...quote, before: mentionPreamble + reviewPreamble + quote.before }
+            : quote,
         ),
       };
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
       const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
-      onSend(mentionPreamble + message, sendFiles);
+      onSend(mentionPreamble + reviewPreamble + message, sendFiles);
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
     setMentionedItems([]);
+    if (conversationId) clearLocalReviewContexts(conversationId);
     setMention(null);
   };
 
@@ -3898,7 +3915,12 @@ function ComposerImpl(
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
         // Empty-composer recall takes the last queued row before browsing history.
-        if (fullText === "" && files.length === 0 && mentionedItems.length === 0) {
+        if (
+          fullText === "" &&
+          files.length === 0 &&
+          mentionedItems.length === 0 &&
+          localReviewComments.length === 0
+        ) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
           if (target !== undefined) {
             e.preventDefault();
@@ -4251,6 +4273,7 @@ function ComposerImpl(
                 onRemove={removeMentionedItem}
                 showLineRange
               />
+              <ComposerLocalReviewChips comments={localReviewComments} />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>
