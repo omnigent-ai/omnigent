@@ -57,11 +57,11 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(container.querySelector(".bg-success")).toBeNull();
   });
 
-  it("renders a background shell with the running spinner and its own label", () => {
+  it("renders background work with the running spinner and its own label", () => {
     const { container } = renderBadge({ kind: "running", background: true });
     const badge = screen.getByTestId("session-state-badge");
     expect(badge).toHaveAttribute("data-state", "running");
-    expect(badge).toHaveAttribute("aria-label", "Background shell running");
+    expect(badge).toHaveAttribute("aria-label", "Working in the background");
     expect(container.querySelector('[data-testid="running-dot"]')).not.toBeNull();
   });
 
