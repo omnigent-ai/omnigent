@@ -190,14 +190,20 @@ async def _connect_proxy(reply):
         yield server.sockets[0].getsockname()[1], requests
 
 
-@pytest.mark.parametrize("userinfo", ["", "alice:open%20sesame@"])
-async def test_connect_tunnel(userinfo):
+@pytest.mark.parametrize(
+    ("userinfo", "ws_url", "authority"),
+    [
+        ("", _TUNNEL_URL, b"server.sandbox.test:8000"),
+        ("alice:open%20sesame@", _TUNNEL_URL, b"server.sandbox.test:8000"),
+        ("", "ws://bücher.example:8000/t", b"xn--bcher-kva.example:8000"),
+    ],
+    ids=["anonymous", "authenticated", "idna-host"],
+)
+async def test_connect_tunnel(userinfo, ws_url, authority):
     async with _connect_proxy(_OK) as (port, requests):
         url = f"http://{userinfo}127.0.0.1:{port}"
-        with await open_proxy_connect_socket(url, _TUNNEL_URL, timeout=5) as sock:
-            expected = (
-                b"CONNECT server.sandbox.test:8000 HTTP/1.1\r\nHost: server.sandbox.test:8000\r\n"
-            )
+        with await open_proxy_connect_socket(url, ws_url, timeout=5) as sock:
+            expected = b"CONNECT " + authority + b" HTTP/1.1\r\nHost: " + authority + b"\r\n"
             if userinfo:
                 expected += (
                     b"Proxy-Authorization: Basic "
@@ -253,18 +259,6 @@ async def test_connect_error(monkeypatch, reply, error):
             await open_proxy_connect_socket(f"http://127.0.0.1:{port}", _TUNNEL_URL, timeout=5)
     assert len(dialed) == 1
     assert dialed[0].fileno() == -1
-
-
-async def test_connect_tunnel_idna_host():
-    async with _connect_proxy(_OK) as (port, requests):
-        with await open_proxy_connect_socket(
-            f"http://127.0.0.1:{port}", "ws://bücher.example:8000/t", timeout=5
-        ):
-            pass
-        authority = b"xn--bcher-kva.example:8000"
-        assert requests == [
-            b"CONNECT " + authority + b" HTTP/1.1\r\nHost: " + authority + b"\r\n\r\n"
-        ]
 
 
 @pytest.mark.parametrize(

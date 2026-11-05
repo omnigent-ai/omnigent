@@ -390,11 +390,9 @@ RUN set -eu; \
     fi; \
     echo "gh ${GH_VERSION} pinned (sha256 verified)"
 
-# Copy the venv and source tree. The editable install's .pth files reference
-# /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
-# policy. Re-install without -e so the package bytes land in the venv's
-# site-packages and imports no longer require /build at runtime.
-# OpenShell's sandbox user installs wheels here; chowning at COPY avoids a second venv layer.
+# Re-install without -e: the editable .pth files point into /build, which the
+# k8s Landlock policy denies. OpenShell's sandbox user installs wheels into this
+# venv; chowning at COPY avoids a second venv layer.
 COPY --from=builder --chown=sandbox:sandbox /opt/venv /opt/venv
 COPY --from=builder /build /build
 RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
@@ -441,9 +439,8 @@ RUN python -m venv /sandbox/.venv \
  && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /sandbox/.venv/lib/python*/site-packages
 
 # ── OpenShell host runtime (`--target host-openshell`) ──
-# OpenShell's Kubernetes driver copies the image's /sandbox into a PVC mounted
-# over /sandbox, as UID 10001 without group 0, and Landlock leaves only /sandbox
-# and /tmp writable. So the venv lives there, and any UID must read /sandbox.
+# The Kubernetes driver seeds /sandbox into a PVC as UID 10001 without group 0,
+# and Landlock leaves only /sandbox and /tmp writable; any UID must read /sandbox.
 FROM host AS host-openshell
 RUN rm -rf /opt/venv && chmod 755 /sandbox
 COPY --from=openshell-venv-builder --chown=sandbox:sandbox /sandbox/.venv /sandbox/.venv

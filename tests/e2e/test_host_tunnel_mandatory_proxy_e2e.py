@@ -114,7 +114,7 @@ def _mandatory_proxy(server_port: int) -> Iterator[tuple[str, list[tuple[str, st
 
 
 # Older host builds dial the tunnel directly instead of through the proxy.
-@pytest.mark.min_runner_version("0.21.0")
+@pytest.mark.min_runner_version("0.22.0")
 def test_host_comes_online_through_mandatory_proxy(
     live_server: str, http_client: httpx.Client, tmp_path: Path
 ) -> None:
