@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { StrictMode } from "react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
 import { toast } from "sonner";
@@ -114,6 +115,27 @@ afterEach(() => {
   localStorage.clear();
 });
 
+describe("undelivered startup messages", () => {
+  it("shows a failed session's first message and its recovery action in a grid", () => {
+    const lost = "Summarize the open PRs";
+    conversationRegistry.acquire(childId).setState({
+      failedInputs: [{ pendingId: "pending_first", content: [{ type: "input_text", text: lost }] }],
+    });
+    renderPane(
+      <MemoryRouter>
+        <SideChatPane childId={childId} fullSession />
+      </MemoryRouter>,
+    );
+
+    const notice = screen.getByTestId("message-undelivered");
+    expect(notice).toHaveTextContent("Not delivered");
+    expect(screen.getByText(lost)).toBeTruthy();
+    expect(
+      within(notice).getByRole("button", { name: "Copy message to new session" }),
+    ).toBeEnabled();
+  });
+});
+
 describe("side-chat working indicator", () => {
   it("shows the full session history and live state without exposing a read-only composer", () => {
     const entry = conversationRegistry.acquire(childId);
@@ -164,6 +186,39 @@ describe("side-chat working indicator", () => {
     renderPane(<SideChatPane childId={childId} />);
 
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
+  });
+
+  it.each([
+    { name: "after a reply", blocks: true },
+    { name: "with no visible bubbles", blocks: false },
+  ])("shows and announces the child's background tasks $name", ({ blocks }) => {
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        sessionStatus: "idle",
+        backgroundTaskCount: 2,
+        blocks: blocks
+          ? itemsToBlocks([
+              {
+                id: "started",
+                response_id: "turn_started",
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: "Started the build in the background." }],
+              },
+            ])
+          : [],
+      }),
+    );
+
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveTextContent(
+      "2 background tasks running",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("2 background tasks running");
+
+    act(() => conversationRegistry.acquire(childId).setState({ backgroundTaskCount: 0 }));
+    expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
   });
 
   it("updates the working label from the child's own blocked state", () => {
@@ -381,6 +436,91 @@ describe("side chat opened from a text selection", () => {
 
     expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
     expect(onStart).toHaveBeenCalledExactlyOnceWith("why?");
+  });
+});
+
+describe("side chat opened from a + button", () => {
+  it("focuses a pending tab's input at once", () => {
+    useChatStore.setState({
+      sideChatComposers: { "pending:plus": { text: "", files: [], autoFocus: true } },
+    });
+    renderPane(<SideChatPane childId="pending:plus" onStart={vi.fn()} />);
+
+    expect(screen.getByTestId("side-chat-input")).toHaveFocus();
+    expect(useChatStore.getState().sideChatComposers["pending:plus"]?.autoFocus).toBe(false);
+  });
+
+  it("focuses a live tab's input once its agent binding enables it, surviving remounts and only once", () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "", files: [], autoFocus: true } },
+    });
+    // The rail or drawer can unmount the pane while the fork is still binding.
+    renderPane(<SideChatPane childId={childId} />).unmount();
+    const bound = renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    expect(input).toBeDisabled();
+    expect(input).not.toHaveFocus();
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+
+    expect(input).toBeEnabled();
+    expect(input).toHaveFocus();
+    expect(useChatStore.getState().sideChatComposers[childId]?.autoFocus).toBe(false);
+
+    // Re-selecting the tab later mounts it again without stealing focus.
+    bound.unmount();
+    renderPane(<SideChatPane childId={childId} />);
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(screen.getByTestId("side-chat-input")).not.toHaveFocus();
+  });
+
+  it.each([
+    ["a textarea", () => <textarea data-testid="other-field" />],
+    ["a text input", () => <input type="text" data-testid="other-field" />],
+    ["an editable element", () => <div contentEditable tabIndex={0} data-testid="other-field" />],
+  ])("drops a live tab's request when the user starts typing in %s while it binds", (_, field) => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "", files: [], autoFocus: true } },
+    });
+    renderPane(
+      <>
+        <button type="button" data-testid="menu-trigger" />
+        <input type="checkbox" data-testid="toggle" />
+        {field()}
+        <SideChatPane childId={childId} />
+      </>,
+    );
+    // A closing menu returning focus to its button, or a toggled checkbox, is not typing.
+    act(() => screen.getByTestId("menu-trigger").focus());
+    act(() => screen.getByTestId("toggle").focus());
+    expect(useChatStore.getState().sideChatComposers[childId]?.autoFocus).toBe(true);
+
+    act(() => screen.getByTestId("other-field").focus());
+    expect(useChatStore.getState().sideChatComposers[childId]?.autoFocus).toBe(false);
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(screen.getByTestId("other-field")).toHaveFocus();
+  });
+
+  it("leaves a text input that already had focus before the pane mounted alone", () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "", files: [], autoFocus: true } },
+    });
+    // A slow fork: the user went back to typing before the side chat appeared.
+    render(<textarea data-testid="main-composer" />);
+    act(() => screen.getByTestId("main-composer").focus());
+    renderPane(<SideChatPane childId={childId} />);
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(screen.getByTestId("side-chat-input")).not.toHaveFocus();
+    expect(screen.getByTestId("main-composer")).toHaveFocus();
+    expect(useChatStore.getState().sideChatComposers[childId]?.autoFocus).toBe(false);
   });
 });
 

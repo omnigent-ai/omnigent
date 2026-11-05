@@ -37,7 +37,7 @@ import {
 } from "./routingDecision";
 import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
-import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
+import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -153,6 +153,7 @@ export type RenderItem =
       } | null;
       askUserQuestion?: Record<string, unknown> | null;
       exitPlanMode?: Record<string, unknown> | null;
+      fileEdit?: FileEditRequest | null;
       codexCommand?: {
         command: string;
         cwd: string | null;
@@ -176,6 +177,8 @@ export type Bubble =
       pending?: boolean;
       /** Pending input sent mid-turn that the agent hasn't read yet. */
       awaitingAgent?: boolean;
+      /** Saved startup message the server never delivered (the launch failed). */
+      undelivered?: boolean;
       content: MessageContentBlock[];
       /** Shell input is literal command text, not Markdown or attachment markers. */
       shellCommand?: string;
@@ -1769,6 +1772,7 @@ function buildAssistantItems(
         response: b.response,
         askUserQuestion: b.askUserQuestion,
         exitPlanMode: b.exitPlanMode,
+        fileEdit: b.fileEdit,
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
         allowAutoMode: b.allowAutoMode,
@@ -1962,6 +1966,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
+      Boolean(a.undelivered) !== Boolean(b.undelivered) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||

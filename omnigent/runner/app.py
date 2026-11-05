@@ -105,6 +105,7 @@ from omnigent.runner.background_titles import (
     generate_background_title as run_background_title,
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
+from omnigent.runner.background_work_reports import BackgroundWorkReporter
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.launch_failure import (
     TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
@@ -499,6 +500,12 @@ _SESSION_STREAM_HEARTBEAT_S = 15.0
 # that died on its own leaves the harness parked on a readiness wait, so the
 # wait is bounded and the stream failure is then attributed to the exit.
 _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
+# A pane Omnigent closed itself (a delivery timeout) has its turn's own error
+# on the way; releasing the harness before it lands severs the stream carrying
+# it, so the wait is longer. The pane is already gone, so nothing else waits.
+_EXPECTED_CLOSE_RELEASE_GRACE_S = 15.0
+# Display names for the terminals whose exits the runner describes to people.
+_TERMINAL_DISPLAY_NAMES = {"claude": "Claude Code"}
 
 # Banner printed by Claude Code on a voluntary /exit or /quit (exit 0).
 # The pane activity from printing it can flip the idle memo back to "running"
@@ -1530,7 +1537,7 @@ def create_runner_app(
     # subprocess. The release closes the httpx client an in-flight
     # ``proxy_stream`` is reading, which surfaces there as a transport error;
     # the stream's failure handler consumes the record to report the exit.
-    _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
+    _required_terminal_exit_errors: dict[str, dict[str, Any]] = {}
     app.state.required_terminal_exit_errors = _required_terminal_exit_errors
     _clean_terminal_exit_responses: dict[str, str | None] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
@@ -1838,6 +1845,7 @@ def create_runner_app(
                 ),
             }
             if failure_detail:
+                from omnigent.harnesses.claude_native.bridge import program_status_turn_error
                 from omnigent.harnesses.claude_native.failure_telemetry import (
                     claude_failure_context,
                 )
@@ -1852,7 +1860,8 @@ def create_runner_app(
                 context = normalize_failure_context(raw_context)
                 detail = context.get("native_error_message")
                 if isinstance(detail, str):
-                    event["error"] = {"code": "native_turn_error", "message": detail}
+                    code, message = program_status_turn_error(detail)
+                    event["error"] = {"code": code, "message": message}
                     event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
@@ -1864,6 +1873,17 @@ def create_runner_app(
             session_id, "failed", failure_detail=detail
         )
     )
+
+    # A session event over HTTP, so a server that predates the flag answers
+    # "Unknown event type" instead of relaying it into its public stream.
+    background_reports = BackgroundWorkReporter(
+        lambda *args, **kwargs: server_client.post(*args, **kwargs)
+    )
+
+    def _publish_session_background(session_id: str, running: bool) -> None:
+        background_reports.report(session_id, running)
+
+    resource_registry.set_session_background_publisher(_publish_session_background)
 
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
         if event.command is None:
@@ -1917,9 +1937,30 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
+    def _build_delivery_timeout_error(event: TerminalExitEvent) -> dict[str, Any]:
+        """Build the failure for a pane the delivery timeout closed.
+
+        Stands in for the turn's own readiness error when releasing the harness
+        severs its stream first. The executor reports that error as a
+        ``RuntimeError`` with ``undelivered`` set, since nothing reached the
+        pane; the same shape keeps both readings of one failure together and
+        lets the server keep the queued message.
+
+        :param event: The exit of the pane Omnigent closed.
+        """
+        terminal = _TERMINAL_DISPLAY_NAMES.get(event.terminal_name, event.terminal_name)
+        message = (
+            f"{terminal} terminal did not become ready before the message delivery timed "
+            "out, so Omnigent closed it and the message was not delivered. Relaunch the "
+            "terminal to continue this conversation."
+        )
+        if event.last_output:
+            message = f"{message}\n\nLast captured terminal output:\n{event.last_output}"
+        return {"code": "RuntimeError", "message": message, "undelivered": True}
+
     def _build_required_terminal_error(
         event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Build the structured ``session.status`` error for a required-terminal exit.
 
         Always carries ``code`` + a fully-composed ``message`` (back-compat: the
@@ -1931,7 +1972,7 @@ def create_runner_app(
         :param diagnosis: The exit's :func:`classify_terminal_failure` result.
         """
         message = _format_required_terminal_exit_output(event, diagnosis)
-        error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
+        error: dict[str, Any] = {"code": "required_terminal_exited", "message": message}
         if diagnosis is not None:
             error["title"] = diagnosis.title
             error["cause"] = diagnosis.cause
@@ -1982,7 +2023,9 @@ def create_runner_app(
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
         return message
 
-    def _release_required_terminal_session(session_id: str) -> None:
+    def _release_required_terminal_session(
+        session_id: str, *, grace_s: float = _TERMINAL_EXIT_RELEASE_GRACE_S
+    ) -> None:
         if process_manager is None:
             return
 
@@ -1990,7 +2033,7 @@ def create_runner_app(
             # Let a live turn stream converge first (bounded): the harness's own
             # failure event may already be on the wire, and releasing now would
             # sever the stream carrying it.
-            deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
+            deadline = time.monotonic() + grace_s
             while session_id in _live_response_id and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
             try:
@@ -2036,7 +2079,12 @@ def create_runner_app(
                 event.session_id,
                 extra={"session_id": event.session_id},
             )
-            _release_required_terminal_session(event.session_id)
+            # Should the release still sever the stream before that error lands,
+            # the drop reports this closed pane and its output, not the transport.
+            _required_terminal_exit_errors[event.session_id] = _build_delivery_timeout_error(event)
+            _release_required_terminal_session(
+                event.session_id, grace_s=_EXPECTED_CLOSE_RELEASE_GRACE_S
+            )
             return
 
         # A required terminal exit ends the session. Tear down any registered
@@ -8371,6 +8419,8 @@ def create_runner_app(
         # native session mid-turn during the restart would sit on a stale
         # ``idle`` for the rest of the turn. Re-arm them before the item scan
         # below (which skips native harnesses entirely).
+        # A server that rejected the background flag may have been upgraded.
+        background_reports.resume()
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
