@@ -312,6 +312,27 @@ async def test_dispatch_hooks_pass_the_live_switch_and_interval_to_the_scheduler
         assert scheduler._poll_interval is poll_interval
 
 
+async def test_dispatch_hooks_pass_run_allowed_to_the_scheduler(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "automations_v2")
+
+    def run_allowed(_task: object) -> bool:
+        return False
+
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
+        dispatch=ScheduledTaskDispatchHooks(run_allowed=run_allowed),
+    )
+    async with app.router.lifespan_context(app):
+        assert app.state.scheduled_task_scheduler._run_allowed is run_allowed
+
+
 @pytest.mark.parametrize("features", [None, "-automations_v2", "automations_v2,-automations_v2"])
 async def test_automations_v2_flag_off_keeps_timers_even_with_hooks(
     runtime_init: None,

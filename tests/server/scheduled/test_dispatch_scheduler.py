@@ -12,6 +12,7 @@ import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.scheduled.dispatch_scheduler import (
+    RUN_NOT_ALLOWED_ERROR_CODE,
     PersistentTaskScheduler,
     ScheduledTaskDispatchHooks,
     StartupLease,
@@ -2029,6 +2030,38 @@ async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeyp
         assert store.list_uninitialized_tasks() == []
     finally:
         await scheduler.stop()
+
+
+@pytest.mark.parametrize("refusal", ["returns_false", "raises"])
+async def test_refused_run_is_skipped_without_firing_and_keeps_its_schedule(
+    store, refusal
+) -> None:
+    task = _task(store)
+    clock = FakeClock(task.next_run_at + 7200)
+    fire = AsyncMock()
+
+    def run_allowed(snapshot) -> bool:
+        if refusal == "raises":
+            raise RuntimeError("flag lookup failed")
+        return False
+
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), run_allowed=run_allowed, now=clock.now, poll_seconds=3600
+    )
+    await scheduler.start()
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+
+    fire.assert_not_called()
+    [run] = store.list_runs(task.id)[0]
+    assert run.status == "skipped"
+    assert run.error_code == RUN_NOT_ALLOWED_ERROR_CODE
+    assert run.scheduled_at == task.next_run_at
+    # Claiming moved the schedule forward, so enabling the gate later does not replay it.
+    assert store.get(task.id).next_run_at > clock.now()
 
 
 def test_dispatch_hooks_replace_the_built_in_executor_only_as_a_whole() -> None:

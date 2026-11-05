@@ -44,9 +44,12 @@ moves the task's `next_run_at` forward, in one transaction. If another replica a
 occurrence, or the task was edited, paused or deleted after it was listed, the
 claim does not apply and nothing starts.
 
-After a claim, the scheduler calls the executor with `on_fire(task, lease)`. A
-heartbeat renews the lease until the executor records `running`, `failed`, or
-`skipped`. The lease only covers startup, not the whole agent turn.
+After a claim, the scheduler checks `run_allowed(task)`. If it refuses, or raises,
+the run is recorded as `skipped` with error code `run_not_allowed` and the
+executor never runs. Otherwise the scheduler calls the executor with
+`on_fire(task, lease)`. A heartbeat renews the lease until the executor records
+`running`, `failed`, or `skipped`. The lease only covers startup, not the whole
+agent turn.
 
 ```mermaid
 flowchart TD
@@ -435,6 +438,7 @@ it leaves out use the defaults:
 | `fire_identity(task)` | An async context manager the built-in executor enters to act as the task's owner, for example by assuming a stored delegation. | None |
 | `dispatch_enabled()` | Whether this replica may dispatch. Checked at the start of each poll and before Run now starts a run here. See [Pausing dispatch](#pausing-dispatch). | Always on |
 | `poll_interval()` | Seconds to wait before the next poll, read before each wait. Overrides `poll_seconds` without a restart. | `poll_seconds` |
+| `run_allowed(task)` | Whether a claimed run may start for this task, checked before the executor. A refusal, or an error, records the run as `skipped`; see [Turning automations off for some callers](#turning-automations-off-for-some-callers). | Always allowed |
 
 Replace `on_fire` and `on_expired` together or not at all. `fire_identity` only
 works with the built-in executor; a replacement executor acts as the owner itself.
@@ -556,10 +560,14 @@ A deployment can pass `create_app(automations=...)`: a bool, or a zero-arg
 callable checked on each request, for example a per-workspace flag. When it is
 off for a request, every `/v1/scheduled-tasks` route returns 404, including the
 agent tools that call them, and `GET /v1/info` reports `automations_enabled`
-false so clients can hide the feature. A callable that raises counts as off. The
-gate does not stop the scheduler: tasks created while it was on keep running,
-and can be paused or deleted only once it is on again. Omitting it enables
-automations.
+false so clients can hide the feature. A callable that raises counts as off.
+Omitting it enables automations.
+
+The request gate does not stop the scheduler. To stop tasks that already exist
+from firing, a deployment also passes `run_allowed` in
+`ScheduledTaskDispatchHooks`, usually checking the same rule for the task's
+owner. A refused run is recorded as `skipped` rather than left due, so turning
+the gate back on does not replay occurrences from the refused period.
 
 ## Sub-hour schedule rollout
 

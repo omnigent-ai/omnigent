@@ -2124,6 +2124,7 @@ def create_app(
                     owned_hosts=dispatch_hooks.owned_hosts,
                     dispatch_enabled=dispatch_hooks.dispatch_enabled,
                     poll_interval=dispatch_hooks.poll_interval,
+                    run_allowed=dispatch_hooks.run_allowed,
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
                     lease_seconds=dispatch_config.lease_seconds,
