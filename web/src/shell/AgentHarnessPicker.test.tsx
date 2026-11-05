@@ -271,7 +271,7 @@ describe("a curated New Chat picker", () => {
 
   it.each([false, true])("opens an empty curated menu with saved selection=%s", async (saved) => {
     renderPicker({
-      harnessEntries: [],
+      harnessEntries: [claude],
       curatedEntries: [],
       hasAgents: saved,
       agentLabel: "Cursor",
@@ -286,7 +286,7 @@ describe("a curated New Chat picker", () => {
     expect(screen.getByTestId("new-chat-landing-no-agents")).toHaveTextContent(
       "limits which agents New Chat offers",
     );
-    expect(row("saved-cursor")).toBeNull();
+    expect(row(claude.id)).toBeNull();
   });
 
   it("leaves the grouped menu alone when no curation is handed down", async () => {

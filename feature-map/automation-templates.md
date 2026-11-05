@@ -46,10 +46,10 @@ to customize.
   runs reuse that session's worktree. Editing can turn it off again.
 - `harness-settings`: model, effort, and permission controls follow the selected
   harness. The selector shares New Session's deployment restrictions, order,
-  and default agent; editing preserves a saved agent outside that list. Selection
-  and saving wait for deployment configuration, including during the boot fallback.
-  Sandbox
-  choices do not inherit a connected host's readiness badges.
+  and default agent; editing preserves a saved agent outside that list. Harness
+  selection, Advanced settings, and saving wait for deployment configuration,
+  including during the boot fallback. Sandbox choices do not inherit a connected
+  host's readiness badges.
   Codex and Devin efforts follow the selected model; Pi exposes thinking
   levels. Connected hosts and sandboxes supply their own catalogs. Default keeps
   agent settings, and switching harnesses clears incompatible overrides. Catalogs

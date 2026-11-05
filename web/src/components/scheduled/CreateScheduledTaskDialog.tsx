@@ -1165,7 +1165,7 @@ export function CreateScheduledTaskDialog({
                       : effectivePermission
                   }
                   settings={harnessSettings}
-                  disabled={reusesExistingSession}
+                  disabled={curationPending || reusesExistingSession}
                   onModelChange={handleModelChange}
                   onEffortChange={setPickedEffort}
                   onPermissionModeChange={setPickedPermission}

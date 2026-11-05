@@ -298,7 +298,10 @@ describe("agent picker readiness (needs-setup badges)", () => {
   it.each([
     ["pending probe", "loading" as const],
     ["boot fallback", SERVER_INFO_OFFLINE_FALLBACK],
-  ])("waits for curation during %s", (_label, pendingInfo) => {
+  ])("waits for curation during %s", async (_label, pendingInfo) => {
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+      data: [...AGENTS, testAgent("ag_codex", "codex-native-ui", { harness: "codex-native" })],
+    } as ReturnType<typeof agentsHook.useAvailableAgents>);
     const dialog = (
       <CreateScheduledTaskDialog
         open
@@ -312,6 +315,12 @@ describe("agent picker readiness (needs-setup badges)", () => {
     fireEvent.click(screen.getByTestId("task-host-trigger"));
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
     expect(screen.getByTestId("pick-harness-claude")).toBeDisabled();
+    expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+    expect(screen.getByTestId("task-effort-trigger")).toBeDisabled();
+    const permission = screen.getByTestId("task-permission-trigger");
+    expect(permission).toBeDisabled();
+    await userEvent.click(permission);
+    expect(screen.queryByRole("option", { name: "Accept edits" })).not.toBeInTheDocument();
     const submit = screen.getByTestId("create-scheduled-task-submit");
     expect(submit).toBeDisabled();
     fireEvent.click(submit);
@@ -321,18 +330,30 @@ describe("agent picker readiness (needs-setup badges)", () => {
       <CapabilitiesProvider
         info={{
           ...SERVER_INFO_OFFLINE_FALLBACK,
-          picker: { restrictToAgentNames: new Set(["polly"]), defaultAgentName: "polly" },
+          scheduled_task_harness_settings: true,
+          picker: {
+            restrictToAgentNames: new Set(["codex-native-ui"]),
+            defaultAgentName: "codex-native-ui",
+          },
         }}
       >
         {dialog}
       </CapabilitiesProvider>,
     );
     const picker = screen.getByTestId("agent-picker-stub");
-    expect(screen.getByTestId("pick-agent-polly")).toBeEnabled();
-    expect(picker).toHaveAttribute("data-curated-entries", "polly");
-    expect(picker).toHaveAttribute("data-harness-entries", "");
-    expect(picker).toHaveAttribute("data-effective", "ag_1");
+    expect(screen.getByRole("button", { name: "pick codex-native" })).toBeEnabled();
+    expect(picker).toHaveAttribute("data-curated-entries", "codex-native-ui");
+    expect(picker).toHaveAttribute("data-harness-entries", "codex-native-ui");
+    expect(picker).toHaveAttribute("data-effective", "ag_codex");
+    expect(screen.getByTestId("task-model-trigger")).toBeEnabled();
+    expect(screen.getByTestId("task-permission-trigger")).toBeEnabled();
     expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].agentId).toBe("ag_codex");
+    for (const override of ["permissionMode", "modelOverride", "reasoningEffort"]) {
+      expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty(override);
+    }
 
     // A settled older server has no curation and still offers the full roster.
     view.rerender(
@@ -341,8 +362,7 @@ describe("agent picker readiness (needs-setup badges)", () => {
       </CapabilitiesProvider>,
     );
     expect(screen.getByTestId("pick-harness-claude")).toBeEnabled();
-    expect(picker).toHaveAttribute("data-harness-entries", "claude-native-ui");
-    expect(submit).toBeEnabled();
+    expect(picker).toHaveAttribute("data-harness-entries", "claude-native-ui,codex-native-ui");
   });
 
   it.each([
