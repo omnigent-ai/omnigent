@@ -1471,7 +1471,11 @@ function sideChatSettingsPending(conversationId: string): boolean {
 // Any semantic stream event makes a snapshot already in flight potentially
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
-conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+const sessionStatusRevisions = new Map<string, number>();
+conversationRegistry.subscribeDisposed((id) => {
+  streamEventRevisions.delete(id);
+  sessionStatusRevisions.delete(id);
+});
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
@@ -4926,6 +4930,7 @@ async function bindStream(
 
   // The slot is held for the pump's whole lifetime; released when it exits (a
   // terminal close, an abort from switchTo/dispose, or eviction).
+  const statusRevisionBeforeFetch = sessionStatusRevisions.get(id) ?? 0;
   void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
     releaseStreamSlot(id),
   );
@@ -4996,6 +5001,8 @@ async function bindStream(
     const oldestItemId = items[0]?.id ?? null;
     const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     set((state) => {
+      const snapshotStatusIsCurrent =
+        (sessionStatusRevisions.get(id) ?? 0) === statusRevisionBeforeFetch;
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
       const racedOptions = racedNativeModelOptions.get(id);
@@ -5111,7 +5118,10 @@ async function bindStream(
           })
         : candidatePending;
       const syntheticError: ErrorBlock | null =
-        session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
+        snapshotStatusIsCurrent &&
+        session.status === "failed" &&
+        session.lastTaskError != null &&
+        !hasErrorBlock
           ? {
               type: "error",
               ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
@@ -5135,31 +5145,29 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
-        sessionStatus: session.status,
-        // Mid-turn first open: the snapshot carries the in-flight turn's
-        // `activeResponseId`, and the turn-start `running` edge that would
-        // have opened the streaming lifecycle is long gone from the SSE
-        // stream. Open it here — mirroring `reconnectStatusPatch` — so the
-        // live turn's bubble renders streaming (trace expanded, tool
-        // spinners live) instead of prematurely settled and folded.
-        ...(session.status === "running" &&
-        session.activeResponseId != null &&
-        state.activeResponse?.responseId !== session.activeResponseId
+        // A live turn edge wins over the initial snapshot; metadata and history
+        // still hydrate when that snapshot's lifecycle is already stale.
+        ...(snapshotStatusIsCurrent
           ? {
-              status: "streaming" as const,
-              activeResponse: {
-                responseId: session.activeResponseId,
-                state: "streaming" as const,
-                error: null,
-              },
+              sessionStatus: session.status,
+              // Opening mid-turn needs the response id whose start edge was missed.
+              ...(session.status === "running" &&
+              session.activeResponseId != null &&
+              state.activeResponse?.responseId !== session.activeResponseId
+                ? {
+                    status: "streaming" as const,
+                    activeResponse: {
+                      responseId: session.activeResponseId,
+                      state: "streaming" as const,
+                      error: null,
+                    },
+                  }
+                : {}),
+              backgroundTaskCount: session.backgroundTaskCount ?? 0,
+              backgroundTasks: session.backgroundTasks ?? [],
+              blockedOn: null,
             }
           : {}),
-        // Re-show "N background tasks still running" after a reload/navigate-back: the
-        // live SSE edge that set this is long gone, so the count rides in on
-        // the snapshot (server keeps it sticky past the trailing PTY `idle`).
-        backgroundTaskCount: session.backgroundTaskCount ?? 0,
-        backgroundTasks: session.backgroundTasks ?? [],
-        blockedOn: null,
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
@@ -9245,6 +9253,14 @@ async function* tapSessionEvents(
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
     }
     if (event.type === "session_status" || event.type === "session_interrupted") {
+      const statusConversationId =
+        event.type === "session_status" ? event.conversationId : conversationId;
+      if (!isConversationDisposed(statusConversationId)) {
+        sessionStatusRevisions.set(
+          statusConversationId,
+          (sessionStatusRevisions.get(statusConversationId) ?? 0) + 1,
+        );
+      }
       beforeTurnEdge?.();
     }
     if (event.type === "elicitation_resolved") {

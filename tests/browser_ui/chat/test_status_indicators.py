@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.browser_ui.chat.session_contract import (
     ChatSessionContract,
@@ -115,8 +115,11 @@ def test_touch_screens_reveal_timestamps_and_pending_steering(
     assert notice_box["x"] + notice_box["width"] <= timestamp_box["x"] + 1
 
 
+@pytest.mark.parametrize(
+    "snapshot_in_flight", [False, True], ids=["settled", "live-before-snapshot"]
+)
 def test_attachment_only_steering_explanation_stays_visible_on_desktop(
-    page: Page, chat_session_contract: ChatSessionContract
+    page: Page, chat_session_contract: ChatSessionContract, snapshot_in_flight: bool
 ) -> None:
     """A text-less steer has no focusable footer control, so it must not hide."""
     chat = chat_session_contract
@@ -124,10 +127,33 @@ def test_attachment_only_steering_explanation_stays_visible_on_desktop(
     chat.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
     chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
     chat.reject_uploads = False
+    held_items: list[Route] = []
+    holding_items = snapshot_in_flight
+    if snapshot_in_flight:
+        items = re.compile(
+            rf"^{re.escape(chat.base_url)}/v1/sessions/{re.escape(chat.session_id)}/items(?:\?.*)?$"
+        )
+
+        def hold_items(route: Route) -> None:
+            if holding_items:
+                held_items.append(route)
+            else:
+                route.fallback()
+
+        chat.contract.route(items, hold_items)
     page.set_viewport_size({"width": 1280, "height": 900})
-    page.goto(chat.url)
-    chat.wait_for_stream()
-    chat.emit_busy("current")
+    try:
+        page.goto(chat.url)
+        chat.wait_for_stream()
+        chat.emit_busy("current")
+        if snapshot_in_flight:
+            # The sidebar changes after the real SSE handler has applied the running edge.
+            expect(page.get_by_role("img", name="Session running", exact=True)).to_be_visible()
+            assert held_items, "The initial item window must still be in flight."
+    finally:
+        holding_items = False
+        for route in held_items:
+            route.fallback()
     expect(page.get_by_test_id("working-indicator")).to_be_visible()
     page.evaluate("localStorage.setItem('omnigent:always-steer', 'true')")
     chat.event_ack = {"queued": True, "pending_id": "steer"}

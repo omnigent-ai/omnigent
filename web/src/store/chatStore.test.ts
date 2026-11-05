@@ -2401,6 +2401,89 @@ describe("chatStore — switchTo", () => {
     expect(streamCall).toBeDefined();
   });
 
+  it.each([
+    { snapshotStatus: "idle", liveStatus: "running", responseId: "live_turn" },
+    { snapshotStatus: "running", liveStatus: "idle", responseId: undefined },
+    { snapshotStatus: "running", liveStatus: "waiting", responseId: undefined },
+    { snapshotStatus: "running", liveStatus: "failed", responseId: undefined },
+    { snapshotStatus: "running", liveStatus: "running", responseId: "live_turn" },
+    { snapshotStatus: "failed", liveStatus: "running", responseId: "live_turn" },
+  ] as const)(
+    "keeps a live $liveStatus edge over an initial $snapshotStatus snapshot",
+    async ({ snapshotStatus, liveStatus, responseId }) => {
+      const sessionId = "conv_initial_status_race";
+      const history = userMessage("history", "Existing history");
+      seedSession(sessionId, [history]);
+      const sink = pushableStream();
+      let releaseItems: (() => void) | undefined;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const path = url.split("?")[0];
+        if (path === `/v1/sessions/${sessionId}/stream`) {
+          init?.signal?.addEventListener("abort", () =>
+            sink.error(new DOMException("aborted", "AbortError")),
+          );
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        if (path === `/v1/sessions/${sessionId}/items`) {
+          const response = defaultFetchHandler(input, init);
+          return new Promise<Response>((resolve) => {
+            releaseItems = () => resolve(response);
+          });
+        }
+        if (path === `/v1/sessions/${sessionId}`) {
+          return mockResponse({
+            id: sessionId,
+            agent_id: "agent_xyz",
+            status: snapshotStatus,
+            active_response_id: snapshotStatus === "running" ? "stale_turn" : null,
+            created_at: 0,
+            labels: { "omnigent.wrapper": "codex-native-ui" },
+            last_task_error:
+              snapshotStatus === "failed" ? { message: "Old failure", code: "OLD_FAILURE" } : null,
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      const binding = useChatStore.getState().switchTo(sessionId);
+      await vi.waitFor(() => expect(releaseItems).toBeDefined());
+      sink.push(
+        sse("session.status", {
+          conversation_id: sessionId,
+          status: liveStatus,
+          ...(responseId !== undefined ? { response_id: responseId } : {}),
+          background_task_count: 2,
+          ...(liveStatus === "running" ? { blocked_on: "permission prompt" } : {}),
+        }),
+      );
+      await vi.waitFor(() => expect(useChatStore.getState().backgroundTaskCount).toBe(2));
+      expect(useChatStore.getState().sessionStatus).toBe(liveStatus);
+
+      releaseItems!();
+      await binding;
+
+      const state = useChatStore.getState();
+      expect(state.sessionStatus).toBe(liveStatus);
+      expect(state.backgroundTaskCount).toBe(2);
+      expect(state.blockedOn).toBe(liveStatus === "running" ? "permission prompt" : null);
+      expect(state.isNativeTerminalSession).toBe(true);
+      expect(state.loadingConversation).toBe(false);
+      expect(state.blocks.some((block) => block.ctx.itemId === history.id)).toBe(true);
+      expect(state.blocks.some((block) => block.type === "error")).toBe(false);
+      if (responseId !== undefined) {
+        expect(state.activeResponse).toMatchObject({ responseId, state: "streaming" });
+      } else {
+        expect(state.activeResponse).toBeNull();
+        expect(state.status).toBe("idle");
+      }
+      await state.send("Follow up", "agent_xyz");
+      expect(useChatStore.getState().pendingUserMessages.at(-1)?.sentMidTurn).toBe(
+        liveStatus === "running" ? true : undefined,
+      );
+    },
+  );
+
   it("switching to the same conversation is a no-op (blocks preserved, no stream re-open)", async () => {
     const block: AnyBlock = {
       type: "user_message",
