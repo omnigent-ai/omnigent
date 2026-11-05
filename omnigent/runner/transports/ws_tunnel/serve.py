@@ -158,9 +158,8 @@ _RUNNER_TUNNEL_REQUEST_SILENCE_TIMEOUT_S = (
 # via the exception path where our close() is already a no-op.
 _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
 
-# Dial + CONNECT-handshake budget for a mandatory egress proxy, matching
-# the upgrade's _RUNNER_TUNNEL_OPEN_TIMEOUT_S.
-_PROXY_CONNECT_TIMEOUT_S = 10.0
+# Dial + CONNECT-handshake budget for a mandatory egress proxy.
+_PROXY_CONNECT_TIMEOUT_S = _RUNNER_TUNNEL_OPEN_TIMEOUT_S
 # Bound on how long the graceful drain waits for in-flight dispatch tasks
 # (the ``GET /stream`` relays, plus any live request) to finish after the
 # end-of-stream sentinel is enqueued. A task still running past this is

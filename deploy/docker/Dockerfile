@@ -435,7 +435,8 @@ ARG PYPI_INDEX_URL=https://pypi.org/simple
 RUN python -m venv /sandbox/.venv \
  && uv pip install --python /sandbox/.venv/bin/python --no-cache-dir \
       --index-url ${PYPI_INDEX_URL} -e . \
- && /sandbox/.venv/bin/pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
+ && /sandbox/.venv/bin/pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} \
+      /build /build/sdks/python-client /build/sdks/ui \
  && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /sandbox/.venv/lib/python*/site-packages
 
 # ── OpenShell host runtime (`--target host-openshell`) ──

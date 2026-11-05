@@ -143,8 +143,13 @@ def test_openshell_overlay_gateway_secret_projects_gateway_metadata() -> None:
     assert secret["optional"] is True
 
 
-def test_server_sdk_resolves_the_projected_gateway(tmp_path, monkeypatch) -> None:
-    """The SDK finds the selected gateway and its mTLS files where the Secret lands."""
+@pytest.mark.parametrize(
+    ("scheme", "mtls"),
+    [("https", True), ("http", False)],
+    ids=["https-mtls", "http-metadata-only"],
+)
+def test_server_sdk_resolves_the_projected_gateway(tmp_path, monkeypatch, scheme, mtls) -> None:
+    """The SDK finds the selected gateway and any mTLS files where the Secret lands."""
     openshell = pytest.importorskip("openshell")
     pod = _server_pod()
     container = pod["containers"][0]
@@ -155,15 +160,21 @@ def test_server_sdk_resolves_the_projected_gateway(tmp_path, monkeypatch) -> Non
     ]
     (mount,) = [mount for mount in container["volumeMounts"] if mount["name"] == volume["name"]]
     secret_data = {
-        "metadata.json": json.dumps({"gateway_endpoint": "https://gateway.openshell.svc:8080"}),
-        "ca.crt": "test CA",
-        "tls.crt": "test client certificate",
-        "tls.key": "test client key",
+        "metadata.json": json.dumps({"gateway_endpoint": f"{scheme}://gateway.openshell.svc:8080"})
     }
+    if mtls:
+        secret_data.update(
+            {
+                "ca.crt": "test CA",
+                "tls.crt": "test client certificate",
+                "tls.key": "test client key",
+            }
+        )
     # Without items, the kubelet writes each key as a file named after it.
     items = volume["secret"].get("items") or [{"key": key, "path": key} for key in secret_data]
     mount_dir = tmp_path / mount["mountPath"].lstrip("/")
-    for item in items:
+    # The optional volume skips listed keys that the Secret lacks.
+    for item in (item for item in items if item["key"] in secret_data):
         projected = mount_dir / item["path"]
         projected.parent.mkdir(parents=True, exist_ok=True)
         projected.write_text(secret_data[item["key"]])
@@ -179,6 +190,9 @@ def test_server_sdk_resolves_the_projected_gateway(tmp_path, monkeypatch) -> Non
     _ResolvedGateway.from_active_cluster(cluster=_openshell_config().get("cluster"))
 
     assert resolved["endpoint"] == "gateway.openshell.svc:8080"
+    if not mtls:
+        assert resolved["tls"] is None
+        return
     tls_files = (resolved["tls"].ca_path, resolved["tls"].cert_path, resolved["tls"].key_path)
     assert [Path(path).read_text() for path in tls_files] == [
         secret_data[key] for key in ("ca.crt", "tls.crt", "tls.key")
