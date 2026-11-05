@@ -254,9 +254,15 @@ async def test_held_bare_failure_is_replaced_by_its_cause(
 ) -> None:
     """The turn fails once, with the hook's cause and the status it was leaving."""
     helpers._session_status_cache["conv_bare"] = "running"
+    initial_handle = None
     with caplog.at_level(logging.ERROR, logger="omnigent.server.routes.sessions"):
         for _ in range(repeats):
             _hold_bare_relayed_failure("conv_bare")
+            current_handle = helpers._held_bare_failures["conv_bare"][0]
+            if initial_handle is None:
+                initial_handle = current_handle
+            else:
+                assert current_handle is initial_handle
         assert helpers._session_status_cache.get("conv_bare") == "running"
         helpers._publish_status(
             "conv_bare",
@@ -271,6 +277,7 @@ async def test_held_bare_failure_is_replaced_by_its_cause(
     assert failure.attributes["origin"] == "external_session_status"
     assert failure.attributes["previous_status"] == "running"
     assert "conv_bare" not in helpers._held_bare_failures
+    assert initial_handle is not None and initial_handle.cancelled()
     # The cancelled grace timer must not publish the bare edge afterwards.
     await asyncio.sleep(0)
     assert len(_turn_failures(caplog)) == 1

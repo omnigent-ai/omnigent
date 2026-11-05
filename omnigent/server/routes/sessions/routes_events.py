@@ -244,6 +244,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
+    cancel_held_bare_failure,
     reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
 )
@@ -2445,19 +2446,32 @@ def register_events_routes(
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )
-            if status_error is not None:
-                failed_agent_name = await asyncio.to_thread(
-                    _response_agent_name_from_store, conversation_store, session_id, response_id
-                )
-                await _persist_session_status_error_labels(
-                    session_id,
-                    status_error,
-                    conversation_store,
-                    owner_runner_id=conv.runner_id,
-                    agent_name=failed_agent_name,
-                )
-            elif status == "running" or recovered_from_failure:
-                await _persist_session_status_error_labels(session_id, None, conversation_store)
+            held_failure = (
+                cancel_held_bare_failure(session_id) if status_error is not None else None
+            )
+            try:
+                if status_error is not None:
+                    failed_agent_name = await asyncio.to_thread(
+                        _response_agent_name_from_store,
+                        conversation_store,
+                        session_id,
+                        response_id,
+                    )
+                    await _persist_session_status_error_labels(
+                        session_id,
+                        status_error,
+                        conversation_store,
+                        owner_runner_id=conv.runner_id,
+                        agent_name=failed_agent_name,
+                    )
+                elif status == "running" or recovered_from_failure:
+                    await _persist_session_status_error_labels(
+                        session_id, None, conversation_store
+                    )
+            except BaseException:
+                if held_failure is not None:
+                    held_failure()
+                raise
             _publish_status(
                 session_id,
                 status,

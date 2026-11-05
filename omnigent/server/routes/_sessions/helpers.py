@@ -4957,6 +4957,16 @@ def hold_bare_failure(session_id: str, publish: Callable[[], None]) -> None:
     _held_bare_failures[session_id] = (handle, publish)
 
 
+def cancel_held_bare_failure(session_id: str) -> Callable[[], None] | None:
+    """Cancel a held fallback when its detailed cause is ready to process."""
+    held = _held_bare_failures.pop(session_id, None)
+    if held is None:
+        return None
+    handle, publish = held
+    handle.cancel()
+    return publish
+
+
 def flush_held_bare_failure(session_id: str) -> None:
     """
     Publish the causeless ``failed`` edge held for *session_id*, if any.

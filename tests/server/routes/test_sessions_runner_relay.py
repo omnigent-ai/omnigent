@@ -1456,6 +1456,76 @@ async def test_relay_holds_a_bare_failed_edge_for_its_cause(
 
 
 @pytest.mark.asyncio
+async def test_relay_cancels_the_bare_fallback_before_persistence_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timely cause wins even when its label persistence outlasts the grace."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as session_helpers
+
+    monkeypatch.setattr(session_helpers, "ERROR_HOOK_GRACE_S", 0.01)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    session_id = "b7340ea10a4743a2a5a3d89f9a3156bd"
+    persistence_started = asyncio.Event()
+    release_persistence = asyncio.Event()
+
+    async def gated_persistence(*_args: Any, **_kwargs: Any) -> None:
+        persistence_started.set()
+        await release_persistence.wait()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._persist_session_status_error_labels",
+        gated_persistence,
+    )
+    frames = [
+        'data: {"type": "session.status", "status": "failed"}\n\n',
+        'data: {"type": "session.status", "status": "failed", "error": '
+        '{"code": "transient_upstream_error", "message": "Server error"}}\n\n',
+    ]
+    gate = asyncio.Event()
+    runner = _ScriptedThenDropRunnerClient(frames, gate)
+    sessions_module._session_status_cache[session_id] = "running"
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner-slow-label-write",
+            runner,  # type: ignore[arg-type]
+            conversation_store=_RecordingLabelStore(live_status="running"),  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        with capture_debug_rows("server") as rows:
+            gate.set()
+            await asyncio.wait_for(persistence_started.wait(), timeout=_TASK_TIMEOUT_S)
+            await asyncio.sleep(0.05)
+            assert not [r for r in rows if r["event_name"] == "session_turn_failed"]
+            release_persistence.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
+        assert failure["attributes"]["code"] == "transient_upstream_error"
+        assert failure["attributes"]["previous_status"] == "running"
+        status = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
+        assert status["error"]["code"] == "transient_upstream_error"
+    finally:
+        release_persistence.set()
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.pop(session_id, None)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mark_before_rebind", [True, False])
 async def test_relay_ignores_stop_intent_for_a_different_runner(
     monkeypatch: pytest.MonkeyPatch, mark_before_rebind: bool

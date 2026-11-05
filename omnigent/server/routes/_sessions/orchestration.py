@@ -371,6 +371,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    cancel_held_bare_failure,
     flush_held_bare_failure,
     hold_bare_failure,
 )
@@ -9395,21 +9396,31 @@ async def _relay_runner_stream_once(
                                 if isinstance(raw_err, dict)
                                 else None
                             )
-                            if status == "failed" and status_error is not None:
-                                await _persist_session_status_error_labels(
-                                    session_id,
-                                    status_error,
-                                    conversation_store,
-                                    owner_runner_id=runner_id,
-                                    agent_name=failure_agent_name,
-                                )
-                            elif status == "running":
-                                failure_agent_name = None
-                                await _persist_session_status_error_labels(
-                                    session_id,
-                                    None,
-                                    conversation_store,
-                                )
+                            held_failure = (
+                                cancel_held_bare_failure(session_id)
+                                if status == "failed" and status_error is not None
+                                else None
+                            )
+                            try:
+                                if status == "failed" and status_error is not None:
+                                    await _persist_session_status_error_labels(
+                                        session_id,
+                                        status_error,
+                                        conversation_store,
+                                        owner_runner_id=runner_id,
+                                        agent_name=failure_agent_name,
+                                    )
+                                elif status == "running":
+                                    failure_agent_name = None
+                                    await _persist_session_status_error_labels(
+                                        session_id,
+                                        None,
+                                        conversation_store,
+                                    )
+                            except BaseException:
+                                if held_failure is not None:
+                                    held_failure()
+                                raise
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
                             # via external_session_status (the codex-shared path)
