@@ -575,12 +575,12 @@ interface SourceText {
 }
 
 const GITHUB_ACCOUNT_INSTRUCTIONS =
-  "Before using GitHub, verify which authenticated account can access the target repository. " +
+  "Before using GitHub.com, verify which authenticated account can access the target repository. " +
   "Prefer your GitHub tools when they have the required access. With the GitHub CLI, inspect " +
-  "gh auth status --hostname <host> and use a read-only repository lookup to verify access. " +
+  "gh auth status --hostname github.com and use a read-only repository lookup to verify access. " +
   "If the active account is wrong, choose an already authenticated account authorized for that " +
   "repository and scope its token to each gh command with GH_TOKEN, obtained from " +
-  "gh auth token --hostname <host> --user <account> without printing or recording it. " +
+  "gh auth token --hostname github.com --user <account> without printing or recording it. " +
   "Do not use gh auth switch: changing shared CLI state can disrupt other sessions. " +
   "Keep the verified account for reads and writes; do not treat an access failure as no matches. " +
   "If no configured account has access, report the blocker without attempting to grant access.";

@@ -614,9 +614,14 @@ describe("renderTriggerPrompt", () => {
     expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
     const [manager, worker] = prompt.split("Instructions for each session:\n");
     for (const instructions of [manager, worker]) {
-      expect(instructions).toContain("gh auth status --hostname <host>");
-      expect(instructions).toContain("gh auth token --hostname <host> --user <account>");
+      expect(instructions).toContain("gh auth status --hostname github.com");
+      expect(instructions).toContain("gh auth token --hostname github.com --user <account>");
+      expect(instructions).toContain("scope its token to each gh command with GH_TOKEN");
+      expect(instructions).toContain("without printing or recording it");
       expect(instructions).toContain("Do not use gh auth switch");
+      expect(instructions).toContain(
+        "If no configured account has access, report the blocker without attempting to grant access",
+      );
       expect(instructions).toContain("do not treat an access failure as no matches");
     }
   });
