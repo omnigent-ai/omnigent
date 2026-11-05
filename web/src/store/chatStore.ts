@@ -1929,6 +1929,15 @@ async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBl
  * session's copy. An attachment that fails to download is left out, and a
  * warning names it.
  */
+/** Build a file from a base64 `data:` URI, e.g. an image a prompt carried inline. */
+function fileFromDataUri(dataUri: string, filename: string): File {
+  const match = dataUri.match(/^data:([^;,]+);base64,(.*)$/s);
+  if (!match) throw new Error("Not a base64 data URI");
+  const binary = atob(match[2]!);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new File([bytes], filename, { type: match[1] });
+}
+
 async function rewindAttachmentFiles(
   sessionId: string,
   attachments: readonly RewindAttachment[],
@@ -1936,6 +1945,9 @@ async function rewindAttachmentFiles(
   const downloads = await Promise.all(
     attachments.map(async (attachment) => {
       try {
+        // An inline image has no stored copy; it uploads on send like a new attachment.
+        if (attachment.imageUrl) return fileFromDataUri(attachment.imageUrl, attachment.filename);
+        if (!attachment.fileId) return null;
         const file = await downloadSessionFile(sessionId, attachment.fileId, attachment.filename);
         const block: ContentBlock = {
           type: attachment.type,

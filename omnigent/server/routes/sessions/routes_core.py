@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -278,6 +279,9 @@ from omnigent.version import VERSION
 
 # Harnesses whose sessions offer ``/rewind``.
 _REWIND_HARNESSES = frozenset({"claude-sdk", "claude-native"})
+
+# An image a prompt carries inline rather than as a stored file.
+_INLINE_IMAGE_URL = re.compile(r"^data:image/[\w.+-]+;base64,", re.IGNORECASE)
 
 # Continues a claude-sdk session in a fresh session on ``/clear`` once the
 # release callback has freed its client; returns the new session's id.
@@ -5226,6 +5230,8 @@ def register_core_routes(
         """
         Return the files *content* attached, as the fork's copies of them.
 
+        An image carried inline as a ``data:image/...`` URI, with no stored
+        file, comes back as that URI for the client to upload on send.
         Attachments whose file the fork holds no copy of are left out.
 
         :param fork_id: The fork continuing the rewound session.
@@ -5233,14 +5239,27 @@ def register_core_routes(
         :param content: The prompt's content blocks.
         """
         attachments: list[SessionRewindAttachment] = []
-        if file_store is None:
-            return attachments
         for part in content:
             block_type, file_id = part.get("type"), part.get("file_id")
-            if block_type not in ("input_file", "input_image") or not isinstance(file_id, str):
+            if block_type not in ("input_file", "input_image"):
+                continue
+            if not isinstance(file_id, str):
+                image_url, filename = part.get("image_url"), part.get("filename")
+                if block_type == "input_image" and _INLINE_IMAGE_URL.match(
+                    image_url if isinstance(image_url, str) else ""
+                ):
+                    attachments.append(
+                        SessionRewindAttachment(
+                            type="input_image",
+                            image_url=image_url,
+                            filename=filename if isinstance(filename, str) else "image",
+                        )
+                    )
                 continue
             copy_id = copied_files.get(file_id)
-            copy = file_store.get(copy_id, session_id=fork_id) if copy_id is not None else None
+            if file_store is None or copy_id is None:
+                continue
+            copy = file_store.get(copy_id, session_id=fork_id)
             if copy is None:
                 continue
             attachments.append(

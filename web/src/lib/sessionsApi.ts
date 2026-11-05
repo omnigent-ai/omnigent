@@ -1048,8 +1048,10 @@ export async function fetchRewindPrompts(
 export interface RewindAttachment {
   /** The prompt's content block type. */
   type: "input_file" | "input_image";
-  /** The rewound session's copy of the file, e.g. "file_abc". */
-  fileId: string;
+  /** The rewound session's copy of the file, e.g. "file_abc"; absent for an inline image. */
+  fileId?: string;
+  /** An image the prompt carried inline, as a `data:image/...` URI, with no stored file. */
+  imageUrl?: string;
   /** The attachment's name, e.g. "diagram.png". */
   filename: string;
 }
@@ -1079,14 +1081,20 @@ export async function rewindSession(
   const body = await readJsonOrThrow<{
     session_id: string;
     prompt: string;
-    attachments?: { type: RewindAttachment["type"]; file_id: string; filename: string }[];
+    attachments?: {
+      type: RewindAttachment["type"];
+      file_id?: string | null;
+      image_url?: string | null;
+      filename: string;
+    }[];
   }>(res);
   return {
     sessionId: body.session_id,
     prompt: body.prompt,
     attachments: (body.attachments ?? []).map((attachment) => ({
       type: attachment.type,
-      fileId: attachment.file_id,
+      ...(attachment.file_id ? { fileId: attachment.file_id } : {}),
+      ...(attachment.image_url ? { imageUrl: attachment.image_url } : {}),
       filename: attachment.filename,
     })),
   };

@@ -9224,17 +9224,36 @@
         "type": "object"
       },
       "SessionRewindAttachment": {
-        "description": "A file the chosen `/rewind` prompt attached, as the rewound session holds it.",
+        "description": "A file the chosen `/rewind` prompt attached, as the rewound session holds it.\n\nExactly one of *file_id* and *image_url* is set.",
         "properties": {
           "file_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "description": "The rewound session's copy of the file, e.g. `\"file_abc\"`; read it from `/v1/sessions/{session_id}/resources/files/{file_id}`.",
-            "title": "File Id",
-            "type": "string"
+            "title": "File Id"
           },
           "filename": {
             "description": "The attachment's name, e.g. `\"diagram.png\"`.",
             "title": "Filename",
             "type": "string"
+          },
+          "image_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "An image the prompt carried inline instead of as a stored file, as a `data:image/...` URI (e.g. from a session imported from another harness); the client uploads it on send like any attachment.",
+            "title": "Image Url"
           },
           "type": {
             "description": "The prompt's content block type, `\"input_file\"` or `\"input_image\"`.",
@@ -9248,7 +9267,6 @@
         },
         "required": [
           "type",
-          "file_id",
           "filename"
         ],
         "title": "SessionRewindAttachment",

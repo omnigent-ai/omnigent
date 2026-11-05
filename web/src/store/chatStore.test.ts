@@ -7385,6 +7385,13 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
           prompt: "",
           attachments: [
             { type: "input_image", file_id: "file_fork_png", filename: "diagram.png" },
+            // Carried inline (e.g. imported), with no stored file to copy.
+            {
+              type: "input_image",
+              file_id: null,
+              image_url: "data:image/png;base64,cGFzdGVk",
+              filename: "pasted.png",
+            },
             { type: "input_file", file_id: "file_fork_gone", filename: "gone.txt" },
             { type: "input_file", file_id: "file_fork_txt", filename: "notes.txt" },
           ],
@@ -7404,7 +7411,14 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
           /\/v1\/sessions\/conv_new\/resources\/files\/(\w+)\/content$/,
         )?.[1];
         if (fileId) return Promise.resolve(contents[fileId]!);
-        if (url.endsWith("/resources/files")) uploads.push(url);
+        if (url.endsWith("/resources/files")) {
+          uploads.push(url);
+          return mockResponse({
+            id: "file_uploaded_pasted",
+            name: "pasted.png",
+            metadata: { filename: "pasted.png", bytes: 6, created_at: 0 },
+          });
+        }
         if (url.endsWith("/v1/sessions/conv_new/events") && init?.method === "POST")
           posted.push(JSON.parse(String(init.body)));
         return rewindFetch(input, init);
@@ -7421,16 +7435,20 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       const files = getSessionDraft("conv_new")?.files ?? [];
       expect(files.map((file) => [file.name, file.type])).toEqual([
         ["diagram.png", "image/png"],
+        ["pasted.png", "image/png"],
         ["notes.txt", "text/plain"],
       ]);
-      expect(await files[1]!.text()).toBe("notes");
+      expect(await files[1]!.text()).toBe("pasted");
+      expect(await files[2]!.text()).toBe("notes");
       expect(useChatStore.getState().rewindPrefill?.files).toEqual(files);
 
-      // Sending them reuses the new session's copies instead of uploading again.
+      // Sending them reuses the new session's copies instead of uploading
+      // again; only the inline image, which had no copy, is uploaded.
       useChatStore.setState({ conversationId: "conv_new", abortController: new AbortController() });
       await useChatStore.getState().send("", "agent_xyz", files);
-      expect(uploads).toEqual([]);
+      expect(uploads).toEqual(["/v1/sessions/conv_new/resources/files"]);
       expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_png"');
+      expect(JSON.stringify(posted)).toContain('"file_id":"file_uploaded_pasted"');
       expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_txt"');
     });
 
