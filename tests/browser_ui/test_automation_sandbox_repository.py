@@ -28,6 +28,8 @@ def test_automation_sandbox_repository(
                 "automations_enabled": True,
                 "managed_sandboxes_enabled": True,
                 "scheduled_task_sandbox_workspaces": True,
+                "scheduled_task_session_modes": True,
+                "scheduled_task_subhour": True,
                 "sandbox_provider": "arclet",
                 "sandbox_provider_capabilities": {"arclet": {"repo_catalog": catalog}},
                 "picker": {
@@ -99,11 +101,40 @@ def test_automation_sandbox_repository(
         page.goto(f"{contract.base_url}/tasks")
         page.get_by_role("button", name="Maybe later", exact=True).click()
         page.get_by_role("button", name="New automation", exact=True).click()
+        expect(page.get_by_label("Instructions", exact=True)).to_be_focused()
+        expect(page.get_by_label("Name", exact=True)).to_be_visible()
+        expect(page.get_by_label("Run on", exact=True)).to_be_visible()
+        session_mode = page.get_by_role("switch", name="Start each run in a new session")
+        expect(session_mode).to_be_visible()
+        expect(page.get_by_role("button", name="Advanced", exact=True)).to_have_attribute(
+            "aria-expanded", "false"
+        )
+        frequency = page.get_by_label("Frequency", exact=True)
+        frequency.click()
+        page.get_by_role("option", name="Interval", exact=True).click()
+        expect(page.get_by_label("Repeat every", exact=True)).to_have_value("60")
+        expect(page.get_by_role("button", name="Apply", exact=True)).to_have_count(0)
+        session_mode.uncheck()
+        frequency.click()
+        page.get_by_role("option", name="Every day", exact=True).click()
+        frequency.click()
+        page.get_by_role("option", name="Interval", exact=True).click()
+        expect(page.get_by_label("Repeat every", exact=True)).to_have_value("60")
+        page.get_by_label("Repeat every", exact=True).fill("10")
+        expect(frequency).to_have_text("Interval")
+        expect(page.get_by_test_id("custom-schedule-trigger")).to_have_count(0)
+        session_mode.check()
+        expect(page.get_by_test_id("schedule-error")).to_contain_text("at least 60 minutes")
+        expect(page.get_by_test_id("create-scheduled-task-submit")).to_be_disabled()
+        frequency.click()
+        page.get_by_role("option", name="Every day", exact=True).click()
+        expect(page.get_by_test_id("schedule-error")).to_have_count(0)
+        page.get_by_role("button", name="Advanced", exact=True).click()
         page.get_by_label("Name", exact=True).fill("Repository maintenance")
-        page.get_by_label("Prompt", exact=True).fill(
+        page.get_by_label("Instructions", exact=True).fill(
             "Review the repository for stale documentation."
         )
-        page.get_by_label("Host", exact=True).click()
+        page.get_by_label("Run on", exact=True).click()
         page.get_by_role("option", name="Arclet Sandbox", exact=True).click()
         page.get_by_test_id("task-agent-picker").get_by_role("button").click()
         for harness in ("claude", "codex", "pi"):
@@ -126,6 +157,7 @@ def test_automation_sandbox_repository(
         expect(page.get_by_role("dialog")).to_have_count(0)
         page.get_by_role("button", name="Actions for Repository maintenance").click()
         page.get_by_role("menuitem", name="Edit", exact=True).click()
+        page.get_by_role("button", name="Advanced", exact=True).click()
         page.get_by_test_id("task-agent-picker").get_by_role("button").click()
         expect(page.get_by_test_id("new-chat-landing-agent-agent-pi")).to_be_visible()
         expect(page.get_by_test_id("new-chat-landing-agent-agent-cursor")).to_have_count(0)
@@ -138,6 +170,7 @@ def test_automation_sandbox_repository(
         assert tasks[0]["workspace"] == catalog[3]["url"]
         page.get_by_role("button", name="Actions for Repository maintenance").click()
         page.get_by_role("menuitem", name="Edit", exact=True).click()
+        page.get_by_role("button", name="Advanced", exact=True).click()
         expect(repository).to_have_text("hadron")
         repository.click()
         page.get_by_role("option", name="Provider default", exact=True).click()
@@ -146,6 +179,7 @@ def test_automation_sandbox_repository(
         assert tasks[0]["workspace"] is None
         page.get_by_role("button", name="Actions for Repository maintenance").click()
         page.get_by_role("menuitem", name="Edit", exact=True).click()
+        page.get_by_role("button", name="Advanced", exact=True).click()
         expect(repository).to_have_text("Provider default")
 
 
@@ -248,6 +282,7 @@ def test_reused_automation_settings(
         page.get_by_role("button", name="Maybe later", exact=True).click()
         page.get_by_role("button", name="Actions for Repository maintenance").click()
         page.get_by_role("menuitem", name="Edit", exact=True).click()
+        page.get_by_role("button", name="Advanced", exact=True).click()
         if prompt_kind == "trigger":
             worker_agent = page.get_by_test_id("task-worker-agent-trigger")
             expect(worker_agent).to_contain_text("Codex")
@@ -263,6 +298,7 @@ def test_reused_automation_settings(
             assert task["agent_id"] == chat.agent_id
             page.get_by_test_id("task-row-open").click()
             page.get_by_test_id("task-detail-edit").click()
+            page.get_by_role("button", name="Advanced", exact=True).click()
             expect(worker_agent).to_contain_text("Claude Code")
             expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
             expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
@@ -277,7 +313,7 @@ def test_reused_automation_settings(
             page.get_by_role("button", name="Edit worker instructions", exact=True).click()
             editor = page.get_by_role(
                 "textbox",
-                name="Prompt" if prompt_kind == "custom-trigger" else "System prompt",
+                name="Instructions" if prompt_kind == "custom-trigger" else "System prompt",
                 exact=True,
             )
             expect(editor).to_be_focused()

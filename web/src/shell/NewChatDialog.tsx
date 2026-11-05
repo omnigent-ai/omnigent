@@ -1198,6 +1198,7 @@ export function AgentHarnessPicker({
   sandboxSelected,
   allowCreateCustomAgent = true,
   onOpenChange,
+  open: controlledOpen,
   dropdownModal = false,
   contentClassName,
   contentAlign = "end",
@@ -1254,6 +1255,9 @@ export function AgentHarnessPicker({
   // `triggerLabelClassName`).
   /** Notified when the picker dropdown opens/closes. */
   onOpenChange?: (open: boolean) => void;
+  /** Controlled visibility; pair with onOpenChange and update open when it fires.
+   * Omit open to let the picker manage its own visibility. */
+  open?: boolean;
   /** Whether the dropdown blocks outside interaction. Defaults false so composer clicks reach their target. */
   dropdownModal?: boolean;
   /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
@@ -1309,7 +1313,8 @@ export function AgentHarnessPicker({
   entriesFailed?: boolean;
 }) {
   // Controlled so picking a row can close the menu.
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setOpen] = useState(false);
+  const open = controlledOpen ?? internalOpen;
   // Tracks the last-applied openNonce so the imperative-open effect (below,
   // after the drill-in state it drives) skips the initial value.
   const appliedOpenNonce = useRef(0);

@@ -81,7 +81,18 @@ to customize.
   scheduling controls, even when the prompt retains its template signature.
   Replacing the template’s opening sentence also restores regular scheduling
   controls after saving and reopening.
-- `schedule`: the shared modal supports ten-minute connected-host schedules in
+- `schedule`: Repeat → Interval exposes the minute interval directly in the Time row,
+  with no timezone selector. Minute schedules preserve their timezone internally and
+  expose it beside the end date only when Ends is On date.
+  Interval is the first option and needs no popup or Apply step.
+  Hourly schedules accept a typed minute from 0 to 59 directly in the Time row.
+  Weekly schedules have a separate On row for their weekday selector.
+  Custom schedule expands inline into Repeats, Every, On (for weekly/monthly/yearly),
+  Month (yearly), and Start time rows. Changes apply to the form immediately;
+  saving the automation persists them, and cancelling discards them.
+  The initial interval respects the server, target, and session-mode minimum.
+  Custom schedule remains available for other recurrence patterns.
+  The shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
 - `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
@@ -91,10 +102,18 @@ to customize.
   keep one session, and editing keeps only the reset to a new session.
 - `responsive`: gallery items have icons, descriptions, access requirements,
   pointer cursors, and keyboard focus indicators. Continued trigger cadence is
-  fixed; other tasks expose schedule controls.
-  Host occupies a full row above Schedule. Project and Workspace (or Repository)
-  share a row on desktop and stack on narrow screens. Gallery cards use two
-  columns on desktop and one on narrow screens.
+  fixed; other tasks expose schedule controls. The modal opens with Instructions
+  focused and Name visible above it. Run on and session mode precede Repeat and
+  Time because both determine the minimum interval. Time and timezone are separate
+  controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
+  opens its searchable dropdown. Custom schedules use the same typed time input.
+  Advanced starts collapsed and contains Workspace or
+  Repository, Project, agent settings, and Ends. Name remains required and editable
+  without opening Advanced; changing instructions preserves it. Configured overrides
+  are summarized beside Advanced, and invalid
+  settings reveal their controls. Escape closes the active selector or folder browser
+  without discarding the automation draft. The footer stays visible while the form scrolls.
+  Gallery cards use two columns on desktop and one on narrow screens.
 
 ## How to get to it (user POV)
 
@@ -103,7 +122,9 @@ to customize.
 - **Your automations:** select a suggestion beneath the saved automations or
   empty-state message, with All selected and the search cleared.
 - **Creation modal:** click New automation on either tab to start from scratch.
-  With `automations_v2` on a server supporting sub-hour schedules, use Custom schedule → Minutes
+  Choose Run on and session mode above Repeat. Expand Advanced to change agent
+  settings or an ending. With `automations_v2` on a server supporting sub-hour
+  schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits

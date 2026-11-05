@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
@@ -84,6 +84,8 @@ const readyHost: Host = {
 };
 
 function renderPicker(props: {
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   harnessEntries: AvailableAgent[];
   agentEntries?: AvailableAgent[];
   effectiveAgentId?: string | null;
@@ -102,6 +104,8 @@ function renderPicker(props: {
       <StoryQueryRouter>
         <TooltipProvider>
           <AgentHarnessPicker
+            open={props.open}
+            onOpenChange={props.onOpenChange}
             agentEntries={props.agentEntries ?? []}
             harnessEntries={props.harnessEntries}
             curatedEntries={props.curatedEntries}
@@ -143,6 +147,15 @@ afterEach(() => {
 });
 
 describe("AgentHarnessPicker inline harness list", () => {
+  it("lets a parent control visibility while reporting close requests", async () => {
+    const onOpenChange = vi.fn();
+    renderPicker({ harnessEntries: [claude], open: true, onOpenChange });
+    expect(screen.getByRole("menu")).toBeVisible();
+    await userEvent.click(screen.getByTestId(`new-chat-landing-agent-${claude.id}`));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(screen.getByRole("menu")).toBeVisible();
+  });
+
   it("keeps the preferred harnesses inline when they are seeded", async () => {
     renderPicker({ harnessEntries: [claude, codex, pi], effectiveAgentId: claude.id });
     await openPicker();
