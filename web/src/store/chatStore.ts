@@ -2023,6 +2023,7 @@ export function initChatStore(client: QueryClient): void {
   // in tests, leak into the next case).
   conversationRegistry.clear();
   disposedReturnedStartupInputs.clear();
+  disposedReplacedStartupInputs.clear();
   startupInputsNamedOut.clear();
   resentUnderOwnId.clear();
   // Drop this tab's held stream slots; disposed pumps release their own locks,
@@ -8029,9 +8030,8 @@ function settleReplacedStartupInputs(
 }
 
 /**
- * Return the viewer's startup messages a failed managed launch left undelivered to the
- * composer once, after any waiting draft, dropping their sending bubbles. Ids a draft or a
- * saved or queued send holds count as returned; a notice names attachments it can't restore.
+ * Return the viewer's unheld failed startup inputs to the composer once, naming any
+ * attachments it can't restore. Only bubbles captured before the read are matched by text.
  *
  * @param conversationId - The session whose launch failed.
  * @param state - The conversation's state.
@@ -8421,6 +8421,8 @@ const startupSettlements = new WeakMap<ConversationEntry, number>();
 
 /** Startup inputs disposed entries had handed back, so a session reopened in this tab doesn't offer them again. */
 const disposedReturnedStartupInputs = new Map<string, string[]>();
+/** Startup inputs disposed entries' accepted sends replaced, which a failed discard leaves listed. */
+const disposedReplacedStartupInputs = new Map<string, string[]>();
 conversationRegistry.subscribeDisposed((id, state) => {
   const carried = disposedReturnedStartupInputs.get(id) ?? [];
   // An untaken recovered draft is lost with its entry, so a later read offers its inputs again.
@@ -8430,6 +8432,11 @@ conversationRegistry.subscribeDisposed((id, state) => {
   );
   if (returned.length > 0) disposedReturnedStartupInputs.set(id, returned);
   else disposedReturnedStartupInputs.delete(id);
+  const replaced = new Set([
+    ...(disposedReplacedStartupInputs.get(id) ?? []),
+    ...state.replacedStartupInputs,
+  ]);
+  if (replaced.size > 0) disposedReplacedStartupInputs.set(id, [...replaced]);
 });
 
 /** Startup inputs each entry adopted as returned, until a read names the files they lack. */
@@ -8438,10 +8445,17 @@ const adoptedStartupInputs = new WeakMap<ConversationEntry, Set<string>>();
 /**
  * Count as returned on this entry the startup inputs an earlier entry for this session handed
  * back and those its saved draft holds, which a reload keeps and the user may clear mid-read.
+ * Those an earlier entry's accepted sends replaced stay replaced.
  */
 function adoptReturnedStartupInputs(entry: ConversationEntry): void {
   const carried = disposedReturnedStartupInputs.get(entry.id) ?? [];
   disposedReturnedStartupInputs.delete(entry.id);
+  const replaced = disposedReplacedStartupInputs.get(entry.id) ?? [];
+  disposedReplacedStartupInputs.delete(entry.id);
+  if (replaced.length > 0)
+    entrySetter(entry)((state) => ({
+      replacedStartupInputs: [...new Set([...state.replacedStartupInputs, ...replaced])],
+    }));
   adoptStartupInputs(entry, [...carried, ...(getSessionDraft(entry.id)?.startupInputIds ?? [])]);
 }
 

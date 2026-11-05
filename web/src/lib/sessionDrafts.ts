@@ -116,7 +116,7 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
 }
 
 /**
- * Record failed startup inputs the composer is taking into a session's draft.
+ * Add held startup input and send ids to a session's draft without replacing its content.
  *
  * @param conversationId - The session the inputs belong to.
  * @param text - Their text, saved only when the session has no draft yet; an existing draft keeps its text.
@@ -140,8 +140,7 @@ export function addSessionDraftStartupInputs(
 }
 
 /**
- * Record the failed startup inputs a draft holds, in place of the inputs and sends it named: those a
- * recalled message brings back, or those a read listed under the draft's sends.
+ * Replace the startup input and send ids a session's draft holds, keeping its content.
  *
  * @param conversationId - The session the inputs belong to.
  * @param text - Their text, saved only when the session has no draft yet; an existing draft keeps its text.

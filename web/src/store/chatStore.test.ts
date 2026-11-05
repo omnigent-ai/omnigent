@@ -4621,6 +4621,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
 
   it("doesn't hand back startup inputs an accepted resend replaced while they were read", async () => {
     seedSession("conv_real");
+    seedSession("conv_other");
     failManagedLaunch("conv_real", "saved on server");
     await useChatStore.getState().switchTo("conv_real");
     await settle();
@@ -4647,6 +4648,15 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
 
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(useChatStore.getState().returnedStartupInputs).toEqual([]);
+
+    // Nor does the session evicted and reopened in this tab while a failed discard leaves them listed.
+    failManagedLaunch("conv_real", "saved on server");
+    await useChatStore.getState().switchTo("conv_other");
+    await settle();
+    expect(conversationRegistry.evictLruEvictable()).toBe("conv_real");
+    await useChatStore.getState().switchTo("conv_real");
+    await settle();
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
   it.each([
