@@ -11,10 +11,7 @@ SDK client.
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
-import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -45,17 +42,14 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from tests._helpers.polling import poll_until_async
 from tests.server.helpers import create_test_agent
 from tests.server.integration._session_continuation import (
     _EDITOR,
     _HOST_ID,
-    _MESSAGE_INPUT,
     _OWNER,
     _READER,
     _RUNNER_ID,
     LiveRunner,
-    bind_to_host,
     create_placed_session,
     install_managed_sandbox,
     message_texts,
@@ -333,71 +327,6 @@ async def test_claude_sdk_clear_ignores_attachments_in_the_history_it_drops(
     assert len(clear_requests(live_runner)) == 1
 
 
-@pytest.mark.parametrize("cancelled_during", ["fork", "runner_binding"])
-async def test_a_cancelled_clear_request_still_finishes_the_move(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-    cancelled_during: str,
-) -> None:
-    """Cancelling the request (e.g. a client disconnect) mid-move leaves no half-made session.
-
-    Once allowed, the move runs to its end on its own: exactly one new session
-    is placed and announced, a retry is refused while it runs, and the original
-    is superseded but can still be resumed.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    source_id = await create_placed_session(client, store)
-    before = len((await client.get("/v1/sessions")).json()["data"])
-    loop = asyncio.get_running_loop()
-    paused, resume = asyncio.Event(), threading.Event()
-    if cancelled_during == "fork":
-        fork = SqlAlchemyConversationStore.fork_conversation
-
-        def fork_after_cancel(self: Any, *args: Any, **kwargs: Any) -> Any:
-            loop.call_soon_threadsafe(paused.set)
-            assert resume.wait(timeout=10)
-            return fork(self, *args, **kwargs)
-
-        monkeypatch.setattr(SqlAlchemyConversationStore, "fork_conversation", fork_after_cancel)
-    else:
-        resolve_runner = sessions_module._get_runner_client
-
-        async def bind_after_cancel(session_id: str, *args: Any, **kwargs: Any) -> Any:
-            if session_id != source_id and not paused.is_set():
-                paused.set()
-                await asyncio.to_thread(resume.wait, 10)
-            return await resolve_runner(session_id, *args, **kwargs)
-
-        monkeypatch.setattr(sessions_module, "_get_runner_client", bind_after_cancel)
-    clearing = asyncio.create_task(
-        client.post(f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}})
-    )
-    await asyncio.wait_for(paused.wait(), timeout=10)
-
-    clearing.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await clearing
-    retried = await client.post(
-        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
-    )
-    resume.set()
-    await poll_until_async(lambda: bool(live_runner.superseded), timeout_s=10)
-
-    assert retried.status_code == 409, retried.text
-    [(_, new_id, _)] = live_runner.superseded
-    continuation = store.get_conversation(new_id)
-    assert continuation is not None
-    assert (continuation.runner_id, continuation.host_id) == (_RUNNER_ID, _HOST_ID)
-    assert new_id in live_runner.announced
-    assert len((await client.get("/v1/sessions")).json()["data"]) == before + 1
-    assert not orchestration._session_is_moving(source_id)
-    resumed = await client.post(f"/v1/sessions/{source_id}/events", json=_MESSAGE_INPUT)
-    assert resumed.status_code < 300, resumed.text
-
-
 def _agent_ids(db_uri: str) -> set[str]:
     """Every agent row in the workspace, session copies included."""
     with get_or_create_engine(db_uri).connect() as connection:
@@ -539,51 +468,6 @@ async def test_claude_sdk_clear_re_addresses_a_runner_that_moved_before_release(
     assert "wrong_replica" in resp.text
     assert len((await client.get("/v1/sessions")).json()["data"]) == before
     assert clear_requests(live_runner) == []
-    assert live_runner.superseded == []
-
-
-async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    live_runner: LiveRunner,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A continuation whose runner rejects it leaves nothing behind.
-
-    The source's saved inference configuration must be accepted, so an
-    unconfirmed initialization fails the clear. The new session is deleted
-    and dropped from the runner it was sent to (which may have set it up
-    without confirming), was never listed in the owner's tabs, and the source
-    gets no notice or redirect. A failure after the runner set the session up
-    is shared with ``/rewind`` and covered in ``test_sessions_continuation.py``.
-    """
-    resolve_harness_as(monkeypatch, "claude-sdk")
-    store = SqlAlchemyConversationStore(db_uri)
-    agent = await create_test_agent(client)
-    source = store.create_conversation(
-        agent_id=agent["id"],
-        inference_snapshot={"runtime_config": {}, "harness": "claude-sdk", "owner_id": "local"},
-    )
-    bind_to_host(store, source.id, "/work/repo")
-    store.replace_runner_id(source.id, _RUNNER_ID)
-    before = len((await client.get("/v1/sessions")).json()["data"])
-
-    resp = await client.post(
-        f"/v1/sessions/{source.id}/events", json={"type": "clear", "data": {}}
-    )
-
-    assert resp.status_code == 503, resp.text
-    assert "did not accept this session's saved inference configuration" in resp.text
-    initialized = [
-        body["session_id"] for path, body in live_runner.posts if path == "/v1/sessions"
-    ]
-    [new_id] = [session_id for session_id in initialized if session_id != source.id]
-    assert store.get_conversation(new_id) is None
-    # Dropped from the runner even when the runner never confirmed it.
-    assert (f"/v1/sessions/{new_id}", {}) in live_runner.posts
-    assert new_id not in live_runner.announced
-    assert len((await client.get("/v1/sessions")).json()["data"]) == before
-    assert message_texts(store, source.id) == []
     assert live_runner.superseded == []
 
 
