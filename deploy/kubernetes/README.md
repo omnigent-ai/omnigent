@@ -285,9 +285,10 @@ kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
 
 **Credentials & auth** — two separate concerns, don't conflate:
 
-- **Server auth.** Front the server with `header`/`oidc` auth or run single-user;
-  the built-in `accounts` mode refuses the per-session runner dial-back (`403`),
-  a framework-level limit shared by all sandbox providers — see [Auth](../README.md#auth).
+- **Server auth.** Managed hosts work under `header`, `oidc`, and the built-in
+  `accounts` mode, or on a single-user server. Under `accounts`/`oidc` the runner
+  exchanges its tunnel binding token for a short-lived owner JWT — see
+  [Auth](../README.md#auth).
 - **Model keys** (`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY`
   / `GIT_TOKEN` / …) ride the `omnigent-creds` Secret projected into every runner Pod.
 

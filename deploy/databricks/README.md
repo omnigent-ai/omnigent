@@ -351,7 +351,11 @@ scopes `all-apis offline_access` (see
 [DATABRICKS_CONNECT.md](../../designs/DATABRICKS_CONNECT.md)). Set its client id and
 secret in `OMNIGENT_DATABRICKS_CLIENT_ID` and `OMNIGENT_DATABRICKS_CLIENT_SECRET`,
 and a credential-store key (`OMNIGENT_CREDENTIAL_KMS_KEY_ID` or
-`OMNIGENT_CREDENTIAL_VAULT_KEY`) to encrypt the stored tokens. The Apps entry
+`OMNIGENT_CREDENTIAL_VAULT_KEY`) to encrypt the stored tokens. The server also
+needs the callback URL: set `OMNIGENT_DATABRICKS_REDIRECT_URI` to the redirect URL
+above, or set `OMNIGENT_DOMAIN` and it is derived as
+`https://<domain>/v1/connections/databricks/callback`. With neither, the server
+logs a warning and the Databricks connection stays disabled. The Apps entry
 point (`src/app.py`), `omnigent server`, and the Docker entry point all read these.
 
 **Stop and resume.** A Sandbox stopped by its idle timeout is started in place on

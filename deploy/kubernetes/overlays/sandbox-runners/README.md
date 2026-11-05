@@ -122,6 +122,15 @@ by whoever created the Pod**, so before keying anything privileged on it:
    variant, which includes it — nothing to build. If you self-build instead,
    keep `kubernetes` in `OMNIGENT_EXTRAS` (see `deploy/docker`) or
    `_ensure_sdk()` fails every launch, and point `images:` at your build.
+   The official variant includes **only** the `kubernetes` extra. If the server
+   also uses a feature that needs another extra, self-build with all of them,
+   e.g. `--build-arg OMNIGENT_EXTRAS=kubernetes,kms,s3`:
+
+   | Server feature | Extra |
+   | --- | --- |
+   | AWS KMS credential-store cipher (`OMNIGENT_CREDENTIAL_KMS_KEY_ID`) | `kms` |
+   | Vault Transit credential-store cipher (`OMNIGENT_CREDENTIAL_VAULT_KEY`) | `vault` |
+   | S3 artifact store (`OMNIGENT_ARTIFACT_URI=s3://…`) | `s3` |
 2. **Harness credentials.** The runners read their LLM / git credentials from a
    Secret named by `secret_name` (default `omnigent-creds`); you create it out of
    band after applying the overlay — see step 2 of **Apply**. It is deliberately
@@ -161,21 +170,22 @@ A managed sandbox opens two connections back to the server. The **host tunnel** 
 authenticated by the per-launch token directly — the per-Pod token Secret, always
 works. But each session's **runner tunnel**, opened by the runner the host spawns,
 authenticates with whatever *server* credential it can resolve — **not** the host
-token. So how you front the server matters:
+token. How the runner gets that credential depends on the auth mode:
 
 - **Header / OIDC-proxy auth, or single-user (no-auth) servers** — the runner
   tunnel needs no extra identity; managed hosts work out of the box. (Verified
   end-to-end on a header-auth server: a `host_type: managed` session launched a
   runner Pod and ran a Claude turn on an injected `CLAUDE_CODE_OAUTH_TOKEN`.)
-- **The built-in `accounts` provider (`OMNIGENT_AUTH_ENABLED=1`)** — the runner
-  tunnel additionally requires a *user* identity, which the per-launch host token
-  does not carry, so the runner dial-back is refused (`403`) even though the host
-  tunnel connects. This is a framework-level managed-host interaction shared by
-  **all** sandbox providers (Modal / Daytona / Islo / …), not specific to Kubernetes.
+- **The built-in `accounts` provider (`OMNIGENT_AUTH_ENABLED=1`) and OIDC** — the
+  runner presents its tunnel binding token to `POST /v1/runners/{id}/token` and
+  receives a short-lived JWT for the session owner, which it sends on its HTTP
+  callbacks. Managed hosts work with no extra setup. This is shared by all sandbox
+  providers, not specific to Kubernetes, and is covered end-to-end against a real
+  accounts-auth server by `tests/e2e/test_managed_runner_http_auth.py`. It needs
+  Omnigent 0.4.0 or later on both the server and the host image.
 
-So front the server with **header or OIDC auth** — a reverse proxy / IdP injects
-the user identity on every request, including the runner WebSocket (see
-[`deploy/README.md`](../../../README.md#auth)) — or run it single-user.
+Pick whichever auth mode fits how you front the server (see
+[`deploy/README.md`](../../../README.md#auth)); all of them support managed hosts.
 
 ## Model credentials (LLM keys)
 
@@ -411,10 +421,11 @@ config inside the runner Pod.
 - **Runner Pod stuck in `CreateContainerConfigError`:** the `secret_name` Secret
   (`omnigent-creds`) doesn't exist in the runner namespace — its `envFrom` is
   non-optional, so the Pod can't start. Create it (see [Apply](#apply)).
-- **Host comes online but the session hangs / 403s on the first message:** the
-  server is using the built-in `accounts` provider, which doesn't support the
-  managed runner dial-back — see [Server auth](#server-auth-managed-hosts) (use
-  header/OIDC auth, or run single-user).
+- **Host comes online but the session hangs on the first message under
+  `accounts`/OIDC auth:** the runner couldn't get an owner token for its
+  callbacks. Check that the server and the host image both run Omnigent 0.4.0 or
+  later (`POST /v1/runners/{id}/token` was added then) — see
+  [Server auth](#server-auth-managed-hosts).
 - **401 / "could not load Kubernetes configuration":** out of cluster, the server
   can't find a kubeconfig — set `kubeconfig` (or `OMNIGENT_KUBERNETES_KUBECONFIG`),
   or unset `in_cluster: true` if it isn't actually running in the cluster.
