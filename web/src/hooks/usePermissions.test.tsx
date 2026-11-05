@@ -19,6 +19,7 @@ import { act, renderHook } from "@testing-library/react";
 import type { Conversation } from "./useConversations";
 import type { Session } from "@/lib/types";
 import type * as PermissionsApi from "@/lib/permissionsApi";
+import { PUBLIC_USER_ID } from "@/lib/permissionsApi";
 
 vi.mock("./useConversations", () => ({ useConversations: vi.fn() }));
 vi.mock("./useSession", () => ({ useSession: vi.fn() }));
@@ -144,46 +145,78 @@ describe("useCanEdit — safe defaults", () => {
 
 describe("share mutations — sidebar shared flag", () => {
   const listKey = ["conversations", "", false];
+  const grantsKey = ["permissions", "conv_1"];
+  const grant = (user_id: string, level = 1) => ({ user_id, conversation_id: "conv_1", level });
+  const listData = (row: Partial<Conversation> = {}) => ({
+    pages: [{ data: [{ ...makeConv(4), owner: "owner@example.com", ...row }] }],
+    pageParams: [null],
+  });
 
-  function setup() {
+  function setup(grantees?: string[]) {
     const qc = new QueryClient();
-    qc.setQueryData(listKey, {
-      pages: [{ data: [{ ...makeConv(4), owner: "owner@example.com" }] }],
-      pageParams: [null],
-    });
+    qc.setQueryData(listKey, listData());
+    if (grantees)
+      qc.setQueryData(grantsKey, [
+        grant("owner@example.com", 4),
+        ...grantees.map((id) => grant(id)),
+      ]);
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={qc}>{children}</QueryClientProvider>
     );
     const sharedFlag = () =>
       qc.getQueryData<{ pages: { data: Conversation[] }[] }>(listKey)!.pages[0].data[0]
         .shared_with_others;
-    return { qc, wrapper, sharedFlag };
+    const hooks = renderHook(
+      () => ({ grant: useGrantPermission("conv_1"), revoke: useRevokePermission("conv_1") }),
+      { wrapper },
+    ).result;
+    return { qc, sharedFlag, hooks };
   }
 
   it.each([
     ["a user", "friend@example.com", true],
-    ["the public link", "__public__", undefined],
+    ["the public link", PUBLIC_USER_ID, undefined],
   ])("sets the flag after granting %s", async (_label, userId, expected) => {
-    const { wrapper, sharedFlag } = setup();
-    const { result } = renderHook(() => useGrantPermission("conv_1"), { wrapper });
-    await act(() => result.current.mutateAsync({ userId, level: 1 }));
+    const { sharedFlag, hooks } = setup();
+    await act(() => hooks.current.grant.mutateAsync({ userId, level: 1 }));
     expect(sharedFlag()).toBe(expected);
   });
 
   it.each([
-    ["the last user grantee", ["friend@example.com", "__public__"], false],
+    ["the last user grantee", ["friend@example.com", PUBLIC_USER_ID], false],
     ["one of two user grantees", ["friend@example.com", "other@example.com"], true],
   ])("recomputes the flag after revoking %s", async (_label, grantees, expected) => {
-    const { qc, wrapper, sharedFlag } = setup();
-    qc.setQueryData(
-      ["permissions", "conv_1"],
-      [
-        { user_id: "owner@example.com", conversation_id: "conv_1", level: 4 },
-        ...grantees.map((user_id) => ({ user_id, conversation_id: "conv_1", level: 1 })),
-      ],
-    );
-    const { result } = renderHook(() => useRevokePermission("conv_1"), { wrapper });
-    await act(() => result.current.mutateAsync("friend@example.com"));
+    const { sharedFlag, hooks } = setup(grantees);
+    await act(() => hooks.current.revoke.mutateAsync("friend@example.com"));
     expect(sharedFlag()).toBe(expected);
+  });
+
+  it("tracks back-to-back changes before the grant list refetches", async () => {
+    const { sharedFlag, hooks } = setup(["a@example.com", "b@example.com"]);
+    await act(() => hooks.current.revoke.mutateAsync("a@example.com"));
+    await act(() => hooks.current.revoke.mutateAsync("b@example.com"));
+    expect(sharedFlag()).toBe(false);
+
+    await act(() => hooks.current.grant.mutateAsync({ userId: "c@example.com", level: 1 }));
+    await act(() => hooks.current.revoke.mutateAsync(PUBLIC_USER_ID));
+    expect(sharedFlag()).toBe(true);
+  });
+
+  it("drops a list response fetched before the change", async () => {
+    const { qc, sharedFlag, hooks } = setup();
+    let resolveStale!: (data: ReturnType<typeof listData>) => void;
+    const staleFetch = qc
+      .fetchQuery({
+        queryKey: listKey,
+        queryFn: () =>
+          new Promise<ReturnType<typeof listData>>((resolve) => {
+            resolveStale = resolve;
+          }),
+      })
+      .catch(() => undefined);
+    await act(() => hooks.current.grant.mutateAsync({ userId: "friend@example.com", level: 1 }));
+    resolveStale(listData({ shared_with_others: false }));
+    await staleFetch;
+    expect(sharedFlag()).toBe(true);
   });
 });

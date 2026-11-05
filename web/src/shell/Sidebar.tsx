@@ -6049,6 +6049,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "background_work_running",
   "blocked_on",
   "provisional",
+  "shared_with_others",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {

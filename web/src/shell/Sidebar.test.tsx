@@ -501,6 +501,35 @@ describe("Sidebar session list", () => {
     }
   });
 
+  it("re-renders a rendered row when its shared flag flips", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      const row = (shared: boolean) =>
+        conv("owned", "Claude Code", { owner: "viewer@example.com", shared_with_others: shared });
+      mockConversations([row(false)]);
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = () => (
+        <QueryClientProvider client={qc}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/"]}>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree());
+      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+
+      mockConversations([row(true)]);
+      rerender(tree());
+      expect(screen.getByRole("img", { name: "Shared session" })).toBeInTheDocument();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
   it("keeps the shared indicator on pinned sessions across filters", () => {
     mockConversations([conv("shared_pin", "Claude Code", { owner: "other@example.com" })]);
     seedPins(["shared_pin"]);

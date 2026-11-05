@@ -5,7 +5,7 @@ import { useLoadedConversations } from "@/hooks/useSidebarData";
  */
 
 import { useMemo } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   LEVEL_OWNER,
   PUBLIC_USER_ID,
@@ -57,44 +57,71 @@ export function useSessionOwner(sessionId: string | null) {
 }
 
 /**
- * Grant or update a permission. Invalidates the permissions list and, for a
- * named user, marks the sidebar row shared (the updates stream confirms it).
+ * Apply a successful share change to the cached grant list, then derive the
+ * sidebar row's shared flag from it. In-flight reads are cancelled first so a
+ * response fetched before the change can't overwrite either cache.
+ *
+ * @param qc - The app QueryClient.
+ * @param sessionId - Session whose grants changed.
+ * @param update - Returns the grant list after the change.
+ * @param sharedWithoutGrants - Flag to apply when no grant list is cached, or
+ *   `undefined` to leave the row for the updates stream to correct.
  */
+async function applyShareChange(
+  qc: QueryClient,
+  sessionId: string,
+  update: (grants: Permission[]) => Permission[],
+  sharedWithoutGrants: boolean | undefined,
+): Promise<void> {
+  await Promise.all([
+    qc.cancelQueries({ queryKey: permissionsKey(sessionId) }),
+    qc.cancelQueries({ queryKey: ["conversations"] }),
+    qc.cancelQueries({ queryKey: ["project-sessions"] }),
+  ]);
+  const grants = qc.getQueryData<Permission[]>(permissionsKey(sessionId));
+  const next = grants && update(grants);
+  if (next) qc.setQueryData(permissionsKey(sessionId), next);
+  const shared = next
+    ? next.some((g) => g.user_id !== PUBLIC_USER_ID && g.level < LEVEL_OWNER)
+    : sharedWithoutGrants;
+  if (shared !== undefined) {
+    overlayListItemIntoCaches(qc, { id: sessionId, shared_with_others: shared });
+  }
+  void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
+}
+
+/** Grant or update a permission, keeping the grant list and sidebar flag current. */
 export function useGrantPermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ userId, level }: { userId: string; level: number }) =>
       grantPermission(sessionId, userId, level),
-    onSuccess: (_data, { userId }) => {
-      if (userId !== PUBLIC_USER_ID) {
-        overlayListItemIntoCaches(qc, { id: sessionId, shared_with_others: true });
-      }
-      void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
-    },
+    onSuccess: (_data, { userId, level }) =>
+      applyShareChange(
+        qc,
+        sessionId,
+        (grants) => [
+          ...grants.filter((g) => g.user_id !== userId),
+          { user_id: userId, conversation_id: sessionId, level },
+        ],
+        // Any named grant means shared; a public grant alone doesn't change it.
+        userId !== PUBLIC_USER_ID ? true : undefined,
+      ),
   });
 }
 
-/**
- * Revoke a permission. Invalidates the permissions list on success and, when
- * the grant list is cached, recomputes the sidebar row's shared flag from the
- * remaining named non-owner grants.
- */
+/** Revoke a permission, keeping the grant list and sidebar flag current. */
 export function useRevokePermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (userId: string) => revokePermission(sessionId, userId),
-    onSuccess: (_data, userId) => {
-      const grants = qc.getQueryData<Permission[]>(permissionsKey(sessionId));
-      if (grants) {
-        overlayListItemIntoCaches(qc, {
-          id: sessionId,
-          shared_with_others: grants.some(
-            (g) => g.user_id !== userId && g.user_id !== PUBLIC_USER_ID && g.level < LEVEL_OWNER,
-          ),
-        });
-      }
-      void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
-    },
+    onSuccess: (_data, userId) =>
+      applyShareChange(
+        qc,
+        sessionId,
+        (grants) => grants.filter((g) => g.user_id !== userId),
+        undefined,
+      ),
   });
 }
 
