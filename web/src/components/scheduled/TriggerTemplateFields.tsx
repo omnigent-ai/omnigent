@@ -122,7 +122,6 @@ export function TriggerTemplateFields({
               </span>
             )}
             <span className="text-muted-foreground">{template.scopeLabel}</span>
-            <span className={cn(CHIP, "flex items-center")}>equals</span>
             <Input
               value={fields.scope}
               placeholder={template.scopePlaceholder}
