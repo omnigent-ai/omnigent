@@ -10,7 +10,7 @@ sign-ins does. This file is how that manager tells Omnigent.
 `~/.omnigent/mcp-auth-status.json`, or the absolute path in
 `OMNIGENT_MCP_AUTH_STATUS_FILE` when `$HOME` is read-only or sandboxed. The path is
 used as given, so a relative value resolves against the host process's working
-directory.
+directory; the host passes runners that resolved path.
 
 ## Format
 
@@ -35,6 +35,14 @@ The panel renders `sign_in_required` as an amber row with a **Sign in** link tha
 `sign_in_url` in a new tab. While the panel is open and a host server for the session's
 harness is reported as `sign_in_required`, it polls this file (through the host inventory) every few seconds, so flipping the entry
 to `connected` updates the row.
+
+Flipping a `claude` entry to `connected` also lets a running claude-sdk session use the
+server: Claude Code connects MCP servers only when the session starts, so at its next
+turn the session reconnects a server that failed to connect before the sign-in. A server
+the CLI is still connecting, or whose reconnect fails, is checked again at the following turn.
+If the reconnects take longer than 30 seconds, the session restarts Claude Code for that
+turn with the conversation so far; the new process connects every server as it starts,
+without holding the turn.
 
 ## Rules the reader enforces
 

@@ -1256,6 +1256,34 @@ describe("index.css electron-mac window drag region", () => {
   });
 });
 
+describe("index.css macOS desktop font smoothing", () => {
+  const SMOOTHING_DECL = /-webkit-font-smoothing\s*:\s*antialiased/;
+  const smoothingRules = cssBlocks
+    .map(([block]) => block)
+    .filter((block) => /-webkit-font-smoothing\s*:/.test(block));
+
+  it("antialiases text only under the macOS desktop shell marker", () => {
+    // Browsers and the other shells keep the platform's default smoothing.
+    expect(smoothingRules.map(selectorOf)).toEqual(["html[data-electron-mac]"]);
+    expect(smoothingRules[0]).toMatch(SMOOTHING_DECL);
+  });
+
+  it("keeps the declaration through build minification", () => {
+    const minified = new TextDecoder().decode(
+      transform({
+        filename: "index.css",
+        code: new TextEncoder().encode(indexCssSource),
+        minify: true,
+        targets: TARGETS,
+      }).code,
+    );
+    const macRootRules = [
+      ...minified.matchAll(/(?:^|\})html\[data-electron-mac\]\{([^}]*)\}/g),
+    ].map(([, body]) => body);
+    expect(macRootRules.some((body) => /-webkit-font-smoothing:antialiased/.test(body))).toBe(true);
+  });
+});
+
 /* On the macOS desktop shell the window's top strip carries the OS traffic
  * lights plus the Search/Settings/toggle cluster, and the cluster is owned by
  * AppShell rather than the sidebar so it holds that spot whether the sidebar is
