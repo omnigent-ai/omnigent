@@ -1554,6 +1554,7 @@ def register_core_routes(
             spec,
             user_id,
             conversation_store,
+            model_override=parsed_metadata.model_override,
         )
         from omnigent.models.model_catalog import spec_harness
         from omnigent.server.routes._session_harness_readiness import (
@@ -1606,6 +1607,7 @@ def register_core_routes(
                 result.session_id,
                 result.agent_id,
                 runner_router,
+                conversation_store=conversation_store,
             )
         # Grant the creator ownership BEFORE scheduling the managed
         # launch, mirroring the JSON path: a managed-guard failure
