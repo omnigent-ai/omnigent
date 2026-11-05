@@ -2811,6 +2811,7 @@ def _bound_codex_replay_argument_bytes(
             or call_id in ambiguous
             or output_positions[call_id] <= index
             or not isinstance(arguments, str)
+            or _CODEX_OMITTED_ARGUMENTS_MARKER.fullmatch(arguments)
             or not isinstance(item.get("name"), str)
             or not item["name"]
             or ("namespace" in item and not isinstance(item["namespace"], str))
@@ -2829,6 +2830,11 @@ def _bound_codex_replay_argument_bytes(
         history_bytes,
         omitted,
     )
+
+
+_CODEX_OMITTED_ARGUMENTS_MARKER = re.compile(
+    r'\{"omitted": "\d+ characters of arguments, too large to replay"\}'
+)
 
 
 def _codex_omitted_arguments(arguments: str) -> str:

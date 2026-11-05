@@ -1362,10 +1362,8 @@ def test_rollout_records_bound_aggregate_completed_arguments(compacted: bool) ->
             history = list(record["payload"]["replacement_history"])
         elif record["type"] == "response_item":
             history.append(record["payload"])
-    request_bytes = len(
-        json.dumps({"input": history}, ensure_ascii=False, separators=(",", ":")).encode()
-    )
-    assert request_bytes < 32 * 1024 * 1024
+    history_bytes = len(json.dumps(history, ensure_ascii=False, separators=(",", ":")).encode())
+    assert history_bytes <= codex_native._MAX_REPLAYED_HISTORY_BYTES < 32 * 1024 * 1024
     calls = [item for item in history if item["type"] == "function_call"]
     assert len(calls) == 40
     assert "omitted" in json.loads(calls[0]["arguments"])
@@ -1489,6 +1487,28 @@ def test_replay_argument_byte_budget_preserves_open_or_ambiguous_calls(
     )
 
     assert history == original
+
+
+def test_replay_argument_byte_budget_keeps_existing_omission_markers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An argument already omitted for size keeps reporting its original size."""
+    marker = codex_native._codex_omitted_arguments("x" * 1_000_000)
+    arguments = json.dumps({"cmd": "x" * 500})
+    history = [
+        {**_tool_call("call_1"), "arguments": marker},
+        _tool_output("call_1"),
+        {**_tool_call("call_2"), "arguments": arguments},
+        _tool_output("call_2"),
+    ]
+    monkeypatch.setattr(codex_native, "_MAX_REPLAYED_HISTORY_BYTES", 100)
+
+    codex_native._bound_codex_replay_argument_bytes(
+        [{"type": "response_item", "payload": item} for item in history]
+    )
+
+    assert history[0]["arguments"] == marker
+    assert history[2]["arguments"] == codex_native._codex_omitted_arguments(arguments)
 
 
 @pytest.mark.parametrize(
