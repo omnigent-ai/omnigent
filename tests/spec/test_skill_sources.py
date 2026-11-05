@@ -1154,7 +1154,12 @@ def test_claude_launch_customization_triggers(
     ids=["no-init", "timeout"],
 )
 def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str, timeout_s: float, summary: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    script: str,
+    timeout_s: float,
+    summary: str,
 ) -> None:
     home = _claude_home_with_plugin(
         tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
@@ -1163,6 +1168,7 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
         isolate_provider_resolution(monkeypatch, tmp_path / "config"),
         tmp_path / "launches.jsonl",
         script,
+        args=("--token", "synthetic-launch-secret"),
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.plugin_discovery.LAUNCH_PLUGINS_TIMEOUT_S", timeout_s
@@ -1179,47 +1185,31 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
         "Claude plugins added by the configured launch are missing: the launch "
         f"{summary}; see the host log for details."
     ]
+    assert summary in caplog.text
+    assert "synthetic-launch-secret" not in caplog.text
+
+
+_CONFIG_UNREADABLE = (
+    "Claude plugins added by a configured launch may be missing: the Omnigent "
+    "config could not be read; see the host log for details."
+)
+_LAUNCH_UNRESOLVED = (
+    "Claude plugins added by the configured launch are missing: the launch "
+    "did not report its plugins; see the host log for details."
+)
 
 
 @pytest.mark.parametrize(
-    ("config_text", "launcher", "warning"),
+    ("scope", "config_text", "launcher", "warning"),
     [
-        (
-            "harness: [\n",
-            "",
-            "Claude plugins added by a configured launch may be missing: the Omnigent "
-            "config could not be read; see the host log for details.",
-        ),
-        (
-            None,
-            "",
-            "Claude plugins added by a configured launch may be missing: the Omnigent "
-            "config could not be read; see the host log for details.",
-        ),
-        (
-            "harness: [\n",
-            "wrapper",
-            "Claude plugins added by the configured launch are missing: the launch "
-            "did not report its plugins; see the host log for details.",
-        ),
-        (
-            "- claude\n",
-            "",
-            "Claude plugins added by a configured launch may be missing: the Omnigent "
-            "config could not be read; see the host log for details.",
-        ),
-        (
-            "- claude\n",
-            "wrapper",
-            "Claude plugins added by the configured launch are missing: the launch "
-            "did not report its plugins; see the host log for details.",
-        ),
-        (
-            b"harness: \x81\n",
-            "",
-            "Claude plugins added by a configured launch may be missing: the Omnigent "
-            "config could not be read; see the host log for details.",
-        ),
+        ("global", "harness: [\n", "", _CONFIG_UNREADABLE),
+        ("global", None, "", _CONFIG_UNREADABLE),
+        ("global", "harness: [\n", "wrapper", _LAUNCH_UNRESOLVED),
+        ("global", "- claude\n", "", _CONFIG_UNREADABLE),
+        ("global", "- claude\n", "wrapper", _LAUNCH_UNRESOLVED),
+        ("global", b"harness: \x81\n", "", _CONFIG_UNREADABLE),
+        ("project", "- claude\n", "", _CONFIG_UNREADABLE),
+        ("project", "claude\n", "wrapper", _LAUNCH_UNRESOLVED),
     ],
     ids=[
         "malformed",
@@ -1228,11 +1218,14 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
         "not-a-mapping",
         "not-a-mapping-with-launcher",
         "invalid-utf8",
+        "project-not-a-mapping",
+        "project-scalar-with-launcher",
     ],
 )
 def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    scope: str,
     config_text: str | bytes | None,
     launcher: str,
     warning: str,
@@ -1241,6 +1234,10 @@ def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
         tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
     )
     config_path = isolate_provider_resolution(monkeypatch, tmp_path / "config") / "config.yaml"
+    if scope == "project":
+        config_path = tmp_path / "project" / ".omnigent" / "config.yaml"
+        config_path.parent.mkdir(parents=True)
+        monkeypatch.chdir(tmp_path / "project")
     if config_text is None:
         # Opening a directory fails even as root, which can read a mode-000 file.
         config_path.mkdir()
@@ -1378,6 +1375,21 @@ def test_prewarm_asks_a_configured_launch_before_any_catalog(
 
     assert plugin_discovery.claude_launch_plugin_dirs() == {"dev@inline": plugin}
     assert len(launches.read_text().splitlines()) == 1
+
+
+def test_prewarm_logs_a_launch_it_could_not_start_probing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def cannot_start(*, wait: bool) -> dict[str, Path]:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(plugin_discovery, "claude_launch_is_customized", lambda: True)
+    monkeypatch.setattr(plugin_discovery, "claude_launch_plugin_dirs", cannot_start)
+
+    plugin_discovery.prewarm_claude_launch_plugins()
+
+    assert "Could not start probing the configured Claude launch" in caplog.text
+    assert "can't start new thread" in caplog.text
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(

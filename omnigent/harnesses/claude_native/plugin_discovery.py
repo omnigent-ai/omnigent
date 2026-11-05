@@ -26,6 +26,8 @@ FAILED_LAUNCH_BACKOFF_S = 30.0
 MAX_FAILED_LAUNCH_BACKOFF_S = 600.0
 # Listing plugins must not run the user's session hooks.
 _PROBE_SETTINGS = json.dumps({"disableAllHooks": True})
+# What an unreadable or malformed Omnigent config raises, e.g. a project config that is a list.
+CONFIG_READ_ERRORS = (OSError, AttributeError, TypeError, ValueError, yaml.YAMLError)
 
 
 class LaunchPluginsPending(Exception):
@@ -55,7 +57,7 @@ _generation = 0
 def claude_launch_is_customized() -> bool:
     """Whether native Claude starts through a configured command, arguments or launcher plugin.
 
-    :raises OSError, TypeError, ValueError, yaml.YAMLError: The Omnigent config could not be read.
+    :raises CONFIG_READ_ERRORS: The Omnigent config could not be read.
     """
     from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR
     from omnigent.config import load_effective_config
@@ -76,13 +78,15 @@ def launch_plugins_generation() -> int:
 def prewarm_claude_launch_plugins() -> None:
     """Start probing a customized launch, so the first skill menu can already list its plugins.
 
-    Failures are left for the menu to report.
+    Config and probe failures are left for the menu to report; anything else is logged.
     """
-    with suppress(
-        LaunchPluginsPending, LaunchPluginsFailed, OSError, TypeError, ValueError, yaml.YAMLError
-    ):
+    try:
         if claude_launch_is_customized():
             claude_launch_plugin_dirs(wait=False)
+    except (LaunchPluginsPending, LaunchPluginsFailed, *CONFIG_READ_ERRORS):
+        pass
+    except Exception:  # noqa: BLE001 — a background prewarm has no caller to report to
+        _log.warning("Could not start probing the configured Claude launch", exc_info=True)
 
 
 def _plugin_dirs(plugins: object) -> dict[str, Path]:
@@ -114,7 +118,7 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
     :param wait: Wait for a first answer rather than raise :class:`LaunchPluginsPending`.
     :raises LaunchPluginsPending: The launch has not answered yet.
     :raises LaunchPluginsFailed: The last probe failed and the next waits out a backoff.
-    :raises OSError, TypeError, ValueError, yaml.YAMLError: The Omnigent config could not be read.
+    :raises CONFIG_READ_ERRORS: The Omnigent config could not be read.
     """
     from omnigent.harnesses.claude_native.main import _claude_model_probe_invocation
     from omnigent.models.model_catalog_store import binary_identity
@@ -161,7 +165,8 @@ def _refresh(
         plugins = _probe_plugin_dirs(command, launch_args, env)
     except subprocess.TimeoutExpired as exc:
         failure = f"timed out after {exc.timeout:g}s"
-        _log.warning("The configured Claude launch %s: %s", failure, exc)
+        # The exception's text includes the launch's arguments, which can carry credentials.
+        _log.warning("The configured Claude launch %s", failure)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         _log.warning("The configured Claude launch %s: %s", failure, exc)
     finally:

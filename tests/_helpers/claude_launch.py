@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 
@@ -24,7 +25,9 @@ def write_launch_recorder(launcher: Path, launches: Path, script: str) -> None:
     launcher.chmod(0o755)
 
 
-def configure_claude_launch(config_home: Path, launches: Path, script: str) -> None:
+def configure_claude_launch(
+    config_home: Path, launches: Path, script: str, args: Sequence[str] = ("--",)
+) -> None:
     """
     Make ``harness.claude-native.command`` a launch recorder in *config_home*'s config.
 
@@ -32,9 +35,10 @@ def configure_claude_launch(config_home: Path, launches: Path, script: str) -> N
         ``isolate_provider_resolution``.
     :param launches: JSON-lines file each launch appends to.
     :param script: Python the launch runs after recording itself.
+    :param args: Configured ``harness.claude-native.args``, e.g. ``("--token", "secret")``.
     """
     launcher = config_home / "claude-launcher"
     write_launch_recorder(launcher, launches, script)
     (config_home / "config.yaml").write_text(
-        json.dumps({"harness": {"claude-native": {"command": str(launcher), "args": ["--"]}}})
+        json.dumps({"harness": {"claude-native": {"command": str(launcher), "args": [*args]}}})
     )
