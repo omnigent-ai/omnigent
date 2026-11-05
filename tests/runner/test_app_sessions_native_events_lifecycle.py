@@ -5618,12 +5618,16 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "command,inherited",
-    [(False, False), (False, True), (True, False)],
-    ids=["follow-up", "inherited-default", "side-command"],
+    "command,inherited,attachment",
+    [(False, False, False), (False, True, False), (True, False, False), (True, False, True)],
+    ids=["follow-up", "inherited-default", "side-command", "side-command-attachment"],
 )
 async def test_events_codex_side_chat_preserves_indentation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool, inherited: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: bool,
+    inherited: bool,
+    attachment: bool,
 ) -> None:
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
@@ -5679,6 +5683,8 @@ async def test_events_codex_side_chat_preserves_indentation(
         payload["model_override"] = "gpt-6-sol"
         if not inherited:
             payload["reasoning_effort"] = "max"
+    if attachment:
+        payload["content"].append({"type": "input_file", "file_id": "attached-file"})
     async with _runner_client(app) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
@@ -5688,6 +5694,12 @@ async def test_events_codex_side_chat_preserves_indentation(
         if not command:
             repeated = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
             assert repeated.status_code == 202, repeated.text
+    if attachment:
+        assert response.status_code == 400, response.text
+        assert "attachments" in response.json()["error"]["message"]
+        assert side_chat.peek_side_chat_requests(bridge_dir) == []
+        assert fake_client.requests == []
+        return
     assert response.status_code == 202, response.text
     if command:
         assert [request.question for request in side_chat.peek_side_chat_requests(bridge_dir)] == [

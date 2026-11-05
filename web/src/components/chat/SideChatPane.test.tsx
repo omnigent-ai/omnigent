@@ -40,11 +40,15 @@ const mockSession = vi.hoisted(() => ({
 }));
 // A conversation id whose snapshot the mock should report as still loading.
 const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
+const failedSession = vi.hoisted(() => ({ id: null as string | null }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id?: string | null) => ({
-    session: { ...mockSession.snapshot, labels: mockSession.labels },
+    session:
+      id && id === failedSession.id
+        ? null
+        : { ...mockSession.snapshot, labels: mockSession.labels },
     isLoading: id != null && id === loadingSession.id,
-    error: null,
+    error: id && id === failedSession.id ? new Error("Snapshot unavailable") : null,
   }),
 }));
 vi.mock("@/hooks/useWorkingLabelTick", () => ({ useWorkingLabelTick: () => 0 }));
@@ -78,6 +82,7 @@ beforeEach(() => {
   mockSession.labels = {};
   mockSession.snapshot = {};
   loadingSession.id = null;
+  failedSession.id = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
   sendSlashCommand.mockReset().mockResolvedValue(undefined);
@@ -1375,6 +1380,169 @@ describe("unsent composer state survives the pane moving", () => {
       expect(useChatStore.getState().sideChatComposers["other-pane"].text).toBe("keep me");
     },
   );
+});
+
+describe("history a side chat copied from its parent", () => {
+  function userItem(id: string, responseId: string, text: string) {
+    return {
+      id,
+      response_id: responseId,
+      type: "message" as const,
+      role: "user" as const,
+      status: "completed" as const,
+      content: [{ type: "input_text" as const, text }],
+    };
+  }
+  function listSideChat() {
+    mockSession.labels = { "omnigent.side_chat": "1" };
+    mockSession.snapshot = { sideChatParentId: "conv_main" };
+  }
+
+  it("hides exactly the items the fork copied, on any device", () => {
+    listSideChat();
+    // This browser's own snapshot would hide nothing; the fork's copies say otherwise.
+    localStorage.setItem(`omnigent.sideChatInherited:${childId}`, "[]");
+    const copied = childId.slice(0, 12);
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      loadingConversation: false,
+      // The copy ends on a hidden input, and the reply before it, the fork and the
+      // side chat's first question all share one second.
+      blocks: itemsToBlocks([
+        { ...userItem(`${copied}old`, "resp_old", "Copied earlier"), created_at: 990 },
+        { ...userItem(`${copied}reply`, "resp_reply", "Copied reply"), created_at: 1_000 },
+        {
+          ...userItem(`${copied}tail`, "resp_tail", "Hidden input"),
+          created_at: 1_000,
+          is_meta: true,
+        },
+        { ...userItem("item_side", "resp_side", "Asked in the side chat"), created_at: 1_000 },
+      ]),
+    });
+
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied earlier")).toBeNull();
+    expect(screen.queryByText("Copied reply")).toBeNull();
+    expect(screen.queryByText("Hidden input")).toBeNull();
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+  });
+
+  it("waits for the session before choosing which history to hide", () => {
+    loadingSession.id = childId;
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+    const { rerender } = renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([
+          userItem(`${childId.slice(0, 12)}copy`, "resp_copy", "Copied reply"),
+          userItem("item_side", "resp_side", "Asked in the side chat"),
+        ]),
+      }),
+    );
+    expect(screen.queryByText("Asked in the side chat")).toBeNull();
+
+    loadingSession.id = null;
+    listSideChat();
+    rerender(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied reply")).toBeNull();
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
+
+  it.each([false, true])(
+    "does not hide a new turn when a delayed snapshot settles (failed: %s)",
+    (failed) => {
+      loadingSession.id = childId;
+      const entry = conversationRegistry.acquire(childId);
+      entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+      const { rerender } = renderPane(<SideChatPane childId={childId} />);
+      const copied = userItem(`${childId.slice(0, 12)}copy`, "resp_copy", "Copied reply");
+      act(() => entry.setState({ loadingConversation: false, blocks: itemsToBlocks([copied]) }));
+      act(() =>
+        entry.setState({
+          blocks: itemsToBlocks([
+            copied,
+            userItem("item_side", "resp_side", "A new side-chat turn"),
+          ]),
+        }),
+      );
+      loadingSession.id = null;
+      failedSession.id = failed ? childId : null;
+      rerender(<SideChatPane childId={childId} />);
+
+      expect(screen.getByText("A new side-chat turn")).toBeInTheDocument();
+      expect(screen.queryByText("Copied reply")).toBeNull();
+      const saved = localStorage.getItem(`omnigent.sideChatInherited:${childId}`);
+      expect(saved === null ? null : JSON.parse(saved)).toEqual(failed ? null : [copied.id]);
+      if (failed) {
+        failedSession.id = null;
+        listSideChat();
+        rerender(<SideChatPane childId={childId} />);
+        expect(screen.queryByText("Copied reply")).toBeNull();
+        expect(screen.getByText("A new side-chat turn")).toBeInTheDocument();
+      }
+    },
+  );
+
+  it("uses a saved legacy boundary when the snapshot fails", () => {
+    failedSession.id = childId;
+    localStorage.setItem(`omnigent.sideChatInherited:${childId}`, '["legacy_copy"]');
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      loadingConversation: false,
+      blocks: itemsToBlocks([
+        userItem("legacy_copy", "resp_copy", "Copied reply"),
+        userItem("item_side", "resp_side", "A saved side-chat turn"),
+      ]),
+    });
+
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied reply")).toBeNull();
+    expect(screen.getByText("A saved side-chat turn")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBe('["legacy_copy"]');
+  });
+
+  it("leaves a listed Codex side chat's own transcript alone", () => {
+    listSideChat();
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "codex-native", loadingConversation: true });
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([
+          // A native fork copies nothing, so even a prefix-looking id is its own turn.
+          userItem(`${childId.slice(0, 12)}own`, "resp_own", "Asked in the Codex side chat"),
+          userItem("item_next", "resp_next", "Followed up"),
+        ]),
+      }),
+    );
+
+    expect(screen.getByText("Asked in the Codex side chat")).toBeInTheDocument();
+    expect(screen.getByText("Followed up")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
+
+  it("hides nothing when the fork copied nothing", () => {
+    listSideChat();
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([userItem("item_side", "resp_side", "Asked in the side chat")]),
+      }),
+    );
+
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
 });
 
 describe("side chat sealed by the server", () => {

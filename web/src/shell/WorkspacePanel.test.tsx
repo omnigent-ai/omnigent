@@ -1117,7 +1117,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     try {
       const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "sidechat" });
 
-      fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+      fireEvent.pointerDown(await screen.findByRole("button", { name: "Open new" }), { button: 0 });
       fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
 
       const pendingId = screen.getByTestId("side-chat-pane-stub").firstChild?.textContent ?? "";
@@ -1486,6 +1486,25 @@ describe("WorkspacePanel browser tab", () => {
   });
 });
 
+describe("WorkspacePanel restored side chats", () => {
+  it("leaves a restored Codex side chat writable; the server seals dead ones", () => {
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    try {
+      // Restored from storage, e.g. on another device or after a reload.
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["conv_codex_side"],
+        selectedSideChatId: "conv_codex_side",
+      });
+      renderWorkspace({ rightRailTab: "sidechat" });
+
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "false");
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+});
+
 describe("WorkspacePanel mobile side chats", () => {
   const openTabs = () =>
     writeSessionWorkspaceState("conv_ws", {
@@ -1544,6 +1563,7 @@ describe("WorkspacePanel mobile side chats", () => {
       await waitFor(() =>
         expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
       );
+      // Closing a tab stops its session.
       expect(stop.mock.calls).toEqual([["conv_side_b"], ["conv_side_b"]]);
       expect(queuedAtStop).toEqual([[], []]);
       expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBeUndefined();
@@ -1552,6 +1572,41 @@ describe("WorkspacePanel mobile side chats", () => {
       stop.mockRestore();
     },
   );
+
+  // Owner level either way: an admin has it without owning the session.
+  it.each([
+    [true, true],
+    [false, false],
+  ])("offers a new side chat when the server allows it (%s)", (sideChatAllowed, offered) => {
+    isMobileMock.mockReturnValue(true);
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_ws"], {
+      id: "conv_ws",
+      agentId: "agent",
+      status: "idle",
+      createdAt: 0,
+      labels: {},
+      permissionLevel: 4,
+      sideChatAllowed,
+    });
+    try {
+      renderWorkspace({
+        rightRailTab: "sidechat",
+        mobileSideChatsOpen: true,
+        permissionLevel: 4,
+        queryClient,
+      });
+
+      const drawer = screen.getByTestId("side-chats-panel-drawer");
+      expect(within(drawer).queryByRole("button", { name: "New side chat" }) !== null).toBe(
+        offered,
+      );
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
 
   it("shows the selected side chat in the drawer, not the hidden rail", () => {
     isMobileMock.mockReturnValue(true);

@@ -1047,26 +1047,6 @@ def _should_dispatch_tool_locally(
     return dispatch is not None or is_mcp or is_runner_builtin or is_spec_local
 
 
-def _side_chat_text_from_content(content: object) -> str:
-    """
-    Join user text from message content blocks for a Codex ``/side`` follow-up.
-
-    :param content: A message body's ``content`` list, e.g.
-        ``[{"type": "input_text", "text": "and why?"}]``.
-    :returns: The concatenated text with leading indentation preserved, or
-        ``""`` when there is none.
-    """
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
-            text = block.get("text")
-            if isinstance(text, str) and text:
-                parts.append(text)
-    return "\n".join(parts).rstrip()
-
-
 def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     """
     Coerce a turn-failure ``error`` dict into a ``{code, message}`` shape.
@@ -7066,7 +7046,7 @@ def create_runner_app(
                         },
                     )
             else:
-                _side_text = _side_chat_text_from_content(
+                _side_text = side_chat.side_chat_text_from_content(
                     body.get("content") if isinstance(body, dict) else None
                 )
                 if not _side_text:
@@ -7166,13 +7146,12 @@ def create_runner_app(
             # and the chat would sit on "Working…" for good.
             from omnigent.harnesses.codex_native import side_chat as _side_chat
 
-            _side_question = _side_chat.side_chat_question_from_text(
-                _side_chat_text_from_content(body.get("content")).lstrip()
+            _side_question = (
+                _side_chat.side_chat_question_from_content(body.get("content"))
+                if _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
+                else None
             )
-            if (
-                _side_question is not None
-                and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
-            ):
+            if _side_question is not None:
                 _side_chat.request_side_chat(
                     await _codex_native_bridge_dir_for_session(conversation_id),
                     _side_question,

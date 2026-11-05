@@ -2505,6 +2505,12 @@ class SessionResponse(BaseModel):
     # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
     # ``GET /v1/sessions?project=``.
     project_id: str | None = None
+    # The session whose Workspace rail lists this one as a side chat; ``None``
+    # otherwise, including side chats from before the rail was server-listed.
+    side_chat_parent_id: str | None = None
+    # Whether the viewer may start side chats here: only the owner of the
+    # session's root can. ``None`` where the response doesn't compute it.
+    side_chat_allowed: bool | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -3245,6 +3251,32 @@ class ChildSessionList(BaseModel):
 
     object: Literal["list"] = "list"
     data: list[ChildSessionSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class SideChatSummary(BaseModel):
+    """
+    A side chat listed in its parent session's Workspace rail.
+
+    :param id: Side-chat session id, e.g. ``"conv_side123"``.
+    :param object: Fixed resource type, always ``"side_chat"``.
+    :param created_at: Unix epoch seconds when the side chat was created.
+    :param title: The side chat's title, when available.
+    """
+
+    id: str
+    object: Literal["side_chat"] = "side_chat"
+    created_at: int
+    title: str | None = None
+
+
+class SideChatList(BaseModel):
+    """Paginated list of side chats; ``data`` is a page of ``SideChatSummary``."""
+
+    object: Literal["list"] = "list"
+    data: list[SideChatSummary] = Field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False

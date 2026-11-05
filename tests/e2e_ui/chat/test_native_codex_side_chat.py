@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import shutil
+from typing import Any
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Browser, Page, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import (
     configure_mock_llm,
@@ -35,6 +37,8 @@ from .test_side_chat_entrypoints import _ASSISTANT, _items, _send_parent, _start
 )
 def test_native_codex_side_chat_inherits_context_and_closes_independently(
     page: Page,
+    browser: Browser,
+    browser_context_args: dict[str, Any],
     native_codex_mock_session: tuple[str, str],
     mock_llm_server_url: str,
     mobile: bool,
@@ -119,11 +123,39 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     assert child_thread_id
     assert child_thread_id != parent["external_session_id"]
 
+    remote_question = f"native-remote-{session_id}: continue on another device"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Answered on the other device."}],
+        key=remote_question.split(":")[0],
+        match=remote_question.split(":")[0],
+        required_tools=[],
+    )
+    set_fallback_mock_llm(
+        mock_llm_server_url, remote_question.split(":")[0], "Answered on the other device."
+    )
+    with user_page(browser, headers={}, **browser_context_args) as remote:
+        remote.goto(f"{base_url}/c/{session_id}")
+        _ensure_chat_view(remote)
+        open_right_rail(remote)
+        remote.get_by_role("button", name="Browse side chats").click()
+        remote.get_by_role("menuitem").first.click()
+        remote_pane = remote.locator(".side-chat-backdrop")
+        expect(remote_pane.locator(_ASSISTANT)).to_contain_text("First native side answer.")
+        expect(remote_pane.get_by_text(parent_reply, exact=True)).to_have_count(0)
+        remote.get_by_test_id("side-chat-input").fill(remote_question)
+        remote.get_by_test_id("side-chat-send").click()
+        expect(
+            remote_pane.locator(_ASSISTANT).filter(has_text="Answered on the other device.")
+        ).to_be_visible(timeout=60_000)
+    assert _items(base_url, session_id) == parent_items
+
     expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     settings = pane.get_by_role("button", name="Side chat model and effort")
     expect(settings).to_be_visible(timeout=30_000)
     settings.click()
     page.get_by_test_id("side-chat-model-edit").click()
+    page.get_by_placeholder("Search models…").fill("gpt-6-sol")
     option = page.locator('[data-model-id$="gpt-6-sol"]')
     selected_model = option.get_attribute("data-model-id")
     assert selected_model and selected_model != first_requests[0]["model"]

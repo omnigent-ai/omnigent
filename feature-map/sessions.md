@@ -41,7 +41,9 @@ the header menu), and each place is a separate entry point.
   closing one stops only that chat. Starting one from a stopped generic hosted
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
-  message or Resume.
+  message or Resume. Only the session's owner can start side chats. A side
+  chat started on one device is available from **Browse side chats** on the
+  owner's other devices. Opening and closing tabs stays local.
 - `side-chat-settings`: choose a supported model or effort in the side-chat composer;
   selections apply to that chat's next turn independently of its parent, in the
   desktop panel and mobile drawer. Generic side chats allow selection before or
@@ -473,10 +475,11 @@ choose Stop session while a side chat or sub-agent is working. On mobile, open
 the sidebar drawer and long-press the row. The current-turn interrupt control is
 a separate action that leaves the session connected.
 
-**Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
-parent composer, or choose **Start a new side chat** from the composer's add
-tray. Selecting assistant text also offers **Ask in side chat** unless the
-composer is read-only. On mobile,
+**Side-chat lifecycle:** as the session's owner, use **Workspace → + → Side
+chat**, type `/side` in the parent composer, or choose **Start a new side chat**
+from the composer's add tray. Selecting assistant text also offers **Ask in side
+chat** unless the composer is read-only. Viewers and editors of a shared session
+see none of these. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
 chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Sending to
@@ -484,6 +487,10 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
+On another device, choose **Browse side chats** in the Workspace toolbar or
+mobile drawer, then select a chat to open it. The picker fetches 20 at a time;
+**Next 20** loads another page. Existing local tabs keep their order. Side chats
+created before server discovery was added remain local to their original browser.
 In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
 in a visible workspace rail. With no closable visible tab it returns to the
 new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are
@@ -498,9 +505,11 @@ keeps running. Covered by `tests/e2e_ui/agents/test_subagent_side_panel.py`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
-Closing the side chat discards its queued follow-ups. A
-chat-only side chat can also send messages from its direct `/c/<child_id>` URL
-without choosing a workspace. The side-chat composer opens the same `/` menu
+Closing the side chat discards the follow-ups queued on that device. Other
+devices keep their tabs and queued work. Closing still stops the chat's running
+turn, as before; a sealed Codex side chat refuses further input. A chat-only
+side chat can also send messages from its direct URL without choosing a
+workspace. The side-chat composer opens the same `/` menu
 affordance as the main composer but with a narrower set — `/help` and the
 session's skills: `/help` is answered locally and a recognised skill runs
 in-process through `slash_command`; a native terminal side chat shows no menu
@@ -887,6 +896,11 @@ plain `uv run pytest`, which starts a private server for the test.
   eligibility; `web/src/pages/ChatPage.composer.test.tsx` checks target routing
   and parent isolation. In an embedded app, repeat text selection in both the
   parent and side chat and check the popup's theme and button styling.
+- **`side-chat-lifecycle`, another device:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_follows_the_user_to_another_device`
+  starts a side chat in the desktop rail, opens it from a phone-sized browser
+  context with its own storage using **Browse side chats**, sends a follow-up,
+  closes it there, and checks that only the phone tab stays closed after reload.
 - **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
   opens a runnerless child directly and sends a message without a directory
@@ -894,7 +908,8 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`side-chat-lifecycle`, `side-chat-settings`, native Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   drives a real Codex CLI and app-server with scripted model replies. It checks
-  inherited context in the model request, isolated follow-ups, and a parent
+  inherited context in the model request, discovery and a follow-up from an
+  independent browser context, isolated follow-ups, and a parent
   that stays usable after closing its side chat. Desktop/mobile variants create
   a side chat through the Workspace menu or `/side`, then change its model and
   effort before a follow-up. Scripted provider requests verify the actual model

@@ -92,6 +92,14 @@ import {
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
+/** The block field that marks it as copied into a side chat. */
+interface CopiedBlock {
+  ctx?: { itemId?: string | null };
+}
+
+/** Leading side-chat id characters on items it copied; the server's `SIDE_CHAT_COPY_ID_PREFIX_LEN`. */
+const SIDE_CHAT_COPY_ID_PREFIX_LEN = 12;
+
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
 function isPendingSideChat(id: string): boolean {
   return id.startsWith("pending:");
@@ -173,7 +181,11 @@ export function SideChatPane({
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
-  const { session } = useSession(pending ? null : childId);
+  const {
+    session,
+    isLoading: sessionLoading,
+    error: sessionError,
+  } = useSession(pending ? null : childId);
   const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
   const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   useLayoutEffect(() => {
@@ -214,54 +226,69 @@ export function SideChatPane({
   // already holds only its own turns (context lives in the native thread), so
   // filtering there would wrongly hide the side chat's first question.
   const filterHistory = !fullSession && !usesNativeSideChatFork(sessionHarness);
+  // A newer side chat's copied items have ids starting with its own id's first 12
+  // characters, so every device hides exactly the copied history; older ones use
+  // this browser's snapshot.
+  const copiedIdPrefix = childId.slice(0, SIDE_CHAT_COPY_ID_PREFIX_LEN);
+  // Until the snapshot says which rule applies, show nothing and persist nothing.
+  const awaitingRule = filterHistory && !pending && sessionLoading;
+  const useLocalBoundary =
+    filterHistory &&
+    !pending &&
+    !sessionLoading &&
+    !sessionError &&
+    session !== null &&
+    !session.sideChatParentId;
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
   // pre-load render.
   const boundaryRef = useRef<{
     childId: string;
-    ids: Set<string> | null;
+    // `undefined` until this browser's stored boundary has been read.
+    ids: Set<string> | null | undefined;
     loadSeen: boolean;
+    loadedIds: Set<string> | null;
   } | null>(null);
   if (boundaryRef.current === null || boundaryRef.current.childId !== childId) {
-    boundaryRef.current = {
-      childId,
-      ids: filterHistory && !pending ? readInheritedBoundary(childId) : null,
-      loadSeen: false,
-    };
+    boundaryRef.current = { childId, ids: undefined, loadSeen: false, loadedIds: null };
+  }
+  if (filterHistory && !pending && boundaryRef.current.ids === undefined) {
+    boundaryRef.current.ids = readInheritedBoundary(childId);
   }
   if (loadingConversation) boundaryRef.current.loadSeen = true;
-  // Capture once, when the fork's load has actually completed — even if it is
-  // EMPTY (a parent with no history), so the side chat's first message isn't
-  // mistaken for inherited history and hidden. Snapshot the inherited item ids
-  // and persist so later mounts/reloads hide the same set, not new turns.
+  // Snapshot at hydration, before a slow metadata lookup can include new turns.
   if (
-    boundaryRef.current.ids === null &&
-    !pending &&
     filterHistory &&
+    !pending &&
+    boundaryRef.current.loadedIds === null &&
     boundaryRef.current.loadSeen &&
     !loadingConversation &&
     conversationLoadError === null
   ) {
-    const ids = new Set(
+    boundaryRef.current.loadedIds = new Set(
       blocks
-        .map((b) => (b as { ctx?: { itemId?: string | null } }).ctx?.itemId)
+        .map((b) => (b as CopiedBlock).ctx?.itemId)
         .filter((id): id is string => typeof id === "string"),
     );
-    boundaryRef.current.ids = ids;
-    writeInheritedBoundary(childId, ids);
   }
-  const inherited = boundaryRef.current.ids;
-  const visibleBlocks = useMemo(
-    () =>
-      inherited === null
-        ? blocks
-        : blocks.filter((b) => {
-            const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
-            return !(typeof id === "string" && inherited.has(id));
-          }),
-    [blocks, inherited],
-  );
+  if (
+    useLocalBoundary &&
+    boundaryRef.current.ids === null &&
+    boundaryRef.current.loadedIds !== null
+  ) {
+    boundaryRef.current.ids = boundaryRef.current.loadedIds;
+    writeInheritedBoundary(childId, boundaryRef.current.ids);
+  }
+  const inherited = session?.sideChatParentId ? null : (boundaryRef.current.ids ?? null);
+  const visibleBlocks = useMemo(() => {
+    if (awaitingRule) return [];
+    if (!filterHistory) return blocks;
+    return blocks.filter((b) => {
+      const id = (b as CopiedBlock).ctx?.itemId;
+      return !(typeof id === "string" && (id.startsWith(copiedIdPrefix) || inherited?.has(id)));
+    });
+  }, [blocks, inherited, filterHistory, copiedIdPrefix, awaitingRule]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
