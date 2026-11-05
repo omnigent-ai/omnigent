@@ -5871,6 +5871,135 @@
         "title": "RoutingDecisionData",
         "type": "object"
       },
+      "RuntimeFlagRequestItem": {
+        "additionalProperties": false,
+        "description": "One flag a client declares.",
+        "properties": {
+          "default": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Default"
+          },
+          "name": {
+            "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,255}$",
+            "title": "Name",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "bool",
+              "int",
+              "long",
+              "float",
+              "string",
+              "string_list"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "default"
+        ],
+        "title": "RuntimeFlagRequestItem",
+        "type": "object"
+      },
+      "RuntimeFlagsRequest": {
+        "additionalProperties": false,
+        "description": "The flags one client process declares.",
+        "properties": {
+          "flags": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeFlagRequestItem"
+            },
+            "maxItems": 500,
+            "title": "Flags",
+            "type": "array"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          }
+        },
+        "required": [
+          "flags"
+        ],
+        "title": "RuntimeFlagsRequest",
+        "type": "object"
+      },
+      "RuntimeFlagsResponse": {
+        "description": "Values the server serves; a missing flag means \"use your default\".",
+        "properties": {
+          "refresh_after_s": {
+            "format": "int64",
+            "title": "Refresh After S",
+            "type": "integer"
+          },
+          "values": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "format": "int64",
+                  "type": "integer"
+                },
+                {
+                  "format": "double",
+                  "type": "number"
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ]
+            },
+            "title": "Values",
+            "type": "object"
+          }
+        },
+        "required": [
+          "values",
+          "refresh_after_s"
+        ],
+        "title": "RuntimeFlagsResponse",
+        "type": "object"
+      },
       "SandboxProfileSummary": {
         "additionalProperties": false,
         "description": "Public session/host reference; execution identity stays on the server.",
@@ -6221,6 +6350,11 @@
           "request_managed_sandbox_host_id": {
             "default": true,
             "title": "Request Managed Sandbox Host Id",
+            "type": "boolean"
+          },
+          "runtime_flags": {
+            "default": false,
+            "title": "Runtime Flags",
             "type": "boolean"
           },
           "sandbox_provider": {
@@ -14142,6 +14276,48 @@
         "summary": "Mint Runner Owner Token",
         "tags": [
           "runners"
+        ]
+      }
+    },
+    "/v1/runtime-flags": {
+      "post": {
+        "description": "Evaluate the caller's declared runtime flags.",
+        "operationId": "evaluate_runtime_flags_v1_runtime_flags_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeFlagsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeFlagsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Evaluate Runtime Flags",
+        "tags": [
+          "runtime-flags"
         ]
       }
     },

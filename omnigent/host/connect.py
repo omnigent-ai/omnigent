@@ -233,6 +233,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.runtime_flags import RuntimeFlagRefresher
 from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
@@ -1472,6 +1473,7 @@ class HostProcess:
         # instead of waiting out the ~90s keepalive timeout. See run() /
         # _on_resume_from_suspend.
         self._suspend_task: asyncio.Task[None] | None = None
+        self._runtime_flags = RuntimeFlagRefresher(self._post_runtime_flags)
         # Set by _on_resume_from_suspend when it aborts a live tunnel after a
         # detected resume; read+cleared in run()'s reconnect handler to force a
         # prompt reconnect (skip the backoff).
@@ -4001,6 +4003,22 @@ class HostProcess:
             )
         return HostMcpToolsResultFrame(request_id=frame.request_id, status="ok", **result)
 
+    async def _post_runtime_flags(self, path: str, *, json: dict[str, object]) -> httpx.Response:
+        """POST a runtime-flag request with this host's tunnel credentials."""
+        # A launch token is valid only for the host it was issued to.
+        body = {**json, "host_id": self._identity.host_id}
+
+        def post() -> httpx.Response:
+            return httpx.post(
+                f"{self._server_url}{path}",
+                json=body,
+                headers=self._build_connect_headers(),
+                timeout=10.0,
+                verify=client_ssl_context(),
+            )
+
+        return await asyncio.to_thread(post)
+
     def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
@@ -4932,6 +4950,7 @@ class HostProcess:
         self._suspend_task = asyncio.create_task(
             watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
         )
+        self._runtime_flags.start()
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
@@ -5144,6 +5163,7 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._suspend_task
                 self._suspend_task = None
+            await self._runtime_flags.aclose()
             if self._lifecycle_task is not None:
                 self._lifecycle_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

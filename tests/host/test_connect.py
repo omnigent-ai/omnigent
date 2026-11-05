@@ -407,6 +407,30 @@ async def test_skill_bundle_fetch_survives_a_deleted_ssl_cert_file(
     assert response.request.url.path == "/v1/sessions/conv_abc/agent/contents"
 
 
+async def test_runtime_flag_post_names_this_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runtime-flag requests carry the host's tunnel headers and its host_id."""
+    import httpx
+
+    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
+    sent: list[httpx.Request] = []
+
+    def handle(_self: object, request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"values": {}}, request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle)
+
+    response = await _make_host_process()._post_runtime_flags(
+        "/v1/runtime-flags", json={"flags": []}
+    )
+
+    assert response.status_code == 200
+    assert str(sent[0].url) == "http://localhost:8000/v1/runtime-flags"
+    assert json.loads(sent[0].content) == {"flags": [], "host_id": "host_test_connect"}
+    assert sent[0].headers["Origin"] == OMNIGENT_INTERNAL_WS_ORIGIN
+
+
 async def test_host_skills_does_not_block_tunnel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -8121,14 +8145,30 @@ async def test_run_starts_and_shuts_down_host_maintenance(
         janitor_roots.append(harness_tmp_parent)
         return janitor
 
+    class _RecordingFlagRefresher:
+        def start(self) -> None:
+            calls.append("flags_start")
+
+        async def aclose(self) -> None:
+            calls.append("flags_close")
+
     monkeypatch.setattr(HostMaintenanceJanitor, "for_host", _for_host)
     host = _host()
     host._lifecycle_lock = _RecordingLifecycleLock()  # type: ignore[assignment]
+    host._runtime_flags = _RecordingFlagRefresher()  # type: ignore[assignment]
     monkeypatch.setattr(host, "_cleanup_runners", lambda: calls.append("cleanup_runners"))
 
     await host.run()
 
-    assert calls == ["acquire", "start", "shutdown", "cleanup_runners", "release"]
+    assert calls == [
+        "acquire",
+        "start",
+        "flags_start",
+        "shutdown",
+        "flags_close",
+        "cleanup_runners",
+        "release",
+    ]
     assert janitor_roots == [host._harness_tmp_parent]
     assert host._maintenance_janitor is None
 
