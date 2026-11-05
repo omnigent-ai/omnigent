@@ -602,15 +602,43 @@ describe("BrowserPane system-browser handoff", () => {
   });
 
   it("shows the shell's error when the system browser can't be opened", async () => {
-    await renderWithView("conv_fail", {
+    const { bridge } = await renderWithView("conv_fail", {
       browserOpenInSystemBrowser: vi
         .fn()
-        .mockResolvedValue({ ok: false, error: "Couldn't open your browser: no handler" }),
+        .mockResolvedValue({ ok: false, error: "The page changed. Try again." }),
     });
-    fireEvent.click(screen.getByRole("button", { name: "Open in browser" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Couldn't open your browser: no handler",
-    );
+    const button = screen.getByRole("button", { name: "Open in browser" });
+    fireEvent.click(button);
+    expect(await screen.findByRole("alert")).toHaveTextContent("The page changed. Try again.");
+
+    bridge.browserOpenInSystemBrowser.mockRejectedValueOnce(new Error("bridge gone"));
+    fireEvent.click(button);
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't open your browser.");
+  });
+
+  it("drops a handoff result that settles after the pane switches tabs", async () => {
+    let finishOpen: (result: { ok: boolean; error?: string }) => void = () => {};
+    installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com/" }),
+      browserOpenInSystemBrowser: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finishOpen = resolve;
+          }),
+      ),
+    });
+    const { rerender } = render(<BrowserPane conversationId="conv_first" />);
+    const button = screen.getByRole("button", { name: "Open in browser" });
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    expect(button).toBeDisabled();
+
+    rerender(<BrowserPane conversationId="conv_second" />);
+    await waitFor(() => expect(button).toBeEnabled());
+    await act(async () => finishOpen({ ok: false, error: "The page changed. Try again." }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(button).toBeEnabled();
   });
 
   it("offers to continue a blocked Google Workspace sign-in in the system browser", async () => {

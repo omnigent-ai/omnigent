@@ -12,7 +12,7 @@ const GOOGLE_ACCESS_BLOCKED_HOST = "access.workspace.google.com";
 // another browser restarts the sign-in instead of reaching the user's page.
 const GOOGLE_SIGN_IN_HOSTS = new Set(["accounts.google.com", GOOGLE_ACCESS_BLOCKED_HOST]);
 
-// Most navigation-trail entries kept per view.
+// Room for a long SSO redirect chain while keeping per-view memory bounded.
 const NAVIGATION_TRAIL_LIMIT = 30;
 
 /**

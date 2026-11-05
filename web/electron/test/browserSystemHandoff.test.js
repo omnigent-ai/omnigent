@@ -78,6 +78,18 @@ describe("browserSystemHandoff — systemBrowserCandidates", () => {
       }),
       [DOC, LANDING, BLOCKED],
     );
+    // The block page's own continue target comes first.
+    const blockedWithContinue = `https://access.workspace.google.com/remediate?continue=${encodeURIComponent(
+      `${DOC}/edit`,
+    )}`;
+    assert.deepEqual(
+      systemBrowserCandidates({
+        currentUrl: blockedWithContinue,
+        requestedUrl: DOC,
+        navigationTrail: [DOC, SIGN_IN],
+      }),
+      [`${DOC}/edit`, DOC, blockedWithContinue],
+    );
     assert.deepEqual(systemBrowserCandidates({ currentUrl: "about:blank" }), []);
   });
 
@@ -89,28 +101,6 @@ describe("browserSystemHandoff — systemBrowserCandidates", () => {
     assert.equal(systemBrowserUrl({ currentUrl: "about:blank" }), null);
     assert.equal(systemBrowserUrl({ currentUrl: "file:///tmp/x" }), null);
     assert.equal(systemBrowserUrl({ currentUrl: "" }), null);
-  });
-
-  it("sends a blocked sign-in to the page it was continuing to", () => {
-    assert.equal(
-      systemBrowserUrl({
-        currentUrl: BLOCKED,
-        requestedUrl: DOC,
-        navigationTrail: [DOC, SIGN_IN, BLOCKED],
-      }),
-      DOC,
-    );
-    const blockedWithContinue = `https://access.workspace.google.com/remediate?continue=${encodeURIComponent(
-      `${DOC}/edit`,
-    )}`;
-    assert.equal(
-      systemBrowserUrl({
-        currentUrl: blockedWithContinue,
-        requestedUrl: DOC,
-        navigationTrail: [DOC, SIGN_IN],
-      }),
-      `${DOC}/edit`,
-    );
   });
 
   it("prefers the newest continue target on the opened origin", () => {

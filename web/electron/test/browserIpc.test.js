@@ -464,7 +464,12 @@ function nonceFromScripts(scripts) {
 /** Build a registry stub around one entry keyed by conversationId. */
 function makeRegistry(conversationId, webContents) {
   const entries = new Map();
-  if (conversationId) entries.set(conversationId, { view: { webContents } });
+  const makeEntry = (wc) => ({
+    view: { webContents: wc },
+    navigationGeneration: 0,
+    navigationTrail: [],
+  });
+  if (conversationId) entries.set(conversationId, makeEntry(webContents));
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
   const recentSessionSupportCalls = [];
   let recentSessionCancelCount = 0;
@@ -476,7 +481,7 @@ function makeRegistry(conversationId, webContents) {
     checkSystemBrowserUrl: allowAgentNavigation,
     openOrNavigate: (id) => {
       const wc = makeWebContents();
-      const entry = { view: { webContents: wc } };
+      const entry = makeEntry(wc);
       entries.set(id, entry);
       return { ok: true, created: true, entry };
     },
@@ -1193,7 +1198,7 @@ describe("browserIpc — open in system browser", () => {
       });
     const pending = ctx.invoke();
     await new Promise(setImmediate);
-    entry.navigationGeneration = (entry.navigationGeneration ?? 0) + 1;
+    entry.navigationGeneration += 1;
     allow({ ok: true });
     assert.deepEqual(await pending, changed);
 
@@ -1201,6 +1206,14 @@ describe("browserIpc — open in system browser", () => {
       wc.getURL = () => {
         throw new Error("Object has been destroyed");
       };
+      return { ok: true };
+    };
+    assert.deepEqual(await ctx.invoke(), changed);
+
+    // The pane reopened the tab with a fresh view at the same URL.
+    wc.getURL = () => "https://example.com/page";
+    ctx.registry.checkSystemBrowserUrl = async () => {
+      ctx.registry.openOrNavigate("conv_1").entry.view.webContents.getURL = wc.getURL;
       return { ok: true };
     };
     assert.deepEqual(await ctx.invoke(), changed);

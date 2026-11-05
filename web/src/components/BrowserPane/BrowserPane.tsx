@@ -195,6 +195,15 @@ export function BrowserPane({
   // Set once a live url event arrives, so a slower remount snapshot can't overwrite it.
   const urlEventSeenRef = useRef(false);
   const [systemBrowserOpening, setSystemBrowserOpening] = useState(false);
+  // A handoff that settles after the pane switches tabs must not touch the new tab.
+  const handoffSequenceRef = useRef(0);
+  useEffect(
+    () => () => {
+      handoffSequenceRef.current++;
+      setSystemBrowserOpening(false);
+    },
+    [conversationId],
+  );
   const systemBrowserSupported = !!getBridge()?.browserOpenInSystemBrowser;
   // Ref (not state): read synchronously in the url-changed listener; a
   // stale-closure state read would race.
@@ -360,16 +369,22 @@ export function BrowserPane({
   const handleOpenInSystemBrowser = useCallback(() => {
     const bridge = getBridge();
     if (!bridge?.browserOpenInSystemBrowser) return;
+    const sequence = ++handoffSequenceRef.current;
+    const isCurrent = () => sequence === handoffSequenceRef.current;
     setSystemBrowserOpening(true);
     setNavigationError(null);
     void bridge
       .browserOpenInSystemBrowser(conversationId)
       .then((result) => {
-        if (!result?.ok) setNavigationError(result?.error ?? "Couldn't open your browser.");
+        if (isCurrent() && !result?.ok) {
+          setNavigationError(result?.error ?? "Couldn't open your browser.");
+        }
       })
-      .catch(() => setNavigationError("Couldn't open your browser."))
+      .catch(() => {
+        if (isCurrent()) setNavigationError("Couldn't open your browser.");
+      })
       .finally(() => {
-        setSystemBrowserOpening(false);
+        if (isCurrent()) setSystemBrowserOpening(false);
       });
   }, [conversationId]);
 

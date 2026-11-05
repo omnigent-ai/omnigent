@@ -205,11 +205,17 @@ async function waitForOpened(electronApp, url) {
 }
 
 async function closeDesktop(desktop, recordDir, name) {
-  // Stop filming first so the clip ends on the outcome, not on teardown.
-  await desktop.stopDisplayCapture();
-  await desktop.electronApp.close();
-  if (name) console.log(saveRecording(recordDir, name));
-  fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+  try {
+    try {
+      // Stop filming first so the clip ends on the outcome, not on teardown.
+      await desktop.stopDisplayCapture();
+    } finally {
+      await desktop.electronApp.close();
+      if (name) console.log(saveRecording(recordDir, name));
+    }
+  } finally {
+    fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+  }
 }
 
 // Pauses that only pace a kept recording for viewers.
@@ -237,6 +243,7 @@ it(
       const blockedText = await electronApp.evaluate(async () => {
         const registry = global.omnigentTestBrowserRegistries[0];
         const entry = registry.get(registry.activeConversationId());
+        if (!entry) return null;
         return {
           url: entry.view.webContents.getURL(),
           text: await entry.view.webContents.executeJavaScript("document.body.innerText"),
@@ -246,6 +253,7 @@ it(
             .map((url) => url.host + url.pathname),
         };
       });
+      assert.ok(blockedText, "the active tab has a browser view");
       assert.match(blockedText.url, /^https:\/\/access\.workspace\.google\.com\/remediate/);
       assert.match(blockedText.text, /Your organization isn't allowing access/);
       assert.equal(blockedText.trail[0], DOC_URL, JSON.stringify(blockedText.trail));
@@ -281,6 +289,8 @@ it(
           }),
         "wiki page loaded",
       );
+      // The tab title arrives with the page's sign-in state, so the notice is settled.
+      await window.getByText("Team onboarding", { exact: true }).waitFor({ timeout: 30_000 });
       assert.equal(
         await window
           .getByRole("status")
