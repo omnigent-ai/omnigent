@@ -53,6 +53,9 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { McpRegistryPicker } from "@/components/McpRegistry";
+import { useMcpRegistryCatalog } from "@/hooks/useMcpRegistry";
+import { readLastMcpServices } from "@/lib/mcpPreferences";
 import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
@@ -115,6 +118,7 @@ export function CreateScheduledTaskDialog({
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   // Older servers reject a task's project fields, so the picker needs the flag.
   const projectsSupported = info !== "loading" && info.scheduled_task_projects === true;
+  const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const sandboxRepoCatalog =
     info !== "loading" && info.scheduled_task_sandbox_workspaces === true && info.sandbox_provider
       ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? [])
@@ -272,6 +276,8 @@ export function CreateScheduledTaskDialog({
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
   const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
+  const [mcpServices, setMcpServices] = useState<string[]>([]);
+  const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
     ? "managed_sandbox"
     : "connected_host";
@@ -334,6 +340,7 @@ export function CreateScheduledTaskDialog({
         setPickedProjectId(null);
         setSessionMode(editingTask.sessionMode);
         setStartNewSession(false);
+        setMcpServices(editingTask.mcpServices);
         setTrigger(null);
       } else {
         setName(initialTrigger ? TRIGGER_TEMPLATES[initialTrigger].name : (initialName ?? ""));
@@ -354,6 +361,8 @@ export function CreateScheduledTaskDialog({
         setSandboxMode(false);
         setProjectChoice(null);
         setPickedProjectId(null);
+        // Start from the services the owner last picked for a new chat.
+        setMcpServices(readLastMcpServices());
       }
       setError(null);
     }
@@ -527,6 +536,33 @@ export function CreateScheduledTaskDialog({
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
+  const mcpCatalog = useMcpRegistryCatalog(open && mcpRegistryEnabled);
+  // A saved or remembered service the catalog no longer offers is not saved again.
+  const offeredMcpServices = mcpServices.filter((id) =>
+    mcpCatalog.services.some((service) => service.id === id),
+  );
+  // Runs start unattended, so every selected service must already be signed in.
+  const mcpBlockedReason =
+    !mcpRegistryEnabled || reusesExistingSession || mcpServices.length === 0
+      ? null
+      : mcpCatalog.loading
+        ? "Loading MCP services…"
+        : mcpCatalog.error
+          ? "Could not load MCP services. Retry, or turn them off."
+          : mcpCatalog.services.some(
+                (service) => offeredMcpServices.includes(service.id) && !service.connected,
+              )
+            ? "Sign in to each selected MCP service, or turn it off."
+            : null;
+  const mcpServicesChanged =
+    editingTask === null
+      ? offeredMcpServices.length > 0
+      : !sameServices(offeredMcpServices, editingTask.mcpServices);
+  const toggleMcpService = (id: string, next: boolean) =>
+    setMcpServices((current) =>
+      next ? [...new Set([...current, id])] : current.filter((service) => service !== id),
+    );
+
   const canSubmit =
     name.trim() !== "" &&
     effectivePrompt.trim() !== "" &&
@@ -537,6 +573,8 @@ export function CreateScheduledTaskDialog({
     !workspaceWithoutHost &&
     !scheduleInvalid &&
     !harnessSettings.blockedReason &&
+    mcpBlockedReason === null &&
+    !mcpAuthorizing &&
     !mutationPending;
 
   function resetForm() {
@@ -556,6 +594,7 @@ export function CreateScheduledTaskDialog({
     setPickedProjectId(null);
     setTrigger(null);
     setTriggerFields(emptyTriggerFields("jira"));
+    setMcpServices([]);
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -618,6 +657,9 @@ export function CreateScheduledTaskDialog({
                   }
                 : {}),
               ...(supportsPermission ? { permissionMode: effectivePermission || null } : {}),
+              ...(mcpRegistryEnabled && mcpServicesChanged
+                ? { mcpServices: offeredMcpServices }
+                : {}),
             };
         await updateMutation.mutateAsync({
           id: editingTask.id,
@@ -649,6 +691,7 @@ export function CreateScheduledTaskDialog({
           ...(supportsPermission && effectivePermission !== ""
             ? { permissionMode: effectivePermission }
             : {}),
+          ...(mcpRegistryEnabled && mcpServicesChanged ? { mcpServices: offeredMcpServices } : {}),
         });
       }
       handleOpenChange(false);
@@ -1132,6 +1175,38 @@ export function CreateScheduledTaskDialog({
             )}
           </div>
 
+          {mcpRegistryEnabled && (
+            <div className="flex flex-col gap-1.5" data-testid="task-mcp-services-field">
+              <Label>MCP services (optional)</Label>
+              <div className="max-h-56 overflow-hidden rounded-lg border border-input">
+                <McpRegistryPicker
+                  attached={mcpServices}
+                  onToggle={toggleMcpService}
+                  busy={mutationPending || reusesExistingSession}
+                  onAuthorizingChange={setMcpAuthorizing}
+                  catalog={mcpCatalog}
+                />
+              </div>
+              {reusesExistingSession ? (
+                <p className="text-sm text-muted-foreground">
+                  The continued session keeps its MCP services. Start a new session to change them.
+                </p>
+              ) : mcpBlockedReason ? (
+                <p
+                  role="alert"
+                  data-testid="task-mcp-services-blocked"
+                  className="text-sm text-destructive"
+                >
+                  {mcpBlockedReason}
+                </p>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  Every run starts with these services.
+                </p>
+              )}
+            </div>
+          )}
+
           {harnessSettings.blockedReason && (
             <p
               role="alert"
@@ -1264,3 +1339,8 @@ const SANDBOX_HOST = "__sandbox__";
 // other dialogs (project settings) can reuse it without pulling this file's
 // module graph. Re-exported here to keep existing imports and tests stable.
 export { isBackdropOverlay, isInsidePopper, shouldGuardDialogDismiss };
+
+/** Whether two MCP service lists name the same services, in any order. */
+function sameServices(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((service) => right.includes(service));
+}

@@ -57,6 +57,8 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  /** MCP services every session the automation creates starts with. */
+  mcpServices: string[];
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
   sessionMode: ScheduledTaskSessionMode;
   /** The session a `"continue"` task sends to; `null` until its first run creates one. */
@@ -150,6 +152,8 @@ export interface CreateScheduledTaskInput {
   reasoningEffort?: string | null;
   /** Harness-specific permission or execution mode; omit for the agent default. */
   permissionMode?: string | null;
+  /** MCP services every run starts with; omit for none. */
+  mcpServices?: string[];
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
   /** Host directory (requires hostId), or a repository URL for a sandbox. */
@@ -187,6 +191,8 @@ export interface UpdateScheduledTaskInput {
   modelOverride?: string | null;
   reasoningEffort?: string | null;
   permissionMode?: string | null;
+  /** Replaces the MCP services; `[]` clears them. */
+  mcpServices?: string[];
   sessionMode?: ScheduledTaskSessionMode;
   /** `null` makes a `"continue"` task's next run start the session later runs continue. */
   sessionId?: string | null;
@@ -219,6 +225,7 @@ interface ScheduledTaskWire {
   model_override: string | null;
   reasoning_effort: string | null;
   permission_mode: string | null;
+  mcp_services?: string[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
   workspace: string | null;
@@ -305,6 +312,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
+    mcpServices: wire.mcp_services ?? [],
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
@@ -375,6 +383,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  if (input.mcpServices?.length) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.workspace != null) body.workspace = input.workspace;
@@ -420,6 +429,7 @@ export async function updateScheduledTask(
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
+  if (input.mcpServices !== undefined) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.sessionId !== undefined) body.session_id = input.sessionId;
