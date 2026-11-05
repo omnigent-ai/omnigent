@@ -1,12 +1,20 @@
 """Shared startup failures retain diagnostics and reap the real child process."""
 
+import asyncio
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from tests._helpers.live_server import isolated_local_server, isolated_process_env
+from tests._helpers.live_server import (
+    isolated_local_server,
+    isolated_process_env,
+    serve_app_in_thread,
+)
 
 
 def test_isolated_process_env_keeps_the_suite_harness_root(tmp_path: Path) -> None:
@@ -46,6 +54,44 @@ def test_startup_exit_reports_log_and_reaps_child(tmp_path: Path, monkeypatch: p
     assert "Server exited with code 23" in str(error.value)
     assert "startup-marker" in str(error.value)
     assert len(children) == 1 and children[0].returncode == 23
+
+
+@pytest.mark.parametrize("startup", ["fails", "outlasts-deadline"])
+def test_thread_served_app_that_does_not_start_leaves_no_server_thread(
+    monkeypatch: pytest.MonkeyPatch, startup: str
+) -> None:
+    """A failed or overdue lifespan startup raises only once uvicorn's thread has stopped."""
+    threads: list[threading.Thread] = []
+
+    class RecordedThread(threading.Thread):
+        def start(self) -> None:
+            threads.append(self)
+            super().start()
+
+    monkeypatch.setattr(
+        "tests._helpers.live_server.threading", SimpleNamespace(Thread=RecordedThread)
+    )
+    if startup == "outlasts-deadline":
+        # The startup deadline has passed by the first check, while the lifespan still runs.
+        clock = iter([0.0])
+        monkeypatch.setattr(
+            "tests._helpers.live_server.time",
+            SimpleNamespace(monotonic=lambda: next(clock, 16.0), sleep=time.sleep),
+        )
+
+    async def app(scope, receive, send) -> None:
+        await receive()
+        if startup == "fails":
+            await send({"type": "lifespan.startup.failed", "message": "refused"})
+            return
+        await asyncio.sleep(0.5)
+        await send({"type": "lifespan.startup.complete"})
+
+    expected = "app exited during startup" if startup == "fails" else "app did not start"
+    with pytest.raises(RuntimeError, match=expected):
+        with serve_app_in_thread(app):
+            pytest.fail("an app that did not start must not be served")
+    assert len(threads) == 1 and not threads[0].is_alive()
 
 
 @pytest.mark.parametrize("inherit_env", [True, False])
