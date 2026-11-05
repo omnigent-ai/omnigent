@@ -22,7 +22,11 @@ import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import {
+  Collapsible,
+  CollapsibleTrigger,
+  RetainedCollapsibleContent,
+} from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
@@ -745,7 +749,8 @@ function TurnWorkedFold({
       {/* Keep pt-2/pl-4 and the vertical pin inside the collapsible
           content so the spacing and guide shrink with its existing
           height animation. */}
-      <CollapsibleContent
+      <RetainedCollapsibleContent
+        open={open}
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
       >
         <div className={cn("relative flex flex-col", inPlace ? "gap-1.5" : "gap-1 pt-2 pl-4")}>
@@ -758,7 +763,7 @@ function TurnWorkedFold({
           )}
           {children}
         </div>
-      </CollapsibleContent>
+      </RetainedCollapsibleContent>
     </Collapsible>
   );
 }

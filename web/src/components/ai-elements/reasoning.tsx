@@ -1,6 +1,10 @@
 "use client";
 
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import {
+  Collapsible,
+  CollapsibleTrigger,
+  RetainedCollapsibleContent,
+} from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import { ChevronRightIcon, SparklesIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
@@ -61,6 +65,7 @@ export const Reasoning = memo(
     isStreaming = false,
     duration,
     expandable = true,
+    open: openProp,
     children,
     ...props
   }: ReasoningProps) => {
@@ -70,7 +75,7 @@ export const Reasoning = memo(
     // doesn't inherit the user's choice from the previous one.
     const [userOverride, setUserOverride] = useState<boolean | null>(null);
     // A non-expandable section is always closed — there's nothing inside.
-    const isOpen = expandable ? (userOverride ?? isStreaming) : false;
+    const isOpen = expandable ? (openProp ?? userOverride ?? isStreaming) : false;
 
     useEffect(() => {
       if (isStreaming) setUserOverride(null);
@@ -178,12 +183,15 @@ export const ReasoningTrigger = memo(
   },
 );
 
-export type ReasoningContentProps = ComponentProps<typeof CollapsibleContent> & {
+export type ReasoningContentProps = Omit<
+  ComponentProps<typeof RetainedCollapsibleContent>,
+  "open"
+> & {
   children: string;
 };
 
 export const ReasoningContent = memo(({ className, children, ...props }: ReasoningContentProps) => {
-  const { expandable } = useReasoning();
+  const { expandable, isOpen } = useReasoning();
   const themeMode = useResolvedThemeMode();
   const normalizedChildren = useMemo(() => normalizeExplicitMathDelimiters(children), [children]);
   const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
@@ -193,7 +201,8 @@ export const ReasoningContent = memo(({ className, children, ...props }: Reasoni
   if (!expandable) return null;
 
   return (
-    <CollapsibleContent
+    <RetainedCollapsibleContent
+      open={isOpen}
       className={cn(
         "mt-1 ml-2 border-l pl-3 py-1 text-sm",
         "data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 text-muted-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in",
@@ -218,7 +227,7 @@ export const ReasoningContent = memo(({ className, children, ...props }: Reasoni
           {normalizedChildren}
         </Streamdown>
       </MarkdownErrorBoundary>
-    </CollapsibleContent>
+    </RetainedCollapsibleContent>
   );
 });
 

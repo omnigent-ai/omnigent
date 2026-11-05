@@ -1093,8 +1093,8 @@ def test_final_answer_setting_folds_narration_with_tool_work(
 
     expect(bubble.locator(_FOLD)).to_have_count(1, timeout=20_000)
     expect(bubble.get_by_text(_PLACEHOLDER_ANSWER, exact=True)).to_be_visible()
-    expect(bubble.get_by_text(narration, exact=True)).to_have_count(0)
-    expect(bubble.get_by_text(progress, exact=True)).to_have_count(0)
+    expect(bubble.get_by_text(narration, exact=True)).to_be_hidden()
+    expect(bubble.get_by_text(progress, exact=True)).to_be_hidden()
     _hold_for_recording(page, 2_500)
 
     trigger = bubble.locator(_FOLD).locator('[data-slot="collapsible-trigger"]').first
@@ -1148,13 +1148,13 @@ def test_final_answer_setting_folds_progress_messages_without_tools(
 
     expect(bubble.locator(_FOLD)).to_have_count(1, timeout=20_000)
     for text in updates:
-        expect(bubble.get_by_text(text, exact=True)).to_have_count(0)
+        expect(bubble.get_by_text(text, exact=True)).to_be_hidden()
     expect(bubble.get_by_text(_PLACEHOLDER_ANSWER, exact=True)).to_be_visible()
     _hold_for_recording(page, 2_500)
 
     page.reload()
     expect(bubble.locator(_FOLD)).to_have_count(1, timeout=20_000)
-    expect(bubble.get_by_text(updates[0], exact=True)).to_have_count(0)
+    expect(bubble.get_by_text(updates[0], exact=True)).to_be_hidden()
     _hold_for_recording(page)
 
     _set_final_answer_preference(page, enabled=False)

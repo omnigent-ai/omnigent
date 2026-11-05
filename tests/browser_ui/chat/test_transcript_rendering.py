@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
-from tests.browser_ui.chat._geometry_helpers import open_live, settled_geometry
+from tests.browser_ui.chat._geometry_helpers import box, open_live, settled_geometry
 from tests.browser_ui.chat.session_contract import (
     ChatSessionContract,
     list_payload,
@@ -728,6 +728,208 @@ def test_worked_fold_forms_without_jolting_the_answer(
     assert all(low <= top <= high for top in tops), (
         f"the answer moved past where it settled ({before:.1f} -> {rest:.1f}): "
         f"{[round(top, 1) for top in tops]}"
+    )
+
+
+# Samples, each frame for two seconds after the trigger opens, the paragraph carrying
+# ``marker``: whether it shows, its offset below the trigger, and its diagram and code.
+_SAMPLE_OPENED_MARKDOWN = """
+(trigger, marker) => {
+  window.__openedSamples = [];
+  window.__openedSamplesDone = false;
+  const start = performance.now();
+  const frame = () => {
+    const paragraph = [...document.querySelectorAll("p")].find(
+      (p) => p.textContent.includes(marker) && p.checkVisibility({ visibilityProperty: true }));
+    let root = paragraph;
+    while (root && !root.querySelector('[data-streamdown="mermaid-block"]')) {
+      root = root.parentElement;
+    }
+    if (trigger.getAttribute("aria-expanded") === "true") {
+      window.__openedSamples.push(root ? {
+        shown: true,
+        offset: paragraph.getBoundingClientRect().top - trigger.getBoundingClientRect().top,
+        diagram: Boolean(
+          root.querySelector('[data-streamdown="mermaid-block"] svg[aria-roledescription]')),
+        tokens: root.querySelectorAll(
+          '[data-streamdown="code-block-body"] span[style*="--sdm-c"]').length,
+      } : { shown: false });
+    }
+    if (performance.now() - start < 2000) requestAnimationFrame(frame);
+    else window.__openedSamplesDone = true;
+  };
+  requestAnimationFrame(frame);
+}
+"""
+
+
+def _rich_markdown(marker: str) -> str:
+    return (
+        "```mermaid\nflowchart TD\n  A[List] --> B[Read]\n  B --> C[Filter]\n"
+        "  C --> D[Summarize]\n  D --> E[Report]\n```\n\n"
+        f"{marker}\n\n"
+        "```python\ndef summarize(paths):\n    return sorted(paths)\n```\n"
+    )
+
+
+def _open_and_assert_laid_out(page: Page, trigger: Locator, marker: str) -> None:
+    trigger.evaluate(_SAMPLE_OPENED_MARKDOWN, marker)
+    trigger.click()
+    expect(trigger).to_have_attribute("aria-expanded", "true")
+    page.wait_for_function("() => window.__openedSamplesDone", timeout=10_000)
+    samples = page.evaluate("() => window.__openedSamples")
+    assert samples, f"no frame showed {marker!r}'s section open"
+    missing = [index for index, sample in enumerate(samples) if not sample["shown"]]
+    assert not missing, f"{marker!r} was missing in opened frames {missing} of {len(samples)}"
+    first = samples[0]
+    assert first["diagram"], f"the diagram above {marker!r} rendered after opening"
+    assert first["tokens"] > 0, f"code below {marker!r} highlighted after opening"
+    shift = max(abs(sample["offset"] - first["offset"]) for sample in samples)
+    assert shift <= 24, f"{marker!r} moved {shift:.0f}px after opening"
+    assert first["tokens"] == samples[-1]["tokens"], f"code below {marker!r} re-highlighted"
+
+
+# Closes the section, reopens it two frames later while its close animation still runs,
+# and reports whether it was closing then and how tall it is two frames after reopening.
+_REOPEN_WHILE_CLOSING = """
+async (trigger) => {
+  const content = trigger.closest('[data-slot="collapsible"]')
+    .querySelector('[data-slot="collapsible-content"]');
+  const frames = () => new Promise((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  trigger.click();
+  await frames();
+  const closing = content.dataset.state === "closed" && content.getAnimations().length > 0;
+  trigger.click();
+  await frames();
+  return {closing, height: content.getBoundingClientRect().height,
+    fullHeight: content.scrollHeight};
+}
+"""
+
+
+def test_folded_markdown_is_laid_out_when_opened(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Opening Worked or a reasoning section, again too, shows its diagram and code at once.
+
+    Folded narration and reasoning must stay rendered while closed: rendering them on open
+    draws the Mermaid diagram late and pushes the text below it down hundreds of pixels.
+    """
+    chat = chat_session_contract
+    response_id = "folded-markdown"
+    answer = "Workspace inspected."
+    chronological = [
+        message_item("folded-user", "user", "Inspect the workspace.", response_id=response_id),
+        {
+            "id": "folded-reasoning",
+            "response_id": response_id,
+            "type": "reasoning",
+            "status": "completed",
+            "model": "browser-model",
+            "summary": [{"type": "summary_text", "text": _rich_markdown("Reasoning marker.")}],
+        },
+        message_item(
+            "folded-narration",
+            "assistant",
+            _rich_markdown("Narration marker."),
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "call-folded", "shell", {"command": "ls"}, "README.md\n", response_id=response_id
+        ),
+        message_item(
+            "folded-answer",
+            "assistant",
+            f"{answer}\n\n```mermaid\nflowchart LR\n  A[Done] --> B[Reply]\n```",
+            response_id=response_id,
+        ),
+    ]
+    chat.set_items(list(reversed(chronological)))
+    page.add_init_script("localStorage.setItem('omnigent:fold-assistant-narration', 'true')")
+    page.goto(chat.url)
+
+    bubble = page.locator('[data-testid="message-bubble"]', has=page.get_by_text(answer)).first
+    rendered_answer = bubble.locator("svg[aria-roledescription] >> visible=true")
+    expect(rendered_answer).to_be_visible(timeout=20_000)
+    expect(bubble.get_by_text("Narration marker.")).to_be_hidden()
+    # The folded narration and reasoning diagrams render before a reader opens them.
+    expect(bubble.locator("svg[aria-roledescription]")).to_have_count(3, timeout=20_000)
+
+    worked = bubble.get_by_test_id("turn-worked-fold").locator('[data-slot="collapsible-trigger"]')
+    _open_and_assert_laid_out(page, worked.first, "Narration marker.")
+
+    reasoning = bubble.get_by_role("button", name="Thought for a few seconds")
+    _open_and_assert_laid_out(page, reasoning, "Reasoning marker.")
+    reasoning.click()
+    hidden_reasoning = bubble.get_by_text("Reasoning marker.")
+    expect(hidden_reasoning).to_be_hidden()
+    hidden_height = hidden_reasoning.evaluate("(p) => p.getBoundingClientRect().height")
+    assert hidden_height < 1, f"the closed thought still spans {hidden_height:.1f}px"
+    _open_and_assert_laid_out(page, reasoning, "Reasoning marker.")
+
+    # The opened thought grew Worked since it opened; a reopen mid-close shows all of it.
+    reopened = worked.first.evaluate(_REOPEN_WHILE_CLOSING)
+    assert reopened["closing"], "Worked finished closing before it was reopened"
+    assert reopened["height"] == pytest.approx(reopened["fullHeight"], abs=1), reopened
+    expect(bubble.get_by_text("Reasoning marker.")).to_be_visible()
+    worked.first.click()
+    hidden_narration = bubble.get_by_text("Narration marker.")
+    expect(hidden_narration).to_be_hidden()
+    hidden_height = hidden_narration.evaluate("(p) => p.getBoundingClientRect().height")
+    assert hidden_height < 1, f"the closed Worked section still spans {hidden_height:.1f}px"
+    _open_and_assert_laid_out(page, worked.first, "Narration marker.")
+
+
+def test_folded_reasoning_keeps_a_short_reply_narrow(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A long thought kept rendered while folded does not widen its short reply.
+
+    An identical turn with a one-word thought gives the width the reply should keep.
+    """
+    chat = chat_session_contract
+    thought = " ".join(["Checking every workspace file before replying."] * 12)
+    chronological: list[dict] = []
+    for turn, turn_thought in (("narrow", thought), ("baseline", "Checking.")):
+        response_id = f"{turn}-reply"
+        chronological += [
+            message_item(f"{turn}-user", "user", "Check the workspace.", response_id=response_id),
+            {
+                "id": f"{turn}-reasoning",
+                "response_id": response_id,
+                "type": "reasoning",
+                "status": "completed",
+                "model": "browser-model",
+                "summary": [{"type": "summary_text", "text": turn_thought}],
+            },
+            message_item(f"{turn}-answer", "assistant", "Done.", response_id=response_id),
+        ]
+    chat.set_items(list(reversed(chronological)))
+    page.goto(chat.url)
+
+    bubbles = page.locator('[data-testid="message-bubble"]', has=page.get_by_text("Done."))
+    expect(bubbles).to_have_count(2, timeout=20_000)
+    bubble = bubbles.first
+    fold = bubble.get_by_test_id("turn-worked-fold")
+    baseline = bubbles.last.get_by_test_id("turn-worked-fold")
+    expect(fold).to_be_visible()
+    expect(baseline).to_be_visible()
+    assert box(fold)["width"] == pytest.approx(box(baseline)["width"], abs=1), (
+        "the folded Worked section widened the reply"
+    )
+    fold.locator('[data-slot="collapsible-trigger"]').first.click()
+    baseline.locator('[data-slot="collapsible-trigger"]').first.click()
+    reasoning = bubble.get_by_role("button", name="Thought for a few seconds")
+    reasoning.click()
+    expect(bubble.get_by_text(thought)).to_be_visible()
+    assert box(fold)["width"] > box(baseline)["width"] + 1, "the opened thought did not widen"
+    reasoning.click()
+    expect(bubble.get_by_text(thought)).to_be_hidden()
+    assert box(fold)["width"] == pytest.approx(box(baseline)["width"], abs=1), (
+        "the folded thought widened the reply"
     )
 
 
