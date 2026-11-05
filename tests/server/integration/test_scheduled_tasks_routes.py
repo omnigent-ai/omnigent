@@ -1796,8 +1796,10 @@ async def test_list_runs_includes_conversation_read_state_fields(
     so the frontend can compute the unread dot without per-row session GETs.
     Runs with no conversation (skipped/failed host-less) get null for all three.
     """
+    import time
     import uuid
 
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     _make_user(db_uri)
@@ -1879,6 +1881,29 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert skip["viewer_unread"] is None
     assert skip["session_cost_usd"] is None
     assert skip["conversation_pending_approvals"] == 0
+
+    # Another replica's fresh runner remains actionable; stale/disconnected runners do not.
+    runner_id = f"runner_{uuid.uuid4().hex}"
+    conv_store.set_runner_id(waiting.id, runner_id)
+    now = int(time.time())
+    for last_seen, pending in (
+        (now - 5, 2),
+        (now - RUNNER_LIVENESS_TTL_S - 5, 0),
+        (None, 0),
+        (now, 2),
+    ):
+        if last_seen is None:
+            conv_store.clear_runner_liveness(runner_id)
+        else:
+            conv_store.touch_runner_liveness([runner_id], now=last_seen)
+        resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+        assert resp.status_code == 200
+        waiting_run = next(row for row in resp.json()["runs"] if row["id"] == running_id)
+        assert waiting_run["conversation_pending_approvals"] == pending
+        assert (
+            conv_store.get_session_activity([waiting.id])[waiting.id].pending_elicitation_count
+            == 2
+        )
 
     # Continuing the same session reports its current total on every run.
     _seed_run(

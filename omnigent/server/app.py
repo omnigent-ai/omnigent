@@ -3956,6 +3956,7 @@ def create_app(
                 artifact_store=artifact_store,
                 project_store=project_store,
                 automations=app.state.automations,
+                liveness_lookup=_bulk_session_liveness,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],

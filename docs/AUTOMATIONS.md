@@ -161,7 +161,7 @@ Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversat
 
 `ScheduledTaskRun` also declares `scheduled` and `starting` statuses. The default scheduler creates runs at dispatch with status `running`. With `automations_v2` enabled, Run now records `scheduled` until a server claims the request. The persistent scheduler then records `starting` while it prepares a run, and `running` once the prompt is sent, or saved with its sandbox's host bound. A continued session's run goes straight to `succeeded` once its prompt is delivered.
 
-Run history shows **Session needs approval · Open to review** when the linked session has a pending permission request or question. Open the run to review it. This is current session state, including when several runs reuse that session; it is not a historical per-run outcome. Permission enforcement and approval timeouts are unchanged.
+Run history shows **Session needs approval · Open to review** when the linked session has a pending permission request or question and its runner is reachable. Stale counts from disconnected runners are hidden using the same liveness rules as the session sidebar. Open the run to review it. This is current session state, including when several runs reuse that session; it is not a historical per-run outcome. Permission enforcement and approval timeouts are unchanged.
 
 ## Lifecycle
 
