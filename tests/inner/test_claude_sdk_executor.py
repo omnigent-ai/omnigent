@@ -4012,8 +4012,9 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
 async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A relay outlives no CLI: a turn cancelled mid-reconnect evicts its client, one
-    whose CLI fails to connect never keeps it, and one that fails to start leaves nothing."""
+    """A relay outlives no CLI: a turn cancelled mid-reconnect evicts its client; one whose
+    CLI fails, hangs past the connect timeout or is cancelled while connecting never keeps
+    it; and one that fails to start leaves nothing."""
     from omnigent.harnesses.claude_native import bridge
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
@@ -4026,13 +4027,17 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         status_file.write_text(json.dumps({"servers": [entry]}))
 
     reconnect_hung = asyncio.Event()
-    fail_connect = False
+    connecting = asyncio.Event()
+    connect_outcome = "connects"
     fake_sdk = _make_recovery_fake_sdk()
 
     class _Client(fake_sdk.ClaudeSDKClient):
         async def connect(self) -> None:
-            if fail_connect:
+            connecting.set()
+            if connect_outcome == "fails":
                 raise RuntimeError("claude exited")
+            if connect_outcome == "hangs":
+                await asyncio.Event().wait()
 
         async def get_mcp_status(self) -> dict[str, object]:
             return {"mcpServers": [{"name": "notes", "status": "failed"}]}
@@ -4071,7 +4076,7 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         assert "managed" not in executor._clients
         assert not relay_dir(first).exists()
 
-        fail_connect = True
+        connect_outcome = "fails"
         with pytest.raises(RuntimeError, match="claude exited"):
             [event async for event in executor.run_turn(messages, tools, "")]
         failed = fake_sdk.created_clients[-1]
@@ -4079,8 +4084,30 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         assert "managed" not in executor._clients
         assert not relay_dir(failed).exists()
 
+        # A turn cancelled while its first CLI connects, before any client registers.
+        connect_outcome = "hangs"
+        connecting.clear()
+        cancelled = asyncio.ensure_future(executor.run_turn(messages, tools, "").__anext__())
+        await asyncio.wait_for(connecting.wait(), timeout=5)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        interrupted = fake_sdk.created_clients[-1]
+        assert interrupted is not failed
+        assert "managed" not in executor._clients
+        assert not relay_dir(interrupted).exists()
+
+        # A CLI that never finishes connecting.
+        monkeypatch.setattr("omnigent.inner.claude_sdk_executor._CONNECT_TIMEOUT_SECONDS", 0.2)
+        with pytest.raises(TimeoutError, match="connect timed out"):
+            [event async for event in executor.run_turn(messages, tools, "")]
+        stalled = fake_sdk.created_clients[-1]
+        assert stalled is not interrupted
+        assert "managed" not in executor._clients
+        assert not relay_dir(stalled).exists()
+
         # A relay that cannot start leaves no bridge directory and starts no CLI.
-        fail_connect = False
+        connect_outcome = "connects"
         allocated: list[Path] = []
         prepare = bridge.prepare_acp_mcp_bridge_dir
 
