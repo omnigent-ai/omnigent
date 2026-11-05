@@ -10,6 +10,7 @@ The credential/profile-aware API provides three primitives:
 
 - :func:`find_free_port` — pick a free TCP port for the server.
 - :func:`reserve_port` — hold a free port until its process is about to bind.
+- :func:`serve_app_in_thread` — serve an ASGI app on a real loopback socket in-process.
 - :func:`make_live_server_fixture` — factory that builds a
   session-scoped pytest fixture starting a real
   ``omnigent.cli server`` subprocess. The subprocess inherits
@@ -46,6 +47,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -54,6 +56,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+import uvicorn
+from starlette.types import ASGIApp
 
 from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 
@@ -88,6 +92,37 @@ def reserve_port() -> Iterator[socket.socket]:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         yield sock
+
+
+@contextmanager
+def serve_app_in_thread(app: ASGIApp) -> Iterator[str]:
+    """
+    Serve an ASGI app under real uvicorn on an ephemeral loopback port.
+
+    Unlike ``httpx.ASGITransport``, clients then cross a socket, so their
+    request timeouts and broken transfers apply.
+
+    :param app: The ASGI app, e.g. a runner app from ``create_runner_app``.
+    :returns: A context manager yielding the base URL, e.g. ``"http://127.0.0.1:58234"``.
+    """
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="critical")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 15
+    while not server.started:
+        if time.monotonic() > deadline:
+            # Stop the daemon thread too, or it outlives the failed caller.
+            server.should_exit = True
+            raise RuntimeError("app did not start")
+        time.sleep(0.05)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+    assert not thread.is_alive(), "uvicorn did not exit within the join timeout"
 
 
 def local_server_env(

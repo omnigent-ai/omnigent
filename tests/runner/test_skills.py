@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,12 +14,15 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.claude_native import plugin_discovery
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
+from omnigent.server.routes._sessions.helpers import _resolve_skill_meta_text_via_runner
 from omnigent.spec.types import SkillSpec
 from tests._helpers.claude_launch import configure_claude_launch
+from tests._helpers.live_server import serve_app_in_thread
 from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 
@@ -176,6 +180,21 @@ async def _client(app: Any) -> AsyncIterator[httpx.AsyncClient]:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
         yield c
+
+
+@asynccontextmanager
+async def _socket_client(app: Any) -> AsyncIterator[httpx.AsyncClient]:
+    """
+    Yield a client for the runner app over a real socket, with the server's runner timeouts.
+
+    :param app: The runner FastAPI app.
+    :returns: Async context manager yielding the client.
+    """
+    with serve_app_in_thread(app) as base_url:
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=httpx.Timeout(5.0, read=None), trust_env=False
+        ) as c:
+            yield c
 
 
 @pytest.mark.asyncio
@@ -672,7 +691,8 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
 ) -> None:
     """A listed skill resolves while the configured launch is pending; its plugin skill waits.
 
-    A catalog missing a stalled or failed launch's plugins is rebuilt once the launch answers.
+    The server's lookup is answered before its runner timeout while a launch is held. A
+    catalog missing a stalled or failed launch's plugins is rebuilt once the launch answers.
     """
     for env_name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH", "OMNIGENT_CLAUDE_LAUNCHER"):
         monkeypatch.delenv(env_name, raising=False)
@@ -681,6 +701,8 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
     )
     now = [0.0]
     monkeypatch.setattr(plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    # A held launch outlives the readers' wait; only the fake clock passes its deadline.
+    monkeypatch.setattr(plugin_discovery, "LAUNCH_PLUGINS_TIMEOUT_S", 60)
     home = tmp_path / "home"
     plugin = tmp_path / "launch" / "dev"
     for root, name in ((home / ".claude", "local"), (plugin, "review")):
@@ -710,7 +732,7 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
     failed_url = "/v1/sessions/conv_failed/skills/resolve"
     review = {"name": "dev:review"}
 
-    async for c in _client(app):
+    async with _socket_client(app) as c:
         try:
             listed = await asyncio.wait_for(c.post(url, json={"name": "local"}), 5)
             pending = asyncio.ensure_future(c.post(url, json=review))
@@ -720,12 +742,15 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
             release.touch()
         launched = await asyncio.wait_for(pending, 15)
 
-        # A new launch identity answers only after its probe's deadline has passed.
+        # A new launch identity is held: the server's lookup hears the skill is missing before
+        # its runner timeout, and past the probe's deadline the launch is reported stalled.
         release.unlink()
         configure_claude_launch(config_home, launches, script, args=("--", "late"))
         try:
             with pytest.raises(plugin_discovery.LaunchPluginsPending):
                 plugin_discovery.claude_launch_plugin_dirs(wait=False)
+            with pytest.raises(OmnigentError, match="not found") as held:
+                await _resolve_skill_meta_text_via_runner("conv_held", "dev:review", "", c)
             await poll_until_async(lambda: len(launches.read_text().splitlines()) == 2)
             now[0] += plugin_discovery.LAUNCH_PLUGINS_DEADLINE_S
             stalled = await c.post(late_url, json=review)
@@ -760,6 +785,7 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
     assert waited
     assert launched.status_code == 200, launched.text
     assert "body for review" in launched.json()["meta_text"]
+    assert held.value.code == ErrorCode.INVALID_INPUT, held.value
     assert stalled.status_code == 404, stalled.text
     assert late.status_code == 200, late.text
     assert failed.status_code == 404, failed.text

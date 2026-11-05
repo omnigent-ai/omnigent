@@ -21,8 +21,10 @@ from omnigent.inner import _proc
 _log = logging.getLogger(__name__)
 
 LAUNCH_PLUGINS_TIMEOUT_S = 10.0
-# Readers stop waiting here, inside the server's 15s limit on a skill-content request.
+# A probe still running here is reported as stalled rather than loading.
 LAUNCH_PLUGINS_DEADLINE_S = LAUNCH_PLUGINS_TIMEOUT_S + 2
+# Readers wait at most this long, leaving the server's 10s runner skill lookup room to answer.
+LAUNCH_PLUGINS_WAIT_S = 7.0
 # The launch identity keys each answer, so this only bounds how long a missed change lasts.
 LAUNCH_PLUGINS_TTL_S = 3600.0
 # Each consecutive failure of one launch doubles the wait before it is spawned again.
@@ -164,8 +166,8 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
     executable it runs changes. A probe that misses its deadline is reported as
     failed, and the launch is asked again only once that probe returns.
 
-    :param wait: Wait for a first answer, up to the probe's deadline, rather than
-        raise :class:`LaunchPluginsPending`.
+    :param wait: Wait for a first answer, up to :data:`LAUNCH_PLUGINS_WAIT_S` and the
+        probe's deadline, rather than raise :class:`LaunchPluginsPending` at once.
     :raises LaunchPluginsPending: The launch has not answered yet.
     :raises LaunchPluginsFailed: The last probe failed or could not start, or the running
         one missed its deadline.
@@ -207,7 +209,7 @@ def claude_launch_plugin_dirs(*, wait: bool = True) -> dict[str, Path]:
                 _log.warning("Could not start probing the configured Claude launch: %s", exc)
         running, deadline = probe.running, probe.deadline
     if wait and running is not None and probe.plugins is None:
-        running.wait(max(0.0, deadline - time.monotonic()))
+        running.wait(max(0.0, min(deadline - time.monotonic(), LAUNCH_PLUGINS_WAIT_S)))
     with _probes_lock:
         if probe.plugins is not None:
             return dict(probe.plugins)

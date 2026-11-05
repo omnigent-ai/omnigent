@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +16,6 @@ from typing import Any, BinaryIO
 
 import httpx
 import pytest
-import uvicorn
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
@@ -34,6 +32,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
+from tests._helpers.live_server import serve_app_in_thread
 from tests.runner.helpers import NullServerClient
 
 
@@ -3338,22 +3337,8 @@ async def test_download_aborts_and_logs_when_file_shrinks_mid_stream(
 @pytest.fixture
 def served_app(app: FastAPI) -> Iterator[str]:
     """Run the runner app under real uvicorn on an ephemeral port; yield its base URL."""
-    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="critical")
-    server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 15
-    while not server.started:
-        if time.monotonic() > deadline:
-            # Stop the daemon thread too, or it outlives the failed fixture.
-            server.should_exit = True
-            raise RuntimeError("runner app did not start")
-        time.sleep(0.05)
-    port = server.servers[0].sockets[0].getsockname()[1]
-    yield f"http://127.0.0.1:{port}"
-    server.should_exit = True
-    thread.join(timeout=10)
-    assert not thread.is_alive(), "uvicorn did not exit within the join timeout"
+    with serve_app_in_thread(app) as base_url:
+        yield base_url
 
 
 def test_download_over_the_wire_fails_instead_of_truncating(
