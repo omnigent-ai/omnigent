@@ -2376,6 +2376,11 @@ class SessionResponse(BaseModel):
         Ordinary native sends use the in-memory
         :mod:`omnigent.runtime.pending_inputs` index; startup inputs also
         survive server restart in the conversation store.
+    :param failed_inputs: Durable managed-startup inputs that were never
+        delivered, e.g. because the sandbox host did not come online. Same
+        shape as ``pending_inputs``, in submission order; their file blocks
+        keep ids that still resolve under this session. Empty when nothing
+        failed.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. Set when the
         session was bound to a host workspace at create-time, or
@@ -2476,6 +2481,8 @@ class SessionResponse(BaseModel):
     # Durable startup inputs plus ordinary native inputs awaiting a receipt.
     # Each {"pending_id", "content"} restores a pending bubble on reconnect.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
+    # Startup inputs that were never delivered, shown as undelivered messages.
+    failed_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
@@ -4103,6 +4110,10 @@ class SessionCreatedEvent(_SSEEventBase):
     parent_session_id: str | None = None
 
 
+# Why a session's work moved to another session (``session.superseded``).
+SupersessionReason = Literal["clear"]
+
+
 class SessionSupersededEvent(_SSEEventBase):
     """
     This conversation was superseded by another and clients should
@@ -4140,7 +4151,7 @@ class SessionSupersededEvent(_SSEEventBase):
     type: Literal["session.superseded"]
     conversation_id: str
     target_conversation_id: str
-    reason: Literal["clear"] = "clear"
+    reason: SupersessionReason = "clear"
 
 
 class SessionBtwSidechatEvent(_SSEEventBase):

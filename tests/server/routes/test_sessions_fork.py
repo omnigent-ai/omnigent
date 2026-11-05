@@ -193,9 +193,13 @@ class _ConversationStore:
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
+        copy_items: bool = True,
+        continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: dict[str, str] | None = None,
         created_by: str | None = None,
+        conversation_id: str | None = None,
     ) -> Conversation:
         """
         Record the fork call and return a fixed new conversation.
@@ -227,6 +231,13 @@ class _ConversationStore:
         :param up_to_response_id: Truncation point, e.g. ``"resp_a"``.
             Mirrors the real store: ``None`` copies everything; a value
             matching no item's ``response_id`` raises ValueError.
+        :param before_item_id: Continuation cutoff; recorded only (the
+            fork route never sets it).
+        :param copy_items: ``False`` for a continuation that keeps no
+            history; recorded only.
+        :param continue_source: Whether the fork continues its source on the
+            same placement; recorded only.
+        :param conversation_id: Id chosen by the caller; recorded only.
         :param project_id: First-class project the fork is filed into
             (route passes the source's project only when the forker
             owns it), or ``None`` for unfiled.
@@ -259,6 +270,10 @@ class _ConversationStore:
                 "resume_source_native_session": resume_source_native_session,
                 "presentation_labels": presentation_labels,
                 "up_to_response_id": up_to_response_id,
+                "before_item_id": before_item_id,
+                "copy_items": copy_items,
+                "continue_source": continue_source,
+                "conversation_id": conversation_id,
                 "project_id": project_id,
                 "file_id_map": file_id_map,
                 "created_by": created_by,
@@ -1017,6 +1032,16 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     # The route forwarded the truncation point to the store — None here
     # means the request field was dropped and the fork copied everything.
     assert conv_store.fork_calls[0]["up_to_response_id"] == "resp_001"
+    # An ordinary fork is no continuation: it keeps history and picks no id.
+    assert {
+        key: conv_store.fork_calls[0][key]
+        for key in ("before_item_id", "copy_items", "continue_source", "conversation_id")
+    } == {
+        "before_item_id": None,
+        "copy_items": True,
+        "continue_source": False,
+        "conversation_id": None,
+    }
     body = resp.json()
     # Only resp_001's two items survive the truncation; msg_3 (resp_002)
     # appearing means the store ignored the cutoff.

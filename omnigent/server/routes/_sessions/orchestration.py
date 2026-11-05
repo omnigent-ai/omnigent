@@ -7924,22 +7924,49 @@ async def _record_create_route_prompt(
 _dispatch_in_flight: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
+# Sessions whose work a slash command (e.g. claude-sdk ``/clear``) is moving
+# into another session; messages to them are refused until the move ends.
+# Process-local like ``_dispatch_in_flight``.
+_session_moves_in_flight: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
 @contextlib.contextmanager
-def _mark_dispatch_in_flight(conversation_id: str) -> Iterator[None]:
+def _count_in_flight(
+    counts: WorkspaceScopedCache[str, int], conversation_id: str
+) -> Iterator[None]:
+    """Count *conversation_id* in *counts* until the block exits."""
+    counts[conversation_id] = counts.get(conversation_id, 0) + 1
+    try:
+        yield
+    finally:
+        remaining = counts.get(conversation_id, 1) - 1
+        if remaining > 0:
+            counts[conversation_id] = remaining
+        else:
+            counts.pop(conversation_id, None)
+
+
+def _mark_dispatch_in_flight(conversation_id: str) -> contextlib.AbstractContextManager[None]:
     """
     Count a message as in flight for *conversation_id* until the block exits.
 
     :param conversation_id: Session/conversation identifier.
     """
-    _dispatch_in_flight[conversation_id] = _dispatch_in_flight.get(conversation_id, 0) + 1
-    try:
-        yield
-    finally:
-        remaining = _dispatch_in_flight.get(conversation_id, 1) - 1
-        if remaining > 0:
-            _dispatch_in_flight[conversation_id] = remaining
-        else:
-            _dispatch_in_flight.pop(conversation_id, None)
+    return _count_in_flight(_dispatch_in_flight, conversation_id)
+
+
+def _mark_session_moving(conversation_id: str) -> contextlib.AbstractContextManager[None]:
+    """
+    Hold *conversation_id* as moving to another session until the block exits.
+
+    :param conversation_id: Session/conversation identifier.
+    """
+    return _count_in_flight(_session_moves_in_flight, conversation_id)
+
+
+def _session_is_moving(conversation_id: str) -> bool:
+    """Whether a slash command is moving *conversation_id*'s work elsewhere."""
+    return _session_moves_in_flight.get(conversation_id, 0) > 0
 
 
 def _session_is_starting(conversation_id: str) -> bool:
@@ -13960,7 +13987,7 @@ async def _get_session_snapshot(
     response.usage_included = include_usage
     startup = getattr(request.app.state, "startup_inputs", None) if request is not None else None
     if startup is not None and STARTUP_LABEL in conv.labels:
-        queued = await startup.pending_snapshot(session_id)
+        queued, response.failed_inputs = await startup.snapshot(session_id)
         known = {item["pending_id"] for item in response.pending_inputs}
         response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
     return response

@@ -280,6 +280,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _recover_side_chat_runner_via_source,
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
+    _session_is_moving,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
@@ -874,6 +875,13 @@ _RUNNER_EVENT_TYPES = frozenset(
 )
 
 
+# Inputs that can start a turn: each counts as in flight until its request
+# ends, and is refused while ``/clear`` moves the session.
+_TURN_STARTING_EVENT_TYPES = frozenset({"message", "session_message", _SLASH_COMMAND_TYPE})
+# Also given ``in_flight``: a claude-sdk ``/compact`` runs a harness turn.
+_IN_FLIGHT_EVENT_TYPES = _TURN_STARTING_EVENT_TYPES | {_COMPACT_TYPE}
+
+
 def register_events_routes(
     router: APIRouter,
     *,
@@ -893,8 +901,17 @@ def register_events_routes(
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
+    clear_session_into_fresh_session: Callable[
+        [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
+    ]
+    | None = None,
 ) -> None:
-    """Register the events, stream, and delete routes on router."""
+    """Register the events, stream, and delete routes on router.
+
+    :param clear_session_into_fresh_session: Continues a claude-sdk session in
+        a fresh session on ``/clear`` and returns its id; ``None`` leaves
+        claude-sdk ``/clear`` unsupported.
+    """
 
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
 
@@ -1021,7 +1038,7 @@ def register_events_routes(
                                     session_id,
                                     event,
                                     in_flight=in_flight
-                                    if event.type in {"message", "session_message"}
+                                    if event.type in _IN_FLIGHT_EVENT_TYPES
                                     else None,
                                 )
                             )
@@ -1037,7 +1054,7 @@ def register_events_routes(
                 request,
                 session_id,
                 body,
-                in_flight=in_flight if body.type in {"message", "session_message"} else None,
+                in_flight=in_flight if body.type in _IN_FLIGHT_EVENT_TYPES else None,
             )
 
     router.include_router(event_router)
@@ -1296,7 +1313,28 @@ def register_events_routes(
             await _require_access_and_level(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
-        if in_flight is not None:
+        starts_turn = body.type in _TURN_STARTING_EVENT_TYPES or (
+            body.type == _COMPACT_TYPE
+            and await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            == "claude-sdk"
+        )
+        # Checked and marked with no await between, so an input and a
+        # ``/clear`` moving the session cannot both proceed. Covers saved
+        # startup inputs too, which are dispatched without ``in_flight``.
+        # Any compact would work on the original chat, so none runs mid-move.
+        if (starts_turn or body.type == _COMPACT_TYPE) and _session_is_moving(session_id):
+            raise OmnigentError(
+                "This chat is moving to a new session; "
+                + (
+                    "run /compact there."
+                    if body.type == _COMPACT_TYPE
+                    else "send the message there."
+                ),
+                code=ErrorCode.CONFLICT,
+            )
+        if in_flight is not None and starts_turn:
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.
             in_flight.enter_context(_mark_dispatch_in_flight(session_id))
@@ -2197,6 +2235,58 @@ def register_events_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         if body.type == _CLEAR_TYPE:
+            if (
+                clear_session_into_fresh_session is not None
+                and isinstance(request, Request)
+                and await asyncio.to_thread(
+                    _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                == "claude-sdk"
+            ):
+                source = conv
+
+                async def release_source_client() -> None:
+                    # The runner drops the old session's live SDK client and
+                    # history (an older runner no-ops with 204). The marker keeps
+                    # a new runner from releasing for an older server.
+                    release = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        {"type": _CLEAR_TYPE, "continue_in_new_session": True},
+                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                    )
+                    if release is None and source.runner_id is not None:
+                        # Unreachable here may mean live on another replica.
+                        await _raise_if_runner_on_another_replica(
+                            source, request.app.state, conversation_store
+                        )
+                        # A still-registered runner that could not be reached
+                        # may hold the client or a turn; only an offline one
+                        # continues without the release.
+                        if runner_router is not None and runner_router.runner_is_online(
+                            source.runner_id
+                        ):
+                            raise OmnigentError(
+                                "Couldn't reach this session's runner to run /clear. Try again.",
+                                code=ErrorCode.RUNNER_UNAVAILABLE,
+                            )
+                    if release is not None and release.status_code == 409:
+                        raise OmnigentError(
+                            "Stop the current turn before running /clear.",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
+                    if release is not None and release.status_code not in (200, 204):
+                        raise OmnigentError(
+                            f"Clear failed: runner returned {release.status_code}",
+                            code=ErrorCode.INTERNAL_ERROR,
+                        )
+
+                # Eligibility is checked before the client is released; the work
+                # then moves to a fresh session on the same placement.
+                new_session_id = await clear_session_into_fresh_session(
+                    request, conv, release_source_client
+                )
+                return {"queued": False, "session_id": new_session_id}
             # Like /compact, /clear runs in the vendor TUI: the runner types the
             # harness's own /clear, and the harness rotates the terminal onto a
             # fresh session that viewers follow via ``session.superseded``.
@@ -4061,29 +4151,20 @@ def register_events_routes(
         managed_launches_for_delete = getattr(request.app.state, "managed_launches", None)
         if managed_launches_for_delete is not None:
             managed_launches_for_delete.finish(session_id)
-        # Managed-host cleanup: when the session's host is backed by a
-        # server-provisioned sandbox (host_type="managed"), terminate
-        # the sandbox and delete the host row — which also revokes its
-        # launch token. Best-effort by design — the provider's lifetime
-        # cap reaps stragglers. External (laptop) hosts have no
-        # sandbox_id and are never touched.
+        # Managed-host cleanup: terminate a server-provisioned sandbox and
+        # delete its host row (revoking its token) once no other session, such
+        # as a /clear continuation, uses it. Best-effort: the provider's
+        # lifetime cap reaps stragglers. Laptop hosts are never touched.
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
-            bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
-            if bound_host is not None and bound_host.sandbox_provider is not None:
-                from omnigent.server.managed_hosts import terminate_managed_host
+            from omnigent.server.managed_hosts import release_session_managed_host
 
-                await terminate_managed_host(
-                    bound_host,
-                    host_store_for_managed,
-                    # Supplies the launcher for the provider-side
-                    # terminate; None (config removed since launch)
-                    # still deletes the row and revokes the token.
-                    getattr(request.app.state, "sandbox_config", None),
-                    # Other sessions may still be bound to this host.
-                    keep_if_bound=True,
-                    capture_logs=capture_logs,
-                )
+            await release_session_managed_host(
+                conv.host_id,
+                host_store_for_managed,
+                getattr(request.app.state, "sandbox_config", None),
+                capture_logs=capture_logs,
+            )
         try:
             import time as _time
 

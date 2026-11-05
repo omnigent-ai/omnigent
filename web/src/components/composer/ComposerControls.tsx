@@ -413,7 +413,7 @@ export const ComposerHarnessTrigger = forwardRef<
       aria-label={label}
       aria-busy={loading || undefined}
       className={cn(
-        "h-auto min-h-8 mobile-touch-target min-w-0 w-auto max-w-full gap-1 rounded-lg border-0 px-2 py-0 text-[13px] leading-5 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
+        "h-auto min-h-8 mobile-touch-target min-w-0 w-auto max-w-full shrink gap-1 rounded-lg border-0 px-2 py-0 text-ui leading-5 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
         className,
       )}
       {...props}
@@ -446,7 +446,7 @@ export const ComposerHarnessTrigger = forwardRef<
       >
         {model && (
           <span
-            className="min-w-0 truncate text-left text-[13px] leading-5 font-medium text-foreground"
+            className="min-w-0 truncate text-left text-ui leading-5 font-medium text-foreground"
             title={model}
             data-testid={`${testIdPrefix}-agent-model-value`}
           >
@@ -455,7 +455,7 @@ export const ComposerHarnessTrigger = forwardRef<
         )}
         {effort && (
           <span
-            className="shrink-0 text-[13px] leading-5 font-normal text-muted-foreground"
+            className="shrink-0 text-ui leading-5 font-normal text-muted-foreground"
             data-testid={`${testIdPrefix}-agent-effort-value`}
           >
             {effort}

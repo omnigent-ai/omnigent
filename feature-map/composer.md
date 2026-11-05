@@ -22,6 +22,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   fills an editable draft without starting a session. The consumed prompt is
   removed from the URL while other query parameters and the fragment remain.
   A new link replaces a parked draft; subsequent edits survive navigation.
+  **Copy message to new session** opens it with a one-time `?handoff=` token
+  instead, naming an in-memory copy of the message's text and attachments. That
+  copy replaces the whole parked draft, even with no text or no attachments; the
+  token leaves the URL and is released once the composer takes it.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
@@ -131,7 +135,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `slash_command` so it runs on an in-process harness. A native terminal side
   chat shows no menu and sends slash text to the vendor TUI. Claude Code and
   Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
-  `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
+  `session_event_types`; claude-sdk sessions only when it reports
+  `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the harness
+  as text. A claude-sdk `/clear` continues in a new, empty session on the same
+  machine and the view follows it.
   A Claude native launch customized by a configured command, arguments or
   launcher also lists the plugins that launch loads, such as `--plugin-dir`, in
   both the in-session and new-session composers. The host asks the launch from
@@ -221,7 +228,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `managed-first-input`: submitting a new managed session saves its first input
   and attachments before provisioning. Follow-ups sent during startup are saved
   in order too. They run even if the creating browser closes; reopening shows
-  each message once.
+  each message once. If the sandbox never comes up, each saved message stays in
+  the transcript marked **Not delivered**, live and after reload. **Copy message
+  to new session** opens New Chat with its text and attachments.
 - `arclet-dbcert`: desktop Arclet launches check laptop credentials first. A
   missing or expired dbcert preserves the draft and shows a yellow refresh
   banner instead of provisioning. Skip continues the current launch without
@@ -246,7 +255,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 - Hover the model/effort pill to see the tooltip; click it to open configuration.
 - Hover the host chip (status dot and machine icon) to see the host and whether
-  it is connected; click it to open the host menu.
+  it is connected; click it to open the host menu. The status indicator remains
+  visible while connecting or without a selected host; the label describes
+  those states without claiming Online or Offline.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
 - With focus in the prompt, press Shift+Tab to step the permission mode without
@@ -367,6 +378,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   in-session composer, then close the browser. Reopen after startup and check
   that all three reached the agent in order. Ordinary busy-session queueing
   resumes after the first input is delivered.
+- For a managed sandbox that fails to start (e.g. an Arclet whose host never
+  comes online), send a prompt with an attachment and wait for the failure. Check
+  the prompt stays marked **Not delivered**, also after reload. **Copy message to
+  new session** opens New Chat with the text and attachment.
 - Select a Codex host and workspace, then type `$<skill-name>` and select the
   namespaced plugin suggestion before starting the session; an unreadable
   plugin catalog shows the same warning and Retry here.
@@ -633,6 +648,13 @@ Other connection providers alone do not enable the managed MCP picker.
   `--plugin-dir`, choose Claude (native) on that host in the new-session
   composer and type `/`: expect its skills, or a still-loading note whose Retry
   lists them once the host has asked the launch.
+  claude-sdk `/clear` from the menu, with a real Claude CLI on the mock model:
+  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`.
+  Manually, in a claude-sdk session with one finished turn, type `/cle` and
+  pick **/clear**, then repeat in a new session by typing `/clear` and pressing
+  Enter. Each time the view moves to an empty chat on the same machine, and the
+  original chat ends with a notice linking to it. Menu and typed entry, and the
+  capability gate, are in `web/src/pages/ChatPage.composer.test.tsx`.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under
@@ -797,10 +819,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_managed_startup_followups.py::test_startup_followups_survive_browser_close`
   sends three messages during provisioning with both harness types, closes the
   browser, and verifies ordered input delivery and a fresh-browser reload.
+  `tests/e2e_ui/start_session/test_managed_initial_attachment.py::test_failed_launch_hands_the_message_and_attachment_to_a_new_session`
+  fails the launch, checks **Not delivered** live and after reload, and copies the
+  message and attachment to New Chat.
   These tests use real servers, host, runner and browser; only
   cloud allocation and model output are local substitutes. Backend coverage in
   `tests/server/integration/test_managed_startup_inputs.py` checks native
-  transcript ownership, bundle uploads, recovery, access revocation and deletion.
+  transcript ownership, bundle uploads, recovery, access revocation and deletion,
+  plus failed inputs in the snapshot.
 - **`arclet-dbcert`, desktop new-session composer (own environment):**
   `web/electron/e2e/desktop_dbcert_preflight.e2e.js` exercises the real desktop,
   native bridge, CLI process, and local server with a fake dbcert executable and

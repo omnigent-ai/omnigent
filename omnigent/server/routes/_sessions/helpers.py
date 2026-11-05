@@ -307,6 +307,7 @@ from omnigent.server.schemas import (
     SessionTerminalPendingEvent,
     SessionTitleEvent,
     SessionTodosEvent,
+    SupersessionReason,
     ToolOutputDeltaEvent,
 )
 from omnigent.server.session_metadata_logging import harness_attributes
@@ -5723,7 +5724,12 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
     session_stream.publish(session_id, payload)
 
 
-def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
+def _publish_session_superseded(
+    session_id: str,
+    target_conversation_id: str,
+    *,
+    reason: SupersessionReason = "clear",
+) -> None:
     """
     Publish a ``session.superseded`` event to the live stream.
 
@@ -5738,12 +5744,13 @@ def _publish_session_superseded(session_id: str, target_conversation_id: str) ->
         should receive the event, e.g. ``"conv_old"``.
     :param target_conversation_id: The conversation to redirect to, e.g.
         ``"conv_new"``.
+    :param reason: The command that moved the session, e.g. ``"clear"``.
     """
     event = SessionSupersededEvent(
         type="session.superseded",
         conversation_id=session_id,
         target_conversation_id=target_conversation_id,
-        reason="clear",
+        reason=reason,
     )
     session_stream.publish(session_id, event.model_dump())
     # Discard any unconsumed pending inputs on the superseded session — notably

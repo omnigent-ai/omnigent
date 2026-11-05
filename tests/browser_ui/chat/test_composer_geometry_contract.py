@@ -1384,6 +1384,7 @@ def test_fully_visible_transcript_paints_no_scrollbar(
     page.wait_for_timeout(1200)
     state = _fully_visible_state(page)
     assert state["first"] >= state["top"] and state["last"] <= state["bottom"] - 32
+    assert state["max"] <= TOLERANCE, state
     assert not state["thumb"], state
 
 
