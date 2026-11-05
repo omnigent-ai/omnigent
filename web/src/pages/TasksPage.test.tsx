@@ -11,7 +11,7 @@ import * as hooks from "@/hooks/useScheduledTasks";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { showToast } from "@/components/ui/toast";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
@@ -576,6 +576,23 @@ describe("template prefill", () => {
 });
 
 describe("row actions", () => {
+  it.each([
+    [new ScheduledTaskApiError("conflict", 409, "CONFLICT"), "This run is already in progress"],
+    [new ScheduledTaskApiError("server error", 503, null), "Couldn't start the run"],
+    [new TypeError("Failed to fetch"), "Couldn't start the run"],
+  ])("shows Run now feedback for %s", (error, message) => {
+    setTasks([task()]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Run now" }));
+
+    expect(runNowMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
+    expect(showToast).not.toHaveBeenCalled();
+
+    runNowMutate.mock.calls[0][1].onError(error);
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(message);
+  });
+
   it("confirms Run now with a run history hint only after the request succeeds", () => {
     setTasks([task()]);
     renderPage();

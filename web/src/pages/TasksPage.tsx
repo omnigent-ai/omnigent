@@ -34,7 +34,7 @@ import {
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
@@ -177,6 +177,13 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         showToast(
           "Run triggered, it will start shortly. Open automation details to check run history.",
         );
+      },
+      onError: (err) => {
+        if (err instanceof ScheduledTaskApiError && err.status === 409) {
+          showToast("This run is already in progress");
+        } else {
+          showToast("Couldn't start the run");
+        }
       },
     });
   }
