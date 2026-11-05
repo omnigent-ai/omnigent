@@ -2820,6 +2820,8 @@ async def _persist_external_codex_subagent_start(
     parent_conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    *,
+    lists_side_chat: bool = False,
 ) -> str:
     """
     Mint or update a child Conversation for a Codex AgentControl sub-agent.
@@ -2832,6 +2834,8 @@ async def _persist_external_codex_subagent_start(
     :param parent_conv: Pre-fetched parent row.
     :param body: POST event body with ``data.thread_id`` required.
     :param conversation_store: Store for reading/creating child rows.
+    :param lists_side_chat: Whether a new ``/side`` child joins the parent's
+        side chats on the owner's devices; only for the owner or bound runner.
     :returns: Child conversation id, e.g. ``"conv_child456"``.
     :raises OmnigentError: If ``thread_id`` is missing or parent has
         no bound agent.
@@ -2859,7 +2863,12 @@ async def _persist_external_codex_subagent_start(
         )
         return existing.id
     return await _create_and_publish_codex_child(
-        parent_id, parent_conv, thread_id, labels, conversation_store
+        parent_id,
+        parent_conv,
+        thread_id,
+        labels,
+        conversation_store,
+        lists_side_chat=lists_side_chat,
     )
 
 

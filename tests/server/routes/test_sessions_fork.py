@@ -800,6 +800,16 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         headers=headers[owner],
     )
     assert registered.status_code == 202, registered.text
+    # An editor may still register a Codex child, but not into the owner's side chats.
+    forged = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_forged", "agent_nickname": "Side chat"},
+        },
+        headers=headers[editor],
+    )
+    assert forged.status_code == 202, forged.text
 
     assert await _side_chat_ids(auth_client, parent.id, headers=headers[owner]) == {
         started.json()["id"]: False,

@@ -2962,6 +2962,15 @@ def register_events_routes(
                 conv,
                 body,
                 conversation_store,
+                # Only the session's runner or its owner may add to the owner's side chats.
+                lists_side_chat=_has_bound_runner_authority(request, conv)
+                or await asyncio.to_thread(
+                    _is_session_owner,
+                    user_id,
+                    conv,
+                    auth_provider=auth_provider,
+                    permission_store=permission_store,
+                ),
             )
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_DEVIN_SUBAGENT_START_TYPE:
