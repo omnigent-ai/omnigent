@@ -658,7 +658,7 @@ def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
     page: Page,
     live_server: str,
 ) -> None:
-    """Claude Code offers model, effort, and permission settings with no overrides."""
+    """Claude Code offers model, effort, and permission settings; a new task starts on Auto."""
     _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
@@ -671,7 +671,7 @@ def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
     expect(permission_trigger).to_be_visible()
     expect(model_trigger).to_have_text("Default")
     expect(effort_trigger).to_have_text("Default")
-    expect(permission_trigger).to_have_text("Default")
+    expect(permission_trigger).to_have_text("Auto")
 
 
 @pytest.mark.parametrize(

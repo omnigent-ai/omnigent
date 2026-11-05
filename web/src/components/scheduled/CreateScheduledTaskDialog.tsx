@@ -31,6 +31,7 @@ import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/compone
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
+import { NEW_AUTOMATION_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import { TriggerWorkerSettingsFields } from "./TriggerWorkerSettingsFields";
@@ -165,6 +166,8 @@ export function CreateScheduledTaskDialog({
   const [pickedModel, setPickedModel] = useState<string>("");
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
+  // "Default" and untouched are both "", so track the user's choice separately.
+  const [permissionPicked, setPermissionPicked] = useState(false);
 
   const curation = pickerCuration(info);
   const curationPending = info === "loading" || isBootFallbackInfo(info);
@@ -210,6 +213,7 @@ export function CreateScheduledTaskDialog({
       backToOriginal && originalTargetSelected ? (editingTask?.reasoningEffort ?? "") : "",
     );
     setPickedPermission(backToOriginal ? (editingTask?.permissionMode ?? "") : "");
+    setPermissionPicked(false);
   }
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
@@ -385,6 +389,7 @@ export function CreateScheduledTaskDialog({
         setPickedModel("");
         setPickedEffort("");
         setPickedPermission("");
+        setPermissionPicked(false);
         // The manager session must persist: it dedupes against its own workers.
         setSessionMode(initialTrigger ? "continue" : "new");
         setStartNewSession(false);
@@ -487,10 +492,19 @@ export function CreateScheduledTaskDialog({
   );
   const supportsModel = harnessSettings.supportsModel;
   const supportsPermission = harnessSettings.permissions.length > 0;
-  const effectivePermission =
-    harnessSettings.harness !== "claude-native" && pickedPermission === "default"
-      ? ""
+  const newAutomationPermission =
+    !isEdit && !permissionPicked && harnessSettings.harness
+      ? NEW_AUTOMATION_PERMISSION_MODES[harnessSettings.harness]
+      : undefined;
+  const permissionChoice =
+    newAutomationPermission &&
+    harnessSettings.permissions.some((option) => option.value === newAutomationPermission)
+      ? newAutomationPermission
       : pickedPermission;
+  const effectivePermission =
+    harnessSettings.harness !== "claude-native" && permissionChoice === "default"
+      ? ""
+      : permissionChoice;
   const originalTargetSelected =
     editingTask?.executionTarget === "managed_sandbox"
       ? sandboxMode
@@ -667,6 +681,7 @@ export function CreateScheduledTaskDialog({
     setPickedModel("");
     setPickedEffort("");
     setPickedPermission("");
+    setPermissionPicked(false);
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
@@ -1399,7 +1414,10 @@ export function CreateScheduledTaskDialog({
                                 disabled={curationPending || reusesExistingSession}
                                 onModelChange={handleModelChange}
                                 onEffortChange={setPickedEffort}
-                                onPermissionModeChange={setPickedPermission}
+                                onPermissionModeChange={(mode) => {
+                                  setPickedPermission(mode);
+                                  setPermissionPicked(true);
+                                }}
                                 onSelectOpenChange={handleSelectOpenChange}
                               />
                               {reusesExistingSession ? (

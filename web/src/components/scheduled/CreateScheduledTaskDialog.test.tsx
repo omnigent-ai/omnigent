@@ -514,7 +514,9 @@ describe("agent picker readiness (needs-setup badges)", () => {
     fireEvent.click(submit);
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].agentId).toBe("ag_codex");
-    for (const override of ["permissionMode", "modelOverride", "reasoningEffort"]) {
+    // A new automation starts unattended-safe; model and effort keep the agent's defaults.
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("approve-for-me");
+    for (const override of ["modelOverride", "reasoningEffort"]) {
       expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty(override);
     }
 
@@ -1940,7 +1942,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(arg.permissionMode).toBe("acceptEdits");
   });
 
-  it("omits model + effort + permission on create when left at Default", async () => {
+  it("omits model + effort and starts permission at Auto on create", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
@@ -1949,7 +1951,20 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     const arg = mutateAsync.mock.calls[0][0];
     expect(arg).not.toHaveProperty("modelOverride");
     expect(arg).not.toHaveProperty("reasoningEffort");
-    expect(arg).not.toHaveProperty("permissionMode");
+    // Nobody watches an automation's turns, so a new one starts in an auto-approve mode.
+    expect(arg.permissionMode).toBe("auto");
+  });
+
+  it("omits permission on create when the user picks Default", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Auto");
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
   });
 
   it("prefills model + effort + permission in edit mode from the loaded task", async () => {
