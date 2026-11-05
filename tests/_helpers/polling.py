@@ -86,11 +86,12 @@ async def wait_for_terminal_screen(
     :raises AssertionError: On timeout, with the last screen for diagnosis.
     """
     deadline = time.monotonic() + timeout_s
-    screen = ""
-    while time.monotonic() < deadline:
+    while True:
         result = await terminal.read()
         screen = str(result.get("screen", result))
         if predicate(screen):
             return screen
+        if time.monotonic() >= deadline:
+            break
         await asyncio.sleep(interval_s)
     raise AssertionError(f"Timed out waiting for {description}; last terminal screen:\n{screen}")

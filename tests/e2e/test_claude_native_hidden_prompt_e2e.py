@@ -51,7 +51,7 @@ def _sse(event: str, data: dict[str, object]) -> bytes:
 
 @contextmanager
 def _slow_messages_api() -> Iterator[str]:
-    """Serve one reply that streams a word per second, then plain non-streamed replies."""
+    """Stream each streaming Messages reply at a word per second; answer others plainly."""
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -243,7 +243,7 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
             assert await terminal.send(keys="Enter") == {"status": "sent"}
             picker = await wait_for_terminal_screen(
                 terminal,
-                lambda pane: not bridge.claude_pane_text_ready(pane),
+                lambda pane: "Select model" in pane and not bridge.claude_pane_text_ready(pane),
                 description="the model picker covering the input box",
             )
             (tmp_path / "native-hidden-prompt.txt").write_text(picker)

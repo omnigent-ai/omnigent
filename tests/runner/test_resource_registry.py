@@ -1488,6 +1488,19 @@ async def test_running_turn_with_hidden_input_box_points_chat_at_terminal(
 
 
 @pytest.mark.asyncio
+async def test_hidden_input_box_without_structured_status_publishes_no_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pane inference owns status when Claude reports none, so no alert is inferred."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_fallback")
+    session.registry.note_external_session_status("conv_hidden_fallback", "running")
+    for now in (100.0, 116.0, 140.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    assert ("running", "terminal prompt") not in session.published
+    assert session.registry.session_turn_is_active("conv_hidden_fallback")
+
+
+@pytest.mark.asyncio
 async def test_reported_reason_replaces_hidden_input_box_alert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
