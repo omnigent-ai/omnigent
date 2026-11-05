@@ -278,6 +278,7 @@ afterEach(() => {
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
   document.documentElement.removeAttribute("data-custom-translucent-sidebar");
+  document.documentElement.removeAttribute("data-full-width-chat");
   for (const property of Array.from(document.documentElement.style)) {
     if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
   }
@@ -1127,6 +1128,7 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("fold-assistant-narration-toggle"));
+    fireEvent.click(screen.getByTestId("full-width-chat-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -1150,6 +1152,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBe("true");
+    expect(localStorage.getItem("omnigent:full-width-chat")).toBe("true");
     expect(screen.getByTestId("fold-assistant-narration-toggle")).toHaveAttribute(
       "aria-checked",
       "true",
@@ -1207,6 +1210,25 @@ describe("SettingsPage", () => {
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
     expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
+    expect(screen.getByTestId("full-width-chat-toggle")).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:full-width-chat")).toBeNull();
+    expect(document.documentElement).not.toHaveAttribute("data-full-width-chat");
+  });
+
+  it("applies the full-width chat toggle immediately and persists it", () => {
+    renderPage("/settings/appearance");
+    const toggle = screen.getByTestId("full-width-chat-toggle");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:full-width-chat")).toBe("true");
+    expect(document.documentElement).toHaveAttribute("data-full-width-chat", "true");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:full-width-chat")).toBe("false");
+    expect(document.documentElement).not.toHaveAttribute("data-full-width-chat");
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {
