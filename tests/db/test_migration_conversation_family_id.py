@@ -5,6 +5,7 @@ from importlib import import_module
 from uuid import uuid4
 
 import sqlalchemy as sa
+from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
@@ -83,9 +84,14 @@ def test_family_id_migration_preserves_metadata_and_indexes_membership() -> None
 
 def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
     from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
-    from omnigent.db.utils import _run_migrations, get_or_create_engine
+    from omnigent.db.utils import (
+        _build_alembic_config,
+        _get_current_db_revision,
+        get_or_create_engine,
+    )
 
     engine = get_or_create_engine(db_uri)
+    original_revision = _get_current_db_revision(engine)
     migration = import_module(
         "omnigent.db.migrations.versions.f1c7a9e2b406_add_conversation_family_id"
     )
@@ -168,7 +174,8 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
                     )
                 restarted = sa.create_engine(db_uri)
                 try:
-                    _run_migrations(restarted, db_uri)
+                    # Later revisions are already applied in the shared test database.
+                    command.upgrade(_build_alembic_config(db_uri), migration.revision)
                     with restarted.connect() as connection:
                         assert (
                             connection.exec_driver_sql(
@@ -198,6 +205,10 @@ def test_family_schema_bootstrap_and_upgrade_agree(db_uri: str) -> None:
         ):
             migrate(migration.upgrade)
         if engine.dialect.name == "postgresql":
-            _run_migrations(engine, db_uri)
+            with engine.begin() as connection:
+                connection.execute(
+                    sa.text("UPDATE alembic_version SET version_num = :revision"),
+                    {"revision": original_revision},
+                )
         with engine.begin() as connection:
             connection.execute(orm_table.delete().where(orm_table.c.id == identifier))
