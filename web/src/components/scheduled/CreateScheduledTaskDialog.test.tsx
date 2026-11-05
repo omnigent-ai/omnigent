@@ -1908,6 +1908,16 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     ).toBeInTheDocument();
   });
 
+  it("does not offer permission modes that skip approval", async () => {
+    renderDialog();
+
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+
+    expect(await screen.findByRole("option", { name: "Auto" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Bypass permissions" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Don't ask" })).not.toBeInTheDocument();
+  });
+
   it("sends the selected model + effort on create for a capable agent", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
@@ -4028,7 +4038,8 @@ describe("automation harness settings", () => {
     ["pi-native", true, true, false],
     ["devin-native", true, true, true],
     ["cursor-native", false, false, true],
-    ["antigravity-native", false, false, true],
+    // Antigravity's only non-default mode skips approval, which automations cannot use.
+    ["antigravity-native", false, false, false],
     ["opencode-native", false, false, false],
   ])("shows independent settings for %s", (harness, model, effort, permission) => {
     mockHarness(harness);
