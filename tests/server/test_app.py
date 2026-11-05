@@ -465,6 +465,7 @@ async def test_info_includes_server_version(
     # is a frozen build-time snapshot that can drift from VERSION in a stale
     # editable or "source"-placeholder install.
     assert body["server_version"] == VERSION
+    assert body["features"].get("comment_anchor_metadata", False) is False
 
 
 def _branding_png(color: tuple[int, int, int, int]) -> bytes:

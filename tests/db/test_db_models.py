@@ -743,7 +743,7 @@ class TestSqlSessionPermission:
 
 class TestSqlComment:
     def test_model_schema_bounds_anchor_bytes(self) -> None:
-        assert "anchor_metadata" not in sa.inspect(SqlComment).columns
+        assert "anchor_metadata" in sa.inspect(SqlComment).columns
         postgres_ddl = str(
             sa.schema.CreateTable(SqlComment.__table__).compile(dialect=postgresql.dialect())
         )

@@ -61,6 +61,25 @@ def test_add_comment_request_valid_anchor_content_optional() -> None:
 # ── start_index validation ────────────────────────────────────────────────────
 
 
+def test_anchor_writes_require_the_feature_release() -> None:
+    """Reader compatibility must not silently turn PR feedback into Files comments."""
+    with pytest.raises(ValidationError, match="anchor_metadata"):
+        AddCommentRequest(
+            **_valid_kwargs(
+                start_index=0,
+                end_index=0,
+                anchor_metadata={
+                    "pr_url": "https://github.com/acme/app/pull/1",
+                    "side": "LEFT",
+                    "line": 9,
+                    "start_line": 7,
+                    "head_sha": "a" * 40,
+                    "base_sha": "b" * 40,
+                },
+            )
+        )
+
+
 @pytest.mark.parametrize("start_index", [-1, -100])
 def test_add_comment_request_rejects_negative_start_index(start_index: int) -> None:
     """start_index must be >= 0; negative values are rejected.
