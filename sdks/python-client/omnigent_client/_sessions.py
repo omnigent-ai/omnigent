@@ -1521,7 +1521,9 @@ def _limit_children_per_parent(
     kept: list[dict[str, Any]] = []
     for row in rows:
         parent_id, child_id = row.get("parent_session_id"), row.get("id")
-        if parent_id not in reached or not isinstance(child_id, str):
+        if not isinstance(parent_id, str) or not isinstance(child_id, str):
+            continue
+        if parent_id not in reached:
             continue
         if kept_per_parent.get(parent_id, 0) >= limit:
             continue

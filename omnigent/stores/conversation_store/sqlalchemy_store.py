@@ -3531,8 +3531,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         if self._conv_engine.dialect.name != "sqlite":
             return page
         with self._conv_session("list_spawn_tree") as session:
-            tiebreakers = dict(
-                session.execute(
+            tiebreakers: dict[str, Any] = {
+                str(row[0]): row[1]
+                for row in session.execute(
                     select(SqlConversation.id, self._tiebreaker_col)
                     .where(
                         SqlConversation.workspace_id == current_workspace_id(),
@@ -3541,7 +3542,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .order_by(SqlConversation.id)
                     .limit(limit)
                 ).all()
-            )
+            }
         rows = sorted(
             page.data, key=lambda c: (c.created_at, tiebreakers.get(c.id, 0)), reverse=True
         )
