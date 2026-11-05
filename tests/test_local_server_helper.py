@@ -56,22 +56,28 @@ def test_startup_exit_reports_log_and_reaps_child(tmp_path: Path, monkeypatch: p
     assert len(children) == 1 and children[0].returncode == 23
 
 
-@pytest.mark.parametrize("startup", ["fails", "outlasts-deadline"])
+@pytest.mark.parametrize("startup", ["fails", "outlasts-deadline", "outlasts-join"])
 def test_thread_served_app_that_does_not_start_leaves_no_server_thread(
     monkeypatch: pytest.MonkeyPatch, startup: str
 ) -> None:
-    """A failed or overdue lifespan startup raises only once uvicorn's thread has stopped."""
+    """A failed or overdue lifespan startup raises, and says when uvicorn's thread still runs."""
     threads: list[threading.Thread] = []
+    release = threading.Event()
 
     class RecordedThread(threading.Thread):
         def start(self) -> None:
             threads.append(self)
             super().start()
 
+        def join(self, timeout: float | None = None) -> None:
+            # Stands in for a startup that outlasts the helper's real join budget.
+            held = startup == "outlasts-join" and not release.is_set()
+            super().join(0.1 if held else timeout)
+
     monkeypatch.setattr(
         "tests._helpers.live_server.threading", SimpleNamespace(Thread=RecordedThread)
     )
-    if startup == "outlasts-deadline":
+    if startup != "fails":
         # The startup deadline has passed by the first check, while the lifespan still runs.
         clock = iter([0.0])
         monkeypatch.setattr(
@@ -85,13 +91,24 @@ def test_thread_served_app_that_does_not_start_leaves_no_server_thread(
             await send({"type": "lifespan.startup.failed", "message": "refused"})
             return
         await asyncio.sleep(0.5)
+        while startup == "outlasts-join" and not release.is_set():
+            await asyncio.sleep(0.01)
         await send({"type": "lifespan.startup.complete"})
 
-    expected = "app exited during startup" if startup == "fails" else "app did not start"
+    expected = {
+        "fails": "^app exited during startup$",
+        "outlasts-deadline": "^app did not start$",
+        "outlasts-join": "^app did not start, and uvicorn did not exit within the join timeout$",
+    }[startup]
     with pytest.raises(RuntimeError, match=expected):
         with serve_app_in_thread(app):
             pytest.fail("an app that did not start must not be served")
-    assert len(threads) == 1 and not threads[0].is_alive()
+    assert len(threads) == 1
+    if startup == "outlasts-join":
+        assert threads[0].is_alive()
+        release.set()
+        threads[0].join(timeout=10)
+    assert not threads[0].is_alive()
 
 
 @pytest.mark.parametrize("inherit_env", [True, False])
