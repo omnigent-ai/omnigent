@@ -310,7 +310,7 @@ describe("Sidebar shift-click selection", () => {
       fireEvent.click(await screen.findByRole("link", { name: "a0" }));
       fireEvent.click(screen.getByRole("link", { name: "b0" }), { shiftKey: true });
 
-      // Collapsing leaves a5 and a6 behind Alpha's Show more, out of the range.
+      // When collapsed, a5 and a6 sit behind Alpha's Show more and fall outside the range.
       await waitFor(() => {
         expect(screen.getByText(`${selected.length} selected`)).toBeInTheDocument();
       });

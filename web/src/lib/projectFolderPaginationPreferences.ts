@@ -17,8 +17,9 @@ export const PROJECT_FOLDER_PAGE_SIZE_MAX = 50;
 
 /** The page size `text` holds, or undefined unless it is a whole number in range. */
 export function parseProjectFolderPageSize(text: string): number | undefined {
-  if (!/^\d+$/.test(text.trim())) return undefined;
-  const size = Number(text);
+  const trimmed = text.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const size = Number(trimmed);
   return size >= PROJECT_FOLDER_PAGE_SIZE_MIN && size <= PROJECT_FOLDER_PAGE_SIZE_MAX
     ? size
     : undefined;

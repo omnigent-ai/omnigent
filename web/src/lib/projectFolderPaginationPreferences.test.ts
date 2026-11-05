@@ -71,6 +71,7 @@ it("turns the switch off for an earlier build's All choice and drops its key", (
   });
   migrateLegacyProjectFolderPagination();
   expect(localStorage.getItem(LEGACY_STORAGE_KEY)).toBe("all");
+  expect(readProjectFolderCollapse()).toBe(true);
 
   setItem.mockRestore();
   migrateLegacyProjectFolderPagination();
