@@ -175,6 +175,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
+import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -1978,12 +1979,38 @@ function ConversationList({
   const unseenTick = useUnseenTick(statusView);
   const draftIds = useSessionDraftIds(statusView);
   const startingId = useStartingConversationId(statusView);
+  // Freeze the active chat's sort key while you're inside it so an
+  // updated_at bump from sending a message doesn't reorder the row
+  // out from under you. Snapshot is dropped on navigate-away so the
+  // chat snaps back to its real position once you've left.
+  const { conversationId: activeId } = useParams<{ conversationId: string }>();
+  // Resolve the active conversation's top-level root once here (rows get a plain
+  // `isActive` prop, not their own query). Falls back to the raw id while the
+  // parent walk loads — a top-level session resolves to itself.
+  const activeRootSessionId = useActiveRootSessionId(activeId ?? null);
+  const resolvedActiveId = activeRootSessionId ?? activeId ?? null;
   // All loaded conversations from the single paginated list (for the flat
   // session list; pinned rows are merged in from the server pinned query).
-  const allConversations = useMemo(
+  const pagedConversations = useMemo(
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
+  // The open session is always listed, so opening one from search reveals it
+  // here: an archived one (with its Unarchive control) or one older than the
+  // loaded pages is added from its own fetch until a list page carries it.
+  const openSessionMissing =
+    activeRootSessionId !== null &&
+    !pagedConversations.some((c) => c.id === activeRootSessionId) &&
+    !pinnedConversations.some((c) => c.id === activeRootSessionId) &&
+    !loadedRows.some((c) => c.id === activeRootSessionId);
+  const openSessionRow = useOpenSessionRow(openSessionMissing ? activeRootSessionId : null);
+  const allConversations = useMemo(
+    () => (openSessionRow ? [...pagedConversations, openSessionRow] : pagedConversations),
+    [pagedConversations, openSessionRow],
+  );
+  // An archived open session lists on the live views too; Pinned and project
+  // folders keep showing only live sessions.
+  const openArchivedId = openSessionRow?.archived === true ? openSessionRow.id : null;
   const groupOrder = useMemo(
     () =>
       view.grouping === "harness"
@@ -2044,16 +2071,6 @@ function ConversationList({
     return map;
   }, [projects]);
 
-  // Freeze the active chat's sort key while you're inside it so an
-  // updated_at bump from sending a message doesn't reorder the row
-  // out from under you. Snapshot is dropped on navigate-away so the
-  // chat snaps back to its real position once you've left.
-  const { conversationId: activeId } = useParams<{ conversationId: string }>();
-  // Resolve the active conversation's top-level root once here (rows get a plain
-  // `isActive` prop, not their own query). Falls back to the raw id while the
-  // parent walk loads — a top-level session resolves to itself.
-  const activeRootSessionId = useActiveRootSessionId(activeId ?? null);
-  const resolvedActiveId = activeRootSessionId ?? activeId ?? null;
   const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
   useEffect(() => setOptimisticActiveId(null), [activeId]);
   const activateRow = useCallback((id: string, event: MouseEvent<HTMLAnchorElement>) => {
@@ -2125,16 +2142,17 @@ function ConversationList({
     // also present in the paginated list, and merging both would render it twice.
     const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
+    const listed = allWithPinned.filter((c) => c.archived !== true || c.id === openArchivedId);
     // The filter picks the slice; the Pinned / Projects / Sessions structure is
     // then built from it, so every filter reuses the same layout.
     const tabScoped =
       activeTab === "archived"
         ? allWithPinned.filter((c) => c.archived === true)
         : activeTab === "shared"
-          ? notArchived.filter((c) => !isOwnedByViewer(c, viewerId))
+          ? listed.filter((c) => !isOwnedByViewer(c, viewerId))
           : activeTab === "mine"
-            ? notArchived.filter((c) => isOwnedByViewer(c, viewerId))
-            : notArchived;
+            ? listed.filter((c) => isOwnedByViewer(c, viewerId))
+            : listed;
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
@@ -2242,6 +2260,7 @@ function ConversationList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     allConversations,
+    openArchivedId,
     pinnedConversations,
     pinnedSet,
     activeOverride,
@@ -2277,6 +2296,7 @@ function ConversationList({
       : config.displayPageSize,
     conversationsQuery.hasNextPage,
     conversationsQuery.fetchNextPage,
+    listRows.findIndex((c) => c.id === resolvedActiveId),
   );
   const sections = useMemo(() => {
     const sharedCount = Math.min(loadedSections.shared.length, displayPagination.rows.length);
@@ -2655,8 +2675,10 @@ function ConversationList({
   const activeProjectName = useMemo(() => {
     if (!activeId) return null;
     const active = allConversations.find((c) => c.id === activeId);
-    return active?.labels?.[PROJECT_LABEL_KEY] ?? null;
-  }, [activeId, allConversations]);
+    // Live views list an archived session outside its folder.
+    if (!active || (active.archived === true && activeTab !== "archived")) return null;
+    return projects.find((p) => sessionBelongsToProject(active, p, viewerId))?.name ?? null;
+  }, [activeId, allConversations, activeTab, projects, viewerId]);
   // Auto-expand the project folder holding the selected session, so navigating
   // to a filed session reveals it instead of leaving it hidden in a collapsed
   // folder. Skipped for pinned sessions: they're already reachable from the

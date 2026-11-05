@@ -52,7 +52,9 @@ the header menu), and each place is a separate entry point.
   interleaved comments and existing attachments; removing a quote keeps its comments.
   Live side chats accept pasted images in every reply text field.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
-  menu of an archived session.
+  menu of an archived session. An archived session opened from search or a
+  link also gets its row on the live sidebar views while it is open, outside
+  Pinned and project folders, so its Unarchive button is there.
 - `delete`: confirmed, then removed from the list and the server.
 - `export`: Export in the header menu saves the transcript as a local file.
 - `unread`: Mark as unread flags a session to revisit and survives a reload,
@@ -631,6 +633,11 @@ plain `uv run pytest`, which starts a private server for the test.
   expect the dialog each time; a session without a worktree archives silently.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
+- **`unarchive`, open archived session's sidebar row:**
+  `tests/e2e_ui/sessions/test_open_session_sidebar_reveal.py::test_archived_session_opened_from_search_shows_unarchive_in_sidebar`
+  opens an archived session from ⌘K and unarchives it from its revealed row.
+  Placement, older live sessions and the display cap are covered in
+  `web/src/shell/Sidebar.openSession.test.tsx`.
   The sidebar row and bulk unarchive have web unit coverage only: archive a
   session, open the archived view, choose Unarchive on the row, and expect the
   session back in the main list.

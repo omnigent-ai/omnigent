@@ -16,9 +16,9 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // The optimistic cache overlay + error reconcile is covered in
 // sessionListCache.test.ts / useConversations.test.ts.
 //
-// Archived sessions are no longer listed in the sidebar (they moved to the
-// Settings page), so unarchiving is covered by SettingsPage.test.tsx; this
-// file exercises the archive path from a row's kebab.
+// Live views list archived sessions only while one is open (see
+// Sidebar.openSession.test.tsx); Settings unarchiving is covered by
+// SettingsPage.test.tsx. This file exercises the archive path from a row.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";

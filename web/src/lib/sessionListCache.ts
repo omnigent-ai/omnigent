@@ -251,6 +251,24 @@ function changedFieldsNeedRefetch(changed: Set<string>): boolean {
 }
 
 /**
+ * A cached copy of one session's row from a list response: any
+ * `["conversations", ...]` variant (including search results) or a project
+ * folder's `["project-sessions", ...]` pages.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - Conversation id to find.
+ */
+export function findCachedListRow(queryClient: QueryClient, id: string): Conversation | undefined {
+  for (const queryKey of [["conversations"], ["project-sessions"]]) {
+    for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey })) {
+      const row = data?.pages.flatMap((page) => page.data).find((c) => c.id === id);
+      if (row) return row;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Overlay incoming wire items onto matching rows of one infinite query's
  * cached pages.
  *
