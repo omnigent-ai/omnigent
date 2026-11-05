@@ -88,10 +88,12 @@ describe("commentsQueryKey", () => {
 });
 
 describe("fetchComments", () => {
-  it("GETs the session list endpoint with no path query", async () => {
+  it("opts into PR comments without a path filter", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse([]));
     await fetchComments("conv_1");
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_1/comments");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1/comments?include_pr_comments=true",
+    );
   });
 
   it("appends an encoded path query when filtering to one file", async () => {
@@ -100,7 +102,7 @@ describe("fetchComments", () => {
     fetchMock.mockResolvedValueOnce(mockResponse([]));
     await fetchComments("conv with space", "src/a b.ts");
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv%20with%20space/comments?path=src%2Fa%20b.ts",
+      "/v1/sessions/conv%20with%20space/comments?path=src%2Fa%20b.ts&include_pr_comments=true",
     );
   });
 
@@ -136,7 +138,9 @@ describe("useComments", () => {
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual(comments);
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_1/comments");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1/comments?include_pr_comments=true",
+    );
   });
 });
 

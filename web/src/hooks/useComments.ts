@@ -51,7 +51,7 @@ export async function fetchComments(sessionId: string, path?: string): Promise<C
   const url = path
     ? `/v1/sessions/${encodeURIComponent(sessionId)}/comments?path=${encodeURIComponent(path)}`
     : `/v1/sessions/${encodeURIComponent(sessionId)}/comments`;
-  const res = await authenticatedFetch(url);
+  const res = await authenticatedFetch(`${url}${path ? "&" : "?"}include_pr_comments=true`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Comment[];
 }

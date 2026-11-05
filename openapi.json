@@ -18535,6 +18535,17 @@
               ],
               "title": "Path"
             }
+          },
+          {
+            "description": "Opt in to revision-anchored comments that legacy clients cannot locate using workspace character offsets.",
+            "in": "query",
+            "name": "include_pr_comments",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Pr Comments",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
