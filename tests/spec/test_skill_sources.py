@@ -1090,10 +1090,16 @@ def test_claude_native_lists_plugins_the_configured_launch_loads(
     )
     launches = tmp_path / "launches.jsonl"
     configured_settings = json.dumps({"disableAllHooks": False})
+    # Output before the init event must not end the search for it.
+    other_output = "".join(
+        f"print({line!r})\n"
+        for line in ("Loading plugins...", "[]", '{"type": "system", "subtype": "hook_started"}')
+    )
     configure_claude_launch(
         isolate_provider_resolution(monkeypatch, tmp_path / "config"),
         launches,
-        _print_init(
+        other_output
+        + _print_init(
             [
                 {"name": "builtin-tools", "path": "builtin", "source": "builtin-tools@builtin"},
                 {
