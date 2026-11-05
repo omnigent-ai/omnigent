@@ -1622,19 +1622,24 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session("list_side_chat_ids") as session:
             return list(session.scalars(stmt.order_by(meta.id).limit(limit)))
 
-    def get_created_at_and_label(
-        self, conversation_ids: list[str], key: str
-    ) -> dict[str, tuple[int, str | None]]:
+    def get_created_at_and_labels(
+        self, conversation_ids: list[str], keys: tuple[str, ...]
+    ) -> dict[str, tuple[int, dict[str, str]]]:
         if not conversation_ids:
             return {}
         stmt = (
-            select(SqlConversation.id, SqlConversation.created_at, SqlConversationLabel.value)
+            select(
+                SqlConversation.id,
+                SqlConversation.created_at,
+                SqlConversationLabel.key,
+                SqlConversationLabel.value,
+            )
             .outerjoin(
                 SqlConversationLabel,
                 and_(
                     SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
                     SqlConversationLabel.conversation_id == SqlConversation.id,
-                    SqlConversationLabel.key == key,
+                    SqlConversationLabel.key.in_(keys),
                 ),
             )
             .where(
@@ -1642,11 +1647,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversation.id.in_(conversation_ids),
             )
         )
-        with self._conv_session("get_created_at_and_label") as ap_sess:
-            return {
-                conv_id: (created_at, value)
-                for conv_id, created_at, value in ap_sess.execute(stmt).all()
-            }
+        found: dict[str, tuple[int, dict[str, str]]] = {}
+        with self._conv_session("get_created_at_and_labels") as ap_sess:
+            for conv_id, created_at, key, value in ap_sess.execute(stmt).all():
+                _, labels = found.setdefault(conv_id, (created_at, {}))
+                if key is not None:
+                    labels[key] = value
+        return found
 
     def set_labels(
         self,

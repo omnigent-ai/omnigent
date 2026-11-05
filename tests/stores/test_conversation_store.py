@@ -187,16 +187,20 @@ def test_side_chats_page_by_parent_in_id_order(tmp_path: Path) -> None:
     )
     store.create_conversation(side_chat_parent_id=store.create_conversation().id)
     store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
-    store.set_labels(generic[0].id, {"omnigent.closed": "true", "unrelated": "x"})
+    store.set_labels(generic[0].id, {"omnigent.side_chat.closed": "1", "unrelated": "x"})
+    store.set_labels(codex.id, {"omnigent.closed": "true"})
 
     first = store.list_side_chat_ids(parent.id, limit=2)
     rest = store.list_side_chat_ids(parent.id, after=first[-1], limit=2)
 
     side_chats = [*generic, codex]
     assert first + rest == sorted(side_chat.id for side_chat in side_chats)
-    assert store.get_created_at_and_label(first + rest, "omnigent.closed") == {
-        side_chat.id: (side_chat.created_at, "true" if side_chat is generic[0] else None)
-        for side_chat in side_chats
+    assert store.get_created_at_and_labels(
+        first + rest, ("omnigent.side_chat.closed", "omnigent.closed")
+    ) == {
+        generic[0].id: (generic[0].created_at, {"omnigent.side_chat.closed": "1"}),
+        generic[1].id: (generic[1].created_at, {}),
+        codex.id: (codex.created_at, {"omnigent.closed": "true"}),
     }
 
 

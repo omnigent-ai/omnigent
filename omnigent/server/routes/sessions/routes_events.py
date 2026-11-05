@@ -317,6 +317,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_CLOSED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     runner_seen_is_fresh,
 )
@@ -1225,8 +1226,8 @@ def register_events_routes(
           kills its tmux pane) and 204s otherwise. Stop is non-sticky:
           it writes no persistent marker, so the next message
           auto-relaunches the session on its (still-online) host via
-          the normal message-dispatch relaunch path. A side chat is the
-          exception: stopping it closes it.
+          the normal message-dispatch relaunch path. Stopping a side chat
+          also records that its tab was closed, for the user's other devices.
         - ``"retry_session"`` reconnects or relaunches the existing runner
           and retries a failed saved startup input, if one is present.
         - ``"message"`` on an ``omnigent claude`` terminal session
@@ -2114,14 +2115,14 @@ def register_events_routes(
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
             if (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY):
-                # Stopping a side chat closes its tab; persist that, as for a
-                # Codex side chat, so the user's other devices drop it too.
+                # Stopping a side chat closes its tab; record that so the user's
+                # other devices drop it too. The side chat stays writable.
                 await asyncio.to_thread(
                     conversation_store.set_labels,
                     session_id,
-                    {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                    {SIDE_CHAT_CLOSED_LABEL_KEY: "1"},
                 )
-            # Any other stop is non-sticky: no persistent marker is written. The
+            # The stop itself is non-sticky: nothing seals the session. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
             # its (still-online) host via the normal message-dispatch

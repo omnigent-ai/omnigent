@@ -46,6 +46,7 @@ from omnigent.server.routes.sessions import create_sessions_router, routes_core
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     FORK_SOURCE_LABEL_KEY,
+    SIDE_CHAT_CLOSED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
@@ -732,9 +733,11 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
         {"thread_id": "thread_side", "agent_nickname": "Side chat"}
     )
     await codex_child({"thread_id": "thread_worker", "agent_nickname": "Worker"})
-    store.set_labels(closed_side_chat["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    store.set_labels(closed_side_chat["id"], {SIDE_CHAT_CLOSED_LABEL_KEY: "1"})
+    # A Codex side chat that ended counts as closed too.
+    store.set_labels(codex_side_chat, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
 
-    expected = {side_chat["id"]: False, closed_side_chat["id"]: True, codex_side_chat: False}
+    expected = {side_chat["id"]: False, closed_side_chat["id"]: True, codex_side_chat: True}
     assert await _side_chat_ids(client, parent.id) == expected
     snapshot = await client.get(f"/v1/sessions/{side_chat['id']}")
     assert snapshot.json()["side_chat_parent_id"] == parent.id

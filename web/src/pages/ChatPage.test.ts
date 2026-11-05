@@ -144,15 +144,6 @@ describe("Composer structural read-only reasons", () => {
     ).toBe("This side chat has ended and can't receive new messages");
   });
 
-  it("gives a closed generic side chat the side-chat reason", () => {
-    expect(
-      readOnlyReasonForSessionLabels(
-        { labels: { "omnigent.closed": "true", "omnigent.side_chat": "1" } },
-        null,
-      ),
-    ).toBe("This side chat has ended and can't receive new messages");
-  });
-
   it("keeps the generic closed reason for a non-side-chat codex sub-agent", () => {
     expect(
       readOnlyReasonForSessionLabels(
