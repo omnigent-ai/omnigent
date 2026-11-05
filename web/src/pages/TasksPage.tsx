@@ -108,6 +108,20 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     setManualOpen(true);
   }
 
+  // A template is picked from the gallery view; show the new automation in the
+  // list so it is obvious it was created.
+  function handleCreated() {
+    if (view !== "yours") {
+      requestedView.current = "yours";
+      setSearchParams((current) => {
+        const next = new URLSearchParams(current);
+        next.delete("view");
+        return next;
+      });
+    }
+    showToast("Automation created");
+  }
+
   function handleManualOpenChange(next: boolean) {
     setManualOpen(next);
     if (!next) {
@@ -206,6 +220,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       initialTemplateId={selectedTemplate?.id}
       sessionLink={sessionLink}
       editingTask={editingTask}
+      onCreated={handleCreated}
     />
   );
 
