@@ -9,8 +9,9 @@ the web UI renders the session terminal-first.
 This module also hosts the interactive local ``omnigent opencode`` CLI wrapper
 (:func:`run_opencode_native`, the analog of ``omnigent codex`` / ``omnigent pi``):
 it ensures a local daemon + runner, creates-or-resumes the ``opencode-native-ui``
-session (whose runner auto-creates the ``opencode serve`` + ``opencode attach``
-terminal), and attaches this TTY directly to that runner-owned tmux pane — the
+session (whose runner auto-creates the ``opencode serve`` process and the
+``opencode --server <url> --session <id>`` TUI terminal), and attaches this TTY
+directly to that runner-owned tmux pane — the
 same web-UI takeover path, driven from the CLI. The provider/gateway comes from
 the runner's ambient env / ``omnigent setup`` config (a profile-bound spec routes
 through the Databricks gateway; otherwise OpenAI-/Anthropic-compatible env vars).
@@ -170,8 +171,8 @@ def run_opencode_native(  # pragma: no cover
 
     Mirrors ``omnigent codex`` / ``omnigent pi``: ensure a local daemon + runner,
     create-or-resume the ``opencode-native-ui`` session (the runner auto-creates
-    the ``opencode serve`` + ``opencode attach`` terminal), then attach this TTY
-    to that runner-owned tmux pane.
+    ``opencode serve`` and the ``opencode --server`` TUI terminal), then attach
+    this TTY to that runner-owned tmux pane.
 
     :param server: Resolved Omnigent server URL. ``None`` is an error (the CLI
         must resolve a backend first).

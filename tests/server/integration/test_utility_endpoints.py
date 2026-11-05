@@ -111,10 +111,14 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["installable_harnesses"] == []
     # Gates the web's archive worktree prompt; older servers omit it.
     assert data["archive_worktree_cleanup"] is True
+    assert data["scheduled_task_worktrees"] is True
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
+    assert data["scheduled_task_subhour"] is True
+    assert data["automation_trigger_poll_minutes"] == 10
+    assert data["scheduled_task_harness_settings"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
     # Gates the web's /clear for native sessions; older servers reject it.
