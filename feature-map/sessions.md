@@ -640,7 +640,9 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_open_session_sidebar_reveal.py::test_archived_session_opened_from_search_shows_unarchive_in_sidebar`
   opens an archived session from ⌘K and unarchives it from its revealed row.
   Placement, shared sessions, older live sessions and the display cap are
-  covered in `web/src/shell/Sidebar.openSession.test.tsx`.
+  covered in `web/src/shell/Sidebar.openSession.test.tsx`. Direct link,
+  manually: archive one of your sessions, paste its `/c/<id>` URL into a new
+  tab, and expect its row in the sidebar with Unarchive on hover.
 - **`unarchive`, Archived view row and bulk selection:** web unit coverage
   only. Manually: archive a session, open the archived view, choose Unarchive
   on the row, and expect the session back in the main list.

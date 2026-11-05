@@ -975,6 +975,34 @@ function restoreArchiveLists(queryClient: QueryClient, snapshot: ArchiveListsSna
 }
 
 /**
+ * Record a committed archive flip on fetched open-session rows. A first fetch
+ * still in flight may have been served before the write, so refetch once it lands.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param ids - Sessions whose archive flag the server confirmed.
+ * @param archived - The confirmed flag.
+ */
+function settleOpenSessionRowsArchived(
+  queryClient: QueryClient,
+  ids: readonly string[],
+  archived: boolean,
+): void {
+  for (const id of ids) {
+    const key = ["conversation-backfill", id];
+    const row = queryClient.getQueryData<Conversation | null>(key);
+    if (row && row.archived !== archived) {
+      const settledRow: Conversation = { ...row, archived };
+      queryClient.setQueryData<Conversation | null>(key, settledRow);
+    }
+    if (queryClient.isFetching({ queryKey: key }) > 0) {
+      void queryClient
+        .refetchQueries({ queryKey: key })
+        .then(() => queryClient.invalidateQueries({ queryKey: key }));
+    }
+  }
+}
+
+/**
  * Drop conversations from the pinned backfill cache — a pinned session outside
  * the paginated window lives only there, so the list overlay can't hide it.
  */
@@ -1042,6 +1070,7 @@ export function useArchiveConversation() {
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
       );
+      settleOpenSessionRowsArchived(queryClient, [updated.id], archived);
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);
       }
@@ -1415,6 +1444,7 @@ export function useBulkArchiveConversations() {
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, ids);
       }
+      settleOpenSessionRowsArchived(queryClient, ids, archived);
     },
     onSettled: () => {
       // Project caches read the DB directly (no search-index lag), so unlike

@@ -1,7 +1,7 @@
 // Unit tests for the conversation-mutation HTTP helpers, plus the
 // query-invalidation contract of the stop mutation hook.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -3628,21 +3628,12 @@ describe("useArchiveConversation", () => {
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 
+  const openRowKey = ["conversation-backfill", "conv_a"];
+
   it("restores a fetched open-session row when unarchiving fails", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    const backfillKey = ["conversation-backfill", "conv_a"];
-    const archivedRow = {
-      id: "conv_a",
-      object: "conversation" as const,
-      title: "A",
-      created_at: 0,
-      updated_at: 0,
-      labels: {},
-      permission_level: null,
-      archived: true,
-    };
-    queryClient.setQueryData(backfillKey, archivedRow);
+    queryClient.setQueryData(openRowKey, conversation({ id: "conv_a", archived: true }));
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useArchiveConversation(), { wrapper });
@@ -3652,29 +3643,19 @@ describe("useArchiveConversation", () => {
 
     // The optimistic overlay flipped this entry; the sidebar row reads it, so
     // the rollback must bring its Unarchive control back.
-    expect(queryClient.getQueryData<Conversation>(backfillKey)?.archived).toBe(true);
+    expect(queryClient.getQueryData<Conversation>(openRowKey)?.archived).toBe(true);
   });
 
   it("drops an open-session row fetch that was in flight when unarchiving", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ id: "conv_a", archived: false }));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    const backfillKey = ["conversation-backfill", "conv_a"];
-    const archivedRow = {
-      id: "conv_a",
-      object: "conversation" as const,
-      title: "A",
-      created_at: 0,
-      updated_at: 0,
-      labels: {},
-      permission_level: null,
-      archived: true,
-    };
-    queryClient.setQueryData(backfillKey, archivedRow);
-    let settleFetch = (_row: typeof archivedRow) => {};
+    const archivedRow = conversation({ id: "conv_a", archived: true });
+    queryClient.setQueryData(openRowKey, archivedRow);
+    let settleFetch = (_row: Conversation) => {};
     const staleFetch = queryClient.fetchQuery({
-      queryKey: backfillKey,
+      queryKey: openRowKey,
       queryFn: () =>
-        new Promise<typeof archivedRow>((resolve) => {
+        new Promise<Conversation>((resolve) => {
           settleFetch = resolve;
         }),
     });
@@ -3688,7 +3669,7 @@ describe("useArchiveConversation", () => {
     settleFetch(archivedRow);
     await staleFetch.catch(() => undefined);
 
-    expect(queryClient.getQueryData<Conversation>(backfillKey)?.archived).toBe(false);
+    expect(queryClient.getQueryData<Conversation>(openRowKey)?.archived).toBe(false);
   });
 
   it("does not restore an open-session row a delete removed while unarchiving failed", async () => {
@@ -3700,64 +3681,69 @@ describe("useArchiveConversation", () => {
         }),
     );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    const backfillKey = ["conversation-backfill", "conv_a"];
-    queryClient.setQueryData(backfillKey, {
-      id: "conv_a",
-      object: "conversation" as const,
-      title: "A",
-      created_at: 0,
-      updated_at: 0,
-      labels: {},
-      permission_level: null,
-      archived: true,
-    });
+    queryClient.setQueryData(openRowKey, conversation({ id: "conv_a", archived: true }));
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useArchiveConversation(), { wrapper });
 
     result.current.mutate({ id: "conv_a", archived: false });
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    queryClient.removeQueries({ queryKey: backfillKey });
+    queryClient.removeQueries({ queryKey: openRowKey });
     settleArchive(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
     await waitFor(() => expect(result.current.isError).toBe(true));
 
-    expect(queryClient.getQueryState(backfillKey)).toBeUndefined();
+    expect(queryClient.getQueryState(openRowKey)).toBeUndefined();
   });
 
-  it("lets the first fetch of an open-session row land during an archive", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse({ id: "conv_a", archived: true }));
-    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    const backfillKey = ["conversation-backfill", "conv_a"];
-    const fetchedRow = {
-      id: "conv_a",
-      object: "conversation" as const,
-      title: "A",
-      created_at: 0,
-      updated_at: 0,
-      labels: {},
-      permission_level: null,
-      archived: false,
-    };
-    let settleFetch = (_row: typeof fetchedRow) => {};
-    const firstFetch = queryClient.fetchQuery({
-      queryKey: backfillKey,
-      queryFn: () =>
-        new Promise<typeof fetchedRow>((resolve) => {
-          settleFetch = resolve;
+  it.each([
+    {
+      hook: "useArchiveConversation",
+      useArchive: () => {
+        const archive = useArchiveConversation();
+        return { archiveA: () => archive.mutate({ id: "conv_a", archived: true }), archive };
+      },
+    },
+    {
+      hook: "useBulkArchiveConversations",
+      useArchive: () => {
+        const archive = useBulkArchiveConversations();
+        return { archiveA: () => archive.mutate({ ids: ["conv_a"], archived: true }), archive };
+      },
+    },
+  ])(
+    "$hook refetches an open-session row whose first fetch predates the archive",
+    async ({ useArchive }) => {
+      fetchMock.mockResolvedValue(mockResponse({ id: "conv_a", archived: true }));
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      let settleFirstFetch = (_row: Conversation) => {};
+      const fetchRow = vi
+        .fn<() => Promise<Conversation>>()
+        .mockImplementationOnce(
+          () =>
+            new Promise<Conversation>((resolve) => {
+              settleFirstFetch = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(conversation({ id: "conv_a", archived: true }));
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(
+        () => ({
+          ...useArchive(),
+          openRow: useQuery({ queryKey: openRowKey, queryFn: fetchRow, retry: false }),
         }),
-    });
-    void firstFetch.catch(() => undefined);
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+        { wrapper },
+      );
+      await waitFor(() => expect(fetchRow).toHaveBeenCalledOnce());
 
-    result.current.mutate({ id: "conv_a", archived: true });
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    settleFetch(fetchedRow);
-    await firstFetch.catch(() => undefined);
+      result.current.archiveA();
+      await waitFor(() => expect(result.current.archive.isSuccess).toBe(true));
+      settleFirstFetch(conversation({ id: "conv_a", archived: false }));
 
-    expect(queryClient.getQueryData<Conversation>(backfillKey)?.id).toBe("conv_a");
-  });
+      await waitFor(() => expect(result.current.openRow.data?.archived).toBe(true));
+      expect(fetchRow).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it("does not restore a row with a concurrent delete in flight", async () => {
     let settleArchive = (_res: Response) => {};

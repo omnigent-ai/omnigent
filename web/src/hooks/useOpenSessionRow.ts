@@ -93,7 +93,8 @@ export function useOpenSessionRow(id: string | null): Conversation | null {
     queryKey: ["conversation-backfill", id],
     enabled: id !== null && listRow === undefined,
     staleTime: 30_000,
-    retry: false,
+    // A 404 resolves to null and is not retried; a failed request is.
+    retry: 2,
     queryFn: async () => {
       const fetched = await fetchConversationById(id as string);
       // The detail response has no owner, so keep the one a remembered list row gave.
