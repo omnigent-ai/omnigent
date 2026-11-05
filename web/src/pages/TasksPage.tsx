@@ -16,6 +16,7 @@ import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { showToast } from "@/components/ui/toast";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
@@ -33,7 +34,7 @@ import {
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
@@ -171,7 +172,20 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function handleRunNow(task: ScheduledTask) {
-    runNowMutation.mutate(task.id);
+    runNowMutation.mutate(task.id, {
+      onSuccess: () => {
+        showToast(
+          "Run triggered, it will start shortly. Open automation details to check run history.",
+        );
+      },
+      onError: (err) => {
+        if (err instanceof ScheduledTaskApiError && err.status === 409) {
+          showToast("This run is already in progress");
+        } else {
+          showToast("Couldn't start the run");
+        }
+      },
+    });
   }
 
   function handleEdit(task: ScheduledTask) {
@@ -418,7 +432,7 @@ function TemplateGallery({
               key={template.id}
               type="button"
               aria-label={template.title}
-              aria-describedby={`${detailsId}-description ${detailsId}-schedule ${detailsId}-requirements`}
+              aria-describedby={`${detailsId}-description ${detailsId}-requirements`}
               onClick={() => onPick(template.id)}
               data-testid={template.testId}
               className="flex cursor-pointer items-start gap-4 rounded-xl p-4 text-left text-ui transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -430,13 +444,6 @@ function TemplateGallery({
                 <span className="font-medium">{template.title}</span>
                 <span id={`${detailsId}-description`} className="text-muted-foreground">
                   {template.description}
-                </span>
-                <span
-                  id={`${detailsId}-schedule`}
-                  className="flex items-center gap-2 text-muted-foreground"
-                >
-                  <ClockIcon className="size-4 shrink-0" />
-                  Checks every hour
                 </span>
                 <span id={`${detailsId}-requirements`} className="text-xs text-muted-foreground">
                   {template.needs}

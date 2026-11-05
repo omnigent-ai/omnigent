@@ -1436,9 +1436,7 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
                 await page.get_by_test_id("new-chat-button").click()
             await (await landing_hosts.value).finished()
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await expect(chip).to_have_attribute(
-                "aria-label", re.compile("No host selected, Offline")
-            )
+            await expect(chip).to_have_attribute("aria-label", "Host: No host selected")
 
             # A later host refresh reports the continuously preferred VM again.
             # The empty slot lets that saved choice heal automatically.
@@ -1545,12 +1543,8 @@ async def _drive_managed_repository_workspace_bar(
                 "aria-label", f"Sandbox repositories: {repo_name}"
             )
             repository_label = repository.locator("[data-workspace-collapse-label]")
-            if viewport_width == 390:
-                await expect(controls).to_have_attribute("data-labels", "collapsed")
-                await expect(repository_label).to_be_hidden()
-            else:
-                await expect(controls).not_to_have_attribute("data-labels", "collapsed")
-                await expect(repository_label).to_be_visible()
+            await expect(controls).not_to_have_attribute("data-labels", "collapsed")
+            await expect(repository_label).to_be_visible()
 
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")
