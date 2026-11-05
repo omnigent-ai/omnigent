@@ -109,7 +109,7 @@ interface PendingInputWire {
 
 interface FailedInputWire extends PendingInputWire {
   position: number;
-  item_id?: string;
+  item_id: string;
 }
 
 const MAX_FAILED_INPUT_PAGES = 10;
@@ -1338,7 +1338,7 @@ export async function listFailedInputs(
     .sort((a, b) => a.position - b.position)
     .map((entry) => ({
       ...pendingInputFromWire(entry),
-      ...(entry.item_id !== undefined ? { itemId: entry.item_id } : {}),
+      itemId: entry.item_id,
     }));
 }
 

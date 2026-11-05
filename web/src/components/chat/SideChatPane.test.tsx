@@ -1893,7 +1893,7 @@ it.each([
     vi.spyOn(sessionsApi, "listFailedInputs").mockResolvedValue([
       {
         pendingId: "pending_first",
-        ...(unanswered ? { itemId: "stable_reload" } : {}),
+        itemId: unanswered ? "stable_reload" : "item_first",
         content: [{ type: "input_text", text: "saved on server" }],
       },
     ]);

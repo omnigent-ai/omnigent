@@ -104,7 +104,7 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   } else {
     const held = sessionDrafts.get(conversationId);
     const { startupInputIds = held?.startupInputIds, sentAs = held?.sentAs, ...rest } = draft;
-    // Omitted lists keep the held ids; an explicit [] clears them, and empty lists aren't stored.
+    // Composer edits omit the lists, so held ids survive typing until the draft clears.
     sessionDrafts.set(conversationId, {
       ...rest,
       ...(startupInputIds?.length ? { startupInputIds } : {}),

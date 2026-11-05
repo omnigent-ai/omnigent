@@ -8248,9 +8248,7 @@ function unreturnedStartupInputs(
 /** Pending ids of the inputs saved under sends' stable ids, e.g. ones from the unanswered-send journal. */
 function inputsSentAs(inputs: FailedInput[], stableIds: readonly (string | null)[]): string[] {
   const ids = new Set(stableIds.filter((id) => id !== null));
-  return inputs
-    .filter((input) => input.itemId !== undefined && ids.has(input.itemId))
-    .map((input) => input.pendingId);
+  return inputs.filter((input) => ids.has(input.itemId)).map((input) => input.pendingId);
 }
 
 /**

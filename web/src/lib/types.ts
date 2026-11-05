@@ -76,8 +76,8 @@ export interface PendingInput {
 
 /** A startup input a failed managed launch couldn't deliver. */
 export interface FailedInput extends PendingInput {
-  /** The saved item's id, a follow-up's `stable_id`. Absent from older servers. */
-  itemId?: string;
+  /** The saved item's id, a follow-up's `stable_id`. */
+  itemId: string;
 }
 
 /** Token usage statistics for a completed response. */
