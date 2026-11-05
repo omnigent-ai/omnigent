@@ -117,10 +117,11 @@ def test_automation_sandbox_repository(
         expect(repository).to_have_text("Provider default")
 
 
-@pytest.mark.parametrize("trigger", [False, True], ids=["scheduled", "trigger"])
+@pytest.mark.parametrize("prompt_kind", ["scheduled", "trigger", "custom-trigger"])
 def test_reused_automation_explains_locked_settings(
-    page: Page, browser_contract: BrowserContract, trigger: bool
+    page: Page, browser_contract: BrowserContract, prompt_kind: str
 ) -> None:
+    trigger = prompt_kind != "scheduled"
     with contextmanager(chat_session_handle)(page, browser_contract) as chat:
         contract = browser_contract
         chat.harness = "claude-native"
@@ -141,6 +142,8 @@ def test_reused_automation_explains_locked_settings(
             if trigger
             else "Summarize changes."
         )
+        if prompt_kind == "custom-trigger":
+            prompt += "\n\nInstructions for each session:\nExtra heading."
         task = {
             "id": "settings-automation",
             "name": "Repository maintenance",
@@ -178,7 +181,15 @@ def test_reused_automation_explains_locked_settings(
         if trigger:
             expect(note).to_contain_text("each match starts a new worker")
             page.get_by_role("button", name="Edit worker instructions", exact=True).click()
-            expect(page.get_by_role("textbox", name="System prompt", exact=True)).to_be_focused()
+            editor = page.get_by_role(
+                "textbox",
+                name="Prompt" if prompt_kind == "custom-trigger" else "System prompt",
+                exact=True,
+            )
+            expect(editor).to_be_focused()
+            page.get_by_test_id("task-name-input").click()
+            page.get_by_role("button", name="Edit worker instructions", exact=True).click()
+            expect(editor).to_be_focused()
         else:
             expect(
                 page.get_by_role("button", name="Edit worker instructions", exact=True)

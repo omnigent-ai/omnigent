@@ -1621,6 +1621,9 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       expect(screen.getByTestId("task-session-settings-note")).toHaveTextContent(
         "This automation continues in an existing session, so its model, effort, and permission mode are controlled by that session.",
       );
+      expect(
+        screen.queryByRole("button", { name: "Edit worker instructions" }),
+      ).not.toBeInTheDocument();
       fireEvent.change(screen.getByTestId("task-prompt-input"), {
         target: { value: "Updated prompt" },
       });
@@ -2791,11 +2794,24 @@ describe("editing template prompts", () => {
         <CreateScheduledTaskDialog
           open
           {...props}
-          editingTask={scheduledTask({ prompt: saved })}
+          editingTask={scheduledTask({
+            prompt: saved,
+            agentId: "ag_claude_native",
+            sessionMode: "continue",
+            sessionId: "conv_1",
+          })}
         />,
       );
       expect(screen.getByRole("textbox", { name: "Prompt" })).toHaveValue(saved);
       expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
+      if (removeSignature) {
+        expect(
+          screen.queryByRole("button", { name: "Edit worker instructions" }),
+        ).not.toBeInTheDocument();
+      } else {
+        fireEvent.click(screen.getByRole("button", { name: "Edit worker instructions" }));
+        expect(screen.getByRole("textbox", { name: "Prompt" })).toHaveFocus();
+      }
     },
   );
 
