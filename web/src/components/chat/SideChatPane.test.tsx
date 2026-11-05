@@ -1475,6 +1475,7 @@ describe("history a side chat copied from its parent", () => {
       rerender(<SideChatPane childId={childId} />);
 
       expect(screen.getByText("A new side-chat turn")).toBeInTheDocument();
+      expect(screen.queryByText("Copied reply")).toBeNull();
       const saved = localStorage.getItem(`omnigent.sideChatInherited:${childId}`);
       expect(saved === null ? null : JSON.parse(saved)).toEqual(failed ? null : [copied.id]);
       if (failed) {
@@ -1486,6 +1487,25 @@ describe("history a side chat copied from its parent", () => {
       }
     },
   );
+
+  it("uses a saved legacy boundary when the snapshot fails", () => {
+    failedSession.id = childId;
+    localStorage.setItem(`omnigent.sideChatInherited:${childId}`, '["legacy_copy"]');
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      loadingConversation: false,
+      blocks: itemsToBlocks([
+        userItem("legacy_copy", "resp_copy", "Copied reply"),
+        userItem("item_side", "resp_side", "A saved side-chat turn"),
+      ]),
+    });
+
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied reply")).toBeNull();
+    expect(screen.getByText("A saved side-chat turn")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBe('["legacy_copy"]');
+  });
 
   it("leaves a listed Codex side chat's own transcript alone", () => {
     listSideChat();

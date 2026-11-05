@@ -123,6 +123,20 @@ def test_an_attachment_never_reads_as_a_side_command() -> None:
     assert side_chat.side_chat_question_from_content([attachment]) is None
 
 
+@pytest.mark.parametrize("attachment_type", ["input_file", "input_image", "image"])
+def test_side_command_rejects_attachments(attachment_type: str) -> None:
+    from omnigent.errors import OmnigentError
+
+    attachment = {"type": attachment_type, "file_id": "attached-file"}
+    with pytest.raises(OmnigentError, match="attachments") as error:
+        side_chat.side_chat_question_from_content([*_text_items("/side explain this"), attachment])
+    assert error.value.http_status == 400
+    assert (
+        side_chat.side_chat_question_from_content([*_text_items("explain this"), attachment])
+        is None
+    )
+
+
 # --------------------------------------------------------------------------- #
 # fork_ephemeral_side_thread / submit_side_turn / open_side_chat_on_client
 # --------------------------------------------------------------------------- #

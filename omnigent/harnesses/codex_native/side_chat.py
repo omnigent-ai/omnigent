@@ -41,6 +41,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from omnigent.errors import ErrorCode, OmnigentError
+
 if TYPE_CHECKING:  # runtime imports are lazy to avoid a forwarder<->side_chat cycle
     import httpx
 
@@ -128,8 +130,22 @@ def side_chat_question_from_content(content: object) -> str | None:
     :param content: A message body's ``content`` list, e.g.
         ``[{"type": "input_text", "text": "/side why?"}]``.
     :returns: The question, or ``None`` when the message is not a ``/side`` command.
+    :raises OmnigentError: A ``/side`` command includes unsupported attachments.
     """
-    return side_chat_question_from_text(side_chat_text_from_content(content).lstrip())
+    question = side_chat_question_from_text(side_chat_text_from_content(content).lstrip())
+    if (
+        question is not None
+        and isinstance(content, list)
+        and any(
+            not isinstance(block, dict) or block.get("type") not in {"text", "input_text"}
+            for block in content
+        )
+    ):
+        raise OmnigentError(
+            "Codex /side doesn't support attachments. Remove the attachments and try again.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return question
 
 
 def is_side_chat_child(labels: Mapping[str, str] | None) -> bool:

@@ -7146,11 +7146,12 @@ def create_runner_app(
             # and the chat would sit on "Working…" for good.
             from omnigent.harnesses.codex_native import side_chat as _side_chat
 
-            _side_question = _side_chat.side_chat_question_from_content(body.get("content"))
-            if (
-                _side_question is not None
-                and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
-            ):
+            _side_question = (
+                _side_chat.side_chat_question_from_content(body.get("content"))
+                if _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
+                else None
+            )
+            if _side_question is not None:
                 _side_chat.request_side_chat(
                     await _codex_native_bridge_dir_for_session(conversation_id),
                     _side_question,

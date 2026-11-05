@@ -917,7 +917,11 @@ def _legacy_side_chat_attachment(
             ) from exc
     if any(
         block.get("type") == "input_image"
-        or (block.get("type") in {"text", "input_text"} and block.get("text"))
+        or (
+            block.get("type") in {"text", "input_text"}
+            and isinstance(block.get("text"), str)
+            and block["text"]
+        )
         for block in blocks
     ):
         return False
@@ -1318,6 +1322,7 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        opens_codex_side_chat = body.type == "message" and _opens_codex_side_chat(conv, body)
         if (
             body.type == "message"
             and isinstance(request, Request)
@@ -1330,7 +1335,7 @@ def register_events_routes(
                 permission_store=permission_store,
             )
             and (
-                _opens_codex_side_chat(conv, body)
+                opens_codex_side_chat
                 or await asyncio.to_thread(
                     _legacy_side_chat_attachment,
                     body.data.get("content"),

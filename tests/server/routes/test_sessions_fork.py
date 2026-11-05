@@ -7,6 +7,7 @@ shape using minimal real-type stubs — no MagicMock.
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -815,6 +816,32 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         headers=headers[editor],
     )
     assert attached.status_code == 403, attached.text
+    malformed = json.loads(attached.request.content)
+    malformed["data"]["content"].insert(0, {"type": "input_text", "text": True})
+    refused = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events", json=malformed, headers=headers[editor]
+    )
+    assert refused.status_code == 403, refused.text
+    assert await _side_chat_ids(auth_client, parent.id, headers=headers[owner]) == set()
+
+    # Reject before forwarding, including when the owner's runner is older.
+    for attachment in (
+        {"type": "input_file", "file_id": "unresolved-file"},
+        {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+    ):
+        refused = await auth_client.post(
+            f"/v1/sessions/{parent.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "/side explain this"}, attachment],
+                },
+            },
+            headers=headers[owner],
+        )
+        assert refused.status_code == 400, refused.text
+        assert "attachments" in refused.json()["error"]["message"]
     uploaded = await auth_client.post(
         f"/v1/sessions/{parent.id}/resources/files",
         files={"file": ("note.txt", b"/side why?", "text/plain")},

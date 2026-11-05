@@ -229,10 +229,8 @@ export function SideChatPane({
   // A newer side chat's copied items have ids starting with its own id's first 12
   // characters, so every device hides exactly the copied history; older ones use
   // this browser's snapshot.
-  const copiedIdPrefix = session?.sideChatParentId
-    ? childId.slice(0, SIDE_CHAT_COPY_ID_PREFIX_LEN)
-    : undefined;
-  // Until the snapshot says which rule applies, show nothing and capture nothing.
+  const copiedIdPrefix = childId.slice(0, SIDE_CHAT_COPY_ID_PREFIX_LEN);
+  // Until the snapshot says which rule applies, show nothing and persist nothing.
   const awaitingRule = filterHistory && !pending && sessionLoading;
   const useLocalBoundary =
     filterHistory &&
@@ -240,7 +238,7 @@ export function SideChatPane({
     !sessionLoading &&
     !sessionError &&
     session !== null &&
-    copiedIdPrefix === undefined;
+    !session.sideChatParentId;
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
@@ -255,7 +253,7 @@ export function SideChatPane({
   if (boundaryRef.current === null || boundaryRef.current.childId !== childId) {
     boundaryRef.current = { childId, ids: undefined, loadSeen: false, loadedIds: null };
   }
-  if (useLocalBoundary && boundaryRef.current.ids === undefined) {
+  if (filterHistory && !pending && boundaryRef.current.ids === undefined) {
     boundaryRef.current.ids = readInheritedBoundary(childId);
   }
   if (loadingConversation) boundaryRef.current.loadSeen = true;
@@ -282,20 +280,14 @@ export function SideChatPane({
     boundaryRef.current.ids = boundaryRef.current.loadedIds;
     writeInheritedBoundary(childId, boundaryRef.current.ids);
   }
-  const inherited = boundaryRef.current.ids ?? null;
+  const inherited = session?.sideChatParentId ? null : (boundaryRef.current.ids ?? null);
   const visibleBlocks = useMemo(() => {
     if (awaitingRule) return [];
-    if (filterHistory && copiedIdPrefix !== undefined) {
-      return blocks.filter(
-        (b) => !((b as CopiedBlock).ctx?.itemId ?? "").startsWith(copiedIdPrefix),
-      );
-    }
-    return inherited === null
-      ? blocks
-      : blocks.filter((b) => {
-          const id = (b as CopiedBlock).ctx?.itemId;
-          return !(typeof id === "string" && inherited.has(id));
-        });
+    if (!filterHistory) return blocks;
+    return blocks.filter((b) => {
+      const id = (b as CopiedBlock).ctx?.itemId;
+      return !(typeof id === "string" && (id.startsWith(copiedIdPrefix) || inherited?.has(id)));
+    });
   }, [blocks, inherited, filterHistory, copiedIdPrefix, awaitingRule]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
