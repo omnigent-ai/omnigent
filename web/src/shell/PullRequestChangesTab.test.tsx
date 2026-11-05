@@ -20,6 +20,12 @@ import {
   writeViewed,
   type PullRequestIdentity,
 } from "@/lib/pullRequestViewed";
+import type { Comment } from "@/hooks/useComments";
+import {
+  requestLocalReviewNavigation,
+  consumeLocalReviewNavigation,
+  useLocalReviewNavigation,
+} from "@/lib/localReviewContext";
 import type * as SonnerModule from "sonner";
 import { PullRequestChangesTab } from "./PullRequestChangesTab";
 import { useChangesViewState } from "./useChangesViewState";
@@ -57,6 +63,17 @@ const mocks = vi.hoisted(() => ({
     head_sha: string;
     base_sha: string;
   },
+}));
+const comments = vi.hoisted(() => ({ data: [] as Comment[] }));
+vi.mock("@/hooks/useComments", () => ({
+  useComments: () => ({ data: comments.data, isSuccess: true, isFetching: false }),
+}));
+vi.mock("./LocalReviewComment", () => ({
+  LocalReviewComment: ({ comment }: { comment: Comment }) => (
+    <section data-local-review-comment={comment.id} tabIndex={-1}>
+      {comment.body}
+    </section>
+  ),
 }));
 vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
@@ -183,6 +200,7 @@ function renderTab({
   listing = {},
   commitHistory = false,
   headRepositoryUrl,
+  loading = false,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
@@ -194,8 +212,10 @@ function renderTab({
   commitHistory?: boolean;
   /** A GitHub head repository, so files can be opened on GitHub. */
   headRepositoryUrl?: string;
+  loading?: boolean;
 }) {
   const prUrl = prUrlFor(conversationId);
+  let patchLoading = loading;
   const tabProps = (current: string) =>
     ({
       conversationId,
@@ -216,7 +236,11 @@ function renderTab({
       canEdit: false,
       selected: true,
       changes: { data: { available: true, data: files, ...listing } },
-      prDiff: { data: { head_sha: "head", base_sha: "base", patch: current }, isLoading: false },
+      prDiff: {
+        data: { head_sha: "head", base_sha: "base", patch: current },
+        isLoading: patchLoading,
+        isFetching: patchLoading,
+      },
       reviews: {
         page: { data: threads, head_sha: "head", base_sha: "base" },
         isFetching: false,
@@ -232,7 +256,12 @@ function renderTab({
     </TooltipProvider>
   );
   const result = render(element(patch));
-  return { rerender: (next: string) => result.rerender(element(next)) };
+  return {
+    rerender: (next: string, pending = false) => {
+      patchLoading = pending;
+      result.rerender(element(next));
+    },
+  };
 }
 
 const findInput = () => screen.getByRole("textbox", { name: "Find in changes" });
@@ -252,8 +281,50 @@ const sectionHeader = (path: string, expanded: boolean) =>
 
 describe("PullRequestChangesTab", () => {
   afterEach(() => {
+    comments.data = [];
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("waits for the patch before focusing a comment that moves from fallback to inline", async () => {
+    const conversationId = "local-comment-loading";
+    const comment = {
+      id: "local-comment",
+      conversation_id: conversationId,
+      path: "b.ts",
+      body: "Review this line",
+      status: "draft",
+      anchor_metadata: {
+        pr_url: prUrlFor(conversationId),
+        side: "RIGHT",
+        line: 2,
+        start_line: null,
+        head_sha: "head",
+        base_sha: "base",
+      },
+    } as Comment;
+    comments.data = [comment];
+    vi.spyOn(Element.prototype, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    const navigation = renderHook(() => useLocalReviewNavigation(conversationId));
+    const tab = renderTab({ conversationId, patch: "", loading: true });
+    vi.useFakeTimers();
+    try {
+      act(() => requestLocalReviewNavigation(comment));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(navigation.result.current).toBe(comment);
+      expect(scroll).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+    tab.rerender(PATCH);
+    await waitFor(() =>
+      expect(diffOf("b.ts")?.querySelector("[data-local-review-comment]")).toHaveFocus(),
+    );
+    expect(navigation.result.current).toBeUndefined();
+    consumeLocalReviewNavigation(conversationId);
   });
 
   it("clears the path filter to navigate to a thread on a filtered-out file", () => {
