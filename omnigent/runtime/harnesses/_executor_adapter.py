@@ -101,6 +101,13 @@ _HARNESS_ALREADY_GONE_ERRORS = (TimeoutError, ConnectionError)
 _ORPHAN_RESYNC_THRESHOLD = 3
 
 
+def _executor_reap_timeout(executor: Executor) -> float:
+    """Keep ACP's response grace and process wait inside its outer reap budget."""
+    from omnigent.inner.acp_executor import ACP_REAP_TIMEOUT_SECONDS, AcpExecutor
+
+    return ACP_REAP_TIMEOUT_SECONDS if isinstance(executor, AcpExecutor) else INTERRUPT_TIMEOUT_S
+
+
 def _strip_mcp_tool_prefix(name: str) -> str:
     """Strip the ``mcp__{server}__`` prefix from a Claude SDK tool name.
 
@@ -670,7 +677,7 @@ class ExecutorAdapter(HarnessApp):
             return closed
 
         try:
-            return await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+            return await asyncio.wait_for(_reap(), timeout=_executor_reap_timeout(executor))
         except Exception:
             _logger.exception("abandoned executor teardown failed or timed out")
             return False
@@ -716,7 +723,7 @@ class ExecutorAdapter(HarnessApp):
                         await exc.close()
 
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(_close(), timeout=INTERRUPT_TIMEOUT_S)
+                    await asyncio.wait_for(_close(), timeout=_executor_reap_timeout(executor))
         finally:
             self._resyncing = False
 
