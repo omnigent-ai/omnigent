@@ -307,6 +307,59 @@ async def test_rewind_returns_the_prompt_attachments_as_the_fork_holds_them(
     assert contents == [b"\x89PNG fake", b"parser notes"]
 
 
+# A 1x1 PNG, as a session imported from another harness carries it inline.
+_INLINE_PNG = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+)
+
+
+@pytest.mark.parametrize("text", ["Look at this", None], ids=["text-and-image", "image-only"])
+async def test_rewind_returns_an_inline_image_from_the_prompt(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str | None,
+) -> None:
+    """An image the prompt carries inline, with no stored file, comes back too.
+
+    The client rebuilds the composer attachment from the data URI and uploads
+    it on send like any other attachment.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    content: list[dict[str, Any]] = [
+        {"type": "input_image", "image_url": _INLINE_PNG, "filename": "pasted.png"}
+    ]
+    if text is not None:
+        content.append({"type": "input_text", "text": text})
+    [prompt] = store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_3",
+                data=MessageData(role="user", content=content),
+            )
+        ],
+    )
+
+    resp = await client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": prompt.id})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["prompt"] == (text or "")
+    assert resp.json()["attachments"] == [
+        {
+            "type": "input_image",
+            "file_id": None,
+            "image_url": _INLINE_PNG,
+            "filename": "pasted.png",
+        }
+    ]
+
+
 async def test_rewind_still_returns_the_new_session_when_its_attachments_fail(
     client: httpx.AsyncClient,
     db_uri: str,
