@@ -27,7 +27,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any
 
 import anyio
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
@@ -289,8 +289,12 @@ def create_host_tunnel_router(
                 ):
                     try:
                         launcher = await asyncio.to_thread(sandbox_config.default.launcher_factory)
-                    except HTTPException:
-                        pass
+                    except Exception:
+                        _logger.debug(
+                            "Cannot resolve sandbox provider for host %s; skipping token renewal",
+                            host_id,
+                            exc_info=True,
+                        )
                     else:
                         if launcher.provider == managed.sandbox_provider:
                             provider_config = sandbox_config.default

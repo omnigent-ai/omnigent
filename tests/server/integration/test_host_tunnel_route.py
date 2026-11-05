@@ -1760,7 +1760,14 @@ async def test_managed_heartbeat_renews_only_when_due_and_retries_failure(
 
 @pytest.mark.parametrize(
     ("provider", "launcher_provider"),
-    [(None, "modal"), (None, "daytona"), (None, None), ("modal", "modal"), ("daytona", "daytona")],
+    [
+        (None, "modal"),
+        (None, "daytona"),
+        (None, None),
+        (None, "broken"),
+        ("modal", "modal"),
+        ("daytona", "daytona"),
+    ],
 )
 async def test_managed_heartbeat_renews_token_for_reconnect(
     db_uri: str,
@@ -1783,6 +1790,8 @@ async def test_managed_heartbeat_renews_token_for_reconnect(
     def launcher_factory() -> FakeSandboxLauncher:
         if launcher_provider is None:
             raise HTTPException(status_code=400, detail="provider unavailable")
+        if launcher_provider == "broken":
+            raise ValueError("invalid launcher configuration")
         return launcher
 
     config = ManagedSandboxConfig(
