@@ -4631,6 +4631,11 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       });
       const sending = useChatStore.getState().send("follow up", "agent_xyz");
       await vi.waitFor(() => expect(answer).toBeDefined());
+      // A newer identical send no receipt named yet, the only kind matched by text.
+      const newerSend: PendingUserMessage = { tempId: "pend_newer", content, posted: true };
+      useChatStore.setState((s) => ({
+        pendingUserMessages: [...s.pendingUserMessages, newerSend],
+      }));
 
       sessionLabels.set("conv_real", { "omnigent.startup": "failed", ...native });
       sessionFailedInputs.set("conv_real", [
@@ -4650,11 +4655,12 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
         recovered: true,
       };
       expect(useChatStore.getState().failedSendDraft).toEqual(recovered);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([othersBubble, newerSend]);
       answer!();
       await sending;
 
       expect(useChatStore.getState().failedSendDraft).toEqual(recovered);
-      expect(useChatStore.getState().pendingUserMessages).toEqual([othersBubble]);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([othersBubble, newerSend]);
       expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
     },
   );

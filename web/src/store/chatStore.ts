@@ -1766,13 +1766,20 @@ interface SendChain {
 const sendChains = new Map<string | symbol, SendChain>();
 
 /**
- * Sends whose POST has not settled, by stable id, flagged `true` once a live
- * `session_input_consumed` named the id or a failed launch's recovery read it back.
- * Read by `send()`'s failure path: either proves THIS attempt was taken even when
- * the POST's answer is lost and an earlier refused attempt's item already sits in
- * the transcript.
+ * Sends whose POST has not settled, by stable id, with their bubble's temp id;
+ * `taken` once a live `session_input_consumed` named the id or a failed launch's
+ * recovery read it back. Read by `send()`'s failure path: either proves THIS
+ * attempt was taken even when the POST's answer is lost and an earlier refused
+ * attempt's item already sits in the transcript.
  */
-const inFlightSends = new Map<string, boolean>();
+const inFlightSends = new Map<string, { tempId: string; taken: boolean }>();
+
+/** Flag a send awaiting its answer as taken, returning its bubble's temp id. */
+function takeInFlightSend(stableId: string): string | undefined {
+  const send = inFlightSends.get(stableId);
+  if (send !== undefined) send.taken = true;
+  return send?.tempId;
+}
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -2892,7 +2899,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
     };
 
-    inFlightSends.set(stableId, false);
+    inFlightSends.set(stableId, { tempId, taken: false });
     try {
       await waitForPrior();
       if (initialDraft && !initialSendPending()) return;
@@ -3091,7 +3098,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
       // A live `session_input_consumed` for this very attempt proves the runner
       // took it, whatever became of the POST's answer.
-      let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
+      let deliveredDespiteFailure = inFlightSends.get(stableId)?.taken === true;
       let unsettled = false;
       if (
         !deliveredDespiteFailure &&
@@ -3107,7 +3114,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         const verdict = await sendVerdictFromServer(draftSessionId, stableId);
         // The acknowledgement may have landed while that fetch was out; it
         // outranks whatever the fetch said or failed to say.
-        if (inFlightSends.get(stableId) === true) deliveredDespiteFailure = true;
+        if (inFlightSends.get(stableId)?.taken === true) deliveredDespiteFailure = true;
         else if (verdict === "refused") serverRefused = true;
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
@@ -8011,6 +8018,7 @@ function settleReplacedStartupInputs(
  * @param failedInputs - The viewer's inputs the server holds as failed.
  * @param unacknowledged - Bubbles of the viewer's sends no server receipt named
  *   when the read began, the only ones matched by text.
+ * @param sending - Bubbles of sends awaiting their answer, by temp id, with the input each was saved as.
  * @param adopted - Inputs the entry took as returned from a reload's draft or an evicted entry.
  * @returns The state patch, empty when nothing is left to hand back.
  */
@@ -8029,6 +8037,7 @@ function returnFailedStartupInputs(
   >,
   failedInputs: FailedInput[],
   unacknowledged: ReadonlySet<string>,
+  sending: ReadonlyMap<string, string>,
   adopted: ReadonlySet<string> = new Set(),
 ): Partial<ConversationState> {
   const unreturned = unreturnedStartupInputs(state, failedInputs);
@@ -8098,9 +8107,10 @@ function returnFailedStartupInputs(
   );
   // A draft holding an input's text leaves its bubble, which only its server id can match.
   const pendingUserMessages = withoutFailedStartupBubbles(
-    withoutFailedStartupBubbles(state.pendingUserMessages, inputs, unacknowledged),
+    withoutFailedStartupBubbles(state.pendingUserMessages, inputs, unacknowledged, sending),
     failedInputs,
     new Set(),
+    sending,
   );
   const patch: Partial<ConversationState> = {
     ...(blocks.length === state.blocks.length && attachments === null ? {} : { blocks }),
@@ -8138,6 +8148,7 @@ function handBackFailedStartupInputs(
   conversationId: string,
   failedInputs: FailedInput[],
   unacknowledged: ReadonlySet<string>,
+  sending: ReadonlyMap<string, string>,
 ): void {
   const state = entry.getState();
   const unreturned = unreturnedStartupInputs(state, failedInputs);
@@ -8160,7 +8171,14 @@ function handBackFailedStartupInputs(
   const adopted = adoptedStartupInputs.get(entry);
   adoptedStartupInputs.delete(entry);
   entrySetter(entry)((current) =>
-    returnFailedStartupInputs(conversationId, current, failedInputs, unacknowledged, adopted),
+    returnFailedStartupInputs(
+      conversationId,
+      current,
+      failedInputs,
+      unacknowledged,
+      sending,
+      adopted,
+    ),
   );
   // The composer holding a send's text names its inputs, and a reload knows its saved draft's as returned.
   if (sideChat && inSideChat.length > 0)
@@ -8323,21 +8341,25 @@ function unacknowledgedSends(pending: PendingUserMessage[]): Set<string> {
 
 /**
  * Drop the bubbles still showing failed startup inputs as sending. A bubble
- * matches its input's pending id; one with no id yet is matched by text, one
- * bubble per input, since its attachments carry local ids.
+ * matches its input's pending id, or a send awaiting its answer the input it was
+ * saved as; one with no id yet is matched by text, one bubble per input, since
+ * its attachments carry local ids.
  *
  * @param pending - The bubbles to filter.
  * @param inputs - The failed inputs.
  * @param unacknowledged - The bubbles that may match by text.
+ * @param sending - Bubbles of sends awaiting their answer, by temp id, with the input each was saved as.
  * @returns The remaining bubbles.
  */
 function withoutFailedStartupBubbles(
   pending: PendingUserMessage[],
   inputs: PendingInput[],
   unacknowledged: ReadonlySet<string>,
+  sending: ReadonlyMap<string, string>,
 ): PendingUserMessage[] {
   // Snapshot-replayed bubbles carry the server id as their tempId.
-  const bubbleId = (message: PendingUserMessage) => message.pendingId ?? message.tempId;
+  const bubbleId = (message: PendingUserMessage) =>
+    message.pendingId ?? sending.get(message.tempId) ?? message.tempId;
   const shown = new Set(pending.map(bubbleId));
   const failedIds = new Set(inputs.map((input) => input.pendingId));
   const unmatchedTexts = inputs
@@ -8496,9 +8518,12 @@ async function lookUpFailedStartupInputs(
   lookup.read();
   forgetUnsentSendSavedAsFailed(conversationId, inputs);
   // A send awaiting its answer that the server saved is handed back here, so its failure isn't.
-  for (const { itemId } of inputs)
-    if (itemId !== undefined && inFlightSends.has(itemId)) inFlightSends.set(itemId, true);
-  handBackFailedStartupInputs(entry, conversationId, inputs, unacknowledged);
+  const sending = new Map<string, string>();
+  for (const { itemId, pendingId } of inputs) {
+    const tempId = itemId === undefined ? undefined : takeInFlightSend(itemId);
+    if (tempId !== undefined) sending.set(tempId, pendingId);
+  }
+  handBackFailedStartupInputs(entry, conversationId, inputs, unacknowledged, sending);
   return true;
 }
 
@@ -9484,7 +9509,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt,
       // and drop the send's failure card.
-      if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
+      takeInFlightSend(event.itemId);
       applyToConversation((s) => {
         const committedIds = new Set([event.itemId]);
         // A late copy of an item already shown is not a new message.
