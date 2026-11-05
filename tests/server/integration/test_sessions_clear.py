@@ -20,6 +20,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -27,11 +28,16 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
-from sqlalchemy import update
+from sqlalchemy import select, update
 from starlette.datastructures import Headers
 
 import omnigent.runtime
-from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+from omnigent.db.db_models import (
+    SqlAgent,
+    SqlConversation,
+    SqlConversationMetadata,
+    current_workspace_id,
+)
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
@@ -802,24 +808,56 @@ async def test_a_cancelled_clear_request_still_finishes_the_move(
     assert resumed.status_code < 300, resumed.text
 
 
+def _agent_ids(db_uri: str) -> set[str]:
+    """Every agent row in the workspace, session copies included."""
+    with get_or_create_engine(db_uri).connect() as connection:
+        rows = connection.execute(
+            select(SqlAgent.id).where(SqlAgent.workspace_id == current_workspace_id())
+        )
+        return {row.id for row in rows}
+
+
+def _stored_files(root: Path) -> list[Path]:
+    """Every file in a local artifact store; deletes leave empty folders."""
+    return sorted(path for path in root.rglob("*") if path.is_file())
+
+
+@pytest.mark.parametrize("agent_owner", ["caller", "another_user"])
 async def test_a_continuation_that_cannot_be_shared_leaves_no_host_reference(
     auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
     db_uri: str,
     auth_live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    agent_owner: str,
 ) -> None:
     """A failure right after the new session is written still removes it.
 
     Granting the new session its sharing fails; the clear then deletes it, so
     nothing but the original holds the managed sandbox, and deleting the
-    original still tears the sandbox down.
+    original still tears the sandbox down. When the session runs another
+    user's agent, the clear made the caller their own copy of it; that copy
+    and its bundle go too.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     host_store, launcher = install_managed_sandbox(auth_app, db_uri, monkeypatch)
     source_id = await create_placed_session(auth_client, store, user=_OWNER)
     owner = {"X-Forwarded-Email": _OWNER}
+    if agent_owner == "another_user":
+        shared_agent = await create_test_agent(auth_client, name="shared-agent", user=_EDITOR)
+        with get_or_create_engine(db_uri).begin() as connection:
+            connection.execute(
+                update(SqlConversation)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == source_id,
+                )
+                .values(agent_id=shared_agent["id"])
+            )
+    agents_before = _agent_ids(db_uri)
+    bundles_before = _stored_files(tmp_path / "artifacts")
     grant = SqlAlchemyPermissionStore.grant
 
     def grant_on_the_original_only(self: Any, user_id: str, session_id: str, level: int) -> Any:
@@ -839,6 +877,9 @@ async def test_a_continuation_that_cannot_be_shared_leaves_no_host_reference(
         for conv in store.list_conversations(limit=100, kind=None).data
         if conv.host_id == _HOST_ID
     ] == [source_id]
+    # No copied agent, nor its bundle, outlives the failed clear.
+    assert _agent_ids(db_uri) == agents_before
+    assert _stored_files(tmp_path / "artifacts") == bundles_before
     assert auth_live_runner.superseded == []
     deleted = await auth_client.delete(f"/v1/sessions/{source_id}", headers=owner)
     assert deleted.status_code == 200, deleted.text

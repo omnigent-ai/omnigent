@@ -609,6 +609,38 @@ def register_core_routes(
                         await asyncio.to_thread(artifact_store.delete, blob_key)
         await conversation_store.delete_conversation(session_id)
 
+    async def _unreturned_fork_agent_copy(
+        fork_id: str, source_agent_id: str | None
+    ) -> Agent | None:
+        """The agent copy a failed fork was given in place of its source's agent."""
+        try:
+            fork = await asyncio.to_thread(conversation_store.get_conversation, fork_id)
+            if fork is None or fork.agent_id is None or fork.agent_id == source_agent_id:
+                return None
+            return await asyncio.to_thread(agent_store.get, fork.agent_id)
+        except Exception:
+            _logger.exception("Failed to look up rejected fork's agent copy")
+            return None
+
+    async def _delete_unreturned_agent_copy(
+        session_id: str, agent_id: str, bundle_location: str | None
+    ) -> None:
+        """Remove the agent copy a failed fork made, once its session is gone."""
+        try:
+            # Keep the copy if session rollback failed and still references it.
+            if (
+                await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                is not None
+            ):
+                return
+            await asyncio.to_thread(agent_store.delete, agent_id)
+            if bundle_location is not None and artifact_store is not None:
+                await asyncio.to_thread(
+                    _delete_stored_session_bundle_after_failure, artifact_store, bundle_location
+                )
+        except Exception:
+            _logger.exception("Failed to remove rejected fork's agent copy")
+
     async def _schedule_managed_launch(
         request: Request,
         *,
@@ -4519,17 +4551,8 @@ def register_core_routes(
         try:
             await record_profile(request, new_conv.id, sandbox_profile, conversation_store)
         except Exception:
-            if clone_location is not None and agent_store is not None:
-                try:
-                    # Keep the copy if session rollback failed and still references it.
-                    if (
-                        await asyncio.to_thread(conversation_store.get_conversation, new_conv.id)
-                        is None
-                    ):
-                        await asyncio.to_thread(agent_store.delete, fork_agent_id)
-                        await drop_unused_copy()
-                except Exception:
-                    _logger.exception("Failed to remove rejected fork's agent copy")
+            if clone_location is not None:
+                await _delete_unreturned_agent_copy(new_conv.id, fork_agent_id, clone_location)
             raise
 
         # Create the fork-owned rows the rewritten items now reference —
@@ -4894,7 +4917,12 @@ def register_core_routes(
                         await _release_unreturned_runner_session(
                             fork_id, dataclasses.replace(source, id=fork_id)
                         )
+                    agent_copy = await _unreturned_fork_agent_copy(fork_id, source.agent_id)
                     await _delete_unreturned_session(fork_id)
+                    if agent_copy is not None:
+                        await _delete_unreturned_agent_copy(
+                            fork_id, agent_copy.id, agent_copy.bundle_location
+                        )
                     await _release_unreturned_fork_host(
                         request, source.host_id if host_bound else None
                     )
