@@ -113,6 +113,7 @@ async function launchThisMachineDesktop({ backend, scratch, recordDir, preload =
     // The caller only cleans up a desktop this helper returns.
     await desktop.electronApp.close().catch(() => {});
     await desktop.stopDisplayCapture();
+    fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
     throw error;
   }
   return {
@@ -833,6 +834,11 @@ it(
       response.writeHead(200, { "Content-Type": "text/plain" });
       response.end("served by the proxy");
     });
+    // Proxied WebSockets tunnel with CONNECT.
+    proxyFixture.on("connect", (request, socket) => {
+      proxyRequests.push(`CONNECT ${request.url}`);
+      socket.destroy();
+    });
     await new Promise((resolve) => {
       proxyFixture.listen(0, "127.0.0.1", resolve);
     });
@@ -908,19 +914,21 @@ it(
       );
       // Dev servers push hot reloads over a WebSocket on the same host.
       const socketUrl = `ws://${devHost}/hmr`;
-      const echo = await electronApp.evaluate(
-        async (_electron, { id, url }) =>
-          global.omnigentTestBrowserRegistries[0].get(id).view.webContents.executeJavaScript(`
-            new Promise((resolve) => {
-              const socket = new WebSocket(${JSON.stringify(url)});
-              const timeout = setTimeout(() => resolve("timed out"), 10000);
-              socket.onopen = () => socket.send("hmr-ping");
-              socket.onmessage = (event) => { clearTimeout(timeout); resolve(event.data); };
-              socket.onerror = () => { clearTimeout(timeout); resolve("failed"); };
-            })
-          `),
-        { id: addressView.id, url: socketUrl },
-      );
+      const socketEcho = (viewId, url) =>
+        electronApp.evaluate(
+          async (_electron, { id, wanted }) =>
+            global.omnigentTestBrowserRegistries[0].get(id).view.webContents.executeJavaScript(`
+              new Promise((resolve) => {
+                const socket = new WebSocket(${JSON.stringify(wanted)});
+                const timeout = setTimeout(() => resolve("timed out"), 10000);
+                socket.onopen = () => socket.send("hmr-ping");
+                socket.onmessage = (event) => { clearTimeout(timeout); resolve(event.data); };
+                socket.onerror = () => { clearTimeout(timeout); resolve("failed"); };
+              })
+            `),
+          { id: viewId, wanted: url },
+        );
+      const echo = await socketEcho(addressView.id, socketUrl);
       assert.equal(echo, "hmr-ping", "a *.localhost WebSocket upgrade completes");
       assert.deepEqual(devUpgrades, [devHost]);
       const upgrades = (await electronApp.evaluate(() => global.allowedNetworkResponses)).filter(
@@ -1006,6 +1014,16 @@ it(
       );
       assert.equal(bypassed.ok, true, JSON.stringify(bypassed));
       await expectDevPage(devUrl("system-proxy"), "*.localhost beside a system proxy");
+      // Chromium proxies WebSockets by the `https=` rule even when `http=` has none.
+      await setViewProxy({
+        proxyRules: `https=127.0.0.1:${proxyFixture.address().port}`,
+        proxyBypassRules: "<-loopback>",
+      });
+      assert.equal(
+        await socketEcho(agentView.id, `ws://${devHost}/scheme-proxy`),
+        "failed",
+        "a WebSocket the https= rule would proxy is refused",
+      );
       await setViewProxy({ proxyRules, proxyBypassRules: "<-loopback>" });
       const forced = await requestAgentNavigation(
         backend.serverUrl,

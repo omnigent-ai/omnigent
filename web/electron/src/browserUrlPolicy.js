@@ -10,9 +10,9 @@ const dns = require("node:dns");
 // javascript:, ...) is a privileged surface or code channel and is rejected.
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 
-// The exact loopback hosts an eligible session context may open. Eligible
-// contexts may also open `*.localhost` subdomains (see isLoopbackName); other
-// loopback spellings and DNS names that resolve to loopback stay blocked.
+// Exact loopback hosts an eligible context may open without an IP check; its
+// `*.localhost` subdomains must also connect to loopback (isAgentConnectionAllowed).
+// Other loopback spellings and DNS names that resolve to loopback stay blocked.
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
@@ -377,6 +377,8 @@ module.exports = {
   isAgentConnectionAllowed,
   isProxyAddress,
   isLoopbackPreviewUrl,
+  isDirectOnly,
+  isLocalhostSubdomain,
   lookupHostAddresses,
   // Exported for focused unit tests.
   proxyHosts,
@@ -386,8 +388,6 @@ module.exports = {
   isBlockedIpv6,
   isInternalAddress,
   isBlockedHostname,
-  isDirectOnly,
-  isLocalhostSubdomain,
   isLoopbackName,
   isLoopbackAddress,
   ALLOWED_SCHEMES,

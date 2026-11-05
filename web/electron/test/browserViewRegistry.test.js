@@ -1121,27 +1121,21 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
       const cancels = await Promise.all(
         ips.map((ip) => registry.shouldCancelAgentResponse({ webContentsId, url, ip })),
       );
-      const upgradeCancelled = await registry.shouldCancelAgentResponse({
-        webContentsId,
-        url: "ws://spog.dev.localhost:5173/hmr",
-        resourceType: "webSocket",
-        statusCode: 101,
-      });
-      return { cancels, upgradeCancelled, proxyLookups };
+      return { cancels, proxyLookups };
     };
     const direct = await responsesOn("DIRECT", ["127.0.0.1", "::1", "10.0.0.2", "93.184.215.14"]);
     assert.deepEqual(direct.cancels, [false, false, true, true]);
-    assert.equal(direct.upgradeCancelled, false);
-    // Upgrades are checked against the HTTP form of their URL.
-    assert.ok(direct.proxyLookups.includes("http://spog.dev.localhost:5173/hmr"));
+    // Only loopback responses reach the route check.
+    assert.deepEqual(direct.proxyLookups, [
+      "http://spog.dev.localhost:5173/",
+      "http://spog.dev.localhost:5173/",
+    ]);
     // A local proxy answers from loopback but resolves the name on its own network.
     const localProxy = await responsesOn("PROXY 127.0.0.1:3128", ["127.0.0.1"]);
     assert.deepEqual(localProxy.cancels, [true]);
-    assert.equal(localProxy.upgradeCancelled, true);
     // A remote proxy's address gets no proxy exemption for *.localhost.
     const remoteProxy = await responsesOn("PROXY proxy.corp:3128; DIRECT", ["10.0.0.2"]);
     assert.deepEqual(remoteProxy.cancels, [true]);
-    assert.equal(remoteProxy.upgradeCancelled, true);
   });
 
   it("sends *.localhost requests and IP-less upgrades only on a direct route for an eligible view", async () => {
@@ -1180,7 +1174,11 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
       assert.deepEqual(lookups, [], "no DNS lookup for *.localhost");
       return verdicts;
     };
-    const direct = async () => "DIRECT";
+    const directLookups = [];
+    const direct = async (url) => {
+      directLookups.push(url);
+      return "DIRECT";
+    };
     assert.deepEqual(
       await verdictsOn(direct),
       {
@@ -1191,6 +1189,26 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
         exactLocalhost: false,
       },
       "Chromium connects a direct *.localhost to loopback",
+    );
+    // WebSockets are looked up by their own scheme, which picks their proxy.
+    assert.deepEqual(directLookups, [
+      "http://spog.dev.localhost:5173/",
+      "http://spog.dev.localhost:5173/",
+      "ws://spog.dev.localhost:5173/hmr",
+      "ws://spog.dev.localhost:5173/hmr",
+    ]);
+    // An `https=`-only proxy rule carries WebSockets but not plain HTTP.
+    assert.deepEqual(
+      await verdictsOn(async (url) =>
+        new URL(url).protocol === "ws:" ? "PROXY 127.0.0.1:3128" : "DIRECT",
+      ),
+      {
+        request: false,
+        workerRequest: false,
+        socketRequest: true,
+        upgrade: true,
+        exactLocalhost: false,
+      },
     );
     assert.deepEqual(
       await verdictsOn(direct, "remote"),

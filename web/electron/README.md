@@ -666,7 +666,9 @@ including the address bar, chat links, and agent actions, enforces this policy.
   response. This is not connected-IP verification and cannot rule out a DNS
   change between check and connection. An IP-less `*.localhost` upgrade
   repeats the direct-route check instead, because Chromium pins those names to
-  loopback and only a proxy could route them elsewhere. Limits: a DNS
+  loopback and only a proxy could route them elsewhere. The route lookup uses
+  the WebSocket's own `ws:`/`wss:` URL, because Chromium can pick a different
+  proxy for it (an `https=` rule) than for plain HTTP. Limits: a DNS
   change between preflight and connection can still send a request to a private
   address; the HTTP response check prevents the page from reading its response.
   Pages restored from the back-forward cache and navigations answered by a service worker make no

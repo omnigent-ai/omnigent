@@ -468,7 +468,7 @@ function createBrowserViewRegistry({
     let verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
     const hostname = hostnameOf(policyUrl);
     if (verdict.ok && isLocalhostSubdomain(hostname)) {
-      verdict = await checkDirectLocalhostRoute(policyUrl, hostname, policy.partition);
+      verdict = await checkDirectLocalhostRoute(url, hostname, policy.partition);
     }
     if (verdict.ok) return false;
     if (policy.conversationId) {
@@ -504,14 +504,15 @@ function createBrowserViewRegistry({
   }
 
   // Chromium pins `*.localhost` to loopback, so only a proxy could send it
-  // anywhere else; an unknown route counts as proxied.
-  async function checkDirectLocalhostRoute(policyUrl, hostname, partition) {
+  // anywhere else; an unknown route counts as proxied. WebSockets keep their
+  // ws(s) URL here because Chromium picks their proxy by that scheme.
+  async function checkDirectLocalhostRoute(requestUrl, hostname, partition) {
     const blocked = {
       ok: false,
       error: `navigation blocked: host "${hostname}" may be routed through a proxy`,
     };
     try {
-      return isDirectOnly(await resolveProxy(policyUrl, partition)) ? { ok: true } : blocked;
+      return isDirectOnly(await resolveProxy(requestUrl, partition)) ? { ok: true } : blocked;
     } catch {
       return blocked;
     }
@@ -533,7 +534,7 @@ function createBrowserViewRegistry({
       // A loopback IP may be a local proxy's, so `*.localhost` also needs a direct route.
       verdict = ipLessUpgrade ? { ok: true } : isAgentConnectionAllowed(policyUrl, ip, policy);
       if (verdict.ok) {
-        verdict = await checkDirectLocalhostRoute(policyUrl, hostname, policy.partition);
+        verdict = await checkDirectLocalhostRoute(url, hostname, policy.partition);
       }
     } else if (ipLessUpgrade) {
       // Repeating the DNS check cannot rule out a DNS change before the connection.
