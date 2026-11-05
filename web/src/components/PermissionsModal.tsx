@@ -79,10 +79,7 @@ interface PermissionsModalProps {
   workspace?: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /**
-   * Opens the fork dialog to move this session into a shareable folder. The
-   * blocked-workspace banner offers the action only when this is provided.
-   */
+  /** Opens the fork dialog for a shareable folder; the blocked banner needs it. */
   onForkIntoAnotherFolder?: () => void;
   /** Visible-but-disabled reason for the fork action, e.g. while it loads. */
   forkDisabledReason?: string;
@@ -425,9 +422,8 @@ export function PermissionsModal({
 }
 
 /**
- * Banner for a session whose working directory is a home or root directory,
- * which a restricted server refuses to share. Names the directory and points
- * at the fix: fork into a project folder (keeping the history) and share that.
+ * Banner for a home or root working directory, which a restricted server won't
+ * share. Points at the fix: fork into a project folder and share the fork.
  */
 function WorkspaceBlockedNotice({
   descriptionId,
