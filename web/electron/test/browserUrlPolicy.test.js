@@ -14,6 +14,7 @@ const {
   isAgentConnectionAllowed,
   isAgentNavigationAllowed,
   isDirectOnly,
+  isLoopbackPreviewUrl,
   isProxyAddress,
   proxyHosts,
 } = require("../src/browserUrlPolicy");
@@ -361,6 +362,31 @@ describe("browserUrlPolicy — connected address check", () => {
       const verdict = isAgentConnectionAllowed(url, ip, eligible);
       assert.equal(verdict.ok, false, String(ip));
       assert.match(verdict.error, /did not connect to a loopback address/);
+    }
+  });
+});
+
+describe("browserUrlPolicy — loopback preview URLs", () => {
+  it("recognizes http(s) loopback names, including *.localhost", () => {
+    for (const url of [
+      "http://localhost:5173/",
+      "https://127.0.0.1/",
+      "http://[::1]:8080/",
+      "https://spog.dev.localhost:23090/one",
+    ]) {
+      assert.equal(isLoopbackPreviewUrl(url), true, url);
+    }
+    for (const url of [
+      "ws://spog.dev.localhost/",
+      "file:///etc/hosts",
+      "http://app.localhost./",
+      "http://a..localhost/",
+      "http://lvh.me/",
+      "http://192.168.1.1/",
+      "not a url",
+      undefined,
+    ]) {
+      assert.equal(isLoopbackPreviewUrl(url), false, String(url));
     }
   });
 });

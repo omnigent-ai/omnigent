@@ -29,7 +29,6 @@ function echoOneWebSocketFrame(request, socket) {
     `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
   );
   let buffered = Buffer.alloc(0);
-  // This fixture echoes one short masked text frame, then closes the socket.
   socket.on("data", (chunk) => {
     buffered = Buffer.concat([buffered, chunk]);
     if (buffered.length < 2) return;
@@ -99,16 +98,23 @@ async function launchThisMachineDesktop({ backend, scratch, recordDir, preload =
     preload,
   });
   let sessionIsLocal = true;
-  await desktop.window.route(/\/v1\/sessions\/[a-f0-9]+(?:\?.*)?$/, async (route) => {
-    if (route.request().method() !== "GET") return route.continue();
-    const response = await route.fetch();
-    const body = await response.json();
-    const local = body.id === backend.sessionId && sessionIsLocal;
-    await route.fulfill({
-      response,
-      json: { ...body, host_id: local ? THIS_MACHINE_HOST_ID : "b".repeat(32) },
+  try {
+    await desktop.window.route(/\/v1\/sessions\/[a-f0-9]+(?:\?.*)?$/, async (route) => {
+      if (route.request().method() !== "GET") return route.continue();
+      const response = await route.fetch();
+      const body = await response.json();
+      const local = body.id === backend.sessionId && sessionIsLocal;
+      await route.fulfill({
+        response,
+        json: { ...body, host_id: local ? THIS_MACHINE_HOST_ID : "b".repeat(32) },
+      });
     });
-  });
+  } catch (error) {
+    // The caller only cleans up a desktop this helper returns.
+    await desktop.electronApp.close().catch(() => {});
+    await desktop.stopDisplayCapture();
+    throw error;
+  }
   return {
     desktop,
     setSessionIsLocal: (value) => {
@@ -875,7 +881,10 @@ it(
           const entry = global.omnigentTestBrowserRegistries[0].get(id);
           await new Promise((resolve) => {
             if (!entry.view.webContents.isLoading()) resolve();
-            else entry.view.webContents.once("did-finish-load", resolve);
+            else {
+              entry.view.webContents.once("did-finish-load", resolve);
+              entry.view.webContents.once("did-fail-load", resolve);
+            }
           });
           return entry.view.webContents.executeJavaScript("document.body.innerText");
         }, viewId);
@@ -939,7 +948,7 @@ it(
       await hold(1000);
 
       mark("CUJ-2 chat link");
-      await fetch(`${backend.mockUrl}/mock/set_fallback`, {
+      const fallback = await fetch(`${backend.mockUrl}/mock/set_fallback`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -949,9 +958,10 @@ it(
         }),
         signal: AbortSignal.timeout(30_000),
       });
+      assert.equal(fallback.ok, true, "the mock model accepts the scripted reply");
       const composer = window.getByPlaceholder("Send a message…");
       await composer.click();
-      await composer.pressSequentially("Where is the dev server?", { delay: 25 });
+      await composer.pressSequentially("Where is the dev server?", { delay: typingDelay });
       await composer.press("Enter");
       const link = window.getByRole("link", { name: "Open spog dev", exact: true });
       await link.waitFor({ timeout: 60_000 });
@@ -1003,6 +1013,18 @@ it(
         devUrl("forced-proxy"),
       );
       assert.equal(forced.ok, true, "the IPC hop accepts the URL; the network guard cancels it");
+      // The relay answers before the load settles; wait for the cancelled attempt to finish.
+      await eventually(
+        () =>
+          electronApp.evaluate(
+            (_electron, { id, wanted }) => {
+              const { webContents } = global.omnigentTestBrowserRegistries[0].get(id).view;
+              return webContents.getURL() === wanted && !webContents.isLoading() ? true : null;
+            },
+            { id: agentView.id, wanted: devUrl("forced-proxy") },
+          ),
+        "forced-proxy navigation settles",
+      );
       assert.equal(await pageText(agentView.id), "", "the proxied *.localhost page stays blank");
       await setViewProxy({ mode: "direct" });
       assert.equal(devRequests.length, 4, "the forced-proxy request never reaches the dev server");

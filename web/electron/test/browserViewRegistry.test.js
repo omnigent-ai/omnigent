@@ -1104,34 +1104,44 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
   });
 
-  it("never exempts a *.localhost response through the proxy", async () => {
-    const proxyLookups = [];
+  it("accepts a *.localhost response only from loopback on a direct route", async () => {
     const context = { hostIsThisMachine: true };
-    const { registry, idOf } = makeNetworkGuardRegistry({
-      allowsLocalhost: (ctx) => ctx === context,
-      resolveProxy: async (url) => {
-        proxyLookups.push(url);
-        return "PROXY proxy.corp:3128; DIRECT";
-      },
-    });
-    const url = "http://spog.dev.localhost:5173/";
-    registry.openOrNavigate("conv_1", url, undefined, { agent: true, agentContext: context });
-    const response = (ip) =>
-      registry.shouldCancelAgentResponse({ webContentsId: idOf("conv_1"), url, ip });
-    assert.deepEqual(
-      await Promise.all(["127.0.0.1", "::1", "10.0.0.2", "93.184.215.14"].map(response)),
-      [false, false, true, true],
-    );
-    assert.deepEqual(proxyLookups, []);
-    // Upgrades omit the connected IP, so a proxy route alone cancels them.
-    const upgrade = {
-      webContentsId: idOf("conv_1"),
-      url: "ws://spog.dev.localhost:5173/hmr",
-      resourceType: "webSocket",
-      statusCode: 101,
+    const responsesOn = async (route, ips) => {
+      const proxyLookups = [];
+      const { registry, idOf } = makeNetworkGuardRegistry({
+        allowsLocalhost: (ctx) => ctx === context,
+        resolveProxy: async (url) => {
+          proxyLookups.push(url);
+          return route;
+        },
+      });
+      const url = "http://spog.dev.localhost:5173/";
+      registry.openOrNavigate("conv_1", url, undefined, { agent: true, agentContext: context });
+      const webContentsId = idOf("conv_1");
+      const cancels = await Promise.all(
+        ips.map((ip) => registry.shouldCancelAgentResponse({ webContentsId, url, ip })),
+      );
+      const upgradeCancelled = await registry.shouldCancelAgentResponse({
+        webContentsId,
+        url: "ws://spog.dev.localhost:5173/hmr",
+        resourceType: "webSocket",
+        statusCode: 101,
+      });
+      return { cancels, upgradeCancelled, proxyLookups };
     };
-    assert.equal(await registry.shouldCancelAgentResponse(upgrade), true);
-    assert.deepEqual(proxyLookups, ["http://spog.dev.localhost:5173/hmr"]);
+    const direct = await responsesOn("DIRECT", ["127.0.0.1", "::1", "10.0.0.2", "93.184.215.14"]);
+    assert.deepEqual(direct.cancels, [false, false, true, true]);
+    assert.equal(direct.upgradeCancelled, false);
+    // Upgrades are checked against the HTTP form of their URL.
+    assert.ok(direct.proxyLookups.includes("http://spog.dev.localhost:5173/hmr"));
+    // A local proxy answers from loopback but resolves the name on its own network.
+    const localProxy = await responsesOn("PROXY 127.0.0.1:3128", ["127.0.0.1"]);
+    assert.deepEqual(localProxy.cancels, [true]);
+    assert.equal(localProxy.upgradeCancelled, true);
+    // A remote proxy's address gets no proxy exemption for *.localhost.
+    const remoteProxy = await responsesOn("PROXY proxy.corp:3128; DIRECT", ["10.0.0.2"]);
+    assert.deepEqual(remoteProxy.cancels, [true]);
+    assert.equal(remoteProxy.upgradeCancelled, true);
   });
 
   it("sends *.localhost requests and IP-less upgrades only on a direct route for an eligible view", async () => {

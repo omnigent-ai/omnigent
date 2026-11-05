@@ -179,6 +179,13 @@ function isLoopbackName(hostname) {
   return LOOPBACK_HOSTS.has(hostname) || isLocalhostSubdomain(hostname);
 }
 
+/** True for an http(s) URL whose host is a loopback preview name, including `*.localhost`. */
+function isLoopbackPreviewUrl(url) {
+  if (typeof url !== "string" || !URL.canParse(url)) return false;
+  const { protocol, hostname } = new URL(url);
+  return ALLOWED_SCHEMES.has(protocol) && isLoopbackName(hostname);
+}
+
 /** True if an IP address is in 127.0.0.0/8 or is ::1 (including IPv4-mapped forms). */
 function isLoopbackAddress(address) {
   const canonical = canonicalAddress(address);
@@ -369,6 +376,7 @@ module.exports = {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isProxyAddress,
+  isLoopbackPreviewUrl,
   lookupHostAddresses,
   // Exported for focused unit tests.
   proxyHosts,

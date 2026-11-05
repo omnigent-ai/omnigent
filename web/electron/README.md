@@ -653,7 +653,8 @@ including the address bar, chat links, and agent actions, enforces this policy.
   (`localhost`, `127.0.0.1`, `[::1]`, and `*.localhost`) remain available to
   eligible Arca and this-machine sessions without DNS. A `*.localhost` request
   is cancelled before sending unless the partition's proxy lookup returns
-  `DIRECT` alone, and its response must come from a loopback address.
+  `DIRECT` alone, and its response must come from a loopback address on a
+  route that is still direct, since a local proxy also answers from loopback.
   Enforcement cancels requests and
   keeps the view open.
   Guarded HTTP requests skip cache reads to obtain connected-address metadata;

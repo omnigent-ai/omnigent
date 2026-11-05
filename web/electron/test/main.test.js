@@ -4557,6 +4557,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(eligible(context), false);
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
     assert.match(hint(event, "http://localhost"), /New session > Host > Run on Arca/);
+    assert.match(
+      hint(event, "https://spog.dev.localhost:23090/one"),
+      /New session > Host > Run on Arca/,
+    );
+    assert.equal(hint(event, "http://lvh.me"), null, "public aliases get no Arca hint");
     await h.api.startArcaHostConnect(serverUrl).promise;
     assert.equal(eligible(context), true);
     assert.equal(hint(event, "http://localhost"), null);

@@ -454,6 +454,10 @@ function createBrowserViewRegistry({
     };
   }
 
+  function hostnameOf(url) {
+    return URL.canParse(url) ? new URL(url).hostname : "";
+  }
+
   // Resolve named hosts in the owning partition before any request is sent.
   // IP literals and exact loopback names need only the URL check; `*.localhost`
   // must also be on a direct route so a proxy never receives the request.
@@ -462,7 +466,7 @@ function createBrowserViewRegistry({
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
     let verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
-    const hostname = URL.canParse(policyUrl) ? new URL(policyUrl).hostname : "";
+    const hostname = hostnameOf(policyUrl);
     if (verdict.ok && isLocalhostSubdomain(hostname)) {
       verdict = await checkDirectLocalhostRoute(policyUrl, hostname, policy.partition);
     }
@@ -520,16 +524,20 @@ function createBrowserViewRegistry({
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
-    const hostname = URL.canParse(policyUrl) ? new URL(policyUrl).hostname : "";
+    const hostname = hostnameOf(policyUrl);
     const localhostSubdomain = isLocalhostSubdomain(hostname);
+    // WebSocket upgrades omit the connected IP.
+    const ipLessUpgrade = !ip && resourceType === "webSocket" && statusCode === 101;
     let verdict;
-    // WebSocket upgrades omit the connected IP. Other hosts repeat the DNS
-    // check, which cannot rule out a DNS change before the connection.
-    if (!ip && resourceType === "webSocket" && statusCode === 101) {
-      verdict =
-        policy.allowLocalhost && localhostSubdomain
-          ? await checkDirectLocalhostRoute(policyUrl, hostname, policy.partition)
-          : await checkAgentNavigationWithPolicy(policyUrl, policy);
+    if (policy.allowLocalhost && localhostSubdomain) {
+      // A loopback IP may be a local proxy's, so `*.localhost` also needs a direct route.
+      verdict = ipLessUpgrade ? { ok: true } : isAgentConnectionAllowed(policyUrl, ip, policy);
+      if (verdict.ok) {
+        verdict = await checkDirectLocalhostRoute(policyUrl, hostname, policy.partition);
+      }
+    } else if (ipLessUpgrade) {
+      // Repeating the DNS check cannot rule out a DNS change before the connection.
+      verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
     } else {
       verdict = isAgentConnectionAllowed(policyUrl, ip, policy);
     }

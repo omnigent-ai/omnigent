@@ -43,7 +43,8 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
-const { isLocalhostUrl, registerLocalhostCors } = require("./localhost_cors");
+const { registerLocalhostCors } = require("./localhost_cors");
+const { isLoopbackPreviewUrl } = require("./browserUrlPolicy");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -3974,7 +3975,7 @@ function guardAgentPartitionRequests(partition, registry) {
 function arcaPreviewRecoveryTargetForEvent(event, url) {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (
-    !isLocalhostUrl(url) ||
+    !isLoopbackPreviewUrl(url) ||
     !isPinnedOriginSender(event) ||
     !win ||
     win.isDestroyed() ||
