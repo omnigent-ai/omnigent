@@ -47,13 +47,34 @@ export function commentsQueryKey(sessionId: string, path?: string) {
   return path ? ["comments", sessionId, path] : ["comments", sessionId];
 }
 
-export async function fetchComments(sessionId: string, path?: string): Promise<Comment[]> {
+export async function fetchComments(
+  sessionId: string,
+  path?: string,
+  signal?: AbortSignal,
+): Promise<Comment[]> {
   const url = path
     ? `/v1/sessions/${encodeURIComponent(sessionId)}/comments?path=${encodeURIComponent(path)}`
     : `/v1/sessions/${encodeURIComponent(sessionId)}/comments`;
-  const res = await authenticatedFetch(`${url}${path ? "&" : "?"}include_pr_comments=true`);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return (await res.json()) as Comment[];
+  const pageUrl = `${url}${path ? "&" : "?"}include_pr_comments=true&limit=100`;
+  const comments: Comment[] = [];
+  let cursor: string | null = null;
+  do {
+    // eslint-disable-next-line no-await-in-loop -- Each page needs the previous cursor.
+    const res = await authenticatedFetch(
+      `${pageUrl}${cursor ? `&after=${encodeURIComponent(cursor)}` : ""}`,
+      { signal },
+    );
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    // eslint-disable-next-line no-await-in-loop -- Decode this page before following its cursor.
+    const page: Comment[] | { comments: Comment[]; next_cursor: string | null } = await res.json();
+    // Older servers ignore the opt-in and return their Files-only array.
+    if (Array.isArray(page)) return page;
+    comments.push(...page.comments);
+    cursor = page.next_cursor;
+  } while (cursor);
+  return comments.sort(
+    (left, right) => left.created_at - right.created_at || left.id.localeCompare(right.id),
+  );
 }
 
 // ── Hooks ────────────────────────────────────────────────────────────────────
@@ -66,7 +87,7 @@ export async function fetchComments(sessionId: string, path?: string): Promise<C
 export function useComments(sessionId: string | undefined, path?: string) {
   return useQuery({
     queryKey: commentsQueryKey(sessionId ?? "", path),
-    queryFn: () => fetchComments(sessionId!, path),
+    queryFn: ({ signal }) => fetchComments(sessionId!, path, signal),
     enabled: !!sessionId,
     staleTime: 2_000,
   });

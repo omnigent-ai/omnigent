@@ -10,7 +10,7 @@ import asyncio
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, model_validator
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
@@ -25,7 +25,7 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found
 from omnigent.stores import ConversationStore
-from omnigent.stores.comment_store import CommentStore
+from omnigent.stores.comment_store import MAX_COMMENT_PAGE_SIZE, CommentStore
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -57,6 +57,13 @@ def _format_message(comments: list[Comment]) -> str:
 
 
 # ── Request models ─────────────────────────────────────────────────────────────
+
+
+class CommentPage(BaseModel):
+    """A bounded comment page; filtered pages can be empty and still have a cursor."""
+
+    comments: list[Comment]
+    next_cursor: str | None
 
 
 class AddCommentRequest(BaseModel):
@@ -249,7 +256,9 @@ def create_comments_router(
         session_id: str,
         path: str | None = None,
         include_pr_comments: bool = False,
-    ) -> list[dict[str, Any]]:
+        limit: int = Query(MAX_COMMENT_PAGE_SIZE, ge=1, le=MAX_COMMENT_PAGE_SIZE),
+        after: str | None = Query(None, pattern=r"^[0-9a-f]{32}$"),
+    ) -> list[dict[str, Any]] | CommentPage:
         """List comments for a session, optionally filtered by file.
 
         Requires ``LEVEL_READ`` on the session in multi-user mode.
@@ -258,15 +267,27 @@ def create_comments_router(
         :param session_id: The session to query, e.g. ``"conv_abc123"``.
         :param path: When provided, only return comments for this file,
             e.g. ``"src/App.tsx"``.
-        :param include_pr_comments: Opt in to revision-anchored comments that
-            legacy clients cannot locate using workspace character offsets.
-        :returns: List of serialized comment dicts.
+        :param include_pr_comments: Opt in to bounded pages including PR anchors.
+            Legacy callers receive the Files-only array.
+        :param limit: Maximum rows examined per page, plus one continuation row.
+        :param after: Exclusive comment ID from the previous page's next_cursor.
+        :returns: A Files-only array, or a page in ID order when opted in.
+            Path filtering happens after paging; follow next_cursor even when
+            comments is empty. Pagination parameters apply only to this mode.
         :raises OmnigentError: 401/403/404 if the user lacks read permission.
         """
         user_id = get_user_id(request, auth_provider)
         await _require_session_access(user_id, session_id, LEVEL_READ)
+        if include_pr_comments:
+            comments, next_cursor = await asyncio.to_thread(
+                store.list_page, session_id, limit=limit, after_id=after
+            )
+            return CommentPage(
+                comments=[c for c in comments if path is None or c.path == path],
+                next_cursor=next_cursor,
+            )
         comments = store.list_for_conversation(session_id, path=path)
-        return [asdict(c) for c in comments if include_pr_comments or c.anchor_metadata is None]
+        return [asdict(c) for c in comments if c.anchor_metadata is None]
 
     @router.patch("/sessions/{session_id}/comments/{comment_id}")
     async def update_comment(

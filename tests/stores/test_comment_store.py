@@ -11,7 +11,9 @@ SQLite file and tears it down automatically.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import event
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.entities.comment import CommentsFingerprint
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 
@@ -152,6 +154,51 @@ def test_list_for_conversation_returns_all_comments(store: SqlAlchemyCommentStor
     )
     bodies = {c.body for c in all_comments}
     assert bodies == {"First", "Second"}
+
+
+def test_comment_pages_use_session_primary_key(store: SqlAlchemyCommentStore) -> None:
+    """Pages stay scoped and seek past deleted cursors without sorting or scanning history."""
+    conversation_id = "e4607e40f7b85bc408d00d2e11aec4d2"
+    comments = sorted(
+        [store.add(conversation_id, "a.py", str(index), 0, 1) for index in range(5)],
+        key=lambda comment: comment.id,
+    )
+    other_session = "6a9338d893871f06de26f91e33256762"
+    store.add(other_session, "a.py", "other session", 0, 1)
+    with workspace_scope(42):
+        other_workspace = store.add(conversation_id, "a.py", "other workspace", 0, 1)
+        assert store.list_page(conversation_id) == ([other_workspace], None)
+    assert store.list_page("0" * 32) == ([], None)
+    page, cursor = store.list_page(conversation_id, limit=2)
+    assert page == comments[:2]
+    assert cursor == comments[1].id
+    store.delete(cursor, conversation_id)
+
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        page, cursor = store.list_page(conversation_id, limit=2, after_id=cursor)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert page == comments[2:4]
+    assert cursor == comments[3].id
+    assert store.list_page(conversation_id, limit=2, after_id=cursor) == (comments[4:], None)
+    assert store.list_page(conversation_id, after_id=comments[-1].id) == ([], None)
+    assert len(queries) == 1
+    statement, parameters = queries[0]
+    with store._engine.connect() as connection:
+        assert len(connection.exec_driver_sql(statement, parameters).all()) == 3
+        if store._engine.dialect.name == "sqlite":
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            assert "workspace_id=? AND conversation_id=? AND id>?" in plan
+            assert "SCAN" not in plan and "TEMP B-TREE" not in plan
 
 
 def test_list_for_conversation_with_path_filter(store: SqlAlchemyCommentStore) -> None:

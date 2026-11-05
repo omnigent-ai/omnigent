@@ -19,7 +19,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Comment, CommentsFingerprint
 from omnigent.entities.comment import PullRequestCommentAnchor
-from omnigent.stores.comment_store import CommentStore
+from omnigent.stores.comment_store import MAX_COMMENT_PAGE_SIZE, CommentStore
 
 
 def _to_entity(row: SqlComment) -> Comment:
@@ -139,6 +139,30 @@ class SqlAlchemyCommentStore(CommentStore):
         with self._session("list_comments") as session:
             rows = list(session.execute(stmt).scalars().all())
             return [_to_entity(r) for r in rows]
+
+    def list_page(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = MAX_COMMENT_PAGE_SIZE,
+        after_id: str | None = None,
+    ) -> tuple[list[Comment], str | None]:
+        """Read a bounded session page. See base class for contract."""
+        if not 1 <= limit <= MAX_COMMENT_PAGE_SIZE:
+            raise ValueError(f"limit must be between 1 and {MAX_COMMENT_PAGE_SIZE}")
+        stmt = select(SqlComment).where(
+            SqlComment.workspace_id == current_workspace_id(),
+            SqlComment.conversation_id == conversation_id,
+        )
+        if after_id is not None:
+            stmt = stmt.where(SqlComment.id > after_id)
+        # The workspace/conversation/id primary key supports this range and order.
+        stmt = stmt.order_by(SqlComment.id).limit(limit + 1)
+        with self._session("list_comment_page") as session:
+            rows = list(session.execute(stmt).scalars().all())
+            page = rows[:limit]
+            next_cursor = page[-1].id if len(rows) > limit else None
+            return [_to_entity(row) for row in page], next_cursor
 
     def update_comment(
         self,
