@@ -120,7 +120,7 @@ vi.mock("@/components/chat/SideChatPane", () => ({
   }) => (
     <div
       data-testid="side-chat-pane-stub"
-      data-read-only={String(readOnly ?? false)}
+      data-read-only={readOnly === undefined ? undefined : String(readOnly)}
       data-full-session={String(fullSession ?? false)}
     >
       {childId}
@@ -1487,7 +1487,7 @@ describe("WorkspacePanel browser tab", () => {
 });
 
 describe("WorkspacePanel restored side chats", () => {
-  it("leaves a restored Codex side chat writable; the server seals dead ones", () => {
+  it("restores the selected Codex child without overriding the pane's permissions", () => {
     const before = useChatStore.getState();
     useChatStore.setState({ sessionHarness: "codex-native" });
     try {
@@ -1498,7 +1498,8 @@ describe("WorkspacePanel restored side chats", () => {
       });
       renderWorkspace({ rightRailTab: "sidechat" });
 
-      expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "false");
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_codex_side");
+      expect(screen.getByTestId("side-chat-pane-stub")).not.toHaveAttribute("data-read-only");
     } finally {
       useChatStore.setState({ sessionHarness: before.sessionHarness });
     }
@@ -1563,7 +1564,6 @@ describe("WorkspacePanel mobile side chats", () => {
       await waitFor(() =>
         expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
       );
-      // Closing a tab stops its session.
       expect(stop.mock.calls).toEqual([["conv_side_b"], ["conv_side_b"]]);
       expect(queuedAtStop).toEqual([[], []]);
       expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBeUndefined();

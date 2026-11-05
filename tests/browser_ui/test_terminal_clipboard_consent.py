@@ -294,8 +294,7 @@ def clipboard_browser(
     )
     browser_contract.json(
         re.compile(
-            rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})"
-            rf"/(child_sessions|side_chats)(?:\?.*)?$"
+            rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/child_sessions(?:\?.*)?$"
         ),
         empty_list,
     )

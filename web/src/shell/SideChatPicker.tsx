@@ -1,6 +1,5 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { MessagesSquareIcon } from "lucide-react";
-import { useState } from "react";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,77 +17,85 @@ interface SideChatPage {
   last_id: string | null;
 }
 
-/** Discover saved side chats without changing this device's open tabs. */
-export function SideChatPicker({
-  conversationId,
-  onOpen,
-}: {
+interface SideChatPickerProps {
   conversationId: string;
   onOpen: (id: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [after, setAfter] = useState<string | null>(null);
-  const { data, isError, isFetching } = useQuery({
-    queryKey: ["conversation", conversationId, "side_chats", after],
-    queryFn: async (): Promise<SideChatPage> => {
-      const params = new URLSearchParams({ limit: "20", ...(after ? { after } : {}) });
-      const response = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(conversationId)}/side_chats?${params}`,
-      );
-      // Older servers keep using local tabs.
-      if (response.status === 404) return { data: [], has_more: false, last_id: null };
-      if (!response.ok) throw new Error("Could not load side chats");
-      return response.json();
-    },
-    enabled: open,
-    placeholderData: keepPreviousData,
-    retry: false,
-  });
+}
 
+function SideChatResults({ conversationId, onOpen }: SideChatPickerProps) {
+  const { data, isError, isFetching, hasNextPage, isFetchNextPageError, fetchNextPage, refetch } =
+    useInfiniteQuery({
+      queryKey: ["conversation", conversationId, "side_chats"],
+      queryFn: async ({ pageParam, signal }): Promise<SideChatPage> => {
+        const params = new URLSearchParams({
+          limit: "20",
+          ...(pageParam ? { after: pageParam } : {}),
+        });
+        const response = await authenticatedFetch(
+          `/v1/sessions/${encodeURIComponent(conversationId)}/side_chats?${params}`,
+          { signal },
+        );
+        // Older servers keep using local tabs.
+        if (response.status === 404) return { data: [], has_more: false, last_id: null };
+        if (!response.ok) throw new Error("Could not load side chats");
+        return response.json();
+      },
+      initialPageParam: null as string | null,
+      getNextPageParam: (page) => (page.has_more ? page.last_id : undefined),
+      // The menu mounts on demand; reopening starts with just the first page.
+      gcTime: 0,
+      refetchOnWindowFocus: false,
+      retry: false,
+    });
+
+  const chats = data?.pages.flatMap((page) => page.data) ?? [];
   const emptyLabel = isError ? "Could not load side chats" : "No saved side chats";
   return (
-    <DropdownMenu
-      open={open}
-      onOpenChange={(value) => {
-        setOpen(value);
-        if (!value) setAfter(null);
-      }}
-    >
+    <>
+      <SuppressBrowserView />
+      {chats.map((chat) => (
+        <DropdownMenuItem
+          key={chat.id}
+          onSelect={() => {
+            setSessionParent(chat.id, conversationId);
+            onOpen(chat.id);
+          }}
+        >
+          <span className="max-w-64 truncate">{chat.title || "Side chat"}</span>
+          <span className="ml-auto pl-2 text-xs text-muted-foreground">
+            {new Date(chat.created_at * 1000).toLocaleString()}
+          </span>
+        </DropdownMenuItem>
+      ))}
+      {(!chats.length || isError) && (
+        <DropdownMenuItem disabled>{isFetching ? "Loading…" : emptyLabel}</DropdownMenuItem>
+      )}
+      {(hasNextPage || isError) && (
+        <DropdownMenuItem
+          disabled={isFetching}
+          onSelect={(event) => {
+            event.preventDefault();
+            void (isError && !isFetchNextPageError ? refetch() : fetchNextPage());
+          }}
+        >
+          {isError ? "Retry" : "Load more"}
+        </DropdownMenuItem>
+      )}
+    </>
+  );
+}
+
+/** Discover saved side chats without changing this device's open tabs. */
+export function SideChatPicker(props: SideChatPickerProps) {
+  return (
+    <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button variant="ghost" size="icon-sm" aria-label="Browse side chats">
           <MessagesSquareIcon className="size-4" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="max-h-80 overflow-y-auto">
-        <SuppressBrowserView />
-        {data?.data.map((chat) => (
-          <DropdownMenuItem
-            key={chat.id}
-            onSelect={() => {
-              setSessionParent(chat.id, conversationId);
-              onOpen(chat.id);
-            }}
-          >
-            <span className="max-w-64 truncate">{chat.title || "Side chat"}</span>
-            <span className="ml-auto pl-2 text-xs text-muted-foreground">
-              {new Date(chat.created_at * 1000).toLocaleString()}
-            </span>
-          </DropdownMenuItem>
-        ))}
-        {(!data?.data.length || isError) && (
-          <DropdownMenuItem disabled>{isFetching ? "Loading…" : emptyLabel}</DropdownMenuItem>
-        )}
-        {data?.has_more && data.last_id && (
-          <DropdownMenuItem
-            disabled={isFetching}
-            onSelect={(event) => {
-              event.preventDefault();
-              setAfter(data.last_id);
-            }}
-          >
-            Next 20
-          </DropdownMenuItem>
-        )}
+        <SideChatResults {...props} />
       </DropdownMenuContent>
     </DropdownMenu>
   );

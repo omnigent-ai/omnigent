@@ -2821,7 +2821,7 @@ async def _persist_external_codex_subagent_start(
     body: SessionEventInput,
     conversation_store: ConversationStore,
     *,
-    lists_side_chat: bool = False,
+    allow_side_chat: bool = False,
 ) -> str:
     """
     Mint or update a child Conversation for a Codex AgentControl sub-agent.
@@ -2834,8 +2834,7 @@ async def _persist_external_codex_subagent_start(
     :param parent_conv: Pre-fetched parent row.
     :param body: POST event body with ``data.thread_id`` required.
     :param conversation_store: Store for reading/creating child rows.
-    :param lists_side_chat: Whether a new ``/side`` child joins the parent's
-        side chats on the owner's devices; only for the owner or bound runner.
+    :param allow_side_chat: Whether the caller is the owner or bound runner.
     :returns: Child conversation id, e.g. ``"conv_child456"``.
     :raises OmnigentError: If ``thread_id`` is missing or parent has
         no bound agent.
@@ -2858,7 +2857,7 @@ async def _persist_external_codex_subagent_start(
     labels = _codex_subagent_labels_from_body(thread_id, body)
     from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 
-    if is_side_chat_child(labels) and not lists_side_chat:
+    if is_side_chat_child(labels) and not allow_side_chat:
         raise OmnigentError(
             "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
         )
@@ -2874,7 +2873,6 @@ async def _persist_external_codex_subagent_start(
         thread_id,
         labels,
         conversation_store,
-        lists_side_chat=lists_side_chat,
     )
 
 
@@ -7010,12 +7008,12 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
 
 
-def _opens_codex_side_chat(conv: Conversation, body: SessionEventInput) -> bool:
-    """Whether a message to *conv* is a Codex ``/side`` command, read as the runner reads it."""
+def _opens_codex_side_chat(harness: str | None, body: SessionEventInput) -> bool:
+    """Whether this is a Codex ``/side`` command, using the runner's parser."""
     from omnigent.harnesses.codex_native.side_chat import side_chat_question_from_content
 
     return (
-        _native_pane_harness(conv) == "codex-native"
+        harness == "codex-native"
         and side_chat_question_from_content(body.data.get("content")) is not None
     )
 
@@ -8237,6 +8235,7 @@ async def _dispatch_session_event_to_runner_impl(
         if side_result is not None:
             return side_result
     if body.type == "message" and _is_native_terminal_session(conv):
+        native_harness = await asyncio.to_thread(_native_pane_harness, conv)
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
         # inputs should still fail locally without creating terminals.
@@ -8287,7 +8286,7 @@ async def _dispatch_session_event_to_runner_impl(
         # A codex /side command never reaches the main thread — the executor
         # forks it into a side chat — so the transcript forwarder never mirrors
         # it back and this bubble would sit in the parent chat forever.
-        opens_side_chat = _opens_codex_side_chat(conv, body)
+        opens_side_chat = _opens_codex_side_chat(native_harness, body)
         # An older host forwards `/side` to Codex as a plain prompt (no fork), so
         # the web side chat opens and hangs and the question lands on the main
         # thread. Refuse here — before the forward — with a clear reason instead.
@@ -8306,7 +8305,7 @@ async def _dispatch_session_event_to_runner_impl(
         # mirrors it back to drain an entry (the web clears its own bubble). With an attachment
         # pasted ahead of the text it is an ordinary prompt, so only text-only content counts.
         is_btw = (
-            _native_pane_harness(conv) == "claude-native"
+            native_harness == "claude-native"
             and isinstance(content, list)
             and all(
                 isinstance(block, dict) and block.get("type") == "input_text" for block in content

@@ -23,52 +23,77 @@ function renderPicker() {
   return onOpen;
 }
 
-it("fetches 20 at a time on demand and opens only the selected side chat", async () => {
-  let finishPage!: (response: Response) => void;
-  const nextPage = new Promise<Response>((resolve) => {
-    finishPage = resolve;
-  });
-  vi.mocked(authenticatedFetch)
-    .mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({
-          data: [{ id: "one", title: "First question", created_at: 100 }],
-          has_more: true,
-          last_id: "one",
-        }),
-      ),
-    )
-    .mockReturnValueOnce(nextPage);
-  const onOpen = renderPicker();
-  expect(authenticatedFetch).not.toHaveBeenCalled();
-  const user = userEvent.setup();
-  await user.click(screen.getByRole("button", { name: "Browse side chats" }));
-  await screen.findByText("First question");
-  expect(authenticatedFetch).toHaveBeenCalledWith("/v1/sessions/parent/side_chats?limit=20");
-  expect(onOpen).not.toHaveBeenCalled();
-  await user.click(screen.getByRole("menuitem", { name: "Next 20" }));
-  expect(screen.getByText("First question")).toBeInTheDocument();
-  expect(screen.getByRole("menuitem", { name: "Next 20" })).toHaveAttribute(
-    "aria-disabled",
-    "true",
-  );
-  finishPage(
-    new Response(
+it.each([false, true])(
+  "keeps earlier pages and opens only the selected side chat (retry: %s)",
+  async (retry) => {
+    let finishPage!: (response: Response) => void;
+    const nextPage = new Promise<Response>((resolve) => {
+      finishPage = resolve;
+    });
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: [{ id: "one", title: "First question", created_at: 100 }],
+            has_more: true,
+            last_id: "one",
+          }),
+        ),
+      )
+      .mockReturnValueOnce(nextPage);
+    const onOpen = renderPicker();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Browse side chats" }));
+    await screen.findByText("First question");
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions/parent/side_chats?limit=20",
+      expect.anything(),
+    );
+    expect(onOpen).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("menuitem", { name: "Load more" }));
+    expect(screen.getByText("First question")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Load more" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    const secondPage = new Response(
       JSON.stringify({
         data: [{ id: "two", title: "Second question", created_at: 200 }],
         has_more: false,
         last_id: "two",
       }),
-    ),
-  );
-  await user.click(await screen.findByText("Second question"));
-  expect(authenticatedFetch).toHaveBeenLastCalledWith(
-    "/v1/sessions/parent/side_chats?limit=20&after=one",
-  );
-  expect(setSessionParent).toHaveBeenCalledWith("two", "parent");
-  expect(onOpen).toHaveBeenCalledExactlyOnceWith("two");
-  await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
-});
+    );
+    if (retry) {
+      finishPage(new Response("{}", { status: 500 }));
+      await screen.findByText("Could not load side chats");
+      expect(screen.getByText("First question")).toBeInTheDocument();
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce(secondPage);
+      await user.click(screen.getByRole("menuitem", { name: "Retry" }));
+    } else {
+      finishPage(secondPage);
+    }
+    await screen.findByText("Second question");
+    expect(screen.getByText("First question")).toBeInTheDocument();
+    await user.click(await screen.findByText("Second question"));
+    expect(authenticatedFetch).toHaveBeenLastCalledWith(
+      "/v1/sessions/parent/side_chats?limit=20&after=one",
+      expect.anything(),
+    );
+    expect(setSessionParent).toHaveBeenCalledWith("two", "parent");
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("two");
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: [], has_more: false, last_id: null })),
+    );
+    await user.click(screen.getByRole("button", { name: "Browse side chats" }));
+    await screen.findByText("No saved side chats");
+    expect(authenticatedFetch).toHaveBeenLastCalledWith(
+      "/v1/sessions/parent/side_chats?limit=20",
+      expect.anything(),
+    );
+  },
+);
 
 it.each([404, 500])("handles a %s response without changing local tabs", async (status) => {
   vi.mocked(authenticatedFetch).mockResolvedValue(new Response("{}", { status }));
@@ -76,4 +101,12 @@ it.each([404, 500])("handles a %s response without changing local tabs", async (
   await userEvent.setup().click(screen.getByRole("button", { name: "Browse side chats" }));
   await screen.findByText(status === 404 ? "No saved side chats" : "Could not load side chats");
   expect(onOpen).not.toHaveBeenCalled();
+  if (status === 500) {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: [], has_more: false, last_id: null })),
+    );
+    await userEvent.setup().click(screen.getByRole("menuitem", { name: "Retry" }));
+    await screen.findByText("No saved side chats");
+    expect(onOpen).not.toHaveBeenCalled();
+  }
 });

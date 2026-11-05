@@ -499,8 +499,10 @@ chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
 On another device, choose **Browse side chats** in the Workspace toolbar or
 mobile drawer, then select a chat to open it. The picker fetches 20 at a time;
-**Next 20** loads another page. Existing local tabs keep their order. Side chats
-created before server discovery was added remain local to their original browser.
+**Load more** adds another page without removing earlier results. If a request
+fails, **Retry** tries it again without closing the picker. Existing local tabs
+keep their order. Side chats created before server discovery was added remain
+local to their original browser.
 In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
 in a visible workspace rail. With no closable visible tab it returns to the
 new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are

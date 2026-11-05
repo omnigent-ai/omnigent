@@ -133,7 +133,6 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
         },
     )
     browser_contract.json(f"{api}/child_sessions", empty)
-    browser_contract.json(f"{api}/side_chats", empty)
     browser_contract.json(f"{api}/policies", empty)
     browser_contract.json("/v1/policy-registry", empty)
     browser_contract.json(f"{api}/owner", {"owner": None})
