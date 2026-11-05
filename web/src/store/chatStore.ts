@@ -5510,9 +5510,9 @@ interface MissedEventRecovery {
  * A stream pump can keep receiving heartbeats while missing a lifecycle event.
  * Periodically re-read durable status, discarding a snapshot if any semantic
  * stream event arrives during the fetch. A snapshot that shows the visible turn
- * ended, or a posted send no longer queued, proves the stream also missed that
- * turn's items, so the stream is recycled once for the reconnect backfill
- * instead. A failed backfill is retried on this cadence until one lands.
+ * idle or failed, or no longer queues a posted send still pending here, proves
+ * the stream also missed that turn's items, so the stream is recycled once for
+ * the reconnect backfill instead. A failed backfill is retried on this cadence until one lands.
  */
 async function reconcileActiveSessionStatus(
   id: string,
@@ -5570,9 +5570,12 @@ async function reconcileActiveSessionStatus(
     return;
   }
   const queuedPendingIds = new Set((session.pendingInputs ?? []).map((p) => p.pendingId));
+  // A send the client already settled during the read is not missing.
+  const stillPendingIds = new Set(current.pendingUserMessages.map((p) => p.pendingId));
   const consumedPendingIds = stateBeforeFetch.pendingUserMessages.flatMap((p) =>
     p.posted &&
     p.pendingId &&
+    stillPendingIds.has(p.pendingId) &&
     !queuedPendingIds.has(p.pendingId) &&
     !recovery.revealedPendingIds.has(p.pendingId)
       ? [p.pendingId]
@@ -5581,9 +5584,8 @@ async function reconcileActiveSessionStatus(
   const turnSeenRunning =
     current.activeResponse?.state === "streaming" ||
     latchedTurnSeenBefore(stateBeforeFetch, current);
-  const turnEnded =
-    turnSeenRunning &&
-    (session.status === "idle" || session.status === "failed" || session.status === "waiting");
+  // A `waiting` turn can still be live, parked on async work, so it never recycles.
+  const turnEnded = turnSeenRunning && (session.status === "idle" || session.status === "failed");
   const turnKey =
     current.activeResponse?.state === "streaming"
       ? current.activeResponse.responseId

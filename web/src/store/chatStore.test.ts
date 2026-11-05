@@ -300,6 +300,30 @@ let sessionLabels: Map<string, Record<string, string>>;
 let sessionMcpStartup: Map<string, Record<string, McpServerStartup>>;
 let sessionTerminalPending: Map<string, boolean>;
 
+/** Hold the next GET of `id`'s session snapshot until the returned release
+ *  runs. The response is built when the request is made, so it reflects the
+ *  server state at that moment. */
+function holdNextSessionSnapshot(id: string): () => void {
+  const route = fetchMock.getMockImplementation()!;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let holdNext = true;
+  const snapshotUrl = new RegExp(`^/v1/sessions/${id}(?:\\?.*)?$`);
+  fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (holdNext && snapshotUrl.test(url) && (init?.method ?? "GET") === "GET") {
+      holdNext = false;
+      const response = route(input, init);
+      await held;
+      return response;
+    }
+    return route(input, init);
+  });
+  return release;
+}
+
 /** Default fetch router: dispatch by URL. Tests override per-call as needed. */
 function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Response {
   const url = typeof input === "string" ? input : input.toString();
@@ -14859,6 +14883,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     seedSession(id, [before]);
     const sinks: StreamSink[] = [];
     let itemFetches = 0;
+    let snapshotFetches = 0;
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.startsWith(`/v1/sessions/${id}/items`)) {
@@ -14876,6 +14901,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         return mockResponse(null, { bodyStream: sink.stream });
       }
       if (url.startsWith(`/v1/sessions/${id}?`) && (init?.method ?? "GET") === "GET") {
+        snapshotFetches += 1;
         return mockResponse({
           id,
           agent_id: "agent_xyz",
@@ -14914,6 +14940,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       sinks,
       bound,
       itemFetches: () => itemFetches,
+      snapshotFetches: () => snapshotFetches,
       stop: async () => {
         controller.abort();
         await drainAsync(2);
@@ -14987,9 +15014,96 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await pump.stop();
   });
 
+  it("keeps the stream when it delivers the consumed send during the status read", async () => {
+    const id = "conv_consumed_mid_read";
+    const pump = await startMissedEventPump(id, "running");
+    const releaseSnapshot = holdNextSessionSnapshot(id);
+    await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    expect(pump.snapshotFetches()).toBe(1);
+
+    pump.sinks[0]!.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_mid_turn",
+          type: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "restore the old format" }] },
+          cleared_pending_id: "pending_mid_turn",
+        },
+      }),
+    );
+    await drainAsync();
+    releaseSnapshot();
+    await drainAsync();
+
+    expect(pump.bound.get().pendingUserMessages).toEqual([]);
+    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([
+      pump.before.id,
+      "item_mid_turn",
+    ]);
+    expect(pump.bound.get().activeResponse).toMatchObject({
+      responseId: "resp_live",
+      state: "streaming",
+    });
+    expect(pump.sinks).toHaveLength(1);
+
+    await pump.stop();
+  });
+
+  it("keeps the stream when a reconnect backfill settles the send during the status read", async () => {
+    const id = "conv_backfilled_mid_read";
+    let releaseItems!: (down: boolean) => void;
+    const itemsHeld = new Promise<boolean>((resolve) => {
+      releaseItems = resolve;
+    });
+    let itemsDown: () => boolean | Promise<boolean> = () => false;
+    const pump = await startMissedEventPump(id, "running", { itemsDown: () => itemsDown() });
+    const consumed = userMessage("resp_live", "restore the old format");
+    seedSessionItems(id, [pump.before, consumed]);
+    itemsDown = () => itemsHeld;
+    pump.sinks[0]!.error();
+    await drainAsync();
+    expect(pump.sinks).toHaveLength(2);
+    // A live turn edge during the backfill's reads makes it skip its status patch.
+    pump.sinks[1]!.push(
+      sse("session.status", { conversation_id: id, status: "running", response_id: "resp_live" }),
+    );
+    await drainAsync();
+    const releaseSnapshot = holdNextSessionSnapshot(id);
+    await advanceWithHeartbeats(pump.sinks[1]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    expect(pump.snapshotFetches()).toBe(2);
+
+    releaseItems(false);
+    await drainAsync();
+    expect(pump.bound.get().pendingUserMessages).toEqual([]);
+    releaseSnapshot();
+    await drainAsync();
+
+    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, consumed.id]);
+    expect(pump.bound.get().activeResponse).toMatchObject({
+      responseId: "resp_live",
+      state: "streaming",
+    });
+    expect(pump.sinks).toHaveLength(2);
+
+    await pump.stop();
+  });
+
+  it("keeps the stream when the snapshot shows the turn waiting on background work", async () => {
+    const id = "conv_snapshot_waiting";
+    const pump = await startMissedEventPump(id, "waiting");
+    pump.bound.set({ pendingUserMessages: [] });
+
+    await advanceWithHeartbeats(pump.sinks[0]!, 2 * ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+
+    expect(pump.sinks).toHaveLength(1);
+    expect(pump.bound.get().sessionStatus).toBe("waiting");
+
+    await pump.stop();
+  });
+
   it.each([
     ["idle", "completed"],
-    ["waiting", "completed"],
     ["failed", "failed"],
   ] as const)(
     "backfills the reply of a turn whose %s end a heartbeat-only stream missed",
@@ -15112,13 +15226,29 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await pump.stop();
   });
 
-  it("backfills the reply and releases a send latch whose unnamed turn ended unseen", async () => {
+  it("settles a send latch from an ended snapshot only after its running edge arrived", async () => {
     const id = "conv_missed_latched_end";
     const pump = await startMissedEventPump(id, "idle");
-    pump.bound.set({ pendingUserMessages: [], activeResponse: null, sendLatchedAt: Date.now() });
+    const latchedAt = Date.now();
+    pump.bound.set({
+      pendingUserMessages: [],
+      activeResponse: null,
+      sessionStatus: "idle",
+      sendLatchedAt: latchedAt,
+    });
+
+    // No running edge yet, so the idle snapshot can predate the latched turn.
+    await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(pump.bound.get().status).toBe("streaming");
+    expect(pump.bound.get().sendLatchedAt).toBe(latchedAt);
+    expect(pump.bound.get().sendLatchSeenRunning).toBeNull();
+    expect(pump.sinks).toHaveLength(1);
+
     // The running edge named no response, so only the send latch shows the turn.
     pump.sinks[0]!.push(sse("session.status", { conversation_id: id, status: "running" }));
     await drainAsync();
+    expect(pump.bound.get().sendLatchSeenRunning).toBe(latchedAt);
     const reply = assistantMessage("resp_live", "Done with the migration");
     seedSessionItems(id, [pump.before, reply]);
 
@@ -15130,26 +15260,6 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(pump.bound.get().sendLatchedAt).toBeNull();
     expect(pump.bound.get().sessionStatus).toBe("idle");
     expect(pump.sinks).toHaveLength(2);
-
-    await pump.stop();
-  });
-
-  it("keeps a fresh send latch when the snapshot predates its turn", async () => {
-    const pump = await startMissedEventPump("conv_fresh_latch", "idle");
-    const latchedAt = Date.now();
-    pump.bound.set({
-      pendingUserMessages: [],
-      activeResponse: null,
-      sessionStatus: "idle",
-      sendLatchedAt: latchedAt,
-    });
-
-    await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
-    await drainAsync();
-
-    expect(pump.bound.get().status).toBe("streaming");
-    expect(pump.bound.get().sendLatchedAt).toBe(latchedAt);
-    expect(pump.sinks).toHaveLength(1);
 
     await pump.stop();
   });
@@ -18068,30 +18178,6 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/elicitations\/[^/]+\/resolve$/.test(url)) await held;
-      return route(input, init);
-    });
-    return release;
-  }
-
-  /** Hold the next GET of `id`'s session snapshot until the returned release
-   *  runs. The response is built when the request is made, so it reflects the
-   *  server state at that moment. */
-  function holdNextSessionSnapshot(id: string): () => void {
-    const route = fetchMock.getMockImplementation()!;
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let holdNext = true;
-    const snapshotUrl = new RegExp(`^/v1/sessions/${id}(?:\\?.*)?$`);
-    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (holdNext && snapshotUrl.test(url) && (init?.method ?? "GET") === "GET") {
-        holdNext = false;
-        const response = route(input, init);
-        await held;
-        return response;
-      }
       return route(input, init);
     });
     return release;
