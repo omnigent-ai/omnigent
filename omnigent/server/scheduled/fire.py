@@ -63,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -355,8 +356,19 @@ class _NewRunRecorder:
                 await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
 
 
+# The trigger form saves its state as the prompt's first line; the model never sees it.
+# Keep in sync with TRIGGER_HEADER_PATTERN in web/src/components/scheduled/triggerTemplates.ts.
+TRIGGER_HEADER_PATTERN = re.compile(r"<!-- omnigent-trigger v\d+ [^\n]* -->\n")
+
+
+def strip_trigger_header(prompt: str) -> str:
+    """Return ``prompt`` without the trigger form's header line, if it has one."""
+    match = TRIGGER_HEADER_PATTERN.match(prompt)
+    return prompt[match.end() :] if match else prompt
+
+
 def _scheduled_session_title(task: ScheduledTask) -> str:
-    if task.session_mode == "continue" and task.prompt.startswith(
+    if task.session_mode == "continue" and strip_trigger_header(task.prompt).startswith(
         tuple(
             f"This automation watches {source} and starts one Omnigent session"
             for source in ("Jira", "Slack", "GitHub", "Linear")
@@ -392,7 +404,7 @@ UNATTENDED_RUN_NOTE = (
 
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
-    text = f"{prompt.rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
+    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
     return SessionEventInput(
         type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": text}]},

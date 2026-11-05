@@ -36,17 +36,21 @@ import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFie
 import { TriggerWorkerSettingsFields } from "./TriggerWorkerSettingsFields";
 import {
   combineTriggerPrompt,
+  decodeTriggerPrompt,
   emptyTriggerFields,
+  encodeTriggerPrompt,
+  hasTriggerHeader,
   isTriggerPrompt,
   readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
-  renderTriggerPrompt,
   splitTriggerPrompt,
+  stripTriggerHeader,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
   updateTriggerWorkerSettings,
   type TriggerFields,
   type TriggerSource,
+  type TriggerWorkerConfig,
 } from "@/components/scheduled/triggerTemplates";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
@@ -168,15 +172,23 @@ export function CreateScheduledTaskDialog({
     editingTask !== null &&
     editingTask.sessionMode === "continue" &&
     isTriggerPrompt(editingTask.prompt);
+  // A trigger with a valid header reopens in its form. One edited outside the form
+  // opens as its full prompt; one saved before headers, as its instructions.
+  const editingTriggerConfig = useMemo(
+    () => (editingTemplateTrigger ? decodeTriggerPrompt(editingTask?.prompt ?? "") : null),
+    [editingTemplateTrigger, editingTask],
+  );
   // Temporary prompt edits must not expose controls that can rebind the poller.
   const editingWorkerSettings =
-    editingTemplateTrigger && readTriggerWorkerSettings(editingTask.prompt) !== null;
+    editingTemplateTrigger &&
+    (editingTriggerConfig !== null || readTriggerWorkerSettings(editingTask.prompt) !== null);
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  // The rendered template text around the instructions of an older trigger. Never shown.
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
-  const [systemPromptOpen, setSystemPromptOpen] = useState(false);
-  const [editingSystemPrompt, setEditingSystemPrompt] = useState(false);
+  // Worker settings of an edited trigger that has a header.
+  const [triggerWorker, setTriggerWorker] = useState<TriggerWorkerConfig | null>(null);
   const promptFieldsRef = useRef<HTMLDivElement>(null);
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
@@ -380,11 +392,19 @@ export function CreateScheduledTaskDialog({
       setTriggerType(initialTrigger ?? "schedule");
       resetMenus();
       setAdvancedOpen(false);
-      setSystemPromptOpen(false);
-      setEditingSystemPrompt(false);
-      const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
-      setPrompt(parts.userPrompt);
-      setSystemPrompt(parts.systemPrompt);
+      const savedPrompt = editingTask?.prompt ?? initialPrompt ?? "";
+      if (editingTriggerConfig !== null) {
+        setPrompt("");
+        setSystemPrompt(null);
+      } else if (hasTriggerHeader(savedPrompt)) {
+        // The header no longer matches, so trust only the text the model runs.
+        setPrompt(stripTriggerHeader(savedPrompt));
+        setSystemPrompt(null);
+      } else {
+        const parts = splitTriggerPrompt(savedPrompt);
+        setPrompt(parts.userPrompt);
+        setSystemPrompt(parts.systemPrompt);
+      }
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
         const parsedSchedule = savedSchedule;
@@ -404,7 +424,15 @@ export function CreateScheduledTaskDialog({
         setPickedProjectId(null);
         setSessionMode(editingTask.sessionMode);
         setStartNewSession(false);
-        setTrigger(null);
+        if (editingTriggerConfig !== null) {
+          const { source, worker, ...fields } = editingTriggerConfig;
+          setTrigger(source);
+          setTriggerFields(fields);
+          setTriggerWorker(worker);
+        } else {
+          setTrigger(null);
+          setTriggerWorker(null);
+        }
       } else {
         setName(initialTrigger ? TRIGGER_TEMPLATES[initialTrigger].name : (initialName ?? ""));
         setPickedAgentId(null);
@@ -416,6 +444,7 @@ export function CreateScheduledTaskDialog({
         setStartNewSession(false);
         setTrigger(initialTrigger);
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
+        setTriggerWorker(null);
         setSchedule(initialTrigger ? defaultTriggerSchedule : DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
@@ -435,6 +464,7 @@ export function CreateScheduledTaskDialog({
     initialTrigger,
     defaultTriggerSchedule,
     editingTask,
+    editingTriggerConfig,
     savedSchedule,
     savedWorkspace,
   ]);
@@ -487,12 +517,17 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
-  const workerSettings = editingWorkerSettings
-    ? readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt))
-    : null;
-  const workerPlacement = editingWorkerSettings
-    ? readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt))
-    : null;
+  const legacyWorkerSettings = editingWorkerSettings && triggerWorker === null;
+  const workerSettings =
+    triggerWorker ??
+    (legacyWorkerSettings
+      ? readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt))
+      : null);
+  const workerPlacement =
+    triggerWorker?.placement ??
+    (legacyWorkerSettings
+      ? readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt))
+      : null);
   const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
   const workerAgent = agents?.find(
     (agent) => agent.id === (workerSettings?.agentId ?? editingTask?.agentId),
@@ -607,20 +642,26 @@ export function CreateScheduledTaskDialog({
     unsupportedByScheduler ||
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
+  // An edit keeps the saved workers; a new trigger's workers run where the
+  // manager runs (beside it on a connected host, or each in its own sandbox).
+  const renderedTriggerWorker: TriggerWorkerConfig = triggerWorker ?? {
+    placement: sandboxMode ? "managed" : "same_host",
+    agentId: null,
+    model: supportsModel ? pickedModel : "",
+    effort: supportsModel ? pickedEffort : "",
+  };
   const renderedTriggerPrompt =
     trigger !== null && triggerFieldsComplete(triggerFields)
-      ? renderTriggerPrompt(trigger, triggerFields, {
-          // Workers run where the manager runs: beside it on a connected host,
-          // or each in its own sandbox.
-          placement: sandboxMode ? "managed" : "same_host",
-          sessionLink,
-          pollingIntervalMinutes:
-            schedule.preset === "custom" && schedule.customFreq === "minutely"
-              ? schedule.interval
-              : 60,
-          model: supportsModel && pickedModel !== "" ? pickedModel : undefined,
-          effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
-        })
+      ? encodeTriggerPrompt(
+          { source: trigger, ...triggerFields, worker: renderedTriggerWorker },
+          {
+            sessionLink,
+            pollingIntervalMinutes:
+              schedule.preset === "custom" && schedule.customFreq === "minutely"
+                ? schedule.interval
+                : 60,
+          },
+        )
       : "";
   const effectivePrompt =
     trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
@@ -721,8 +762,6 @@ export function CreateScheduledTaskDialog({
     setTimezone(draft?.timezone ?? timezone);
     setSessionMode(draft?.sessionMode ?? (next === "schedule" ? "new" : "continue"));
     setScheduleUnsupported(false);
-    setSystemPromptOpen(false);
-    setEditingSystemPrompt(false);
     setError(null);
   }
 
@@ -743,6 +782,7 @@ export function CreateScheduledTaskDialog({
     setPickedProjectId(null);
     setTrigger(null);
     setTriggerFields(emptyTriggerFields("jira"));
+    setTriggerWorker(null);
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -963,21 +1003,10 @@ export function CreateScheduledTaskDialog({
                     toolsProvided={
                       sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
                     }
-                    renderedPrompt={renderedTriggerPrompt}
-                    onEditAsPrompt={() => {
-                      const parts = splitTriggerPrompt(renderedTriggerPrompt);
-                      setPrompt(parts.userPrompt);
-                      setSystemPrompt(parts.systemPrompt);
-                      setSystemPromptOpen(false);
-                      setEditingSystemPrompt(false);
-                      setTrigger(null);
-                    }}
                   />
                 ) : (
                   <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
-                    <Label htmlFor="task-prompt">
-                      {systemPrompt === null ? "Instructions" : "Your prompt"}
-                    </Label>
+                    <Label htmlFor="task-prompt">Instructions</Label>
                     <Textarea
                       id="task-prompt"
                       value={prompt}
@@ -992,59 +1021,10 @@ export function CreateScheduledTaskDialog({
                       splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
                         <p role="status" className="text-sm text-warning">
                           {prompt.trim() === ""
-                            ? "Your prompt can't be empty."
-                            : systemPrompt.trim() === ""
-                              ? "System prompt can't be empty. Expand System prompt and click Edit system prompt to restore it."
-                              : "These edits change the template structure. After saving, the full text will appear as one prompt."}
+                            ? "Instructions can't be empty."
+                            : "These edits change the template structure. After saving, the full text will appear as one prompt."}
                         </p>
                       )}
-                    {systemPrompt !== null && (
-                      <Collapsible
-                        open={systemPromptOpen}
-                        onOpenChange={(expanded) => {
-                          setSystemPromptOpen(expanded);
-                          setEditingSystemPrompt(false);
-                        }}
-                        className="mt-2 rounded-md border border-border p-3"
-                      >
-                        <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2 rounded-sm text-ui text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-                          <ChevronDownIcon className="size-4 transition-transform group-data-[state=closed]:-rotate-90" />
-                          System prompt
-                        </CollapsibleTrigger>
-                        <CollapsibleContent className="space-y-2 pt-3">
-                          <p className="text-sm text-muted-foreground">
-                            Instructions for how the automation runs. Your prompt is added
-                            separately.
-                          </p>
-                          {editingSystemPrompt ? (
-                            <Textarea
-                              aria-label="System prompt"
-                              autoFocus
-                              value={systemPrompt}
-                              rows={8}
-                              className="max-h-80 resize-y text-ui focus-visible:ring-0"
-                              componentId="tasks.scheduled.system_prompt"
-                              onChange={(event) => setSystemPrompt(event.target.value)}
-                            />
-                          ) : (
-                            <pre className="max-h-56 overflow-y-auto rounded-md bg-muted/40 p-2 font-sans text-sm whitespace-pre-wrap break-words">
-                              {systemPrompt}
-                            </pre>
-                          )}
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            componentId="tasks.scheduled.edit_system_prompt"
-                            onClick={() => setEditingSystemPrompt(!editingSystemPrompt)}
-                          >
-                            {editingSystemPrompt
-                              ? "Done editing system prompt"
-                              : "Edit system prompt"}
-                          </Button>
-                        </CollapsibleContent>
-                      </Collapsible>
-                    )}
                   </div>
                 )}
 
@@ -1091,9 +1071,9 @@ export function CreateScheduledTaskDialog({
                     )}
                   </div>
 
-                  {/* A trigger needs its one kept session, so its form leaves the choice out. */}
+                  {/* A trigger keeps one session: the mode switch stays hidden, but an edit can restart it. */}
                   {sessionModesSupported &&
-                    trigger === null &&
+                    (trigger === null || isEdit) &&
                     (!editingTemplateTrigger || editingTask?.sessionId) && (
                       <div
                         className="flex flex-col gap-2 border-t border-border pt-3"
@@ -1411,6 +1391,10 @@ export function CreateScheduledTaskDialog({
                           disabled={curationPending}
                           onSelectOpenChange={handleSelectOpenChange}
                           onChange={(settings) => {
+                            if (triggerWorker !== null) {
+                              setTriggerWorker({ ...triggerWorker, ...settings });
+                              return;
+                            }
                             const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
                             if (updated === null) return;
                             const parts = splitTriggerPrompt(updated);
@@ -1420,8 +1404,8 @@ export function CreateScheduledTaskDialog({
                         />
                       ) : editingWorkerSettings ? (
                         <p className="text-sm text-muted-foreground" role="status">
-                          Worker controls are unavailable for these customized instructions. Edit
-                          the prompt or system prompt above to configure matching sessions.
+                          Worker controls are unavailable for these customized instructions. Create
+                          this automation again from its template to configure matching sessions.
                         </p>
                       ) : (
                         <>
@@ -1520,30 +1504,28 @@ export function CreateScheduledTaskDialog({
                                       <>
                                         {" "}
                                         Trigger automations reuse a polling session even though each
-                                        match starts a new worker. To change the model or harness
-                                        for future workers, edit the worker creation instructions in
-                                        the {systemPrompt === null
-                                          ? "prompt"
-                                          : "system prompt"}.{" "}
-                                        <button
-                                          type="button"
-                                          className="underline underline-offset-2"
-                                          onClick={() => {
-                                            if (systemPrompt !== null) {
-                                              setSystemPromptOpen(true);
-                                              setEditingSystemPrompt(true);
-                                            }
-                                            promptFieldsRef.current
-                                              ?.querySelector<HTMLTextAreaElement>(
-                                                systemPrompt === null
-                                                  ? "#task-prompt"
-                                                  : 'textarea[aria-label="System prompt"]',
-                                              )
-                                              ?.focus();
-                                          }}
-                                        >
-                                          Edit worker instructions
-                                        </button>
+                                        match starts a new worker.{" "}
+                                        {systemPrompt === null ? (
+                                          <>
+                                            To change the model or harness for future workers, edit
+                                            the worker creation instructions in the prompt.{" "}
+                                            <button
+                                              type="button"
+                                              className="underline underline-offset-2"
+                                              onClick={() =>
+                                                promptFieldsRef.current
+                                                  ?.querySelector<HTMLTextAreaElement>(
+                                                    "#task-prompt",
+                                                  )
+                                                  ?.focus()
+                                              }
+                                            >
+                                              Edit worker instructions
+                                            </button>
+                                          </>
+                                        ) : (
+                                          "To change the model or harness for future workers, create this automation again from its template."
+                                        )}
                                       </>
                                     )}
                                   </p>

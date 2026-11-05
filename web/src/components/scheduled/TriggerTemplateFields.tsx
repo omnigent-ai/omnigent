@@ -37,18 +37,12 @@ export function TriggerTemplateFields({
   source,
   fields,
   onChange,
-  renderedPrompt,
-  onEditAsPrompt,
   onSelectOpenChange,
   toolsProvided = false,
 }: {
   source: TriggerSource;
   fields: TriggerFields;
   onChange: (next: TriggerFields) => void;
-  /** The prompt the task will save; "" until the required fields are filled. */
-  renderedPrompt: string;
-  /** Leave the template and edit the rendered prompt as a plain prompt. */
-  onEditAsPrompt: () => void;
   /** Forwarded to each Select so the dialog's dismiss guard knows one is open. */
   onSelectOpenChange: (open: boolean) => void;
   /** Where the task runs already gives the agent the service's tools, so skip that warning. */
@@ -366,26 +360,6 @@ export function TriggerTemplateFields({
           {fields.linkBack && ` Links are posted with your ${triggerServiceName(source)} account.`}
         </span>
       </p>
-
-      {renderedPrompt !== "" && (
-        <details className="group" data-testid="task-trigger-preview">
-          <summary className="cursor-pointer text-sm text-muted-foreground">Preview prompt</summary>
-          <pre className="mt-2 max-h-56 overflow-y-auto rounded-md border border-border bg-muted/40 p-2 font-sans text-sm whitespace-pre-wrap">
-            {renderedPrompt}
-          </pre>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="mt-2"
-            onClick={onEditAsPrompt}
-            data-testid="task-trigger-edit-as-prompt"
-            componentId="tasks.scheduled.trigger_edit_as_prompt"
-          >
-            Edit as prompt
-          </Button>
-        </details>
-      )}
     </div>
   );
 }

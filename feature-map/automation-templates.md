@@ -22,23 +22,25 @@ to customize.
   the entered values; Slack placeholders omit the optional leading `#`.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, or Linear. Sessions start whether it is checked or not.
-- `prompt-editing`: the detail page and edit dialog show Your prompt first. System
-  prompt starts collapsed, expands into a read-only preview, and requires Edit
-  system prompt to change it. Done editing system prompt returns to the read-only
-  preview without collapsing. Posting instructions for each session stay in the
-  worker instructions when their text changes. Saving preserves both parts;
-  reopening collapses and locks the system prompt again. Edit as prompt during creation uses the same
-  separation. Unrecognized or ambiguous prompt formats remain fully editable
-  as a single Instructions field in the modal (Prompt on the detail page). For a recognized trigger creation call, **Harness for matching sessions**, Model,
-  and Effort update future worker instructions without rebinding the polling session.
-  Existing worker sessions retain their settings. Customized or ambiguous creation calls
-  keep **Edit worker instructions**, which opens System prompt or the full Instructions field in the modal. Clicking it again refocuses an already-open editor. Edits that remove the template signature or add
-  ambiguous section headings show a notice before saving as a single prompt.
-  Your prompt must contain text; clearing it shows a required-field message.
-  Explicitly clearing only the posting-rule body in System prompt is supported
-  and preserves the separate prompts when saved and reopened.
-  The detail page also keeps the system prompt collapsed by default, with a
-  bounded read-only preview when expanded; use Edit automation to change it.
+- `prompt-editing`: the rendered template prompt is never shown or editable; there is
+  no System prompt, Preview prompt, or Edit as prompt. A trigger saves its form state
+  as a one-line `<!-- omnigent-trigger v1 {...} -->` header above the rendered prompt.
+  Edit automation reads that header and reopens the trigger form with its scope,
+  conditions, instructions, link-back and worker settings; saving re-renders the
+  prompt from the form. The server strips the header before the message reaches the
+  model. The header carries a fingerprint of its fields and the prompt below it; if
+  either was changed outside the form (for example through the REST API), Edit and the
+  detail page ignore the header and show the full prompt as one editable field, and
+  saving keeps that text. Triggers saved before headers open as their Instructions only, with the
+  template text kept hidden and unchanged on save; prompts that can't be split stay
+  one editable Instructions field (Prompt on the detail page). For a recognized trigger
+  creation call, **Harness for matching sessions**, Model, and Effort update future
+  worker instructions without rebinding the polling session. Existing worker sessions
+  retain their settings. Customized creation calls in a single Instructions field keep
+  **Edit worker instructions**, which focuses that field. Edits that remove the template
+  signature or add ambiguous section headings show a notice before saving as a single
+  prompt. Instructions must contain text; clearing them shows a required-field message.
+  The detail page shows a trigger's instructions only.
 - `default-project`: new automations select Omnigent Automation. Saving reuses or
   creates that project; canceling creates nothing. The project picker can choose
   another project or remove the default. Editing preserves the saved project.
@@ -76,13 +78,11 @@ to customize.
   default 10), otherwise hourly when the requested cadence is unsupported; saved
   schedules are preserved. The initial search covers at least one polling interval
   or one hour, whichever is longer, plus the indexing overlap. Both row-menu and detail-page editing keep schedule
-  controls hidden, including while customizing the system prompt. Unsupported
+  controls hidden. Unsupported
   polling offers an explicit Use server default action without exposing schedule
   fields or changing session mode.
-  Edit as prompt → turn **Start each run in a new session** on to restore the
-  scheduling controls, even when the prompt retains its template signature.
-  Replacing the template’s opening sentence also restores regular scheduling
-  controls after saving and reopening.
+  Replacing the template’s opening sentence in an older trigger's single
+  Instructions field restores regular scheduling controls after saving and reopening.
 - `schedule`: Repeat → Interval exposes the minute interval directly in the Time row,
   with no timezone selector. Minute schedules preserve their timezone internally and
   expose it beside the end date only when Ends is On date.
@@ -154,12 +154,12 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   covers the preview and Templates tab with reload, plus New automation's
   trigger selector on desktop and mobile. It creates
   a Jira automation and cross-checks the saved schedule and prompt through REST
-  with trigger controls always active. The gallery variants also convert a template to new-session mode and verify schedule controls, list
-  Run now/next-run, and detail Run now/next-run remain available.
+  with trigger controls always active.
   The mobile preview uses equals with one project; the desktop Templates path selects in with two
   comma-separated projects and verifies that both appear in the saved query.
-  The gallery variants edit the user prompt through the row menu and the system prompt through
-  the detail page, check persistence through REST, and reopen the editor. The
+  The gallery variants reopen the trigger form through the row menu and the detail
+  page, edit the instructions and a condition, check the saved header and prompt
+  through REST, and confirm no rendered prompt is shown. The
   preview entry runs at mobile width; the Templates entry runs at desktop width.
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
   covers new-session host creation, nine-minute rejection, reopening, and switching
@@ -176,8 +176,9 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   saved workspace, and sandbox creation with offline connected hosts. It also
   covers repository/default selections, legacy edits, target switching, and
   continued-session setting locks, plus Random worktree on/off in the shared modal.
-  Prompt coverage includes expansion before explicit editing, preserving the
-  system prompt on user-only edits, discarding canceled edits, and Edit as prompt.
+  Prompt coverage includes reopening a trigger from its header, saving edited
+  conditions and worker settings into it, and preserving an older trigger's hidden
+  template text on instruction-only edits.
 - `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
   uses its own built-SPA browser contract, with a synthetic provider catalog,
   to cover repository creation, replacement, clearing, and reopening on desktop
@@ -188,9 +189,10 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   with **Start each run in a new session** on and check that the sessions have distinct
   worktree paths. Disable the option and run again: the new session uses the selected
   directory. With **Start each run in a new session** off, later runs reuse its worktree.
-- In any integration template, fill in the scope and session instructions, then
-  expand Preview prompt. Toggle the link checkbox below the trigger and check
-  that only the comment or reply step changes; sessions still start either way.
+- In any integration template, fill in the scope, a condition and session instructions,
+  save, then choose Edit: the trigger form reopens with the same values and no
+  rendered prompt. Toggle the link checkbox below the trigger, save, and check through
+  REST that only the comment or reply step changes; sessions still start either way.
   Hover, focus, or tap the warning icon beside Instructions for each session to
   read the integration requirement;
   Escape dismisses it without closing the modal. The source and link-posting

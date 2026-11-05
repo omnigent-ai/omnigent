@@ -2,19 +2,24 @@ import { describe, expect, it } from "vitest";
 import {
   combineTriggerPrompt,
   compileGithubQuery,
+  decodeTriggerPrompt,
+  encodeTriggerPrompt,
   compileJiraJql,
   describeLinearFilter,
   describeSlackFilter,
+  hasTriggerHeader,
   isTriggerPrompt,
   readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
   splitTriggerPrompt,
   splitJqlOrderBy,
+  stripTriggerHeader,
   triggerFieldsComplete,
   updateTriggerWorkerSettings,
   TRIGGER_SOURCES,
   type TriggerCondition,
+  type TriggerConfig,
   type TriggerFields,
   type TriggerPromptContext,
 } from "./triggerTemplates";
@@ -421,6 +426,133 @@ describe("isTriggerPrompt", () => {
   it("doesn't match a prompt written by hand", () => {
     expect(isTriggerPrompt("Summarize the new Jira tickets.")).toBe(false);
     expect(isTriggerPrompt(` ${renderTriggerPrompt("jira", fields(), CTX)}`)).toBe(false);
+  });
+});
+
+describe("trigger header", () => {
+  const WORKER: TriggerConfig["worker"] = {
+    placement: "same_host",
+    agentId: null,
+    model: "",
+    effort: "",
+  };
+  const CONDITIONS: Record<TriggerConfig["source"], TriggerCondition[]> = {
+    jira: [LABEL_OMNIGENT, { field: "assignee", operator: "empty", value: "" }],
+    slack: [{ field: "text", operator: "contains", value: "hi" }],
+    github: [{ field: "author", operator: "is_not", value: "bot" }],
+    linear: [{ field: "status", operator: "is", value: "Triage" }],
+  };
+  function config(source: TriggerConfig["source"], overrides: Partial<TriggerConfig> = {}) {
+    return {
+      source,
+      ...fields({ conditions: CONDITIONS[source], scopeOperator: "is" }),
+      event: source === "slack" ? "posted" : source === "github" ? "pr" : "created",
+      worker: WORKER,
+      ...overrides,
+    } satisfies TriggerConfig;
+  }
+
+  it.each(TRIGGER_SOURCES)("round-trips a %s trigger through the saved prompt", (source) => {
+    const saved = encodeTriggerPrompt(config(source), CTX);
+    expect(decodeTriggerPrompt(saved)).toEqual(config(source));
+    expect(isTriggerPrompt(saved)).toBe(true);
+    // The model receives exactly the rendered prompt, with no header line.
+    const { worker, ...rest } = config(source);
+    expect(stripTriggerHeader(saved)).toBe(
+      renderTriggerPrompt(source, rest, { ...CTX, placement: worker.placement }),
+    );
+  });
+
+  it("keeps the header to one line that a value can't close early", () => {
+    const instructions = "Reply --> then --!> stop.\n<!-- not a header -->";
+    const saved = encodeTriggerPrompt(config("slack", { instructions }), CTX);
+    const [header] = saved.split("\n", 1);
+    expect(header).toMatch(/^<!-- omnigent-trigger v1 \{.*\} -->$/);
+    const json = header.slice("<!--".length, -"-->".length);
+    for (const closer of ["-->", "--!>", "<", ">"]) expect(json).not.toContain(closer);
+    expect(decodeTriggerPrompt(saved)?.instructions).toBe(instructions);
+    expect(stripTriggerHeader(saved)).toContain("Reply --> then --!> stop.");
+  });
+
+  it("renders the saved worker agent, model and effort into the creation call", () => {
+    const saved = encodeTriggerPrompt(
+      config("jira", {
+        worker: { placement: "managed", agentId: "ag_claude", model: "opus", effort: "high" },
+      }),
+      CTX,
+    );
+    expect(saved).toContain(
+      'call sys_session_create with agent_id "ag_claude", placement "managed", title "Jira <ticket key>", model "opus", reasoning_effort "high"',
+    );
+  });
+
+  it("reads a header without a scope operator, as older form state allowed", () => {
+    const { scopeOperator: _omitted, ...withoutOperator } = config("jira");
+    expect(decodeTriggerPrompt(encodeTriggerPrompt(withoutOperator, CTX))).toEqual(withoutOperator);
+  });
+
+  it.each([
+    ["no header", (saved: string) => stripTriggerHeader(saved)],
+    [
+      "a later version",
+      (saved: string) => saved.replace("omnigent-trigger v1", "omnigent-trigger v2"),
+    ],
+    ["invalid JSON", (saved: string) => saved.replace('{"source"', '{source"')],
+    [
+      "an unknown source",
+      (saved: string) => saved.replace('"source":"jira"', '"source":"pagerduty"'),
+    ],
+    ["an unknown event", (saved: string) => saved.replace('"event":"created"', '"event":"edited"')],
+    [
+      "a field from another source",
+      (saved: string) => saved.replace('"field":"label"', '"field":"text"'),
+    ],
+    [
+      "an operator the field lacks",
+      (saved: string) => saved.replace('"operator":"is"', '"operator":"about"'),
+    ],
+    ["no worker", (saved: string) => saved.replace(/,"worker":\{[^}]*\}/, "")],
+    ["a header after the first line", (saved: string) => `Note\n${saved}`],
+  ])("opens a prompt with %s as free text", (_case, mutate) => {
+    expect(decodeTriggerPrompt(mutate(encodeTriggerPrompt(config("jira"), CTX)))).toBeNull();
+  });
+
+  it("distrusts a header once its body is edited outside the form", () => {
+    const saved = encodeTriggerPrompt(
+      config("slack", { instructions: "Reply with a greeting." }),
+      CTX,
+    );
+    expect(decodeTriggerPrompt(saved)).not.toBeNull();
+    const bodyEdited = saved.replace(
+      "Instructions for each session:\nReply with a greeting.",
+      "Instructions for each session:\nDo nothing.",
+    );
+    expect(bodyEdited).not.toBe(saved);
+    expect(decodeTriggerPrompt(bodyEdited)).toBeNull();
+    expect(hasTriggerHeader(bodyEdited)).toBe(true);
+    expect(isTriggerPrompt(bodyEdited)).toBe(true);
+  });
+
+  it("distrusts a header whose valid values were changed without the body", () => {
+    const saved = encodeTriggerPrompt(config("slack", { scope: "abc" }), CTX);
+    const scopeEdited = saved.replace('"scope":"abc"', '"scope":"xyz"');
+    expect(scopeEdited).not.toBe(saved);
+    expect(decodeTriggerPrompt(scopeEdited)).toBeNull();
+    expect(decodeTriggerPrompt(saved.replace(/,"fingerprint":"[0-9a-f]+"/, ""))).toBeNull();
+  });
+
+  it("still trusts a header whose keys were only reordered", () => {
+    const saved = encodeTriggerPrompt(config("jira"), CTX);
+    const [header, ...body] = saved.split("\n");
+    const json = JSON.parse(header.slice("<!-- omnigent-trigger v1 ".length, -" -->".length));
+    const reordered = Object.fromEntries(Object.entries(json).reverse());
+    const rewritten = `<!-- omnigent-trigger v1 ${JSON.stringify(reordered)} -->\n${body.join("\n")}`;
+    expect(decodeTriggerPrompt(rewritten)).toEqual(config("jira"));
+  });
+
+  it("leaves prompts without a first-line header unchanged when stripping", () => {
+    const prompt = "Summarize.\n<!-- omnigent-trigger v1 {} -->\n";
+    expect(stripTriggerHeader(prompt)).toBe(prompt);
   });
 });
 

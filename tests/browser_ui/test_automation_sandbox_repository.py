@@ -328,11 +328,8 @@ def test_reused_automation_settings(
         if trigger:
             expect(note).to_contain_text("each match starts a new worker")
             page.get_by_role("button", name="Edit worker instructions", exact=True).click()
-            editor = page.get_by_role(
-                "textbox",
-                name="Instructions" if prompt_kind == "custom-trigger" else "System prompt",
-                exact=True,
-            )
+            # Only a prompt that can't be split keeps the creation call in the Instructions field.
+            editor = page.get_by_role("textbox", name="Instructions", exact=True)
             expect(editor).to_be_focused()
             page.get_by_test_id("task-name-input").click()
             page.get_by_role("button", name="Edit worker instructions", exact=True).click()

@@ -34,10 +34,13 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import {
+  decodeTriggerPrompt,
   emptyTriggerFields,
+  encodeTriggerPrompt,
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
+  stripTriggerHeader,
 } from "./triggerTemplates";
 
 const gitWorkspace = vi.hoisted(() => ({
@@ -2789,12 +2792,7 @@ describe("CreateScheduledTaskDialog session mode", () => {
         expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
         if (supported) {
           expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
-          fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
-          fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-          const editor = screen.getByRole("textbox", { name: "System prompt" });
-          fireEvent.change(editor, { target: { value: "Custom polling instructions." } });
-          expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
-          expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
+          expect(screen.queryByRole("button", { name: "System prompt" })).toBeNull();
         } else {
           expect(submit).toBeDisabled();
           expect(screen.getByRole("alert")).toHaveTextContent("polling configuration");
@@ -2951,10 +2949,6 @@ describe("automation trigger type", () => {
     expect(screen.getByTestId("task-trigger-scope")).toHaveValue("ES");
     expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Triage the ticket.");
     expect(screen.getByTestId("task-trigger-condition-0-value")).toHaveValue("bug");
-    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
-    fireEvent.click(screen.getByTestId("task-session-mode-trigger"));
-    await choose("Every day", "schedule-preset-trigger");
-    await chooseTimezone("Europe/London");
     await choose("Schedule");
     expect(screen.getByTestId("task-prompt-input")).toHaveValue("Prepare the weekly report.");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every week");
@@ -2963,8 +2957,8 @@ describe("automation trigger type", () => {
     );
     expect(screen.getByTestId("task-session-mode-trigger")).toBeChecked();
     await choose("Jira");
-    expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every day");
-    expect(screen.getByLabelText("Timezone", { exact: true })).toHaveTextContent("Europe/London");
+    expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 30 minutes");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("ES");
     await choose("Schedule");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
@@ -2974,29 +2968,24 @@ describe("automation trigger type", () => {
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
   });
 
-  it("keeps custom prompt edits and attributes a switched gallery template to the selected source", async () => {
+  it("attributes a switched gallery template to the selected source", async () => {
     render(dialog({ initialTrigger: "jira", initialTemplateId: "jira" }));
     expect(screen.getByLabelText("Trigger type")).toHaveTextContent("Jira");
     await choose("GitHub");
     expect(screen.getByTestId("task-name-input")).toHaveValue("GitHub");
     type("task-trigger-scope", "acme/app");
     type("task-trigger-instructions", "Investigate it.");
-    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
-    type("task-prompt-input", "Investigate it and add a regression test.");
     await choose("Slack");
     await choose("GitHub");
-    expect(screen.queryByTestId("task-trigger-fields")).not.toBeInTheDocument();
-    expect(screen.getByTestId("task-prompt-input")).toHaveValue(
-      "Investigate it and add a regression test.",
-    );
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("acme/app");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0]).toMatchObject({
       templateId: "github",
       prompt: expect.stringContaining("repo:acme/app"),
     });
-    expect(mutateAsync.mock.calls[0][0].prompt).toContain(
-      "Investigate it and add a regression test.",
+    expect(decodeTriggerPrompt(mutateAsync.mock.calls[0][0].prompt)?.instructions).toBe(
+      "Investigate it.",
     );
   });
 
@@ -3133,22 +3122,6 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     },
   );
 
-  it("restores schedule controls after converting a template to new-session mode", async () => {
-    renderTrigger("jira", {
-      features: { automations_v2: true },
-      scheduled_task_subhour: true,
-    });
-    fillJira();
-    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
-    expect(screen.getByTestId("task-trigger-cadence")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("switch", { name: "Start each run in a new session" }));
-    expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
-    expect(screen.getByTestId("schedule-preset-trigger")).toBeInTheDocument();
-    await submittedPrompt();
-    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
-    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
-  });
-
   it("replaces the prompt with a trigger builder, runs hourly and keeps one session", async () => {
     const user = userEvent.setup();
     const { onOpenChange } = renderTrigger("jira");
@@ -3257,7 +3230,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(submit).toBeDisabled();
     fillJira();
     expect(submit).toBeEnabled();
-    expect(screen.getByTestId("task-trigger-preview")).toHaveTextContent('project = "ES"');
+    expect(screen.queryByTestId("task-trigger-preview")).toBeNull();
 
     expect(screen.getByTestId("task-trigger-scope-operator")).toHaveTextContent("equals");
     type("task-trigger-scope", "ES, OPS");
@@ -3272,9 +3245,6 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     fireEvent.click(screen.getByRole("option", { name: "in" }));
     expect(submit).toBeEnabled();
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.getByTestId("task-trigger-preview")).toHaveTextContent(
-      'project in ("ES", "OPS")',
-    );
 
     // A new row starts empty and blocks saving until it's filled in or removed.
     fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
@@ -3410,7 +3380,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
   });
 
-  it("separates the rendered system and user prompts on Edit as prompt", async () => {
+  it("saves a GitHub pull request trigger with no way to edit its rendered prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
     expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
@@ -3422,23 +3392,16 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
     type("task-trigger-scope", "acme/app");
     type("task-trigger-instructions", "Fix it.");
-    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
-
-    expect(screen.queryByTestId("task-trigger-fields")).toBeNull();
-    const prompt = screen.getByTestId("task-prompt-input") as HTMLTextAreaElement;
-    expect(prompt.value).toBe("Fix it.");
-    expect(screen.getByRole("button", { name: "System prompt" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    // The kept session stays, but the user may now change it.
-    expect(screen.getByTestId("task-session-mode-trigger")).toBeEnabled();
-    expect(screen.getByTestId("task-session-mode-trigger")).not.toBeChecked();
-    const editedPrompt = `${prompt.value}\nOnly act on pull requests labeled ready.`;
-    fireEvent.change(prompt, { target: { value: editedPrompt } });
+    expect(screen.queryByTestId("task-trigger-edit-as-prompt")).toBeNull();
+    expect(screen.queryByRole("button", { name: "System prompt" })).toBeNull();
     const submitted = await submittedPrompt();
     expect(submitted).toContain("repo:acme/app is:pr created:>=<that time>");
-    expect(splitTriggerPrompt(submitted).userPrompt).toBe(editedPrompt);
+    expect(decodeTriggerPrompt(submitted)).toMatchObject({
+      source: "github",
+      event: "pr",
+      scope: "acme/app",
+      instructions: "Fix it.",
+    });
     expect(mutateAsync.mock.calls[0][0].templateId).toBe("github");
   });
 });
@@ -3497,45 +3460,38 @@ describe("editing template prompts", () => {
     });
   });
 
-  it.each(["Your prompt", "System prompt"])(
-    "keeps polling settings unchanged while clearing and restoring %s",
-    async (field) => {
-      render(
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          editingTask={scheduledTask({
-            prompt: original,
-            sessionMode: "continue",
-            sessionId: "poller",
-          })}
-        />,
-      );
-      if (field === "System prompt") {
-        fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
-        fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-      }
-      const editor = screen.getByRole("textbox", { name: field }) as HTMLTextAreaElement;
-      const saved = editor.value;
-      fireEvent.change(editor, { target: { value: "" } });
-      const pollerPicker = screen.queryByTestId("pick-harness-claude");
-      if (pollerPicker) fireEvent.click(pollerPicker);
-      fireEvent.change(editor, { target: { value: saved } });
-      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-      const input = updateMutateAsync.mock.calls[0][0].input;
-      expect(input.prompt).toBe(original);
-      for (const key of [
-        "agentId",
-        "sessionId",
-        "modelOverride",
-        "reasoningEffort",
-        "permissionMode",
-      ])
-        expect(input).not.toHaveProperty(key);
-      expect(pollerPicker).toBeNull();
-    },
-  );
+  it("keeps polling settings unchanged while clearing and restoring Instructions", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          prompt: original,
+          sessionMode: "continue",
+          sessionId: "poller",
+        })}
+      />,
+    );
+    const editor = screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement;
+    const saved = editor.value;
+    fireEvent.change(editor, { target: { value: "" } });
+    const pollerPicker = screen.queryByTestId("pick-harness-claude");
+    if (pollerPicker) fireEvent.click(pollerPicker);
+    fireEvent.change(editor, { target: { value: saved } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(input.prompt).toBe(original);
+    for (const key of [
+      "agentId",
+      "sessionId",
+      "modelOverride",
+      "reasoningEffort",
+      "permissionMode",
+    ])
+      expect(input).not.toHaveProperty(key);
+    expect(pollerPicker).toBeNull();
+  });
 
   it.each(
     [true, false].flatMap((workerReady) =>
@@ -3627,43 +3583,31 @@ describe("editing template prompts", () => {
     },
   );
 
-  it("keeps a customized creation call in the separate system prompt editor", async () => {
-    const task = scheduledTask({
-      prompt: original,
-      agentId: "ag_claude_native",
-      sessionMode: "continue",
-      sessionId: "poller",
-    });
-    const props = { onOpenChange: vi.fn(), editingTask: task };
-    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
-    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
-    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    const editor = screen.getByRole("textbox", { name: "System prompt" }) as HTMLTextAreaElement;
-    fireEvent.change(editor, {
-      target: {
-        value: editor.value.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
-      },
-    });
+  it("saves a customized creation call unchanged without offering worker controls", async () => {
+    const customized = original.replace(
+      "agent_id set to your agent ID",
+      "agent_id chosen dynamically",
+    );
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          prompt: customized,
+          agentId: "ag_claude_native",
+          sessionMode: "continue",
+          sessionId: "poller",
+        })}
+      />,
+    );
     expect(screen.queryByTestId("task-worker-settings")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("task-agent-picker")).not.toBeInTheDocument();
-    expect(screen.getByText(/Worker controls are unavailable/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "System prompt" })).toBeNull();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const input = updateMutateAsync.mock.calls[0][0].input;
-    expect(input.prompt).toBe(
-      original.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
-    );
+    expect(input.prompt).toBe(customized);
     expect(input).not.toHaveProperty("agentId");
     expect(input).not.toHaveProperty("sessionId");
-    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-    rerender(
-      <CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt: input.prompt }} />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Edit worker instructions" }));
-    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveFocus();
-    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(
-      splitTriggerPrompt(input.prompt).systemPrompt,
-    );
   });
 
   it("keeps a hand-written heading editable for unrelated changes", async () => {
@@ -3688,69 +3632,44 @@ describe("editing template prompts", () => {
     });
   });
 
-  it.each([
-    ["Your prompt", false],
-    ["System prompt", false],
-    ["System prompt", true],
-  ] as const)(
-    "saves and reopens a format-changing edit to %s (remove signature: %s)",
-    async (field, removeSignature) => {
-      const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
-      const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
-      expect(
-        screen.queryByText(/These edits change the template structure/),
-      ).not.toBeInTheDocument();
-      if (field === "System prompt") {
-        fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
-        fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-      }
-      const editor = screen.getByRole("textbox", { name: field }) as HTMLTextAreaElement;
-      const savedValue = editor.value;
-      const changedValue = removeSignature
-        ? savedValue.replace("This automation watches Jira ", "Custom Jira automation ")
-        : `${savedValue}\n\nInstructions for each session:\nExtra heading.`;
-      fireEvent.change(editor, { target: { value: changedValue } });
-      expect(
-        screen.getByText(/After saving, the full text will appear as one prompt/),
-      ).toBeVisible();
-      expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
-      fireEvent.change(editor, { target: { value: savedValue } });
-      expect(
-        screen.queryByText(/These edits change the template structure/),
-      ).not.toBeInTheDocument();
-      fireEvent.change(editor, { target: { value: changedValue } });
-      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-      const saved = updateMutateAsync.mock.calls[0][0].input.prompt;
-      expect(saved).toContain(removeSignature ? "Custom Jira automation " : "Extra heading.");
-      expect(saved).toContain("Triage the ticket.");
-      rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-      rerender(
-        <CreateScheduledTaskDialog
-          open
-          {...props}
-          editingTask={scheduledTask({
-            prompt: saved,
-            agentId: "ag_claude_native",
-            sessionMode: "continue",
-            sessionId: "conv_1",
-          })}
-        />,
-      );
-      expect(screen.getByRole("textbox", { name: "Instructions" })).toHaveValue(saved);
-      expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
-      if (removeSignature) {
-        expect(
-          screen.queryByRole("button", { name: "Edit worker instructions" }),
-        ).not.toBeInTheDocument();
-      } else {
-        fireEvent.click(screen.getByRole("button", { name: "Edit worker instructions" }));
-        expect(screen.getByRole("textbox", { name: "Instructions" })).toHaveFocus();
-      }
-    },
-  );
+  it("saves and reopens an Instructions edit that changes the template structure", async () => {
+    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+    expect(screen.queryByText(/These edits change the template structure/)).not.toBeInTheDocument();
+    const editor = screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement;
+    const savedValue = editor.value;
+    const changedValue = `${savedValue}\n\nInstructions for each session:\nExtra heading.`;
+    fireEvent.change(editor, { target: { value: changedValue } });
+    expect(screen.getByText(/After saving, the full text will appear as one prompt/)).toBeVisible();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+    fireEvent.change(editor, { target: { value: savedValue } });
+    expect(screen.queryByText(/These edits change the template structure/)).not.toBeInTheDocument();
+    fireEvent.change(editor, { target: { value: changedValue } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const saved = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(saved).toContain("Extra heading.");
+    expect(saved).toContain("Triage the ticket.");
+    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    rerender(
+      <CreateScheduledTaskDialog
+        open
+        {...props}
+        editingTask={scheduledTask({
+          prompt: saved,
+          agentId: "ag_claude_native",
+          sessionMode: "continue",
+          sessionId: "conv_1",
+        })}
+      />,
+    );
+    expect(screen.getByRole("textbox", { name: "Instructions" })).toHaveValue(saved);
+    expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit worker instructions" }));
+    expect(screen.getByRole("textbox", { name: "Instructions" })).toHaveFocus();
+  });
 
-  it("edits the user prompt while preserving collapsed system instructions", async () => {
+  it("edits only the instructions of an older trigger, keeping its hidden template text", async () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -3758,22 +3677,19 @@ describe("editing template prompts", () => {
         editingTask={scheduledTask({ prompt: original })}
       />,
     );
-    expect(screen.getByLabelText("Your prompt")).toHaveValue("Triage the ticket.");
-    expect(screen.getByRole("button", { name: "System prompt" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    expect(screen.queryByRole("button", { name: "Edit system prompt" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Instructions")).toHaveValue("Triage the ticket.");
+    expect(screen.queryByRole("button", { name: "System prompt" })).toBeNull();
+    expect(screen.queryByText(/This automation watches Jira/)).toBeNull();
     for (const value of ["", "  \n"]) {
-      fireEvent.change(screen.getByLabelText("Your prompt"), { target: { value } });
+      fireEvent.change(screen.getByLabelText("Instructions"), { target: { value } });
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-      expect(screen.getByText("Your prompt can't be empty.")).toBeVisible();
+      expect(screen.getByText("Instructions can't be empty.")).toBeVisible();
       expect(screen.queryByText(/After saving, the full text/)).not.toBeInTheDocument();
     }
-    fireEvent.change(screen.getByLabelText("Your prompt"), {
+    fireEvent.change(screen.getByLabelText("Instructions"), {
       target: { value: "Investigate it." },
     });
-    expect(screen.queryByText("Your prompt can't be empty.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Instructions can't be empty.")).not.toBeInTheDocument();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
@@ -3781,97 +3697,110 @@ describe("editing template prompts", () => {
       original.replace("Triage the ticket.", "Investigate it."),
     );
   });
+});
 
-  it("requires expansion and Edit and preserves empty-system validation across collapse", () => {
-    render(
-      <CreateScheduledTaskDialog
-        open
-        onOpenChange={vi.fn()}
-        editingTask={scheduledTask({ prompt: original })}
-      />,
-      { expandAdvanced: false },
-    );
-    const toggle = screen.getByRole("button", { name: "System prompt" });
-    fireEvent.click(toggle);
-    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
-      target: { value: "  \n" },
-    });
-    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Done editing system prompt" }));
-    expect(screen.getByText(/System prompt can't be empty/)).toBeVisible();
-    fireEvent.click(toggle);
-    expect(screen.getByText(/System prompt can't be empty/)).toBeVisible();
-    fireEvent.click(toggle);
-    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
-      target: { value: splitTriggerPrompt(original).systemPrompt },
-    });
-    expect(screen.queryByText(/System prompt can't be empty/)).not.toBeInTheDocument();
-    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
-  });
+describe("editing triggers saved with a header", () => {
+  const saved = encodeTriggerPrompt(
+    {
+      source: "slack",
+      ...emptyTriggerFields("slack"),
+      scope: "abc",
+      conditions: [{ field: "text", operator: "contains", value: "hi" }],
+      instructions: "Reply with a greeting.",
+      worker: { placement: "same_host", agentId: null, model: "", effort: "" },
+    },
+    { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+  );
+  const task = scheduledTask({ prompt: saved, sessionMode: "continue", sessionId: "poller" });
 
-  it("saves both prompts and reopens with the system editor collapsed", async () => {
-    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
-    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />, {
-      expandAdvanced: false,
+  it("reopens in the trigger form and saves an edited condition", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />);
+    expect(screen.getByTestId("task-trigger-fields")).toBeVisible();
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("abc");
+    expect(screen.getByTestId("task-trigger-condition-0-value")).toHaveValue("hi");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Reply with a greeting.");
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+    expect(screen.queryByRole("button", { name: "System prompt" })).toBeNull();
+    expect(screen.queryByTestId("task-trigger-preview")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("task-trigger-condition-0-value"), {
+      target: { value: "hello" },
     });
-    const toggle = screen.getByRole("button", { name: "System prompt" });
-    fireEvent.click(toggle);
-    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    const systemPrompt =
-      splitTriggerPrompt(original).systemPrompt!.replace('project = "ENG"', 'project = "OPS"') +
-      "\n";
-    fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
-      target: { value: systemPrompt },
-    });
-    fireEvent.change(screen.getByLabelText("Your prompt"), { target: { value: "Fix it." } });
-    fireEvent.click(toggle);
-    fireEvent.click(toggle);
-    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    const saved = updateMutateAsync.mock.calls[0][0].input.prompt;
-    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "Fix it.", systemPrompt });
-
-    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-    rerender(
-      <CreateScheduledTaskDialog open {...props} editingTask={scheduledTask({ prompt: saved })} />,
-    );
-    expect(screen.getByLabelText("Your prompt")).toHaveValue("Fix it.");
-    expect(screen.getByRole("button", { name: "System prompt" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
-    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(systemPrompt);
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(decodeTriggerPrompt(input.prompt)?.conditions).toEqual([
+      { field: "text", operator: "contains", value: "hello" },
+    ]);
+    expect(stripTriggerHeader(input.prompt)).toContain('whose text contains "hello"');
+    expect(stripTriggerHeader(input.prompt)).not.toContain("omnigent-trigger");
+    for (const key of ["agentId", "sessionId", "modelOverride", "reasoningEffort"])
+      expect(input).not.toHaveProperty(key);
   });
 
-  it("discards unsaved system edits when cancelled and reopened", () => {
-    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
-    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />, {
-      expandAdvanced: false,
-    });
-    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
-    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
-      target: { value: "Unsaved edit" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(props.onOpenChange).toHaveBeenLastCalledWith(false);
-    expect(updateMutateAsync).not.toHaveBeenCalled();
-    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-    rerender(<CreateScheduledTaskDialog open {...props} />);
-    expect(screen.getByLabelText("Your prompt")).toHaveValue("Triage the ticket.");
-    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
-    expect(screen.queryByText("Unsaved edit")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(
-      splitTriggerPrompt(original).systemPrompt,
+  it("opens a header edited outside the form as its full prompt and keeps that edit", async () => {
+    const edited = saved.replace(
+      "Instructions for each session:\nReply with a greeting.",
+      "Instructions for each session:\nDo nothing.",
     );
+    const props = { onOpenChange: vi.fn(), editingTask: { ...task, prompt: edited } };
+    render(<CreateScheduledTaskDialog open {...props} />);
+    expect(screen.queryByTestId("task-trigger-fields")).toBeNull();
+    const editor = screen.getByRole("textbox", { name: "Instructions" });
+    expect(editor).toHaveValue(stripTriggerHeader(edited));
+    expect((editor as HTMLTextAreaElement).value).not.toContain("omnigent-trigger");
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(prompt).toBe(stripTriggerHeader(edited).trim());
+    expect(prompt).toContain("Do nothing.");
+    expect(prompt).not.toContain("Reply with a greeting.");
+  });
+
+  it("offers a fresh polling session without the new-session switch", async () => {
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ sessionId: null });
+  });
+
+  it("saves worker settings into the header and reopens with them", async () => {
+    const props = { onOpenChange: vi.fn(), editingTask: task };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+    const select = async (id: string, name: string) => {
+      fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    await select("task-worker-agent-trigger", "Claude Code");
+    await select("task-model-trigger", "Opus");
+    await select("task-effort-trigger", "High");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(decodeTriggerPrompt(prompt)?.worker).toEqual({
+      placement: "same_host",
+      agentId: "ag_claude_native",
+      model: "opus",
+      effort: "high",
+    });
+    expect(prompt).toContain('agent_id "ag_claude_native", placement "same_host"');
+    expect(prompt).toContain('model "opus", reasoning_effort "high"');
+
+    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    rerender(<CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt }} />);
+    expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Claude Code");
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+    expect(screen.getByTestId("task-trigger-condition-0-value")).toHaveValue("hi");
   });
 });
 
