@@ -1110,6 +1110,9 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-edit").click()
     user_prompt = page.get_by_label("Your prompt", exact=True)
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0 if trigger_ui else 1)
+    if trigger_ui:
+        expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
     system_toggle = page.get_by_role("dialog").get_by_role(
         "button", name="System prompt", exact=True
     )
@@ -1136,6 +1139,9 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     detail_system_toggle.click()
     page.get_by_test_id("task-detail-edit").click()
     expect(user_prompt).to_have_value("Investigate the ticket and propose a fix.")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0 if trigger_ui else 1)
+    if trigger_ui:
+        expect(page.get_by_test_id("task-trigger-cadence")).to_contain_text("Every 10 minutes")
     expect(system_toggle).to_have_attribute("aria-expanded", "false")
     system_toggle.click()
     system_editor = page.get_by_role("textbox", name="System prompt", exact=True)

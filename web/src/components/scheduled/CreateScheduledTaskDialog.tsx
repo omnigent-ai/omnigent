@@ -301,6 +301,13 @@ export function CreateScheduledTaskDialog({
   );
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
+  const defaultTriggerSchedule = useMemo(
+    () =>
+      triggerUiEnabled && anchoredScheduling && (subhourSupported || triggerPollMinutes >= 60)
+        ? { ...TRIGGER_SCHEDULE_MODEL, interval: triggerPollMinutes }
+        : HOURLY_SCHEDULE_MODEL,
+    [triggerUiEnabled, anchoredScheduling, subhourSupported, triggerPollMinutes],
+  );
   const savedSchedule = useMemo(
     () => (editingTask ? parseRRuleToScheduleModel(editingTask.rrule) : null),
     [editingTask],
@@ -352,15 +359,7 @@ export function CreateScheduledTaskDialog({
         setStartNewSession(false);
         setTrigger(initialTrigger);
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
-        setSchedule(
-          initialTrigger
-            ? triggerUiEnabled &&
-              anchoredScheduling &&
-              (subhourSupported || triggerPollMinutes >= 60)
-              ? { ...TRIGGER_SCHEDULE_MODEL, interval: triggerPollMinutes }
-              : HOURLY_SCHEDULE_MODEL
-            : DEFAULT_SCHEDULE_MODEL,
-        );
+        setSchedule(initialTrigger ? defaultTriggerSchedule : DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
         setWorkspace("");
@@ -377,10 +376,7 @@ export function CreateScheduledTaskDialog({
     initialName,
     initialPrompt,
     initialTrigger,
-    triggerUiEnabled,
-    anchoredScheduling,
-    subhourSupported,
-    triggerPollMinutes,
+    defaultTriggerSchedule,
     editingTask,
     savedSchedule,
     savedWorkspace,
@@ -546,7 +542,8 @@ export function CreateScheduledTaskDialog({
     trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
   const triggerMode =
     triggerUiEnabled &&
-    (trigger !== null || (sessionMode === "continue" && isTriggerPrompt(effectivePrompt)));
+    (trigger !== null ||
+      (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt))));
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
@@ -920,7 +917,7 @@ export function CreateScheduledTaskDialog({
             <p className="text-sm text-muted-foreground">{getHostHelpText()}</p>
           </div>
 
-          {(!triggerMode || scheduleInvalid) && (
+          {!triggerMode && (
             <ScheduleFields
               timezone={timezone}
               onTimezoneChange={setTimezone}
@@ -936,19 +933,38 @@ export function CreateScheduledTaskDialog({
               onSelectOpenChange={handleSelectOpenChange}
             />
           )}
-          {triggerMode && (
+          {triggerMode && !scheduleInvalid && (
             <p className="text-sm text-muted-foreground" data-testid="task-trigger-cadence">
               Checks for new matches: {describeSchedule(buildRRule(schedule))}. Matching items start
               sessions automatically.
             </p>
           )}
-          {scheduleUnsupported && (
+          {triggerMode && scheduleInvalid && (
+            <div className="space-y-2">
+              <p className="text-sm text-destructive" role="alert">
+                This polling configuration is no longer supported. Use the server default to save
+                your changes.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setSchedule(defaultTriggerSchedule);
+                  setScheduleUnsupported(false);
+                }}
+              >
+                Use server default ({describeSchedule(buildRRule(defaultTriggerSchedule))})
+              </Button>
+            </div>
+          )}
+          {!triggerMode && scheduleUnsupported && (
             <p className="text-sm text-destructive" role="alert">
               This schedule can&apos;t be edited in this form yet. Choose a frequency to replace it.
             </p>
           )}
 
-          {unsupportedByScheduler && (
+          {!triggerMode && unsupportedByScheduler && (
             <p className="text-sm text-destructive" role="alert">
               This server does not support custom schedules or occurrence limits. Choose a supported
               frequency and ending to replace this schedule.

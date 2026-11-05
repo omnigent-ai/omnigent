@@ -2535,12 +2535,36 @@ describe("CreateScheduledTaskDialog session mode", () => {
         },
       );
       const submit = screen.getByTestId("create-scheduled-task-submit");
-      if (trigger && supported) {
+      if (trigger) {
         expect(screen.queryByTestId("custom-schedule-trigger")).toBeNull();
-        expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
+        expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
+        if (supported) {
+          expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
+          fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+          fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+          const editor = screen.getByRole("textbox", { name: "System prompt" });
+          fireEvent.change(editor, { target: { value: "Custom polling instructions." } });
+          expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
+          expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
+        } else {
+          expect(submit).toBeDisabled();
+          expect(screen.getByRole("alert")).toHaveTextContent("polling configuration");
+          fireEvent.click(submit);
+          expect(updateMutateAsync).not.toHaveBeenCalled();
+          fireEvent.click(
+            screen.getByRole("button", { name: "Use server default (Every 240 minutes)" }),
+          );
+          expect(screen.queryByRole("alert")).toBeNull();
+          expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 240 minutes");
+        }
+        expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
+        expect(submit).toBeEnabled();
         fireEvent.click(submit);
         await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-        expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
+        expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
+          supported ? "FREQ=MINUTELY;INTERVAL=10" : "FREQ=MINUTELY;INTERVAL=240",
+        );
+        expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("sessionMode");
         return;
       }
       expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
@@ -2560,10 +2584,6 @@ describe("CreateScheduledTaskDialog session mode", () => {
       expect(screen.getByTestId("custom-interval")).toHaveValue(1);
       fireEvent.click(screen.getByRole("button", { name: "Apply" }));
       expect(submit).toBeEnabled();
-      if (trigger) {
-        expect(screen.queryByTestId("schedule-error")).toBeNull();
-        expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
-      }
       fireEvent.click(submit);
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
