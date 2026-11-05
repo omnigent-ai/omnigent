@@ -315,6 +315,14 @@ choose a branch for each, and remove any repositories the clone does not need.
 Removing every repository starts an empty sandbox. The phone header's Fork
 action offers the same choices.
 
+**Fork into a shareable folder:** on a server with
+`OMNIGENT_SHARING_MODE=restricted_read_only`, open a session whose workspace is
+a home or root folder and choose Share from the header or the sidebar row menu.
+The banner names the folder; **Fork into a different folder** closes Share and
+opens the fork dialog with an empty directory field. A home or root path turns
+the hint red and blocks submit. Pick a project folder, submit, then share the
+fork from its own header Share.
+
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers
 "No, archive only" and "Yes, delete worktree", plus Remember my choice.

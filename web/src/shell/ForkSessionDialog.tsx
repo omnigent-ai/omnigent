@@ -1478,11 +1478,9 @@ function SupportedForkSessionForm({
         // the same lineage as its worktree — not a mismatch.
         (sourceRepo === null || workspaceTrimmed !== sourceRepo)));
 
-  // Default state: a coding clone on the source host still pointed at the
-  // source's directory. Drives the "reuses the original's working directory"
-  // indicator, which explains the default without forcing Advanced open. On a
-  // different host this is false (the mismatch warning takes over instead).
-  // A fork that must leave the source's folder has nothing to reuse by default.
+  // A coding clone on the source host still pointed at the source's directory;
+  // drives the "reuses the original" hint. False on another host (mismatch
+  // warning instead) and in modes that must leave the source's folder.
   const usingSourceDir =
     !workspaceRecovery &&
     !pickShareableDirectory &&

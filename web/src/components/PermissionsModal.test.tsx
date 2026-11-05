@@ -820,7 +820,7 @@ describe("PermissionsModal", () => {
 
         const banner = screen.getByRole("alert");
         expect(banner).toHaveTextContent("Sharing is blocked for this folder");
-        // The first code span names the blocked directory itself.
+        // Later code spans are the literal `~` and `/` examples.
         expect(banner.querySelector("code")?.textContent).toBe(workspace);
         const warning = within(banner).getByText(/fork the session into a project folder/);
         expect(warning).toHaveTextContent("The fork keeps the conversation history.");

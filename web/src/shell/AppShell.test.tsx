@@ -5191,6 +5191,16 @@ describe("AppShell share action", () => {
       expect(
         within(dialog).getByText(/can't share a session that runs in a home or root directory/),
       ).toBeVisible();
+
+      // Closing resets the mode, so the header's plain Fork is an ordinary clone again.
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+      const clone = screen.getByTestId("fork-session-dialog");
+      expect(within(clone).getByRole("heading", { name: "Clone session" })).toBeInTheDocument();
+      expect(
+        within(clone).queryByTestId("fork-session-shareable-dir-hint"),
+      ).not.toBeInTheDocument();
     });
   });
 
