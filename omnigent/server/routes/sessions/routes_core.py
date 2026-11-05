@@ -4837,6 +4837,17 @@ def register_core_routes(
                     # of the source is redirected to it, so it shares exactly as
                     # the source does (no creation default was applied).
                     await _copy_session_grants(source.id, fork.id)
+                    # Created with no grants of its own, the fork is the caller's
+                    # only through the copy: a source deleted meanwhile had none.
+                    try:
+                        await _require_access_and_level(
+                            user_id, fork.id, LEVEL_OWNER, permission_store, conversation_store
+                        )
+                    except OmnigentError as exc:
+                        raise OmnigentError(
+                            f"This session was deleted or changed hands during {command}.",
+                            code=ErrorCode.CONFLICT,
+                        ) from exc
                     if host_bound:
                         assert source.host_id is not None
                         # The fork was born on the host under its row lock, so a

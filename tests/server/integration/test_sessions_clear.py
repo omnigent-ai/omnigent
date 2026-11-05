@@ -674,14 +674,46 @@ async def test_stopping_or_archiving_the_original_leaves_the_continuation_runnin
     assert (original.runner_id, original.host_id) == (None, _HOST_ID)
 
 
+@dataclass
+class Handoff:
+    """The app and client a clear runs on, with a live runner installed."""
+
+    app: FastAPI
+    client: httpx.AsyncClient
+    owner: str | None
+
+
+@pytest.fixture
+def handoff(request: pytest.FixtureRequest) -> Handoff:
+    """Signed in as ``request.param`` on the app with permissions, else the shared app.
+
+    A sync fixture, so it can pick the async app fixtures before the test's loop runs.
+    """
+    owner: str | None = getattr(request, "param", None)
+    prefix = "auth_" if owner is not None else ""
+    client: httpx.AsyncClient = request.getfixturevalue(f"{prefix}client")
+    request.getfixturevalue(f"{prefix}live_runner")
+    if owner is not None:
+        client.headers["X-Forwarded-Email"] = owner
+    return Handoff(app=request.getfixturevalue(f"{prefix}app"), client=client, owner=owner)
+
+
 @pytest.mark.parametrize(
-    "deleted", ["before_fork", "after_fork", "after_fork_then_failure", "not_then_failure"]
+    ("deleted", "handoff"),
+    [
+        ("before_fork", None),
+        ("after_fork", None),
+        # Signed in with the runner offline: nothing but the copied sharing
+        # gives the owner the continuation, and the deleted original has none.
+        ("after_fork", _OWNER),
+        ("after_fork_then_failure", None),
+        ("not_then_failure", None),
+    ],
+    indirect=["handoff"],
 )
 async def test_deleting_the_original_during_the_handoff_never_strands_the_continuation(
-    app: FastAPI,
-    client: httpx.AsyncClient,
+    handoff: Handoff,
     db_uri: str,
-    live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
     deleted: str,
 ) -> None:
@@ -689,13 +721,18 @@ async def test_deleting_the_original_during_the_handoff_never_strands_the_contin
 
     Once the continuation exists it already holds the host, so the delete keeps
     the sandbox; a delete that lands first leaves no continuation behind. If
-    the continuation then fails to be placed, removing it releases the sandbox
-    it was the last user of, but not one the original still uses.
+    the continuation then fails to be placed, or no one would own it, removing
+    it releases the sandbox it was the last user of, but not one the original
+    still uses.
     """
+    app, client, owner = handoff.app, handoff.client, handoff.owner
+    signed_in = owner is not None
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     host_store, launcher = install_managed_sandbox(app, db_uri, monkeypatch)
-    source_id = await create_placed_session(client, store)
+    source_id = await create_placed_session(
+        client, store, runner_id=None if signed_in else _RUNNER_ID, user=owner
+    )
     before = len((await client.get("/v1/sessions")).json()["data"])
     if deleted.endswith("then_failure"):
         resolve_runner = sessions_module._get_runner_client
@@ -738,7 +775,7 @@ async def test_deleting_the_original_during_the_handoff_never_strands_the_contin
         assert host_store.get_host(_HOST_ID) is not None
         assert launcher.terminated == []
         return
-    if deleted != "after_fork":
+    if deleted != "after_fork" or signed_in:
         # No session is left on the sandbox, so it is torn down.
         assert cleared.status_code >= 400, cleared.text
         assert len((await client.get("/v1/sessions")).json()["data"]) == before - 1
