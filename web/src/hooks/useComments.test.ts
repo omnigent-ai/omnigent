@@ -10,6 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { useChatStore } from "@/store/chatStore";
+import { requestLocalReviewContext } from "@/lib/localReviewContext";
+import { clearSessionDrafts, getSessionDraft } from "@/lib/sessionDrafts";
 import {
   commentsQueryKey,
   fetchComments,
@@ -50,6 +52,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  clearSessionDrafts();
 });
 
 function wrapperWith(queryClient: QueryClient, gridEnabled = false) {
@@ -258,6 +261,58 @@ describe("useUpdateComment", () => {
   function renderUpdate(queryClient: QueryClient) {
     return renderHook(() => useUpdateComment("conv_1"), { wrapper: wrapperWith(queryClient) });
   }
+
+  it.each([undefined, null])(
+    "preserves attached coordinates after a legacy PATCH with %s anchor",
+    async (anchor_metadata) => {
+      const comment = makeComment({
+        id: "c1",
+        path: "a.ts",
+        anchor_metadata: {
+          pr_url: "https://github.com/acme/app/pull/1",
+          side: "LEFT",
+          line: 9,
+          start_line: 7,
+          head_sha: "a".repeat(40),
+          base_sha: "b".repeat(40),
+        },
+      });
+      requestLocalReviewContext(comment);
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ ...comment, body: "Updated", anchor_metadata }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const { result } = renderUpdate(queryClient);
+      result.current.mutate({ commentId: comment.id, body: "Updated" });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(getSessionDraft("conv_1")?.reviewComments).toEqual([{ ...comment, body: "Updated" }]);
+
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({
+          ...comment,
+          anchor_metadata: { ...comment.anchor_metadata!, line: 10 },
+        }),
+      );
+      result.current.mutate({ commentId: comment.id, body: "Another edit" });
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.error?.message).toContain("Your attached comment is unchanged");
+      expect(getSessionDraft("conv_1")?.reviewComments).toEqual([{ ...comment, body: "Updated" }]);
+    },
+  );
+
+  it.each([{ id: "another-comment" }, { conversation_id: "another-session" }])(
+    "rejects a response with a different identity: %j",
+    async (changes) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse(makeComment({ id: "c1", path: "a.ts", ...changes })),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const { result } = renderUpdate(queryClient);
+      result.current.mutate({ commentId: "c1", body: "Updated" });
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.error?.message).toContain("a different comment");
+    },
+  );
 
   it("PATCHes only the mutable fields, excluding commentId from the body", async () => {
     // commentId belongs in the URL, not the body; leaking it into the

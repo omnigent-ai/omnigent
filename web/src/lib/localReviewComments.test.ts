@@ -72,3 +72,24 @@ it("preserves attached context through draft writes, updates edits and removes a
   expect(getSessionDraft("session")?.text).toBe("Please check");
   expect(getSessionDraft("session")?.reviewComments).toEqual([]);
 });
+
+it.each([
+  ["path", { path: "different.py" }],
+  ["PR", { anchor_metadata: { ...comment.anchor_metadata!, pr_url: "https://example.test/2" } }],
+  ["side", { anchor_metadata: { ...comment.anchor_metadata!, side: "RIGHT" } }],
+  ["line", { anchor_metadata: { ...comment.anchor_metadata!, line: 10 } }],
+  ["range", { anchor_metadata: { ...comment.anchor_metadata!, start_line: 8 } }],
+  ["head", { anchor_metadata: { ...comment.anchor_metadata!, head_sha: "different" } }],
+  ["base", { anchor_metadata: { ...comment.anchor_metadata!, base_sha: "different" } }],
+] satisfies [string, Partial<Comment>][])(
+  "rejects edits that change the attached %s coordinate",
+  (_coordinate, changes) => {
+    requestLocalReviewContext(comment);
+    for (const status of ["draft", "addressed"] as const) {
+      expect(() => updateLocalReviewContext({ ...comment, ...changes, status })).toThrow(
+        "Your attached comment is unchanged",
+      );
+      expect(getSessionDraft("session")?.reviewComments).toEqual([comment]);
+    }
+  },
+);
