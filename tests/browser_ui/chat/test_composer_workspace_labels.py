@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
@@ -75,13 +75,26 @@ def test_composer_details_wrap_without_clipping(
     workspace_title = (
         f"Working directory: {_WORKSPACE}" if has_binding else "No working directory bound"
     )
-    expect(workspace).to_have_attribute("title", workspace_title)
+    _expect_tooltip_fits(page, workspace, workspace_title, viewport_width)
     if has_binding:
         worktree = controls.get_by_test_id("composer-git-branch")
-        expect(worktree).to_have_attribute("title", f"Worktree: {_WORKSPACE}. {_BRANCH}")
+        _expect_tooltip_fits(page, worktree, f"Worktree: {_WORKSPACE}. {_BRANCH}", viewport_width)
     else:
         expect(controls.get_by_test_id("composer-git-branch")).to_have_count(0)
     controls.screenshot(path=tmp_path / f"details-{viewport_width}.png", animations="disabled")
+
+
+def _expect_tooltip_fits(page: Page, chip: Locator, text: str, viewport_width: int) -> None:
+    chip.hover()
+    tooltip = page.get_by_role("tooltip")
+    expect(tooltip).to_have_text(text)
+    surface = page.locator("[data-slot='tooltip-content']")
+    box = surface.bounding_box()
+    assert box is not None
+    assert box["x"] >= 0
+    assert box["x"] + box["width"] <= viewport_width
+    page.keyboard.press("Escape")
+    expect(tooltip).to_have_count(0)
 
 
 @pytest.mark.parametrize(

@@ -255,11 +255,15 @@ describe("resolveServerInfo session_search_scope", () => {
 describe.each([
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
+  "scheduled_task_subhour",
   "scheduled_task_sandbox_workspaces",
+  "scheduled_task_inbox",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],
+    [false, false],
     [undefined, false],
+    ["true", false],
     ["yes", false],
   ])("reads %j as %j", async (advertised, expected) => {
     const payload = advertised === undefined ? {} : { [capability]: advertised };
@@ -471,5 +475,17 @@ describe("picker curation", () => {
   it("treats a loading probe and a missing block as unrestricted", () => {
     expect(pickerCuration("loading").restrictToAgentNames.size).toBe(0);
     expect(pickerCuration(info({})).defaultAgentName).toBeNull();
+  });
+});
+
+describe("resolveServerInfo scheduled_task_worktrees", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("requires explicit support (%s)", async (advertised, expected) => {
+    expect((await probe({ scheduled_task_worktrees: advertised })).scheduled_task_worktrees).toBe(
+      expected,
+    );
   });
 });

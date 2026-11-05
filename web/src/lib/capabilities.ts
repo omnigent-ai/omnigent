@@ -225,6 +225,8 @@ export interface ServerInfo {
    * hidden there. Fails to ``false``.
    */
   archive_worktree_cleanup?: boolean;
+  /** True when scheduled tasks accept the optional random-worktree base ref. */
+  scheduled_task_worktrees?: boolean;
   /**
    * True when ``GET /v1/sessions`` accepts ``search_scope``. Older servers
    * ignore it, so the palette lists one mixed search group there. Fails to
@@ -237,6 +239,8 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /** Connected hosts and continued sandboxes accept ten-minute schedules. */
+  scheduled_task_subhour?: boolean;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
@@ -271,6 +275,8 @@ export interface ServerInfo {
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Scheduled tasks accept a project; absent on older servers (off). */
   scheduled_task_projects?: boolean;
+  /** Latest sessionless automation failures can be listed for Inbox. */
+  scheduled_task_inbox?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
@@ -405,9 +411,11 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
@@ -564,9 +572,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          scheduled_task_subhour: data.scheduled_task_subhour === true,
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
@@ -579,6 +589,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_pull_requests: data.session_pull_requests === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
+          scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           branding: parseBranding(data.branding),
           picker: parsePicker(data.picker),

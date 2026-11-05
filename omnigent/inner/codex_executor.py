@@ -71,6 +71,7 @@ from omnigent.models.codex_model_vocabulary import (
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.spec.repo_scope import repo_scope_dirs
 from omnigent.spec.types import RetryPolicy
 from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
@@ -759,22 +760,39 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     return env
 
 
+@dataclass(frozen=True)
+class CodexSkillSources:
+    """
+    Existing Codex skill roots, split by who loads them, each in priority order.
+
+    :param linked: The bundle, host Codex, and ``~/.agents`` skills that the
+        launch symlinks into ``$CODEX_HOME/skills``. Codex ranks them as user
+        skills.
+    :param native: The repo-scope ``.agents/skills`` dirs, nearest first, which
+        Codex reads from its own cwd and ranks above user skills.
+    """
+
+    linked: list[Path]
+    native: list[Path]
+
+
 def codex_skill_sources(
     bundle_dir: Path | None,
     home: Path,
     *,
     codex_home: Path | None = None,
-) -> list[Path]:
+    workspace: Path | None = None,
+) -> CodexSkillSources:
     """
-    Build the ordered Codex skill-source list: bundle skills, then host skills.
+    Find every Codex skill root, split into linked and native groups.
 
     The single source of truth for *where* Codex skills come from, shared
-    by :func:`populate_codex_skills_from_bundle` (which symlinks them into
-    ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
-    provider — so the linked set and the menu cannot drift on which roots
-    are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    the host-installed Codex skills dir, then ``~/.agents/skills`` (a bundled
-    skill shadows a host skill of the same name). Only existing directories
+    by :func:`populate_codex_skills_from_bundle` (which symlinks only the
+    ``linked`` group into ``$CODEX_HOME/skills/``) and the slash-command
+    menu's ``codex_host_skills`` provider, which lists both groups. The
+    ``linked`` order is the agent's own ``<bundle>/skills/``, then the
+    host-installed Codex skills dir, then ``~/.agents/skills``: an earlier
+    source shadows a later skill of the same name. Only existing directories
     are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
@@ -786,18 +804,31 @@ def codex_skill_sources(
         ``$CODEX_HOME`` for its config, so the native launch passes the
         resolved home here to keep the seeded skills and the menu in step with
         the CLI's own ``$CODEX_HOME``.
-    :returns: Existing skill-dir roots in priority order.
+    :param workspace: Codex's working directory. Codex reads ``.agents/skills``
+        from it up to the repository root, or from it alone outside a
+        repository. ``None`` leaves ``native`` empty.
+    :returns: The linked and native skill roots.
     """
-    sources: list[Path] = []
+    linked: list[Path] = []
     if bundle_dir is not None and (bundle_dir / "skills").is_dir():
-        sources.append(bundle_dir / "skills")
+        linked.append(bundle_dir / "skills")
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
-        sources.append(host)
+        linked.append(host)
     shared = home / ".agents" / "skills"
     if shared.is_dir():
-        sources.append(shared)
-    return sources
+        linked.append(shared)
+    native: list[Path] = []
+    if workspace is not None:
+        # A home-directory workspace keeps ~/.agents/skills at its user-tier rank.
+        user_tier = os.path.realpath(shared)
+        native = [
+            skills
+            for directory in repo_scope_dirs(workspace, outside_repo="self")
+            if (skills := directory / ".agents" / "skills").is_dir()
+            and os.path.realpath(skills) != user_tier
+        ]
+    return CodexSkillSources(linked=linked, native=native)
 
 
 def select_codex_skill_dirs(
@@ -978,11 +1009,13 @@ def populate_codex_skills_from_bundle(
     Populate a CODEX_HOME's ``skills/`` from a bundle + host skills.
 
     Shared by the wrapped ``codex`` executor and the ``codex-native``
-    launch path so both expose the same skill surface. Builds the source
-    list in priority order — the agent's own ``<bundle>/skills/`` before
-    the host skills dir (so a bundled skill shadows a host skill of the same
-    name) — and delegates to :func:`_populate_codex_skills`, which honours
-    ``skills_filter`` (``"all"`` / ``"none"`` / list of names).
+    launch path so both expose the same skill surface. Links the ``linked``
+    roots of :func:`codex_skill_sources` in priority order — the agent's own
+    ``<bundle>/skills/`` before the host skills dir (so a bundled skill shadows
+    a host skill of the same name) — and delegates to
+    :func:`_populate_codex_skills`, which honours ``skills_filter`` (``"all"`` /
+    ``"none"`` / list of names). Repo-scope skills are not linked: Codex reads
+    them from its cwd, so a link would register each one twice.
 
     :param codex_home: The CODEX_HOME whose ``skills/`` subdir Codex
         scans, e.g. a per-conversation temp dir or the per-bridge native
@@ -1006,7 +1039,7 @@ def populate_codex_skills_from_bundle(
     """
     skill_sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
     _populate_codex_skills(
-        codex_home / "skills", skills_filter, skill_sources, copy_skills=copy_skills
+        codex_home / "skills", skills_filter, skill_sources.linked, copy_skills=copy_skills
     )
 
 

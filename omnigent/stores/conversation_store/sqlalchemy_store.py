@@ -28,6 +28,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -226,6 +227,26 @@ class _RowCountResult(Protocol):
     rowcount: int
 
 
+def _bind_runner(meta: SqlConversationMetadata, runner_id: str | None) -> None:
+    """
+    Set a session's runner, resetting its background flag when the runner changes.
+
+    Only the bound runner reports the flag, so the old runner's value would stay
+    on a moved or unbound session, and report times from two runners' clocks
+    would be compared. The reset is written even when the row was read with no
+    flag, since the old runner may have stored one after that read.
+
+    :param meta: The session's metadata row, inside the write transaction.
+    :param runner_id: The runner to bind, e.g. ``"runner_abc123"``, or ``None``.
+    """
+    if meta.runner_id != runner_id:
+        meta.background_work_running = None
+        meta.background_work_reported_at = None
+        flag_modified(meta, "background_work_running")
+        flag_modified(meta, "background_work_reported_at")
+    meta.runner_id = runner_id
+
+
 def _to_conversation(
     row: SqlConversation,
     meta: SqlConversationMetadata | None = None,
@@ -311,6 +332,8 @@ def _to_conversation(
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
+        background_work_running=meta.background_work_running if meta else None,
+        blocked_on=meta.blocked_on if meta else None,
         project_id=meta.project_id if meta else None,
     )
 
@@ -1400,7 +1423,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         }
 
     def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SessionActivity]:
-        """One ``SELECT`` per database for the ids' update times and live statuses."""
+        """One ``SELECT`` per database for the ids' activity and usage."""
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
@@ -1415,12 +1438,21 @@ class SqlAlchemyConversationStore(ConversationStore):
             return {}
         with self._session("get_session_activity") as session:
             meta_rows = session.execute(
-                select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(
+                select(
+                    SqlConversationMetadata.id,
+                    SqlConversationMetadata.live_status,
+                    SqlConversationMetadata.session_usage,
+                ).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id.in_([row.id for row in updated]),
                 )
             ).all()
         statuses = {row.id: row.live_status for row in meta_rows}
+        costs = {
+            row.id: json.loads(row.session_usage).get("total_cost_usd")
+            for row in meta_rows
+            if row.session_usage
+        }
         activity: dict[str, SessionActivity] = {}
         for row in updated:
             status = statuses.get(row.id)
@@ -1429,7 +1461,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             except ValueError:
                 # A newer replica's status must not drop the rest of the batch.
                 live_status = None
-            activity[row.id] = SessionActivity(updated_at=row.updated_at, live_status=live_status)
+            activity[row.id] = SessionActivity(
+                updated_at=row.updated_at,
+                live_status=live_status,
+                total_cost_usd=costs.get(row.id),
+            )
         return activity
 
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:
@@ -3032,8 +3068,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``. Powers ``GET /v1/sessions`` — sessions
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"``
-            or ``"updated_at"``.
+        :param sort_by: Column to sort on, ``"created_at"``,
+            ``"updated_at"``, or ``"id"``.
         :param search_query: Case-insensitive substring filter on
             the session title OR conversation item content.
             ``None`` or empty string disables the filter;
@@ -3077,6 +3113,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises ValueError: If ``search_scope`` is not a known scope.
+        :raises StaleCursorError: If a cursor names a vanished conversation,
+            or one that ``accessible_by``/``owned_by`` has no grant on.
         """
         from omnigent.server.auth import LEVEL_OWNER
 
@@ -3156,6 +3194,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     qualifying_ids = list(
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
+
+        # A permission-scoped page only lists sessions the viewer has a grant
+        # on, so a cursor without one didn't come from a page. Resolving it
+        # anyway would reveal where that session sorts.
+        cursor_viewer = accessible_by if accessible_by is not None else owned_by
+        if cursor_viewer is not None:
+            for cursor_id in (after, before):
+                if cursor_id:
+                    self._require_cursor_grant(cursor_id, cursor_viewer)
 
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
@@ -3468,13 +3515,75 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more=has_more,
         )
 
+    def _require_cursor_grant(self, cursor_id: str, viewer: str) -> None:
+        """
+        Reject a list cursor naming a session the viewer has no grant on.
+
+        Fails the same way as a deleted cursor, so it doesn't reveal whether
+        the session exists.
+
+        :param cursor_id: The ``after`` or ``before`` session ID.
+        :param viewer: The user whose listing the cursor pages.
+        :raises StaleCursorError: If the viewer has no grant on the session.
+        """
+        with self._session("authorize_session_list_cursor") as meta_sess:
+            granted = meta_sess.execute(
+                select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == cursor_id,
+                    SqlSessionPermission.user_id == viewer,
+                )
+            ).first()
+        if granted is None:
+            raise StaleCursorError(cursor_id)
+
+    def list_spawn_tree(self, root_conversation_id: str, *, limit: int) -> PagedList[Conversation]:
+        """Read one spawn tree, breaking timestamp ties by this store's tiebreaker.
+
+        The one-level listing orders siblings by ``(created_at,
+        _tiebreaker_col)`` (insertion order on SQLite, id elsewhere), so the
+        tree is ordered the same way. Both reads walk the
+        ``(workspace_id, root_conversation_id, id)`` index in id order, so
+        *limit* bounds the rows each examines.
+
+        :param root_conversation_id: Root of the spawn tree.
+        :param limit: Maximum conversations to return.
+        :returns: The tree's conversations in listing order.
+        """
+        page = super().list_spawn_tree(root_conversation_id, limit=limit)
+        if self._conv_engine.dialect.name != "sqlite":
+            return page
+        with self._conv_session("list_spawn_tree") as session:
+            tiebreakers: dict[str, Any] = {
+                str(row[0]): row[1]
+                for row in session.execute(
+                    select(SqlConversation.id, self._tiebreaker_col)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.root_conversation_id == root_conversation_id,
+                    )
+                    .order_by(SqlConversation.id)
+                    .limit(limit)
+                ).all()
+            }
+        rows = sorted(
+            page.data, key=lambda c: (c.created_at, tiebreakers.get(c.id, 0)), reverse=True
+        )
+        return PagedList(
+            data=rows,
+            first_id=rows[0].id if rows else None,
+            last_id=rows[-1].id if rows else None,
+            has_more=page.has_more,
+        )
+
     @staticmethod
-    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
+    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[Any]:
         """
         Map a ``sort_by`` string to the corresponding
         :class:`SqlConversation` column.
 
-        :param sort_by: ``"created_at"`` or ``"updated_at"``.
+        :param sort_by: ``"created_at"``, ``"updated_at"``, or ``"id"``
+            (index order, for bounded reads of one spawn tree).
         :returns: The mapped column attribute.
         :raises ValueError: If ``sort_by`` is not a valid column
             name.
@@ -3482,6 +3591,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         allowed = {
             "created_at": SqlConversation.created_at,
             "updated_at": SqlConversation.updated_at,
+            "id": SqlConversation.id,
         }
         col = allowed.get(sort_by)
         if col is None:
@@ -3493,7 +3603,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         session: Session,
         stmt: Select[tuple[SqlConversation]],
         cursor_id: str,
-        sort_col: QueryableAttribute[int],
+        sort_col: QueryableAttribute[Any],
         is_desc: bool,
         tiebreaker_col: ColumnElement[Any],
         forward: bool,
@@ -3995,7 +4105,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .where(SqlConversationMetadata.runner_id.is_(None))
-                .values(runner_id=runner_id)
+                # A flag written while unbound is not the new runner's to report.
+                .values(
+                    runner_id=runner_id,
+                    background_work_running=None,
+                    background_work_reported_at=None,
+                )
             )
             result = cast(_RowCountResult, session.execute(stmt))
             return result.rowcount == 1
@@ -4171,6 +4286,83 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
 
+    def set_background_work_running(
+        self,
+        conversation_id: str,
+        running: bool,
+        *,
+        runner_id: str | None = None,
+        unseen_since: int | None = None,
+        reported_at: int | None = None,
+    ) -> None:
+        """
+        Persist whether a session's background shells outlive its ended turn.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param running: ``True`` while a background shell outlives the turn.
+        :param runner_id: When set, write only while the session is bound to it.
+        :param unseen_since: When set, write only while the runner was last seen
+            before this epoch second, or never.
+        :param reported_at: When set, write only if no newer report is stored.
+        """
+        from sqlalchemy import or_, update
+
+        conditions = [
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.id == conversation_id,
+        ]
+        if runner_id is not None:
+            conditions.append(SqlConversationMetadata.runner_id == runner_id)
+        if unseen_since is not None:
+            conditions.append(
+                or_(
+                    SqlConversationMetadata.runner_last_seen.is_(None),
+                    SqlConversationMetadata.runner_last_seen < unseen_since,
+                )
+            )
+
+        values: dict[str, object] = {"background_work_running": running}
+        if reported_at is not None:
+            conditions.append(
+                or_(
+                    SqlConversationMetadata.background_work_reported_at.is_(None),
+                    SqlConversationMetadata.background_work_reported_at < reported_at,
+                )
+            )
+            values["background_work_reported_at"] = reported_at
+
+        def write(session: Session) -> None:
+            session.execute(update(SqlConversationMetadata).where(*conditions).values(**values))
+
+        run_write_transaction(self._session_immediate, "set_background_work_running", write)
+
+    def set_blocked_on(self, conversation_id: str, blocked_on: str | None) -> None:
+        """
+        Persist why a running session's agent is parked on a terminal prompt.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param blocked_on: The reason, at most 128 characters, or ``None``.
+        """
+        from sqlalchemy import update
+
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(blocked_on=blocked_on)
+            )
+
+        run_write_transaction(self._session_immediate, "set_blocked_on", write)
+
     def replace_runner_id(
         self,
         conversation_id: str,
@@ -4211,8 +4403,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             ):
                 raise ValueError("The session binding changed; retry the request")
             if expected_runner_id is None:
-                meta.runner_id = runner_id
+                _bind_runner(meta, runner_id)
             else:
+                # The old runner's background work is not the new runner's to report.
+                reset = (
+                    {"background_work_running": None, "background_work_reported_at": None}
+                    if runner_id != expected_runner_id
+                    else {}
+                )
                 session.execute(
                     update(SqlConversationMetadata)
                     .where(
@@ -4220,7 +4418,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversationMetadata.id == conversation_id,
                         SqlConversationMetadata.runner_id == expected_runner_id,
                     )
-                    .values(runner_id=runner_id)
+                    .values(runner_id=runner_id, **reset)
                 )
                 session.refresh(meta)
             return meta
@@ -4263,7 +4461,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 or meta.host_id != expected_binding.host_id
             ):
                 raise ValueError("The session binding changed; retry the request")
-            meta.runner_id = None
+            _bind_runner(meta, None)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_runner_id", write)
@@ -4326,7 +4524,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.host_id = None
             meta.workspace = None
             meta.git_branch = None
-            meta.runner_id = None
+            _bind_runner(meta, None)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_host_binding", write)
@@ -4541,7 +4739,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     source.workspace,
                     source.git_branch,
                 )
-            meta.runner_id = runner_id
+            _bind_runner(meta, runner_id)
 
         run_write_transaction(self._session_immediate, "rotate_profiled_runner", write)
 
@@ -4618,7 +4816,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.git_branch = git_branch
             meta.host_id, meta.workspace = host_id, workspace
             if runner_id is not None:
-                meta.runner_id = runner_id
+                _bind_runner(meta, runner_id)
                 meta.runner_last_seen = None
             return previous
 
@@ -4644,12 +4842,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     previous.git_branch,
                     previous.runner_id,
                 )
-            meta.host_id, meta.workspace, meta.git_branch, meta.runner_id = (
+            meta.host_id, meta.workspace, meta.git_branch = (
                 previous.host_id,
                 previous.workspace,
                 previous.git_branch,
-                previous.runner_id,
             )
+            _bind_runner(meta, previous.runner_id)
             # Split databases retain the accepted reference if metadata rolls back;
             # deleting it first could leave a live binding without its profile.
             if previous.profile_snapshot is None and self._conv_engine is self._engine:
@@ -4698,7 +4896,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.host_id = previous.host_id
                 meta.workspace = previous.workspace
                 meta.git_branch = previous.git_branch
-            meta.runner_id = previous.runner_id
+            _bind_runner(meta, previous.runner_id)
             return True
 
         return run_write_transaction(self._session_immediate, "rollback_profiled_runner", write)
