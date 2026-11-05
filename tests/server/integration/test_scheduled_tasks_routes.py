@@ -1799,6 +1799,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     import time
     import uuid
 
+    from omnigent.runtime import pending_elicitations
     from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
@@ -1820,7 +1821,26 @@ async def test_list_runs_includes_conversation_read_state_fields(
     waiting = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
     conv_store.set_session_live_status(waiting.id, "waiting")
     conv_store.set_pending_elicitation_count(waiting.id, 2)
+    runner_id = f"runner_{uuid.uuid4().hex}"
+    conv_store.set_runner_id(waiting.id, runner_id)
+    conv_store.touch_runner_liveness([runner_id], now=int(time.time()))
     _set_read_state("alice@example.com", waiting.id, 1_700_000_100, False)
+
+    in_process = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
+    elicitation_id = uuid.uuid4().hex
+    pending_elicitations.record_publish(
+        in_process.id,
+        {"type": "response.elicitation_request", "elicitation_id": elicitation_id},
+    )
+    in_process_run_id = uuid.uuid4().hex
+    _seed_run(
+        db_uri,
+        task_id,
+        in_process_run_id,
+        scheduled_at=1600,
+        status="running",
+        conversation_id=in_process.id,
+    )
 
     succeeded_id = uuid.uuid4().hex
     running_id = uuid.uuid4().hex
@@ -1872,6 +1892,8 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert running["viewer_unread"] is False
     assert running["session_cost_usd"] is None
     assert running["conversation_pending_approvals"] == 2
+    assert runs[in_process_run_id]["conversation_pending_approvals"] == 1
+    pending_elicitations.resolve(in_process.id, elicitation_id)
 
     # The skipped run (no conversation_id) gets null for all three fields.
     skip = runs[skipped_id]
@@ -1883,8 +1905,6 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert skip["conversation_pending_approvals"] == 0
 
     # Another replica's fresh runner remains actionable; stale/disconnected runners do not.
-    runner_id = f"runner_{uuid.uuid4().hex}"
-    conv_store.set_runner_id(waiting.id, runner_id)
     now = int(time.time())
     for last_seen, pending in (
         (now - 5, 2),
@@ -1904,6 +1924,14 @@ async def test_list_runs_includes_conversation_read_state_fields(
             conv_store.get_session_activity([waiting.id])[waiting.id].pending_elicitation_count
             == 2
         )
+
+    conv_store.clear_runner_id(waiting.id)
+    assert pending_elicitations.count_for(waiting.id) == 0
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200
+    waiting_run = next(row for row in resp.json()["runs"] if row["id"] == running_id)
+    assert waiting_run["conversation_pending_approvals"] == 0
+    assert conv_store.get_session_activity([waiting.id])[waiting.id].pending_elicitation_count == 2
 
     # Continuing the same session reports its current total on every run.
     _seed_run(

@@ -33,6 +33,7 @@ from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
+from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, bind_host_is_loopback
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
@@ -828,9 +829,15 @@ def create_scheduled_tasks_router(
         # Runs without a conversation_id (skipped/failed) contribute null fields.
         conv_ids = [r.conversation_id for r in runs if r.conversation_id is not None]
         sessions = conversation_store.get_session_activity(conv_ids) if conv_ids else {}
-        pending_ids = [
-            sid for sid, session in sessions.items() if session.pending_elicitation_count
-        ]
+        live_counts = pending_elicitations.counts_for(list(sessions))
+        # Only runner-bound sessions need the persisted cross-replica mirror.
+        pending_counts = {
+            sid: max(live_counts.get(sid, 0), session.pending_elicitation_count or 0)
+            if session.runner_id is not None
+            else live_counts.get(sid, 0)
+            for sid, session in sessions.items()
+        }
+        pending_ids = [sid for sid, count in pending_counts.items() if count]
         liveness = (
             await asyncio.to_thread(liveness_lookup, pending_ids)
             if liveness_lookup is not None and pending_ids
@@ -841,7 +848,7 @@ def create_scheduled_tasks_router(
             session = sessions.get(r.conversation_id) if r.conversation_id is not None else None
             if r.conversation_id is not None and session is not None:
                 last_seen, explicit_unread = _read_state_entry(viewer_id, r.conversation_id)
-                pending_approvals = session.pending_elicitation_count or 0
+                pending_approvals = pending_counts[r.conversation_id]
                 live = liveness.get(r.conversation_id)
                 # A disconnected runner's persisted count can outlive its approval requests.
                 if live is not None and not live.runner_online:
