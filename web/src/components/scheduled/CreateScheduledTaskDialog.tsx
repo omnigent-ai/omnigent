@@ -53,10 +53,9 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
-import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
-import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
+import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
   isBackdropOverlay,
   isInsidePopper,
@@ -156,13 +155,13 @@ export function CreateScheduledTaskDialog({
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
 
-  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
-  const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
-    [agentList],
+  const curation = pickerCuration(info);
+  const agentList = useMemo(
+    () => selectableSessionAgents(agents ?? [], curation.restrictToAgentNames),
+    [agents, curation.restrictToAgentNames],
   );
-  const agentEntries = useMemo(
-    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+  const { harnesses: harnessEntries, agents: agentEntries } = useMemo(
+    () => partitionPickerEntries(agentList),
     [agentList],
   );
   // Resolve the effective selection: the explicit pick if it's still in the
@@ -174,8 +173,9 @@ export function CreateScheduledTaskDialog({
       ? pickedAgentId
       : isEdit
         ? editingTask?.agentId
-        : agentList[0]?.id) ?? null;
-  const selectedAgent = agentList.find((a) => a.id === effectiveAgentId);
+        : (agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+          agentList[0]?.id)) ?? null;
+  const selectedAgent = agents?.find((agent) => agent.id === effectiveAgentId);
   const agentLabel = selectedAgent
     ? selectedAgent.display_name
     : isEdit && editingTask
@@ -1093,8 +1093,9 @@ export function CreateScheduledTaskDialog({
                 effectiveAgentId={effectiveAgentId}
                 agentLabel={agentLabel}
                 hasAgents={agentList.length > 0}
-                // Needs-setup badges use the pinned host, else the first online host.
-                host={badgeHost}
+                curatedEntries={curation.restrictToAgentNames.size > 0 ? agentList : undefined}
+                // Sandboxes provision their own harnesses; host badges only apply to hosts.
+                host={sandboxMode ? undefined : badgeHost}
                 onSelectAgent={handleSelectAgent}
                 pendingAgent={null}
                 pendingAgentId="__unused_pending_agent__"
@@ -1102,7 +1103,8 @@ export function CreateScheduledTaskDialog({
                 // Custom-agent creation is inert until there is a way to
                 // persist a new agent independently of creating a session.
                 onCreateCustomAgent={() => {}}
-                sandboxSelected={false}
+                sandboxSelected={sandboxMode}
+                allowCreateCustomAgent={false}
                 // Forward the dropdown open/close into the dialog's outside-click
                 // dismiss guard so opening the picker doesn't close the modal.
                 onOpenChange={handleSelectOpenChange}

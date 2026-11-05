@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from playwright.sync_api import Page, Request, expect
 
-from tests.browser_ui.chat.session_contract import chat_session_handle
+from tests.browser_ui.chat.session_contract import chat_session_handle, list_payload
 from tests.browser_ui.conftest import BrowserContract
 
 
@@ -30,8 +30,30 @@ def test_automation_sandbox_repository(
                 "scheduled_task_sandbox_workspaces": True,
                 "sandbox_provider": "arclet",
                 "sandbox_provider_capabilities": {"arclet": {"repo_catalog": catalog}},
+                "picker": {
+                    "restrict_to_agent_names": [
+                        "claude-native-ui",
+                        "codex-native-ui",
+                        "pi-native-ui",
+                    ],
+                    "default_agent_name": "claude-native-ui",
+                },
                 "features": {"automations_v2": True},
             },
+        )
+        contract.json(
+            "/v1/agents",
+            list_payload(
+                [
+                    {
+                        "id": f"agent-{harness}",
+                        "name": f"{harness}-native-ui",
+                        "harness": f"{harness}-native",
+                        "builtin": True,
+                    }
+                    for harness in ("claude", "codex", "pi", "cursor", "opencode")
+                ]
+            ),
         )
         tasks: list[dict[str, Any]] = []
         contract.json("/v1/scheduled-tasks", lambda _: {"scheduled_tasks": tasks})
@@ -83,6 +105,12 @@ def test_automation_sandbox_repository(
         )
         page.get_by_label("Host", exact=True).click()
         page.get_by_role("option", name="Arclet Sandbox", exact=True).click()
+        page.get_by_test_id("task-agent-picker").get_by_role("button").click()
+        for harness in ("claude", "codex", "pi"):
+            expect(page.get_by_test_id(f"new-chat-landing-agent-agent-{harness}")).to_be_visible()
+        for harness in ("cursor", "opencode"):
+            expect(page.get_by_test_id(f"new-chat-landing-agent-agent-{harness}")).to_have_count(0)
+        page.get_by_test_id("new-chat-landing-agent-agent-claude").click()
         repository = page.get_by_label("Repository", exact=True)
         expect(repository).to_have_text("Provider default")
         repository.click()
@@ -98,6 +126,10 @@ def test_automation_sandbox_repository(
         expect(page.get_by_role("dialog")).to_have_count(0)
         page.get_by_role("button", name="Actions for Repository maintenance").click()
         page.get_by_role("menuitem", name="Edit", exact=True).click()
+        page.get_by_test_id("task-agent-picker").get_by_role("button").click()
+        expect(page.get_by_test_id("new-chat-landing-agent-agent-pi")).to_be_visible()
+        expect(page.get_by_test_id("new-chat-landing-agent-agent-cursor")).to_have_count(0)
+        page.get_by_test_id("new-chat-landing-agent-agent-claude").click()
         expect(repository).to_have_text("runtime")
         repository.click()
         page.get_by_role("option", name="hadron", exact=True).click()
