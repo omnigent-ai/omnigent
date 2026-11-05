@@ -627,6 +627,10 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, automations_v2_se
     expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
 
     page.get_by_test_id("task-timezone-trigger").click()
+    zones = page.get_by_role("listbox")
+    zones.hover()
+    page.mouse.wheel(0, 400)
+    page.wait_for_function("document.querySelector('[cmdk-list]').scrollTop > 0")
     page.get_by_placeholder("Search timezones…").fill("Singapore")
     page.get_by_role("option", name="Asia/Singapore", exact=True).click()
     expect(page.get_by_test_id("task-timezone-trigger")).to_contain_text("Asia/Singapore")
